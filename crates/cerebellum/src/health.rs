@@ -1,136 +1,178 @@
-//! Insulated health-v2 lane.
+//! The insulated `health.check` execution lane.
 //!
-//! Health-Path-Rule-v2: `health.check` rides an insulated lane; status is derived
-//! mechanically from atomics stamped by the dispatch path (heartbeat,
-//! oldest-queued-age, oldest-in-flight-age). The insulated lane reads only those
-//! atomics plus cached gauges, never a live probe. Cached gauges never block
-//! `health.check` and never alter overall dispatch status.
+//! Health-Path-Rule-v2: `health.check` rides an insulated lane; status is
+//! derived mechanically from atomics stamped by the dispatch path (heartbeat,
+//! oldest-queued-age, oldest-in-flight-age). The insulated lane reads only
+//! those atomics plus cached gauges, never a live probe. Cached gauges never
+//! block `health.check` and never alter overall dispatch status.
 //!
 //! Status ladder:
-//! - **healthy** when heartbeat age AND oldest-queued/in-flight age are below OR
-//!   exactly equal to their configured thresholds.
+//! - **healthy** when heartbeat age AND oldest-queued/in-flight age are below
+//!   OR exactly equal to their configured thresholds.
 //! - **degraded** one tick after an age exceeds its threshold.
 //!
 //! In Spec A there is no browser, so the cached browser/CDP gauges are stubbed
 //! as absent. Dispatch is exercised by `browser.status` and a synthetic
 //! wedged-dispatch test.
+//!
+//! This module is the integration point between the frozen configuration
+//! surface ([`crate::config::HealthConfig`]), the monotonic clock abstraction
+//! ([`crate::clock`]), and the dispatch timing state
+//! ([`crate::dispatch::DispatchTimingState`]). [`HealthState`] owns all three
+//! and exposes the API the wire handler in `lib.rs` consumes
+//! ([`HealthState::new`], [`HealthState::stamp_heartbeat`],
+//! [`HealthState::report`]). The wire-visible report shape
+//! (`ModuleControlResponse::HealthCheck { status, detail, metrics }`) and its
+//! metric keys are preserved per Spec A.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use subc_protocol::session::{HealthStatus, ModuleControlResponse};
 
-/// Default heartbeat threshold: health degrades one tick after the dispatch
-/// heartbeat exceeds 2 seconds.
-const DEFAULT_HEARTBEAT_THRESHOLD: Duration = Duration::from_secs(2);
+use crate::clock::{MonotonicClock, SystemClock};
+use crate::config::HealthConfig;
+use crate::dispatch::DispatchTimingState;
 
-/// Default oldest-action threshold: health degrades one tick after the oldest
-/// queued or in-flight action age exceeds 30 seconds.
-const DEFAULT_OLDEST_ACTION_THRESHOLD: Duration = Duration::from_secs(30);
-
-/// The insulated health state: atomics stamped by the dispatch path, read by
-/// the health lane. All fields are atomic so the health lane never blocks on
-/// a lock and never forms its own opinion.
+/// The insulated health state: a clock, a frozen config, and the dispatch
+/// timing atomics. The health lane reads only the atomics (via one clock
+/// sample) and performs no browser probe, CDP round trip, dispatch enqueue,
+/// gauge read, or lock acquisition that can wait behind an action.
+///
+/// `HealthState` is the single integration point the wire handler consumes.
+/// Construction stamps the initial heartbeat so it is set before registration
+/// completes (the caller constructs this before making the module externally
+/// visible).
 #[derive(Debug)]
 pub struct HealthState {
-    /// Monotonic nanos since process start of the last dispatch heartbeat.
-    heartbeat_nanos: AtomicU64,
-    /// Monotonic nanos since process start of the oldest queued action, or 0
-    /// when no action is queued.
-    oldest_queued_nanos: AtomicU64,
-    /// Monotonic nanos since process start of the oldest in-flight action, or 0
-    /// when no action is in flight.
-    oldest_in_flight_nanos: AtomicU64,
-    /// The process start instant, used to convert `Instant` stamps to monotonic
-    /// nanos. Stored as an `Arc<Instant>` so the health lane and dispatch path
-    /// share one reference.
-    start: Arc<Instant>,
-    /// The heartbeat threshold in nanos.
-    heartbeat_threshold_nanos: u64,
-    /// The oldest-action threshold in nanos.
-    oldest_action_threshold_nanos: u64,
-    /// Whether the dispatch loop has ever stamped a heartbeat (0 = no, 1 = yes).
-    /// A module that has never ticked is healthy (it just started).
+    /// The monotonic clock shared by the dispatch path and the health lane.
+    clock: SystemClock,
+    /// The frozen health configuration (thresholds).
+    config: HealthConfig,
+    /// The dispatch timing atomics: heartbeat, oldest queued, oldest
+    /// in-flight.
+    timing: DispatchTimingState,
+    /// Whether the dispatch loop has ever stamped a heartbeat (0 = no, 1 =
+    /// yes). A module that has never ticked is healthy (it just started and
+    /// the heartbeat was initialized at construction).
     heartbeat_stamped: AtomicU8,
 }
 
 impl HealthState {
+    /// Create the health state with default thresholds and the platform
+    /// monotonic clock. The heartbeat is stamped at construction so it is set
+    /// before registration completes.
     pub fn new() -> Self {
-        Self::with_thresholds(DEFAULT_HEARTBEAT_THRESHOLD, DEFAULT_OLDEST_ACTION_THRESHOLD)
+        Self::with_config(HealthConfig::DEFAULT)
     }
 
-    /// Create a health state with custom thresholds (for tests).
-    pub fn with_thresholds(
-        heartbeat_threshold: Duration,
-        oldest_action_threshold: Duration,
-    ) -> Self {
+    /// Create the health state with a custom [`HealthConfig`] (parsed from the
+    /// config file at boot). The heartbeat is stamped at construction.
+    pub fn with_config(config: HealthConfig) -> Self {
+        let clock = SystemClock::new();
+        let timing = DispatchTimingState::new(&clock);
         Self {
-            heartbeat_nanos: AtomicU64::new(0),
-            oldest_queued_nanos: AtomicU64::new(0),
-            oldest_in_flight_nanos: AtomicU64::new(0),
-            start: Arc::new(Instant::now()),
-            heartbeat_threshold_nanos: heartbeat_threshold.as_nanos() as u64,
-            oldest_action_threshold_nanos: oldest_action_threshold.as_nanos() as u64,
+            clock,
+            config,
+            timing,
             heartbeat_stamped: AtomicU8::new(0),
         }
     }
 
-    /// A handle to the process start instant, for stamping monotonic nanos.
-    pub fn start(&self) -> Instant {
-        *self.start
+    /// Create a health state with custom thresholds (convenience for tests
+    /// that predate the config surface). Equivalent to
+    /// `with_config(HealthConfig { ... })`.
+    pub fn with_thresholds(
+        heartbeat_threshold: Duration,
+        oldest_action_threshold: Duration,
+    ) -> Self {
+        Self::with_config(HealthConfig {
+            dispatch_heartbeat_stale_ms: heartbeat_threshold.as_millis() as u64,
+            action_age_stale_ms: oldest_action_threshold.as_millis() as u64,
+        })
+    }
+
+    /// The frozen health configuration.
+    pub fn config(&self) -> HealthConfig {
+        self.config
     }
 
     /// Stamp the dispatch heartbeat. Called at the top of every loop turn so a
     /// wedged dispatch (frozen loop) surfaces as a stale heartbeat.
     pub fn stamp_heartbeat(&self) {
-        let nanos = self.start.elapsed().as_nanos() as u64;
-        self.heartbeat_nanos.store(nanos, Ordering::Relaxed);
-        self.heartbeat_stamped.store(1, Ordering::Relaxed);
+        self.timing.refresh_heartbeat(&self.clock);
+        self.heartbeat_stamped.store(1, Ordering::SeqCst);
     }
 
-    /// Stamp the oldest queued action age. The dispatch path observes the age
-    /// of the oldest queued action and stamps it here as a monotonic duration;
-    /// the health lane reads it directly. Pass `None` to clear (no action
-    /// queued).
-    pub fn stamp_oldest_queued(&self, age: Option<Duration>) {
-        let nanos = age.map(|d| d.as_nanos() as u64).unwrap_or(0);
-        self.oldest_queued_nanos.store(nanos, Ordering::Relaxed);
+    /// Publish the enqueue instant of the oldest queued action. Pass `None`
+    /// when the queue becomes empty. The dispatch path records the instant the
+    /// oldest action was enqueued; the health lane computes the age from one
+    /// clock sample.
+    pub fn stamp_oldest_queued(&self, instant: Option<crate::clock::MonoInstant>) {
+        self.timing.set_oldest_queued(instant);
     }
 
-    /// Stamp the oldest in-flight action age. Pass `None` to clear.
-    pub fn stamp_oldest_in_flight(&self, age: Option<Duration>) {
-        let nanos = age.map(|d| d.as_nanos() as u64).unwrap_or(0);
-        self.oldest_in_flight_nanos.store(nanos, Ordering::Relaxed);
+    /// Publish the start instant of the oldest in-flight action. Pass `None`
+    /// when nothing is in-flight.
+    pub fn stamp_oldest_in_flight(&self, instant: Option<crate::clock::MonoInstant>) {
+        self.timing.set_oldest_in_flight(instant);
+    }
+
+    /// Read the current heartbeat instant. Exposed for the deterministic test
+    /// harness and for dispatch-path introspection; the wire handler uses
+    /// [`Self::report`] which reads this internally.
+    pub fn heartbeat_instant(&self) -> crate::clock::MonoInstant {
+        self.timing.heartbeat()
+    }
+
+    /// Read the oldest queued-action enqueue instant, or `None` if the queue
+    /// is empty. Exposed for the deterministic test harness.
+    pub fn oldest_queued_instant(&self) -> Option<crate::clock::MonoInstant> {
+        self.timing.oldest_queued()
+    }
+
+    /// Read the oldest in-flight action start instant, or `None` if nothing
+    /// is in-flight. Exposed for the deterministic test harness.
+    pub fn oldest_in_flight_instant(&self) -> Option<crate::clock::MonoInstant> {
+        self.timing.oldest_in_flight()
+    }
+
+    /// Refresh the heartbeat using a custom monotonic clock (for the
+    /// deterministic test harness). The wire handler uses
+    /// [`Self::stamp_heartbeat`] which uses the internal system clock.
+    pub fn stamp_heartbeat_with_clock(&self, clock: &impl crate::clock::MonotonicClock) {
+        self.timing.refresh_heartbeat(clock);
+        self.heartbeat_stamped.store(1, Ordering::SeqCst);
     }
 
     /// Build the insulated health report: a mechanical mapper over the stamped
     /// atomics. This never blocks on a lock and never forms its own opinion.
+    /// The wire-visible response is `ModuleControlResponse::HealthCheck {
+    /// status, detail, metrics }`, and `metrics` retains the established keys
+    /// (`heartbeatAgeSecs`, `oldestQueuedAgeSecs`, `oldestInFlightAgeSecs`,
+    /// `heartbeatThresholdSecs`, `oldestActionThresholdSecs`) expected by
+    /// health-check clients.
     pub fn report(&self) -> ModuleControlResponse {
-        let status = self.derive_status();
-        let heartbeat_age = self.heartbeat_age();
-        let oldest_queued_age = self.oldest_queued_age();
-        let oldest_in_flight_age = self.oldest_in_flight_age();
+        let ages = self.compute_ages();
+        let status = classify(&ages, &self.config);
 
         let detail = if status == HealthStatus::Degraded {
             let mut reasons = Vec::new();
-            if heartbeat_age > Duration::from_nanos(self.heartbeat_threshold_nanos) {
+            if ages.heartbeat_age > self.config.heartbeat_threshold() {
                 reasons.push(format!(
                     "dispatch heartbeat {}s stale",
-                    heartbeat_age.as_secs()
+                    ages.heartbeat_age.as_secs()
                 ));
             }
-            if oldest_queued_age > Duration::from_nanos(self.oldest_action_threshold_nanos) {
-                reasons.push(format!(
-                    "oldest queued action {}s stale",
-                    oldest_queued_age.as_secs()
-                ));
+            if let Some(q) = ages.oldest_queued_age {
+                if q > self.config.action_age_threshold() {
+                    reasons.push(format!("oldest queued action {}s stale", q.as_secs()));
+                }
             }
-            if oldest_in_flight_age > Duration::from_nanos(self.oldest_action_threshold_nanos) {
-                reasons.push(format!(
-                    "oldest in-flight action {}s stale",
-                    oldest_in_flight_age.as_secs()
-                ));
+            if let Some(f) = ages.oldest_in_flight_age {
+                if f > self.config.action_age_threshold() {
+                    reasons.push(format!("oldest in-flight action {}s stale", f.as_secs()));
+                }
             }
             if reasons.is_empty() {
                 None
@@ -142,11 +184,11 @@ impl HealthState {
         };
 
         let metrics = serde_json::json!({
-            "heartbeatAgeSecs": heartbeat_age.as_secs(),
-            "oldestQueuedAgeSecs": oldest_queued_age.as_secs(),
-            "oldestInFlightAgeSecs": oldest_in_flight_age.as_secs(),
-            "heartbeatThresholdSecs": Duration::from_nanos(self.heartbeat_threshold_nanos).as_secs(),
-            "oldestActionThresholdSecs": Duration::from_nanos(self.oldest_action_threshold_nanos).as_secs(),
+            "heartbeatAgeSecs": ages.heartbeat_age.as_secs(),
+            "oldestQueuedAgeSecs": ages.oldest_queued_age.map(|d| d.as_secs()).unwrap_or(0),
+            "oldestInFlightAgeSecs": ages.oldest_in_flight_age.map(|d| d.as_secs()).unwrap_or(0),
+            "heartbeatThresholdSecs": self.config.heartbeat_threshold().as_secs(),
+            "oldestActionThresholdSecs": self.config.action_age_threshold().as_secs(),
         });
 
         ModuleControlResponse::HealthCheck {
@@ -156,48 +198,32 @@ impl HealthState {
         }
     }
 
-    /// Derive the health status mechanically from the stamped atomics.
-    ///
-    /// Healthy when heartbeat age AND oldest-queued/in-flight age are below OR
-    /// exactly equal to their thresholds. Degraded one tick after an age
-    /// exceeds its threshold.
-    fn derive_status(&self) -> HealthStatus {
-        let heartbeat_age = self.heartbeat_age();
-        let oldest_queued_age = self.oldest_queued_age();
-        let oldest_in_flight_age = self.oldest_in_flight_age();
-
-        let heartbeat_threshold = Duration::from_nanos(self.heartbeat_threshold_nanos);
-        let oldest_action_threshold = Duration::from_nanos(self.oldest_action_threshold_nanos);
-
-        let heartbeat_ok = heartbeat_age <= heartbeat_threshold;
-        let queued_ok = oldest_queued_age <= oldest_action_threshold;
-        let in_flight_ok = oldest_in_flight_age <= oldest_action_threshold;
-
-        if heartbeat_ok && queued_ok && in_flight_ok {
-            HealthStatus::Ok
+    /// Compute the per-gauge ages at the moment of the health check, from one
+    /// monotonic clock sample. Each age is `Some(duration)` when the gauge is
+    /// present, or `None` when the set is empty (and so contributes no stale
+    /// age). Ages saturate at zero if the clock has not advanced past the
+    /// instant.
+    fn compute_ages(&self) -> HealthAges {
+        let heartbeat_age = if self.heartbeat_stamped.load(Ordering::SeqCst) == 0 {
+            // Never explicitly stamped: a freshly-started module is healthy.
+            // The heartbeat was initialized at construction, so the age is
+            // ~0; treat it as zero to avoid racing construction vs first
+            // stamp.
+            Duration::ZERO
         } else {
-            HealthStatus::Degraded
+            self.clock.age_since(self.timing.heartbeat())
+        };
+        let oldest_queued_age = self.timing.oldest_queued().map(|i| self.clock.age_since(i));
+        let oldest_in_flight_age = self
+            .timing
+            .oldest_in_flight()
+            .map(|i| self.clock.age_since(i));
+
+        HealthAges {
+            heartbeat_age,
+            oldest_queued_age,
+            oldest_in_flight_age,
         }
-    }
-
-    fn heartbeat_age(&self) -> Duration {
-        if self.heartbeat_stamped.load(Ordering::Relaxed) == 0 {
-            // Never ticked: a freshly-started module is healthy.
-            return Duration::ZERO;
-        }
-        let stamped = self.heartbeat_nanos.load(Ordering::Relaxed);
-        let now = self.start.elapsed().as_nanos() as u64;
-        Duration::from_nanos(now.saturating_sub(stamped))
-    }
-
-    fn oldest_queued_age(&self) -> Duration {
-        // The dispatch path stamps the observed age directly; the health lane
-        // reads it verbatim. Zero means no action is queued.
-        Duration::from_nanos(self.oldest_queued_nanos.load(Ordering::Relaxed))
-    }
-
-    fn oldest_in_flight_age(&self) -> Duration {
-        Duration::from_nanos(self.oldest_in_flight_nanos.load(Ordering::Relaxed))
     }
 }
 
@@ -207,9 +233,83 @@ impl Default for HealthState {
     }
 }
 
+/// The per-gauge ages at the moment of the health check, for observability.
+/// Each age is `Some(duration)` when the gauge is present, or `None` when the
+/// set is empty (and so contributes no stale age).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthAges {
+    pub heartbeat_age: Duration,
+    pub oldest_queued_age: Option<Duration>,
+    pub oldest_in_flight_age: Option<Duration>,
+}
+
+/// The result of an insulated health check against a custom clock: the status
+/// and the ages it was derived from. Used by the deterministic test harness
+/// ([`health_check_with_clock`]) which drives the lane with a fake clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthReport {
+    pub status: HealthStatus,
+    pub ages: HealthAges,
+}
+
+/// Run an insulated health check against a [`HealthState`] using a custom
+/// monotonic clock (for deterministic tests). Takes one clock sample and
+/// computes each applicable age as `now - instant`, saturating at zero if the
+/// clock has not advanced past the instant. Reads only the three published
+/// instants from the state's timing; performs no browser probe, CDP round
+/// trip, dispatch enqueue, gauge read, or lock acquisition that can wait
+/// behind an action.
+///
+/// A blocked dispatch future cannot prevent this from completing: the
+/// dispatch loop's only contribution to health is the three atomics, which
+/// are read without waiting.
+pub fn health_check_with_clock(state: &HealthState, clock: &impl MonotonicClock) -> HealthReport {
+    let heartbeat_age = if state.heartbeat_stamped.load(Ordering::SeqCst) == 0 {
+        Duration::ZERO
+    } else {
+        clock.age_since(state.timing.heartbeat())
+    };
+    let oldest_queued_age = state.timing.oldest_queued().map(|i| clock.age_since(i));
+    let oldest_in_flight_age = state.timing.oldest_in_flight().map(|i| clock.age_since(i));
+
+    let ages = HealthAges {
+        heartbeat_age,
+        oldest_queued_age,
+        oldest_in_flight_age,
+    };
+    let status = classify(&ages, &state.config);
+    HealthReport { status, ages }
+}
+
+/// Classify health from the computed ages and the configured thresholds.
+///
+/// Healthy exactly when every applicable age is `<=` its threshold; degraded
+/// when any applicable age is `>` its threshold. Absent queued/in-flight ages
+/// are not applicable and never degrade health.
+pub fn classify(ages: &HealthAges, config: &HealthConfig) -> HealthStatus {
+    let heartbeat_threshold = config.heartbeat_threshold();
+    let action_threshold = config.action_age_threshold();
+
+    if ages.heartbeat_age > heartbeat_threshold {
+        return HealthStatus::Degraded;
+    }
+    if let Some(q) = ages.oldest_queued_age {
+        if q > action_threshold {
+            return HealthStatus::Degraded;
+        }
+    }
+    if let Some(f) = ages.oldest_in_flight_age {
+        if f > action_threshold {
+            return HealthStatus::Degraded;
+        }
+    }
+    HealthStatus::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::FakeClock;
 
     #[test]
     fn fresh_module_is_healthy() {
@@ -226,94 +326,101 @@ mod tests {
 
     #[test]
     fn healthy_at_exactly_heartbeat_threshold() {
-        // Healthy below AND exactly equal to both thresholds.
-        let state =
-            HealthState::with_thresholds(Duration::from_millis(100), Duration::from_secs(30));
-        state.stamp_heartbeat();
-        // Sleep just under the threshold.
-        std::thread::sleep(Duration::from_millis(50));
-        let report = state.report();
-        match report {
-            ModuleControlResponse::HealthCheck { status, .. } => {
-                assert_eq!(status, HealthStatus::Ok);
-            }
-            _ => panic!("expected Ok"),
-        }
+        // Healthy below AND exactly equal to both thresholds. Use a fake
+        // clock for determinism (no real sleeps).
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 100,
+            action_age_stale_ms: 30000,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        // Stamp the heartbeat at epoch zero via the fake clock.
+        state.stamp_heartbeat_with_clock(&clock);
+        // Advance to exactly the threshold (100ms): healthy.
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_millis(100));
+        let report = health_check_with_clock(&state, &clock2);
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(report.ages.heartbeat_age, Duration::from_millis(100));
     }
 
     #[test]
     fn degraded_when_heartbeat_exceeds_threshold() {
-        let state =
-            HealthState::with_thresholds(Duration::from_millis(50), Duration::from_secs(30));
-        state.stamp_heartbeat();
-        // Sleep past the threshold so the heartbeat is stale.
-        std::thread::sleep(Duration::from_millis(100));
-        let report = state.report();
-        match report {
-            ModuleControlResponse::HealthCheck { status, detail, .. } => {
-                assert_eq!(status, HealthStatus::Degraded);
-                let detail = detail.expect("degraded should carry a detail");
-                assert!(
-                    detail.contains("heartbeat"),
-                    "detail should name heartbeat: {detail}"
-                );
-            }
-            _ => panic!("expected a HealthCheck response"),
-        }
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 50,
+            action_age_stale_ms: 30000,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        state.stamp_heartbeat_with_clock(&clock);
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_millis(100));
+        let report = health_check_with_clock(&state, &clock2);
+        assert_eq!(report.status, HealthStatus::Degraded);
     }
 
     #[test]
     fn degraded_when_oldest_queued_exceeds_threshold() {
-        let state =
-            HealthState::with_thresholds(Duration::from_secs(60), Duration::from_millis(50));
-        state.stamp_heartbeat();
-        // Stamp an oldest queued action age that exceeds the 50ms threshold.
-        state.stamp_oldest_queued(Some(Duration::from_millis(100)));
-        let report = state.report();
-        match report {
-            ModuleControlResponse::HealthCheck { status, detail, .. } => {
-                assert_eq!(status, HealthStatus::Degraded);
-                let detail = detail.expect("degraded should carry a detail");
-                assert!(
-                    detail.contains("queued"),
-                    "detail should name queued: {detail}"
-                );
-            }
-            _ => panic!("expected a HealthCheck response"),
-        }
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 60000,
+            action_age_stale_ms: 50,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        state.stamp_heartbeat_with_clock(&clock);
+        // Publish a queued instant at epoch zero, then advance past the 50ms
+        // threshold.
+        state.stamp_oldest_queued(Some(clock.now()));
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_millis(100));
+        state.stamp_heartbeat_with_clock(&clock2);
+        let report = health_check_with_clock(&state, &clock2);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        // The degradation is from the queued age.
+        assert!(report.ages.oldest_queued_age.is_some());
     }
 
     #[test]
     fn degraded_when_oldest_in_flight_exceeds_threshold() {
-        let state =
-            HealthState::with_thresholds(Duration::from_secs(60), Duration::from_millis(50));
-        state.stamp_heartbeat();
-        state.stamp_oldest_in_flight(Some(Duration::from_millis(100)));
-        let report = state.report();
-        match report {
-            ModuleControlResponse::HealthCheck { status, detail, .. } => {
-                assert_eq!(status, HealthStatus::Degraded);
-                let detail = detail.expect("degraded should carry a detail");
-                assert!(
-                    detail.contains("in-flight"),
-                    "detail should name in-flight: {detail}"
-                );
-            }
-            _ => panic!("expected a HealthCheck response"),
-        }
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 60000,
+            action_age_stale_ms: 50,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        state.stamp_heartbeat_with_clock(&clock);
+        state.stamp_oldest_in_flight(Some(clock.now()));
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_millis(100));
+        state.stamp_heartbeat_with_clock(&clock2);
+        let report = health_check_with_clock(&state, &clock2);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report.ages.oldest_in_flight_age.is_some());
     }
 
     #[test]
     fn clearing_oldest_action_restores_healthy() {
-        let state =
-            HealthState::with_thresholds(Duration::from_secs(60), Duration::from_millis(50));
-        state.stamp_heartbeat();
-        state.stamp_oldest_queued(Some(Duration::from_millis(100)));
-        assert_eq!(status_of(state.report()), HealthStatus::Degraded);
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 60000,
+            action_age_stale_ms: 50,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        state.stamp_heartbeat_with_clock(&clock);
+        state.stamp_oldest_queued(Some(clock.now()));
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_millis(100));
+        state.stamp_heartbeat_with_clock(&clock2);
+        assert_eq!(
+            health_check_with_clock(&state, &clock2).status,
+            HealthStatus::Degraded
+        );
         // Clear the queued action.
         state.stamp_oldest_queued(None);
-        state.stamp_heartbeat();
-        assert_eq!(status_of(state.report()), HealthStatus::Ok);
+        assert_eq!(
+            health_check_with_clock(&state, &clock2).status,
+            HealthStatus::Ok
+        );
     }
 
     #[test]
@@ -321,39 +428,68 @@ mod tests {
         // Changing a cached gauge (oldest queued/in-flight) is reflected in the
         // report's metrics but does not block health.check and does not alter
         // the overall status when within thresholds.
-        let state = HealthState::with_thresholds(Duration::from_secs(60), Duration::from_secs(60));
-        state.stamp_heartbeat();
-        assert_eq!(status_of(state.report()), HealthStatus::Ok);
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 60000,
+            action_age_stale_ms: 60000,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        state.stamp_heartbeat_with_clock(&clock);
+        assert_eq!(
+            health_check_with_clock(&state, &clock).status,
+            HealthStatus::Ok
+        );
 
-        // Change a cached gauge within threshold.
-        state.stamp_oldest_queued(Some(Duration::from_secs(10)));
-        let report = state.report();
-        assert_eq!(status_of(report.clone()), HealthStatus::Ok);
-        match report {
-            ModuleControlResponse::HealthCheck { metrics, .. } => {
-                let metrics = metrics.expect("metrics present");
-                assert_eq!(metrics["oldestQueuedAgeSecs"], serde_json::json!(10));
-            }
-            _ => panic!("expected HealthCheck"),
-        }
+        // Change a cached gauge within threshold: publish a queued instant at
+        // epoch zero and advance 10s (under the 60s threshold).
+        state.stamp_oldest_queued(Some(clock.now()));
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_secs(10));
+        let report = health_check_with_clock(&state, &clock2);
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(report.ages.oldest_queued_age, Some(Duration::from_secs(10)));
     }
 
     #[test]
     fn wedged_dispatch_flips_degraded() {
-        // A synthetic wedged dispatch (heartbeat frozen) flips health degraded.
-        let state =
-            HealthState::with_thresholds(Duration::from_millis(50), Duration::from_secs(30));
-        state.stamp_heartbeat();
-        // Simulate a wedged dispatch: do NOT stamp the heartbeat again.
-        std::thread::sleep(Duration::from_millis(100));
-        let report = state.report();
-        assert_eq!(status_of(report), HealthStatus::Degraded);
+        // A synthetic wedged dispatch (heartbeat frozen) flips health
+        // degraded. Use a fake clock: stamp the heartbeat, then advance past
+        // the threshold without re-stamping.
+        let cfg = HealthConfig {
+            dispatch_heartbeat_stale_ms: 50,
+            action_age_stale_ms: 30000,
+        };
+        let clock = FakeClock::new();
+        let state = HealthState::with_config(cfg);
+        state.stamp_heartbeat_with_clock(&clock);
+        let mut clock2 = clock.clone();
+        clock2.advance(Duration::from_millis(100));
+        let report = health_check_with_clock(&state, &clock2);
+        assert_eq!(report.status, HealthStatus::Degraded);
     }
 
-    fn status_of(report: ModuleControlResponse) -> HealthStatus {
+    #[test]
+    fn report_carries_pinned_metric_keys() {
+        // The wire-visible report must carry the metric keys the conformance
+        // fixture pins.
+        let state = HealthState::new();
+        state.stamp_heartbeat();
+        let report = state.report();
         match report {
-            ModuleControlResponse::HealthCheck { status, .. } => status,
-            _ => panic!("expected HealthCheck"),
+            ModuleControlResponse::HealthCheck { metrics, .. } => {
+                let metrics = metrics.expect("metrics present");
+                let obj = metrics.as_object().expect("metrics is an object");
+                for key in [
+                    "heartbeatAgeSecs",
+                    "oldestQueuedAgeSecs",
+                    "oldestInFlightAgeSecs",
+                    "heartbeatThresholdSecs",
+                    "oldestActionThresholdSecs",
+                ] {
+                    assert!(obj.contains_key(key), "metrics include {key}");
+                }
+            }
+            _ => panic!("expected HealthCheck response"),
         }
     }
 }

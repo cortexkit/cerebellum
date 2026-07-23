@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
+use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -66,6 +66,7 @@ pub async fn send(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), crat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use subc_protocol::PROTOCOL_VERSION;
 
     #[test]
     fn control_flags_are_passive_non_binary_non_last() {

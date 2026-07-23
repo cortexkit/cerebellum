@@ -34,6 +34,7 @@ pub enum SessionKind {
 impl SessionKind {
     /// Parse a session-kind string stamped on the bind. Returns `None` for an
     /// unknown value (the caller decides whether to reject or default).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(kind: &str) -> Option<Self> {
         match kind {
             "primary" => Some(Self::Primary),
