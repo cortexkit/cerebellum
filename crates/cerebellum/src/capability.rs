@@ -42,7 +42,9 @@ struct BrowserSession {
 /// entry point is useful for the closed-schema unit tests; live dispatch uses
 /// [`handle_browser_status_for_identity`] after route.bind has been accepted.
 pub fn handle_browser_status(params: &Value) -> Value {
-    handle_browser_status_for_identity(params, &legacy_identity())
+    // Live dispatch always uses handle_browser_status_for_identity with real bind
+    // facts; this placeholder exists only to support schema-focused tests.
+    handle_browser_status_for_identity(params, &placeholder_identity_for_schema_tests())
 }
 
 /// Handle `browser.status` using the identity retained from an accepted bind.
@@ -107,7 +109,7 @@ fn context_for(kind: SessionKind, resolution: &ProfileResolution) -> BrowserStat
     }
 }
 
-fn legacy_identity() -> RouteIdentity {
+fn placeholder_identity_for_schema_tests() -> RouteIdentity {
     RouteIdentity::from_accepted_bind(
         &subc_protocol::BindIdentity {
             project_root: std::path::PathBuf::from("/legacy/project"),
