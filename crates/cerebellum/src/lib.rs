@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod clock;
+pub mod config;
+pub mod dispatch;
 pub mod health;
 pub mod identity;
 pub mod manifest;
@@ -32,6 +35,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 pub use capability::handle_browser_status;
+pub use config::{parse_config, Config, ConfigError, HealthConfig};
 pub use health::HealthState;
 pub use identity::{ProfileDisposition, RouteIdentity, SessionKind};
 pub use principal::{trust_for_principal, PrincipalTrust};
@@ -42,8 +46,9 @@ const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 const BROWSER_STATUS_TOOL: &str = "browser.status";
 
-/// The binary entry point: read config from env and run the module loop.
-/// Exposed publicly so the thin `main.rs` binary can delegate here.
+/// The binary entry point: read config from env, load the health config
+/// file, and run the module loop. Exposed publicly so the thin `main.rs`
+/// binary can delegate here.
 pub async fn run_entry() -> Result<(), ModuleError> {
     let config = ModuleConfig::from_env()?;
     run(config).await
@@ -52,6 +57,7 @@ pub async fn run_entry() -> Result<(), ModuleError> {
 struct ModuleConfig {
     connection_file_path: PathBuf,
     module_id: String,
+    health: HealthConfig,
 }
 
 impl ModuleConfig {
@@ -61,9 +67,18 @@ impl ModuleConfig {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+        // Load the health config file at boot. A missing file uses defaults;
+        // a present-but-malformed file fails registration deterministically
+        // rather than silently falling back (Spec A: zero, negative,
+        // fractional, non-numeric, and unknown-member values are
+        // configuration errors).
+        let health = config::load_config_file()
+            .map_err(ModuleError::Config)?
+            .health;
         Ok(Self {
             connection_file_path,
             module_id,
+            health,
         })
     }
 }
@@ -74,7 +89,7 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
-    let health_state = Arc::new(HealthState::new());
+    let health_state = Arc::new(HealthState::with_config(config.health));
     let loop_result = module_loop(
         &mut read_half,
         tx.clone(),
@@ -444,6 +459,7 @@ fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, M
 pub enum ModuleError {
     Message(String),
     Json(serde_json::Error),
+    Config(ConfigError),
 }
 
 impl std::fmt::Display for ModuleError {
@@ -451,6 +467,7 @@ impl std::fmt::Display for ModuleError {
         match self {
             Self::Message(m) => write!(f, "{m}"),
             Self::Json(e) => write!(f, "json: {e}"),
+            Self::Config(e) => write!(f, "config: {e}"),
         }
     }
 }

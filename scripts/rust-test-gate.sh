@@ -1,19 +1,33 @@
 #!/usr/bin/env bash
-# Rust test gate for ck-cerebellum.
+# ck-cerebellum Rust test gate.
 #
-# Phase 1: cargo fmt --all -- --check (unformatted code fails the gate).
-# Phase 2: cargo test (all crates).
-#
-# Serialize cargo invocations (never parallel cargo) — the shared build machine
-# saturates under concurrent workspace builds.
+# Run from the repo root after any code change. The first phase is
+# `cargo fmt --all -- --check`, so an unformatted commit fails the gate.
+# Serialize cargo invocations (never parallel cargo): other workers share this
+# machine and concurrent workspace builds have saturated it.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
 
-echo "=== Phase 1: cargo fmt --all -- --check ==="
-cargo fmt --all -- --check
+run_phase() {
+  local label="$1"
+  shift
+  local started=$SECONDS
+  echo "==> $label"
+  "$@"
+  echo "    ok ($((SECONDS - started))s)"
+}
 
-echo "=== Phase 2: cargo test ==="
-cargo test
+# Phase 1: formatting check. `cargo fmt --all` must be run before committing;
+# this check fails the gate on an unformatted commit.
+run_phase "cargo fmt --all -- --check" \
+  cargo fmt --all -- --check
 
-echo "=== Gate passed ==="
+# Phase 2: clippy with warnings as errors, across all targets.
+run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
+  cargo clippy --workspace --all-targets --quiet -- -D warnings
+
+# Phase 3: compile + all tests (lib, bins, integration).
+run_phase "cargo test --workspace --quiet" \
+  cargo test --workspace --quiet
