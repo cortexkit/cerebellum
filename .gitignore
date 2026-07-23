@@ -1,0 +1,9 @@
+# Alfonso session artifacts (drafts, task outputs, context) — never repo content.
+# A fired spec draft writes into .cortexkit/alfonso/drafts/; without this ignore,
+# that file dirties the parent repo and blocks every mason worktree dispatch.
+.cortexkit/alfonso/*
+!.cortexkit/alfonso/rules/
+
+# Internal design material stays out of the repository by policy.
+docs/design/
+docs/field-notes.md
