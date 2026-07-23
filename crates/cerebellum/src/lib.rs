@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use serde_json::json;
+use serde_json::Value;
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -430,7 +431,29 @@ async fn handle_tool_request(
         }
     };
 
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // The route body is opaque to the capability handler. Accept the canonical
+    // envelope (`name`/`arguments`) and the local test envelope
+    // (`method`/`params`); a direct value is also a browser.status request body.
+    // Keeping the capability payload intact is important because `{}` and each
+    // non-object value must reach the closed-schema validator.
+    let (method, params) = match &request {
+        Value::Object(object)
+            if object.contains_key("name") && object.contains_key("arguments") =>
+        {
+            let method = object.get("name").and_then(Value::as_str).unwrap_or("");
+            let params = object
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            (method, params)
+        }
+        Value::Object(object) if object.contains_key("method") && object.contains_key("params") => {
+            let method = object.get("method").and_then(Value::as_str).unwrap_or("");
+            let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+            (method, params)
+        }
+        _ => (BROWSER_STATUS_TOOL, request.clone()),
+    };
     if method != BROWSER_STATUS_TOOL {
         return send_route_error(
             writer,
@@ -469,7 +492,6 @@ async fn handle_tool_request(
         .await;
     }
 
-    let params = request.get("params").cloned().unwrap_or(json!({}));
     let result = handle_browser_status_for_identity(&params, &accepted_facts.identity);
 
     let body = serde_json::to_vec(&result).map_err(ModuleError::Json)?;
