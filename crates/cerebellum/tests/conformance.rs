@@ -292,7 +292,10 @@ async fn browser_status_returns_flat_no_session_result() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
 
-    let request = json!({});
+    let request = json!({
+        "name": "browser.status",
+        "arguments": {},
+    });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
         FrameType::Request,
@@ -334,8 +337,11 @@ async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
 
     let request = json!({
-        "zebra": true,
-        "alpha": false,
+        "name": "browser.status",
+        "arguments": {
+            "zebra": true,
+            "alpha": false,
+        },
     });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -368,7 +374,84 @@ async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     assert_field_set(&body, &["outcome", "context", "session", "detail"]);
 }
 
-/// Every non-object capability request is rejected as a wrong top-level type
+/// The management-surface method/params envelope is not accepted on a tool
+/// route; its members are ordinary unknown envelope fields here.
+#[tokio::test]
+async fn browser_status_rejects_management_envelope() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let request = json!({
+        "method": "browser.status",
+        "params": {},
+    });
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        5,
+        1,
+        100,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+
+    cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+        .await
+        .unwrap();
+
+    let response = rx.recv().await.expect("a response frame");
+    assert_eq!(response.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["outcome"], "invalid_request");
+    assert_eq!(body["detail"]["field"], "method");
+    assert_eq!(body["detail"]["reason_code"], "unknown_field");
+    assert_field_set(&body, &["outcome", "context", "session", "detail"]);
+}
+
+/// Missing and wrongly typed tool-route envelope members are application
+/// validation failures carried by normal Response frames.
+#[tokio::test]
+async fn browser_status_rejects_malformed_tool_envelopes() {
+    let cases = [
+        (Value::Null, "$", "wrong_type"),
+        (json!({"arguments": {}}), "name", "missing_field"),
+        (json!({"name": 7, "arguments": {}}), "name", "wrong_type"),
+        (
+            json!({"name": "browser.status"}),
+            "arguments",
+            "missing_field",
+        ),
+    ];
+
+    for (offset, (request, field, reason_code)) in cases.into_iter().enumerate() {
+        let (tx, mut rx) = mpsc::channel::<Frame>(16);
+        let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            5,
+            1,
+            200 + offset as u64,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+
+        cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+            .await
+            .unwrap();
+
+        let response = rx.recv().await.expect("a response frame");
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["outcome"], "invalid_request");
+        assert_eq!(body["detail"]["field"], field);
+        assert_eq!(body["detail"]["reason_code"], reason_code);
+        assert_field_set(&body, &["outcome", "context", "session", "detail"]);
+    }
+}
+
+/// Every non-object capability arguments value is rejected as a wrong type
 /// in a normal Response frame, rather than being treated as a route error.
 #[tokio::test]
 async fn browser_status_top_level_wrong_types_return_response_frames() {
@@ -383,6 +466,10 @@ async fn browser_status_top_level_wrong_types_return_response_frames() {
     for (offset, value) in values.into_iter().enumerate() {
         let (tx, mut rx) = mpsc::channel::<Frame>(16);
         let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+        let request = json!({
+            "name": "browser.status",
+            "arguments": value,
+        });
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,
             FrameType::Request,
@@ -390,7 +477,7 @@ async fn browser_status_top_level_wrong_types_return_response_frames() {
             5,
             1,
             100 + offset as u64,
-            serde_json::to_vec(&value).unwrap(),
+            serde_json::to_vec(&request).unwrap(),
         )
         .unwrap();
 
@@ -547,12 +634,8 @@ async fn accepted_bind_facts_drive_profile_resolution() {
     assert_eq!(bind_response.header.ty, FrameType::Response);
 
     let request = json!({
-        "method": "browser.status",
-        "agentProjectId": "pj-forged",
-        "sessionKind": "ephemeral",
-        "principal": "untrusted",
-        "effectiveCapabilityScope": [],
-        "params": {},
+        "name": "browser.status",
+        "arguments": {},
     });
     let tool_frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -584,8 +667,8 @@ async fn accepted_bind_facts_drive_profile_resolution() {
     assert!(!body.to_string().contains("conversation-subagent"));
 }
 
-/// A bind with an explicit empty effective scope cannot be widened by the
-/// request body, even though the route is otherwise first-party.
+/// A bind with an explicit empty effective scope denies browser.status even
+/// for a valid canonical tool-route request.
 #[tokio::test]
 async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
@@ -631,9 +714,8 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let _ = rx.recv().await;
 
     let request = json!({
-        "method": "browser.status",
-        "effectiveCapabilityScope": ["browser.status"],
-        "params": {},
+        "name": "browser.status",
+        "arguments": {},
     });
     let tool_frame = Frame::build_with_version(
         PROTOCOL_VERSION,

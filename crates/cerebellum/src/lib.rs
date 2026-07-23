@@ -431,30 +431,69 @@ async fn handle_tool_request(
         }
     };
 
-    // The route body is opaque to the capability handler. Accept the canonical
-    // envelope (`name`/`arguments`) and the local test envelope
-    // (`method`/`params`); a direct value is also a browser.status request body.
-    // Keeping the capability payload intact is important because `{}` and each
-    // non-object value must reach the closed-schema validator.
-    let (method, params) = match &request {
-        Value::Object(object)
-            if object.contains_key("name") && object.contains_key("arguments") =>
-        {
-            let method = object.get("name").and_then(Value::as_str).unwrap_or("");
-            let params = object
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            (method, params)
-        }
-        Value::Object(object) if object.contains_key("method") && object.contains_key("params") => {
-            let method = object.get("method").and_then(Value::as_str).unwrap_or("");
-            let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
-            (method, params)
-        }
-        _ => (BROWSER_STATUS_TOOL, request.clone()),
+    let Some(object) = request.as_object() else {
+        return send_invalid_request_response(writer, ver, channel, epoch, corr, "$", "wrong_type")
+            .await;
     };
-    if method != BROWSER_STATUS_TOOL {
+
+    // Tool-route envelopes are closed. `progress_token` is the only optional
+    // gateway member; it is accepted for correlation but not used here.
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "name" | "arguments" | "progress_token"))
+        .min()
+    {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            field,
+            "unknown_field",
+        )
+        .await;
+    }
+
+    let Some(name_value) = object.get("name") else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "name",
+            "missing_field",
+        )
+        .await;
+    };
+    let Some(name) = name_value.as_str() else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "name",
+            "wrong_type",
+        )
+        .await;
+    };
+
+    let Some(arguments) = object.get("arguments") else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "arguments",
+            "missing_field",
+        )
+        .await;
+    };
+
+    if name != BROWSER_STATUS_TOOL {
         return send_route_error(
             writer,
             ver,
@@ -462,7 +501,7 @@ async fn handle_tool_request(
             epoch,
             corr,
             "unknown_method",
-            &format!("unknown method '{method}', expected '{BROWSER_STATUS_TOOL}'"),
+            &format!("unknown method '{name}', expected '{BROWSER_STATUS_TOOL}'"),
         )
         .await;
     }
@@ -492,9 +531,47 @@ async fn handle_tool_request(
         .await;
     }
 
-    let result = handle_browser_status_for_identity(&params, &accepted_facts.identity);
+    let result = handle_browser_status_for_identity(arguments, &accepted_facts.identity);
+    send_tool_response(writer, ver, channel, epoch, corr, result).await
+}
 
-    let body = serde_json::to_vec(&result).map_err(ModuleError::Json)?;
+async fn send_invalid_request_response(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    field: &str,
+    reason_code: &str,
+) -> Result<(), ModuleError> {
+    send_tool_response(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        json!({
+            "outcome": "invalid_request",
+            "context": null,
+            "session": null,
+            "detail": {
+                "field": field,
+                "reason_code": reason_code,
+            },
+        }),
+    )
+    .await
+}
+
+async fn send_tool_response(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Value,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
         ver,
         FrameType::Response,
