@@ -17,9 +17,10 @@ pub mod manifest;
 pub mod principal;
 pub mod wire;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::json;
 use subc_protocol::session::{
@@ -34,10 +35,15 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-pub use capability::handle_browser_status;
+pub use capability::{handle_browser_status, handle_browser_status_for_identity};
 pub use config::{parse_config, Config, ConfigError, HealthConfig};
 pub use health::HealthState;
-pub use identity::{ProfileDisposition, RouteIdentity, SessionKind};
+#[cfg(any(test, feature = "test-observer"))]
+pub use identity::{take_test_observations, IdentityResolutionObservation};
+pub use identity::{
+    AcceptedBindFacts, LogicalProfileKey, ProfileDisposition, ProfileResolution, RouteIdentity,
+    SessionKind,
+};
 pub use principal::{trust_for_principal, PrincipalTrust};
 pub use wire::{build_error_frame, control_flags};
 
@@ -45,6 +51,35 @@ const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 const BROWSER_STATUS_TOOL: &str = "browser.status";
+
+/// Accepted bind facts retained for the lifetime of a route.
+///
+/// This is an in-memory route table, not a profile registry or storage layer.
+/// It lets data-plane frames inherit the identity and effective scope that the
+/// daemon accepted on `route.bind`.
+#[derive(Clone, Default)]
+pub struct RouteBindings {
+    inner: Arc<RwLock<HashMap<(u16, u32), AcceptedBindFacts>>>,
+}
+
+impl RouteBindings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, channel: u16, epoch: u32, facts: AcceptedBindFacts) {
+        if let Ok(mut routes) = self.inner.write() {
+            routes.insert((channel, epoch), facts);
+        }
+    }
+
+    fn get(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|routes| routes.get(&(channel, epoch)).cloned())
+    }
+}
 
 /// The binary entry point: read config from env, load the health config
 /// file, and run the module loop. Exposed publicly so the thin `main.rs`
@@ -90,11 +125,13 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let health_state = Arc::new(HealthState::with_config(config.health));
+    let route_bindings = Arc::new(RouteBindings::new());
     let loop_result = module_loop(
         &mut read_half,
         tx.clone(),
         &config,
         Arc::clone(&health_state),
+        Arc::clone(&route_bindings),
     )
     .await;
     drop(tx);
@@ -132,6 +169,7 @@ async fn module_loop<R>(
     writer: mpsc::Sender<Frame>,
     config: &ModuleConfig,
     health_state: Arc<HealthState>,
+    route_bindings: Arc<RouteBindings>,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -150,7 +188,7 @@ where
         else {
             return Ok(()); // clean EOF: subc closed the connection.
         };
-        if !handle_frame(frame, &writer, &health_state).await? {
+        if !handle_frame(frame, &writer, &health_state, &route_bindings).await? {
             return Ok(());
         }
     }
@@ -233,6 +271,7 @@ async fn handle_frame(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
+    route_bindings: &Arc<RouteBindings>,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -252,14 +291,15 @@ async fn handle_frame(
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => Ok(true),
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, health_state).await?;
+            handle_control_request(frame, writer, health_state, route_bindings).await?;
             Ok(true)
         }
         FrameType::Request => {
             let writer = writer.clone();
             let health_state = Arc::clone(health_state);
+            let route_bindings = Arc::clone(route_bindings);
             tokio::spawn(async move {
-                let _ = handle_tool_request(frame, &writer, &health_state).await;
+                let _ = handle_tool_request(frame, &writer, &health_state, &route_bindings).await;
             });
             Ok(true)
         }
@@ -271,13 +311,17 @@ async fn handle_control_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
+    route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
     let response_body = match request {
         ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch,
             principal,
             identity,
+            admission_facts,
             ..
         } => {
             // In-module principal default-deny backstop: the gateway policy
@@ -296,12 +340,15 @@ async fn handle_control_request(
                 .await;
             }
 
-            // Record the route identity for later capability dispatch. The
-            // three-fact identity (conversation-key, agentProjectId, sessionKind)
-            // is read verbatim from the bind; cerebellum mints no identity.
-            let _route_identity = RouteIdentity::from_bind(&identity, &principal);
-            // Accept the bind — first-party access is capability-scoped, granted
-            // per-request at dispatch time, not blanket at bind time.
+            // Retain only facts from the accepted bind. Data-plane frames inherit
+            // these facts by (channel, epoch); request bodies cannot replace them.
+            let accepted_facts = AcceptedBindFacts::from_bind(
+                &identity,
+                principal.clone(),
+                admission_facts.as_ref(),
+            );
+            route_bindings.insert(route_channel, epoch, accepted_facts);
+            // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}
         }
         ModuleControlRequest::HealthCheck {} => {
@@ -360,6 +407,7 @@ async fn handle_tool_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     _health_state: &Arc<HealthState>,
+    route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -396,8 +444,33 @@ async fn handle_tool_request(
         .await;
     }
 
+    let Some(accepted_facts) = route_bindings.get(channel, epoch) else {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "route_not_bound",
+            "browser.status requires an accepted route.bind",
+        )
+        .await;
+    };
+    if !accepted_facts.allows_capability(BROWSER_STATUS_TOOL) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "capability_denied",
+            "browser.status is outside the effective capability scope",
+        )
+        .await;
+    }
+
     let params = request.get("params").cloned().unwrap_or(json!({}));
-    let result = handle_browser_status(&params);
+    let result = handle_browser_status_for_identity(&params, &accepted_facts.identity);
 
     let body = serde_json::to_vec(&result).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
@@ -508,7 +581,17 @@ pub async fn handle_control_request_for_test(
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
 ) -> Result<(), ModuleError> {
-    handle_control_request(frame, writer, health_state).await
+    let route_bindings = Arc::new(RouteBindings::new());
+    handle_control_request(frame, writer, health_state, &route_bindings).await
+}
+
+pub async fn handle_control_request_for_test_with_bindings(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    health_state: &Arc<HealthState>,
+    route_bindings: &Arc<RouteBindings>,
+) -> Result<(), ModuleError> {
+    handle_control_request(frame, writer, health_state, route_bindings).await
 }
 
 pub async fn handle_tool_request_for_test(
@@ -516,7 +599,30 @@ pub async fn handle_tool_request_for_test(
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
 ) -> Result<(), ModuleError> {
-    handle_tool_request(frame, writer, health_state).await
+    let route_bindings = Arc::new(RouteBindings::new());
+    // Older unit fixtures invoke only the data-plane helper. Install a
+    // synthetic accepted first-party bind so they still exercise the real
+    // bound-route path without weakening the production handler.
+    let identity = subc_protocol::BindIdentity {
+        project_root: PathBuf::from("/test/project"),
+        harness: "test".to_string(),
+        session: "test-session".to_string(),
+    };
+    route_bindings.insert(
+        frame.header.channel,
+        frame.header.epoch,
+        AcceptedBindFacts::from_bind(&identity, Some(subc_protocol::Principal::Direct), None),
+    );
+    handle_tool_request(frame, writer, health_state, &route_bindings).await
+}
+
+pub async fn handle_tool_request_for_test_with_bindings(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    health_state: &Arc<HealthState>,
+    route_bindings: &Arc<RouteBindings>,
+) -> Result<(), ModuleError> {
+    handle_tool_request(frame, writer, health_state, route_bindings).await
 }
 
 #[cfg(test)]
