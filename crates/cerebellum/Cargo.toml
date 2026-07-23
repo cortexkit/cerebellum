@@ -29,4 +29,5 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+subc-control = { workspace = true }
 subc-core = { workspace = true }
