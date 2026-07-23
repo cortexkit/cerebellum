@@ -56,28 +56,16 @@ pub fn handle_browser_status_for_identity(params: &Value, identity: &RouteIdenti
     // `{ field, reason_code: "unknown_field" }`.
     if let Some(obj) = params.as_object() {
         if !obj.is_empty() {
-            let field = obj.keys().next().expect("non-empty object has a key");
-            return json!({
-                "outcome": "invalid_request",
-                "context": null,
-                "session": null,
-                "detail": {
-                    "field": field,
-                    "reason_code": "unknown_field",
-                },
-            });
+            // Select explicitly rather than relying on serde_json's map
+            // implementation: the closed-schema contract reports the
+            // lexicographically smallest unknown property.
+            let field = obj.keys().min().expect("non-empty object has a key");
+            return invalid_request(field, "unknown_field");
         }
     } else {
-        // params is not an object at all (e.g. null, string, number).
-        return json!({
-            "outcome": "invalid_request",
-            "context": null,
-            "session": null,
-            "detail": {
-                "field": "params",
-                "reason_code": "expected_object",
-            },
-        });
+        // The capability request itself must be an object. `$` identifies the
+        // top-level value when it is null, an array, string, number, or boolean.
+        return invalid_request("$", "wrong_type");
     }
 
     // This is policy-only resolution. It computes a logical key but does not
@@ -96,6 +84,18 @@ pub fn handle_browser_status_for_identity(params: &Value, identity: &RouteIdenti
             "context": null,
             "session": null,
         })
+    })
+}
+
+fn invalid_request(field: &str, reason_code: &str) -> Value {
+    json!({
+        "outcome": "invalid_request",
+        "context": null,
+        "session": null,
+        "detail": {
+            "field": field,
+            "reason_code": reason_code,
+        },
     })
 }
 
@@ -191,21 +191,29 @@ mod tests {
     }
 
     #[test]
-    fn multiple_unknown_fields_report_first_field() {
-        let result = handle_browser_status(&json!({ "a": 1, "b": 2 }));
+    fn multiple_unknown_fields_report_lexicographically_smallest_field() {
+        let result = handle_browser_status(&json!({ "zebra": 1, "alpha": 2, "middle": 3 }));
         assert_eq!(result["outcome"], "invalid_request");
+        assert_eq!(result["detail"]["field"], "alpha");
         assert_eq!(result["detail"]["reason_code"], "unknown_field");
-        // serde_json maps object keys deterministically for this request.
-        let field = result["detail"]["field"].as_str().unwrap();
-        assert!(field == "a" || field == "b");
     }
 
     #[test]
-    fn non_object_params_returns_invalid_request() {
-        let result = handle_browser_status(&json!("not an object"));
-        assert_eq!(result["outcome"], "invalid_request");
-        assert_eq!(result["detail"]["field"], "params");
-        assert_eq!(result["detail"]["reason_code"], "expected_object");
+    fn top_level_non_objects_return_wrong_type_detail() {
+        for value in [
+            Value::Null,
+            json!([]),
+            json!("not an object"),
+            json!(42),
+            json!(true),
+        ] {
+            let result = handle_browser_status(&value);
+            assert_eq!(result["outcome"], "invalid_request");
+            assert_eq!(result["detail"]["field"], "$");
+            assert_eq!(result["detail"]["reason_code"], "wrong_type");
+            assert_eq!(result["context"], Value::Null);
+            assert_eq!(result["session"], Value::Null);
+        }
     }
 
     #[test]

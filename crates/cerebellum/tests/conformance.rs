@@ -32,6 +32,15 @@ use cerebellum::principal;
 
 const MODULE_ID: &str = "cerebellum";
 
+fn assert_field_set(body: &Value, expected: &[&str]) {
+    let object = body.as_object().expect("response body must be an object");
+    let mut actual: Vec<&str> = object.keys().map(String::as_str).collect();
+    let mut expected = expected.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
 /// Read the pinned conformance fixture for route.bind and assert the module's
 /// HELLO body shape matches the wire-v2 contract it implies.
 #[tokio::test]
@@ -283,10 +292,7 @@ async fn browser_status_returns_flat_no_session_result() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
 
-    let request = json!({
-        "method": "browser.status",
-        "params": {},
-    });
+    let request = json!({});
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
         FrameType::Request,
@@ -314,7 +320,10 @@ async fn browser_status_returns_flat_no_session_result() {
     assert!(body["context"].is_object(), "context must be resolved");
     assert_eq!(body["context"]["session_kind_effective"], "primary");
     assert_eq!(body["context"]["profile_disposition"], "durable");
+    assert_eq!(body["context"]["profile_uuid"], Value::Null);
     assert_eq!(body["session"], Value::Null);
+    assert_field_set(&body, &["outcome", "context", "session"]);
+    assert_ne!(body["outcome"], "ok");
 }
 
 /// browser.status with an unknown field returns `invalid_request` with the
@@ -325,8 +334,8 @@ async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
 
     let request = json!({
-        "method": "browser.status",
-        "params": { "unexpected": true },
+        "zebra": true,
+        "alpha": false,
     });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -352,8 +361,53 @@ async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     );
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["outcome"], "invalid_request");
-    assert_eq!(body["detail"]["field"], "unexpected");
+    assert_eq!(body["context"], Value::Null);
+    assert_eq!(body["session"], Value::Null);
+    assert_eq!(body["detail"]["field"], "alpha");
     assert_eq!(body["detail"]["reason_code"], "unknown_field");
+    assert_field_set(&body, &["outcome", "context", "session", "detail"]);
+}
+
+/// Every non-object capability request is rejected as a wrong top-level type
+/// in a normal Response frame, rather than being treated as a route error.
+#[tokio::test]
+async fn browser_status_top_level_wrong_types_return_response_frames() {
+    let values = [
+        Value::Null,
+        json!([]),
+        json!("not an object"),
+        json!(42),
+        json!(true),
+    ];
+
+    for (offset, value) in values.into_iter().enumerate() {
+        let (tx, mut rx) = mpsc::channel::<Frame>(16);
+        let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            5,
+            1,
+            100 + offset as u64,
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+            .await
+            .unwrap();
+
+        let response = rx.recv().await.expect("a response frame");
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["outcome"], "invalid_request");
+        assert_eq!(body["detail"]["field"], "$");
+        assert_eq!(body["detail"]["reason_code"], "wrong_type");
+        assert_eq!(body["context"], Value::Null);
+        assert_eq!(body["session"], Value::Null);
+        assert_field_set(&body, &["outcome", "context", "session", "detail"]);
+    }
 }
 
 /// The full sessionKind matrix resolves correctly at the status layer without
