@@ -7,21 +7,12 @@
 //! Result: `{ outcome, context, session: null | { url: string|null, ready: bool } }`.
 //!
 //! `context` carries module-resolved facts only (never an echo of caller-supplied
-//! bind identity, which subc already correlates by (channel, corr)):
-//! `{ profile_uuid: string|null, profile_name: string,
-//! session_kind_effective: "primary"|"subagent"|"ephemeral",
-//! profile_disposition: "durable"|"disposable"|"none" }`.
-//!
-//! Outcomes: `ok`, `no_session`, `invalid_request`, `internal_error`. In Spec A,
-//! absent a browser, a bound session with no browsing context returns `no_session`
-//! with a resolved `context`. `invalid_request` is the application-level
-//! closed-schema rejection — the module parses the body, so an unknown-field
-//! request is rejected in the response body's outcome enum, never via the
-//! transport Error frame.
+//! bind identity because the surrounding daemon already correlates each request
+//! using its channel and correlation ID.
 
 use serde_json::{json, Value};
 
-use crate::identity::{ProfileDisposition, SessionKind};
+use crate::identity::{ProfileResolution, RouteIdentity, SessionKind};
 
 /// The `browser.status` result body (flat, no `{result}` wrapper).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -35,7 +26,7 @@ struct BrowserStatusResult {
 #[derive(Debug, Clone, serde::Serialize)]
 struct BrowserStatusContext {
     profile_uuid: Option<String>,
-    profile_name: String,
+    profile_name: Option<String>,
     session_kind_effective: &'static str,
     profile_disposition: &'static str,
 }
@@ -47,13 +38,17 @@ struct BrowserSession {
     ready: bool,
 }
 
-/// Handle a `browser.status` request. The `params` value is the parsed request
-/// body's `params` field (or `{}` when absent).
-///
-/// Returns a flat JSON result body (`{ outcome, context, session }`) suitable
-/// for a normal Response frame. The subc Error frame stays purely
-/// transport/routing — schema violations are application-level.
+/// Handle a `browser.status` request without a bound route. This compatibility
+/// entry point is useful for the closed-schema unit tests; live dispatch uses
+/// [`handle_browser_status_for_identity`] after route.bind has been accepted.
 pub fn handle_browser_status(params: &Value) -> Value {
+    handle_browser_status_for_identity(params, &legacy_identity())
+}
+
+/// Handle `browser.status` using the identity retained from an accepted bind.
+/// The request contributes only its closed-schema parameters; identity and
+/// profile policy come exclusively from the bind facts.
+pub fn handle_browser_status_for_identity(params: &Value, identity: &RouteIdentity) -> Value {
     // Closed schema: the request is `{}` (empty). Unknown fields are rejected at
     // the application level with `outcome: invalid_request` and a detail
     // `{ field, reason_code: "unknown_field" }`.
@@ -83,26 +78,13 @@ pub fn handle_browser_status(params: &Value) -> Value {
         });
     }
 
-    // In Spec A there is no browser, so a bound session with no browsing context
-    // returns `no_session` with a resolved `context`. The session_kind_effective
-    // and profile_disposition are resolved from the alfonso-core-stamped
-    // sessionKind (defaulted to `primary` in this slice; Spec B threads the real
-    // stamped value from the bind).
-    let session_kind = SessionKind::Primary;
-    let disposition = ProfileDisposition::for_session_kind(session_kind);
-
+    // This is policy-only resolution. It computes a logical key but does not
+    // consult profile storage or launch a browser.
+    let resolution = identity.resolve_profile();
     let result = BrowserStatusResult {
         outcome: "no_session",
-        context: BrowserStatusContext {
-            // No profile storage in Spec A — profile_uuid is absent.
-            profile_uuid: None,
-            // The profile name is derived from the agentProjectId + sessionKind
-            // in Spec B; in Spec A it is a stable placeholder.
-            profile_name: "default".to_string(),
-            session_kind_effective: session_kind.as_str(),
-            profile_disposition: disposition.as_str(),
-        },
-        // No browsing context in Spec A.
+        context: context_for(identity.session_kind, &resolution),
+        // No browsing context exists in this browser-free slice.
         session: None,
     };
 
@@ -113,6 +95,28 @@ pub fn handle_browser_status(params: &Value) -> Value {
             "session": null,
         })
     })
+}
+
+fn context_for(kind: SessionKind, resolution: &ProfileResolution) -> BrowserStatusContext {
+    BrowserStatusContext {
+        // No profile storage in this slice — profile_uuid is absent.
+        profile_uuid: None,
+        profile_name: resolution.profile_name.clone(),
+        session_kind_effective: kind.as_str(),
+        profile_disposition: resolution.profile_disposition.as_str(),
+    }
+}
+
+fn legacy_identity() -> RouteIdentity {
+    RouteIdentity::from_accepted_bind(
+        &subc_protocol::BindIdentity {
+            project_root: std::path::PathBuf::from("/legacy/project"),
+            harness: "legacy".to_string(),
+            session: "legacy-session".to_string(),
+        },
+        &None,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -128,8 +132,51 @@ mod tests {
         assert_eq!(context["session_kind_effective"], "primary");
         assert_eq!(context["profile_disposition"], "durable");
         assert_eq!(context["profile_uuid"], serde_json::Value::Null);
-        assert!(context["profile_name"].is_string());
+        assert_eq!(context["profile_name"], "default");
         assert_eq!(result["session"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn identity_resolution_changes_context_without_opening_storage() {
+        let identity = RouteIdentity::from_accepted_bind(
+            &subc_protocol::BindIdentity {
+                project_root: std::path::PathBuf::from("/tmp/project"),
+                harness: "opencode".to_string(),
+                session: "conversation-1".to_string(),
+            },
+            &Some(subc_protocol::Principal::Direct),
+            Some(&json!({
+                "agentProjectId": "pj-project",
+                "sessionKind": "subagent",
+            })),
+        );
+        let result = handle_browser_status_for_identity(&json!({}), &identity);
+        assert_eq!(result["outcome"], "no_session");
+        assert_eq!(result["context"]["session_kind_effective"], "subagent");
+        assert_eq!(result["context"]["profile_disposition"], "disposable");
+        assert_eq!(result["context"]["profile_name"], "default");
+        assert_eq!(result["context"]["profile_uuid"], Value::Null);
+        assert!(!result.to_string().contains("pj-project"));
+        assert!(!result.to_string().contains("conversation-1"));
+    }
+
+    #[test]
+    fn ephemeral_context_has_null_profile_name() {
+        let identity = RouteIdentity::from_accepted_bind(
+            &subc_protocol::BindIdentity {
+                project_root: std::path::PathBuf::from("/tmp/project"),
+                harness: "opencode".to_string(),
+                session: "conversation-1".to_string(),
+            },
+            &Some(subc_protocol::Principal::Direct),
+            Some(&json!({
+                "agentProjectId": "pj-project",
+                "sessionKind": "ephemeral",
+            })),
+        );
+        let result = handle_browser_status_for_identity(&json!({}), &identity);
+        assert_eq!(result["context"]["profile_disposition"], "none");
+        assert_eq!(result["context"]["profile_name"], Value::Null);
     }
 
     #[test]
@@ -146,12 +193,9 @@ mod tests {
         let result = handle_browser_status(&json!({ "a": 1, "b": 2 }));
         assert_eq!(result["outcome"], "invalid_request");
         assert_eq!(result["detail"]["reason_code"], "unknown_field");
-        // The first key is reported (deterministic).
+        // serde_json maps object keys deterministically for this request.
         let field = result["detail"]["field"].as_str().unwrap();
-        assert!(
-            field == "a" || field == "b",
-            "field should be one of the keys"
-        );
+        assert!(field == "a" || field == "b");
     }
 
     #[test]
@@ -164,8 +208,6 @@ mod tests {
 
     #[test]
     fn result_does_not_echo_conversation_key_or_agent_project_id() {
-        // The result context carries module-resolved facts only, never an echo
-        // of caller-supplied bind identity.
         let result = handle_browser_status(&json!({}));
         let context = &result["context"];
         let context_str = context.to_string();
@@ -181,9 +223,6 @@ mod tests {
 
     #[test]
     fn result_body_is_flat_no_result_wrapper() {
-        // The subc data plane treats the response body as opaque bytes, so the
-        // flat `{ outcome, context, ... }` result body is cerebellum's own
-        // contract with first-party callers (no `{result}` wrapper).
         let result = handle_browser_status(&json!({}));
         assert!(result.get("result").is_none(), "no {{result}} wrapper");
         assert!(result.get("outcome").is_some(), "flat outcome field");

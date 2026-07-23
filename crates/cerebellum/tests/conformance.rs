@@ -443,3 +443,164 @@ async fn hello_frame_is_channel_zero_epoch_zero() {
     assert_eq!(body.protocol_ver, PROTOCOL_VERSION);
     assert_eq!(body.manifest.module_id, MODULE_ID);
 }
+
+/// Data-plane identity comes from the accepted bind facts. Fields added to the
+/// tool request cannot change the resolved session kind or profile boundary.
+#[tokio::test]
+async fn accepted_bind_facts_drive_profile_resolution() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
+
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 9,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: MODULE_ID.to_string(),
+        },
+        identity: BindIdentity {
+            project_root: PathBuf::from("/tmp/request-body-project"),
+            harness: "opencode".to_string(),
+            session: "conversation-subagent".to_string(),
+        },
+        principal: Some(Principal::Direct),
+        consumer_capabilities: None,
+        admission_facts: Some(json!({
+            "agentProjectId": "pj-accepted",
+            "sessionKind": "subagent",
+            "effectiveCapabilityScope": ["browser.status"],
+        })),
+    };
+    let bind_frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        301,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_control_request_for_test_with_bindings(
+        bind_frame,
+        &tx,
+        &health_state,
+        &route_bindings,
+    )
+    .await
+    .unwrap();
+    let bind_response = rx.recv().await.expect("bind response");
+    assert_eq!(bind_response.header.ty, FrameType::Response);
+
+    let request = json!({
+        "method": "browser.status",
+        "agentProjectId": "pj-forged",
+        "sessionKind": "ephemeral",
+        "principal": "untrusted",
+        "effectiveCapabilityScope": [],
+        "params": {},
+    });
+    let tool_frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        9,
+        3,
+        302,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_tool_request_for_test_with_bindings(
+        tool_frame,
+        &tx,
+        &health_state,
+        &route_bindings,
+    )
+    .await
+    .unwrap();
+
+    let response = rx.recv().await.expect("status response");
+    assert_eq!(response.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["outcome"], "no_session");
+    assert_eq!(body["context"]["session_kind_effective"], "subagent");
+    assert_eq!(body["context"]["profile_disposition"], "disposable");
+    assert_eq!(body["context"]["profile_name"], "default");
+    assert!(!body.to_string().contains("pj-accepted"));
+    assert!(!body.to_string().contains("conversation-subagent"));
+}
+
+/// A bind with an explicit empty effective scope cannot be widened by the
+/// request body, even though the route is otherwise first-party.
+#[tokio::test]
+async fn accepted_effective_scope_is_not_widened_by_request_body() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 10,
+        epoch: 4,
+        target: RouteTarget::ToolProvider {
+            module_id: MODULE_ID.to_string(),
+        },
+        identity: BindIdentity {
+            project_root: PathBuf::from("/tmp/project"),
+            harness: "opencode".to_string(),
+            session: "conversation-scoped".to_string(),
+        },
+        principal: Some(Principal::Direct),
+        consumer_capabilities: None,
+        admission_facts: Some(json!({
+            "agentProjectId": "pj-scoped",
+            "sessionKind": "primary",
+            "effectiveCapabilityScope": [],
+        })),
+    };
+    let bind_frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        401,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_control_request_for_test_with_bindings(
+        bind_frame,
+        &tx,
+        &health_state,
+        &route_bindings,
+    )
+    .await
+    .unwrap();
+    let _ = rx.recv().await;
+
+    let request = json!({
+        "method": "browser.status",
+        "effectiveCapabilityScope": ["browser.status"],
+        "params": {},
+    });
+    let tool_frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        10,
+        4,
+        402,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_tool_request_for_test_with_bindings(
+        tool_frame,
+        &tx,
+        &health_state,
+        &route_bindings,
+    )
+    .await
+    .unwrap();
+    let response = rx.recv().await.expect("scope rejection");
+    assert_eq!(response.header.ty, FrameType::Error);
+    let error: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(error.code, "capability_denied");
+}

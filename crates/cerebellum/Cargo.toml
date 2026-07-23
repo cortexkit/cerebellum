@@ -5,6 +5,12 @@ edition = "2021"
 publish = false
 description = "The ck-cerebellum subc module: Spec A — wire-v2 registration, insulated health-v2, three-fact identity, profile-boundary disposition, principal default-deny, and the browser.status capability."
 
+[features]
+default = []
+# Enables the in-memory identity-resolution observer for conformance tests only.
+# Production builds leave this feature disabled, so no observer code is emitted.
+test-observer = []
+
 [[bin]]
 name = "ck-cerebellum"
 path = "src/main.rs"

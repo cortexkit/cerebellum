@@ -1,28 +1,22 @@
-//! Three-fact bind identity and profile-boundary disposition.
+//! Identity facts accepted on a route bind and the profile-boundary policy.
 //!
-//! Cerebellum reads three identity facts verbatim from the bind and trusts them
-//! because the consumer is spawn-attested first-party:
-//! - **conversation-key**: the wire session-id the caller stamps on the bind
-//!   (the fleet's per-conversation identity). Read verbatim; never minted.
-//! - **agentProjectId**: the ck-projects PROJECT_ID (`pj-...`), the durable
-//!   profile owner. One durable Alfonso per project directory.
-//! - **sessionKind**: `primary | subagent | ephemeral`, stamped at bind time by
-//!   alfonso-core from durable state, not self-declared.
+//! Cerebellum consumes identity from the daemon-accepted bind facts. It does not
+//! inspect tool request bodies for identity and it does not mint identity:
+//! - **conversation-key** is the wire session id from `BindIdentity::session`.
+//! - **agentProjectId** and **sessionKind** are stamped admission facts.
+//! - **principal** is the daemon-stamped bind fact.
+//! - **effective capability scope** is the admitted capability scope.
 //!
-//! Profile lookup is `(agentProjectId, sessionKind)`. Isolation rides
-//! `sessionKind`, not identity resolution: a mason and its primary resolve to
-//! the same `agentProjectId`, and `sessionKind=subagent` is what keeps the
-//! mason off the primary's profile.
+//! Profile resolution is policy only. This module intentionally does not open a
+//! browser, a profile registry, or profile storage.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use subc_protocol::{BindIdentity, Principal};
 
-/// The alfonso-core-stamped session kind, read verbatim from the bind.
-///
-/// Derivation (owned by alfonso-core, not cerebellum): task-bound → `subagent`;
-/// known-ephemeral prefix or persona_seats row → `ephemeral`; else `primary`.
+/// The alfonso-core-stamped session kind, read verbatim from the bind facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
@@ -33,7 +27,7 @@ pub enum SessionKind {
 
 impl SessionKind {
     /// Parse a session-kind string stamped on the bind. Returns `None` for an
-    /// unknown value (the caller decides whether to reject or default).
+    /// unknown value; callers can choose a fail-closed or compatibility policy.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(kind: &str) -> Option<Self> {
         match kind {
@@ -54,13 +48,6 @@ impl SessionKind {
 }
 
 /// The profile disposition for a session kind, per the boundary policy.
-///
-/// - `primary` → durable profile (`profile_disposition: "durable"`).
-/// - `subagent` → disposable profile, torn down at task end
-///   (`profile_disposition: "disposable"`).
-/// - `ephemeral` → no profile by default (`profile_disposition: "none"`).
-///
-/// The disposition vocabulary matches the `browser.status` context enum exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileDisposition {
@@ -78,7 +65,6 @@ impl ProfileDisposition {
         }
     }
 
-    /// Resolve the disposition from the alfonso-core-stamped session kind.
     pub fn for_session_kind(kind: SessionKind) -> Self {
         match kind {
             SessionKind::Primary => Self::Durable,
@@ -88,42 +74,82 @@ impl ProfileDisposition {
     }
 }
 
-/// The three-fact identity read verbatim from a route bind.
+/// The logical key used by the future profile-storage slice.
 ///
-/// In Spec A there is no browser, so `profile_uuid` and `profile_name` are
-/// stubbed as absent/empty — `browser.status` reports the resolved disposition
-/// without opening a browser. Spec B owns actual profile storage.
-#[derive(Debug, Clone)]
+/// The key is deliberately a value type rather than a handle to storage. The
+/// identity slice only computes this key; it never resolves or opens a profile.
+pub type LogicalProfileKey = (String, String);
+
+/// The result of the profile-boundary policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileResolution {
+    pub profile_disposition: ProfileDisposition,
+    pub profile_name: Option<String>,
+    pub logical_profile_key: Option<LogicalProfileKey>,
+}
+
+impl ProfileResolution {
+    fn for_identity(
+        identity: &RouteIdentity,
+        logical_profile_key: Option<LogicalProfileKey>,
+    ) -> Self {
+        match identity.session_kind {
+            SessionKind::Primary => Self {
+                profile_disposition: ProfileDisposition::Durable,
+                profile_name: Some("default".to_string()),
+                logical_profile_key,
+            },
+            SessionKind::Subagent => Self {
+                profile_disposition: ProfileDisposition::Disposable,
+                profile_name: Some("default".to_string()),
+                logical_profile_key,
+            },
+            SessionKind::Ephemeral => Self {
+                profile_disposition: ProfileDisposition::None,
+                profile_name: None,
+                logical_profile_key: None,
+            },
+        }
+    }
+}
+
+/// The three identity facts read from a route bind, plus the resolved
+/// disposition used by capability policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteIdentity {
     /// The wire session-id (conversation-key), read verbatim from the bind.
-    /// Never echoed back in a result body (subc already correlates by
-    /// (channel, corr)).
     pub conversation_key: String,
-    /// The durable profile owner (`pj-...`), read verbatim from the bind.
-    /// Never echoed back in a result body.
+    /// The durable profile owner, read verbatim from accepted bind facts.
     pub agent_project_id: String,
     /// The alfonso-core-stamped session kind.
     pub session_kind: SessionKind,
     /// The resolved profile disposition for this session kind.
     pub profile_disposition: ProfileDisposition,
-    /// The project root from the bind identity (used for profile lookup keying
-    /// in Spec B; carried here for completeness).
+    /// The project root remains available as routing metadata, but is not used
+    /// when an admitted agentProjectId is present.
     pub project_root: PathBuf,
 }
 
 impl RouteIdentity {
-    /// Build a route identity from the bind fields.
+    /// Build identity from a bind without admission extensions.
     ///
-    /// `agent_project_id` and `session_kind` are carried on the bind identity's
-    /// `session` field in Spec A's wire shape (the fleet conversation-key is the
-    /// `session` field; the agentProjectId and sessionKind ride alongside as
-    /// bind-identity extensions). When they are absent, cerebellum defaults to
-    /// `primary` (the common case) — the honest scope is that v1 isolation is
-    /// defense-in-depth within a trusted consumer.
-    pub fn from_bind(identity: &BindIdentity, _principal: &Option<Principal>) -> Self {
+    /// This compatibility constructor supports older wire fixtures that do not
+    /// include daemon-accepted admission facts. New route handling should use
+    /// [`Self::from_accepted_bind`], which consumes those facts.
+    pub fn from_bind(identity: &BindIdentity, principal: &Option<Principal>) -> Self {
+        Self::from_accepted_bind(identity, principal, None)
+    }
+
+    /// Read identity from the accepted bind facts. `admission_facts` is already
+    /// carried by the daemon's `route.bind`; tool request bodies are not involved.
+    pub fn from_accepted_bind(
+        identity: &BindIdentity,
+        _principal: &Option<Principal>,
+        admission_facts: Option<&Value>,
+    ) -> Self {
         let conversation_key = identity.session.clone();
-        let agent_project_id = agent_project_id_from_identity(identity);
-        let session_kind = session_kind_from_identity(identity);
+        let agent_project_id = agent_project_id_from_facts(identity, admission_facts);
+        let session_kind = session_kind_from_facts(admission_facts);
         let profile_disposition = ProfileDisposition::for_session_kind(session_kind);
         Self {
             conversation_key,
@@ -133,30 +159,200 @@ impl RouteIdentity {
             project_root: identity.project_root.clone(),
         }
     }
+
+    /// Compute the logical profile key without opening profile storage.
+    pub fn logical_profile_key(&self) -> Option<LogicalProfileKey> {
+        match self.session_kind {
+            SessionKind::Primary => Some((self.agent_project_id.clone(), "default".to_string())),
+            SessionKind::Subagent => {
+                Some((self.agent_project_id.clone(), self.conversation_key.clone()))
+            }
+            SessionKind::Ephemeral => None,
+        }
+    }
+
+    /// Resolve the logical profile boundary without opening profile storage.
+    pub fn resolve_profile(&self) -> ProfileResolution {
+        let logical_profile_key = self.logical_profile_key();
+        #[cfg(any(test, feature = "test-observer"))]
+        record_test_observation(self, logical_profile_key.clone());
+        ProfileResolution::for_identity(self, logical_profile_key)
+    }
 }
 
-/// Extract the agentProjectId from the bind identity. In Spec A's wire shape it
-/// rides on the `harness` field (the fleet convention is one durable Alfonso
-/// per project directory, and the harness identifies the project context). When
-/// absent, a stable fallback is derived from the project root.
-fn agent_project_id_from_identity(identity: &BindIdentity) -> String {
-    // The agentProjectId is a stable blake3-derived id from the canonical project
-    // root. In Spec A we do not have the ck-projects crate available, so we use
-    // the project root path as the identity key (Spec B will thread the real
-    // `pj-...` id from the bind).
-    identity.project_root.to_string_lossy().to_string()
+/// Facts retained after a route bind has passed principal admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedBindFacts {
+    pub identity: RouteIdentity,
+    pub principal: Option<Principal>,
+    /// `None` means the legacy bind had no explicit scope and receives the
+    /// module's first-party default. `Some(empty)` is an explicitly empty scope.
+    pub effective_capability_scope: Option<Vec<String>>,
 }
 
-/// Extract the sessionKind from the bind identity. In Spec A's wire shape it
-/// rides as a bind-identity extension. When absent, default to `primary`.
-fn session_kind_from_identity(identity: &BindIdentity) -> SessionKind {
-    // The sessionKind is stamped by alfonso-core from durable state. In Spec A
-    // the bind does not yet carry a dedicated sessionKind field, so we default
-    // to `primary` (the common case). Spec B will thread the real stamped value.
-    // The harness field is cosmetic (routing/storage-slug); it does not carry
-    // the session kind.
-    let _ = &identity.harness;
-    SessionKind::Primary
+impl AcceptedBindFacts {
+    pub fn from_bind(
+        identity: &BindIdentity,
+        principal: Option<Principal>,
+        admission_facts: Option<&Value>,
+    ) -> Self {
+        Self {
+            identity: RouteIdentity::from_accepted_bind(identity, &principal, admission_facts),
+            principal,
+            effective_capability_scope: effective_capability_scope_from_facts(admission_facts),
+        }
+    }
+
+    /// Whether the accepted scope permits a capability. This uses only facts
+    /// retained from `route.bind`; callers cannot widen it through a request.
+    pub fn allows_capability(&self, capability: &str) -> bool {
+        let Some(scope) = &self.effective_capability_scope else {
+            return true;
+        };
+        scope.iter().any(|entry| {
+            entry == "*"
+                || entry == capability
+                || (entry.ends_with(":*") && capability.starts_with(&entry[..entry.len() - 1]))
+        })
+    }
+}
+
+fn admission_object(facts: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
+    let root = facts?.as_object()?;
+    Some(root)
+}
+
+/// Look up a fact using the fleet's camelCase spelling and the Rust-facing
+/// snake_case spelling. The small set of nested containers keeps the parser
+/// tolerant of the carrier envelope while avoiding any request-body fallback.
+fn fact<'a>(facts: Option<&'a Value>, names: &[&str]) -> Option<&'a Value> {
+    let root = admission_object(facts)?;
+    let containers = std::iter::once(root).chain(
+        ["accepted", "bind", "bind_identity", "identity"]
+            .into_iter()
+            .filter_map(|name| root.get(name).and_then(Value::as_object)),
+    );
+    for object in containers {
+        for name in names {
+            if let Some(value) = object.get(*name) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -> String {
+    fact(
+        facts,
+        &[
+            "agentProjectId",
+            "agent_project_id",
+            "projectId",
+            "project_id",
+        ],
+    )
+    .and_then(Value::as_str)
+    .filter(|value| !value.is_empty())
+    .map(ToOwned::to_owned)
+    // Old wire fixtures predate the admitted project id. Keeping a stable
+    // project-root fallback preserves those fixtures; admitted facts always win.
+    .unwrap_or_else(|| identity.project_root.to_string_lossy().into_owned())
+}
+
+fn session_kind_from_facts(facts: Option<&Value>) -> SessionKind {
+    fact(facts, &["sessionKind", "session_kind"])
+        .and_then(Value::as_str)
+        .and_then(SessionKind::from_str)
+        .unwrap_or(SessionKind::Primary)
+}
+
+fn effective_capability_scope_from_facts(facts: Option<&Value>) -> Option<Vec<String>> {
+    let value = fact(
+        facts,
+        &[
+            "effectiveCapabilityScope",
+            "effective_capability_scope",
+            "capabilityScope",
+            "capability_scope",
+        ],
+    )?;
+    if let Some(scope) = value.as_str() {
+        return Some(vec![scope.to_string()]);
+    }
+    if let Some(scope) = value.as_array() {
+        return Some(
+            scope
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect(),
+        );
+    }
+    let object = value.as_object()?;
+    ["capabilities", "allowed", "tools"]
+        .iter()
+        .find_map(|key| object.get(*key))
+        .and_then(Value::as_array)
+        .map(|scope| {
+            scope
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+}
+
+#[cfg(any(test, feature = "test-observer"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityResolutionObservation {
+    pub conversation_key: String,
+    pub agent_project_id: String,
+    pub session_kind: SessionKind,
+    pub logical_profile_key: Option<LogicalProfileKey>,
+}
+
+#[cfg(any(test, feature = "test-observer"))]
+mod test_observer {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{IdentityResolutionObservation, LogicalProfileKey, RouteIdentity};
+
+    static OBSERVATIONS: OnceLock<Mutex<Vec<IdentityResolutionObservation>>> = OnceLock::new();
+
+    pub(super) fn record(identity: &RouteIdentity, logical_profile_key: Option<LogicalProfileKey>) {
+        let observations = OBSERVATIONS.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut observations) = observations.lock() {
+            observations.push(IdentityResolutionObservation {
+                conversation_key: identity.conversation_key.clone(),
+                agent_project_id: identity.agent_project_id.clone(),
+                session_kind: identity.session_kind,
+                logical_profile_key,
+            });
+        }
+    }
+
+    pub(super) fn take() -> Vec<IdentityResolutionObservation> {
+        let observations = OBSERVATIONS.get_or_init(|| Mutex::new(Vec::new()));
+        observations
+            .lock()
+            .map(|mut observations| std::mem::take(&mut *observations))
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(any(test, feature = "test-observer"))]
+fn record_test_observation(
+    identity: &RouteIdentity,
+    logical_profile_key: Option<LogicalProfileKey>,
+) {
+    test_observer::record(identity, logical_profile_key);
+}
+
+/// Drain observations produced by the test-only identity-resolution observer.
+#[cfg(any(test, feature = "test-observer"))]
+pub fn take_test_observations() -> Vec<IdentityResolutionObservation> {
+    test_observer::take()
 }
 
 #[cfg(test)]
@@ -169,6 +365,14 @@ mod tests {
             harness: "opencode".to_string(),
             session: session.to_string(),
         }
+    }
+
+    fn facts(project: &str, kind: &str) -> Value {
+        serde_json::json!({
+            "agentProjectId": project,
+            "sessionKind": kind,
+            "effectiveCapabilityScope": ["browser.status"],
+        })
     }
 
     #[test]
@@ -188,23 +392,15 @@ mod tests {
     }
 
     #[test]
-    fn primary_resolves_durable() {
+    fn profile_disposition_matches_session_kind() {
         assert_eq!(
             ProfileDisposition::for_session_kind(SessionKind::Primary),
             ProfileDisposition::Durable
         );
-    }
-
-    #[test]
-    fn subagent_resolves_disposable() {
         assert_eq!(
             ProfileDisposition::for_session_kind(SessionKind::Subagent),
             ProfileDisposition::Disposable
         );
-    }
-
-    #[test]
-    fn ephemeral_resolves_none() {
         assert_eq!(
             ProfileDisposition::for_session_kind(SessionKind::Ephemeral),
             ProfileDisposition::None
@@ -212,7 +408,108 @@ mod tests {
     }
 
     #[test]
-    fn route_identity_defaults_to_primary_when_session_kind_absent() {
+    fn primary_resolves_default_durable_profile() {
+        let identity = bind_identity("/tmp/project", "conversation-1");
+        let route = RouteIdentity::from_accepted_bind(
+            &identity,
+            &Some(Principal::Direct),
+            Some(&facts("pj-project", "primary")),
+        );
+        assert_eq!(
+            route.resolve_profile(),
+            ProfileResolution {
+                profile_disposition: ProfileDisposition::Durable,
+                profile_name: Some("default".to_string()),
+                logical_profile_key: Some(("pj-project".to_string(), "default".to_string())),
+            }
+        );
+    }
+
+    #[test]
+    fn subagent_resolves_conversation_scoped_disposable_profile() {
+        let identity = bind_identity("/tmp/project", "conversation-1");
+        let route = RouteIdentity::from_accepted_bind(
+            &identity,
+            &Some(Principal::Direct),
+            Some(&facts("pj-project", "subagent")),
+        );
+        assert_eq!(
+            route.resolve_profile(),
+            ProfileResolution {
+                profile_disposition: ProfileDisposition::Disposable,
+                profile_name: Some("default".to_string()),
+                logical_profile_key: Some(("pj-project".to_string(), "conversation-1".to_string())),
+            }
+        );
+    }
+
+    #[test]
+    fn ephemeral_resolves_without_profile_name_or_key() {
+        let identity = bind_identity("/tmp/project", "conversation-1");
+        let route = RouteIdentity::from_accepted_bind(
+            &identity,
+            &Some(Principal::Direct),
+            Some(&facts("pj-project", "ephemeral")),
+        );
+        assert_eq!(
+            route.resolve_profile(),
+            ProfileResolution {
+                profile_disposition: ProfileDisposition::None,
+                profile_name: None,
+                logical_profile_key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn admitted_project_and_conversation_facts_are_not_request_fields() {
+        let identity = bind_identity("/tmp/request-body-project", "conversation-1");
+        let route = RouteIdentity::from_accepted_bind(
+            &identity,
+            &Some(Principal::Direct),
+            Some(&facts("pj-accepted", "subagent")),
+        );
+        assert_eq!(route.agent_project_id, "pj-accepted");
+        assert_eq!(route.conversation_key, "conversation-1");
+    }
+
+    #[test]
+    fn explicit_scope_is_enforced_without_request_body_input() {
+        let bind = bind_identity("/tmp/project", "conversation-1");
+        let accepted = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            Some(&serde_json::json!({
+                "effective_capability_scope": ["other.capability"]
+            })),
+        );
+        assert!(!accepted.allows_capability("browser.status"));
+    }
+
+    #[test]
+    fn observer_records_identity_and_logical_key() {
+        let identity = bind_identity("/tmp/project", "conversation-observed");
+        let route = RouteIdentity::from_accepted_bind(
+            &identity,
+            &Some(Principal::Direct),
+            Some(&facts("pj-observed", "subagent")),
+        );
+        let _ = route.resolve_profile();
+        let observations = take_test_observations();
+        assert!(observations.iter().any(|observation| {
+            observation.conversation_key == "conversation-observed"
+                && observation.agent_project_id == "pj-observed"
+                && observation.session_kind == SessionKind::Subagent
+                && observation.logical_profile_key
+                    == Some((
+                        "pj-observed".to_string(),
+                        "conversation-observed".to_string(),
+                    ))
+        }));
+    }
+
+    #[test]
+    fn legacy_bind_defaults_to_primary() {
         let identity = bind_identity("/tmp/project", "session-0001");
         let route = RouteIdentity::from_bind(&identity, &None);
         assert_eq!(route.session_kind, SessionKind::Primary);
@@ -220,18 +517,41 @@ mod tests {
     }
 
     #[test]
-    fn route_identity_carries_conversation_key_verbatim() {
-        let identity = bind_identity("/tmp/project", "session-0001");
-        let route = RouteIdentity::from_bind(&identity, &None);
-        assert_eq!(route.conversation_key, "session-0001");
-    }
+    fn distinct_projects_and_conversations_have_distinct_keys() {
+        let same_conversation_a = bind_identity("/tmp/project-a", "conversation-shared");
+        let same_conversation_b = bind_identity("/tmp/project-b", "conversation-shared");
+        let project_a = RouteIdentity::from_accepted_bind(
+            &same_conversation_a,
+            &Some(Principal::Direct),
+            Some(&facts("pj-a", "primary")),
+        );
+        let project_b = RouteIdentity::from_accepted_bind(
+            &same_conversation_b,
+            &Some(Principal::Direct),
+            Some(&facts("pj-b", "primary")),
+        );
+        assert_ne!(
+            project_a.resolve_profile().logical_profile_key,
+            project_b.resolve_profile().logical_profile_key,
+            "different projects must not share a durable profile key"
+        );
 
-    #[test]
-    fn distinct_project_roots_resolve_to_distinct_agent_project_ids() {
-        let identity_a = bind_identity("/tmp/project-a", "session-1");
-        let identity_b = bind_identity("/tmp/project-b", "session-1");
-        let route_a = RouteIdentity::from_bind(&identity_a, &None);
-        let route_b = RouteIdentity::from_bind(&identity_b, &None);
-        assert_ne!(route_a.agent_project_id, route_b.agent_project_id);
+        let same_project_a = bind_identity("/tmp/project", "conversation-a");
+        let same_project_b = bind_identity("/tmp/project", "conversation-b");
+        let conversation_a = RouteIdentity::from_accepted_bind(
+            &same_project_a,
+            &Some(Principal::Direct),
+            Some(&facts("pj-shared", "subagent")),
+        );
+        let conversation_b = RouteIdentity::from_accepted_bind(
+            &same_project_b,
+            &Some(Principal::Direct),
+            Some(&facts("pj-shared", "subagent")),
+        );
+        assert_ne!(
+            conversation_a.resolve_profile().logical_profile_key,
+            conversation_b.resolve_profile().logical_profile_key,
+            "different subagent conversations must not share a disposable key"
+        );
     }
 }
