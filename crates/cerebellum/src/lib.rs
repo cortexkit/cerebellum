@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser_type;
 pub mod capability;
 pub mod clock;
 pub mod config;
@@ -36,6 +37,15 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+pub use browser_type::{
+    browser_type_dispatch_eligible, browser_type_eligibility, browser_type_geometry_eligible,
+    browser_type_revalidation_eligible, BrowserTypeAuthorizer, BrowserTypeDriver,
+    BrowserTypeExecutor, BrowserTypeJournal, BrowserTypeRequest, BrowserTypeResult,
+    ClassificationFingerprint, ClassificationRecord, DeterministicTypeFixture,
+    EligibilityPredicates, EvidenceEligibilityInput, FixtureMutation, FormDescendantClassification,
+    JournalError, JournalEvent, RecordingAuthorizer, RecordingJournal, StaleReason,
+    TypeDriverError, TypeGeometry, TypeTarget, BROWSER_EVIDENCE_ELIGIBILITY_SHA256,
+};
 pub use capability::{handle_browser_status, handle_browser_status_for_identity};
 pub use config::{parse_config, Config, ConfigError, HealthConfig};
 pub use health::HealthState;
