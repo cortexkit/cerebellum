@@ -20,6 +20,7 @@ members = ["crates/cerebellum"]
 # does not resolve to the real sibling repo.
 subc-protocol = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-protocol" }
 subc-transport = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-transport" }
+subc-control = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-control" }
 subc-core = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-core" }
 subc-jsonc = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-jsonc" }
 

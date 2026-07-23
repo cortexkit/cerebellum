@@ -14,9 +14,12 @@
 
 #![cfg(test)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::manifest::{ExecutionMode, ProviderRole};
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -25,7 +28,11 @@ use subc_protocol::{
     BindIdentity, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, RouteTarget,
     PROTOCOL_VERSION,
 };
+use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout};
 
 use cerebellum::manifest;
 use cerebellum::principal;
@@ -739,4 +746,290 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
     assert_eq!(response.header.ty, FrameType::Error);
     let error: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(error.code, "capability_denied");
+}
+
+/// Run the module through the real authenticated subc TCP daemon. The in-memory
+/// handler tests above prove individual frame decisions; this test proves that
+/// registration, route binding, and the flat capability response survive the
+/// actual daemon splice without opening a browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_daemon_registers_and_serves_browser_status() {
+    let (mut daemon, connection) = start_live_daemon().await;
+    let mut client = connect_client(&connection).await;
+
+    let catalog = wait_for_cerebellum_catalog(&mut client).await;
+    let ClientControlResponse::CatalogList { modules, .. } = catalog else {
+        panic!("expected catalog.list response");
+    };
+    let entry = modules
+        .iter()
+        .find(|module| module.module_id == MODULE_ID)
+        .expect("real subc catalog must contain cerebellum");
+    assert_eq!(entry.roles.len(), 1);
+    let role = entry
+        .roles
+        .first()
+        .expect("cerebellum must advertise a provider role");
+    let ProviderRole::ToolProvider { tools, .. } = role else {
+        panic!("cerebellum must register as a tool provider");
+    };
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "browser.status");
+    assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
+
+    let route = open_live_route(&mut client, 2).await;
+    let invalid_response =
+        send_live_tool_request(&mut client, route, 3, json!({"unexpected": true})).await;
+    assert_eq!(invalid_response.header.ty, FrameType::Response);
+    let invalid_body: Value = serde_json::from_slice(&invalid_response.body).unwrap();
+    assert_eq!(invalid_body["outcome"], "invalid_request");
+    assert_eq!(invalid_body["detail"]["field"], "unexpected");
+    assert_eq!(invalid_body["detail"]["reason_code"], "unknown_field");
+
+    let response = send_live_tool_request(&mut client, route, 4, json!({})).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["outcome"], "no_session");
+    assert!(body["context"].is_object());
+    assert_eq!(body["context"]["session_kind_effective"], "primary");
+    assert_eq!(body["context"]["profile_disposition"], "durable");
+    assert_eq!(body["session"], Value::Null);
+    assert!(body.get("result").is_none(), "response body is flat");
+
+    // Close the client before the daemon and module guards are dropped so the
+    // daemon can release the route deterministically.
+    drop(client);
+    daemon.stop();
+}
+
+struct LiveDaemonGuard {
+    task: Option<JoinHandle<Result<(), subc_core::bootstrap::BootstrapError>>>,
+    directory: PathBuf,
+}
+
+impl LiveDaemonGuard {
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+impl Drop for LiveDaemonGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("cerebellum-conformance-{nonce}"));
+    let home = directory.join("home");
+    fs::create_dir_all(&home).expect("create isolated module home");
+    let connection_file_path = directory.join("subc-connection.json");
+    let binary = std::env::var_os("CARGO_BIN_EXE_ck-cerebellum")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ck-cerebellum")
+        });
+    let daemon_config_path = directory.join("subc.jsonc");
+    fs::write(
+        &daemon_config_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "modules": {
+                MODULE_ID: {
+                    "program": binary,
+                    "env": { "HOME": home },
+                    "reserved": true,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("write isolated subc daemon configuration");
+    let daemon_config = subc_core::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
+        .with_daemon_config_path(&daemon_config_path)
+        .expect("load isolated subc daemon configuration");
+    let task = tokio::spawn(subc_core::bootstrap::run_with_config(daemon_config));
+
+    let connection = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(connection) = connection_file::read(&connection_file_path) {
+                break connection;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real subc daemon must publish a connection file");
+
+    (
+        LiveDaemonGuard {
+            task: Some(task),
+            directory,
+        },
+        connection,
+    )
+}
+
+async fn connect_client(connection: &subc_transport::ConnectionInfo) -> TcpStream {
+    let endpoint = connection
+        .endpoints
+        .first()
+        .expect("real daemon must publish an endpoint");
+    let mut stream = TcpStream::connect(format!("{}:{}", endpoint.host, endpoint.port))
+        .await
+        .expect("connect to real subc daemon");
+    authenticate_client(&mut stream, connection, Duration::from_secs(5))
+        .await
+        .expect("authenticate client against real subc daemon");
+    stream
+}
+
+async fn send_control_request(
+    stream: &mut TcpStream,
+    corr: u64,
+    request: ClientControlRequest,
+) -> Frame {
+    let frame = Frame::build(
+        FrameType::Request,
+        cerebellum::control_flags(),
+        0,
+        0,
+        corr,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    write_frame(stream, &frame)
+        .await
+        .expect("write control request to real subc");
+    timeout(Duration::from_secs(5), read_frame(stream))
+        .await
+        .expect("real subc response deadline")
+        .expect("read real subc response")
+        .expect("real subc connection remains open")
+}
+
+async fn wait_for_cerebellum_catalog(stream: &mut TcpStream) -> ClientControlResponse {
+    for corr in 10..510 {
+        let frame = send_control_request(
+            stream,
+            corr,
+            ClientControlRequest::CatalogList {
+                module_id: Some(MODULE_ID.to_string()),
+            },
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        let response: ClientControlResponse = serde_json::from_slice(&frame.body).unwrap();
+        if let ClientControlResponse::CatalogList { modules, .. } = &response {
+            if modules.iter().any(|module| module.module_id == MODULE_ID) {
+                return response;
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("real subc did not register cerebellum before the deadline");
+}
+
+async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
+    let response = send_control_request(
+        stream,
+        corr,
+        ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: MODULE_ID.to_string(),
+            },
+            identity: BindIdentity {
+                project_root: PathBuf::from("/tmp"),
+                harness: "conformance".to_string(),
+                session: "conversation-live".to_string(),
+            },
+            consumer_identity: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "route.open failed: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    match serde_json::from_slice::<ClientControlResponse>(&response.body).unwrap() {
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            route_epoch,
+        } => (route_channel, route_epoch),
+        other => panic!("expected route.open response, got {other:?}"),
+    }
+}
+
+async fn send_live_tool_request(
+    stream: &mut TcpStream,
+    (channel, epoch): (u16, u32),
+    corr: u64,
+    arguments: Value,
+) -> Frame {
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        serde_json::to_vec(&json!({
+            "name": "browser.status",
+            "arguments": arguments,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    write_frame(stream, &frame)
+        .await
+        .expect("write live capability request");
+    timeout(Duration::from_secs(5), read_frame(stream))
+        .await
+        .expect("live capability response deadline")
+        .expect("read live capability response")
+        .expect("real subc connection remains open")
+}
+
+#[cfg(feature = "test-observer")]
+#[tokio::test]
+async fn feature_gated_identity_observer_records_resolved_facts() {
+    use cerebellum::identity::{take_test_observations, RouteIdentity, SessionKind};
+
+    let _ = take_test_observations();
+    let identity = RouteIdentity::from_accepted_bind(
+        &BindIdentity {
+            project_root: PathBuf::from("/tmp/observer-project"),
+            harness: "conformance".to_string(),
+            session: "observer-conversation".to_string(),
+        },
+        &Some(Principal::Direct),
+        Some(&json!({
+            "agentProjectId": "pj-observer",
+            "sessionKind": "subagent",
+        })),
+    );
+    let resolution = identity.resolve_profile();
+    assert_eq!(resolution.profile_disposition.as_str(), "disposable");
+    let observations = take_test_observations();
+    assert!(observations.iter().any(|observation| {
+        observation.conversation_key == "observer-conversation"
+            && observation.agent_project_id == "pj-observer"
+            && observation.session_kind == SessionKind::Subagent
+            && observation.logical_profile_key
+                == Some((
+                    "pj-observer".to_string(),
+                    "observer-conversation".to_string(),
+                ))
+    }));
 }
