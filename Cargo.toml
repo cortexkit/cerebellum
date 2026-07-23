@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/cerebellum"]
+
+# ck-cerebellum — the browser/computer-use motor-execution organ for the
+# CortexKit fleet. Spec A (this slice) stands up the subc wire seam: wire-v2
+# registration with spawn attestation, insulated health-v2, three-fact bind
+# identity, profile-boundary disposition, principal default-deny, and one
+# no-op capability (`browser.status`). No browser, no CDP, no profile storage
+# — those are Spec B.
+#
+# The subc wire contract crates are PATH dependencies on the sibling
+# subconscious monorepo (same arrangement AFT and ck-quota use):
+# subc-protocol/subc-transport are the module-facing wire; subc-core is a
+# dev-only dep for the in-process daemon used in end-to-end conformance tests.
+[workspace.dependencies]
+# The subc wire contract crates are PATH dependencies on the sibling subconscious
+# monorepo (same arrangement AFT and ck-quota use). Absolute paths are used because
+# this workspace may be built from a git worktree whose relative `../subconscious`
+# does not resolve to the real sibling repo.
+subc-protocol = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-protocol" }
+subc-transport = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-transport" }
+subc-core = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-core" }
+subc-jsonc = { path = "/Users/ufukaltinok/Work/Projects/CortexKit/subconscious/crates/subc-jsonc" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false }

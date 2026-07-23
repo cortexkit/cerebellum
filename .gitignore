@@ -7,3 +7,5 @@
 # Internal design material stays out of the repository by policy.
 docs/design/
 docs/field-notes.md
+# Rust build artifacts.
+target/
