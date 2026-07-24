@@ -5,7 +5,11 @@
 //! `now - instant`. Three instants are published:
 //!
 //! - **heartbeat**: refreshed on every dispatch-loop iteration and on bounded
-//!   idle wake-up. Initialized before registration becomes externally visible
+//!   idle wake-up. The bounded idle wake wraps ONLY the loop's wait-for-input
+//!   (read) await — never the frame handler — so an idle module stays healthy
+//!   while a wedged handler still lets the heartbeat age out (Health-Path-Rule-v2
+//!   honesty: Degraded means dispatch-impaired, not "no frame recently").
+//!   Initialized before registration becomes externally visible
 //!   (see [`DispatchTimingState::new`]).
 //! - **oldest queued**: the enqueue instant of the oldest action currently
 //!   queued for dispatch. Absent when the queue is empty.
@@ -59,7 +63,9 @@ impl DispatchTimingState {
     }
 
     /// Refresh the heartbeat instant to `clock.now()`. Called by the dispatch
-    /// loop on every iteration and on bounded idle wake-up.
+    /// loop on every iteration and on bounded idle wake-up. The idle wake-up
+    /// re-stamps only while the loop is parked waiting for the next frame; it is
+    /// NOT called around the frame handler, so a wedged handler still goes stale.
     pub fn refresh_heartbeat(&self, clock: &impl crate::clock::MonotonicClock) {
         self.heartbeat_nanos
             .store(clock.now().as_nanos(), Ordering::SeqCst);

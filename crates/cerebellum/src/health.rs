@@ -97,6 +97,15 @@ impl HealthState {
         self.config
     }
 
+    /// The monotonic clock this state uses internally to age the heartbeat.
+    /// Exposed so the dispatch loop can stamp the heartbeat with the SAME clock
+    /// the insulated health lane reads, keeping stamped instants and computed
+    /// ages on a single epoch (instants from different clock epochs are not
+    /// comparable).
+    pub fn clock(&self) -> &SystemClock {
+        &self.clock
+    }
+
     /// Stamp the dispatch heartbeat. Called at the top of every loop turn so a
     /// wedged dispatch (frozen loop) surfaces as a stale heartbeat.
     pub fn stamp_heartbeat(&self) {
