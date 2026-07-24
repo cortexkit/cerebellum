@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde_json::json;
 use serde_json::Value;
@@ -175,6 +176,40 @@ async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, Mo
     Ok(stream)
 }
 
+/// Derive the bounded idle-wake cadence from the configured heartbeat stale
+/// threshold. The wake fires at half the threshold (floored at 1 ms) so the
+/// idle loop always re-stamps the heartbeat at least once well inside the
+/// threshold, even if a wake is slightly delayed; idle therefore never trips a
+/// false Degraded. The 1 ms floor avoids a zero-duration busy loop if a
+/// deployment configures a 1 ms threshold. No new configuration knob is
+/// introduced: the cadence simply tracks the existing stale threshold.
+fn idle_wake_period(heartbeat_threshold: Duration) -> Duration {
+    (heartbeat_threshold / 2).max(Duration::from_millis(1))
+}
+
+/// A source of bounded idle wake-ups for the dispatch loop. Each call returns a
+/// fresh future that resolves when the next idle heartbeat re-stamp is due.
+/// Production uses a fixed-period tokio timer ([`PeriodicIdleWake`]); tests
+/// drive it deterministically.
+trait IdleWake {
+    fn next_wake(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
+/// Production idle wake: resolves every `period` on the tokio timer.
+struct PeriodicIdleWake {
+    period: Duration,
+}
+
+impl IdleWake for PeriodicIdleWake {
+    fn next_wake(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(self.period))
+    }
+}
+
 async fn module_loop<R>(
     read_half: &mut R,
     writer: mpsc::Sender<Frame>,
@@ -188,18 +223,97 @@ where
     send_hello(&writer, config).await?;
     expect_hello_ack(read_half).await?;
 
+    let mut idle_wake = PeriodicIdleWake {
+        period: idle_wake_period(config.health.heartbeat_threshold()),
+    };
+    // Stamp and age the heartbeat with the SAME clock the insulated health lane
+    // uses internally, so stamped instants and computed ages share one epoch.
+    let clock = health_state.clock().clone();
+
+    let handler_health = Arc::clone(&health_state);
+    let handler_routes = Arc::clone(&route_bindings);
+    let handler = move |frame: Frame| {
+        let writer = writer.clone();
+        let health = Arc::clone(&handler_health);
+        let routes = Arc::clone(&handler_routes);
+        async move { handle_frame(frame, &writer, &health, &routes).await }
+    };
+
+    run_dispatch_loop(read_half, &health_state, &clock, &mut idle_wake, handler).await
+}
+
+/// The bounded-idle-wake dispatch loop.
+///
+/// The heartbeat means "the dispatch loop is responsive", NOT "a frame arrived
+/// recently". A frame-driven-only stamp would make every idle module self-report
+/// a Degraded false positive once it sits idle longer than the stale threshold
+/// (a log-noise lie under `on_degraded:Report`, an idle restart loop under
+/// `on_degraded:Restart`). To keep an idle-but-healthy module Ok, the loop
+/// re-stamps the heartbeat on a bounded idle wake while it is parked waiting for
+/// the next frame.
+///
+/// Two asymmetries are load-bearing for Health-Path-Rule-v2 honesty:
+///
+/// 1. The idle wake wraps ONLY the `read_frame` await — never the handler.
+///    Waiting for input is healthy, so it re-stamps. A handler that wedges the
+///    loop leaves it parked past the read with no re-stamp, so the heartbeat
+///    ages out and the module honestly reports Degraded. Re-stamping around the
+///    handler would mask a real dispatch impairment.
+///
+/// 2. The read future is PINNED and re-polled across wakes — never dropped and
+///    recreated (as `tokio::time::timeout(read_frame(..))` would). `read_frame`
+///    performs `read_exact`-style reads and is not cancellation-safe: dropping it
+///    partway through a frame loses the already-consumed bytes and the next read
+///    mis-frames the stream. Re-polling the same pinned future preserves
+///    partial-read state across idle wakes; a fresh read future is created only
+///    when a frame actually completes.
+async fn run_dispatch_loop<R, C, W, H, Fut>(
+    read_half: &mut R,
+    health_state: &Arc<HealthState>,
+    clock: &C,
+    idle_wake: &mut W,
+    mut handler: H,
+) -> Result<(), ModuleError>
+where
+    R: AsyncRead + Unpin,
+    C: crate::clock::MonotonicClock,
+    W: IdleWake,
+    H: FnMut(Frame) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ModuleError>>,
+{
     // Stamp the initial heartbeat so a freshly-started module reports healthy.
-    health_state.stamp_heartbeat();
+    health_state.stamp_heartbeat_with_clock(clock);
 
     loop {
-        health_state.stamp_heartbeat();
-        let Some(frame) = read_frame(read_half)
-            .await
-            .map_err(|e| ModuleError::Message(e.to_string()))?
-        else {
-            return Ok(()); // clean EOF: subc closed the connection.
+        health_state.stamp_heartbeat_with_clock(clock);
+        // Pin the read future once; it is re-polled across idle wakes below and
+        // dropped only when a frame completes (see the function-level comment).
+        let mut read = std::pin::pin!(read_frame(read_half));
+        let frame = loop {
+            let wake = idle_wake.next_wake();
+            tokio::select! {
+                // `biased` polls the read first so an available frame is always
+                // processed before an idle re-stamp (a wake never pre-empts a
+                // ready frame), and so the wake/frame ordering is deterministic.
+                biased;
+                result = &mut read => {
+                    let Some(frame) =
+                        result.map_err(|e| ModuleError::Message(e.to_string()))?
+                    else {
+                        return Ok(()); // clean EOF: subc closed the connection.
+                    };
+                    break frame;
+                }
+                _ = wake => {
+                    // Bounded idle wake: still waiting for input (healthy), so
+                    // re-stamp and keep awaiting the SAME pinned read.
+                    health_state.stamp_heartbeat_with_clock(clock);
+                }
+            }
         };
-        if !handle_frame(frame, &writer, &health_state, &route_bindings).await? {
+        // The handler runs OUTSIDE the idle-wake select on purpose: a wedged
+        // handler gets no re-stamp here, so it honestly goes stale (Degraded).
+        if !handler(frame).await? {
             return Ok(());
         }
     }
@@ -811,5 +925,458 @@ mod tests {
             module_id: "subc-mcp".to_string(),
         }));
         assert!(!trust.is_first_party());
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Bounded-idle-wake dispatch loop tests (health-v2 idle-heartbeat fix).
+//
+// These drive the real `run_dispatch_loop` with a deterministic fake clock and a
+// test-controlled idle wake (no wall-clock sleeps), asserting:
+//   1. an idle module stays healthy well past the stale threshold (idle-healthy);
+//   2. a wedged handler still lets the heartbeat go stale (honesty preserved);
+//   3. a frame split across an idle-wake boundary reassembles uncorrupted
+//      (pinned-read regression fence), with an ignored fail-before variant that
+//      shows a dropped-and-recreated read (the `timeout()` shape) corrupts it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod dispatch_idle_tests {
+    use super::*;
+    use crate::clock::{FakeClock, MonotonicClock, MonoInstant};
+    use crate::health::health_check_with_clock;
+    use std::sync::Mutex;
+    use subc_protocol::session::HealthStatus;
+
+    /// Share one fake clock between the loop (which stamps the heartbeat) and
+    /// the test (which advances time and reads health), so both observe the same
+    /// epoch. Locks are held only for the instant read/advance, never across an
+    /// await, so the loop and the test cannot deadlock.
+    impl MonotonicClock for Arc<Mutex<FakeClock>> {
+        fn now(&self) -> MonoInstant {
+            self.lock().unwrap().now()
+        }
+    }
+
+    /// A test-controlled idle wake: resolves when the test sends a permit on the
+    /// channel. When the channel closes (test drops the sender) the wake pends
+    /// forever rather than busy-resolving, so the loop exits only via the
+    /// transport (EOF), not a wake storm.
+    struct TestIdleWake {
+        rx: mpsc::UnboundedReceiver<()>,
+    }
+
+    impl IdleWake for TestIdleWake {
+        fn next_wake(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                match self.rx.recv().await {
+                    Some(()) => {}
+                    None => std::future::pending::<()>().await,
+                }
+            })
+        }
+    }
+
+    /// Poll until the stamped heartbeat reaches `target` (nanoseconds since the
+    /// fake clock epoch). Reads only the health state's atomic heartbeat, never
+    /// the clock lock, so it cannot deadlock with the loop's stamping.
+    async fn wait_for_heartbeat(state: &HealthState, target: Duration) {
+        let target_nanos = target.as_nanos() as u64;
+        for _ in 0..100_000 {
+            if state.heartbeat_instant().as_nanos() >= target_nanos {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("heartbeat did not reach {target:?}");
+    }
+
+    fn test_health_config() -> HealthConfig {
+        HealthConfig {
+            dispatch_heartbeat_stale_ms: 100,
+            action_age_stale_ms: 30000,
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_module_stays_healthy_well_past_stale_threshold() {
+        // Threshold 100ms; idle for 1000ms (10x) with NO frames, firing a
+        // bounded idle wake each step. Before the fix the heartbeat was stamped
+        // only per frame, so idling past 100ms reported Degraded. With the
+        // bounded idle wake the heartbeat is re-stamped on each wake and the
+        // report stays Ok even though cumulative idle time far exceeds the
+        // threshold.
+        let health_state = Arc::new(HealthState::with_config(test_health_config()));
+        let clock = Arc::new(Mutex::new(FakeClock::new()));
+
+        let (writer_io, mut reader_io) = tokio::io::duplex(1024);
+        let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
+        let mut idle_wake = TestIdleWake { rx: wake_rx };
+
+        // No frames arrive in this test; the handler must never run.
+        let handler = |_frame: Frame|
+            -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, ModuleError>> + Send>,
+            > {
+            Box::pin(async { panic!("no frame should arrive while idle") })
+        };
+
+        let loop_health = Arc::clone(&health_state);
+        let loop_clock = Arc::clone(&clock);
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(&mut reader_io, &loop_health, &loop_clock, &mut idle_wake, handler)
+                .await
+        });
+
+        // Idle in 50ms steps for 1000ms. After each wake the heartbeat must be
+        // re-stamped at the advanced clock, so the report stays Ok even once the
+        // cumulative idle time is far past the 100ms threshold.
+        let mut elapsed_ms = 0u64;
+        for _ in 0..20 {
+            elapsed_ms += 50;
+            clock.lock().unwrap().advance(Duration::from_millis(50));
+            wake_tx.send(()).unwrap();
+            wait_for_heartbeat(&health_state, Duration::from_millis(elapsed_ms)).await;
+            let report = health_check_with_clock(&health_state, &*clock.lock().unwrap());
+            assert_eq!(
+                report.status,
+                HealthStatus::Ok,
+                "idle module must stay healthy at {elapsed_ms}ms (threshold 100ms)"
+            );
+        }
+
+        // The heartbeat tracked the clock all the way to 1000ms (10x the
+        // threshold), proving each wake re-stamped rather than the heartbeat
+        // being frozen at startup.
+        assert_eq!(
+            health_state.heartbeat_instant().as_nanos(),
+            Duration::from_millis(1000).as_nanos() as u64,
+            "heartbeat must track the idle wakes to 1000ms"
+        );
+
+        // Counterfactual (keeps the test non-vacuous): stop firing wakes and
+        // advance past the threshold from the last stamp. The lane must now
+        // report Degraded, proving the idle wake — not an always-healthy
+        // short-circuit — is what kept it Ok.
+        clock.lock().unwrap().advance(Duration::from_millis(200));
+        let report = health_check_with_clock(&health_state, &*clock.lock().unwrap());
+        assert_eq!(
+            report.status,
+            HealthStatus::Degraded,
+            "without wakes the heartbeat must go stale"
+        );
+
+        // Clean shutdown: closing the transport gives the loop a clean EOF.
+        drop(writer_io);
+        drop(wake_tx);
+        loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wedged_handler_lets_heartbeat_go_stale() {
+        // The idle wake wraps ONLY the read await, never the handler. A handler
+        // that wedges leaves the loop parked past the read with no re-stamp, so
+        // the heartbeat ages out and the report honestly goes Degraded — even
+        // though idle wakes are available. This proves the fix does not paper
+        // over a stuck handler.
+        let health_state = Arc::new(HealthState::with_config(test_health_config()));
+        let clock = Arc::new(Mutex::new(FakeClock::new()));
+
+        let (mut writer_io, mut reader_io) = tokio::io::duplex(1024);
+        let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
+        let mut idle_wake = TestIdleWake { rx: wake_rx };
+
+        // Handler that signals it was entered, then wedges forever.
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel::<()>();
+        let handler = move |_frame: Frame| {
+            let entered_tx = entered_tx.clone();
+            async move {
+                let _ = entered_tx.send(());
+                std::future::pending::<Result<bool, ModuleError>>().await
+            }
+        };
+
+        let loop_health = Arc::clone(&health_state);
+        let loop_clock = Arc::clone(&clock);
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(&mut reader_io, &loop_health, &loop_clock, &mut idle_wake, handler)
+                .await
+        });
+
+        // Deliver one frame so the loop reads it and enters the wedged handler.
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            1,
+            1,
+            7,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut writer_io, &frame).await.unwrap();
+
+        // Wait until the handler is entered: the loop is now parked in the
+        // handler, past the read. The last heartbeat stamp was at the top of
+        // that iteration (clock offset 0).
+        entered_rx.recv().await.expect("handler must be entered");
+
+        // Advance well past the threshold and fire idle wakes too: with the
+        // handler wedged the loop is not in the read select, so the wakes are
+        // never processed and never re-stamp. The heartbeat must age out.
+        clock.lock().unwrap().advance(Duration::from_millis(500));
+        for _ in 0..5 {
+            let _ = wake_tx.send(());
+            clock.lock().unwrap().advance(Duration::from_millis(100));
+        }
+
+        let report = health_check_with_clock(&health_state, &*clock.lock().unwrap());
+        assert_eq!(
+            report.status,
+            HealthStatus::Degraded,
+            "a wedged handler must let the heartbeat go stale"
+        );
+        assert!(
+            report.ages.heartbeat_age > Duration::from_millis(100),
+            "heartbeat age {:?} must exceed the 100ms threshold",
+            report.ages.heartbeat_age
+        );
+
+        loop_task.abort();
+    }
+
+    /// Build a frame with a non-trivial body plus its full wire encoding, for
+    /// the split-frame fence.
+    fn split_test_frame() -> (Frame, Vec<u8>) {
+        let body = b"split-frame-payload-0123456789".to_vec(); // 30 bytes
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            3,
+            1,
+            99,
+            body,
+        )
+        .unwrap();
+        let mut bytes = frame.header.encode().to_vec();
+        bytes.extend_from_slice(&frame.body);
+        (frame, bytes)
+    }
+
+    /// Drive the split-frame scenario deterministically: write part 1 of the
+    /// frame, fire two idle wakes (the first ensures part 1 is consumed by the
+    /// read; the second fires mid-frame), then write part 2. Returns true if the
+    /// handler recorded the frame, false if the stream was corrupted (the
+    /// handler was never called). No wall-clock timing drives the result — the
+    /// 500ms recv timeout is only a hang guard for the corrupted case.
+    async fn drive_split_frame<W>(
+        writer_io: &mut W,
+        clock: &Mutex<FakeClock>,
+        wake_tx: &mpsc::UnboundedSender<()>,
+        health_state: &HealthState,
+        done_rx: &mut mpsc::UnboundedReceiver<()>,
+        bytes: &[u8],
+    ) -> bool
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mid = bytes.len() / 2;
+        let (part1, part2) = bytes.split_at(mid);
+
+        // Part 1: the read consumes it and awaits the rest.
+        writer_io.write_all(part1).await.unwrap();
+
+        // Wake #1: with the read polled first (biased select), this turn reads
+        // part 1 into the pinned read before the wake branch re-stamps. Advance
+        // the clock so the re-stamp lands at a distinctive instant we can await.
+        clock.lock().unwrap().advance(Duration::from_millis(10));
+        wake_tx.send(()).unwrap();
+        wait_for_heartbeat(health_state, Duration::from_millis(10)).await;
+
+        // Wake #2 fires MID-FRAME: the read holds part 1 but part 2 has not
+        // arrived. A pinned read survives this; a dropped-and-recreated read
+        // (the timeout shape) loses part 1 here and corrupts the stream.
+        clock.lock().unwrap().advance(Duration::from_millis(10));
+        wake_tx.send(()).unwrap();
+        wait_for_heartbeat(health_state, Duration::from_millis(20)).await;
+
+        // Deliver the rest of the frame.
+        writer_io.write_all(part2).await.unwrap();
+
+        // True if the handler recorded the frame; false on timeout (corruption).
+        tokio::time::timeout(Duration::from_millis(500), done_rx.recv())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn split_frame_across_idle_wake_reassembles_uncorrupted() {
+        // Regression fence: a frame whose bytes arrive split across an idle-wake
+        // boundary must reassemble uncorrupted and be handled exactly once. The
+        // pinned read future preserves partial-read progress across the wake.
+        // (A `tokio::time::timeout(read_frame(..))` would drop the mid-frame
+        // read and corrupt the stream — see the ignored fail-before variant
+        // `split_frame_fail_before_dropped_read_corrupts`.)
+        let health_state = Arc::new(HealthState::with_config(test_health_config()));
+        let clock = Arc::new(Mutex::new(FakeClock::new()));
+
+        let (mut writer_io, mut reader_io) = tokio::io::duplex(1024);
+        let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
+        let mut idle_wake = TestIdleWake { rx: wake_rx };
+
+        let handled: Arc<Mutex<Vec<Frame>>> = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
+        let handler_handled = Arc::clone(&handled);
+        let handler = move |frame: Frame| {
+            let handled = Arc::clone(&handler_handled);
+            let done_tx = done_tx.clone();
+            async move {
+                handled.lock().unwrap().push(frame);
+                let _ = done_tx.send(());
+                Ok::<bool, ModuleError>(true)
+            }
+        };
+
+        let loop_health = Arc::clone(&health_state);
+        let loop_clock = Arc::clone(&clock);
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop(&mut reader_io, &loop_health, &loop_clock, &mut idle_wake, handler)
+                .await
+        });
+
+        let (expected, bytes) = split_test_frame();
+        let handled_ok = drive_split_frame(
+            &mut writer_io,
+            &clock,
+            &wake_tx,
+            &health_state,
+            &mut done_rx,
+            &bytes,
+        )
+        .await;
+        assert!(handled_ok, "frame must be handled (stream not corrupted)");
+
+        let handled = handled.lock().unwrap().clone();
+        assert_eq!(handled.len(), 1, "frame handled exactly once");
+        assert_eq!(handled[0], expected, "frame reassembled uncorrupted");
+
+        drop(writer_io);
+        drop(wake_tx);
+        loop_task.await.unwrap().unwrap();
+    }
+
+    /// A deliberately-broken variant of [`run_dispatch_loop`] that recreates the
+    /// read future on every idle wake (what `tokio::time::timeout(read_frame(..))`
+    /// effectively does, since a timeout drops its inner future on expiry). Used
+    /// ONLY by the ignored fail-before test to demonstrate that dropping a
+    /// mid-frame read corrupts the stream.
+    async fn run_dispatch_loop_drop_read_on_wake<R, C, W, H, Fut>(
+        read_half: &mut R,
+        health_state: &Arc<HealthState>,
+        clock: &C,
+        idle_wake: &mut W,
+        mut handler: H,
+    ) -> Result<(), ModuleError>
+    where
+        R: AsyncRead + Unpin,
+        C: crate::clock::MonotonicClock,
+        W: IdleWake,
+        H: FnMut(Frame) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, ModuleError>>,
+    {
+        health_state.stamp_heartbeat_with_clock(clock);
+        loop {
+            health_state.stamp_heartbeat_with_clock(clock);
+            let frame = loop {
+                // BUG: a fresh read future each wake. Dropping the in-progress
+                // read loses any partial frame bytes already consumed.
+                let mut read = std::pin::pin!(read_frame(read_half));
+                let wake = idle_wake.next_wake();
+                tokio::select! {
+                    biased;
+                    result = &mut read => {
+                        let Some(frame) =
+                            result.map_err(|e| ModuleError::Message(e.to_string()))?
+                        else {
+                            return Ok(());
+                        };
+                        break frame;
+                    }
+                    _ = wake => {
+                        health_state.stamp_heartbeat_with_clock(clock);
+                        // `read` is dropped here, losing partial frame bytes.
+                    }
+                }
+            };
+            if !handler(frame).await? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Fail-before demonstration (ignored by default). This is the SAME scenario
+    /// and the SAME assertions as
+    /// [`split_frame_across_idle_wake_reassembles_uncorrupted`], but run against
+    /// the dropped-read loop above. Un-ignoring it makes it go RED: the mid-frame
+    /// wake drops the partial read, part 1 is lost, and the stream mis-frames so
+    /// the frame is never reassembled. That is exactly the regression the
+    /// pinned-read fence guards against (e.g. a future "simplify to timeout()").
+    #[ignore = "fail-before fence: goes RED against a dropped-read (timeout-style) loop"]
+    #[tokio::test]
+    async fn split_frame_fail_before_dropped_read_corrupts() {
+        let health_state = Arc::new(HealthState::with_config(test_health_config()));
+        let clock = Arc::new(Mutex::new(FakeClock::new()));
+
+        let (mut writer_io, mut reader_io) = tokio::io::duplex(1024);
+        let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
+        let mut idle_wake = TestIdleWake { rx: wake_rx };
+
+        let handled: Arc<Mutex<Vec<Frame>>> = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
+        let handler_handled = Arc::clone(&handled);
+        let handler = move |frame: Frame| {
+            let handled = Arc::clone(&handler_handled);
+            let done_tx = done_tx.clone();
+            async move {
+                handled.lock().unwrap().push(frame);
+                let _ = done_tx.send(());
+                Ok::<bool, ModuleError>(true)
+            }
+        };
+
+        let loop_health = Arc::clone(&health_state);
+        let loop_clock = Arc::clone(&clock);
+        let loop_task = tokio::spawn(async move {
+            run_dispatch_loop_drop_read_on_wake(
+                &mut reader_io,
+                &loop_health,
+                &loop_clock,
+                &mut idle_wake,
+                handler,
+            )
+            .await
+        });
+
+        let (expected, bytes) = split_test_frame();
+        let handled_ok = drive_split_frame(
+            &mut writer_io,
+            &clock,
+            &wake_tx,
+            &health_state,
+            &mut done_rx,
+            &bytes,
+        )
+        .await;
+        // Same assertions as the pinned test; they fail here because the
+        // dropped-read loop corrupts the split frame.
+        assert!(handled_ok, "frame must be handled (stream not corrupted)");
+        let handled = handled.lock().unwrap().clone();
+        assert_eq!(handled.len(), 1, "frame handled exactly once");
+        assert_eq!(handled[0], expected, "frame reassembled uncorrupted");
+
+        drop(writer_io);
+        drop(wake_tx);
+        let _ = loop_task.await;
     }
 }
