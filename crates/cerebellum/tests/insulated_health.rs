@@ -2,7 +2,7 @@
 //!
 //! These tests cover the slice acceptance criteria, ported onto the integrated
 //! `cerebellum` crate. They drive the health lane with a deterministic fake
-//! clock via [`cerebellum::health::health_check_with_clock`] and the
+//! clock via [`cerebellum_core::health::health_check_with_clock`] and the
 //! `timing_access` test helpers, asserting the frozen configuration surface,
 //! the mechanical threshold boundaries, the insulated-lane rules, and the
 //! dispatch-timing-state semantics.
@@ -27,12 +27,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cerebellum::clock::{FakeClock, MonotonicClock};
-use cerebellum::config::{
+use cerebellum_core::clock::{FakeClock, MonotonicClock};
+use cerebellum_core::config::{
     parse_config, ConfigReason, HealthConfig, DEFAULT_ACTION_AGE_STALE_MS,
     DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
 };
-use cerebellum::health::{health_check_with_clock, HealthState};
+use cerebellum_core::health::{health_check_with_clock, HealthState};
 use subc_protocol::session::HealthStatus;
 
 /// Helper: build a health state + fake clock with the heartbeat stamped at

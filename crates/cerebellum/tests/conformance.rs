@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use cerebellum::manifest;
-use cerebellum::principal;
+use cerebellum_core::principal;
 
 const MODULE_ID: &str = "cerebellum";
 
@@ -105,7 +105,7 @@ async fn manifest_advertises_exactly_one_application_capability() {
 #[tokio::test]
 async fn first_party_route_bind_is_acked() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 42,
@@ -151,7 +151,7 @@ async fn first_party_route_bind_is_acked() {
 #[tokio::test]
 async fn ineligible_principal_receives_transport_rejection() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 42,
@@ -206,7 +206,7 @@ async fn ineligible_principal_receives_transport_rejection() {
 #[tokio::test]
 async fn absent_principal_is_rejected() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 42,
@@ -248,7 +248,7 @@ async fn absent_principal_is_rejected() {
 #[tokio::test]
 async fn health_check_returns_insulated_report() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     health_state.stamp_heartbeat();
 
     let request = ModuleControlRequest::HealthCheck {};
@@ -297,7 +297,7 @@ async fn health_check_returns_insulated_report() {
 #[tokio::test]
 async fn browser_status_returns_flat_no_session_result() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let request = json!({
         "name": "browser.status",
@@ -341,7 +341,7 @@ async fn browser_status_returns_flat_no_session_result() {
 #[tokio::test]
 async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let request = json!({
         "name": "browser.status",
@@ -386,7 +386,7 @@ async fn browser_status_unknown_field_returns_invalid_request_in_body() {
 #[tokio::test]
 async fn browser_status_rejects_management_envelope() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let request = json!({
         "method": "browser.status",
         "params": {},
@@ -432,7 +432,7 @@ async fn browser_status_rejects_malformed_tool_envelopes() {
 
     for (offset, (request, field, reason_code)) in cases.into_iter().enumerate() {
         let (tx, mut rx) = mpsc::channel::<Frame>(16);
-        let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+        let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,
             FrameType::Request,
@@ -472,7 +472,7 @@ async fn browser_status_top_level_wrong_types_return_response_frames() {
 
     for (offset, value) in values.into_iter().enumerate() {
         let (tx, mut rx) = mpsc::channel::<Frame>(16);
-        let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+        let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
         let request = json!({
             "name": "browser.status",
             "arguments": value,
@@ -508,7 +508,7 @@ async fn browser_status_top_level_wrong_types_return_response_frames() {
 /// opening a browser: primary → durable, subagent → disposable, ephemeral → none.
 #[tokio::test]
 async fn session_kind_matrix_resolves_profile_disposition() {
-    use cerebellum::identity::{ProfileDisposition, SessionKind};
+    use cerebellum_core::identity::{ProfileDisposition, SessionKind};
 
     assert_eq!(
         ProfileDisposition::for_session_kind(SessionKind::Primary),
@@ -528,7 +528,7 @@ async fn session_kind_matrix_resolves_profile_disposition() {
 /// identities.
 #[tokio::test]
 async fn distinct_agent_project_ids_resolve_to_distinct_profiles() {
-    use cerebellum::identity::RouteIdentity;
+    use cerebellum_core::identity::RouteIdentity;
 
     let identity_a = BindIdentity {
         project_root: PathBuf::from("/tmp/project-a"),
@@ -597,7 +597,7 @@ async fn hello_frame_is_channel_zero_epoch_zero() {
 #[tokio::test]
 async fn accepted_bind_facts_drive_profile_resolution() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
 
     let bind = ModuleControlRequest::RouteBind {
@@ -679,7 +679,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
 #[tokio::test]
 async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum::health::HealthState::new());
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 10,
@@ -1004,7 +1004,8 @@ async fn send_live_tool_request(
 #[cfg(feature = "test-observer")]
 #[tokio::test]
 async fn feature_gated_identity_observer_records_resolved_facts() {
-    use cerebellum::identity::{take_test_observations, RouteIdentity, SessionKind};
+    use cerebellum::take_test_observations;
+    use cerebellum_core::identity::{RouteIdentity, SessionKind};
 
     let _ = take_test_observations();
     let identity = RouteIdentity::from_accepted_bind(
