@@ -1,0 +1,22 @@
+[package]
+name = "cerebellum-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The plane-agnostic substrate for ck-cerebellum: three-fact bind identity, insulated health-v2, dispatch timing atomics, the monotonic clock, principal default-deny, and config parsing. Vendored one-way by each plane's module crate."
+
+[features]
+default = []
+# Enables the in-memory identity-resolution observer for conformance tests only.
+# Production builds leave this feature disabled, so no observer code is emitted.
+test-observer = []
+
+[lib]
+name = "cerebellum_core"
+path = "src/lib.rs"
+
+[dependencies]
+subc-protocol = { workspace = true }
+subc-jsonc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

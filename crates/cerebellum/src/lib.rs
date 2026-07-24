@@ -9,13 +9,7 @@
 
 pub mod browser_type;
 pub mod capability;
-pub mod clock;
-pub mod config;
-pub mod dispatch;
-pub mod health;
-pub mod identity;
 pub mod manifest;
-pub mod principal;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -48,15 +42,18 @@ pub use browser_type::{
     TypeDriverError, TypeGeometry, TypeTarget, BROWSER_EVIDENCE_ELIGIBILITY_SHA256,
 };
 pub use capability::{handle_browser_status, handle_browser_status_for_identity};
-pub use config::{parse_config, Config, ConfigError, HealthConfig};
-pub use health::HealthState;
-#[cfg(any(test, feature = "test-observer"))]
-pub use identity::{take_test_observations, IdentityResolutionObservation};
-pub use identity::{
+pub use cerebellum_core::config::{parse_config, Config, ConfigError, HealthConfig};
+pub use cerebellum_core::health::HealthState;
+// The observer lives behind a feature (not `cfg(test)`) because it now resides
+// in the cerebellum-core dependency: a `test` build of this crate does not
+// enable code in that dependency, so only the forwarded feature gates the seam.
+#[cfg(feature = "test-observer")]
+pub use cerebellum_core::identity::{take_test_observations, IdentityResolutionObservation};
+pub use cerebellum_core::identity::{
     AcceptedBindFacts, LogicalProfileKey, ProfileDisposition, ProfileResolution, RouteIdentity,
     SessionKind,
 };
-pub use principal::{trust_for_principal, PrincipalTrust};
+pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
 pub use wire::{build_error_frame, control_flags};
 
 const DEFAULT_MODULE_ID: &str = "cerebellum";
@@ -119,7 +116,7 @@ impl ModuleConfig {
         // rather than silently falling back (Spec A: zero, negative,
         // fractional, non-numeric, and unknown-member values are
         // configuration errors).
-        let health = config::load_config_file()
+        let health = cerebellum_core::config::load_config_file()
             .map_err(ModuleError::Config)?
             .health;
         Ok(Self {
@@ -192,9 +189,8 @@ fn idle_wake_period(heartbeat_threshold: Duration) -> Duration {
 /// Production uses a fixed-period tokio timer ([`PeriodicIdleWake`]); tests
 /// drive it deterministically.
 trait IdleWake {
-    fn next_wake(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    fn next_wake(&mut self)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
 /// Production idle wake: resolves every `period` on the tokio timer.
@@ -276,7 +272,7 @@ async fn run_dispatch_loop<R, C, W, H, Fut>(
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
-    C: crate::clock::MonotonicClock,
+    C: cerebellum_core::clock::MonotonicClock,
     W: IdleWake,
     H: FnMut(Frame) -> Fut,
     Fut: std::future::Future<Output = Result<bool, ModuleError>>,
@@ -454,7 +450,7 @@ async fn handle_control_request(
             // from `mcp:*` surfaces. This check is the defense-in-depth backstop
             // that rejects a forged direct dispatch under a non-first-party
             // principal before any capability executes.
-            let trust = principal::trust_for_principal(&principal);
+            let trust = trust_for_principal(&principal);
             if !trust.is_first_party() {
                 return send_principal_denied(
                     writer,
@@ -928,7 +924,6 @@ mod tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Bounded-idle-wake dispatch loop tests (health-v2 idle-heartbeat fix).
 //
@@ -943,18 +938,34 @@ mod tests {
 #[cfg(test)]
 mod dispatch_idle_tests {
     use super::*;
-    use crate::clock::{FakeClock, MonotonicClock, MonoInstant};
-    use crate::health::health_check_with_clock;
+    use cerebellum_core::clock::{FakeClock, MonoInstant, MonotonicClock};
+    use cerebellum_core::health::health_check_with_clock;
     use std::sync::Mutex;
     use subc_protocol::session::HealthStatus;
 
-    /// Share one fake clock between the loop (which stamps the heartbeat) and
-    /// the test (which advances time and reads health), so both observe the same
-    /// epoch. Locks are held only for the instant read/advance, never across an
-    /// await, so the loop and the test cannot deadlock.
-    impl MonotonicClock for Arc<Mutex<FakeClock>> {
+    /// A fake clock shared between the spawned dispatch loop (which stamps the
+    /// heartbeat by reading it) and the test (which advances it), so both observe
+    /// the same epoch. They share one `FakeClock` behind an `Arc<Mutex<_>>`;
+    /// locks are held only for the instant read/advance, never across an await,
+    /// so the loop and the test cannot deadlock.
+    ///
+    /// This is a newtype rather than a bare `Arc<Mutex<FakeClock>>` because the
+    /// `MonotonicClock` trait and `FakeClock` now live in `cerebellum-core`: the
+    /// orphan rules permit this impl only for a type local to this crate. `Deref`
+    /// keeps the existing `clock.lock()` call sites working unchanged.
+    #[derive(Clone)]
+    struct SharedFakeClock(Arc<Mutex<FakeClock>>);
+
+    impl std::ops::Deref for SharedFakeClock {
+        type Target = Mutex<FakeClock>;
+        fn deref(&self) -> &Mutex<FakeClock> {
+            &self.0
+        }
+    }
+
+    impl MonotonicClock for SharedFakeClock {
         fn now(&self) -> MonoInstant {
-            self.lock().unwrap().now()
+            self.0.lock().unwrap().now()
         }
     }
 
@@ -1009,25 +1020,28 @@ mod dispatch_idle_tests {
         // report stays Ok even though cumulative idle time far exceeds the
         // threshold.
         let health_state = Arc::new(HealthState::with_config(test_health_config()));
-        let clock = Arc::new(Mutex::new(FakeClock::new()));
+        let clock = SharedFakeClock(Arc::new(Mutex::new(FakeClock::new())));
 
         let (writer_io, mut reader_io) = tokio::io::duplex(1024);
         let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
         let mut idle_wake = TestIdleWake { rx: wake_rx };
 
         // No frames arrive in this test; the handler must never run.
-        let handler = |_frame: Frame|
-            -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<bool, ModuleError>> + Send>,
-            > {
-            Box::pin(async { panic!("no frame should arrive while idle") })
-        };
+        let handler = |_frame: Frame| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, ModuleError>> + Send>,
+        > { Box::pin(async { panic!("no frame should arrive while idle") }) };
 
         let loop_health = Arc::clone(&health_state);
-        let loop_clock = Arc::clone(&clock);
+        let loop_clock = clock.clone();
         let loop_task = tokio::spawn(async move {
-            run_dispatch_loop(&mut reader_io, &loop_health, &loop_clock, &mut idle_wake, handler)
-                .await
+            run_dispatch_loop(
+                &mut reader_io,
+                &loop_health,
+                &loop_clock,
+                &mut idle_wake,
+                handler,
+            )
+            .await
         });
 
         // Idle in 50ms steps for 1000ms. After each wake the heartbeat must be
@@ -1082,7 +1096,7 @@ mod dispatch_idle_tests {
         // though idle wakes are available. This proves the fix does not paper
         // over a stuck handler.
         let health_state = Arc::new(HealthState::with_config(test_health_config()));
-        let clock = Arc::new(Mutex::new(FakeClock::new()));
+        let clock = SharedFakeClock(Arc::new(Mutex::new(FakeClock::new())));
 
         let (mut writer_io, mut reader_io) = tokio::io::duplex(1024);
         let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
@@ -1099,10 +1113,16 @@ mod dispatch_idle_tests {
         };
 
         let loop_health = Arc::clone(&health_state);
-        let loop_clock = Arc::clone(&clock);
+        let loop_clock = clock.clone();
         let loop_task = tokio::spawn(async move {
-            run_dispatch_loop(&mut reader_io, &loop_health, &loop_clock, &mut idle_wake, handler)
-                .await
+            run_dispatch_loop(
+                &mut reader_io,
+                &loop_health,
+                &loop_clock,
+                &mut idle_wake,
+                handler,
+            )
+            .await
         });
 
         // Deliver one frame so the loop reads it and enters the wedged handler.
@@ -1219,7 +1239,7 @@ mod dispatch_idle_tests {
         // read and corrupt the stream — see the ignored fail-before variant
         // `split_frame_fail_before_dropped_read_corrupts`.)
         let health_state = Arc::new(HealthState::with_config(test_health_config()));
-        let clock = Arc::new(Mutex::new(FakeClock::new()));
+        let clock = SharedFakeClock(Arc::new(Mutex::new(FakeClock::new())));
 
         let (mut writer_io, mut reader_io) = tokio::io::duplex(1024);
         let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
@@ -1239,10 +1259,16 @@ mod dispatch_idle_tests {
         };
 
         let loop_health = Arc::clone(&health_state);
-        let loop_clock = Arc::clone(&clock);
+        let loop_clock = clock.clone();
         let loop_task = tokio::spawn(async move {
-            run_dispatch_loop(&mut reader_io, &loop_health, &loop_clock, &mut idle_wake, handler)
-                .await
+            run_dispatch_loop(
+                &mut reader_io,
+                &loop_health,
+                &loop_clock,
+                &mut idle_wake,
+                handler,
+            )
+            .await
         });
 
         let (expected, bytes) = split_test_frame();
@@ -1280,7 +1306,7 @@ mod dispatch_idle_tests {
     ) -> Result<(), ModuleError>
     where
         R: AsyncRead + Unpin,
-        C: crate::clock::MonotonicClock,
+        C: cerebellum_core::clock::MonotonicClock,
         W: IdleWake,
         H: FnMut(Frame) -> Fut,
         Fut: std::future::Future<Output = Result<bool, ModuleError>>,
@@ -1326,7 +1352,7 @@ mod dispatch_idle_tests {
     #[tokio::test]
     async fn split_frame_fail_before_dropped_read_corrupts() {
         let health_state = Arc::new(HealthState::with_config(test_health_config()));
-        let clock = Arc::new(Mutex::new(FakeClock::new()));
+        let clock = SharedFakeClock(Arc::new(Mutex::new(FakeClock::new())));
 
         let (mut writer_io, mut reader_io) = tokio::io::duplex(1024);
         let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
@@ -1346,7 +1372,7 @@ mod dispatch_idle_tests {
         };
 
         let loop_health = Arc::clone(&health_state);
-        let loop_clock = Arc::clone(&clock);
+        let loop_clock = clock.clone();
         let loop_task = tokio::spawn(async move {
             run_dispatch_loop_drop_read_on_wake(
                 &mut reader_io,

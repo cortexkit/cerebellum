@@ -12,7 +12,7 @@
 
 use serde_json::{json, Value};
 
-use crate::identity::{ProfileResolution, RouteIdentity, SessionKind};
+use cerebellum_core::identity::{ProfileResolution, RouteIdentity, SessionKind};
 
 /// The `browser.status` result body (flat, no `{result}` wrapper).
 #[derive(Debug, Clone, serde::Serialize)]

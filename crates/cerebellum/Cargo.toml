@@ -9,7 +9,9 @@ description = "The ck-cerebellum subc module: Spec A — wire-v2 registration, i
 default = []
 # Enables the in-memory identity-resolution observer for conformance tests only.
 # Production builds leave this feature disabled, so no observer code is emitted.
-test-observer = []
+# Forwards to the substrate crate, which owns the observer now that identity
+# lives in cerebellum-core.
+test-observer = ["cerebellum-core/test-observer"]
 
 [[bin]]
 name = "ck-cerebellum"
@@ -20,6 +22,7 @@ name = "cerebellum"
 path = "src/lib.rs"
 
 [dependencies]
+cerebellum-core = { path = "../cerebellum-core" }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cerebellum"]
+members = ["crates/cerebellum", "crates/cerebellum-core"]
 
 # ck-cerebellum — the browser/computer-use motor-execution organ for the
 # CortexKit fleet. Spec A (this slice) stands up the subc wire seam: wire-v2
