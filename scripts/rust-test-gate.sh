@@ -31,3 +31,10 @@ run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
 # Phase 3: compile + all tests (lib, bins, integration).
 run_phase "cargo test --workspace --quiet" \
   cargo test --workspace --quiet
+
+# Phase 4: the identity-resolution observer seam is feature-gated so production
+# builds emit no observer code. A plain `cargo test` therefore skips the
+# conformance test that exercises it, so run that feature explicitly — otherwise
+# the seam could rot unnoticed.
+run_phase "cargo test -p cerebellum --features test-observer --test conformance --quiet" \
+  cargo test -p cerebellum --features test-observer --test conformance --quiet
