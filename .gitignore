@@ -1,11 +1,20 @@
-# Alfonso session artifacts (drafts, task outputs, context) — never repo content.
-# A fired spec draft writes into .cortexkit/alfonso/drafts/; without this ignore,
-# that file dirties the parent repo and blocks every mason worktree dispatch.
+# Alfonso + fleet session artifacts (drafts, task outputs, historian, context) —
+# never repo content. A fired spec draft writes into .cortexkit/alfonso/drafts/;
+# without this ignore it dirties the parent repo and blocks every mason worktree
+# dispatch. The nested negation keeps a future .cortexkit/alfonso/rules/ tracked.
+.cortexkit/*
+!.cortexkit/alfonso/
 .cortexkit/alfonso/*
 !.cortexkit/alfonso/rules/
+
+# AFT-generated codebase analysis docs (regenerated from source, not authored) —
+# kept out of the repo so generated content never churns the tree.
+ARCHITECTURE.md
+STRUCTURE.md
 
 # Internal design material stays out of the repository by policy.
 docs/design/
 docs/field-notes.md
+
 # Rust build artifacts.
 target/
