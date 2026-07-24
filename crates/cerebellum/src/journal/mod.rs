@@ -1,0 +1,584 @@
+//! Audit journal, redaction, snapshot retention, and late-event delivery.
+//!
+//! This module tree is the B2A-owned journal surface of the browser plane
+//! (Spec B2A, slice S7). It implements the closed `ck-browser-journal/v1`
+//! entry contract together with the durable allocator and store, reservation
+//! and transition-pin internals, dispatch commitment, recovery markers,
+//! reduced-rejection recovery, retained governing observations and snapshot
+//! pins, policy-event commitment, audit obligations, and live-session
+//! late-event delivery.
+//!
+//! The invocation-bound frozen pin, the B2B association seam, administration,
+//! manifest gating, and strict-bind-fact validation live in slice S10
+//! (`src/journal_pin.rs`, `src/journal_admin.rs`); this module supplies the
+//! machinery those surfaces build on and never edits them.
+//!
+//! # Durability model
+//!
+//! The specification requires a durable allocator, atomic capacity reservation,
+//! transition markers, export snapshots, retention mutation, and crash
+//! recovery. The concrete storage substrate is a release-time dependency; this
+//! implementation models durability with an in-memory store whose every
+//! mutating step is an explicit, atomic "commit". Fault injection lets tests
+//! fail a specific durable-write step so the marker, recovery, and cancellation
+//! contracts can be exercised without a real disk. Crash/restart is modeled by
+//! dropping invocation-only state (handles and tokens) and re-running recovery
+//! against the surviving durable records.
+//!
+//! # Serialization sizing
+//!
+//! Export encoding is newline-delimited RFC 8785 JSON Canonicalization Scheme
+//! (JCS) JSON, each line terminated by exactly one LF. Canonical JCS byte
+//! production is a release dependency; for capacity accounting this module
+//! measures the UTF-8 length of the deterministic `serde_json` encoding plus
+//! the terminating LF. Callers that require exact JCS bytes substitute the
+//! canonicalizer at the export seam without changing the accounting logic.
+
+// This module is a library API surface: slice S10 wires it into the crate root
+// (`pub mod journal`) and consumes its public items through the invocation pin,
+// the administration seam, and the manifest gates. Slice S7 delivers and tests
+// the module standalone, compiling it into the test crate via a `#[path]`
+// include rather than editing S10-owned `lib.rs`. In that standalone test
+// compilation not every public item is exercised, so rustc flags them as dead
+// code even though they are part of the frozen contract. The allowance keeps
+// the standalone S7 build warning-free without changing the public surface; in
+// the wired library build these items are live public API.
+#![allow(dead_code)]
+
+pub mod late_events;
+pub mod recovery;
+pub mod redaction;
+pub mod reservation;
+pub mod retention;
+pub mod snapshots;
+pub mod store;
+
+use serde::{Deserialize, Serialize};
+
+/// The literal `format_version` carried by every journal entry.
+pub const FORMAT_VERSION: &str = "ck-browser-journal/v1";
+
+/// The export `format_version` reported by the administration export surface.
+pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v1";
+
+/// The greatest sequence the allocator may hand out (`9007199254740991`).
+///
+/// Sequences live in `1..=MAX_SEQUENCE`. Advancement past this bound is
+/// exhaustion: it never wraps and produces `journal_reservation_failed`.
+pub const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
+
+/// Closed `internal_error.reason_code` vocabulary for journal entries.
+///
+/// `interrupted_after_dispatch` and `redaction_unavailable` are journal-only:
+/// B1 never surfaces them to a caller. The remaining codes are the closed set
+/// B1 may surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalReasonCode {
+    #[serde(rename = "journal_reservation_failed")]
+    JournalReservationFailed,
+    #[serde(rename = "journal_entry_oversize")]
+    JournalEntryOversize,
+    #[serde(rename = "interrupted_after_dispatch")]
+    InterruptedAfterDispatch,
+    #[serde(rename = "profile_storage_unavailable")]
+    ProfileStorageUnavailable,
+    #[serde(rename = "result_serialization_limit")]
+    ResultSerializationLimit,
+    #[serde(rename = "connector_failure")]
+    ConnectorFailure,
+    #[serde(rename = "cdp_failure")]
+    CdpFailure,
+    #[serde(rename = "redaction_unavailable")]
+    RedactionUnavailable,
+    #[serde(rename = "internal_failure")]
+    InternalFailure,
+}
+
+impl JournalReasonCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JournalReservationFailed => "journal_reservation_failed",
+            Self::JournalEntryOversize => "journal_entry_oversize",
+            Self::InterruptedAfterDispatch => "interrupted_after_dispatch",
+            Self::ProfileStorageUnavailable => "profile_storage_unavailable",
+            Self::ResultSerializationLimit => "result_serialization_limit",
+            Self::ConnectorFailure => "connector_failure",
+            Self::CdpFailure => "cdp_failure",
+            Self::RedactionUnavailable => "redaction_unavailable",
+            Self::InternalFailure => "internal_failure",
+        }
+    }
+}
+
+/// The error shape returned to invocation-side callers by the journal pin.
+///
+/// It carries exactly one closed reason code and never exception text, platform
+/// errors, oversize caller material, or implementation-specific messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalError {
+    pub reason_code: JournalReasonCode,
+}
+
+impl JournalError {
+    pub fn new(reason_code: JournalReasonCode) -> Self {
+        Self { reason_code }
+    }
+
+    pub fn reservation_failed() -> Self {
+        Self::new(JournalReasonCode::JournalReservationFailed)
+    }
+
+    pub fn internal_failure() -> Self {
+        Self::new(JournalReasonCode::InternalFailure)
+    }
+}
+
+/// The three journal phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    #[serde(rename = "rejected_pre_dispatch")]
+    RejectedPreDispatch,
+    #[serde(rename = "dispatched")]
+    Dispatched,
+    #[serde(rename = "policy_event")]
+    PolicyEvent,
+}
+
+/// The four unfenceable request capabilities that reserve journal capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Capability {
+    #[serde(rename = "browser.navigate")]
+    Navigate,
+    #[serde(rename = "browser.click")]
+    Click,
+    #[serde(rename = "browser.type")]
+    Type,
+    #[serde(rename = "browser.click_point")]
+    ClickPoint,
+}
+
+impl Capability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Navigate => "browser.navigate",
+            Self::Click => "browser.click",
+            Self::Type => "browser.type",
+            Self::ClickPoint => "browser.click_point",
+        }
+    }
+
+    /// Whether this capability's governing observation is a text snapshot.
+    pub fn governs_text_snapshot(self) -> bool {
+        matches!(self, Self::Click | Self::Type)
+    }
+
+    /// Whether this capability's governing observation is a screenshot.
+    pub fn governs_screenshot(self) -> bool {
+        matches!(self, Self::ClickPoint)
+    }
+}
+
+/// The eight B1 capability names that may appear as a policy-event
+/// `initiating_capability`, plus the null case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InitiatingCapability {
+    #[serde(rename = "browser.status")]
+    Status,
+    #[serde(rename = "browser.navigate")]
+    Navigate,
+    #[serde(rename = "browser.click")]
+    Click,
+    #[serde(rename = "browser.type")]
+    Type,
+    #[serde(rename = "browser.click_point")]
+    ClickPoint,
+    #[serde(rename = "browser.snapshot")]
+    Snapshot,
+    #[serde(rename = "browser.screenshot")]
+    Screenshot,
+    #[serde(rename = "browser.wait_for")]
+    WaitFor,
+}
+
+/// Daemon-stamped journal identity.
+///
+/// `principal` is the canonical projection defined by the manifest-pinned Spec A
+/// principal schema, never a raw identity string and never `not mcp:*`. The
+/// profile facts come from the applicable B2B current-open association.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalIdentity {
+    pub principal: String,
+    pub conversation_key: String,
+    pub agent_project_id: String,
+    pub session_kind: SessionKind,
+    pub profile_uuid: Option<String>,
+    pub profile_name: Option<String>,
+}
+
+/// Effective session kind, mirroring the closed Spec A enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Primary,
+    Subagent,
+    Ephemeral,
+}
+
+/// Severity classification attached to a request entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Severity {
+    pub tier: u8,
+    pub credential: bool,
+    pub financial: bool,
+}
+
+/// The grant-decision block. `reason` is null exactly for `allowed` and
+/// `not_reached`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantDecision {
+    pub outcome: GrantOutcome,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantOutcome {
+    Allowed,
+    Denied,
+    NotReached,
+}
+
+impl GrantDecision {
+    pub fn not_reached() -> Self {
+        Self {
+            outcome: GrantOutcome::NotReached,
+            reason: None,
+        }
+    }
+}
+
+/// The governing-observation block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GoverningObservation {
+    Text {
+        bytes_utf8: String,
+        observation_policy: TextObservationPolicy,
+    },
+    ImagePngB64 {
+        bytes_utf8: String,
+        observation_policy: ImageObservationPolicy,
+    },
+    None {
+        reason: NoObservationReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextObservationPolicy {
+    #[serde(rename = "ck-browser-redaction/v1")]
+    RedactionV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageObservationPolicy {
+    #[serde(rename = "visual_unredacted_v1")]
+    VisualUnredactedV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoObservationReason {
+    NoPriorObservation,
+    ObservationNotRequired,
+}
+
+impl GoverningObservation {
+    pub fn observation_not_required() -> Self {
+        Self::None {
+            reason: NoObservationReason::ObservationNotRequired,
+        }
+    }
+
+    pub fn no_prior_observation() -> Self {
+        Self::None {
+            reason: NoObservationReason::NoPriorObservation,
+        }
+    }
+}
+
+/// The typed action block for a request entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Action {
+    Navigate {
+        url_redacted: String,
+        wait: NavigateWait,
+    },
+    Click {
+        #[serde(rename = "ref")]
+        reference: String,
+        snapshot_id: String,
+    },
+    Type {
+        #[serde(rename = "ref")]
+        reference: String,
+        snapshot_id: String,
+        text_bytes_utf8: u64,
+        replace: bool,
+    },
+    ClickPoint {
+        snapshot_id: String,
+        x_px: i64,
+        y_px: i64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigateWait {
+    Settle,
+    None,
+}
+
+/// The locator block for a request entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Locator {
+    Ref {
+        #[serde(rename = "ref")]
+        reference: String,
+        snapshot_id: String,
+        frame_path: Vec<String>,
+        role: String,
+        name_redacted: String,
+        nth: u64,
+    },
+    Point {
+        snapshot_id: String,
+        x_px: i64,
+        y_px: i64,
+    },
+}
+
+/// The closed outcome-detail union for a request entry.
+///
+/// Normal request entries carry exactly the B1 frozen outcome and detail. The
+/// journal-only exceptions are `internal_error` with `interrupted_after_dispatch`
+/// (recovered dispatch commitment) and `internal_error` with
+/// `redaction_unavailable` (exact reduced redactor-unavailable entry), plus the
+/// deterministic oversize fallback `journal_entry_oversize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeDetail {
+    pub outcome: Outcome,
+    pub detail: Detail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Success,
+    InvalidRequest,
+    InternalError,
+    Denied,
+    StaleSnapshot,
+    ProfileBusy,
+}
+
+/// Closed detail block. The `reason_code` form covers every `internal_error`
+/// detail; structured B1 details (e.g. `profile_busy`) carry their own fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Detail {
+    ReasonCode { reason_code: JournalReasonCode },
+    ProfileBusy { profile_uuid: String },
+    Message { message: String },
+}
+
+impl Detail {
+    pub fn reason_code(code: JournalReasonCode) -> Self {
+        Self::ReasonCode { reason_code: code }
+    }
+}
+
+/// A policy-event detail block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum PolicyEventDetail {
+    DownloadBlocked {
+        initiating_capability: Option<InitiatingCapability>,
+        initiating_snapshot_id: Option<String>,
+    },
+    JsDialogDismissed {
+        initiating_capability: Option<InitiatingCapability>,
+        initiating_snapshot_id: Option<String>,
+    },
+    OriginTransitionBlocked {
+        initiating_capability: Option<InitiatingCapability>,
+        attempted_origin: String,
+    },
+    NetworkRequestBlocked {
+        initiating_capability: Option<InitiatingCapability>,
+        reason_code: String,
+    },
+}
+
+/// The closed `ck-browser-journal/v1` entry.
+///
+/// No additional fields are permitted (`deny_unknown_fields`). For a policy
+/// event, `capability`, `intent_redacted`, `requested_severity`,
+/// `effective_severity`, `action`, and `locator` are null, `grant_decision` is
+/// `not_reached`, `outcome` is null, and `detail` carries the event block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalEntry {
+    pub format_version: String,
+    pub sequence: u64,
+    pub phase: Phase,
+    pub identity: JournalIdentity,
+    pub capability: Option<Capability>,
+    pub intent_redacted: Option<String>,
+    pub requested_severity: Option<Severity>,
+    pub effective_severity: Option<Severity>,
+    pub grant_decision: GrantDecision,
+    pub governing_observation: GoverningObservation,
+    pub action: Option<Action>,
+    pub locator: Option<Locator>,
+    pub snapshot_ids: Vec<String>,
+    pub outcome: Option<Outcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl JournalEntry {
+    /// The RFC 8785 JCS-plus-LF size used for capacity accounting.
+    ///
+    /// See the module note on serialization sizing: this measures the
+    /// deterministic `serde_json` encoding plus the terminating LF byte.
+    pub fn serialized_size(&self) -> u64 {
+        // `serde_json::to_vec` produces a deterministic encoding for the closed
+        // entry shape; the canonical JCS byte production is a release seam.
+        let bytes = serde_json::to_vec(self).expect("closed entry serializes");
+        (bytes.len() + 1) as u64
+    }
+
+    /// Serialize this entry as one export line: the JCS JSON followed by exactly
+    /// one terminating LF.
+    pub fn export_line(&self) -> String {
+        let mut line = serde_json::to_string(self).expect("closed entry serializes");
+        line.push('\n');
+        line
+    }
+}
+
+/// Manifest-bound journal deployment configuration.
+///
+/// `journal_max_entry_bytes <= journal_retention_bytes` and both are positive.
+/// Neither release tooling nor runtime code infers missing values; absent bounds
+/// keep the affected surfaces unadvertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalConfig {
+    pub journal_retention_bytes: u64,
+    pub journal_max_entry_bytes: u64,
+}
+
+impl JournalConfig {
+    /// Validate the ordering and positivity invariant.
+    pub fn validate(&self) -> Result<(), JournalError> {
+        if self.journal_retention_bytes == 0
+            || self.journal_max_entry_bytes == 0
+            || self.journal_max_entry_bytes > self.journal_retention_bytes
+        {
+            return Err(JournalError::internal_failure());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> JournalIdentity {
+        JournalIdentity {
+            principal: "direct:agent".to_string(),
+            conversation_key: "conv-1".to_string(),
+            agent_project_id: "proj-1".to_string(),
+            session_kind: SessionKind::Primary,
+            profile_uuid: None,
+            profile_name: None,
+        }
+    }
+
+    #[test]
+    fn reason_code_round_trips_through_closed_vocabulary() {
+        for code in [
+            JournalReasonCode::JournalReservationFailed,
+            JournalReasonCode::JournalEntryOversize,
+            JournalReasonCode::InterruptedAfterDispatch,
+            JournalReasonCode::RedactionUnavailable,
+            JournalReasonCode::InternalFailure,
+        ] {
+            let json = serde_json::to_string(&code).unwrap();
+            let back: JournalReasonCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code);
+        }
+    }
+
+    #[test]
+    fn entry_serialized_size_includes_terminating_lf() {
+        let entry = JournalEntry {
+            format_version: FORMAT_VERSION.to_string(),
+            sequence: 1,
+            phase: Phase::RejectedPreDispatch,
+            identity: identity(),
+            capability: Some(Capability::Navigate),
+            intent_redacted: None,
+            requested_severity: None,
+            effective_severity: None,
+            grant_decision: GrantDecision::not_reached(),
+            governing_observation: GoverningObservation::observation_not_required(),
+            action: None,
+            locator: None,
+            snapshot_ids: vec![],
+            outcome: Some(Outcome::InternalError),
+            detail: Some(serde_json::json!({"reason_code":"journal_entry_oversize"})),
+        };
+        let line = entry.export_line();
+        assert!(line.ends_with('\n'));
+        assert_eq!(entry.serialized_size() as usize, line.len());
+    }
+
+    #[test]
+    fn entry_rejects_unknown_fields() {
+        let json = r#"{"format_version":"ck-browser-journal/v1","sequence":1,"phase":"dispatched","identity":{"principal":"p","conversation_key":"c","agent_project_id":"a","session_kind":"primary","profile_uuid":null,"profile_name":null},"capability":null,"intent_redacted":null,"requested_severity":null,"effective_severity":null,"grant_decision":{"outcome":"not_reached","reason":null},"governing_observation":{"kind":"none","reason":"observation_not_required"},"action":null,"locator":null,"snapshot_ids":[],"outcome":null,"extra":1}"#;
+        let parsed: Result<JournalEntry, _> = serde_json::from_str(json);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn config_validate_enforces_ordering_and_positivity() {
+        assert!(JournalConfig {
+            journal_retention_bytes: 100,
+            journal_max_entry_bytes: 50,
+        }
+        .validate()
+        .is_ok());
+        assert!(JournalConfig {
+            journal_retention_bytes: 50,
+            journal_max_entry_bytes: 100,
+        }
+        .validate()
+        .is_err());
+        assert!(JournalConfig {
+            journal_retention_bytes: 0,
+            journal_max_entry_bytes: 0,
+        }
+        .validate()
+        .is_err());
+    }
+}
