@@ -505,6 +505,17 @@ impl BrowserPlane {
             ..Self::default()
         }
     }
+    /// Test seam for the per-context dispatch lane.
+    ///
+    /// The lane's mutual exclusion is an ordering property with no observable
+    /// effect on any single call's result, so it cannot be asserted through the
+    /// public dispatch surface alone.  Exposing the guard lets a test hold two
+    /// lanes concurrently and observe that the same context never grants both.
+    #[doc(hidden)]
+    pub async fn lane_for_test(&self, key: &str) -> OwnedMutexGuard<()> {
+        self.lane(key).await
+    }
+
     async fn lane(&self, key: &str) -> OwnedMutexGuard<()> {
         let lane = {
             let mut lanes = self.lanes.lock().await;
