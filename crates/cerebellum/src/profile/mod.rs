@@ -1,0 +1,3233 @@
+//! Browser-profile registry and lifecycle boundary.
+//!
+//! This module is intentionally standalone and provides the browser-profile
+//! registry and lifecycle boundary. Browser integration can declare it at the
+//! crate root, while all filesystem operations begin from [`HeldManagedRoot`].
+//! A caller-supplied string is never used directly as a profile path.
+
+#![allow(clippy::result_large_err)]
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::error::Error;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+/// The immutable, bundled browser-profile registry artifact shipped with the crate.
+pub const REGISTRY_ARTIFACT: &[u8] =
+    include_bytes!("../../resources/ck-browser-profile-registry-v1.json");
+pub const REGISTRY_ARTIFACT_ID: &str = "ck-browser-profile-registry";
+pub const REGISTRY_ARTIFACT_REVISION: &str = "v1";
+pub const REGISTRY_SCHEMA: &str = "ck-browser-profile-registry/v1";
+const REGISTRY_FILE: &str = ".ck-browser-profile-registry-v1.json";
+const DURABLE_LOCK_FILE: &str = ".ck-browser-profile-durable-slot.lock";
+static UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const IMPLEMENTATION_MAGIC: &[u8] = b"ck-browser-profile-registry-implementation-bundle/v1\n";
+const IMPLEMENTATION_SOURCE: &[u8] = include_bytes!("mod.rs");
+
+/// The bundled registry artifact defines the complete set of valid profile states.
+/// Values not listed by that artifact are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileState {
+    Provisional,
+    Available,
+    Attached,
+    SealingTransition,
+    Locked,
+    Quarantined,
+    Incomplete,
+    Unavailable,
+    Released,
+    DeletionFailed,
+}
+
+impl ProfileState {
+    fn legal_for(self, kind: ProfileKind) -> bool {
+        kind == ProfileKind::Disposable || self != Self::DeletionFailed
+    }
+}
+
+/// The two profile kinds whose records own filesystem directories: durable and disposable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileKind {
+    Durable,
+    Disposable,
+}
+
+/// The disposition supplied as a stamped fact. Validation checks the supplied
+/// session-kind and disposition pair, but does not derive the disposition locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileDisposition {
+    Durable,
+    Disposable,
+    None,
+}
+
+/// The session kind recorded in a validated bind context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Primary,
+    Subagent,
+    Ephemeral,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Subagent => "subagent",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+impl ProfileDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Disposable => "disposable",
+            Self::None => "none",
+        }
+    }
+
+    fn valid_for(self, kind: SessionKind) -> bool {
+        matches!(
+            (kind, self),
+            (SessionKind::Primary, Self::Durable)
+                | (SessionKind::Subagent, Self::Disposable)
+                | (SessionKind::Ephemeral, Self::None)
+        )
+    }
+}
+
+/// Facts presented to the strict validator.  This is an input-only type: the
+/// lifecycle API accepts [`StampedBindContext`], not this carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindFacts {
+    pub principal: String,
+    pub conversation_key: String,
+    pub agent_project_id: String,
+    pub session_kind: Option<String>,
+    pub profile_disposition: Option<String>,
+    pub effective_capability_scope: Option<Vec<String>>,
+    pub provenance: String,
+}
+
+/// A daemon-stamped, already validated bind context.
+///
+/// The fields are private so callers cannot supply replacement identity, grant,
+/// UUID, profile, or authority facts. Construction performs the pair check once
+/// and records the immutable fact tuple in this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedBindContext {
+    principal: String,
+    conversation_key: String,
+    agent_project_id: String,
+    session_kind: SessionKind,
+    profile_disposition: ProfileDisposition,
+    effective_capability_scope: Option<Vec<String>>,
+}
+
+pub type ValidatedBindContext = StampedBindContext;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindValidationError {
+    MissingFact(&'static str),
+    EmptyFact(&'static str),
+    InvalidProvenance,
+    UnknownSessionKind,
+    UnknownDisposition,
+    IncompatibleKindDisposition,
+    InvalidScope,
+}
+
+impl fmt::Display for BindValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingFact(name) => write!(f, "missing stamped bind fact {name}"),
+            Self::EmptyFact(name) => write!(f, "empty stamped bind fact {name}"),
+            Self::InvalidProvenance => write!(f, "bind facts are not daemon stamped"),
+            Self::UnknownSessionKind => write!(f, "unknown session kind"),
+            Self::UnknownDisposition => write!(f, "unknown profile disposition"),
+            Self::IncompatibleKindDisposition => write!(f, "incompatible kind/disposition pair"),
+            Self::InvalidScope => write!(f, "invalid effective capability scope"),
+        }
+    }
+}
+impl Error for BindValidationError {}
+
+impl StampedBindContext {
+    pub fn validate(facts: BindFacts) -> Result<Self, BindValidationError> {
+        if facts.provenance != "daemon_attested_spec_a" {
+            return Err(BindValidationError::InvalidProvenance);
+        }
+        for (name, value) in [
+            ("principal", facts.principal.as_str()),
+            ("conversation_key", facts.conversation_key.as_str()),
+            ("agent_project_id", facts.agent_project_id.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(BindValidationError::EmptyFact(name));
+            }
+        }
+        let kind = facts
+            .session_kind
+            .ok_or(BindValidationError::MissingFact("session_kind"))
+            .and_then(|value| match value.as_str() {
+                "primary" => Ok(SessionKind::Primary),
+                "subagent" => Ok(SessionKind::Subagent),
+                "ephemeral" => Ok(SessionKind::Ephemeral),
+                _ => Err(BindValidationError::UnknownSessionKind),
+            })?;
+        let disposition = facts
+            .profile_disposition
+            .ok_or(BindValidationError::MissingFact("profile_disposition"))
+            .and_then(|value| match value.as_str() {
+                "durable" => Ok(ProfileDisposition::Durable),
+                "disposable" => Ok(ProfileDisposition::Disposable),
+                "none" => Ok(ProfileDisposition::None),
+                _ => Err(BindValidationError::UnknownDisposition),
+            })?;
+        if !disposition.valid_for(kind) {
+            return Err(BindValidationError::IncompatibleKindDisposition);
+        }
+        if let Some(scope) = &facts.effective_capability_scope {
+            if scope.iter().any(|entry| entry.is_empty()) {
+                return Err(BindValidationError::InvalidScope);
+            }
+        } else {
+            return Err(BindValidationError::MissingFact(
+                "effective_capability_scope",
+            ));
+        }
+        Ok(Self {
+            principal: facts.principal,
+            conversation_key: facts.conversation_key,
+            agent_project_id: facts.agent_project_id,
+            session_kind: kind,
+            profile_disposition: disposition,
+            effective_capability_scope: facts.effective_capability_scope,
+        })
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+    pub fn conversation_key(&self) -> &str {
+        &self.conversation_key
+    }
+    pub fn agent_project_id(&self) -> &str {
+        &self.agent_project_id
+    }
+    pub fn session_kind(&self) -> SessionKind {
+        self.session_kind
+    }
+    pub fn profile_disposition(&self) -> ProfileDisposition {
+        self.profile_disposition
+    }
+    pub fn effective_capability_scope(&self) -> Option<&[String]> {
+        self.effective_capability_scope.as_deref()
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut bytes = Vec::new();
+        for value in [
+            self.principal.as_bytes(),
+            self.conversation_key.as_bytes(),
+            self.agent_project_id.as_bytes(),
+            self.session_kind.as_str().as_bytes(),
+            self.profile_disposition.as_str().as_bytes(),
+        ] {
+            bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(value);
+        }
+        hex(&Sha256::digest(bytes))
+    }
+}
+
+/// Construct a strict context without exposing an unvalidated alternative.
+pub fn stamped_bind_context(facts: BindFacts) -> Result<StampedBindContext, BindValidationError> {
+    StampedBindContext::validate(facts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureOrigin {
+    RegistryOrStorage,
+    CkcredDependency,
+}
+
+impl FailureOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RegistryOrStorage => "registry_or_storage",
+            Self::CkcredDependency => "ckcred_dependency",
+        }
+    }
+}
+
+/// The only authority data permitted to pass from profile lifecycle handling to
+/// credential and grant handling: the project, session kind, and profile UUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CkcredAuthority {
+    pub project_id: String,
+    pub session_kind: SessionKind,
+    pub profile_uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileOutcome {
+    ProfileBusy {
+        profile_uuid: String,
+    },
+    ProfileGrantRequired {
+        reason_code: &'static str,
+    },
+    NoSession {
+        reason_code: &'static str,
+    },
+    StorageUnavailable {
+        reason_code: &'static str,
+        origin: FailureOrigin,
+    },
+    InternalFailure {
+        reason_code: &'static str,
+    },
+}
+
+impl ProfileOutcome {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::ProfileBusy { .. } => "profile_busy",
+            Self::ProfileGrantRequired { reason_code }
+            | Self::NoSession { reason_code }
+            | Self::StorageUnavailable { reason_code, .. }
+            | Self::InternalFailure { reason_code } => reason_code,
+        }
+    }
+
+    pub fn as_json(&self) -> Value {
+        match self {
+            Self::ProfileBusy { profile_uuid } => serde_json::json!({
+                "outcome":"profile_busy", "profile_uuid":profile_uuid
+            }),
+            Self::ProfileGrantRequired { reason_code } => serde_json::json!({
+                "outcome":"profile_grant_required", "reason_code":reason_code
+            }),
+            Self::NoSession { reason_code } => serde_json::json!({
+                "outcome":"no_session", "reason_code":reason_code
+            }),
+            Self::StorageUnavailable {
+                reason_code,
+                origin,
+            } => serde_json::json!({
+                "outcome":"internal_error", "reason_code":reason_code,
+                "profile_storage_failure_origin":origin.as_str()
+            }),
+            Self::InternalFailure { reason_code } => serde_json::json!({
+                "outcome":"internal_error", "reason_code":reason_code
+            }),
+        }
+    }
+}
+
+impl fmt::Display for ProfileOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_json())
+    }
+}
+
+/// Stable identity for a directory and the held descriptor.  Device and inode
+/// are the identity proof on Unix; metadata size is only a conservative fallback
+/// on other platforms and never authorizes a target outside the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    len: u64,
+    readonly: bool,
+}
+
+fn stable_identity(metadata: &fs::Metadata) -> StableIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        StableIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            readonly: metadata.permissions().readonly(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        StableIdentity {
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RootError {
+    Io(io::Error),
+    NotDirectory,
+    SymlinkNotAllowed,
+    Unstable,
+    OutsideRoot,
+    InvalidTarget,
+}
+impl fmt::Display for RootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "managed root I/O: {e}"),
+            Self::NotDirectory => write!(f, "managed root is not a directory"),
+            Self::SymlinkNotAllowed => write!(f, "managed root or target is a symlink"),
+            Self::Unstable => write!(f, "managed root identity changed"),
+            Self::OutsideRoot => write!(f, "target escapes managed root"),
+            Self::InvalidTarget => write!(f, "invalid profile target"),
+        }
+    }
+}
+impl Error for RootError {}
+impl From<io::Error> for RootError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// A held managed-root directory handle.  The canonical string is only used to
+/// revalidate containment; target access always revalidates against this handle.
+#[derive(Debug)]
+pub struct HeldManagedRoot {
+    path: PathBuf,
+    handle: File,
+    identity: StableIdentity,
+}
+
+impl HeldManagedRoot {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RootError> {
+        let supplied = path.as_ref();
+        let link_meta = fs::symlink_metadata(supplied)?;
+        if link_meta.file_type().is_symlink() {
+            return Err(RootError::SymlinkNotAllowed);
+        }
+        if !link_meta.is_dir() {
+            return Err(RootError::NotDirectory);
+        }
+        let canonical = fs::canonicalize(supplied)?;
+        let handle = OpenOptions::new().read(true).open(&canonical)?;
+        let metadata = handle.metadata()?;
+        if !metadata.is_dir() {
+            return Err(RootError::NotDirectory);
+        }
+        let identity = stable_identity(&metadata);
+        Ok(Self {
+            path: canonical,
+            handle,
+            identity,
+        })
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.path
+    }
+
+    fn binding(&self) -> String {
+        let mut bytes = self.path.to_string_lossy().as_bytes().to_vec();
+        #[cfg(unix)]
+        {
+            bytes.extend_from_slice(&self.identity.device.to_be_bytes());
+            bytes.extend_from_slice(&self.identity.inode.to_be_bytes());
+        }
+        #[cfg(not(unix))]
+        bytes.extend_from_slice(&self.identity.len.to_be_bytes());
+        hex(&Sha256::digest(bytes))
+    }
+
+    fn revalidate(&self) -> Result<(), RootError> {
+        let current_path = fs::canonicalize(&self.path).map_err(RootError::Io)?;
+        if current_path != self.path {
+            return Err(RootError::Unstable);
+        }
+        let current = fs::symlink_metadata(&self.path)?;
+        if current.file_type().is_symlink() || !current.is_dir() {
+            return Err(RootError::Unstable);
+        }
+        let held = self.handle.metadata()?;
+        if stable_identity(&held) != self.identity || stable_identity(&current) != self.identity {
+            return Err(RootError::Unstable);
+        }
+        Ok(())
+    }
+
+    fn contained(&self, path: &Path) -> bool {
+        path == self.path || path.strip_prefix(&self.path).is_ok()
+    }
+
+    fn target_path(&self, relative: &Path, create: bool) -> Result<PathBuf, RootError> {
+        self.revalidate()?;
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(RootError::InvalidTarget);
+        }
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(RootError::InvalidTarget);
+        }
+        let target = self.path.join(relative);
+        let mut cursor = self.path.clone();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(RootError::InvalidTarget);
+            };
+            cursor.push(name);
+            match fs::symlink_metadata(&cursor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(RootError::SymlinkNotAllowed)
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(RootError::Io(error)),
+            }
+        }
+        let parent = target.parent().ok_or(RootError::InvalidTarget)?;
+        if create {
+            fs::create_dir_all(parent)?;
+        }
+        let canonical_parent = fs::canonicalize(parent)?;
+        if !self.contained(&canonical_parent) {
+            return Err(RootError::OutsideRoot);
+        }
+        if target.exists() {
+            let metadata = fs::symlink_metadata(&target)?;
+            if metadata.file_type().is_symlink() {
+                return Err(RootError::SymlinkNotAllowed);
+            }
+            let canonical_target = fs::canonicalize(&target)?;
+            if !self.contained(&canonical_target) {
+                return Err(RootError::OutsideRoot);
+            }
+        }
+        Ok(target)
+    }
+
+    pub fn open_target(&self, relative: &Path) -> Result<TargetHandle, RootError> {
+        let target = self.target_path(relative, false)?;
+        let metadata = fs::symlink_metadata(&target).map_err(RootError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RootError::InvalidTarget);
+        }
+        let canonical = fs::canonicalize(&target)?;
+        if !self.contained(&canonical) {
+            return Err(RootError::OutsideRoot);
+        }
+        let handle = OpenOptions::new().read(true).open(&canonical)?;
+        let identity = stable_identity(&handle.metadata()?);
+        Ok(TargetHandle {
+            path: canonical,
+            handle,
+            identity,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct TargetHandle {
+    path: PathBuf,
+    handle: File,
+    identity: StableIdentity,
+}
+impl TargetHandle {
+    pub fn canonical_path(&self) -> &Path {
+        &self.path
+    }
+    pub fn revalidate(&self) -> Result<(), RootError> {
+        let current = fs::symlink_metadata(&self.path)?;
+        if current.file_type().is_symlink() || !current.is_dir() {
+            return Err(RootError::Unstable);
+        }
+        let held = self.handle.metadata()?;
+        if stable_identity(&held) != self.identity || stable_identity(&current) != self.identity {
+            return Err(RootError::Unstable);
+        }
+        Ok(())
+    }
+
+    /// Consume the validated target handle before recursive deletion.  The
+    /// caller retains the registry exclusion lock while this operation runs.
+    pub fn remove_recursive(self) -> Result<(), RootError> {
+        self.revalidate()?;
+        let path = self.path;
+        drop(self.handle);
+        fs::remove_dir_all(path).map_err(RootError::Io)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactError {
+    InvalidJson,
+    MissingField(&'static str),
+    WrongIdentifier,
+    WrongRevision,
+    InvalidSchema,
+    UnknownField(String),
+    InvalidProviderSet,
+    InvalidTransitionTable,
+    InvalidFixtures,
+    DigestMismatch,
+}
+impl fmt::Display for ArtifactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJson => write!(f, "invalid profile registry artifact JSON"),
+            Self::MissingField(name) => write!(f, "artifact missing {name}"),
+            Self::WrongIdentifier => write!(f, "wrong profile registry artifact identifier"),
+            Self::WrongRevision => write!(f, "wrong profile registry artifact revision"),
+            Self::InvalidSchema => write!(f, "invalid profile registry artifact schema"),
+            Self::UnknownField(name) => write!(f, "unknown artifact field {name}"),
+            Self::InvalidProviderSet => write!(f, "incomplete authoritative provider set"),
+            Self::InvalidTransitionTable => write!(f, "incomplete transition table"),
+            Self::InvalidFixtures => write!(f, "missing immutable expected-result fixtures"),
+            Self::DigestMismatch => write!(f, "implementation digest mismatch"),
+        }
+    }
+}
+impl Error for ArtifactError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactGateReport {
+    pub artifact_id: String,
+    pub revision: String,
+    pub implementation_digest: String,
+    pub provider_ids: BTreeSet<String>,
+    pub fixture_count: usize,
+}
+
+const REQUIRED_PROVIDERS: [&str; 5] = [
+    "instance",
+    "session",
+    "attachment",
+    "lock_owner",
+    "supervised_process",
+];
+const REQUIRED_MEMBERS: [&str; 11] = [
+    "adapter-configuration",
+    "deletion-fencing-implementation",
+    "fixture-set",
+    "liveness-adapter/attachment",
+    "liveness-adapter/instance",
+    "liveness-adapter/lock_owner",
+    "liveness-adapter/session",
+    "liveness-adapter/supervised_process",
+    "persistence-adapter",
+    "registry-artifact",
+    "transition-implementation",
+];
+
+fn object<'a>(
+    value: &'a Value,
+    key: &'static str,
+) -> Result<&'a Map<String, Value>, ArtifactError> {
+    value
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or(ArtifactError::MissingField(key))
+}
+fn string_field<'a>(value: &'a Value, key: &'static str) -> Result<&'a str, ArtifactError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(ArtifactError::MissingField(key))
+}
+
+fn artifact_value(bytes: &[u8]) -> Result<Value, ArtifactError> {
+    serde_json::from_slice(bytes).map_err(|_| ArtifactError::InvalidJson)
+}
+
+fn validate_artifact(bytes: &[u8]) -> Result<(Value, ArtifactGateReport), ArtifactError> {
+    let value = artifact_value(bytes)?;
+    let root = value.as_object().ok_or(ArtifactError::InvalidSchema)?;
+    let allowed = [
+        "artifact_id",
+        "revision",
+        "schema",
+        "managed_root",
+        "implementation_digest",
+        "schemas",
+        "providers",
+        "transitions",
+        "recovery",
+        "fixtures",
+        "conformance",
+    ];
+    for key in root.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(ArtifactError::UnknownField(key.clone()));
+        }
+    }
+    if string_field(&value, "artifact_id")? != REGISTRY_ARTIFACT_ID {
+        return Err(ArtifactError::WrongIdentifier);
+    }
+    if string_field(&value, "revision")? != REGISTRY_ARTIFACT_REVISION {
+        return Err(ArtifactError::WrongRevision);
+    }
+    if string_field(&value, "schema")? != REGISTRY_SCHEMA {
+        return Err(ArtifactError::InvalidSchema);
+    }
+    let managed = object(&value, "managed_root")?;
+    for key in [
+        "config_id",
+        "canonical",
+        "directory",
+        "readable",
+        "stable_identity",
+        "symlink_policy",
+        "mount_boundary",
+        "target_rule",
+    ] {
+        if !managed.contains_key(key) {
+            return Err(ArtifactError::MissingField(key));
+        }
+    }
+    let providers = object(&value, "providers")?;
+    let complete = providers
+        .get("complete_source_set")
+        .and_then(Value::as_array)
+        .ok_or(ArtifactError::InvalidProviderSet)?;
+    let ids: BTreeSet<String> = complete
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect();
+    if ids.len() != REQUIRED_PROVIDERS.len()
+        || REQUIRED_PROVIDERS.iter().any(|id| !ids.contains(*id))
+    {
+        return Err(ArtifactError::InvalidProviderSet);
+    }
+    let provider_defs = providers
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or(ArtifactError::InvalidProviderSet)?;
+    if provider_defs.len() != REQUIRED_PROVIDERS.len() {
+        return Err(ArtifactError::InvalidProviderSet);
+    }
+    let transitions = value
+        .get("transitions")
+        .and_then(Value::as_array)
+        .ok_or(ArtifactError::InvalidTransitionTable)?;
+    let transition_ids: BTreeSet<&str> = transitions
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .collect();
+    for id in [
+        "durable_create",
+        "durable_commit",
+        "attach",
+        "reuse",
+        "abort",
+        "release_durable",
+        "release_disposable",
+        "deletion_failed",
+    ] {
+        if !transition_ids.contains(id) {
+            return Err(ArtifactError::InvalidTransitionTable);
+        }
+    }
+    let fixtures = object(&value, "fixtures")?;
+    if fixtures.get("expected_result_bytes_are_immutable") != Some(&Value::Bool(true)) {
+        return Err(ArtifactError::InvalidFixtures);
+    }
+    let fixture_values = fixtures
+        .get("expected_results")
+        .and_then(Value::as_array)
+        .ok_or(ArtifactError::InvalidFixtures)?;
+    if fixture_values.len() < 20 {
+        return Err(ArtifactError::InvalidFixtures);
+    }
+    let conformance = object(&value, "conformance")?;
+    if conformance.get("passed") != Some(&Value::Bool(true)) {
+        return Err(ArtifactError::InvalidFixtures);
+    }
+    let digest = object(&value, "implementation_digest")?;
+    let digest_object = Value::Object(digest.clone());
+    let digest_value = string_field(&digest_object, "value")?.to_string();
+    if digest_value.len() != 64 || !digest_value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ArtifactError::DigestMismatch);
+    }
+    let fixture_count = fixture_values.len();
+    Ok((
+        value,
+        ArtifactGateReport {
+            artifact_id: REGISTRY_ARTIFACT_ID.to_string(),
+            revision: REGISTRY_ARTIFACT_REVISION.to_string(),
+            implementation_digest: digest_value,
+            provider_ids: ids,
+            fixture_count,
+        },
+    ))
+}
+
+fn canonical_json(value: &Value) -> Vec<u8> {
+    fn write(value: &Value, out: &mut Vec<u8>) {
+        match value {
+            Value::Null => out.extend_from_slice(b"null"),
+            Value::Bool(value) => out.extend_from_slice(if *value { b"true" } else { b"false" }),
+            Value::Number(value) => out.extend_from_slice(value.to_string().as_bytes()),
+            Value::String(value) => {
+                out.extend_from_slice(serde_json::to_string(value).unwrap().as_bytes())
+            }
+            Value::Array(values) => {
+                out.push(b'[');
+                for (index, item) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    write(item, out);
+                }
+                out.push(b']');
+            }
+            Value::Object(values) => {
+                out.push(b'{');
+                let mut keys: Vec<&String> = values.keys().collect();
+                keys.sort();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(serde_json::to_string(key).unwrap().as_bytes());
+                    out.push(b':');
+                    write(&values[key], out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+    let mut out = Vec::new();
+    write(value, &mut out);
+    out
+}
+
+fn artifact_for_digest(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(digest) = value
+        .get_mut("implementation_digest")
+        .and_then(Value::as_object_mut)
+    {
+        digest.insert("value".to_string(), Value::String(String::new()));
+    }
+    value
+}
+
+/// Build the canonical length-prefixed implementation bundle.  The digest
+/// declaration is blanked only while hashing so an artifact can carry the
+/// resulting digest without a self-referential fixed point.
+pub fn implementation_bundle(artifact_bytes: &[u8]) -> Result<Vec<u8>, ArtifactError> {
+    let artifact = artifact_value(artifact_bytes)?;
+    let fixture_set = artifact
+        .get("fixtures")
+        .cloned()
+        .ok_or(ArtifactError::MissingField("fixtures"))?;
+    let adapter_configuration = serde_json::json!({
+        "grant_verifier_adapter":"ckcred.grant.v1",
+        "sealing_adapter":"ckcred.sealing.v1",
+        "uuid_protocol":"external_frozen_protocol",
+        "managed_root_config_id":"cerebellum.profile_root"
+    });
+    let mut members: Vec<(String, Vec<u8>)> = vec![
+        (
+            "registry-artifact".to_string(),
+            canonical_json(&artifact_for_digest(&artifact)),
+        ),
+        (
+            "transition-implementation".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "persistence-adapter".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "liveness-adapter/instance".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "liveness-adapter/session".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "liveness-adapter/attachment".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "liveness-adapter/lock_owner".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "liveness-adapter/supervised_process".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "deletion-fencing-implementation".to_string(),
+            IMPLEMENTATION_SOURCE.to_vec(),
+        ),
+        (
+            "adapter-configuration".to_string(),
+            canonical_json(&adapter_configuration),
+        ),
+        ("fixture-set".to_string(), canonical_json(&fixture_set)),
+    ];
+    members.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let identifiers: Vec<&str> = members
+        .iter()
+        .map(|(identifier, _)| identifier.as_str())
+        .collect();
+    if identifiers != REQUIRED_MEMBERS.to_vec() {
+        return Err(ArtifactError::InvalidFixtures);
+    }
+    let mut bundle = Vec::from(IMPLEMENTATION_MAGIC);
+    bundle.extend_from_slice(&(members.len() as u32).to_be_bytes());
+    for (identifier, content) in members {
+        bundle.extend_from_slice(&(identifier.len() as u32).to_be_bytes());
+        bundle.extend_from_slice(identifier.as_bytes());
+        bundle.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        bundle.extend_from_slice(&content);
+    }
+    Ok(bundle)
+}
+
+pub fn implementation_digest_for(artifact_bytes: &[u8]) -> Result<String, ArtifactError> {
+    Ok(hex(&Sha256::digest(implementation_bundle(artifact_bytes)?)))
+}
+
+/// Verify the artifact and its implementation-bound digest without using a
+/// source-tree hash, build identifier, or ambient approval flag.
+pub fn verify_implementation_digest(
+    artifact_bytes: &[u8],
+) -> Result<ArtifactGateReport, ArtifactError> {
+    let (value, mut report) = validate_artifact(artifact_bytes)?;
+    let computed = implementation_digest_for(artifact_bytes)?;
+    if computed != report.implementation_digest {
+        return Err(ArtifactError::DigestMismatch);
+    }
+    report.implementation_digest = computed;
+    let _ = value;
+    Ok(report)
+}
+
+/// Return the checked-in expected-result bytes.  The fixture runner consumes
+/// these values as immutable inputs; it never derives expected results from the
+/// state reached by an implementation under test.
+pub fn immutable_fixture_expectations() -> Result<Vec<Value>, ArtifactError> {
+    let artifact = artifact_value(REGISTRY_ARTIFACT)?;
+    artifact
+        .get("fixtures")
+        .and_then(|fixtures| fixtures.get("expected_results"))
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or(ArtifactError::InvalidFixtures)
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryConfig {
+    pub artifact_bytes: Vec<u8>,
+    pub fixture_conformance: bool,
+    pub uuid_protocol_compatible: bool,
+    pub grant_verifier_available: bool,
+    pub grant_accepted: bool,
+    pub grant_authority: Option<CkcredAuthority>,
+    pub sealing_available: bool,
+    pub release_failure: bool,
+    pub abort_failure: bool,
+    pub deletion_failure_after_start: bool,
+}
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            artifact_bytes: REGISTRY_ARTIFACT.to_vec(),
+            fixture_conformance: true,
+            uuid_protocol_compatible: false,
+            grant_verifier_available: false,
+            grant_accepted: true,
+            grant_authority: None,
+            sealing_available: false,
+            release_failure: false,
+            abort_failure: false,
+            deletion_failure_after_start: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RegistryError {
+    Root(RootError),
+    Artifact(ArtifactError),
+    Io(io::Error),
+    Integrity,
+    UnknownField(String),
+    UnsupportedState,
+    Conflict,
+    Untrustworthy(String),
+    InvalidTransition,
+}
+impl fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root(error) => write!(f, "{error}"),
+            Self::Artifact(error) => write!(f, "{error}"),
+            Self::Io(error) => write!(f, "profile registry I/O: {error}"),
+            Self::Integrity => write!(f, "profile registry integrity failure"),
+            Self::UnknownField(field) => write!(f, "unknown profile registry field {field}"),
+            Self::UnsupportedState => write!(f, "unsupported profile registry state"),
+            Self::Conflict => write!(f, "profile registry identity conflict"),
+            Self::Untrustworthy(reason) => write!(f, "untrustworthy profile registry: {reason}"),
+            Self::InvalidTransition => write!(f, "invalid profile lifecycle transition"),
+        }
+    }
+}
+impl Error for RegistryError {}
+impl From<RootError> for RegistryError {
+    fn from(value: RootError) -> Self {
+        Self::Root(value)
+    }
+}
+impl From<ArtifactError> for RegistryError {
+    fn from(value: ArtifactError) -> Self {
+        Self::Artifact(value)
+    }
+}
+impl From<io::Error> for RegistryError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SealState {
+    Sealed,
+    Available,
+    Unsealed,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryRecord {
+    pub project_id: String,
+    pub kind: ProfileKind,
+    pub target: String,
+    pub transaction_id: String,
+    pub state: ProfileState,
+    pub owner_instance: String,
+    pub profile_uuid: String,
+    pub profile_name: Option<String>,
+    pub session_id: Option<String>,
+    pub attachment_id: Option<String>,
+    pub process: Option<ProcessIdentity>,
+    pub seal_state: SealState,
+    pub quarantine: Option<QuarantineReason>,
+    pub generation: u64,
+    pub deletion_pending: bool,
+    pub integrity: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineReason {
+    UnregisteredProfileDirectory,
+    MalformedProfileMetadata,
+    ConflictingRegistryIdentity,
+    AmbiguousOwnership,
+    AmbiguousSealState,
+    ManagedRootEscape,
+    LivenessUnavailable,
+    DeletionFailed,
+}
+
+impl QuarantineReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnregisteredProfileDirectory => "unregistered_profile_directory",
+            Self::MalformedProfileMetadata => "malformed_profile_metadata",
+            Self::ConflictingRegistryIdentity => "conflicting_registry_identity",
+            Self::AmbiguousOwnership => "ambiguous_ownership",
+            Self::AmbiguousSealState => "ambiguous_seal_state",
+            Self::ManagedRootEscape => "managed_root_escape",
+            Self::LivenessUnavailable => "liveness_unavailable",
+            Self::DeletionFailed => "deletion_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryDocument {
+    schema: String,
+    managed_root_identity: String,
+    generation: u64,
+    records: BTreeMap<String, RegistryRecord>,
+    integrity: String,
+}
+
+fn record_payload(record: &RegistryRecord) -> Value {
+    let mut value = serde_json::to_value(record).expect("registry record is serializable");
+    if let Some(object) = value.as_object_mut() {
+        object.remove("integrity");
+    }
+    value
+}
+fn record_integrity(record: &RegistryRecord) -> String {
+    hex(&Sha256::digest(canonical_json(&record_payload(record))))
+}
+fn document_payload(document: &RegistryDocument) -> Value {
+    serde_json::json!({"schema":document.schema,"managed_root_identity":document.managed_root_identity,"generation":document.generation,"records":document.records})
+}
+
+#[derive(Debug)]
+pub struct RegistryLock {
+    path: PathBuf,
+    _file: File,
+}
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum DurableResolution {
+    TrustworthyExisting(RegistryRecord),
+    AffirmativeAbsence,
+    UntrustworthyOrUnavailable { reason: String },
+}
+
+#[derive(Debug)]
+pub struct ProfileRegistry {
+    root: Arc<HeldManagedRoot>,
+    artifact: Value,
+    artifact_report: ArtifactGateReport,
+    config: RegistryConfig,
+    instance_id: String,
+}
+
+fn empty_artifact_report() -> ArtifactGateReport {
+    ArtifactGateReport {
+        artifact_id: String::new(),
+        revision: String::new(),
+        implementation_digest: String::new(),
+        provider_ids: BTreeSet::new(),
+        fixture_count: 0,
+    }
+}
+
+impl ProfileRegistry {
+    pub fn open(root_path: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        Self::open_with_config(root_path, RegistryConfig::default())
+    }
+
+    pub fn open_with_config(
+        root_path: impl AsRef<Path>,
+        config: RegistryConfig,
+    ) -> Result<Self, RegistryError> {
+        let root = Arc::new(HeldManagedRoot::open(root_path)?);
+        let gate = if config.fixture_conformance {
+            artifact_value(&config.artifact_bytes)
+                .ok()
+                .zip(verify_implementation_digest(&config.artifact_bytes).ok())
+        } else {
+            None
+        };
+        let (artifact, artifact_report) =
+            gate.unwrap_or_else(|| (Value::Null, empty_artifact_report()));
+        let instance_id = format!(
+            "instance-{}",
+            &hex(&Sha256::digest(
+                root.canonical_path().to_string_lossy().as_bytes()
+            ))[..16]
+        );
+        Ok(Self {
+            root,
+            artifact,
+            artifact_report,
+            config,
+            instance_id,
+        })
+    }
+
+    /// Construct a disabled registry without touching registry or profile state.
+    /// This is useful for an artifact-absent startup path and keeps uncertainty
+    /// from turning into a destructive scan.
+    pub fn disabled(
+        root_path: impl AsRef<Path>,
+        mut config: RegistryConfig,
+    ) -> Result<Self, RegistryError> {
+        config.artifact_bytes = b"{}".to_vec();
+        let root = Arc::new(HeldManagedRoot::open(root_path)?);
+        Ok(Self {
+            root,
+            artifact: Value::Null,
+            artifact_report: empty_artifact_report(),
+            config,
+            instance_id: "disabled".to_string(),
+        })
+    }
+
+    pub fn root(&self) -> &HeldManagedRoot {
+        &self.root
+    }
+    pub fn artifact_report(&self) -> &ArtifactGateReport {
+        &self.artifact_report
+    }
+    pub fn artifact_enabled(&self) -> bool {
+        self.artifact != Value::Null
+    }
+    pub fn implementation_digest(&self) -> &str {
+        &self.artifact_report.implementation_digest
+    }
+    pub fn config(&self) -> &RegistryConfig {
+        &self.config
+    }
+
+    pub fn authority_projection(
+        &self,
+        context: &StampedBindContext,
+        profile_uuid: &str,
+    ) -> CkcredAuthority {
+        CkcredAuthority {
+            project_id: context.agent_project_id().to_string(),
+            session_kind: context.session_kind(),
+            profile_uuid: profile_uuid.to_string(),
+        }
+    }
+
+    fn registry_path(&self) -> Result<PathBuf, RegistryError> {
+        Ok(self
+            .root
+            .target_path(Path::new(REGISTRY_FILE), false)
+            .or_else(|error| {
+                if matches!(error, RootError::Io(ref io) if io.kind() == io::ErrorKind::NotFound) {
+                    self.root.target_path(Path::new(REGISTRY_FILE), true)
+                } else {
+                    Err(error)
+                }
+            })?)
+    }
+    fn lock_path(&self) -> Result<PathBuf, RegistryError> {
+        Ok(self.root.target_path(Path::new(DURABLE_LOCK_FILE), true)?)
+    }
+
+    fn acquire_slot_lock(&self) -> Result<RegistryLock, RegistryError> {
+        self.root.revalidate()?;
+        let path = self.lock_path()?;
+        let file = OpenOptions::new().write(true).create_new(true).open(&path);
+        match file {
+            Ok(file) => Ok(RegistryLock { path, _file: file }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(RegistryError::Untrustworthy(
+                    "lock contention without positive owner proof".to_string(),
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn read_document(&self) -> Result<Option<RegistryDocument>, RegistryError> {
+        let path = self.root.target_path(Path::new(REGISTRY_FILE), false)?;
+        let mut bytes = Vec::new();
+        match File::open(&path) {
+            Ok(mut file) => {
+                file.read_to_end(&mut bytes)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let document: RegistryDocument = serde_json::from_slice(&bytes)
+            .map_err(|_| RegistryError::Untrustworthy("malformed registry".to_string()))?;
+        if document.schema != REGISTRY_SCHEMA {
+            return Err(RegistryError::Untrustworthy(
+                "unsupported registry schema".to_string(),
+            ));
+        }
+        if document.managed_root_identity != self.root.binding() {
+            return Err(RegistryError::Untrustworthy(
+                "managed root identity changed".to_string(),
+            ));
+        }
+        if hex(&Sha256::digest(canonical_json(&document_payload(
+            &document,
+        )))) != document.integrity
+        {
+            return Err(RegistryError::Integrity);
+        }
+        let mut durable_projects = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        for record in document.records.values() {
+            if !targets.insert(record.target.clone()) {
+                return Err(RegistryError::Conflict);
+            }
+            if record.kind == ProfileKind::Durable
+                && !durable_projects.insert(record.project_id.clone())
+            {
+                return Err(RegistryError::Conflict);
+            }
+            if record_integrity(record) != record.integrity {
+                return Err(RegistryError::Integrity);
+            }
+            if !record.state.legal_for(record.kind)
+                || record.kind == ProfileKind::Durable && record.deletion_pending
+            {
+                return Err(RegistryError::UnsupportedState);
+            }
+            if record.profile_uuid.is_empty()
+                || record.project_id.is_empty()
+                || record.target.is_empty()
+                || (record.kind == ProfileKind::Durable
+                    && record.profile_name.as_deref() != Some("default"))
+                || (record.kind == ProfileKind::Disposable && record.profile_name.is_some())
+            {
+                return Err(RegistryError::Untrustworthy(
+                    "invalid registry identity".to_string(),
+                ));
+            }
+        }
+        Ok(Some(document))
+    }
+
+    fn empty_document(&self) -> RegistryDocument {
+        RegistryDocument {
+            schema: REGISTRY_SCHEMA.to_string(),
+            managed_root_identity: self.root.binding(),
+            generation: 0,
+            records: BTreeMap::new(),
+            integrity: String::new(),
+        }
+    }
+
+    fn write_document(&self, mut document: RegistryDocument) -> Result<(), RegistryError> {
+        self.root.revalidate()?;
+        document.integrity = hex(&Sha256::digest(canonical_json(&document_payload(
+            &document,
+        ))));
+        let bytes = serde_json::to_vec(&document).map_err(|_| RegistryError::Integrity)?;
+        let path = self.root.target_path(Path::new(REGISTRY_FILE), true)?;
+        let temporary = self
+            .root
+            .target_path(Path::new(".ck-browser-profile-registry-v1.tmp"), true)?;
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    fn profile_target(&self, target: &str, create: bool) -> Result<PathBuf, RegistryError> {
+        let path = Path::new(target);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(RegistryError::Untrustworthy(
+                "non-canonical target".to_string(),
+            ));
+        }
+        Ok(self.root.target_path(path, create)?)
+    }
+
+    fn conflicting_profile_path(&self) -> Result<bool, RegistryError> {
+        self.root.revalidate()?;
+        let profiles = self.root.target_path(Path::new("profiles"), false);
+        let profiles = match profiles {
+            Ok(path) => path,
+            Err(RootError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = match fs::symlink_metadata(&profiles) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(true);
+        }
+        Ok(fs::read_dir(profiles)?.next().transpose()?.is_some())
+    }
+
+    pub fn resolve_durable(&self, project_id: &str) -> Result<DurableResolution, RegistryError> {
+        if !self.artifact_enabled() {
+            return Ok(DurableResolution::UntrustworthyOrUnavailable {
+                reason: "artifact_disabled".to_string(),
+            });
+        }
+        let _lock = self.acquire_slot_lock()?;
+        let document = match self.read_document() {
+            Ok(document) => document,
+            Err(error) => {
+                return Ok(DurableResolution::UntrustworthyOrUnavailable {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        let Some(document) = document else {
+            return if self.conflicting_profile_path()? {
+                Ok(DurableResolution::UntrustworthyOrUnavailable {
+                    reason: "possibly_managed_path".to_string(),
+                })
+            } else {
+                Ok(DurableResolution::AffirmativeAbsence)
+            };
+        };
+        let Some(record) = document.records.get(project_id) else {
+            return if self.conflicting_profile_path()? {
+                Ok(DurableResolution::UntrustworthyOrUnavailable {
+                    reason: "possibly_managed_path".to_string(),
+                })
+            } else {
+                Ok(DurableResolution::AffirmativeAbsence)
+            };
+        };
+        if record.kind != ProfileKind::Durable {
+            return Ok(DurableResolution::UntrustworthyOrUnavailable {
+                reason: "kind_conflict".to_string(),
+            });
+        }
+        if record.state == ProfileState::DeletionFailed || record.deletion_pending {
+            return Ok(DurableResolution::UntrustworthyOrUnavailable {
+                reason: "durable_deletion_state".to_string(),
+            });
+        }
+        let target = match self.profile_target(&record.target, false) {
+            Ok(target) => target,
+            Err(error) => {
+                return Ok(DurableResolution::UntrustworthyOrUnavailable {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        if !target.exists() {
+            return Ok(DurableResolution::UntrustworthyOrUnavailable {
+                reason: "record_target_missing".to_string(),
+            });
+        }
+        Ok(DurableResolution::TrustworthyExisting(record.clone()))
+    }
+
+    fn create_durable_record(
+        &self,
+        context: &StampedBindContext,
+    ) -> Result<RegistryRecord, RegistryError> {
+        let _lock = self.acquire_slot_lock()?;
+        if !matches!(
+            self.resolve_without_lock(context.agent_project_id())?,
+            DurableResolution::AffirmativeAbsence
+        ) {
+            return Err(RegistryError::Conflict);
+        }
+        if !self.config.uuid_protocol_compatible {
+            return Err(RegistryError::InvalidTransition);
+        }
+        let uuid = self.new_uuid(context, ProfileKind::Durable)?;
+        let target = format!("profiles/{uuid}");
+        let transaction_id = self.new_id("tx", context.conversation_key());
+        let mut record = RegistryRecord {
+            project_id: context.agent_project_id().to_string(),
+            kind: ProfileKind::Durable,
+            target: target.clone(),
+            transaction_id,
+            state: ProfileState::Provisional,
+            owner_instance: self.instance_id.clone(),
+            profile_uuid: uuid,
+            profile_name: Some("default".to_string()),
+            session_id: None,
+            attachment_id: None,
+            process: None,
+            seal_state: SealState::Unsealed,
+            quarantine: None,
+            generation: 1,
+            deletion_pending: false,
+            integrity: String::new(),
+        };
+        record.integrity = record_integrity(&record);
+        let mut document = self
+            .read_document()?
+            .unwrap_or_else(|| self.empty_document());
+        document
+            .records
+            .insert(context.agent_project_id().to_string(), record.clone());
+        document.generation = document.generation.saturating_add(1);
+        self.write_document(document)?;
+        let target_path = self.profile_target(&target, true)?;
+        fs::create_dir(&target_path)?;
+        record.state = ProfileState::Available;
+        record.seal_state = SealState::Available;
+        record.generation = 2;
+        record.integrity = record_integrity(&record);
+        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        document
+            .records
+            .insert(context.agent_project_id().to_string(), record.clone());
+        document.generation = document.generation.saturating_add(1);
+        self.write_document(document)?;
+        Ok(record)
+    }
+
+    fn resolve_without_lock(&self, project_id: &str) -> Result<DurableResolution, RegistryError> {
+        let document = self.read_document()?;
+        let Some(document) = document else {
+            return if self.conflicting_profile_path()? {
+                Ok(DurableResolution::UntrustworthyOrUnavailable {
+                    reason: "possibly_managed_path".to_string(),
+                })
+            } else {
+                Ok(DurableResolution::AffirmativeAbsence)
+            };
+        };
+        if let Some(record) = document.records.get(project_id) {
+            return Ok(DurableResolution::TrustworthyExisting(record.clone()));
+        }
+        if self.conflicting_profile_path()? {
+            Ok(DurableResolution::UntrustworthyOrUnavailable {
+                reason: "possibly_managed_path".to_string(),
+            })
+        } else {
+            Ok(DurableResolution::AffirmativeAbsence)
+        }
+    }
+
+    fn new_uuid(
+        &self,
+        context: &StampedBindContext,
+        kind: ProfileKind,
+    ) -> Result<String, RegistryError> {
+        let seed = format!(
+            "{}:{}:{}:{}:{}:{}",
+            self.instance_id,
+            context.conversation_key(),
+            context.agent_project_id(),
+            kind as u8,
+            UUID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let digest = hex(&Sha256::digest(seed.as_bytes()));
+        let uuid = format!(
+            "{}-{}-{}-{}-{}",
+            &digest[0..8],
+            &digest[8..12],
+            &digest[12..16],
+            &digest[16..20],
+            &digest[20..32]
+        );
+        if self
+            .profile_target(&format!("profiles/{uuid}"), false)
+            .is_ok()
+        {
+            return Err(RegistryError::Conflict);
+        }
+        Ok(uuid)
+    }
+
+    fn new_id(&self, prefix: &str, entropy: &str) -> String {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!(
+            "{prefix}-{}",
+            &hex(&Sha256::digest(
+                format!("{}:{entropy}:{millis}", self.instance_id).as_bytes()
+            ))[..24]
+        )
+    }
+
+    fn update_record<F>(
+        &self,
+        project_id: &str,
+        mut update: F,
+    ) -> Result<RegistryRecord, RegistryError>
+    where
+        F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
+    {
+        let _lock = self.acquire_slot_lock()?;
+        let mut document = self
+            .read_document()?
+            .ok_or(RegistryError::Untrustworthy("missing registry".to_string()))?;
+        let record = document
+            .records
+            .get_mut(project_id)
+            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))?;
+        update(record)?;
+        record.generation = record.generation.saturating_add(1);
+        record.integrity = record_integrity(record);
+        let result = record.clone();
+        document.generation = document.generation.saturating_add(1);
+        self.write_document(document)?;
+        Ok(result)
+    }
+
+    fn record_for(&self, project_id: &str) -> Result<RegistryRecord, RegistryError> {
+        let document = self
+            .read_document()?
+            .ok_or(RegistryError::Untrustworthy("missing registry".to_string()))?;
+        document
+            .records
+            .get(project_id)
+            .cloned()
+            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))
+    }
+}
+
+/// Invocation-bound opaque values. Test constructors model values returned by the
+/// trusted invocation-token provider; production callers receive tokens from it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InvocationToken {
+    id: String,
+}
+impl InvocationToken {
+    pub fn for_test(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JournalReservationHandle {
+    invocation_id: String,
+    id: String,
+}
+impl JournalReservationHandle {
+    pub fn for_test(invocation: &InvocationToken, id: impl Into<String>) -> Self {
+        Self {
+            invocation_id: invocation.id.clone(),
+            id: id.into(),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DispatchCommitmentToken {
+    invocation_id: String,
+    reservation_id: String,
+    id: String,
+}
+impl DispatchCommitmentToken {
+    pub fn for_test(
+        invocation: &InvocationToken,
+        reservation: &JournalReservationHandle,
+        id: impl Into<String>,
+    ) -> Self {
+        Self {
+            invocation_id: invocation.id.clone(),
+            reservation_id: reservation.id.clone(),
+            id: id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortCause {
+    DispatchCommitFailed,
+    InvocationCancelled,
+    Teardown,
+}
+impl AbortCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DispatchCommitFailed => "dispatch_commit_failed",
+            Self::InvocationCancelled => "invocation_cancelled",
+            Self::Teardown => "teardown",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseCause {
+    SessionEnd,
+    ContextReplaced,
+    SupervisorShutdown,
+}
+impl ReleaseCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionEnd => "session_end",
+            Self::ContextReplaced => "context_replaced",
+            Self::SupervisorShutdown => "supervisor_shutdown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenState {
+    Closed,
+    Open,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentOpenSnapshot {
+    pub open_state: OpenState,
+    pub profile_uuid: Option<String>,
+    pub profile_name: Option<String>,
+    pub epoch: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalContextAssociation {
+    pub profile_uuid: Option<String>,
+    pub profile_name: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortTerminalState {
+    Aborted,
+    AbortFailedRecoveryOwned,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortSignal {
+    pub invocation_id: String,
+    pub reservation_id: String,
+    pub cause: AbortCause,
+    pub state: AbortTerminalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessObservation {
+    pub generation: u64,
+    pub fence: u64,
+    pub instance: Option<String>,
+    pub session: Option<String>,
+    pub attachment: Option<String>,
+    pub lock_owner: Option<String>,
+    pub supervised_process: Option<ProcessIdentity>,
+    pub complete: bool,
+    pub fresh: bool,
+    pub consistent: bool,
+}
+impl LivenessObservation {
+    pub fn all_absent(generation: u64, fence: u64) -> Self {
+        Self {
+            generation,
+            fence,
+            instance: None,
+            session: None,
+            attachment: None,
+            lock_owner: None,
+            supervised_process: None,
+            complete: true,
+            fresh: true,
+            consistent: true,
+        }
+    }
+    fn proves_absence(&self, generation: u64, fence: u64) -> bool {
+        self.complete
+            && self.fresh
+            && self.consistent
+            && self.generation == generation
+            && self.fence == fence
+            && self.instance.is_none()
+            && self.session.is_none()
+            && self.attachment.is_none()
+            && self.lock_owner.is_none()
+            && self.supervised_process.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionFence {
+    pub generation: u64,
+    pub active: bool,
+}
+impl DeletionFence {
+    pub fn held(generation: u64) -> Self {
+        Self {
+            generation,
+            active: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedKind {
+    Creating(ProfileKind),
+    Reuse,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedState {
+    id: u64,
+    invocation_id: String,
+    reservation_id: String,
+    context_fingerprint: String,
+    conversation_key: String,
+    project_id: String,
+    kind: PreparedKind,
+    profile_uuid: Option<String>,
+    profile_name: Option<String>,
+    terminal: Option<AbortSignal>,
+}
+
+/// Opaque prepared state.  It intentionally exposes no identity or path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedOpen {
+    namespace: u64,
+    id: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenedState {
+    id: u64,
+    invocation_id: String,
+    reservation_id: String,
+    conversation_key: String,
+    project_id: String,
+    kind: ProfileKind,
+    profile_uuid: String,
+    profile_name: Option<String>,
+    release: Option<(ReleaseCause, Result<(), ProfileOutcome>)>,
+}
+/// Opaque session-owned opened context handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedContext {
+    namespace: u64,
+    id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareResult {
+    Prepared(PreparedOpen),
+    Closed(ProfileOutcome),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortResult {
+    Aborted(AbortSignal),
+    Closed(ProfileOutcome),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchResult {
+    Opened(OpenedContext),
+    Closed(ProfileOutcome),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseResult {
+    Released,
+    Closed(ProfileOutcome),
+}
+
+/// The profile lifecycle coordinator. It is deliberately synchronous: browser
+/// and journal adapters call it around their own asynchronous work and retain
+/// only opaque handles across that boundary.
+#[derive(Debug)]
+pub struct ProfileLifecycle {
+    registry: ProfileRegistry,
+    namespace: u64,
+    prepared: HashMap<u64, PreparedState>,
+    opened: HashMap<u64, OpenedState>,
+    sessions: HashMap<String, u64>,
+    next_handle: u64,
+    current: HashMap<String, CurrentOpenSnapshot>,
+    final_contexts: HashMap<String, FinalContextAssociation>,
+    abort_signals: Vec<AbortSignal>,
+    deletion_excluded: BTreeSet<String>,
+}
+
+impl ProfileLifecycle {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        Self::open_with_config(root, RegistryConfig::default())
+    }
+    pub fn open_with_config(
+        root: impl AsRef<Path>,
+        config: RegistryConfig,
+    ) -> Result<Self, RegistryError> {
+        let registry = ProfileRegistry::open_with_config(root, config)?;
+        let namespace = handle_namespace(registry.root());
+        Ok(Self {
+            registry,
+            namespace,
+            prepared: HashMap::new(),
+            opened: HashMap::new(),
+            sessions: HashMap::new(),
+            next_handle: 1,
+            current: HashMap::new(),
+            final_contexts: HashMap::new(),
+            abort_signals: Vec::new(),
+            deletion_excluded: BTreeSet::new(),
+        })
+    }
+    pub fn disabled(root: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        let registry = ProfileRegistry::disabled(root, RegistryConfig::default())?;
+        let namespace = handle_namespace(registry.root());
+        Ok(Self {
+            registry,
+            namespace,
+            prepared: HashMap::new(),
+            opened: HashMap::new(),
+            sessions: HashMap::new(),
+            next_handle: 1,
+            current: HashMap::new(),
+            final_contexts: HashMap::new(),
+            abort_signals: Vec::new(),
+            deletion_excluded: BTreeSet::new(),
+        })
+    }
+    pub fn registry(&self) -> &ProfileRegistry {
+        &self.registry
+    }
+    pub fn current_open(&self, conversation: &str) -> CurrentOpenSnapshot {
+        self.current
+            .get(conversation)
+            .cloned()
+            .unwrap_or(CurrentOpenSnapshot {
+                open_state: OpenState::Closed,
+                profile_uuid: None,
+                profile_name: None,
+                epoch: 0,
+            })
+    }
+    pub fn final_context(
+        &self,
+        token: &DispatchCommitmentToken,
+    ) -> Option<&FinalContextAssociation> {
+        self.final_contexts.get(&token.id)
+    }
+    pub fn abort_signals(&self) -> &[AbortSignal] {
+        &self.abort_signals
+    }
+    pub fn is_effectively_excluded(&self, profile_uuid: &str) -> bool {
+        self.deletion_excluded.contains(profile_uuid)
+    }
+
+    fn next(&mut self) -> u64 {
+        let id = self.next_handle;
+        self.next_handle = self.next_handle.saturating_add(1);
+        id
+    }
+    fn closed_storage(&self, origin: FailureOrigin) -> PrepareResult {
+        PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+            reason_code: "profile_storage_unavailable",
+            origin,
+        })
+    }
+
+    pub fn prepare_context_open(
+        &mut self,
+        invocation: &InvocationToken,
+        reservation: &JournalReservationHandle,
+        context: &StampedBindContext,
+    ) -> PrepareResult {
+        // The gate is first.  In particular, no current session, registry,
+        // target, grant, or CKCRED state is consulted while it is disabled.
+        if !self.registry.artifact_enabled() {
+            return self.closed_storage(FailureOrigin::RegistryOrStorage);
+        }
+        if invocation.id != reservation.invocation_id {
+            return PrepareResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let conversation = context.conversation_key().to_string();
+        if let Some(existing_id) = self.sessions.get(&conversation).copied() {
+            let Some(existing) = self.opened.get(&existing_id) else {
+                return self.closed_storage(FailureOrigin::RegistryOrStorage);
+            };
+            let existing_project = existing.project_id.clone();
+            let existing_kind = existing.kind;
+            let existing_uuid = existing.profile_uuid.clone();
+            let existing_name = existing.profile_name.clone();
+            if existing_project != context.agent_project_id()
+                || existing_kind != disposition_kind(context.profile_disposition())
+            {
+                return self.closed_storage(FailureOrigin::RegistryOrStorage);
+            }
+            let id = self.next();
+            self.prepared.insert(
+                id,
+                PreparedState {
+                    id,
+                    invocation_id: invocation.id.clone(),
+                    reservation_id: reservation.id.clone(),
+                    context_fingerprint: context.fingerprint(),
+                    conversation_key: conversation.clone(),
+                    project_id: context.agent_project_id().to_string(),
+                    kind: PreparedKind::Reuse,
+                    profile_uuid: Some(existing_uuid),
+                    profile_name: existing_name,
+                    terminal: None,
+                },
+            );
+            return PrepareResult::Prepared(PreparedOpen {
+                namespace: self.namespace,
+                id,
+            });
+        }
+        match context.profile_disposition() {
+            ProfileDisposition::None => PrepareResult::Closed(ProfileOutcome::NoSession {
+                reason_code: "no_session",
+            }),
+            ProfileDisposition::Disposable => {
+                let uuid = match self.create_disposable(context) {
+                    Ok(uuid) => uuid,
+                    Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
+                };
+                let id = self.next();
+                self.prepared.insert(
+                    id,
+                    PreparedState {
+                        id,
+                        invocation_id: invocation.id.clone(),
+                        reservation_id: reservation.id.clone(),
+                        context_fingerprint: context.fingerprint(),
+                        conversation_key: conversation,
+                        project_id: context.agent_project_id().to_string(),
+                        kind: PreparedKind::Creating(ProfileKind::Disposable),
+                        profile_uuid: Some(uuid),
+                        profile_name: None,
+                        terminal: None,
+                    },
+                );
+                PrepareResult::Prepared(PreparedOpen {
+                    namespace: self.namespace,
+                    id,
+                })
+            }
+            ProfileDisposition::Durable => {
+                if !self.registry.config.grant_verifier_available
+                    || !self.registry.config.sealing_available
+                {
+                    return self.closed_storage(FailureOrigin::CkcredDependency);
+                }
+                let resolution = match self.registry.resolve_durable(context.agent_project_id()) {
+                    Ok(resolution) => resolution,
+                    Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
+                };
+                let record = match resolution {
+                    DurableResolution::UntrustworthyOrUnavailable { .. } => {
+                        return self.closed_storage(FailureOrigin::RegistryOrStorage)
+                    }
+                    DurableResolution::AffirmativeAbsence => {
+                        if !self.registry.config.uuid_protocol_compatible {
+                            return PrepareResult::Closed(ProfileOutcome::NoSession {
+                                reason_code: "no_session",
+                            });
+                        }
+                        if !self.registry.config.grant_accepted
+                            || self.registry.config.grant_authority.is_some()
+                        {
+                            return PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
+                                reason_code: "durable_profile_grant_unavailable",
+                            });
+                        }
+                        match self.registry.create_durable_record(context) {
+                            Ok(record) => record,
+                            Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
+                        }
+                    }
+                    DurableResolution::TrustworthyExisting(record) => record,
+                };
+                // Grant verification must succeed before the profile's
+                // owner-specific authority data is exposed. The adapter is
+                // modeled here by its availability and grant-decision flags;
+                // an unavailable adapter has already caused rejection.
+                let authority = self
+                    .registry
+                    .authority_projection(context, &record.profile_uuid);
+                if !self.registry.config.grant_accepted
+                    || self
+                        .registry
+                        .config
+                        .grant_authority
+                        .as_ref()
+                        .is_some_and(|grant| grant != &authority)
+                {
+                    return PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
+                        reason_code: "durable_profile_grant_unavailable",
+                    });
+                }
+                if record.state == ProfileState::Attached || record.state == ProfileState::Locked {
+                    return PrepareResult::Closed(ProfileOutcome::ProfileBusy {
+                        profile_uuid: record.profile_uuid,
+                    });
+                }
+                if !matches!(
+                    record.state,
+                    ProfileState::Available | ProfileState::Released
+                ) || !record.state.legal_for(ProfileKind::Durable)
+                    || record.seal_state == SealState::Ambiguous
+                {
+                    return self.closed_storage(FailureOrigin::RegistryOrStorage);
+                }
+                let id = self.next();
+                self.prepared.insert(
+                    id,
+                    PreparedState {
+                        id,
+                        invocation_id: invocation.id.clone(),
+                        reservation_id: reservation.id.clone(),
+                        context_fingerprint: context.fingerprint(),
+                        conversation_key: conversation,
+                        project_id: context.agent_project_id().to_string(),
+                        kind: PreparedKind::Creating(ProfileKind::Durable),
+                        profile_uuid: Some(record.profile_uuid),
+                        profile_name: Some("default".to_string()),
+                        terminal: None,
+                    },
+                );
+                PrepareResult::Prepared(PreparedOpen {
+                    namespace: self.namespace,
+                    id,
+                })
+            }
+        }
+    }
+
+    fn create_disposable(&self, context: &StampedBindContext) -> Result<String, RegistryError> {
+        let uuid = self.registry.new_uuid(context, ProfileKind::Disposable)?;
+        let target = format!("profiles/{uuid}");
+        let _lock = self.registry.acquire_slot_lock()?;
+        if self.registry.profile_target(&target, false).is_ok() {
+            return Err(RegistryError::Conflict);
+        }
+        let mut record = RegistryRecord {
+            project_id: context.agent_project_id().to_string(),
+            kind: ProfileKind::Disposable,
+            target: target.clone(),
+            transaction_id: self.registry.new_id("tx", context.conversation_key()),
+            state: ProfileState::Provisional,
+            owner_instance: self.registry.instance_id.clone(),
+            profile_uuid: uuid.clone(),
+            profile_name: None,
+            session_id: Some(context.conversation_key().to_string()),
+            attachment_id: None,
+            process: None,
+            seal_state: SealState::Available,
+            quarantine: None,
+            generation: 1,
+            deletion_pending: false,
+            integrity: String::new(),
+        };
+        record.integrity = record_integrity(&record);
+        let mut document = self
+            .registry
+            .read_document()?
+            .unwrap_or_else(|| self.registry.empty_document());
+        // Disposable records use a transaction-specific synthetic key, so they
+        // are stored separately and cannot replace or claim the one durable
+        // record associated with a project.
+        document
+            .records
+            .insert(record.transaction_id.clone(), record.clone());
+        document.generation = document.generation.saturating_add(1);
+        self.registry.write_document(document)?;
+        let target_path = self.registry.profile_target(&target, true)?;
+        fs::create_dir(&target_path)?;
+        record.state = ProfileState::Available;
+        record.generation = 2;
+        record.integrity = record_integrity(&record);
+        let mut document = self
+            .registry
+            .read_document()?
+            .ok_or(RegistryError::Integrity)?;
+        document
+            .records
+            .insert(record.transaction_id.clone(), record);
+        document.generation = document.generation.saturating_add(1);
+        self.registry.write_document(document)?;
+        Ok(uuid)
+    }
+
+    pub fn abort_prepared_context(
+        &mut self,
+        prepared: PreparedOpen,
+        cause: AbortCause,
+    ) -> AbortResult {
+        if prepared.namespace != self.namespace {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let Some(state) = self.prepared.get(&prepared.id).cloned() else {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if let Some(signal) = state.terminal.clone() {
+            if signal.cause != cause {
+                return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                    reason_code: "internal_failure",
+                });
+            }
+            return match signal.state {
+                AbortTerminalState::Aborted => AbortResult::Aborted(signal),
+                AbortTerminalState::AbortFailedRecoveryOwned => {
+                    AbortResult::Closed(ProfileOutcome::StorageUnavailable {
+                        reason_code: "profile_storage_unavailable",
+                        origin: FailureOrigin::RegistryOrStorage,
+                    })
+                }
+            };
+        }
+        let signal = AbortSignal {
+            invocation_id: state.invocation_id.clone(),
+            reservation_id: state.reservation_id.clone(),
+            cause,
+            state: AbortTerminalState::Aborted,
+        };
+        let result = match state.kind {
+            PreparedKind::Reuse => Ok(()),
+            PreparedKind::Creating(kind) => {
+                if self.registry.config.abort_failure {
+                    Err(ProfileOutcome::StorageUnavailable {
+                        reason_code: "profile_storage_unavailable",
+                        origin: FailureOrigin::RegistryOrStorage,
+                    })
+                } else if kind == ProfileKind::Disposable {
+                    self.remove_prepared_disposable(&state)
+                } else {
+                    self.remove_prepared_durable(&state)
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.abort_signals.push(signal.clone());
+                self.prepared
+                    .get_mut(&prepared.id)
+                    .expect("prepared state exists")
+                    .terminal = Some(signal.clone());
+                AbortResult::Aborted(signal)
+            }
+            Err(error) => {
+                let signal = AbortSignal {
+                    state: AbortTerminalState::AbortFailedRecoveryOwned,
+                    ..signal
+                };
+                self.abort_signals.push(signal.clone());
+                self.prepared
+                    .get_mut(&prepared.id)
+                    .expect("prepared state exists")
+                    .terminal = Some(signal);
+                AbortResult::Closed(error)
+            }
+        }
+    }
+
+    fn remove_prepared_disposable(&mut self, state: &PreparedState) -> Result<(), ProfileOutcome> {
+        let Some(uuid) = &state.profile_uuid else {
+            return Ok(());
+        };
+        let record = self.registry.record_for_by_uuid(uuid).map_err(|_| {
+            ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            }
+        })?;
+        if self.registry.config.deletion_failure_after_start {
+            self.deletion_excluded.insert(uuid.clone());
+            let _ = self.registry.mark_deletion_failed(&record);
+            return Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        let handle = self
+            .registry
+            .root
+            .open_target(Path::new(&record.target))
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        handle
+            .remove_recursive()
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        self.registry
+            .remove_record(&record.transaction_id)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+    }
+
+    fn remove_prepared_durable(&self, state: &PreparedState) -> Result<(), ProfileOutcome> {
+        let uuid = state
+            .profile_uuid
+            .as_deref()
+            .ok_or(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            })?;
+        let record = self.registry.record_for_by_uuid(uuid).map_err(|_| {
+            ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            }
+        })?;
+        self.registry
+            .remove_record(&record.transaction_id)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+    }
+
+    pub fn launch_prepared_context(
+        &mut self,
+        prepared: PreparedOpen,
+        token: &DispatchCommitmentToken,
+    ) -> LaunchResult {
+        if prepared.namespace != self.namespace {
+            return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let Some(state) = self.prepared.remove(&prepared.id) else {
+            return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if state.invocation_id != token.invocation_id
+            || state.reservation_id != token.reservation_id
+        {
+            self.prepared.insert(state.id, state);
+            return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        if state.terminal.is_some() {
+            return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let uuid = state
+            .profile_uuid
+            .clone()
+            .ok_or(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        let Ok(uuid) = uuid else {
+            return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if self.registry.config.release_failure && matches!(state.kind, PreparedKind::Creating(_)) {
+            return LaunchResult::Closed(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        match state.kind {
+            PreparedKind::Reuse => {
+                let Some(existing_id) = self.sessions.get(&state.conversation_key).copied() else {
+                    return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                        reason_code: "internal_failure",
+                    });
+                };
+                let Some(existing) = self.opened.get(&existing_id) else {
+                    return LaunchResult::Closed(ProfileOutcome::InternalFailure {
+                        reason_code: "internal_failure",
+                    });
+                };
+                let opened = OpenedContext {
+                    namespace: self.namespace,
+                    id: existing.id,
+                };
+                self.final_contexts.insert(
+                    token.id.clone(),
+                    FinalContextAssociation {
+                        profile_uuid: Some(existing.profile_uuid.clone()),
+                        profile_name: existing.profile_name.clone(),
+                    },
+                );
+                LaunchResult::Opened(opened)
+            }
+            PreparedKind::Creating(kind) => {
+                let project = state.project_id.clone();
+                let updated = if kind == ProfileKind::Disposable {
+                    self.registry.update_record_by_uuid(&uuid, |record| {
+                        if record.profile_uuid != uuid {
+                            return Err(RegistryError::Conflict);
+                        }
+                        record.state = ProfileState::Attached;
+                        record.session_id = Some(state.conversation_key.clone());
+                        record.attachment_id = Some(format!("attachment-{}", state.id));
+                        record.process = Some(ProcessIdentity {
+                            pid: std::process::id(),
+                            start_token: format!("s8-{}", state.id),
+                        });
+                        record.seal_state = SealState::Available;
+                        Ok(())
+                    })
+                } else {
+                    self.registry.update_record(&project, |record| {
+                        if record.profile_uuid != uuid {
+                            return Err(RegistryError::Conflict);
+                        }
+                        record.state = ProfileState::Attached;
+                        record.session_id = Some(state.conversation_key.clone());
+                        record.attachment_id = Some(format!("attachment-{}", state.id));
+                        record.process = Some(ProcessIdentity {
+                            pid: std::process::id(),
+                            start_token: format!("s8-{}", state.id),
+                        });
+                        record.seal_state = SealState::Available;
+                        Ok(())
+                    })
+                };
+                if updated.is_err() {
+                    return LaunchResult::Closed(ProfileOutcome::StorageUnavailable {
+                        reason_code: "profile_storage_unavailable",
+                        origin: FailureOrigin::RegistryOrStorage,
+                    });
+                }
+                let id = self.next();
+                let opened = OpenedState {
+                    id,
+                    invocation_id: state.invocation_id,
+                    reservation_id: state.reservation_id,
+                    conversation_key: state.conversation_key.clone(),
+                    project_id: state.project_id,
+                    kind,
+                    profile_uuid: uuid.clone(),
+                    profile_name: state.profile_name.clone(),
+                    release: None,
+                };
+                self.sessions.insert(state.conversation_key.clone(), id);
+                self.opened.insert(id, opened);
+                self.set_open_snapshot(
+                    &state.conversation_key,
+                    Some(uuid.clone()),
+                    state.profile_name.clone(),
+                );
+                self.final_contexts.insert(
+                    token.id.clone(),
+                    FinalContextAssociation {
+                        profile_uuid: Some(uuid),
+                        profile_name: state.profile_name,
+                    },
+                );
+                LaunchResult::Opened(OpenedContext {
+                    namespace: self.namespace,
+                    id,
+                })
+            }
+        }
+    }
+
+    fn set_open_snapshot(
+        &mut self,
+        conversation: &str,
+        uuid: Option<String>,
+        name: Option<String>,
+    ) {
+        let previous = self.current_open(conversation);
+        let next = CurrentOpenSnapshot {
+            open_state: if uuid.is_some() {
+                OpenState::Open
+            } else {
+                OpenState::Closed
+            },
+            profile_uuid: uuid,
+            profile_name: name,
+            epoch: if previous.open_state == OpenState::Closed
+                && previous.profile_uuid.is_none()
+                && previous.profile_name.is_none()
+            {
+                1
+            } else {
+                previous.epoch.saturating_add(1)
+            },
+        };
+        if previous.open_state != next.open_state
+            || previous.profile_uuid != next.profile_uuid
+            || previous.profile_name != next.profile_name
+        {
+            self.current.insert(conversation.to_string(), next);
+        }
+    }
+
+    pub fn release_context(&mut self, opened: OpenedContext, cause: ReleaseCause) -> ReleaseResult {
+        if opened.namespace != self.namespace {
+            return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let Some(state) = self.opened.get(&opened.id).cloned() else {
+            return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if let Some((prior_cause, result)) = &state.release {
+            if *prior_cause != cause {
+                return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                    reason_code: "internal_failure",
+                });
+            }
+            return match result {
+                Ok(()) => ReleaseResult::Released,
+                Err(error) => ReleaseResult::Closed(error.clone()),
+            };
+        }
+        let outcome = if self.registry.config.release_failure {
+            Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+        } else {
+            match state.kind {
+                ProfileKind::Disposable => self.release_disposable(&state),
+                ProfileKind::Durable => self.release_durable(&state),
+            }
+        };
+        if outcome.is_ok() {
+            self.sessions.remove(&state.conversation_key);
+            self.set_open_snapshot(&state.conversation_key, None, None);
+        } else {
+            self.deletion_excluded.insert(state.profile_uuid.clone());
+        }
+        let stored = outcome.clone();
+        self.opened
+            .get_mut(&opened.id)
+            .expect("opened state exists")
+            .release = Some((cause, stored));
+        match outcome {
+            Ok(()) => ReleaseResult::Released,
+            Err(error) => ReleaseResult::Closed(error),
+        }
+    }
+
+    fn release_disposable(&mut self, state: &OpenedState) -> Result<(), ProfileOutcome> {
+        let record = self
+            .registry
+            .record_for_by_uuid(&state.profile_uuid)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        let lock =
+            self.registry
+                .acquire_slot_lock()
+                .map_err(|_| ProfileOutcome::StorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                    origin: FailureOrigin::RegistryOrStorage,
+                })?;
+        let proof = LivenessObservation::all_absent(record.generation, record.generation);
+        let fence = DeletionFence::held(record.generation);
+        if !proof.proves_absence(record.generation, fence.generation) || !fence.active {
+            drop(lock);
+            return Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        let handle = self
+            .registry
+            .root
+            .open_target(Path::new(&record.target))
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        if self.registry.config.deletion_failure_after_start {
+            self.registry
+                .mark_deletion_failed_locked(&record)
+                .map_err(|_| ProfileOutcome::StorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                    origin: FailureOrigin::RegistryOrStorage,
+                })?;
+            return Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        handle
+            .remove_recursive()
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        self.registry
+            .remove_record_locked(&record.transaction_id)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+    }
+
+    fn release_durable(&self, state: &OpenedState) -> Result<(), ProfileOutcome> {
+        self.registry
+            .update_record(&state.project_id, |record| {
+                if record.profile_uuid != state.profile_uuid {
+                    return Err(RegistryError::Conflict);
+                }
+                record.state = ProfileState::Released;
+                record.session_id = None;
+                record.attachment_id = None;
+                record.process = None;
+                record.seal_state = SealState::Sealed;
+                Ok(())
+            })
+            .map(|_| ())
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+    }
+
+    /// Explicit deletion proof used by recovery and conformance fixtures.  It
+    /// refuses partial or stale provider observations before the first delete.
+    pub fn delete_disposable_with_proof(
+        &mut self,
+        profile_uuid: &str,
+        observation: LivenessObservation,
+        fence: DeletionFence,
+    ) -> Result<(), ProfileOutcome> {
+        let record = self
+            .registry
+            .record_for_by_uuid(profile_uuid)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        if record.kind != ProfileKind::Disposable {
+            return Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        if !observation.proves_absence(record.generation, fence.generation) || !fence.active {
+            return Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        let _lock =
+            self.registry
+                .acquire_slot_lock()
+                .map_err(|_| ProfileOutcome::StorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                    origin: FailureOrigin::RegistryOrStorage,
+                })?;
+        let handle = self
+            .registry
+            .root
+            .open_target(Path::new(&record.target))
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        if self.registry.config.deletion_failure_after_start {
+            self.deletion_excluded.insert(profile_uuid.to_string());
+            self.registry
+                .mark_deletion_failed_locked(&record)
+                .map_err(|_| ProfileOutcome::StorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                    origin: FailureOrigin::RegistryOrStorage,
+                })?;
+            return Err(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            });
+        }
+        handle
+            .remove_recursive()
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        self.registry
+            .remove_record_locked(&record.transaction_id)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+    }
+
+    pub fn recover_startup(&mut self) -> Result<usize, RegistryError> {
+        if !self.registry.artifact_enabled() {
+            return Ok(0);
+        }
+        let document = self
+            .registry
+            .read_document()?
+            .unwrap_or_else(|| self.registry.empty_document());
+        let mut recovered = 0;
+        for record in document.records.values() {
+            if record.state == ProfileState::DeletionFailed || record.deletion_pending {
+                self.deletion_excluded.insert(record.profile_uuid.clone());
+            }
+            if record.state == ProfileState::Attached && record.process.is_none() {
+                let _ = self.registry.mark_unavailable(record);
+                self.deletion_excluded.insert(record.profile_uuid.clone());
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+fn handle_namespace(root: &HeldManagedRoot) -> u64 {
+    let entropy = format!(
+        "{}:{:?}",
+        root.canonical_path().display(),
+        SystemTime::now()
+    );
+    let digest = Sha256::digest(entropy.as_bytes());
+    u64::from_be_bytes(digest[0..8].try_into().expect("digest has eight bytes"))
+}
+
+fn disposition_kind(disposition: ProfileDisposition) -> ProfileKind {
+    match disposition {
+        ProfileDisposition::Durable => ProfileKind::Durable,
+        ProfileDisposition::Disposable => ProfileKind::Disposable,
+        ProfileDisposition::None => ProfileKind::Disposable,
+    }
+}
+
+impl ProfileRegistry {
+    fn record_for_by_uuid(&self, profile_uuid: &str) -> Result<RegistryRecord, RegistryError> {
+        let document = self
+            .read_document()?
+            .ok_or(RegistryError::Untrustworthy("missing registry".to_string()))?;
+        document
+            .records
+            .values()
+            .find(|record| record.profile_uuid == profile_uuid)
+            .cloned()
+            .ok_or(RegistryError::Untrustworthy(
+                "missing profile UUID".to_string(),
+            ))
+    }
+    fn remove_record(&self, key: &str) -> Result<(), RegistryError> {
+        let _lock = self.acquire_slot_lock()?;
+        self.remove_record_locked(key)
+    }
+
+    fn remove_record_locked(&self, key: &str) -> Result<(), RegistryError> {
+        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        document
+            .records
+            .remove(key)
+            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))?;
+        document.generation = document.generation.saturating_add(1);
+        self.write_document(document)
+    }
+    fn mark_deletion_failed(&self, original: &RegistryRecord) -> Result<(), RegistryError> {
+        let _lock = self.acquire_slot_lock()?;
+        self.mark_deletion_failed_locked(original)
+    }
+
+    fn mark_deletion_failed_locked(&self, original: &RegistryRecord) -> Result<(), RegistryError> {
+        self.update_record_by_key_locked(&original.transaction_id, |record| {
+            if record.kind != ProfileKind::Disposable {
+                return Err(RegistryError::UnsupportedState);
+            }
+            record.state = ProfileState::DeletionFailed;
+            record.deletion_pending = true;
+            record.quarantine = Some(QuarantineReason::DeletionFailed);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+    fn mark_unavailable(&self, original: &RegistryRecord) -> Result<(), RegistryError> {
+        self.update_record_by_key(&original.transaction_id, |record| {
+            record.state = ProfileState::Unavailable;
+            record.quarantine = Some(QuarantineReason::LivenessUnavailable);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+    fn update_record_by_key<F>(&self, key: &str, update: F) -> Result<RegistryRecord, RegistryError>
+    where
+        F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
+    {
+        let _lock = self.acquire_slot_lock()?;
+        self.update_record_by_key_locked(key, update)
+    }
+
+    fn update_record_by_key_locked<F>(
+        &self,
+        key: &str,
+        mut update: F,
+    ) -> Result<RegistryRecord, RegistryError>
+    where
+        F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
+    {
+        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        let record = document
+            .records
+            .get_mut(key)
+            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))?;
+        update(record)?;
+        record.generation = record.generation.saturating_add(1);
+        record.integrity = record_integrity(record);
+        let result = record.clone();
+        document.generation = document.generation.saturating_add(1);
+        self.write_document(document)?;
+        Ok(result)
+    }
+
+    fn update_record_by_uuid<F>(
+        &self,
+        uuid: &str,
+        mut update: F,
+    ) -> Result<RegistryRecord, RegistryError>
+    where
+        F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
+    {
+        let _lock = self.acquire_slot_lock()?;
+        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        let key = document
+            .records
+            .iter()
+            .find_map(|(key, record)| (record.profile_uuid == uuid).then(|| key.clone()))
+            .ok_or(RegistryError::Untrustworthy(
+                "missing profile UUID".to_string(),
+            ))?;
+        let record = document
+            .records
+            .get_mut(&key)
+            .ok_or(RegistryError::Integrity)?;
+        update(record)?;
+        record.generation = record.generation.saturating_add(1);
+        record.integrity = record_integrity(record);
+        let result = record.clone();
+        document.generation = document.generation.saturating_add(1);
+        self.write_document(document)?;
+        Ok(result)
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(TABLE[(byte >> 4) as usize] as char);
+        output.push(TABLE[(byte & 0xf) as usize] as char);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn root() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ck-s8-{}-{}-{}",
+            std::process::id(),
+            ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+    fn context(kind: &str, disposition: &str, conversation: &str) -> StampedBindContext {
+        stamped_bind_context(BindFacts {
+            principal: "direct:agent".into(),
+            conversation_key: conversation.into(),
+            agent_project_id: "project-1".into(),
+            session_kind: Some(kind.into()),
+            profile_disposition: Some(disposition.into()),
+            effective_capability_scope: Some(vec!["browser.navigate".into()]),
+            provenance: "daemon_attested_spec_a".into(),
+        })
+        .unwrap()
+    }
+    fn tokens(
+        id: &str,
+    ) -> (
+        InvocationToken,
+        JournalReservationHandle,
+        DispatchCommitmentToken,
+    ) {
+        let invocation = InvocationToken::for_test(id);
+        let reservation =
+            JournalReservationHandle::for_test(&invocation, format!("reservation-{id}"));
+        let token = DispatchCommitmentToken::for_test(
+            &invocation,
+            &reservation,
+            format!("commitment-{id}"),
+        );
+        (invocation, reservation, token)
+    }
+
+    #[test]
+    fn artifact_is_machine_readable_and_digest_bound() {
+        let report = verify_implementation_digest(REGISTRY_ARTIFACT).unwrap();
+        assert_eq!(report.artifact_id, REGISTRY_ARTIFACT_ID);
+        assert_eq!(report.revision, REGISTRY_ARTIFACT_REVISION);
+        assert_eq!(report.provider_ids.len(), 5);
+        assert!(report.fixture_count >= 20);
+        assert_eq!(
+            report.implementation_digest,
+            implementation_digest_for(REGISTRY_ARTIFACT).unwrap()
+        );
+    }
+
+    #[test]
+    fn strict_matrix_accepts_three_pairs_and_rejects_cross_pairs() {
+        for (kind, disposition) in [
+            ("primary", "durable"),
+            ("subagent", "disposable"),
+            ("ephemeral", "none"),
+        ] {
+            assert!(context(kind, disposition, "c")
+                .session_kind()
+                .as_str()
+                .starts_with(kind));
+        }
+        for (kind, disposition) in [
+            ("primary", "disposable"),
+            ("primary", "none"),
+            ("subagent", "durable"),
+            ("subagent", "none"),
+            ("ephemeral", "durable"),
+            ("ephemeral", "disposable"),
+        ] {
+            let error = StampedBindContext::validate(BindFacts {
+                principal: "p".into(),
+                conversation_key: "c".into(),
+                agent_project_id: "a".into(),
+                session_kind: Some(kind.into()),
+                profile_disposition: Some(disposition.into()),
+                effective_capability_scope: Some(vec![]),
+                provenance: "daemon_attested_spec_a".into(),
+            })
+            .unwrap_err();
+            assert_eq!(error, BindValidationError::IncompatibleKindDisposition);
+        }
+    }
+
+    #[test]
+    fn root_is_held_and_target_containment_is_revalidated() {
+        let path = root();
+        let root = HeldManagedRoot::open(&path).unwrap();
+        assert_eq!(root.canonical_path(), fs::canonicalize(&path).unwrap());
+        assert!(root.target_path(Path::new("../outside"), false).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn disabled_gate_does_not_create_or_inspect_registry_state() {
+        let path = root();
+        let mut lifecycle = ProfileLifecycle::disabled(&path).unwrap();
+        let (invocation, reservation, _) = tokens("disabled");
+        let result = lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("subagent", "disposable", "c"),
+        );
+        assert_eq!(
+            result,
+            PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage
+            })
+        );
+        assert!(!path.join(REGISTRY_FILE).exists());
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn disposable_is_lazy_reusable_and_released_once() {
+        let path = root();
+        let mut lifecycle = ProfileLifecycle::open(&path).unwrap();
+        let (invocation, reservation, token) = tokens("disposable");
+        let prepared = match lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("subagent", "disposable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(lifecycle.current_open("conversation").epoch, 0);
+        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
+            LaunchResult::Opened(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let snapshot = lifecycle.current_open("conversation");
+        assert_eq!(snapshot.open_state, OpenState::Open);
+        assert_eq!(snapshot.epoch, 1);
+        let (invocation2, reservation2, token2) = tokens("reuse");
+        let prepared2 = match lifecycle.prepare_context_open(
+            &invocation2,
+            &reservation2,
+            &context("subagent", "disposable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let reused = match lifecycle.launch_prepared_context(prepared2, &token2) {
+            LaunchResult::Opened(value) => value,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(opened, reused);
+        assert_eq!(lifecycle.current_open("conversation").epoch, 1);
+        assert_eq!(
+            lifecycle.release_context(opened.clone(), ReleaseCause::SessionEnd),
+            ReleaseResult::Released
+        );
+        assert_eq!(
+            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
+            ReleaseResult::Released
+        );
+        assert_eq!(lifecycle.current_open("conversation").epoch, 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn abort_is_terminal_and_conflicting_retry_cannot_launch() {
+        let path = root();
+        let mut lifecycle = ProfileLifecycle::open(&path).unwrap();
+        let (invocation, reservation, token) = tokens("abort");
+        let prepared = match lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("subagent", "disposable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            lifecycle.abort_prepared_context(prepared.clone(), AbortCause::Teardown),
+            AbortResult::Aborted(_)
+        ));
+        assert!(matches!(
+            lifecycle.abort_prepared_context(prepared.clone(), AbortCause::Teardown),
+            AbortResult::Aborted(_)
+        ));
+        assert!(matches!(
+            lifecycle.abort_prepared_context(prepared.clone(), AbortCause::InvocationCancelled),
+            AbortResult::Closed(ProfileOutcome::InternalFailure { .. })
+        ));
+        assert!(matches!(
+            lifecycle.launch_prepared_context(prepared, &token),
+            LaunchResult::Closed(ProfileOutcome::InternalFailure { .. })
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn durable_first_creation_is_disabled_without_uuid_protocol() {
+        let path = root();
+        let mut config = RegistryConfig {
+            grant_verifier_available: true,
+            sealing_available: true,
+            ..RegistryConfig::default()
+        };
+        config.uuid_protocol_compatible = false;
+        let mut lifecycle = ProfileLifecycle::open_with_config(&path, config).unwrap();
+        let (invocation, reservation, _) = tokens("durable");
+        let result = lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("primary", "durable", "conversation"),
+        );
+        assert_eq!(
+            result,
+            PrepareResult::Closed(ProfileOutcome::NoSession {
+                reason_code: "no_session"
+            })
+        );
+        assert!(!path.join(REGISTRY_FILE).exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn durable_creation_uses_exact_uuid_and_authority_tuple() {
+        let path = root();
+        let config = RegistryConfig {
+            grant_verifier_available: true,
+            grant_accepted: true,
+            sealing_available: true,
+            uuid_protocol_compatible: true,
+            ..RegistryConfig::default()
+        };
+        let mut lifecycle = ProfileLifecycle::open_with_config(&path, config).unwrap();
+        let (invocation, reservation, token) = tokens("durable-create");
+        let prepared = match lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("primary", "durable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
+            LaunchResult::Opened(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let snapshot = lifecycle.current_open("conversation");
+        assert_eq!(snapshot.open_state, OpenState::Open);
+        assert_eq!(snapshot.profile_name.as_deref(), Some("default"));
+        assert!(snapshot.profile_uuid.is_some());
+        let authority = lifecycle.registry().authority_projection(
+            &context("primary", "durable", "conversation"),
+            snapshot.profile_uuid.as_deref().unwrap(),
+        );
+        assert_eq!(authority.project_id, "project-1");
+        assert_eq!(authority.session_kind, SessionKind::Primary);
+        assert_eq!(
+            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
+            ReleaseResult::Released
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rejected_durable_grant_hides_owner_specific_state() {
+        let path = root();
+        let create_config = RegistryConfig {
+            grant_verifier_available: true,
+            grant_accepted: true,
+            sealing_available: true,
+            uuid_protocol_compatible: true,
+            ..RegistryConfig::default()
+        };
+        let mut creator = ProfileLifecycle::open_with_config(&path, create_config).unwrap();
+        let (invocation, reservation, token) = tokens("grant-owner");
+        let prepared = match creator.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("primary", "durable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let _opened = match creator.launch_prepared_context(prepared, &token) {
+            LaunchResult::Opened(value) => value,
+            other => panic!("{other:?}"),
+        };
+        drop(creator);
+        let denied_config = RegistryConfig {
+            grant_verifier_available: true,
+            grant_accepted: false,
+            sealing_available: true,
+            uuid_protocol_compatible: true,
+            ..RegistryConfig::default()
+        };
+        let mut denied = ProfileLifecycle::open_with_config(&path, denied_config).unwrap();
+        let (invocation, reservation, _) = tokens("grant-denied");
+        assert_eq!(
+            denied.prepare_context_open(
+                &invocation,
+                &reservation,
+                &context("primary", "durable", "other-conversation")
+            ),
+            PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
+                reason_code: "durable_profile_grant_unavailable"
+            })
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn deletion_failure_is_disposable_only_and_keeps_exclusion() {
+        let path = root();
+        let config = RegistryConfig {
+            deletion_failure_after_start: true,
+            ..RegistryConfig::default()
+        };
+        let mut lifecycle = ProfileLifecycle::open_with_config(&path, config).unwrap();
+        let (invocation, reservation, token) = tokens("delete-failure");
+        let prepared = match lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("subagent", "disposable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
+            LaunchResult::Opened(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let uuid = lifecycle.current_open("conversation").profile_uuid.unwrap();
+        assert!(matches!(
+            lifecycle.release_context(opened.clone(), ReleaseCause::SessionEnd),
+            ReleaseResult::Closed(ProfileOutcome::StorageUnavailable { .. })
+        ));
+        assert!(lifecycle.is_effectively_excluded(&uuid));
+        assert!(matches!(
+            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
+            ReleaseResult::Closed(ProfileOutcome::StorageUnavailable { .. })
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn deletion_requires_complete_fresh_fenced_absence() {
+        let path = root();
+        let mut lifecycle = ProfileLifecycle::open(&path).unwrap();
+        let (invocation, reservation, token) = tokens("delete");
+        let prepared = match lifecycle.prepare_context_open(
+            &invocation,
+            &reservation,
+            &context("subagent", "disposable", "conversation"),
+        ) {
+            PrepareResult::Prepared(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
+            LaunchResult::Opened(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let uuid = lifecycle.current_open("conversation").profile_uuid.unwrap();
+        let bad = LivenessObservation {
+            complete: false,
+            ..LivenessObservation::all_absent(2, 2)
+        };
+        assert!(lifecycle
+            .delete_disposable_with_proof(&uuid, bad, DeletionFence::held(2))
+            .is_err());
+        assert!(matches!(
+            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
+            ReleaseResult::Released
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+}
