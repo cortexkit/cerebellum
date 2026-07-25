@@ -100,8 +100,8 @@ impl Severity {
     }
 }
 
-/// An unfenceable action whose grant is evaluated by the authorization policy
-/// defined in this module.
+/// An action that cannot be protected by a separate execution fence; its grant
+/// is evaluated by the authorization policy defined in this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -325,8 +325,8 @@ pub struct AuthorizationCommitment {
     decision: AuthorizationDecision,
 }
 
-/// A lightweight pre-commit guard for integrations that want to separate
-/// decision construction from the journal's dispatch commitment call.
+/// A borrowed pre-commit guard that lets a caller construct a decision first
+/// and commit that same decision through the grant store later.
 pub struct AuthorizationCommitGuard<'a> {
     store: &'a GrantStore,
     decision: &'a AuthorizationDecision,
@@ -669,8 +669,9 @@ pub fn evaluate_origin_scope(
     }
 }
 
-/// Retains the unique decision association required by the connector-facing
-/// transition binding.  A missing or ambiguous association fails closed.
+/// Retains the unique authorization decision associated with each invocation so
+/// connector transitions can verify which decision authorized them.  A missing
+/// or ambiguous association fails closed.
 #[derive(Debug, Clone, Default)]
 pub struct DecisionBindings {
     by_invocation: BTreeMap<String, Vec<AuthorizationDecision>>,
