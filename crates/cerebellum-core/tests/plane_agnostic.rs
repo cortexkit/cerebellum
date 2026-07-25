@@ -210,7 +210,7 @@ fn sources_contain_no_plane_types() {
     for prefix in FORBIDDEN_TYPE_PREFIXES {
         assert!(
             !sources.contains(prefix),
-            "cerebellum-core sources must not reference any `{prefix}*` browser-plane identifier"
+            "cerebellum-core sources must not reference any `{prefix}*` plane identifier"
         );
     }
 }

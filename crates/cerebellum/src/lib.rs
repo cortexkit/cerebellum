@@ -47,6 +47,11 @@ pub use browser_type::{
 pub use capability::{handle_browser_status, handle_browser_status_for_identity};
 pub use cerebellum_core::config::{parse_config, Config, ConfigError, HealthConfig};
 pub use cerebellum_core::health::HealthState;
+pub use journal::core_adapter::{
+    encode_browser_entry, map_late_event_cause, map_recovery_action, map_recovery_classification,
+    open_browser_core_journal, BrowserCoreJournal, BrowserJournalCodec,
+    UnreachableBrowserLateEventCause,
+};
 // The observer lives behind a feature (not `cfg(test)`) because it now resides
 // in the cerebellum-core dependency: a `test` build of this crate does not
 // enable code in that dependency, so only the forwarded feature gates the seam.
