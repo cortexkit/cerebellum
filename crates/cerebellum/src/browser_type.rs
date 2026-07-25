@@ -940,6 +940,22 @@ mod tests {
         }
     }
 
+    /// A target whose own autocomplete token marks it credential-bearing.
+    fn credential_target(token: &str) -> TypeTarget {
+        let mut target = target();
+        target.autocomplete_tokens = vec![token.to_string()];
+        target
+    }
+
+    /// A target marked credential-bearing by the password attribute alone,
+    /// carrying no autocomplete hint at all.
+    fn password_target() -> TypeTarget {
+        let mut target = target();
+        target.autocomplete_tokens = Vec::new();
+        target.password = true;
+        target
+    }
+
     fn request(replace: bool) -> BrowserTypeRequest {
         BrowserTypeRequest {
             ref_name: "e1".to_string(),
@@ -1174,5 +1190,77 @@ mod tests {
                 ..input
             }
         ));
+    }
+
+    /// The credential and financial refusal is the single most important safety
+    /// property of this module: a refused target must never receive a keystroke,
+    /// and the refusal must happen BEFORE authorization is consulted, so that no
+    /// grant can ever authorize typing into a credential field.
+    ///
+    /// Without these cases the whole suite passes with the refusal branch
+    /// removed, because every other fixture targets an ordinary text control.
+    #[test]
+    fn credential_and_financial_targets_are_refused_before_authorization() {
+        let cases: Vec<(&str, TypeTarget)> = vec![
+            ("password attribute", password_target()),
+            ("current-password", credential_target("current-password")),
+            ("new-password", credential_target("new-password")),
+            ("one-time-code", credential_target("one-time-code")),
+            ("cc-number", credential_target("cc-number")),
+            ("cc-csc", credential_target("cc-csc")),
+            ("cc-exp", credential_target("cc-exp")),
+        ];
+
+        for (label, snapshot) in cases {
+            let mut fixture = DeterministicTypeFixture::new(snapshot.clone());
+            let mut journal = RecordingJournal::default();
+            let mut authorizer = RecordingAuthorizer::allowing();
+
+            let result = execute(
+                &mut fixture,
+                &mut journal,
+                &mut authorizer,
+                &snapshot,
+                &request(true),
+            );
+
+            assert_eq!(
+                result,
+                BrowserTypeResult::InvalidRequest {
+                    field: "text".to_string(),
+                    reason_code: "credential_input_unsupported".to_string(),
+                },
+                "{label} was not refused"
+            );
+            // The authorizer is never consulted, so an over-broad grant cannot
+            // turn this refusal into an allow.
+            assert_eq!(authorizer.calls, 0, "{label} consulted the authorizer");
+            // No keystroke reaches the field.
+            assert!(!fixture.inserted(), "{label} inserted text");
+        }
+    }
+
+    /// The refusal must be driven by classification, not by the request shape:
+    /// the same request against an ordinary text control is accepted.  Without
+    /// this pair, a constant-reject implementation would satisfy the refusal
+    /// test above and never be caught.
+    #[test]
+    fn an_ordinary_text_control_with_the_same_request_is_not_refused() {
+        let snapshot = target();
+        let mut fixture = DeterministicTypeFixture::new(snapshot.clone());
+        let mut journal = RecordingJournal::default();
+        let mut authorizer = RecordingAuthorizer::allowing();
+
+        let result = execute(
+            &mut fixture,
+            &mut journal,
+            &mut authorizer,
+            &snapshot,
+            &request(true),
+        );
+
+        assert_eq!(result, BrowserTypeResult::Ok);
+        assert_eq!(authorizer.calls, 1);
+        assert!(fixture.inserted());
     }
 }
