@@ -10,6 +10,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Snapshot the tree before anything builds, so the final phase can attribute a
+# change to the build rather than to uncommitted work the author already had.
+tree_before_build="$(git status --porcelain)"
+
 run_phase() {
   local label="$1"
   shift
@@ -45,3 +49,31 @@ run_phase "cargo test --workspace --quiet" \
 # the seam could rot unnoticed.
 run_phase "cargo test -p cerebellum --features test-observer --test conformance --quiet" \
   cargo test -p cerebellum --features test-observer --test conformance --quiet
+
+# Phase 6: a generated file must be committed in the form its generator emits.
+# An entry that is semantically right but textually different -- a hand-written
+# Cargo.lock line with the wrong indent, say -- is rewritten by the next build,
+# so the tree goes dirty again however often it is restored. Every test still
+# passes, because the only observable is repository state rather than behaviour,
+# and worker dispatch refuses to launch against a dirty parent checkout.
+#
+# This compares against a snapshot taken before the first build rather than
+# requiring a clean tree, because the normal caller is an author or worker with
+# uncommitted work in progress. Only a file the BUILD itself changed is a
+# finding.
+check_build_rewrote_nothing() {
+  local after rewritten
+  after="$(git status --porcelain)"
+  rewritten="$(comm -13 <(printf '%s\n' "$tree_before_build" | sort) \
+                        <(printf '%s\n' "$after" | sort))"
+  if [ -n "$rewritten" ]; then
+    echo "    building rewrote these tracked files:" >&2
+    echo "$rewritten" >&2
+    echo "    they are committed in a form their generator does not emit;" >&2
+    echo "    regenerate and commit the result rather than editing by hand." >&2
+    return 1
+  fi
+}
+
+run_phase "the build rewrote no generated file" \
+  check_build_rewrote_nothing
