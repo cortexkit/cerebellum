@@ -103,12 +103,13 @@ fn stale_identity_forfeits_structural_containment_but_can_fall_to_global_none() 
     );
 }
 
-// Exceeding a bound does not refuse the action -- it proceeds at the weaker
-// containment claim.  That makes these paths degraded successes rather than
-// failures, so each one needs its own vector: a finalization that quietly kept
-// the structural rung would still return Ok, and the audit row would assert
-// confinement the dispatch never earned.  The reason variant is asserted
-// exactly because the row carries it.
+// When a bound is exceeded the action is not refused: dispatch continues, and
+// the containment level recorded for it drops to the weaker one.  These cases
+// are therefore successes rather than failures, which is why each needs its own
+// test -- finalization that wrongly kept the stronger level would still return
+// Ok, and the audit record would then claim the input was confined to the target
+// process when it was not.  The exact reason is asserted because the audit
+// record carries it, and a wrong reason is as misleading as a wrong level.
 #[test]
 fn identity_bound_exceeded_finalizes_global_none_with_exact_reason() {
     let mut identity = identity_check_with_maximum(

@@ -81,6 +81,30 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
         .all(|(_, operation)| *operation != browser::Operation::CdpInputPress));
 }
 
+#[tokio::test]
+async fn navigation_reports_unsettled_result_after_recording_non_success() {
+    let plane = BrowserPlane::new();
+    let route = identity();
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://example.com",
+                "intent": "open the example page",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "not_settled");
+    assert_eq!(result["url_final"], "https://example.com");
+    assert!(result["lifecycle"].is_array());
+}
+
 #[test]
 fn cdp_correlation_and_attachment_are_fail_closed() {
     let now = Instant::now();
