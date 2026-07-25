@@ -700,6 +700,56 @@ fn first_creation_disabled_path_does_not_provision_uuid() {
 }
 
 #[test]
+fn first_creation_non_affirmative_authority_requires_profile_grant() {
+    let trace = new_trace();
+    let registry = MockRegistry::absent(trace.clone(), "uuid-denied", "retry-denied");
+    let mut custody = MockCustody::available(trace.clone());
+    custody.exact_uuid = AuthorityDecision::NonAffirmative;
+    let mut coordinator = make_coordinator(registry, custody);
+
+    // First creation must not commit a durable profile until the exact UUID
+    // authority decision is affirmative.
+    let result = coordinator.prepare(
+        &facts(SessionKind::Primary, ProfileDisposition::Durable),
+        "new-denied",
+    );
+    assert_eq!(result, Err(ProfileOutcome::ProfileGrantRequired));
+    // The refusal has to precede the commit, not merely accompany it: a durable
+    // profile committed for an identity that was refused would outlive the
+    // refusal.  Asserting the absent side effect makes that ordering a property
+    // of the test rather than of the current control flow.
+    assert!(
+        !trace
+            .borrow()
+            .iter()
+            .any(|event| event == "registry.commit_first_creation"),
+        "refused first creation must not commit a durable profile"
+    );
+
+    let trace = new_trace();
+    let registry = MockRegistry::absent(trace.clone(), "uuid-allowed", "retry-allowed");
+    let custody = MockCustody::available(trace.clone());
+    let mut coordinator = make_coordinator(registry, custody);
+    let prepared = coordinator
+        .prepare(
+            &facts(SessionKind::Primary, ProfileDisposition::Durable),
+            "new-allowed",
+        )
+        .expect("affirmative first-creation authority should proceed");
+    assert_eq!(prepared.profile_uuid().as_str(), "uuid-allowed");
+    assert_eq!(prepared.retry_identity().as_str(), "retry-allowed");
+    // The paired positive vector proves the absence assertion above is not
+    // vacuous: this same event is present when the authority is affirmative.
+    assert!(
+        trace
+            .borrow()
+            .iter()
+            .any(|event| event == "registry.commit_first_creation"),
+        "affirmative first creation must commit a durable profile"
+    );
+}
+
+#[test]
 fn first_creation_uses_same_uuid_retry_and_conflict_contract_as_registry() {
     let trace = new_trace();
     let registry = MockRegistry::absent(trace.clone(), "uuid-created", "retry-created");
