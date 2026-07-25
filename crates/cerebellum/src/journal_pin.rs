@@ -53,6 +53,7 @@ pub struct InvocationToken(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinReservationHandle {
     sequence: u64,
+    journal: ReservationHandle,
 }
 
 impl PinReservationHandle {
@@ -70,6 +71,7 @@ impl PinReservationHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinCommitmentToken {
     sequence: u64,
+    journal: DispatchCommitmentToken,
 }
 
 impl PinCommitmentToken {
@@ -353,7 +355,6 @@ impl AssociationSeam {
 }
 
 /// The invocation-bound journal pin over the S7 [`JournalStore`].
-#[derive(Debug)]
 pub struct JournalPin {
     store: JournalStore,
     next_invocation: u64,
@@ -444,7 +445,10 @@ impl JournalPin {
         self.owners.insert(sequence, token);
         self.states.insert(sequence, PinState::Active);
         self.seam.record_reservation(sequence, token, assoc);
-        Ok(PinReservationHandle { sequence })
+        Ok(PinReservationHandle {
+            sequence,
+            journal: handle,
+        })
     }
 
     /// Finalize a reservation as one exportable `rejected_pre_dispatch` entry.
@@ -468,10 +472,7 @@ impl JournalPin {
             &[PinState::Active, PinState::NoCommitComplete],
         )?;
         let was_active = self.states.get(&sequence) == Some(&PinState::Active);
-        match self
-            .store
-            .finalize_rejected(ReservationHandle(sequence), material)
-        {
+        match self.store.finalize_rejected(handle.journal, material) {
             Ok(committed) => {
                 self.states.insert(sequence, PinState::NoCommitComplete);
                 Ok(committed)
@@ -503,14 +504,14 @@ impl JournalPin {
         // retry of an already-committed dispatch).
         self.preflight(token, sequence, &[PinState::Active, PinState::Dispatched])?;
         let was_active = self.states.get(&sequence) == Some(&PinState::Active);
-        match self
-            .store
-            .commit_dispatched(ReservationHandle(sequence), material)
-        {
-            Ok(_s7_token) => {
+        match self.store.commit_dispatched(handle.journal, material) {
+            Ok(core_token) => {
                 self.states.insert(sequence, PinState::Dispatched);
                 self.seam.record_commitment(sequence, token);
-                Ok(PinCommitmentToken { sequence })
+                Ok(PinCommitmentToken {
+                    sequence,
+                    journal: core_token,
+                })
             }
             Err(e) if e.reason_code == JournalReasonCode::JournalReservationFailed => {
                 if was_active {
@@ -545,11 +546,10 @@ impl JournalPin {
             sequence,
             &[PinState::Dispatched, PinState::Finalized],
         )?;
-        match self.store.finalize_dispatched(
-            DispatchCommitmentToken(sequence),
-            final_context,
-            result,
-        ) {
+        match self
+            .store
+            .finalize_dispatched(commitment.journal, final_context, result)
+        {
             Ok(committed) => {
                 self.states.insert(sequence, PinState::Finalized);
                 self.seam

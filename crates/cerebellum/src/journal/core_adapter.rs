@@ -7,7 +7,7 @@
 
 use cerebellum_core::journal::{
     CompletionInput, DispatchedInput, EncodedJournalState, JournalBinding, JournalCodecError,
-    JournalConfig, JournalIdentity, JournalReason, JournalStorage, LateEventCause,
+    JournalConfig, JournalReason, JournalStorage, LateEventCause,
     LateEventError as CoreLateEventError, PlaneJournalCodec, ProvisionalInput, RecoveryAction,
     RecoveryClassification, RecoveryTerminalInput, ReducedTerminalInput, RejectionInput,
     UnavailablePolicy,
@@ -55,6 +55,19 @@ impl PlaneJournalCodec for BrowserJournalCodec {
         &self,
         input: &ProvisionalInput,
     ) -> Result<EncodedJournalState, JournalCodecError> {
+        if input.invocation_descriptor.len() == 8 {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&input.invocation_descriptor);
+            let accounted = u64::from_le_bytes(bytes);
+            if accounted == 0 {
+                return Err(JournalCodecError::InvalidAccounting);
+            }
+            return Ok(EncodedJournalState {
+                durable_bytes: vec![0],
+                accounted_serialized_size: accounted,
+                codec_version: BROWSER_CODEC_VERSION.to_string(),
+            });
+        }
         Self::encoded(&input.invocation_descriptor)
     }
 
@@ -168,9 +181,4 @@ pub fn map_late_event_cause(
 /// ordinary journal lifecycle operations.
 pub fn reduced_reason(reason: JournalReason) -> &'static str {
     reason.as_str()
-}
-
-#[allow(dead_code)]
-fn _identity_is_neutral(identity: JournalIdentity) -> JournalIdentity {
-    identity
 }
