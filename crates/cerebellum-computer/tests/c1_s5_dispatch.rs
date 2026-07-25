@@ -212,6 +212,19 @@ impl PlatformDriver for RecordingDriver {
     }
 }
 
+#[derive(Debug)]
+struct RecordingConsent {
+    calls: Vec<String>,
+    decision: ConsentDecision,
+}
+
+impl dispatch::EscalationConsent for RecordingConsent {
+    fn request_consent(&mut self, escalation_id: &str) -> ConsentDecision {
+        self.calls.push(escalation_id.to_string());
+        self.decision
+    }
+}
+
 fn background_attendance() -> AttendanceContext {
     AttendanceContext::background(
         "conversation-1",
@@ -536,6 +549,104 @@ fn retry_and_escalation_never_repeat_a_committed_attempt_blindly() {
         escalation.observed_attempt_id.as_deref(),
         Some("escalation-1:observed")
     );
+}
+
+// Escalation retries an action in observed mode after a background attempt whose
+// effect may already have landed, so refusing an unsafe retry is what stops a
+// committed action from being performed twice.  The consent call is asserted to
+// be absent rather than merely late: asking someone to approve an escalation
+// already known to be unsafe is itself the defect, and the ordering is only a
+// property of the current control flow until a test requires it.
+fn assert_escalation_refused_before_consent(
+    prior_disposition: AttemptDisposition,
+    reconciliation: ReconciliationResult,
+    retry_class: RetryClass,
+    ledger: &dispatch::AttemptLedger,
+    attempt_id: &str,
+) {
+    let mut consent = RecordingConsent {
+        calls: Vec::new(),
+        decision: ConsentDecision::Granted,
+    };
+    let result = authorize_escalation(
+        &mut consent,
+        "unsafe-escalation",
+        attempt_id,
+        prior_disposition,
+        reconciliation,
+        retry_class,
+        ledger,
+    );
+    assert_eq!(result, Err(dispatch::EscalationError::RetryUnsafe));
+    assert_eq!(consent.calls, Vec::<String>::new());
+}
+
+#[test]
+fn escalation_refuses_possible_commit_without_no_effect_reconciliation() {
+    let ledger = dispatch::AttemptLedger::new();
+    assert_escalation_refused_before_consent(
+        AttemptDisposition::MayHaveCommitted,
+        ReconciliationResult::EffectIndeterminate,
+        RetryClass::Idempotent,
+        &ledger,
+        "possibly-committed",
+    );
+}
+
+#[test]
+fn every_non_retryable_class_refuses_before_consent() {
+    let ledger = dispatch::AttemptLedger::new();
+    assert_escalation_refused_before_consent(
+        AttemptDisposition::NoEffectObserved,
+        ReconciliationResult::NoEffectObserved,
+        RetryClass::NeverAutomaticRetry,
+        &ledger,
+        "never-automatic",
+    );
+    assert_escalation_refused_before_consent(
+        AttemptDisposition::NoEffectObserved,
+        ReconciliationResult::NoEffectObserved,
+        RetryClass::Deduplicated,
+        &ledger,
+        "missing-deduplication-key",
+    );
+    assert_escalation_refused_before_consent(
+        AttemptDisposition::NoEffectObserved,
+        ReconciliationResult::EffectIndeterminate,
+        RetryClass::ReconcileBeforeRetry,
+        &ledger,
+        "unreconciled",
+    );
+}
+
+#[test]
+fn permitted_escalation_requests_consent_and_records_a_distinct_attempt() {
+    let ledger = dispatch::AttemptLedger::new();
+    let mut consent = RecordingConsent {
+        calls: Vec::new(),
+        decision: ConsentDecision::Granted,
+    };
+    let result = authorize_escalation(
+        &mut consent,
+        "escalation-positive",
+        "background-attempt",
+        AttemptDisposition::MayHaveCommitted,
+        ReconciliationResult::NoEffectObserved,
+        RetryClass::ReconcileBeforeRetry,
+        &ledger,
+    );
+    assert_eq!(
+        result,
+        Ok(dispatch::EscalationAttempt {
+            escalation_id: "escalation-positive".into(),
+            background_attempt_id: "background-attempt".into(),
+            observed_attempt_id: Some("escalation-positive:observed".into()),
+            consent: ConsentDecision::Granted,
+            prior_disposition: AttemptDisposition::MayHaveCommitted,
+            reconciliation: ReconciliationResult::NoEffectObserved,
+        })
+    );
+    assert_eq!(consent.calls, vec!["escalation-positive".to_string()]);
 }
 
 #[test]
