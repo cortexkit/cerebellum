@@ -341,3 +341,76 @@ fn typed_dispatch_carries_adapter_resolved_inputs() {
         IsolationClass::Uncontained
     );
 }
+
+/// A broad-grant (full-display) capture must be refused outright when its grant
+/// is absent.  The gate has its own test because a broad capture is the only
+/// path that can return another application's pixels, and silently degrading it
+/// to a per-window capture would make the recorded scope describe something the
+/// caller never asked for.
+#[test]
+fn broad_grant_capture_without_its_grant_is_refused() {
+    let mut audit = audit();
+    let handle = audit
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::GlobalNone,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(
+        audit
+            .prepare_capture(handle, CaptureScope::BroadGrant, None, 10)
+            .unwrap_err()
+            .cause,
+        cerebellum_computer::capture_custody::CapturePrepareRefusalCause::GrantAbsent
+    );
+
+    // The paired positive: the same scope with a valid broad grant is admitted,
+    // so a blanket refusal cannot satisfy the case above.
+    let mut authority = cerebellum_computer::capture_custody::InMemoryGrantAuthority::default();
+    authority.insert(cerebellum_computer::capture_custody::CaptureGrant::new(
+        "broad-1",
+        CaptureScope::BroadGrant,
+        0,
+        1_000,
+    ));
+    let custody = cerebellum_computer::capture_custody::CaptureCustody::new(
+        bounds(),
+        authority,
+        cerebellum_computer::capture_custody::InMemoryCustodyStorage::new(),
+    )
+    .unwrap();
+    let mut granted = ComputerAudit::new(
+        TestRedactor,
+        taxonomy(),
+        JournalConfig {
+            journal_retention_bytes: 20_000,
+            journal_max_entry_bytes: 4_000,
+        },
+        InMemoryJournalStorage::new(),
+        custody,
+    )
+    .unwrap();
+    let handle = granted
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::GlobalNone,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+    assert!(granted
+        .prepare_capture(
+            handle,
+            CaptureScope::BroadGrant,
+            Some("broad-1".to_string()),
+            10
+        )
+        .is_ok());
+}
