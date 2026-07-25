@@ -474,8 +474,8 @@ impl fmt::Display for ClassificationError {
 
 impl std::error::Error for ClassificationError {}
 
-/// Classify a ref target.  Point-click uses the same function after its
-/// topmost hit-test has selected the `target` node.
+/// Classify a non-type action target.  Point-click uses the same function after
+/// its topmost hit-test has selected the `target` node.
 pub fn classify_non_type(
     input: &NonTypeClassificationInput,
 ) -> Result<NonTypeClassificationRecord, ClassificationError> {
