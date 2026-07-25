@@ -12,6 +12,7 @@ use crate::browser_type::{
     browser_type_registration_eligible, EvidenceEligibilityInput,
     BROWSER_EVIDENCE_ELIGIBILITY_SHA256, BROWSER_TYPE_TOOL,
 };
+use crate::journal::JournalConfig;
 use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
     ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
@@ -81,13 +82,184 @@ pub fn build(module_id: &str) -> ModuleManifest {
     }
 }
 
-/// Build a release manifest with `browser.type` only when the manifest value,
-/// source lock, and digest computed from the immutable eligibility artifact all
-/// agree. This function checks only those three registration inputs; runtime
-/// and packaging requirements are validated elsewhere.
-pub fn build_with_browser_type_evidence(input: &EvidenceEligibilityInput) -> ModuleManifest {
+/// Evidence that the immutable B1 revision or contract-bundle vendors the B2A
+/// journal pin exactly (`b1_journal_pin_compatibility_gate`).
+///
+/// A tokenless trait, a B1 revision that defines `journal_entry_oversize` as a
+/// direct `reserve` result, or an implementation that invokes any journal
+/// transition after a failed marked attempt is incompatible and keeps the
+/// affected capability unadvertised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct B1PinCompatibility {
+    /// The pinned immutable B1 revision or contract-bundle digest.
+    pub revision_or_digest: String,
+    /// Whether conformance proved every pin rule: invocation-bound reservation
+    /// handles and commitment tokens, the exact `reserve` result set,
+    /// post-reservation-only `journal_entry_oversize`, no invocation-side
+    /// journal transition after a failed marked attempt (recovery-exclusive
+    /// retry/cancellation), and matching-token `finalize_dispatched`.
+    pub conformance_passed: bool,
+}
+
+/// The external manifest-bound inputs required to advertise one unfenceable
+/// capability.
+///
+/// Each input is absent until bound at release time. Absence gates
+/// advertisement (the capability stays unadvertised) but never blocks slice
+/// implementation, and is reported distinctly from an implementation failure.
+#[derive(Debug, Clone, Default)]
+pub struct UnfenceableReleaseInputs {
+    /// The browser evidence eligibility digests (manifest value, source lock,
+    /// computed artifact).
+    pub evidence: Option<EvidenceEligibilityInput>,
+    /// The immutable B1 revision or contract-bundle digest satisfying the
+    /// journal-pin compatibility gate.
+    pub b1_pin: Option<B1PinCompatibility>,
+    /// The positive journal deployment bounds.
+    pub journal_bounds: Option<JournalConfig>,
+    /// The computed maximum request-entry size for the capability
+    /// (`computed_max_entry_bytes`).
+    pub computed_max_entry_bytes: Option<u64>,
+}
+
+/// The outcome of evaluating one release gate.
+///
+/// A missing external input and an implementation failure are DIFFERENT facts
+/// and never collapse into one outcome: the former means the gate could not be
+/// evaluated because its external dependency is not bound; the latter means the
+/// inputs were present but the implementation could not satisfy the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// The gate passed.
+    Pass,
+    /// A required external manifest-bound input is absent or incompatible.
+    MissingInput { gate: &'static str },
+    /// An implementation check ran against present inputs and failed.
+    ImplementationFailure { gate: &'static str },
+}
+
+/// The B2A release report: the outcome of every gate evaluated for a surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseReport {
+    pub outcomes: Vec<GateOutcome>,
+}
+
+impl ReleaseReport {
+    /// Whether every gate passed (the surface may be advertised).
+    pub fn passed(&self) -> bool {
+        self.outcomes.iter().all(|o| matches!(o, GateOutcome::Pass))
+    }
+
+    /// The gates suppressed by a missing external input.
+    pub fn missing_inputs(&self) -> Vec<&'static str> {
+        self.outcomes
+            .iter()
+            .filter_map(|o| match o {
+                GateOutcome::MissingInput { gate } => Some(*gate),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The gates suppressed by an implementation failure.
+    pub fn implementation_failures(&self) -> Vec<&'static str> {
+        self.outcomes
+            .iter()
+            .filter_map(|o| match o {
+                GateOutcome::ImplementationFailure { gate } => Some(*gate),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Evaluate every B2A release gate applicable to an unfenceable capability.
+///
+/// The browser evidence eligibility digest is ONE gate among several; it alone
+/// never authorizes advertisement. Each gate reports a missing external input
+/// distinctly from an implementation failure.
+pub fn evaluate_unfenceable_gates(inputs: &UnfenceableReleaseInputs) -> ReleaseReport {
+    let mut outcomes = Vec::new();
+
+    // Gate: browser evidence eligibility (manifest value, source lock, computed
+    // artifact all agree).
+    outcomes.push(match &inputs.evidence {
+        None => GateOutcome::MissingInput {
+            gate: "browser_evidence",
+        },
+        Some(evidence) => {
+            if browser_type_registration_eligible(evidence) {
+                GateOutcome::Pass
+            } else {
+                GateOutcome::ImplementationFailure {
+                    gate: "browser_evidence",
+                }
+            }
+        }
+    });
+
+    // Gate: immutable B1 journal-pin compatibility.
+    outcomes.push(match &inputs.b1_pin {
+        None => GateOutcome::MissingInput {
+            gate: "b1_journal_pin",
+        },
+        Some(pin) if !pin.revision_or_digest.is_empty() && pin.conformance_passed => {
+            GateOutcome::Pass
+        }
+        Some(_) => GateOutcome::ImplementationFailure {
+            gate: "b1_journal_pin",
+        },
+    });
+
+    // Gate: positive, ordered journal deployment bounds.
+    outcomes.push(match &inputs.journal_bounds {
+        None => GateOutcome::MissingInput {
+            gate: "journal_bounds",
+        },
+        Some(bounds) => {
+            if bounds.validate().is_ok() {
+                GateOutcome::Pass
+            } else {
+                GateOutcome::ImplementationFailure {
+                    gate: "journal_bounds",
+                }
+            }
+        }
+    });
+
+    // Gate: serialization fit (computed_max_entry_bytes <= journal_max_entry_bytes).
+    outcomes.push(
+        match (&inputs.computed_max_entry_bytes, &inputs.journal_bounds) {
+            (Some(max), Some(bounds)) => {
+                if *max <= bounds.journal_max_entry_bytes {
+                    GateOutcome::Pass
+                } else {
+                    GateOutcome::ImplementationFailure {
+                        gate: "serialization_fit",
+                    }
+                }
+            }
+            _ => GateOutcome::MissingInput {
+                gate: "serialization_fit",
+            },
+        },
+    );
+
+    ReleaseReport { outcomes }
+}
+
+/// Build a release manifest, adding `browser.type` ONLY when every applicable
+/// B2A release gate passes.
+///
+/// This supersedes the legacy eligibility-digest-only manifest path: the browser
+/// evidence or eligibility digest alone never authorizes advertisement. With the
+/// evidence artifact valid but the B1 pin absent, the journal bounds absent, or
+/// any required gate failed, `browser.type` is absent and externally
+/// non-invocable.
+pub fn build_with_unfenceable_evidence(inputs: &UnfenceableReleaseInputs) -> ModuleManifest {
     let mut manifest = build("cerebellum");
-    if !browser_type_registration_eligible(input) {
+    let report = evaluate_unfenceable_gates(inputs);
+    if !report.passed() {
         return manifest;
     }
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
@@ -193,29 +365,138 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_type_registration_requires_all_three_digest_sources() {
+    fn valid_evidence() -> EvidenceEligibilityInput {
         let digest = crate::browser_type::computed_eligibility_artifact_digest();
-        let complete = EvidenceEligibilityInput {
+        EvidenceEligibilityInput {
             manifest_digest: Some(digest.clone()),
             source_lock_digest: Some(digest.clone()),
             computed_artifact_digest: Some(digest),
             ..EvidenceEligibilityInput::default()
-        };
-        let registered = build_with_browser_type_evidence(&complete);
-        let ProviderRole::ToolProvider { tools, .. } = &registered.provides[0] else {
-            panic!("expected a ToolProvider role");
-        };
-        assert!(tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
+        }
+    }
 
-        let manifest_only = EvidenceEligibilityInput {
-            manifest_digest: Some(BROWSER_EVIDENCE_ELIGIBILITY_SHA256.to_string()),
-            ..EvidenceEligibilityInput::default()
-        };
-        let rejected = build_with_browser_type_evidence(&manifest_only);
-        let ProviderRole::ToolProvider { tools, .. } = &rejected.provides[0] else {
+    fn valid_inputs() -> UnfenceableReleaseInputs {
+        UnfenceableReleaseInputs {
+            evidence: Some(valid_evidence()),
+            b1_pin: Some(B1PinCompatibility {
+                revision_or_digest: "b1-rev-1".to_string(),
+                conformance_passed: true,
+            }),
+            journal_bounds: Some(JournalConfig {
+                journal_retention_bytes: 1_000_000,
+                journal_max_entry_bytes: 100_000,
+            }),
+            computed_max_entry_bytes: Some(100_000),
+        }
+    }
+
+    fn has_browser_type(manifest: &ModuleManifest) -> bool {
+        let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
         };
-        assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
+        tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL)
+    }
+
+    #[test]
+    fn unfenceable_advertisement_requires_every_gate_to_pass() {
+        // All gates pass: browser.type is advertised.
+        assert!(has_browser_type(&build_with_unfenceable_evidence(
+            &valid_inputs()
+        )));
+
+        // Suppressing any single gate keeps browser.type absent.
+        let mut no_evidence = valid_inputs();
+        no_evidence.evidence = None;
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(
+            &no_evidence
+        )));
+
+        let mut no_pin = valid_inputs();
+        no_pin.b1_pin = None;
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(&no_pin)));
+
+        let mut no_bounds = valid_inputs();
+        no_bounds.journal_bounds = None;
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(
+            &no_bounds
+        )));
+
+        let mut no_fit = valid_inputs();
+        no_fit.computed_max_entry_bytes = None;
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(&no_fit)));
+    }
+
+    #[test]
+    fn digest_alone_never_authorizes_advertisement() {
+        // The legacy eligibility-digest-only path is superseded: a valid browser
+        // evidence artifact with no B1 pin, bounds, or fit input does NOT
+        // advertise browser.type.
+        let digest_only = UnfenceableReleaseInputs {
+            evidence: Some(valid_evidence()),
+            ..UnfenceableReleaseInputs::default()
+        };
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(
+            &digest_only
+        )));
+    }
+
+    #[test]
+    fn advertisement_suppressed_when_a_gate_fails() {
+        // A present-but-incompatible B1 pin (conformance not proved) suppresses
+        // advertisement and is reported as an implementation failure, not a
+        // missing input.
+        let mut failing_pin = valid_inputs();
+        failing_pin.b1_pin = Some(B1PinCompatibility {
+            revision_or_digest: "b1-rev-1".to_string(),
+            conformance_passed: false,
+        });
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(
+            &failing_pin
+        )));
+        let report = evaluate_unfenceable_gates(&failing_pin);
+        assert_eq!(report.implementation_failures(), vec!["b1_journal_pin"]);
+        assert!(report.missing_inputs().is_empty());
+    }
+
+    #[test]
+    fn release_report_distinguishes_missing_input_from_implementation_failure() {
+        let bounds = JournalConfig {
+            journal_retention_bytes: 1_000_000,
+            journal_max_entry_bytes: 100_000,
+        };
+
+        // Missing external input: the B1 pin is absent.
+        let missing = UnfenceableReleaseInputs {
+            evidence: Some(valid_evidence()),
+            b1_pin: None,
+            journal_bounds: Some(bounds),
+            computed_max_entry_bytes: Some(100_000),
+        };
+        let missing_report = evaluate_unfenceable_gates(&missing);
+        assert_eq!(missing_report.missing_inputs(), vec!["b1_journal_pin"]);
+        assert!(missing_report.implementation_failures().is_empty());
+
+        // Implementation failure: the B1 pin is present but conformance failed.
+        let failed = UnfenceableReleaseInputs {
+            evidence: Some(valid_evidence()),
+            b1_pin: Some(B1PinCompatibility {
+                revision_or_digest: "b1-rev-1".to_string(),
+                conformance_passed: false,
+            }),
+            journal_bounds: Some(bounds),
+            computed_max_entry_bytes: Some(100_000),
+        };
+        let failed_report = evaluate_unfenceable_gates(&failed);
+        assert_eq!(
+            failed_report.implementation_failures(),
+            vec!["b1_journal_pin"]
+        );
+        assert!(failed_report.missing_inputs().is_empty());
+
+        // The two outcomes are distinct variants for the same gate (index 1).
+        assert_ne!(
+            missing_report.outcomes[1], failed_report.outcomes[1],
+            "missing input and implementation failure must be distinct outcomes"
+        );
     }
 }

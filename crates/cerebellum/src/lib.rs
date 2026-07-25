@@ -9,6 +9,9 @@
 
 pub mod browser_type;
 pub mod capability;
+pub mod journal;
+pub mod journal_admin;
+pub mod journal_pin;
 pub mod manifest;
 pub mod wire;
 
