@@ -836,6 +836,22 @@ async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ck-cerebellum")
         });
+    // Pay the first-exec cost of a freshly built binary before the registration
+    // deadline starts.  macOS validates a newly written executable's signature on
+    // its first exec and caches the result: measured 5-22s for the first run of a
+    // fresh copy of this binary, and 0.00s for every run afterwards.  cargo
+    // rebuilds ck-cerebellum, the daemon spawns it, and that validation lands
+    // inside the window this test measures -- so a rebuild made the test time the
+    // kernel rather than registration, which is why it failed only on the first
+    // run after a build.  The module exits immediately without --subc, so this
+    // costs nothing once the binary is already validated.
+    let _ = tokio::process::Command::new(&binary)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
     let daemon_config_path = directory.join("subc.jsonc");
     fs::write(
         &daemon_config_path,
