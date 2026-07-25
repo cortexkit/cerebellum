@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod capture;
 pub mod capture_custody;
 pub mod grounding;
 pub mod platform;
