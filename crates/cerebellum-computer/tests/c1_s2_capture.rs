@@ -182,3 +182,28 @@ fn leakage_report_has_the_closed_shape_even_for_direct_construction() {
     let report = CaptureLeakageReport::scoped();
     assert_eq!(report.as_map().len(), CaptureLeakageFlag::ALL.len());
 }
+
+#[test]
+fn probe_owner_change_between_enumeration_and_capture_is_refused() {
+    let target = target();
+    let mut backend = InMemoryCaptureBackend::default();
+    backend.set_windows(vec![window("target", &target, true)]);
+    let mut controller = ScopedCaptureController::with_v1_bounds(backend, target).unwrap();
+    // First capture enumerates and succeeds.
+    assert_eq!(controller.capture_scoped(100).unwrap().windows.len(), 1);
+    // The window keeps its id but is now owned by a DIFFERENT process, without
+    // any enumeration event announcing it. Pixels must not be returned.
+    let hostile = ProcessGrant {
+        pid: 999,
+        bundle_identity: "com.example.hostile".into(),
+        process_generation_evidence: "start-time-999".into(),
+    };
+    controller
+        .backend_mut()
+        .set_windows(vec![window("target", &hostile, true)]);
+    let result = controller.capture_scoped(150);
+    assert!(
+        result.is_err(),
+        "capture returned pixels for a window whose owner changed after enumeration"
+    );
+}
