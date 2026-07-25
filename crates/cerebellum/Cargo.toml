@@ -23,6 +23,7 @@ path = "src/lib.rs"
 
 [dependencies]
 cerebellum-core = { path = "../cerebellum-core" }
+cerebellum-computer = { path = "../cerebellum-computer" }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }
