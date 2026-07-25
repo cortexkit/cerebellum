@@ -172,17 +172,27 @@ impl LateEventQueue {
             .find(|(_, record)| record.route == route && record.committed)
             .map(|(sequence, _)| *sequence)
             .ok_or_else(|| LateEventError::new(LateEventCause::Backpressure))?;
-        let record = self
-            .records
-            .remove(&sequence)
-            .expect("selected record exists");
+        let record = self.records.get(&sequence).expect("selected record exists");
         Ok(LateDelivery {
             sequence: LateEventSequence(sequence),
-            descriptor: record.descriptor,
+            descriptor: record.descriptor.clone(),
         })
     }
 
     /// Recover an admitted but uncommitted item at its original sequence.
+    pub fn confirm_late_delivery(&mut self, sequence: LateEventSequence) -> bool {
+        let committed = self
+            .records
+            .get(&sequence.0)
+            .map(|record| record.committed)
+            .unwrap_or(false);
+        committed && self.records.remove(&sequence.0).is_some()
+    }
+
+    pub fn release_late_event(&mut self, sequence: LateEventSequence) -> bool {
+        self.records.remove(&sequence.0).is_some()
+    }
+
     pub fn recover_late_event(&mut self, sequence: LateEventSequence) -> bool {
         self.records
             .get_mut(&sequence.0)
@@ -195,5 +205,26 @@ impl LateEventQueue {
 
     pub fn has_uncommitted(&self) -> bool {
         self.records.values().any(|record| !record.committed)
+    }
+
+    pub fn uncommitted_count(&self) -> usize {
+        self.records
+            .values()
+            .filter(|record| !record.committed)
+            .count()
+    }
+
+    pub fn is_committed(&self, sequence: LateEventSequence) -> bool {
+        self.records
+            .get(&sequence.0)
+            .map(|record| record.committed)
+            .unwrap_or(false)
+    }
+
+    pub fn committed_count(&self, route: DeliveryRoute) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.route == route && record.committed)
+            .count()
     }
 }

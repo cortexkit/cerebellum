@@ -455,15 +455,34 @@ where
             .sum()
     }
 
+    pub fn active_pre_dispatch_count(&self) -> usize {
+        self.state
+            .reservations
+            .values()
+            .filter(|record| record.state == LifecycleState::Active)
+            .count()
+    }
+
+    pub fn set_oversize_flag(&mut self) {
+        self.state.oversize_flag = true;
+        let candidate = self.state.clone();
+        let _ = self.commit_state(candidate);
+    }
+
     pub fn status(&self) -> JournalStatus {
+        let mut sequences: Vec<u64> = self.state.entries.keys().copied().collect();
+        sequences.extend(
+            self.state
+                .reservations
+                .iter()
+                .filter(|(_, record)| record.state == LifecycleState::Dispatched)
+                .map(|(sequence, _)| *sequence),
+        );
+        sequences.sort_unstable();
         JournalStatus {
-            entry_count: self.state.entries.len()
-                + self
-                    .state
-                    .reservations
-                    .values()
-                    .filter(|record| record.state == LifecycleState::Dispatched)
-                    .count(),
+            entry_count: sequences.len(),
+            oldest_retained_sequence: sequences.first().copied(),
+            newest_retained_sequence: sequences.last().copied(),
             retained_bytes: retained_bytes(&self.state),
             active_reservation_count: self.state.reservations.len(),
             active_reserved_bytes: self
@@ -474,6 +493,19 @@ where
                 .sum(),
             oversize_flag: self.state.oversize_flag,
         }
+    }
+
+    /// Allocate and persist the next sequence number without reserving or
+    /// committing a journal entry for it.
+    pub fn allocate_sequence(&mut self) -> Result<u64, JournalError> {
+        let mut candidate = self.state.clone();
+        if take_fault(&mut candidate, "advance_allocator") {
+            return Err(JournalError::ReservationFailed);
+        }
+        let sequence = candidate.next_sequence;
+        candidate.next_sequence = candidate.next_sequence.saturating_add(1);
+        self.commit_state(candidate)?;
+        Ok(sequence)
     }
 
     /// Reserve capacity through the codec's provisional representation.
@@ -798,6 +830,28 @@ where
     }
 
     /// Recover every active reservation from durable opaque material.
+    pub fn classify(&self, action_obligation_id: u64) -> Option<RecoveryClassification> {
+        let record = self.state.reservations.get(&action_obligation_id)?;
+        if record.state == LifecycleState::Dispatched {
+            return Some(RecoveryClassification::ProvisionalDispatched);
+        }
+        match record.marker {
+            None => Some(RecoveryClassification::UnmarkedOrphan),
+            Some(ReservationMarker::Rejection(_)) | Some(ReservationMarker::Reduced(_)) => {
+                Some(RecoveryClassification::FailedRejection)
+            }
+            Some(ReservationMarker::DispatchCommitment) => {
+                Some(RecoveryClassification::FailedCommitment)
+            }
+        }
+    }
+
+    pub fn recover_one(&mut self, action_obligation_id: u64) -> Option<CoreRecoveryOutcome> {
+        self.recover_active()
+            .into_iter()
+            .find(|outcome| outcome.action_obligation_id == action_obligation_id)
+    }
+
     pub fn recover_active(&mut self) -> Vec<CoreRecoveryOutcome> {
         let sequences: Vec<u64> = self.state.reservations.keys().copied().collect();
         let mut outcomes = Vec::new();
@@ -897,16 +951,24 @@ where
     }
 
     pub fn export_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for entry in self.state.entries.values() {
-            bytes.extend_from_slice(&entry.bytes);
-        }
-        for record in self.state.reservations.values() {
-            if record.state == LifecycleState::Dispatched {
-                bytes.extend_from_slice(&record.provisional.durable_bytes);
-            }
-        }
-        bytes
+        let mut records: Vec<(u64, &[u8])> = self
+            .state
+            .entries
+            .iter()
+            .map(|(sequence, entry)| (*sequence, entry.bytes.as_slice()))
+            .collect();
+        records.extend(
+            self.state
+                .reservations
+                .iter()
+                .filter(|(_, record)| record.state == LifecycleState::Dispatched)
+                .map(|(sequence, record)| (*sequence, record.provisional.durable_bytes.as_slice())),
+        );
+        records.sort_by_key(|(sequence, _)| *sequence);
+        records
+            .into_iter()
+            .flat_map(|(_, bytes)| bytes.iter().copied())
+            .collect()
     }
 
     pub fn export(&self) -> String {
@@ -1281,6 +1343,8 @@ fn attachments_from(attachments: &BTreeMap<String, AttachmentState>) -> Vec<Obli
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalStatus {
     pub entry_count: usize,
+    pub oldest_retained_sequence: Option<u64>,
+    pub newest_retained_sequence: Option<u64>,
     pub retained_bytes: u64,
     pub active_reservation_count: usize,
     pub active_reserved_bytes: u64,
