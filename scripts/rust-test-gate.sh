@@ -24,15 +24,22 @@ run_phase() {
 run_phase "cargo fmt --all -- --check" \
   cargo fmt --all -- --check
 
-# Phase 2: clippy with warnings as errors, across all targets.
+# Phase 2: structural wiring. A module that exists on disk but is not declared
+# in its crate root compiles only where a test includes it explicitly, so dead
+# code inside it is never reported and nothing outside a test can call it. That
+# state is indistinguishable from a module nobody remembered to wire up.
+run_phase "scripts/module-wiring-gate.sh" \
+  ./scripts/module-wiring-gate.sh
+
+# Phase 3: clippy with warnings as errors, across all targets.
 run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
   cargo clippy --workspace --all-targets --quiet -- -D warnings
 
-# Phase 3: compile + all tests (lib, bins, integration).
+# Phase 4: compile + all tests (lib, bins, integration).
 run_phase "cargo test --workspace --quiet" \
   cargo test --workspace --quiet
 
-# Phase 4: the identity-resolution observer seam is feature-gated so production
+# Phase 5: the identity-resolution observer seam is feature-gated so production
 # builds emit no observer code. A plain `cargo test` therefore skips the
 # conformance test that exercises it, so run that feature explicitly — otherwise
 # the seam could rot unnoticed.
