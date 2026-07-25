@@ -857,7 +857,10 @@ async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo
         .expect("load isolated subc daemon configuration");
     let task = tokio::spawn(subc_core::bootstrap::run_with_config(daemon_config));
 
-    let connection = timeout(Duration::from_secs(5), async {
+    // Same reasoning as `wait_for_cerebellum_catalog`: this is a startup race
+    // against a real daemon process, not a network operation, so the bound is
+    // generous and only decides how long a genuinely broken boot takes to fail.
+    let connection = timeout(Duration::from_secs(60), async {
         loop {
             if let Ok(connection) = connection_file::read(&connection_file_path) {
                 break connection;
@@ -915,8 +918,21 @@ async fn send_control_request(
         .expect("real subc connection remains open")
 }
 
+/// Poll the daemon catalog until cerebellum registers.
+///
+/// The bound is wall-clock rather than an iteration count.  An iteration count
+/// silently encodes an assumption about how long one poll takes, and this test
+/// spawns a real daemon and a real module process while the rest of the
+/// workspace suite competes for the same cores -- exactly when a poll is
+/// slowest.  A generous wall-clock deadline costs nothing on an idle machine
+/// (the loop returns as soon as the module appears) and still fails a genuinely
+/// unregistrable module, just later.
 async fn wait_for_cerebellum_catalog(stream: &mut TcpStream) -> ClientControlResponse {
-    for corr in 10..510 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    for corr in 10.. {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let frame = send_control_request(
             stream,
             corr,

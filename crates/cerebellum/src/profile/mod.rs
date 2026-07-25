@@ -6,7 +6,6 @@
 //! A caller-supplied string is never used directly as a profile path.
 
 #![allow(clippy::result_large_err)]
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
@@ -1230,19 +1229,6 @@ impl ProfileRegistry {
             profile_uuid: profile_uuid.to_string(),
         }
     }
-
-    fn registry_path(&self) -> Result<PathBuf, RegistryError> {
-        Ok(self
-            .root
-            .target_path(Path::new(REGISTRY_FILE), false)
-            .or_else(|error| {
-                if matches!(error, RootError::Io(ref io) if io.kind() == io::ErrorKind::NotFound) {
-                    self.root.target_path(Path::new(REGISTRY_FILE), true)
-                } else {
-                    Err(error)
-                }
-            })?)
-    }
     fn lock_path(&self) -> Result<PathBuf, RegistryError> {
         Ok(self.root.target_path(Path::new(DURABLE_LOCK_FILE), true)?)
     }
@@ -1608,17 +1594,6 @@ impl ProfileRegistry {
         self.write_document(document)?;
         Ok(result)
     }
-
-    fn record_for(&self, project_id: &str) -> Result<RegistryRecord, RegistryError> {
-        let document = self
-            .read_document()?
-            .ok_or(RegistryError::Untrustworthy("missing registry".to_string()))?;
-        document
-            .records
-            .get(project_id)
-            .cloned()
-            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))
-    }
 }
 
 /// Invocation-bound opaque values. Test constructors model values returned by the
@@ -1672,7 +1647,10 @@ pub enum AbortCause {
     Teardown,
 }
 impl AbortCause {
-    fn as_str(self) -> &'static str {
+    /// The pinned wire name for this cause.  The strings are frozen by the
+    /// profile-lifecycle contract, so they live with the enum rather than at
+    /// the call site that will serialize them.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::DispatchCommitFailed => "dispatch_commit_failed",
             Self::InvocationCancelled => "invocation_cancelled",
@@ -1687,7 +1665,10 @@ pub enum ReleaseCause {
     SupervisorShutdown,
 }
 impl ReleaseCause {
-    fn as_str(self) -> &'static str {
+    /// The stable wire name for this cause.  These strings are serialized into
+    /// profile-lifecycle records, so their spellings must not change; the
+    /// mapping lives with the enum rather than at the serializing call site.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionEnd => "session_end",
             Self::ContextReplaced => "context_replaced",
