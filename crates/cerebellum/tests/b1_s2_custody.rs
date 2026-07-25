@@ -168,6 +168,37 @@ fn process_bound_proof_is_exact_child_and_restart_revokes_old_proof() {
 }
 
 #[test]
+fn a_proof_from_before_a_restart_is_stale_even_for_a_process_of_the_same_id() {
+    // The earlier restart test rejects the old proof because the restarted gate
+    // holds no admitted process at all, so the process ids differ and the
+    // generation is never compared.  Here a new process is admitted under the
+    // SAME id after the restart, so the old and new proofs agree on the id and
+    // only their generations differ.  That is what the generation is for: an
+    // operating system may hand a fresh process the id a terminated one
+    // released, and without it an old proof would vouch for a process it never
+    // inspected.
+    let artifact = artifact();
+    let mut gate = LaunchQuarantine::new(&artifact);
+    gate.commit_for_launch(1).unwrap();
+    let stale = gate
+        .verify_and_admit(&artifact, 41, &observation(artifact.ordered_args.clone()))
+        .unwrap();
+    gate.release(&stale).unwrap();
+    assert!(gate.proof_is_current(&stale, 41));
+
+    gate.restart();
+    gate.commit_for_launch(2).unwrap();
+    let fresh = gate
+        .verify_and_admit(&artifact, 41, &observation(artifact.ordered_args.clone()))
+        .unwrap();
+    gate.release(&fresh).unwrap();
+
+    assert_eq!(fresh.process_id(), stale.process_id());
+    assert!(gate.proof_is_current(&fresh, 41));
+    assert!(!gate.proof_is_current(&stale, 41));
+}
+
+#[test]
 fn admission_proof_type_is_not_caller_constructible() {
     fn accepts_only_production_proof(_: &ConnectorAdmissionProof) {}
     let _ = accepts_only_production_proof;
