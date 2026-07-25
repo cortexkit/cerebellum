@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use cerebellum_computer::audit::{
-    ComputerAudit, ComputerCapability, ComputerPlaneDescriptor, ComputerTerminalKind,
-    EscalationPair, ObservationState, TypedCaptureDispatch,
+    AttemptRole, BackgroundEscalationDescriptor, BackgroundFailureCause, ComputerAudit,
+    ComputerCapability, ComputerPlaneDescriptor, ComputerTerminalKind, ConsentProvenance,
+    EscalationPair, ObservationState, ReauthorizedEscalationDescriptor, TypedCaptureDispatch,
 };
 use cerebellum_computer::capture_custody::{
     redact_accessibility_snapshot, AccessibilityRedactionOutcome, AccessibilityRedactionPath,
@@ -13,7 +14,8 @@ use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
     EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalIdentity,
-    ObservabilityClass, Redactor, SeverityInputs, SeverityRecord, ValidatedSeverityTaxonomy,
+    LifecycleState, ObservabilityClass, Redactor, SeverityInputs, SeverityRecord,
+    ValidatedSeverityTaxonomy,
 };
 
 #[derive(Clone)]
@@ -327,6 +329,50 @@ fn consent_pair_verifies_digest_and_refused_escalation_has_no_successor() {
     )
     .unwrap();
     assert!(provenance.verify().is_ok());
+}
+
+#[test]
+fn consented_escalation_retains_its_reauthorization_descriptor() {
+    let background = BackgroundEscalationDescriptor {
+        escalation_id: "escalation-2".into(),
+        attempt_role: AttemptRole::Background,
+        achieved_containment_rung: ContainmentRung::PidStructural,
+        background_failure_cause: BackgroundFailureCause::PidScopeUnavailable,
+    };
+    let provenance =
+        ConsentProvenance::new("grant-2", "authority-2", "decision-2", "window-2", 30, 40).unwrap();
+    let reauthorized = ReauthorizedEscalationDescriptor {
+        escalation_id: "escalation-2".into(),
+        attempt_role: AttemptRole::Reauthorized,
+        consent_provenance: provenance,
+    };
+    let pair = EscalationPair::consented(background.clone(), reauthorized.clone()).unwrap();
+
+    assert_eq!(pair.background, background);
+    assert_eq!(pair.reauthorized, Some(reauthorized));
+}
+
+#[test]
+fn reduced_terminal_keeps_the_redaction_unavailable_reason() {
+    let mut audit = audit();
+    let handle = audit
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::SemanticElement,
+                ObservationState::HumanUnobserved,
+            ),
+        )
+        .unwrap();
+
+    audit.finalize_redacted_failure(handle).unwrap();
+    let record = audit.read_obligation_audit(handle.sequence()).unwrap();
+    assert_eq!(record.lifecycle, LifecycleState::Rejected);
+    assert_eq!(
+        record.reason,
+        Some(cerebellum_core::journal::JournalReason::RedactionUnavailable)
+    );
 }
 
 #[test]

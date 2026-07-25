@@ -407,7 +407,7 @@ fn download_payload(route: DeliveryRoute) -> PolicyEventPayload {
         },
         identity: identity(),
         route,
-        outcome: Some(Outcome::InternalError),
+        outcome: Outcome::InternalError,
         outcome_detail: Some(serde_json::json!({"reason_code":"internal_failure"})),
     }
 }

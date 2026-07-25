@@ -23,7 +23,13 @@ pub struct PolicyEventPayload {
     pub detail: PolicyEventDetail,
     pub identity: JournalIdentity,
     pub route: DeliveryRoute,
-    pub outcome: Option<Outcome>,
+    /// The outcome reported to a waiting caller.  Required rather than optional:
+    /// an absent outcome would have to be given a meaning at delivery, and every
+    /// available meaning is a claim -- reporting success asserts a result nobody
+    /// established, and reporting a failure invents one.  The admitting caller
+    /// always knows the outcome, so the ambiguous state is removed rather than
+    /// resolved by a default.
+    pub outcome: Outcome,
     pub outcome_detail: Option<serde_json::Value>,
 }
 
@@ -205,7 +211,7 @@ impl LateEventQueue {
         let sequence = self.actual_sequences.get(&local).copied().unwrap_or(local);
         Ok(WaitDelivery {
             sequence,
-            outcome: payload.outcome.unwrap_or(Outcome::Success),
+            outcome: payload.outcome,
             detail: payload
                 .outcome_detail
                 .clone()
