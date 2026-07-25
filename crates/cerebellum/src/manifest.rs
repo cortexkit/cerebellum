@@ -6,7 +6,24 @@
 //! capabilities — they are advertised in the HELLO `control_ops` grant, not in
 //! the manifest's `provides` list.
 
-use serde_json::json;
+use serde_json::{json, Value};
+
+#[path = "connector_evidence.rs"]
+pub mod connector_evidence;
+#[path = "custody.rs"]
+pub mod custody;
+
+pub use connector_evidence::{
+    admission_proof_is_current, connector_evidence_eligibility, verify_connector_evidence,
+    ConnectorEvidence, ConnectorTestPlan, EvidenceCaseResult, EvidenceEligibility,
+    EvidenceSelection, TestPlanCase, REQUIREMENTS as CONNECTOR_REQUIREMENTS,
+};
+pub use custody::{
+    arguments_are_quarantinable, canonical_json_bytes, sha256_file, sha256_hex,
+    verify_registration, verify_registration_in_profile_directory, verify_registration_path,
+    ConnectorAdmissionProof, CustodyArtifact, CustodyArtifactError, LaunchError, LaunchQuarantine,
+    LaunchStage, QuarantineMechanism, RegistrationError, RegistrationObservation, SpawnObservation,
+};
 
 use crate::browser_type::{
     browser_type_registration_eligible, EvidenceEligibilityInput,
@@ -52,8 +69,6 @@ pub fn build(module_id: &str) -> ModuleManifest {
                     "type": "object",
                     "properties": {},
                     "additionalProperties": false,
-                    "browser_evidence_eligibility_sha256":
-                        BROWSER_EVIDENCE_ELIGIBILITY_SHA256,
                 }),
             }],
             identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
@@ -291,8 +306,6 @@ pub fn browser_type_tool() -> Tool {
             },
             "required": ["ref", "snapshot_id", "text", "intent", "severity"],
             "additionalProperties": false,
-            "browser_evidence_eligibility_sha256":
-                BROWSER_EVIDENCE_ELIGIBILITY_SHA256,
         }),
     }
 }
@@ -354,15 +367,15 @@ mod tests {
     }
 
     #[test]
-    fn manifest_carries_computed_eligibility_digest() {
+    fn manifest_tool_schema_has_no_evidence_approval_member() {
         let manifest = build("cerebellum");
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
         };
-        assert_eq!(
-            tools[0].schema["browser_evidence_eligibility_sha256"],
-            BROWSER_EVIDENCE_ELIGIBILITY_SHA256
-        );
+        assert!(tools[0]
+            .schema
+            .get("browser_evidence_eligibility_sha256")
+            .is_none());
     }
 
     fn valid_evidence() -> EvidenceEligibilityInput {
@@ -499,4 +512,296 @@ mod tests {
             "missing input and implementation failure must be distinct outcomes"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Browser-plane release pins: values that identify the exact contracts and
+// policies used by the browser-facing execution plane.
+// ---------------------------------------------------------------------------
+
+/// The closed top-level browser-plane pin object. It is kept separate from
+/// tool JSON schemas so release tooling and browser-facing protocol messages
+/// serialize and reuse exactly the same pin bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestPinSet {
+    pub schema: String,
+    pub spec_a_contract_sha256: String,
+    pub spec_b2_contract_bundle_sha256: String,
+    pub browser_custody_sha256: String,
+    pub browser_address_policy_sha256: String,
+    pub browser_connector_evidence_sha256: String,
+    pub browser_connector_runner_revision: String,
+    pub browser_connector_test_plan_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_extraction_corpus_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_extraction_evidence_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_extraction_runner_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_type_evidence_eligibility_sha256: Option<String>,
+}
+
+pub const MANIFEST_PINS_SCHEMA: &str = "ck-browser-plane-pins/v1";
+pub type BrowserPlanePins = ManifestPinSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenTypeEvidenceStatus {
+    Absent,
+    Accepted,
+    OmittedMalformed,
+    OmittedMismatched,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPinParseReport {
+    pub frozen_type_evidence: FrozenTypeEvidenceStatus,
+    pub messages: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedManifestPins {
+    pub pins: ManifestPinSet,
+    pub report: ManifestPinParseReport,
+    pub canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestPinError {
+    InvalidJson,
+    NonCanonical,
+    UnknownField(String),
+    MissingField(&'static str),
+    InvalidField(&'static str),
+}
+
+impl ManifestPinSet {
+    pub fn parse(
+        bytes: &[u8],
+        expected_frozen_type_digest: Option<&str>,
+    ) -> Result<ParsedManifestPins, ManifestPinError> {
+        parse_manifest_pins(bytes, expected_frozen_type_digest)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestPinError> {
+        self.validate_common()
+    }
+
+    /// Validate fields that gate every minted capability. Extraction pins are
+    /// checked separately because snapshot consumers may be suppressed while
+    /// navigate, screenshot, click-point, and wait-for remain live.
+    pub fn validate_common(&self) -> Result<(), ManifestPinError> {
+        if self.schema != MANIFEST_PINS_SCHEMA {
+            return Err(ManifestPinError::InvalidField("schema"));
+        }
+        for (name, value) in [
+            ("spec_a_contract_sha256", &self.spec_a_contract_sha256),
+            (
+                "spec_b2_contract_bundle_sha256",
+                &self.spec_b2_contract_bundle_sha256,
+            ),
+            ("browser_custody_sha256", &self.browser_custody_sha256),
+            (
+                "browser_address_policy_sha256",
+                &self.browser_address_policy_sha256,
+            ),
+            (
+                "browser_connector_evidence_sha256",
+                &self.browser_connector_evidence_sha256,
+            ),
+            (
+                "browser_connector_test_plan_sha256",
+                &self.browser_connector_test_plan_sha256,
+            ),
+        ] {
+            if !custody::valid_digest(value) {
+                return Err(ManifestPinError::InvalidField(name));
+            }
+        }
+        if !(1..=256).contains(&self.browser_connector_runner_revision.len())
+            || matches!(
+                self.browser_connector_runner_revision
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "placeholder" | "tbd" | "unknown"
+            )
+        {
+            return Err(ManifestPinError::InvalidField(
+                "browser_connector_runner_revision",
+            ));
+        }
+        if let Some(digest) = &self.browser_type_evidence_eligibility_sha256 {
+            if !custody::valid_digest(digest) {
+                return Err(ManifestPinError::InvalidField(
+                    "browser_type_evidence_eligibility_sha256",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn extraction_group_eligible(&self) -> bool {
+        let extraction = [
+            self.browser_extraction_corpus_sha256.as_ref(),
+            self.browser_extraction_evidence_sha256.as_ref(),
+            self.browser_extraction_runner_revision.as_ref(),
+        ];
+        if extraction.iter().all(Option::is_none) || extraction.iter().any(Option::is_none) {
+            return false;
+        }
+        let (Some(corpus), Some(evidence), Some(revision)) = (
+            self.browser_extraction_corpus_sha256.as_ref(),
+            self.browser_extraction_evidence_sha256.as_ref(),
+            self.browser_extraction_runner_revision.as_ref(),
+        ) else {
+            return false;
+        };
+        custody::valid_digest(corpus)
+            && custody::valid_digest(evidence)
+            && (1..=256).contains(&revision.len())
+            && !matches!(
+                revision.to_ascii_lowercase().as_str(),
+                "placeholder" | "tbd" | "unknown"
+            )
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        custody::canonical_json_bytes(&serde_json::to_value(self).expect("manifest pins serialize"))
+    }
+}
+
+/// Parse a canonical pin object. The optional pin for the expected frozen
+/// browser type is handled differently: if it is invalid or does not match the
+/// expected digest, report and remove it instead of blocking a minted action.
+pub fn parse_manifest_pins(
+    bytes: &[u8],
+    expected_frozen_type_digest: Option<&str>,
+) -> Result<ParsedManifestPins, ManifestPinError> {
+    let mut value: Value =
+        serde_json::from_slice(bytes).map_err(|_| ManifestPinError::InvalidJson)?;
+    if custody::canonical_json_bytes(&value) != bytes {
+        return Err(ManifestPinError::NonCanonical);
+    }
+    let object = value.as_object_mut().ok_or(ManifestPinError::InvalidJson)?;
+    let allowed = [
+        "schema",
+        "spec_a_contract_sha256",
+        "spec_b2_contract_bundle_sha256",
+        "browser_custody_sha256",
+        "browser_address_policy_sha256",
+        "browser_connector_evidence_sha256",
+        "browser_connector_runner_revision",
+        "browser_connector_test_plan_sha256",
+        "browser_extraction_corpus_sha256",
+        "browser_extraction_evidence_sha256",
+        "browser_extraction_runner_revision",
+        "browser_type_evidence_eligibility_sha256",
+    ];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ManifestPinError::UnknownField(field.clone()));
+    }
+    let candidate = object
+        .get("browser_type_evidence_eligibility_sha256")
+        .cloned();
+    let (status, message) = match candidate {
+        None => (FrozenTypeEvidenceStatus::Absent, None),
+        Some(Value::String(value))
+            if custody::valid_digest(&value)
+                && expected_frozen_type_digest.is_none_or(|expected| expected == value) =>
+        {
+            (FrozenTypeEvidenceStatus::Accepted, None)
+        }
+        Some(Value::String(_)) => {
+            object.remove("browser_type_evidence_eligibility_sha256");
+            (
+                FrozenTypeEvidenceStatus::OmittedMismatched,
+                Some("optional frozen-type evidence digest omitted: mismatch"),
+            )
+        }
+        Some(_) => {
+            object.remove("browser_type_evidence_eligibility_sha256");
+            (
+                FrozenTypeEvidenceStatus::OmittedMalformed,
+                Some("optional frozen-type evidence digest omitted: malformed"),
+            )
+        }
+    };
+    let normalized_bytes = custody::canonical_json_bytes(&value);
+    let pins: ManifestPinSet = serde_json::from_value(value).map_err(|error| {
+        let text = error.to_string();
+        if text.contains("missing field") {
+            ManifestPinError::MissingField("browser_plane_pins")
+        } else {
+            ManifestPinError::InvalidField("browser_plane_pins")
+        }
+    })?;
+    pins.validate()?;
+    Ok(ParsedManifestPins {
+        pins,
+        report: ManifestPinParseReport {
+            frozen_type_evidence: status,
+            messages: message.into_iter().collect(),
+        },
+        canonical_bytes: normalized_bytes,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityGateInputs {
+    pub common_artifacts_eligible: bool,
+    pub extraction_evidence_eligible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityEligibility {
+    pub capability: &'static str,
+    pub eligible: bool,
+    pub requires_extraction: bool,
+}
+
+pub fn capability_relative_eligibility(
+    pins: &ManifestPinSet,
+    capability: &str,
+    gates: CapabilityGateInputs,
+) -> CapabilityEligibility {
+    let requires_extraction = matches!(capability, "browser.snapshot" | "browser.click");
+    let known = matches!(
+        capability,
+        "browser.navigate"
+            | "browser.snapshot"
+            | "browser.click"
+            | "browser.screenshot"
+            | "browser.click_point"
+            | "browser.wait_for"
+    );
+    let eligible = known
+        && pins.validate().is_ok()
+        && gates.common_artifacts_eligible
+        && (!requires_extraction
+            || (pins.extraction_group_eligible() && gates.extraction_evidence_eligible));
+    CapabilityEligibility {
+        capability: match capability {
+            "browser.navigate" => "browser.navigate",
+            "browser.snapshot" => "browser.snapshot",
+            "browser.click" => "browser.click",
+            "browser.screenshot" => "browser.screenshot",
+            "browser.click_point" => "browser.click_point",
+            "browser.wait_for" => "browser.wait_for",
+            _ => "",
+        },
+        eligible,
+        requires_extraction,
+    }
+}
+
+pub fn capability_is_eligible(
+    pins: &ManifestPinSet,
+    capability: &str,
+    gates: CapabilityGateInputs,
+) -> bool {
+    capability_relative_eligibility(pins, capability, gates).eligible
 }

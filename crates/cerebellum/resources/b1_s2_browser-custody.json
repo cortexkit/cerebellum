@@ -1,0 +1,1 @@
+{"chromium_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","chromium_version":"127.0.1","connector_endpoint_mode":"enforcing_connector_only","ordered_args":["--proxy-server=connector","--user-data-dir=/private/profile"],"platform":"macos","resolver_mode":"connector_owned","schema":"ck-browser-custody/v1"}
