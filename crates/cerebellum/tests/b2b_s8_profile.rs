@@ -1,19 +1,16 @@
 //! Profile-registry acceptance target.
 //!
-//! This test includes the live profile module directly so registry, artifact,
-//! and lifecycle conformance can be compiled and tested independently of the
-//! browser crate-root wiring.
+//! The profile module is exposed from the crate root as `cerebellum::profile`,
+//! so these tests exercise the same code the library compiles rather than a
+//! second private copy included by path.
 
-#[path = "../src/profile/mod.rs"]
-mod profile;
-
-use profile::{
+use cerebellum::profile::{
     implementation_digest_for, verify_implementation_digest, BindFacts, ProfileLifecycle,
     ProfileOutcome, RegistryConfig, REGISTRY_ARTIFACT,
 };
 
-fn context(kind: &str, disposition: &str) -> profile::StampedBindContext {
-    profile::stamped_bind_context(BindFacts {
+fn context(kind: &str, disposition: &str) -> cerebellum::profile::StampedBindContext {
+    cerebellum::profile::stamped_bind_context(BindFacts {
         principal: "direct:agent".to_string(),
         conversation_key: "s8-conversation".to_string(),
         agent_project_id: "s8-project".to_string(),
@@ -45,8 +42,9 @@ fn invalid_artifact_is_a_non_mutating_gate_failure() {
         ..RegistryConfig::default()
     };
     let mut lifecycle = ProfileLifecycle::open_with_config(&root, config).unwrap();
-    let invocation = profile::InvocationToken::for_test("invalid-artifact");
-    let reservation = profile::JournalReservationHandle::for_test(&invocation, "reservation");
+    let invocation = cerebellum::profile::InvocationToken::for_test("invalid-artifact");
+    let reservation =
+        cerebellum::profile::JournalReservationHandle::for_test(&invocation, "reservation");
     let result = lifecycle.prepare_context_open(
         &invocation,
         &reservation,
@@ -54,9 +52,9 @@ fn invalid_artifact_is_a_non_mutating_gate_failure() {
     );
     assert_eq!(
         result,
-        profile::PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+        cerebellum::profile::PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
             reason_code: "profile_storage_unavailable",
-            origin: profile::FailureOrigin::RegistryOrStorage,
+            origin: cerebellum::profile::FailureOrigin::RegistryOrStorage,
         })
     );
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
@@ -69,8 +67,9 @@ fn gate_failure_is_fail_closed_for_all_dispositions() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let mut lifecycle = ProfileLifecycle::disabled(&root).unwrap();
-    let invocation = profile::InvocationToken::for_test("gate");
-    let reservation = profile::JournalReservationHandle::for_test(&invocation, "reservation");
+    let invocation = cerebellum::profile::InvocationToken::for_test("gate");
+    let reservation =
+        cerebellum::profile::JournalReservationHandle::for_test(&invocation, "reservation");
     for (kind, disposition) in [
         ("primary", "durable"),
         ("subagent", "disposable"),
@@ -80,9 +79,9 @@ fn gate_failure_is_fail_closed_for_all_dispositions() {
             lifecycle.prepare_context_open(&invocation, &reservation, &context(kind, disposition));
         assert_eq!(
             result,
-            profile::PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+            cerebellum::profile::PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
                 reason_code: "profile_storage_unavailable",
-                origin: profile::FailureOrigin::RegistryOrStorage,
+                origin: cerebellum::profile::FailureOrigin::RegistryOrStorage,
             })
         );
     }

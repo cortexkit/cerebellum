@@ -3,15 +3,11 @@
 //! The local mocks model the profile registry and custody adapter without
 //! linking a concrete custody dependency or runtime implementation.
 
-#[allow(dead_code)]
-#[path = "../src/profile_custody/mod.rs"]
-mod profile_custody;
-
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-use profile_custody::{
+use cerebellum::profile_custody::{
     AbortCause, AuthorityDecision, CkcredResult, CkcredUnavailable, CustodyAdapter,
     CustodyCoordinator, CustodyOperation, DispatchCommitmentToken, DurableResolution,
     FailureOrigin, LifecycleResult, LiveOwnerProof, LockAcquisition, ProfileDisposition,
@@ -272,7 +268,7 @@ impl CustodyAdapter for MockCustody {
     fn availability(
         &mut self,
         operation: CustodyOperation,
-        authority: &profile_custody::AuthorityTuple,
+        authority: &cerebellum::profile_custody::AuthorityTuple,
     ) -> CkcredResult<()> {
         self.event(format!("custody.availability:{operation:?}"));
         self.availability_calls.push(operation);
@@ -282,7 +278,7 @@ impl CustodyAdapter for MockCustody {
 
     fn verify_authority(
         &mut self,
-        authority: &profile_custody::AuthorityTuple,
+        authority: &cerebellum::profile_custody::AuthorityTuple,
     ) -> CkcredResult<AuthorityDecision> {
         self.event("custody.verify_authority");
         self.seen_authorities.push(authority.as_json());
@@ -296,7 +292,7 @@ impl CustodyAdapter for MockCustody {
 
     fn authorize_exact_uuid(
         &mut self,
-        authority: &profile_custody::AuthorityTuple,
+        authority: &cerebellum::profile_custody::AuthorityTuple,
         _retry_identity: &RetryIdentity,
     ) -> CkcredResult<AuthorityDecision> {
         self.event("custody.authorize_exact_uuid");
@@ -307,7 +303,7 @@ impl CustodyAdapter for MockCustody {
     fn operate(
         &mut self,
         operation: CustodyOperation,
-        authority: &profile_custody::AuthorityTuple,
+        authority: &cerebellum::profile_custody::AuthorityTuple,
         _retry_identity: &RetryIdentity,
     ) -> CkcredResult<()> {
         self.event(format!("custody.operate:{operation:?}"));
@@ -717,7 +713,7 @@ fn first_creation_uses_same_uuid_retry_and_conflict_contract_as_registry() {
         .unwrap();
     assert_eq!(prepared.profile_uuid().as_str(), "uuid-created");
     assert_eq!(prepared.retry_identity().as_str(), "retry-created");
-    assert!(profile_custody::seam_identities_agree(
+    assert!(cerebellum::profile_custody::seam_identities_agree(
         &identity("uuid-created", "retry-created"),
         &prepared
     ));
@@ -760,7 +756,7 @@ fn matching_dispatch_token_is_required_and_post_launch_failure_is_distinct() {
     assert_eq!(error.outcome(), &ProfileOutcome::InternalFailure);
     assert_eq!(
         error.cleanup_classification(),
-        profile_custody::CleanupClassification::None
+        cerebellum::profile_custody::CleanupClassification::None
     );
     let right = DispatchCommitmentToken::for_fixture("launch-1", retry("retry-launch"));
     assert!(coordinator.launch(&prepared, &right).is_ok());
@@ -780,7 +776,7 @@ fn matching_dispatch_token_is_required_and_post_launch_failure_is_distinct() {
     let error = coordinator.launch(&prepared, &token).unwrap_err();
     assert_eq!(
         error.cleanup_classification(),
-        profile_custody::CleanupClassification::PostLaunchFailure
+        cerebellum::profile_custody::CleanupClassification::PostLaunchFailure
     );
     assert_eq!(error.outcome().reason_code(), "internal_failure");
 }

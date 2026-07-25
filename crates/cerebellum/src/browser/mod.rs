@@ -1236,9 +1236,17 @@ impl BrowserPlane {
                 .snapshots
                 .pin(snapshot_id, SnapshotKind::Screenshot, context.epoch.value())
                 .map_err(map_snapshot_error)?;
+            // `pin` refuses a kind mismatch, so a non-screenshot should not reach
+            // here.  Return the typed refusal anyway rather than panicking: this
+            // runs on the shared dispatch path, the claim depends on `pin`
+            // staying correct through every future change, and the cost of
+            // handling it is one arm mapping to the refusal `pin` itself would
+            // have produced.
             let screenshot = match screenshot {
                 snapshot_store::StoredSnapshot::Screenshot(snapshot) => snapshot,
-                _ => unreachable!(),
+                snapshot_store::StoredSnapshot::Text(_) => {
+                    return Err(map_snapshot_error(SnapshotError::WrongKind))
+                }
             };
             let transform = TransformInputs::new(
                 screenshot.input_rect,
