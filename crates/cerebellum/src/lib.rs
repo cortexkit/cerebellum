@@ -22,6 +22,7 @@ pub mod journal_pin;
 pub mod manifest;
 pub mod network;
 pub mod profile;
+pub mod profile_custody;
 pub mod snapshot_store;
 pub mod wire;
 
