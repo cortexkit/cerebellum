@@ -26,7 +26,7 @@ pub mod profile_custody;
 pub mod snapshot_store;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -34,6 +34,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use serde_json::Value;
+
+pub use cerebellum_computer as computer;
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -80,6 +82,439 @@ const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 const BROWSER_STATUS_TOOL: &str = "browser.status";
+
+/// The immutable substrate contract consumed by the computer adapter.  The
+/// computer crate depends one-way on cerebellum-core; this crate only binds the
+/// release identifier into the module manifest.
+pub const CEREBELLUM_CORE_CONTRACT_REVISION: &str = "cerebellum-core-contract-v1";
+/// The schema and revision identifiers used to describe computer capability
+/// rows in release and audit evidence.
+pub const COMPUTER_C2_JOURNAL_SCHEMA_ID: &str = "ck-computer-descriptor/v1";
+pub const COMPUTER_C2_JOURNAL_REVISION: &str = "ck-computer-journal/v1";
+pub const COMPUTER_CAPTURE_LEAKAGE_REVISION: &str = "capture-residual-leakage-v1";
+pub const COMPUTER_PERMISSION_MATRIX_REVISION: &str = "permission-matrix-macos26-v1";
+pub const COMPUTER_ATTENDANCE_SCHEMA_ID: &str = "ck-attendance-contract/v1";
+
+pub use computer::platform::{
+    CapabilityAdvertisementContext as ComputerCapabilityAdvertisementContext,
+    CapabilityDeclaration as ComputerCapabilityDeclaration,
+    ImmutableReleaseInputs as ComputerReleaseInputs, PermissionLiveness, PermissionLivenessReport,
+    PermissionProbeResult, PermissionService, StartupCapabilityProbe, StartupProbeInput,
+};
+
+/// A release gate outcome preserves the difference between an input that has not
+/// been supplied and an implementation that failed a supplied compatibility
+/// check.  Both outcomes suppress advertisement.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ComputerGateOutcome {
+    Pass,
+    MissingExternalInput { gate: String },
+    ImplementationFailure { gate: String },
+}
+
+/// Release evidence records the fixed set of eight canonical computer
+/// capability rows, while runtime advertisement and successfully exercised
+/// behavior are counted independently.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerReleaseEvidence {
+    pub frozen_row_count: usize,
+    pub canonical_row_count: usize,
+    pub advertised_row_count: usize,
+    pub advertised_capabilities: Vec<String>,
+    pub exercised_row_count: usize,
+    pub functional_computer_plane: bool,
+    pub scope: ComputerAdvertisementScope,
+    pub gate_outcomes: Vec<ComputerGateOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerAdvertisementScope {
+    FrozenEightRows,
+    PartialRuntimeAdvertisement,
+    EmptyRuntimeAdvertisement,
+}
+
+const COMPUTER_FROZEN_ROW_COUNT: usize = 8;
+const COMPUTER_CAPABILITY_IDS: [&str; COMPUTER_FROZEN_ROW_COUNT] = [
+    "computer.click",
+    "computer.type",
+    "computer.keys",
+    "computer.scroll",
+    "computer.move",
+    "computer.drag",
+    "computer.screenshot",
+    "computer.wait",
+];
+
+fn pin_outcome(
+    gate: &'static str,
+    value: Option<&str>,
+    expected: Option<&'static str>,
+) -> ComputerGateOutcome {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return ComputerGateOutcome::MissingExternalInput {
+            gate: gate.to_string(),
+        };
+    };
+    if value.eq_ignore_ascii_case("placeholder")
+        || value.eq_ignore_ascii_case("tbd")
+        || value.eq_ignore_ascii_case("unknown")
+    {
+        return ComputerGateOutcome::ImplementationFailure {
+            gate: gate.to_string(),
+        };
+    }
+    if expected.is_some_and(|expected| value != expected) {
+        return ComputerGateOutcome::ImplementationFailure {
+            gate: gate.to_string(),
+        };
+    }
+    ComputerGateOutcome::Pass
+}
+
+fn computer_gate_outcomes(
+    context: &ComputerCapabilityAdvertisementContext,
+) -> Vec<ComputerGateOutcome> {
+    let inputs = &context.inputs;
+    let mut outcomes = vec![
+        pin_outcome(
+            "computer_action_vocabulary_revision",
+            inputs.computer_action_vocabulary_revision.as_deref(),
+            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_REVISION),
+        ),
+        pin_outcome(
+            "cerebellum_core_contract_revision",
+            inputs.cerebellum_core_contract_revision.as_deref(),
+            Some(CEREBELLUM_CORE_CONTRACT_REVISION),
+        ),
+        pin_outcome(
+            "c2_journal_pin_schema_id",
+            inputs.c2_journal_pin_schema_id.as_deref(),
+            Some(COMPUTER_C2_JOURNAL_SCHEMA_ID),
+        ),
+        pin_outcome(
+            "c2_journal_pin_revision",
+            inputs.c2_journal_pin_revision.as_deref(),
+            Some(COMPUTER_C2_JOURNAL_REVISION),
+        ),
+        pin_outcome(
+            "process_identity_primitive_revision",
+            inputs.process_identity_primitive_revision.as_deref(),
+            Some(computer::platform::containment::PROCESS_IDENTITY_PRIMITIVE_REVISION),
+        ),
+        pin_outcome(
+            "capture_residual_leakage_revision",
+            inputs.capture_residual_leakage_revision.as_deref(),
+            Some(COMPUTER_CAPTURE_LEAKAGE_REVISION),
+        ),
+        pin_outcome(
+            "permission_matrix_revision",
+            inputs.permission_matrix_revision.as_deref(),
+            Some(COMPUTER_PERMISSION_MATRIX_REVISION),
+        ),
+        pin_outcome(
+            "attendance_contract_owner",
+            inputs.attendance_contract_owner.as_deref(),
+            None,
+        ),
+        pin_outcome(
+            "attendance_contract_schema_id",
+            inputs.attendance_contract_schema_id.as_deref(),
+            Some(COMPUTER_ATTENDANCE_SCHEMA_ID),
+        ),
+        pin_outcome(
+            "attendance_contract_revision",
+            inputs.attendance_contract_revision.as_deref(),
+            None,
+        ),
+        pin_outcome(
+            "input_review_revision",
+            inputs.input_review_revision.as_deref(),
+            None,
+        ),
+        pin_outcome(
+            "capture_review_revision",
+            inputs.capture_review_revision.as_deref(),
+            None,
+        ),
+        pin_outcome(
+            "release_signing_topology_revision",
+            inputs.release_signing_topology_revision.as_deref(),
+            None,
+        ),
+    ];
+    let digest_inputs = &inputs.vocabulary_digests;
+    outcomes.extend([
+        pin_outcome(
+            "vocabulary_manifest_digest",
+            digest_inputs.manifest_digest.as_deref(),
+            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
+        ),
+        pin_outcome(
+            "vocabulary_source_lock_digest",
+            digest_inputs.source_lock_digest.as_deref(),
+            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
+        ),
+        pin_outcome(
+            "vocabulary_computed_artifact_digest",
+            digest_inputs.computed_artifact_digest.as_deref(),
+            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
+        ),
+    ]);
+    outcomes
+}
+
+fn gate_passes(outcomes: &[ComputerGateOutcome], gate: &str) -> bool {
+    let index = match gate {
+        "computer_action_vocabulary_revision" => 0,
+        "cerebellum_core_contract_revision" => 1,
+        "c2_journal_pin_schema_id" => 2,
+        "c2_journal_pin_revision" => 3,
+        "process_identity_primitive_revision" => 4,
+        "capture_residual_leakage_revision" => 5,
+        "permission_matrix_revision" => 6,
+        "attendance_contract_owner" => 7,
+        "attendance_contract_schema_id" => 8,
+        "attendance_contract_revision" => 9,
+        "input_review_revision" => 10,
+        "capture_review_revision" => 11,
+        "release_signing_topology_revision" => 12,
+        "vocabulary_manifest_digest" => 13,
+        "vocabulary_source_lock_digest" => 14,
+        "vocabulary_computed_artifact_digest" => 15,
+        _ => return false,
+    };
+    outcomes
+        .get(index)
+        .is_some_and(|outcome| matches!(outcome, ComputerGateOutcome::Pass))
+}
+
+fn declaration_gate_passes(
+    declaration: &ComputerCapabilityDeclaration,
+    context: &ComputerCapabilityAdvertisementContext,
+    outcomes: &[ComputerGateOutcome],
+) -> bool {
+    let common = [
+        "computer_action_vocabulary_revision",
+        "cerebellum_core_contract_revision",
+        "c2_journal_pin_schema_id",
+        "c2_journal_pin_revision",
+        "vocabulary_manifest_digest",
+        "vocabulary_source_lock_digest",
+        "vocabulary_computed_artifact_digest",
+    ];
+    if !common.iter().all(|gate| gate_passes(outcomes, gate)) {
+        return false;
+    }
+    let id = declaration.capability_id.as_str();
+    if id == "computer.screenshot" {
+        context
+            .startup
+            .permissions
+            .state(PermissionService::ScreenRecording)
+            == PermissionLiveness::Live
+            && [
+                "process_identity_primitive_revision",
+                "capture_residual_leakage_revision",
+                "capture_review_revision",
+                "release_signing_topology_revision",
+            ]
+            .iter()
+            .all(|gate| gate_passes(outcomes, gate))
+    } else if matches!(
+        id,
+        "computer.click"
+            | "computer.type"
+            | "computer.keys"
+            | "computer.scroll"
+            | "computer.move"
+            | "computer.drag"
+    ) {
+        [
+            "process_identity_primitive_revision",
+            "permission_matrix_revision",
+            "attendance_contract_owner",
+            "attendance_contract_schema_id",
+            "attendance_contract_revision",
+            "input_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
+            && context.startup.private_envelope_recognized
+    } else {
+        declaration.capability_id == "computer.wait"
+    }
+}
+
+fn canonical_declaration_is_complete(declarations: &[ComputerCapabilityDeclaration]) -> bool {
+    declarations.len() == COMPUTER_FROZEN_ROW_COUNT
+        && declarations
+            .iter()
+            .map(|declaration| declaration.capability_id.as_str())
+            .eq(COMPUTER_CAPABILITY_IDS)
+        && computer::platform::validate_vocabulary().is_ok()
+}
+
+fn advertised_computer_declarations<'a>(
+    declarations: &'a [ComputerCapabilityDeclaration],
+    context: &ComputerCapabilityAdvertisementContext,
+    outcomes: &[ComputerGateOutcome],
+) -> Vec<&'a ComputerCapabilityDeclaration> {
+    if !canonical_declaration_is_complete(declarations) {
+        return Vec::new();
+    }
+    declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.advertised && declaration_gate_passes(declaration, context, outcomes)
+        })
+        .collect()
+}
+
+fn canonical_computer_declarations(
+    context: &ComputerCapabilityAdvertisementContext,
+) -> (Vec<ComputerCapabilityDeclaration>, Vec<ComputerGateOutcome>) {
+    let driver = computer::platform::MacOs26PlatformDriver::new(&StartupProbeInput {
+        os_major: context.startup.os_major,
+        private_envelope_revision: if context.startup.private_envelope_recognized {
+            Some(computer::platform::macos::PRIVATE_ENVELOPE_REVISION.to_string())
+        } else {
+            None
+        },
+        resolved_private_symbols: if context.startup.private_envelope_recognized {
+            [computer::platform::macos::PRIVATE_PID_POST_SYMBOL.to_string()]
+                .into_iter()
+                .collect()
+        } else {
+            BTreeSet::new()
+        },
+        permission_results: Vec::new(),
+    });
+    let declarations = driver.declarations(context);
+    let outcomes = computer_gate_outcomes(context);
+    (declarations, outcomes)
+}
+
+fn computer_tool(id: &str) -> Option<subc_protocol::manifest::Tool> {
+    let artifact: Value = serde_json::from_slice(include_bytes!(
+        "../../cerebellum-computer/resources/computer_action_vocabulary-v1.json"
+    ))
+    .ok()?;
+    let row = artifact
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("capability_id").and_then(Value::as_str) == Some(id))?;
+    let action_kind = row.get("action_kind").and_then(Value::as_str)?;
+    let execution_mode = if action_kind == "observe" {
+        subc_protocol::manifest::ExecutionMode::Pure
+    } else {
+        subc_protocol::manifest::ExecutionMode::Unfenceable
+    };
+    Some(subc_protocol::manifest::Tool {
+        name: id.to_string(),
+        description: Some(format!("Computer-plane capability {id}.")),
+        execution_mode,
+        schema: row.get("request_schema")?.clone(),
+    })
+}
+
+/// Build the typed module manifest using the standard computer capability
+/// declarations and the compatibility checks that apply to the supplied context.
+pub fn build_manifest_with_computer_plane(
+    module_id: &str,
+    context: &ComputerCapabilityAdvertisementContext,
+) -> subc_protocol::manifest::ModuleManifest {
+    let mut manifest = manifest::build(module_id);
+    let (declarations, outcomes) = canonical_computer_declarations(context);
+    let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } =
+        &mut manifest.provides[0]
+    else {
+        return manifest;
+    };
+    for declaration in advertised_computer_declarations(&declarations, context, &outcomes) {
+        if let Some(tool) = computer_tool(&declaration.capability_id) {
+            tools.push(tool);
+        }
+    }
+    manifest
+}
+
+/// Produce release evidence for the runtime advertisement.  `exercised_rows`
+/// is intentionally explicit: an advertisement alone is not evidence that a
+/// functional computer action ran.
+pub fn computer_release_evidence(
+    context: &ComputerCapabilityAdvertisementContext,
+) -> ComputerReleaseEvidence {
+    computer_release_evidence_with_exercised_rows(context, 0)
+}
+
+pub fn computer_release_evidence_with_exercised_rows(
+    context: &ComputerCapabilityAdvertisementContext,
+    exercised_rows: usize,
+) -> ComputerReleaseEvidence {
+    let (declarations, gate_outcomes) = canonical_computer_declarations(context);
+    let advertised_capabilities: Vec<String> =
+        advertised_computer_declarations(&declarations, context, &gate_outcomes)
+            .into_iter()
+            .map(|declaration| declaration.capability_id.clone())
+            .collect();
+    let canonical_row_count = declarations.len();
+    let advertised_row_count = advertised_capabilities.len();
+    let scope = if advertised_row_count == COMPUTER_FROZEN_ROW_COUNT {
+        ComputerAdvertisementScope::FrozenEightRows
+    } else if advertised_row_count == 0 {
+        ComputerAdvertisementScope::EmptyRuntimeAdvertisement
+    } else {
+        ComputerAdvertisementScope::PartialRuntimeAdvertisement
+    };
+    ComputerReleaseEvidence {
+        frozen_row_count: COMPUTER_FROZEN_ROW_COUNT,
+        canonical_row_count,
+        advertised_row_count,
+        advertised_capabilities,
+        exercised_row_count: exercised_rows.min(advertised_row_count),
+        functional_computer_plane: exercised_rows > 0 && advertised_row_count > 0,
+        scope,
+        gate_outcomes,
+    }
+}
+
+/// Serialize the ordinary manifest plus a separate, machine-readable computer
+/// release evidence extension.  The extension distinguishes the frozen scope
+/// from what this process actually advertises.
+pub fn serialize_manifest_with_computer_plane(
+    module_id: &str,
+    context: &ComputerCapabilityAdvertisementContext,
+) -> Value {
+    let manifest = build_manifest_with_computer_plane(module_id, context);
+    let mut value = serde_json::to_value(manifest).expect("module manifest serializes");
+    value
+        .as_object_mut()
+        .expect("module manifest is an object")
+        .insert(
+            "computer_plane_release".to_string(),
+            serde_json::to_value(computer_release_evidence(context))
+                .expect("computer release evidence serializes"),
+        );
+    value
+}
+
+fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
+    let startup = StartupCapabilityProbe::run(&StartupProbeInput {
+        os_major: computer::platform::MACOS_MAJOR_VERSION,
+        private_envelope_revision: None,
+        resolved_private_symbols: BTreeSet::new(),
+        permission_results: Vec::new(),
+    });
+    ComputerCapabilityAdvertisementContext {
+        inputs: ComputerReleaseInputs::default(),
+        permissions: startup.permissions.clone(),
+        startup,
+    }
+}
 
 /// Accepted bind facts retained for the lifetime of a route.
 ///
@@ -370,7 +805,7 @@ async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ModuleHelloBody {
+    let mut body = serde_json::to_value(ModuleHelloBody {
         manifest: manifest::build(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![
@@ -383,6 +818,9 @@ async fn send_hello(
             .filter(|value| !value.is_empty()),
     })
     .map_err(ModuleError::Json)?;
+    body["manifest"] =
+        serialize_manifest_with_computer_plane(&config.module_id, &default_computer_context());
+    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
@@ -830,7 +1268,7 @@ pub async fn send_hello_for_test(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfigForTest,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ModuleHelloBody {
+    let mut body = serde_json::to_value(ModuleHelloBody {
         manifest: manifest::build(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![
@@ -841,6 +1279,9 @@ pub async fn send_hello_for_test(
         launch_nonce: None,
     })
     .map_err(ModuleError::Json)?;
+    body["manifest"] =
+        serialize_manifest_with_computer_plane(&config.module_id, &default_computer_context());
+    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
@@ -867,12 +1308,16 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
         launch_nonce: None,
     })
     .map_err(ModuleError::Json)?;
-    body["manifest"] = manifest::serialize_with_browser_plane_pins(
+    let mut browser_manifest = manifest::serialize_with_browser_plane_pins(
         module_id,
         Some(pins),
         common_artifacts_eligible,
         extraction_evidence_eligible,
     );
+    browser_manifest["computer_plane_release"] =
+        serde_json::to_value(computer_release_evidence(&default_computer_context()))
+            .map_err(ModuleError::Json)?;
+    body["manifest"] = browser_manifest;
     let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -1019,6 +1464,21 @@ mod tests {
             module_id: "subc-mcp".to_string(),
         }));
         assert!(!trust.is_first_party());
+    }
+
+    #[test]
+    fn malformed_canonical_declaration_set_never_reaches_manifest_filter() {
+        let context = default_computer_context();
+        let driver = computer::platform::MacOs26PlatformDriver::default();
+        let mut declarations = driver.declarations(&context);
+        for declaration in &mut declarations {
+            declaration.advertised = true;
+        }
+        declarations[0].capability_id = "computer.wait".to_string();
+        let outcomes = (0..16)
+            .map(|_| ComputerGateOutcome::Pass)
+            .collect::<Vec<_>>();
+        assert!(advertised_computer_declarations(&declarations, &context, &outcomes).is_empty());
     }
 }
 
