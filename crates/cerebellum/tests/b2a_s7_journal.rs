@@ -1,24 +1,20 @@
 //! S7 acceptance tests: audit journal, redaction, snapshots, and late events.
 //!
-//! The journal module is owned by slice S7 (`src/journal/**`) but is wired into
-//! the crate root by slice S10. To exercise S7 in isolation without editing
-//! S10-owned `lib.rs`, the module tree is compiled into this test crate via a
-//! `#[path]` include; `crate::journal` inside the module resolves to the
-//! included tree.
+//! The journal module is implemented in `src/journal` and exposed from the crate
+//! root as the public `cerebellum::journal` API. These tests use that public API
+//! rather than a `#[path]` include, so the module is compiled once as live
+//! library code and needs no standalone dead-code suppression.
 
-#[path = "../src/journal/mod.rs"]
-mod journal;
-
-use journal::late_events::{
+use cerebellum::journal::late_events::{
     CommitOutcome, DeliveryRoute, LateEventError, LateEventQueue, PolicyEventPayload,
 };
-use journal::recovery::RecoveryClassification;
-use journal::reservation::{
+use cerebellum::journal::recovery::RecoveryClassification;
+use cerebellum::journal::reservation::{
     CompletedResult, DispatchMaterial, FinalContextAssociation, RejectionMaterial,
 };
-use journal::snapshots::{Observation, SnapshotError, SnapshotStore};
-use journal::store::JournalStore;
-use journal::{
+use cerebellum::journal::snapshots::{Observation, SnapshotError, SnapshotStore};
+use cerebellum::journal::store::JournalStore;
+use cerebellum::journal::{
     Action, Capability, GoverningObservation, GrantDecision, GrantOutcome, JournalConfig,
     JournalIdentity, JournalReasonCode, NavigateWait, Outcome, PolicyEventDetail, SessionKind,
 };
@@ -191,7 +187,8 @@ fn recovery_classifies_orphan_failed_rejection_and_failed_commitment() {
     // Exactly one entry exported: the retried rejection.
     assert_eq!(export.lines().count(), 1);
     assert!(export.contains("rejected_pre_dispatch"));
-    assert!(store.active_sequences().is_empty());
+    // No active writes remain: every reservation was resolved by recovery.
+    assert_eq!(store.active_reserved_bytes(), 0);
 }
 
 // ---------------------------------------------------------------------------

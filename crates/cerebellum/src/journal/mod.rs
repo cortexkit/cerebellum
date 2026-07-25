@@ -34,17 +34,6 @@
 //! the terminating LF. Callers that require exact JCS bytes substitute the
 //! canonicalizer at the export seam without changing the accounting logic.
 
-// This module is a library API surface: slice S10 wires it into the crate root
-// (`pub mod journal`) and consumes its public items through the invocation pin,
-// the administration seam, and the manifest gates. Slice S7 delivers and tests
-// the module standalone, compiling it into the test crate via a `#[path]`
-// include rather than editing S10-owned `lib.rs`. In that standalone test
-// compilation not every public item is exercised, so rustc flags them as dead
-// code even though they are part of the frozen contract. The allowance keeps
-// the standalone S7 build warning-free without changing the public surface; in
-// the wired library build these items are live public API.
-#![allow(dead_code)]
-
 pub mod late_events;
 pub mod recovery;
 pub mod redaction;
