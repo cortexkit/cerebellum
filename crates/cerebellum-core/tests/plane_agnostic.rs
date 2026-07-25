@@ -42,8 +42,20 @@ const FORBIDDEN_BROWSER_TYPES: &[&str] =
 
 /// Desktop-plane (macOS GUI/automation) type identifiers that must never
 /// appear in the substrate.
-const FORBIDDEN_DESKTOP_TYPES: &[&str] =
-    &["AXUIElement", "CGEvent", "SLEventPostToPid", "SCStream"];
+const FORBIDDEN_DESKTOP_TYPES: &[&str] = &[
+    "AXUIElement",
+    "CGEvent",
+    "SLEventPostToPid",
+    "SCStream",
+    "PlatformDriver",
+    "MacOs26PlatformDriver",
+    "ComputerActionVocabulary",
+    "CapabilityDeclaration",
+    "PermissionLivenessProbe",
+    "PrivateEnvelopeStartupProbe",
+    "StartupCapabilityProbe",
+    "FrontingSnapshot",
+];
 
 /// Identifier prefix forbidden anywhere in the substrate source: `browser_*`
 /// names belong to the browser plane's surface, not the shared substrate.
