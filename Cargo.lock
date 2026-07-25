@@ -50,6 +50,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerebellum-computer"
+version = "0.1.0"
+dependencies = [
+ "cerebellum-core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cerebellum-core"
 version = "0.1.0"
 dependencies = [
