@@ -88,3 +88,32 @@ fn gate_failure_is_fail_closed_for_all_dispositions() {
     assert!(!root.join(".ck-browser-profile-v1.json").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Report the correct digest when the pin is stale, rather than only that it is.
+///
+/// The registry's implementation digest covers the bytes of `profile/mod.rs`
+/// itself, so *any* edit to that file -- including a comment -- invalidates the
+/// pinned value and fails several tests at once with only a mismatch. That is the
+/// tamper-evidence working, but the pinned value is checked in, so a legitimate
+/// edit has to repin it, and the digest is not recoverable from the failure.
+///
+/// This test names the value to write into the artifact, so repinning does not
+/// require hand-writing a throwaway probe.
+#[test]
+fn pinned_implementation_digest_matches_the_module_source() {
+    let computed =
+        cerebellum::profile::implementation_digest_for(cerebellum::profile::REGISTRY_ARTIFACT)
+            .expect("implementation bundle builds from the checked-in artifact");
+    let artifact: serde_json::Value =
+        serde_json::from_slice(cerebellum::profile::REGISTRY_ARTIFACT).expect("artifact is JSON");
+    let pinned = artifact["implementation_digest"]["value"]
+        .as_str()
+        .expect("artifact pins an implementation digest");
+    assert_eq!(
+        pinned, computed,
+        "\nthe pinned implementation digest is stale.\n\
+         if the edit to crates/cerebellum/src/profile/mod.rs was intended, set\n\
+         implementation_digest.value in crates/cerebellum/resources/\
+         ck-browser-profile-registry-v1.json to:\n  {computed}\n"
+    );
+}
