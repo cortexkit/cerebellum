@@ -8,10 +8,12 @@
 
 use serde_json::{json, Value};
 
-#[path = "connector_evidence.rs"]
-pub mod connector_evidence;
-#[path = "custody.rs"]
-pub mod custody;
+pub mod connector_evidence {
+    pub use crate::connector_evidence::*;
+}
+pub mod custody {
+    pub use crate::custody::*;
+}
 
 pub use connector_evidence::{
     admission_proof_is_current, connector_evidence_eligibility, verify_connector_evidence,
@@ -41,12 +43,10 @@ pub const BROWSER_STATUS: &str = "browser.status";
 
 /// Build the browser-free cerebellum capability manifest.
 ///
-/// The manifest declares exactly one `ToolProvider` role with exactly one tool
-/// (`browser.status`, `execution_mode: pure`). Register `browser.type` only
-/// when its manifest value, locked source revision, and SHA-256 digest of the
-/// immutable eligibility artifact match the expected values. This prevents a
-/// dependency bundle from authorizing registration without matching source
-/// evidence.
+/// The default manifest declares exactly one `ToolProvider` role with the
+/// browser.status tool (`execution_mode: pure`). Minted browser routes are added
+/// only by `build_with_browser_plane_pins` after their independent release gates
+/// pass; this builder never adds the legacy type route.
 pub fn build(module_id: &str) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
@@ -95,6 +95,88 @@ pub fn build(module_id: &str) -> ModuleManifest {
             },
         },
     }
+}
+
+/// Compose the six browser routes independently from the existing type route.
+/// A common pin failure suppresses every minted route; an extraction failure
+/// suppresses only routes that consume accessibility or DOM data (snapshot and
+/// click).
+pub fn build_with_browser_plane_pins(
+    module_id: &str,
+    pins: Option<&ManifestPinSet>,
+    common_artifacts_eligible: bool,
+    extraction_evidence_eligible: bool,
+) -> ModuleManifest {
+    let mut manifest = build(module_id);
+    let Some(pins) = pins else {
+        return manifest;
+    };
+    if pins.validate().is_err() || !common_artifacts_eligible {
+        return manifest;
+    }
+    let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
+        return manifest;
+    };
+    for (name, description, schema) in crate::browser::tool_definitions() {
+        let requires_extraction = matches!(name, crate::browser::SNAPSHOT | crate::browser::CLICK);
+        if requires_extraction
+            && (!pins.extraction_group_eligible() || !extraction_evidence_eligible)
+        {
+            continue;
+        }
+        tools.push(Tool {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            execution_mode: if matches!(
+                name,
+                crate::browser::NAVIGATE | crate::browser::CLICK | crate::browser::CLICK_POINT
+            ) {
+                ExecutionMode::Unfenceable
+            } else {
+                ExecutionMode::Pure
+            },
+            schema,
+        });
+    }
+    manifest
+}
+
+/// Serialize the standard manifest and its single top-level browser-plane
+/// extension for HELLO/release tooling. The external SUBC manifest type used by
+/// status-only builds predates extensions, so composition is explicit here.
+pub fn serialize_with_browser_plane_pins(
+    module_id: &str,
+    pins: Option<&ManifestPinSet>,
+    common_artifacts_eligible: bool,
+    extraction_evidence_eligible: bool,
+) -> Value {
+    let manifest = build_with_browser_plane_pins(
+        module_id,
+        pins,
+        common_artifacts_eligible,
+        extraction_evidence_eligible,
+    );
+    let mut value = serde_json::to_value(manifest).expect("module manifest serializes");
+    if let Some(pins) = pins {
+        if common_artifacts_eligible && pins.validate().is_ok() {
+            let mut pin_value = serde_json::to_value(pins).expect("pins serialize");
+            if !pins
+                .browser_type_evidence_eligibility_sha256
+                .as_deref()
+                .is_some_and(custody::valid_digest)
+            {
+                pin_value
+                    .as_object_mut()
+                    .expect("pins are an object")
+                    .remove("browser_type_evidence_eligibility_sha256");
+            }
+            value
+                .as_object_mut()
+                .expect("manifest is an object")
+                .insert("browser_plane_pins".into(), pin_value);
+        }
+    }
+    value
 }
 
 /// Evidence that the immutable B1 revision or contract-bundle vendors the B2A
@@ -263,18 +345,12 @@ pub fn evaluate_unfenceable_gates(inputs: &UnfenceableReleaseInputs) -> ReleaseR
     ReleaseReport { outcomes }
 }
 
-/// Build a release manifest, adding `browser.type` ONLY when every applicable
-/// B2A release gate passes.
-///
-/// This supersedes the legacy eligibility-digest-only manifest path: the browser
-/// evidence or eligibility digest alone never authorizes advertisement. With the
-/// evidence artifact valid but the B1 pin absent, the journal bounds absent, or
-/// any required gate failed, `browser.type` is absent and externally
-/// non-invocable.
+/// Compatibility helper that preserves the old evidence-gated browser.type
+/// descriptor so a frozen manifest fixture can compare its historical output.
+/// Production manifest builders omit browser.type.
 pub fn build_with_unfenceable_evidence(inputs: &UnfenceableReleaseInputs) -> ModuleManifest {
     let mut manifest = build("cerebellum");
-    let report = evaluate_unfenceable_gates(inputs);
-    if !report.passed() {
+    if !evaluate_unfenceable_gates(inputs).passed() {
         return manifest;
     }
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
@@ -403,6 +479,66 @@ mod tests {
         }
     }
 
+    fn valid_browser_pins(with_extraction: bool) -> ManifestPinSet {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        ManifestPinSet {
+            schema: MANIFEST_PINS_SCHEMA.to_string(),
+            spec_a_contract_sha256: digest.clone(),
+            spec_b2_contract_bundle_sha256: digest.clone(),
+            browser_custody_sha256: digest.clone(),
+            browser_address_policy_sha256: digest.clone(),
+            browser_connector_evidence_sha256: digest.clone(),
+            browser_connector_runner_revision: "runner-v1".to_string(),
+            browser_connector_test_plan_sha256: digest.clone(),
+            browser_extraction_corpus_sha256: with_extraction.then(|| digest.clone()),
+            browser_extraction_evidence_sha256: with_extraction.then(|| digest.clone()),
+            browser_extraction_runner_revision: with_extraction.then(|| "extract-v1".to_string()),
+            browser_type_evidence_eligibility_sha256: Some("not-a-digest".to_string()),
+        }
+    }
+
+    #[test]
+    fn browser_plane_routes_are_capability_relative_and_type_free() {
+        let common_only = build_with_browser_plane_pins(
+            "cerebellum",
+            Some(&valid_browser_pins(false)),
+            true,
+            false,
+        );
+        let ProviderRole::ToolProvider { tools, .. } = &common_only.provides[0] else {
+            panic!("expected tool provider");
+        };
+        assert_eq!(
+            tools.len(),
+            5,
+            "status plus navigate, screenshot, point-click, and wait"
+        );
+        assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
+
+        let all = build_with_browser_plane_pins(
+            "cerebellum",
+            Some(&valid_browser_pins(true)),
+            true,
+            true,
+        );
+        let ProviderRole::ToolProvider { tools, .. } = &all.provides[0] else {
+            panic!("expected tool provider");
+        };
+        assert_eq!(tools.len(), 7, "status plus six minted browser routes");
+        assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
+        let serialized = serialize_with_browser_plane_pins(
+            "cerebellum",
+            Some(&valid_browser_pins(true)),
+            true,
+            true,
+        );
+        assert!(serialized.get("browser_plane_pins").is_some());
+        assert!(serialized["provides"]
+            .to_string()
+            .find("browser_evidence_eligibility_sha256")
+            .is_none());
+    }
+
     fn has_browser_type(manifest: &ModuleManifest) -> bool {
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
@@ -412,7 +548,8 @@ mod tests {
 
     #[test]
     fn unfenceable_advertisement_requires_every_gate_to_pass() {
-        // All gates pass: browser.type is advertised.
+        // This test exercises the historical evidence-gated fixture; normal
+        // production registration uses the current browser-route composition path instead.
         assert!(has_browser_type(&build_with_unfenceable_evidence(
             &valid_inputs()
         )));
@@ -631,13 +768,9 @@ impl ManifestPinSet {
                 "browser_connector_runner_revision",
             ));
         }
-        if let Some(digest) = &self.browser_type_evidence_eligibility_sha256 {
-            if !custody::valid_digest(digest) {
-                return Err(ManifestPinError::InvalidField(
-                    "browser_type_evidence_eligibility_sha256",
-                ));
-            }
-        }
+        // The legacy type-route digest is optional and non-blocking. Invalid or
+        // mismatched candidates are omitted by `parse_manifest_pins`; they never
+        // gate a newly minted browser capability.
         Ok(())
     }
 

@@ -7,12 +7,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authorization;
+pub mod browser;
 pub mod browser_type;
 pub mod capability;
+pub mod cdp;
+pub mod classification;
+pub mod connector_evidence;
+pub mod coordinate;
+pub mod custody;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
 pub mod manifest;
+pub mod network;
+pub mod profile;
+pub mod snapshot_store;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -35,6 +45,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+pub use browser::{handle_tool as handle_browser_tool, BrowserCapability, BrowserPlane};
 pub use browser_type::{
     browser_type_dispatch_eligible, browser_type_eligibility, browser_type_geometry_eligible,
     browser_type_revalidation_eligible, BrowserTypeAuthorizer, BrowserTypeDriver,
@@ -143,12 +154,14 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 
     let health_state = Arc::new(HealthState::with_config(config.health));
     let route_bindings = Arc::new(RouteBindings::new());
+    let browser_plane = Arc::new(BrowserPlane::new());
     let loop_result = module_loop(
         &mut read_half,
         tx.clone(),
         &config,
         Arc::clone(&health_state),
         Arc::clone(&route_bindings),
+        browser_plane,
     )
     .await;
     drop(tx);
@@ -220,6 +233,7 @@ async fn module_loop<R>(
     config: &ModuleConfig,
     health_state: Arc<HealthState>,
     route_bindings: Arc<RouteBindings>,
+    browser_plane: Arc<BrowserPlane>,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -236,11 +250,13 @@ where
 
     let handler_health = Arc::clone(&health_state);
     let handler_routes = Arc::clone(&route_bindings);
+    let handler_browser = Arc::clone(&browser_plane);
     let handler = move |frame: Frame| {
         let writer = writer.clone();
         let health = Arc::clone(&handler_health);
         let routes = Arc::clone(&handler_routes);
-        async move { handle_frame(frame, &writer, &health, &routes).await }
+        let browser = Arc::clone(&handler_browser);
+        async move { handle_frame(frame, &writer, &health, &routes, &browser).await }
     };
 
     run_dispatch_loop(read_half, &health_state, &clock, &mut idle_wake, handler).await
@@ -401,6 +417,7 @@ async fn handle_frame(
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
+    browser_plane: &Arc<BrowserPlane>,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -427,8 +444,16 @@ async fn handle_frame(
             let writer = writer.clone();
             let health_state = Arc::clone(health_state);
             let route_bindings = Arc::clone(route_bindings);
+            let browser_plane = Arc::clone(browser_plane);
             tokio::spawn(async move {
-                let _ = handle_tool_request(frame, &writer, &health_state, &route_bindings).await;
+                let _ = handle_tool_request(
+                    frame,
+                    &writer,
+                    &health_state,
+                    &route_bindings,
+                    &browser_plane,
+                )
+                .await;
             });
             Ok(true)
         }
@@ -537,6 +562,7 @@ async fn handle_tool_request(
     writer: &mpsc::Sender<Frame>,
     _health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
+    browser_plane: &Arc<BrowserPlane>,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -608,6 +634,54 @@ async fn handle_tool_request(
         .await;
     };
 
+    // Route admission is completed before decoding capability arguments.
+    // Admitted routes may proceed to their handlers; denied routes perform no
+    // reservation, context lookup, grant lookup, or CDP work.
+    let known_capability = if name == BROWSER_STATUS_TOOL {
+        Some(BROWSER_STATUS_TOOL)
+    } else if browser::BrowserCapability::parse(name).is_some() {
+        Some(name)
+    } else {
+        None
+    };
+    let Some(capability_name) = known_capability else {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "unknown_method",
+            &format!("unknown method '{name}'"),
+        )
+        .await;
+    };
+
+    let Some(accepted_facts) = route_bindings.get(channel, epoch) else {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "route_not_bound",
+            "browser capability requires an accepted route.bind",
+        )
+        .await;
+    };
+    if !accepted_facts.allows_capability(capability_name) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "capability_denied",
+            "capability is outside the effective capability scope",
+        )
+        .await;
+    }
+
     let Some(arguments) = object.get("arguments") else {
         return send_invalid_request_response(
             writer,
@@ -621,45 +695,13 @@ async fn handle_tool_request(
         .await;
     };
 
-    if name != BROWSER_STATUS_TOOL {
-        return send_route_error(
-            writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "unknown_method",
-            &format!("unknown method '{name}', expected '{BROWSER_STATUS_TOOL}'"),
-        )
-        .await;
+    if name == BROWSER_STATUS_TOOL {
+        let result = handle_browser_status_for_identity(arguments, &accepted_facts.identity);
+        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
     }
 
-    let Some(accepted_facts) = route_bindings.get(channel, epoch) else {
-        return send_route_error(
-            writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "route_not_bound",
-            "browser.status requires an accepted route.bind",
-        )
-        .await;
-    };
-    if !accepted_facts.allows_capability(BROWSER_STATUS_TOOL) {
-        return send_route_error(
-            writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "capability_denied",
-            "browser.status is outside the effective capability scope",
-        )
-        .await;
-    }
-
-    let result = handle_browser_status_for_identity(arguments, &accepted_facts.identity);
+    let result =
+        browser::handle_tool(browser_plane, &accepted_facts.identity, name, arguments).await;
     send_tool_response(writer, ver, channel, epoch, corr, result).await
 }
 
@@ -803,6 +845,39 @@ pub async fn send_hello_for_test(
     send(writer, frame).await
 }
 
+/// Build an eligible HELLO fixture with the browser-plane pins as the single
+/// top-level manifest extension. Production status-only HELLOs use the normal
+/// typed SUBC manifest path above when no release inputs are bound.
+pub async fn send_hello_with_browser_plane_pins_for_test(
+    writer: &mpsc::Sender<Frame>,
+    module_id: &str,
+    pins: &manifest::ManifestPinSet,
+    common_artifacts_eligible: bool,
+    extraction_evidence_eligible: bool,
+) -> Result<(), ModuleError> {
+    let mut body = serde_json::to_value(ModuleHelloBody {
+        manifest: manifest::build(module_id),
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: Some(vec![
+            "route.bind".to_string(),
+            "route.status".to_string(),
+            MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
+        ]),
+        launch_nonce: None,
+    })
+    .map_err(ModuleError::Json)?;
+    body["manifest"] = manifest::serialize_with_browser_plane_pins(
+        module_id,
+        Some(pins),
+        common_artifacts_eligible,
+        extraction_evidence_eligible,
+    );
+    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
+    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
 pub async fn handle_control_request_for_test(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -840,7 +915,14 @@ pub async fn handle_tool_request_for_test(
         frame.header.epoch,
         AcceptedBindFacts::from_bind(&identity, Some(subc_protocol::Principal::Direct), None),
     );
-    handle_tool_request(frame, writer, health_state, &route_bindings).await
+    handle_tool_request(
+        frame,
+        writer,
+        health_state,
+        &route_bindings,
+        &Arc::new(BrowserPlane::new()),
+    )
+    .await
 }
 
 pub async fn handle_tool_request_for_test_with_bindings(
@@ -849,7 +931,14 @@ pub async fn handle_tool_request_for_test_with_bindings(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    handle_tool_request(frame, writer, health_state, route_bindings).await
+    handle_tool_request(
+        frame,
+        writer,
+        health_state,
+        route_bindings,
+        &Arc::new(BrowserPlane::new()),
+    )
+    .await
 }
 
 #[cfg(test)]
