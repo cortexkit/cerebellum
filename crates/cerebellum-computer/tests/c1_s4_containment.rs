@@ -33,6 +33,14 @@ fn identity_check(
     observed_evidence: ProcessIdentityEvidence,
     dispatch_at_ms: u64,
 ) -> cerebellum_computer::platform::containment::IdentityCheckEvidence {
+    identity_check_with_maximum(observed_evidence, dispatch_at_ms, Some(5))
+}
+
+fn identity_check_with_maximum(
+    observed_evidence: ProcessIdentityEvidence,
+    dispatch_at_ms: u64,
+    maximum_interval_ms: Option<u64>,
+) -> cerebellum_computer::platform::containment::IdentityCheckEvidence {
     let primitive = ProcessIdentityPrimitive::pinned_v1();
     let binding = primitive
         .capture_grant(
@@ -46,7 +54,7 @@ fn identity_check(
         &ProcessIdentityObservation::new(7, "com.example.target", observed_evidence),
         10,
         Some(dispatch_at_ms),
-        Some(5),
+        maximum_interval_ms,
         IdentityDiscriminationRequirement::GenerationDiscriminating,
     )
 }
@@ -93,6 +101,141 @@ fn stale_identity_forfeits_structural_containment_but_can_fall_to_global_none() 
         result.forfeiture_reason,
         Some(ContainmentForfeitureReason::IdentityStale)
     );
+}
+
+// Exceeding a bound does not refuse the action -- it proceeds at the weaker
+// containment claim.  That makes these paths degraded successes rather than
+// failures, so each one needs its own vector: a finalization that quietly kept
+// the structural rung would still return Ok, and the audit row would assert
+// confinement the dispatch never earned.  The reason variant is asserted
+// exactly because the row carries it.
+#[test]
+fn identity_bound_exceeded_finalizes_global_none_with_exact_reason() {
+    let mut identity = identity_check_with_maximum(
+        ProcessIdentityEvidence::kernel_vouched("generation-1"),
+        20,
+        None,
+    );
+    identity.maximum_identity_check_to_dispatch_interval_ms = Some(5);
+    let fronting = compare_fronting(
+        &grant(),
+        Some(snapshot(0, 1)),
+        Some(snapshot(100, 1)),
+        0,
+        100,
+        100,
+    );
+    let result = finalize_containment(ContainmentEvidence::input(
+        ActionKind::Compose,
+        DeliveryPrimitive::PerPidSynthetic,
+        false,
+        Some(identity),
+        Some(fronting),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(result.containment_rung, Some(ContainmentRung::GlobalNone));
+    assert_eq!(
+        result.forfeiture_reason,
+        Some(ContainmentForfeitureReason::IdentityBoundExceeded)
+    );
+}
+
+#[test]
+fn identity_within_bound_finalizes_pid_structural_without_forfeiture() {
+    let mut identity = identity_check_with_maximum(
+        ProcessIdentityEvidence::kernel_vouched("generation-1"),
+        12,
+        None,
+    );
+    identity.maximum_identity_check_to_dispatch_interval_ms = Some(5);
+    let fronting = compare_fronting(
+        &grant(),
+        Some(snapshot(0, 1)),
+        Some(snapshot(100, 1)),
+        0,
+        100,
+        100,
+    );
+    let result = finalize_containment(ContainmentEvidence::input(
+        ActionKind::Compose,
+        DeliveryPrimitive::PerPidSynthetic,
+        false,
+        Some(identity),
+        Some(fronting),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        result.containment_rung,
+        Some(ContainmentRung::PidStructural)
+    );
+    assert_eq!(result.forfeiture_reason, None);
+}
+
+#[test]
+fn fronting_bound_exceeded_finalizes_global_none_with_exact_reason() {
+    let mut identity = identity_check_with_maximum(
+        ProcessIdentityEvidence::kernel_vouched("generation-1"),
+        12,
+        None,
+    );
+    identity.maximum_identity_check_to_dispatch_interval_ms = Some(5);
+    let mut fronting = compare_fronting(
+        &grant(),
+        Some(snapshot(0, 1)),
+        Some(snapshot(100, 1)),
+        0,
+        100,
+        100,
+    );
+    fronting.maximum_fronting_bracket_interval_ms = 50;
+    let result = finalize_containment(ContainmentEvidence::input(
+        ActionKind::Compose,
+        DeliveryPrimitive::PerPidSynthetic,
+        false,
+        Some(identity),
+        Some(fronting),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(result.containment_rung, Some(ContainmentRung::GlobalNone));
+    assert_eq!(
+        result.forfeiture_reason,
+        Some(ContainmentForfeitureReason::FrontingBoundExceeded)
+    );
+}
+
+#[test]
+fn fronting_within_bound_finalizes_pid_structural_without_forfeiture() {
+    let mut identity = identity_check_with_maximum(
+        ProcessIdentityEvidence::kernel_vouched("generation-1"),
+        12,
+        None,
+    );
+    identity.maximum_identity_check_to_dispatch_interval_ms = Some(5);
+    let fronting = compare_fronting(
+        &grant(),
+        Some(snapshot(0, 1)),
+        Some(snapshot(100, 1)),
+        0,
+        100,
+        100,
+    );
+    let result = finalize_containment(ContainmentEvidence::input(
+        ActionKind::Compose,
+        DeliveryPrimitive::PerPidSynthetic,
+        false,
+        Some(identity),
+        Some(fronting),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        result.containment_rung,
+        Some(ContainmentRung::PidStructural)
+    );
+    assert_eq!(result.forfeiture_reason, None);
 }
 
 #[test]
