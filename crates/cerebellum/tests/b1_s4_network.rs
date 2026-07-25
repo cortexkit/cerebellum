@@ -143,6 +143,49 @@ fn direct_fallback_and_page_asserted_attribution_are_fail_closed() {
 }
 
 #[test]
+fn non_http_scheme_is_refused_before_resolution_or_commit() {
+    let (connector, _) = connector();
+    let target = parse_canonical_url("ftp://public.example/").unwrap();
+
+    assert_eq!(
+        connector.resolve_allowed(&target),
+        Err(ConnectorError::SchemeNotAllowed {
+            scheme: "ftp".to_string()
+        })
+    );
+    assert_eq!(connector.transport_count(), 0);
+}
+
+#[test]
+fn http_scheme_reaches_the_same_resolution_path() {
+    let (connector, _) = connector();
+    let target = parse_canonical_url("http://public.example/").unwrap();
+
+    let peer = connector
+        .resolve_allowed(&target)
+        .expect("an allowed HTTP scheme should resolve");
+    assert_eq!(peer.address.to_string(), "93.184.216.34");
+}
+
+#[test]
+fn missing_transport_is_refused_before_any_commit() {
+    let (mut connector, _) = connector();
+    let request = request(
+        "https://public.example/",
+        RequestClass::Retry,
+        Some("decision-1"),
+    )
+    .reuse_transport("transport-missing");
+
+    assert_eq!(
+        connector.commit_request(&request),
+        Err(ConnectorError::TransportNotFound)
+    );
+    assert_eq!(connector.total_committed_bytes(), 0);
+    assert_eq!(connector.transport_count(), 0);
+}
+
+#[test]
 fn transport_reuse_keeps_the_validated_peer_and_rejects_coalescing_widening() {
     let (mut connector, _) = connector();
     let first = connector

@@ -7,10 +7,10 @@ mod capture;
 mod platform;
 
 use capture::{
-    BroadDisplayCaptureRequest, BroadDisplayGrant, CaptureError, CaptureLeakageFlag,
-    CaptureLeakageReport, CaptureSessionState, EnumeratedWindow, InMemoryCaptureBackend,
-    LeakageValue, ScopedCaptureController, TeardownBehavior, TeardownProgress, WindowChangeKind,
-    WindowFrame,
+    BroadDisplayCaptureRequest, BroadDisplayGrant, CaptureArtifact, CaptureError,
+    CaptureLeakageFlag, CaptureLeakageReport, CaptureSessionState, EnumeratedWindow,
+    InMemoryCaptureBackend, LeakageValue, ScopedCaptureController, TeardownBehavior,
+    TeardownProgress, WindowChangeKind, WindowFrame,
 };
 use platform::{PermissionLiveness, ProcessGrant};
 
@@ -202,8 +202,23 @@ fn probe_owner_change_between_enumeration_and_capture_is_refused() {
         .backend_mut()
         .set_windows(vec![window("target", &hostile, true)]);
     let result = controller.capture_scoped(150);
-    assert!(
-        result.is_err(),
-        "capture returned pixels for a window whose owner changed after enumeration"
+    assert_eq!(result, Err(CaptureError::CaptureScopeUnavailable));
+}
+
+#[test]
+fn stable_owner_returns_scoped_pixels_through_the_same_capture_path() {
+    let target = target();
+    let mut backend = InMemoryCaptureBackend::default();
+    backend.set_windows(vec![window("target", &target, true)]);
+    backend.set_window_artifact("target", CaptureArtifact::Bytes(vec![1, 2, 3]));
+    let mut controller = ScopedCaptureController::with_v1_bounds(backend, target).unwrap();
+
+    let result = controller
+        .capture_scoped(150)
+        .expect("a verified stable owner should produce scoped pixels");
+    assert_eq!(result.windows.len(), 1);
+    assert_eq!(
+        result.windows[0].artifact,
+        CaptureArtifact::Bytes(vec![1, 2, 3])
     );
 }
