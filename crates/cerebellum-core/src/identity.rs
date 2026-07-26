@@ -257,10 +257,27 @@ fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -
     .map(ToOwned::to_owned)
     // Old wire fixtures predate the admitted project id. Keeping a stable
     // project-root fallback preserves those fixtures; admitted facts always win.
+    //
+    // SAFETY OF THIS FALLBACK IS NOT LOCAL. `project_root` arrives in
+    // `BindIdentity`, which the daemon relays verbatim from the caller, so a
+    // substituted value is caller-chosen rather than attested. What keeps that
+    // out of durable storage is that both durable paths refuse a bind whose
+    // facts are not daemon-attested BEFORE reading this field:
+    // `profile::StampedBindContext::validate` and `journal_pin`'s
+    // `validate_bind_facts` each require attested provenance and a present
+    // `agent_project_id`, with no substitution of their own. This value
+    // therefore reaches only policy resolution that opens no profile storage.
+    // Extending a compatibility path to durable state means reproducing those
+    // refusals, not reusing this fallback.
     .unwrap_or_else(|| identity.project_root.to_string_lossy().into_owned())
 }
 
 fn session_kind_from_facts(facts: Option<&Value>) -> SessionKind {
+    // An absent kind resolves to the MOST privileged one, since `Primary` is the
+    // kind that owns a durable profile. That is safe only on this path, and only
+    // for the reason given above `agent_project_id_from_facts`: the durable
+    // validators require a present, attested `session_kind` and refuse rather
+    // than defaulting, so a defaulted kind never selects durable storage.
     fact(facts, &["sessionKind", "session_kind"])
         .and_then(Value::as_str)
         .and_then(SessionKind::from_str)
