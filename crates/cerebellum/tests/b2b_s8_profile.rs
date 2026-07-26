@@ -5,21 +5,179 @@
 //! second private copy included by path.
 
 use cerebellum::profile::{
-    implementation_digest_for, verify_implementation_digest, BindFacts, ProfileLifecycle,
-    ProfileOutcome, RegistryConfig, REGISTRY_ARTIFACT,
+    implementation_digest_for, stamped_bind_context, verify_implementation_digest, BindFacts,
+    BindValidationError, ProfileLifecycle, ProfileOutcome, RegistryConfig, REGISTRY_ARTIFACT,
 };
 
-fn context(kind: &str, disposition: &str) -> cerebellum::profile::StampedBindContext {
-    cerebellum::profile::stamped_bind_context(BindFacts {
+/// Bind facts that pass every clause of the strict validator.
+///
+/// The rejection tests below each spoil exactly one field of this value, so a
+/// refusal is attributable to the clause under test rather than to an
+/// incidentally malformed fixture.
+fn valid_facts() -> BindFacts {
+    BindFacts {
         principal: "direct:agent".to_string(),
         conversation_key: "s8-conversation".to_string(),
         agent_project_id: "s8-project".to_string(),
-        session_kind: Some(kind.to_string()),
-        profile_disposition: Some(disposition.to_string()),
+        session_kind: Some("primary".to_string()),
+        profile_disposition: Some("durable".to_string()),
         effective_capability_scope: Some(vec!["browser.navigate".to_string()]),
         provenance: "daemon_attested_spec_a".to_string(),
+    }
+}
+
+fn context(kind: &str, disposition: &str) -> cerebellum::profile::StampedBindContext {
+    stamped_bind_context(BindFacts {
+        session_kind: Some(kind.to_string()),
+        profile_disposition: Some(disposition.to_string()),
+        ..valid_facts()
     })
     .expect("strict bind facts")
+}
+
+/// The paired positive vector for every rejection below.  Without it a
+/// validator that refused unconditionally would satisfy the whole rejection
+/// suite, since each of those tests only asserts that some specific refusal
+/// came back.
+#[test]
+fn well_formed_daemon_attested_facts_are_admitted() {
+    let context = stamped_bind_context(valid_facts()).expect("valid facts are admitted");
+    assert_eq!(context.agent_project_id(), "s8-project");
+    assert_eq!(context.conversation_key(), "s8-conversation");
+}
+
+/// Facts reconstructed by a compatibility path carry the same shape as attested
+/// ones and differ only in provenance, so this clause is the only thing standing
+/// between a derived identity and a durable profile keyed on it.
+#[test]
+fn compatibility_derived_provenance_is_refused() {
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            provenance: "compatibility_derived".to_string(),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::InvalidProvenance)
+    );
+}
+
+#[test]
+fn each_empty_required_identity_fact_is_refused_by_name() {
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            principal: String::new(),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::EmptyFact("principal"))
+    );
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            conversation_key: String::new(),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::EmptyFact("conversation_key"))
+    );
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            agent_project_id: String::new(),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::EmptyFact("agent_project_id"))
+    );
+}
+
+#[test]
+fn absent_session_kind_is_refused_rather_than_defaulted() {
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            session_kind: None,
+            ..valid_facts()
+        }),
+        Err(BindValidationError::MissingFact("session_kind"))
+    );
+}
+
+#[test]
+fn unknown_session_kind_is_refused_rather_than_defaulted() {
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            session_kind: Some("supervisor".to_string()),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::UnknownSessionKind)
+    );
+}
+
+#[test]
+fn absent_or_unknown_profile_disposition_is_refused() {
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            profile_disposition: None,
+            ..valid_facts()
+        }),
+        Err(BindValidationError::MissingFact("profile_disposition"))
+    );
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            profile_disposition: Some("shared".to_string()),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::UnknownDisposition)
+    );
+}
+
+/// Both halves are individually well formed here.  Only the pairing is wrong,
+/// which is what would let a subagent or an ephemeral seat reach the durable
+/// profile that belongs to the primary session.
+#[test]
+fn a_kind_paired_with_the_wrong_disposition_is_refused() {
+    for (kind, disposition) in [
+        ("primary", "disposable"),
+        ("primary", "none"),
+        ("subagent", "durable"),
+        ("ephemeral", "durable"),
+        ("ephemeral", "disposable"),
+    ] {
+        assert_eq!(
+            stamped_bind_context(BindFacts {
+                session_kind: Some(kind.to_string()),
+                profile_disposition: Some(disposition.to_string()),
+                ..valid_facts()
+            }),
+            Err(BindValidationError::IncompatibleKindDisposition),
+            "{kind} must not be admitted with a {disposition} profile"
+        );
+    }
+}
+
+#[test]
+fn absent_or_malformed_capability_scope_is_refused() {
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            effective_capability_scope: None,
+            ..valid_facts()
+        }),
+        Err(BindValidationError::MissingFact(
+            "effective_capability_scope"
+        ))
+    );
+    assert_eq!(
+        stamped_bind_context(BindFacts {
+            effective_capability_scope: Some(vec!["browser.navigate".to_string(), String::new()]),
+            ..valid_facts()
+        }),
+        Err(BindValidationError::InvalidScope)
+    );
+}
+
+/// An explicitly empty scope is a bind that admitted no capability, which is a
+/// different fact from a malformed one and must not be conflated with it.
+#[test]
+fn an_explicitly_empty_capability_scope_is_admitted() {
+    assert!(stamped_bind_context(BindFacts {
+        effective_capability_scope: Some(Vec::new()),
+        ..valid_facts()
+    })
+    .is_ok());
 }
 
 #[test]
