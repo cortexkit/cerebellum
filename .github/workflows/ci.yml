@@ -74,30 +74,19 @@ jobs:
           path: subconscious
           token: ${{ steps.app-token.outputs.token }}
 
-      # The workspace Cargo.toml pins the subc crates to ABSOLUTE developer
-      # paths, so the tree has to be materialized at that location here.
-      #
-      # The relative form (`../subconscious/crates/...`, which sibling modules
-      # use) is the better shape and is NOT adopted yet for one reason: a
-      # detached worktree lives outside the repo root, so `../subconscious`
-      # resolves there only if something places the sibling beside it, and
-      # nothing does so automatically today. Switching before that exists would
-      # trade a CI problem for a workspace that builds nowhere at all.
-      #
-      # The `test -d` assertion makes a broken link fail AT THE LINK. Without
-      # it the symptom surfaces later as a cargo resolution error, which reads
-      # as a dependency problem rather than a layout one.
-      - name: Materialize absolute path-dep layout
+      # Both checkouts land side by side in the workspace directory, which is
+      # exactly what the relative path deps expect, so nothing needs to be
+      # moved or linked. The assertion is kept anyway: it fails AT THE LAYOUT,
+      # whereas the same problem discovered by cargo surfaces as a dependency
+      # resolution error and reads as a manifest fault rather than a missing
+      # checkout.
+      - name: Assert the sibling layout
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          ABS_ROOT=/Users/ufukaltinok/Work/Projects/CortexKit
-          sudo mkdir -p "$ABS_ROOT"
-          sudo ln -sfn "${{ github.workspace }}/subconscious" "$ABS_ROOT/subconscious"
-          echo "Absolute path-dep layout:"
-          ls -la "$ABS_ROOT"
-          test -d "$ABS_ROOT/subconscious/crates/subc-protocol"
-          test -d "$ABS_ROOT/subconscious/crates/subc-transport"
+          ls -la .
+          test -d subconscious/crates/subc-protocol
+          test -d subconscious/crates/subc-transport
 
       - uses: dtolnay/rust-toolchain@stable
         with:
