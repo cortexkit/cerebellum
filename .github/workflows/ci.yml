@@ -23,6 +23,16 @@ jobs:
   # crate rather than target-gating the code, since gating would hide the plane
   # from the build that is supposed to verify it.
   #
+  # WHAT A GREEN RUN HERE DOES NOT COVER: the conformance suite spawns a real
+  # subc daemon and measures how long the module takes to register, and on macOS
+  # that window includes the kernel validating a freshly built executable's
+  # signature on its first execution -- 5 to 22 seconds measured, then cached at
+  # ~0. Linux has no such step, so the same test completes in about 0.19s here
+  # and this job is structurally incapable of failing on that class of timing
+  # fault. It has already produced one flake. Read a green conformance run as
+  # "registration works where the expensive step does not happen", and keep
+  # running the gate on macOS before trusting a registration-timing change.
+  #
   # Runners are Blacksmith rather than GitHub-hosted: these repos belong to a
   # free-plan organization where GitHub bills private-repo Actions minutes and
   # blocks jobs at the (zero) spending limit. Revert to ubuntu-latest if the
