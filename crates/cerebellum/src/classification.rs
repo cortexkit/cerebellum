@@ -419,10 +419,6 @@ impl NonTypeClassificationRecord {
     pub fn required_severity_tier(&self) -> u8 {
         self.required_tier
     }
-
-    pub fn is_equal_to(&self, other: &Self) -> bool {
-        self.try_fingerprint().ok() == other.try_fingerprint().ok()
-    }
 }
 
 /// Opaque equality-only fingerprint for the non-type record.  This type is
