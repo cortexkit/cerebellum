@@ -674,7 +674,14 @@ pub fn encode_dom_text(content: &str, max_bytes: usize) -> (String, bool) {
     (output.clone(), output.len() != content.len())
 }
 
-pub fn redact_then_truncate(value: &str, max_bytes: usize) -> String {
+/// Bound an accessibility field to its byte budget.
+///
+/// Truncation only.  It is deliberately not named for redaction: the journal's
+/// redaction contract refuses when no policy is bound, precisely so that
+/// shortening a value is never mistaken for removing sensitive material from it.
+/// A caller that needs redacted output wants `journal::redaction`, which fails
+/// closed instead of returning a prefix of the secret.
+pub fn truncate_ax_field(value: &str, max_bytes: usize) -> String {
     utf8_safe_truncate(value, max_bytes)
 }
 
@@ -694,12 +701,12 @@ pub fn ax_record_from_value(value: &Value) -> Result<AxRecord, SnapshotError> {
         .ok_or(SnapshotError::Serialization)?;
     let item = AxRecord {
         depth,
-        role: redact_then_truncate(role, MAX_ROLE_BYTES),
-        name: redact_then_truncate(name, MAX_NAME_BYTES),
+        role: truncate_ax_field(role, MAX_ROLE_BYTES),
+        name: truncate_ax_field(name, MAX_NAME_BYTES),
         value: object
             .get("value")
             .and_then(Value::as_str)
-            .map(|value| redact_then_truncate(value, MAX_VALUE_BYTES)),
+            .map(|value| truncate_ax_field(value, MAX_VALUE_BYTES)),
         reference: object
             .get("ref")
             .and_then(Value::as_str)
