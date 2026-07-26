@@ -79,7 +79,7 @@ fn taxonomy() -> ValidatedSeverityTaxonomy {
 
 fn identity() -> JournalIdentity {
     JournalIdentity {
-        principal: "alfonso-core".into(),
+        principal: "prefrontal".into(),
         conversation_key: "conversation-1".into(),
         agent_project_id: "project-1".into(),
         session_kind: SessionKind::Primary,
