@@ -15,14 +15,17 @@ members = ["crates/cerebellum", "crates/cerebellum-core", "crates/cerebellum-com
 # dev-only dep for the in-process daemon used in end-to-end conformance tests.
 [workspace.dependencies]
 # The subc wire contract crates are PATH dependencies on the sibling subconscious
-# monorepo (same arrangement AFT and ck-quota use). Absolute paths are used because
-# this workspace may be built from a git worktree whose relative `../subconscious`
-# does not resolve to the real sibling repo.
-subc-protocol = { path = "/Users/operator/Work/Projects/CortexKit/subconscious/crates/subc-protocol" }
-subc-transport = { path = "/Users/operator/Work/Projects/CortexKit/subconscious/crates/subc-transport" }
-subc-control = { path = "/Users/operator/Work/Projects/CortexKit/subconscious/crates/subc-control" }
-subc-core = { path = "/Users/operator/Work/Projects/CortexKit/subconscious/crates/subc-core" }
-subc-jsonc = { path = "/Users/operator/Work/Projects/CortexKit/subconscious/crates/subc-jsonc" }
+# monorepo (same arrangement AFT and ck-quota use). The paths are RELATIVE, so
+# the workspace builds from any checkout that has the sibling beside it rather
+# than only on one developer's machine. A detached worktree lives outside this
+# repo's parent directory, and the sibling is placed beside it there when the
+# worktree is created; CI checks the sibling out next to this repo for the same
+# reason.
+subc-protocol = { path = "../subconscious/crates/subc-protocol" }
+subc-transport = { path = "../subconscious/crates/subc-transport" }
+subc-control = { path = "../subconscious/crates/subc-control" }
+subc-core = { path = "../subconscious/crates/subc-core" }
+subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
