@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Runs on Linux even though the computer plane targets macOS. That is true
+  # TODAY only because `cerebellum-computer` links no macOS framework yet: the
+  # platform driver is a portable surface plus a backend skeleton, with no
+  # SkyLight, CoreGraphics or ScreenCaptureKit linkage and no `cfg(target_os)`
+  # anywhere in the workspace. THE FIRST SLICE THAT LINKS A REAL macOS FRAMEWORK
+  # BREAKS THIS JOB, and the fix at that point is a macOS runner for the computer
+  # crate rather than target-gating the code, since gating would hide the plane
+  # from the build that is supposed to verify it.
+  #
+  # Runners are Blacksmith rather than GitHub-hosted: these repos belong to a
+  # free-plan organization where GitHub bills private-repo Actions minutes and
+  # blocks jobs at the (zero) spending limit. Revert to ubuntu-latest if the
+  # repo becomes public.
+  test:
+    name: Test (ubuntu)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # A wedged test must surface as a fast red run rather than burning the
+    # runner for the 6-hour Actions default. Healthy runs finish well under
+    # this; the workspace test phase is the long pole at roughly 4 minutes cold.
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: cerebellum
+    steps:
+      - name: Checkout cerebellum
+        uses: actions/checkout@v5
+        with:
+          path: cerebellum
+
+      # cerebellum path-deps one private sibling: cortexkit/subconscious, for
+      # the subc wire crates. The default GITHUB_TOKEN is scoped to this repo
+      # only, so mint a short-lived token from the org-installed cortexkit-ci
+      # GitHub App (Contents: read). The client id is public App metadata and so
+      # is a repo variable; the private key stays a secret.
+      - name: Mint cross-repo read token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CK_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious
+
+      - name: Checkout subconscious
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: subconscious
+          token: ${{ steps.app-token.outputs.token }}
+
+      # The workspace Cargo.toml pins the subc crates to ABSOLUTE developer
+      # paths, so the tree has to be materialized at that location here.
+      #
+      # The relative form (`../subconscious/crates/...`, which sibling modules
+      # use) is the better shape and is NOT adopted yet for one reason: a
+      # detached worktree lives outside the repo root, so `../subconscious`
+      # resolves there only if something places the sibling beside it, and
+      # nothing does so automatically today. Switching before that exists would
+      # trade a CI problem for a workspace that builds nowhere at all.
+      #
+      # The `test -d` assertion makes a broken link fail AT THE LINK. Without
+      # it the symptom surfaces later as a cargo resolution error, which reads
+      # as a dependency problem rather than a layout one.
+      - name: Materialize absolute path-dep layout
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          ABS_ROOT=/Users/ufukaltinok/Work/Projects/CortexKit
+          sudo mkdir -p "$ABS_ROOT"
+          sudo ln -sfn "${{ github.workspace }}/subconscious" "$ABS_ROOT/subconscious"
+          echo "Absolute path-dep layout:"
+          ls -la "$ABS_ROOT"
+          test -d "$ABS_ROOT/subconscious/crates/subc-protocol"
+          test -d "$ABS_ROOT/subconscious/crates/subc-transport"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # The six-phase gate is the same script every local change and every mason
+      # runs, so CI and the desk enforce one definition rather than two that
+      # drift.
+      - name: Rust test gate
+        run: ./scripts/rust-test-gate.sh
+
+      # `!cancelled()` runs this even when the gate failed. Without it GitHub
+      # skips every later step on a failure, so a formatting slip in phase 1
+      # would suppress the conformance answer entirely and the job would show a
+      # single red mark indistinguishable from "style problem, module fine".
+      #
+      # The setup steps above stay unguarded on purpose: a failed checkout or
+      # toolchain install makes this step impossible rather than skipped by
+      # policy, and running it anyway would report a conformance failure whose
+      # real cause is a missing dependency.
+      #
+      # This is the observer-gated conformance binary, which the gate's own
+      # final phase also runs. It is repeated here because it is the suite that
+      # exercises the live subc daemon end to end, and a green gate with a red
+      # conformance run is the single most informative failure this repo can
+      # produce.
+      - name: Conformance (live subc daemon)
+        if: ${{ !cancelled() }}
+        run: cargo test -p cerebellum --features test-observer --test conformance
