@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # ck-cerebellum Rust test gate.
 #
+# THIS SCRIPT IS THE ONLY THING THAT VERIFIES THIS REPOSITORY. There is no
+# push-triggered CI, and that is a known gap rather than a decision: the
+# workspace resolves subc-protocol/subc-transport/subc-core through ABSOLUTE
+# paths into a sibling checkout (see the workspace Cargo.toml), which no hosted
+# runner can resolve, so a workflow cannot build this tree as it stands. The
+# absolute paths are load-bearing for worktree-based work, where a relative
+# `../subconscious` resolves to nothing. Closing the gap means settling that
+# tension first; until then every push rests on someone running this script.
+#
 # Run from the repo root after any code change. The first phase is
 # `cargo fmt --all -- --check`, so an unformatted commit fails the gate.
 # Serialize cargo invocations (never parallel cargo): other workers share this
