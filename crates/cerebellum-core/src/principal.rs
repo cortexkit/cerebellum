@@ -41,9 +41,9 @@ impl PrincipalTrust {
 /// This mirrors AFT's policy mapping (docs/subc-principal.md §3):
 /// - `Direct` → trusted (first-party host plugins).
 /// - `Reserved{module_id}` → per-id allowlist over daemon-spawned, spawn-
-///   attested module ids. Trusted: alfonso-core, alfonso-routing, aft, broca,
-///   and other first-party fleet modules. Untrusted: subc-mcp (the facade is
-///   the remote-model choke point → containment).
+///   attested module ids; see [`is_first_party_module_id`] for the ids
+///   themselves. Untrusted: subc-mcp (the facade is the remote-model choke
+///   point → containment).
 /// - `Unverified` → fail-closed (defensive backstop).
 /// - principal ABSENT → untrusted (a daemon bug that fails to stamp must not
 ///   silently grant trust).
@@ -61,18 +61,37 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
     }
 }
 
+/// The daemon-spawned module ids trusted as first-party consumers of cerebellum
+/// capabilities.
+///
+/// Membership is deliberately tight: a module belongs here only if driving
+/// browser or computer use is part of its normal orchestration. The subc-mcp
+/// facade is excluded by that rule rather than by exception — it fronts
+/// remote-model calls and is the containment boundary.
+///
+/// An id is added BEFORE the module starts using it. The daemon keys modules by
+/// id and refuses a duplicate active id, so a rename is a flag day with no
+/// window in which both names resolve: the moment a module registers under a new
+/// id, a list still naming only the old one classifies it as untrusted and
+/// revokes its access. That failure is safe but silent, and it presents as a
+/// permission fault here rather than as a rename elsewhere. Both names are
+/// therefore carried across a rename, and the old one is dropped once the flip
+/// has settled.
+pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
+    // Both ids are the agent orchestrator, which is being renamed from
+    // `alfonso-core` to `prefrontal`. Drop `alfonso-core` once the rename has
+    // settled.
+    "alfonso-core",
+    "prefrontal",
+    "alfonso-routing",
+    "aft",
+    "broca",
+];
+
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
-///
-/// The allowlist is deliberately tight: only the fleet modules that drive
-/// browser/computer use as part of their normal orchestration. The subc-mcp
-/// facade (`subc-mcp`) is explicitly excluded — it fronts remote-model calls
-/// and is the containment boundary.
 fn is_first_party_module_id(module_id: &str) -> bool {
-    matches!(
-        module_id,
-        "alfonso-core" | "alfonso-routing" | "aft" | "broca"
-    )
+    FIRST_PARTY_MODULE_IDS.contains(&module_id)
 }
 
 #[cfg(test)]
@@ -95,6 +114,55 @@ mod tests {
             })),
             PrincipalTrust::FirstParty
         );
+    }
+
+    /// Each module that depends on cerebellum is admitted, named by literal so
+    /// that removing it from the list fails here.
+    ///
+    /// The ids are written out rather than iterated over
+    /// [`FIRST_PARTY_MODULE_IDS`]: a loop over the list takes its expectations
+    /// FROM the thing under test, so deleting an entry deletes its own check and
+    /// the silent revocation this test exists to catch passes. Measured, not
+    /// assumed -- an iterating version stayed green for three of the five ids.
+    ///
+    /// `alfonso-core` and `prefrontal` are both present because the executive is
+    /// mid-rename; the old id is removed here when it is removed from the list.
+    #[test]
+    fn each_dependent_module_is_admitted() {
+        for module_id in [
+            "alfonso-core",
+            "prefrontal",
+            "alfonso-routing",
+            "aft",
+            "broca",
+        ] {
+            assert_eq!(
+                trust_for_principal(&Some(Principal::Reserved {
+                    module_id: module_id.to_string()
+                })),
+                PrincipalTrust::FirstParty,
+                "{module_id} depends on cerebellum but was not admitted"
+            );
+        }
+    }
+
+    /// The list and the admission predicate agree, so an id can never be listed
+    /// as trusted while being refused in practice.
+    #[test]
+    fn every_listed_id_is_admitted() {
+        assert!(
+            !FIRST_PARTY_MODULE_IDS.is_empty(),
+            "an empty list would satisfy this test vacuously"
+        );
+        for module_id in FIRST_PARTY_MODULE_IDS {
+            assert_eq!(
+                trust_for_principal(&Some(Principal::Reserved {
+                    module_id: (*module_id).to_string()
+                })),
+                PrincipalTrust::FirstParty,
+                "{module_id} is listed as first-party but was not admitted"
+            );
+        }
     }
 
     #[test]
