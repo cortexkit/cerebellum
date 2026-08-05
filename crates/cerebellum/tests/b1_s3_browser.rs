@@ -190,3 +190,82 @@ async fn same_context_dispatches_serialize_and_different_contexts_do_not() {
     drop(guard_b);
     drop(guard_a);
 }
+
+/// A click presses before it releases.
+///
+/// The ordering is not implied by the outcome: a release recorded before its
+/// press still reports success, still journals a commitment, and still leaves
+/// the same set of operations behind, so nothing about the returned value can
+/// distinguish it. Only the sequence can.
+///
+/// Both click paths share one actuation helper, so this covers the coordinate
+/// path as well; a change that reordered actuation for one of them would have
+/// to reorder it for both.
+///
+/// Commitment ordering is deliberately not asserted here. The journal records
+/// it and the operation log does not, so a test written over this log could
+/// only check a proxy for it.
+#[tokio::test]
+async fn a_click_presses_before_it_releases() {
+    let plane = BrowserPlane::new();
+    let route = identity();
+    plane.open_context(route.clone()).await.unwrap();
+    let reference = SnapshotRef::new("e1", "button", "Save", 0).unwrap();
+    let snapshot_id = plane
+        .retain_text_snapshot(
+            &route,
+            SnapshotKind::Ax,
+            &[AxRecord {
+                depth: 0,
+                role: "button".into(),
+                name: "Save".into(),
+                value: None,
+                reference: Some("e1".into()),
+            }],
+            None,
+            vec![RefRecord {
+                captured: reference,
+                frame_path: vec![],
+                backend_identity: None,
+                raw_role: None,
+                raw_name: None,
+            }],
+            4096,
+        )
+        .await
+        .unwrap()["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &json!({
+                "ref": "e1",
+                "snapshot_id": snapshot_id,
+                "intent": "click",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    let operations: Vec<browser::Operation> = plane
+        .operation_log()
+        .await
+        .into_iter()
+        .map(|(_, operation)| operation)
+        .collect();
+    let position = |wanted: browser::Operation| {
+        operations
+            .iter()
+            .position(|operation| *operation == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} was never recorded: {operations:?}"))
+    };
+
+    assert!(
+        position(browser::Operation::CdpInputPress) < position(browser::Operation::CdpInputRelease),
+        "a button is pressed before it is released: {operations:?}"
+    );
+}

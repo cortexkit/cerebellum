@@ -1079,6 +1079,40 @@ impl BrowserPlane {
         )
     }
 
+    /// Record the post-commitment input sequence for a click and release the
+    /// snapshot it was aimed at.
+    ///
+    /// Shared by the structured and coordinate click paths so the actuation
+    /// ordering cannot be changed for one and left alone for the other. The two
+    /// paths are required to reach the same target classification, and a change
+    /// that landed on only one of them would be a difference in what actually
+    /// gets pressed rather than in how it was authorized.
+    ///
+    /// The adapter supplies geometry and hit-test observations, and commitment
+    /// is recorded before they are read because those reads are part of the
+    /// click's verification sequence.
+    async fn actuate_click(&self, identity: &RouteIdentity, snapshot_id: &str) {
+        let mut state = self.state.lock().await;
+        Self::op(
+            &mut state,
+            &identity.conversation_key,
+            Operation::CdpObserve,
+        );
+        Self::op(
+            &mut state,
+            &identity.conversation_key,
+            Operation::CdpInputPress,
+        );
+        Self::op(
+            &mut state,
+            &identity.conversation_key,
+            Operation::CdpInputRelease,
+        );
+        if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
+            context.snapshots.unpin(snapshot_id);
+        }
+    }
+
     async fn click(&self, identity: &RouteIdentity, args: &Value) -> Result<Value, BrowserError> {
         let object = self
             .validate_request(args, &["ref", "snapshot_id", "intent", "severity"])
@@ -1137,30 +1171,7 @@ impl BrowserPlane {
         );
         drop(state);
         self.commit(identity, BrowserCapability::Click).await?;
-        {
-            let mut state = self.state.lock().await;
-            // The adapter supplies geometry and hit-test observations. The
-            // integration records commitment before reading them because those
-            // reads are part of the click operation's verification sequence.
-            Self::op(
-                &mut state,
-                &identity.conversation_key,
-                Operation::CdpObserve,
-            );
-            Self::op(
-                &mut state,
-                &identity.conversation_key,
-                Operation::CdpInputPress,
-            );
-            Self::op(
-                &mut state,
-                &identity.conversation_key,
-                Operation::CdpInputRelease,
-            );
-            if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
-                context.snapshots.unpin(snapshot_id);
-            }
-        }
+        self.actuate_click(identity, snapshot_id).await;
         self.finalize(
             identity,
             BrowserCapability::Click,
@@ -1270,27 +1281,7 @@ impl BrowserPlane {
         );
         drop(state);
         self.commit(identity, BrowserCapability::ClickPoint).await?;
-        {
-            let mut state = self.state.lock().await;
-            Self::op(
-                &mut state,
-                &identity.conversation_key,
-                Operation::CdpObserve,
-            );
-            Self::op(
-                &mut state,
-                &identity.conversation_key,
-                Operation::CdpInputPress,
-            );
-            Self::op(
-                &mut state,
-                &identity.conversation_key,
-                Operation::CdpInputRelease,
-            );
-            if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
-                context.snapshots.unpin(snapshot_id);
-            }
-        }
+        self.actuate_click(identity, snapshot_id).await;
         self.finalize(
             identity,
             BrowserCapability::ClickPoint,
