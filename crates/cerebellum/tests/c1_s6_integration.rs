@@ -96,25 +96,55 @@ fn empty_runtime_advertisement_reports_frozen_eight_row_scope_without_functional
 #[test]
 fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_exercise_honest() {
     let context = valid_context();
+    let evidence = computer_release_evidence(&context);
+
+    // Complete release identifiers admit exactly the two read-only rows. This
+    // was originally asserted against the manifest, on the assumption that
+    // advertisement is a function of the identifiers alone -- the assumption
+    // that allowed a capability to be advertised which dispatch cannot serve.
+    // Advertisement is now the conjunction of gate admission and
+    // dispatchability, so the identifier half is asserted here and the manifest
+    // half below.
+    assert_eq!(
+        evidence.gate_admitted_capabilities,
+        vec!["computer.screenshot", "computer.wait"]
+    );
+
+    // No computer capability is dispatchable yet, so none is advertised. When
+    // the first one is served, it appears here without this test changing.
     let manifest = build_manifest_with_computer_plane("cerebellum", &context);
     let computer_tools: Vec<String> = tools(&manifest)
         .into_iter()
         .filter(|tool| tool.name.starts_with("computer."))
         .map(|tool| tool.name.clone())
         .collect();
-    assert_eq!(computer_tools, vec!["computer.screenshot", "computer.wait"]);
+    assert!(computer_tools
+        .iter()
+        .all(|name| cerebellum::dispatchable_tool(name).is_some()));
 
-    let evidence = computer_release_evidence(&context);
     assert_eq!(evidence.frozen_row_count, 8);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
+
+    // The scope describes what is advertised, not what the identifiers admit,
+    // so it is empty while nothing is dispatchable. It becomes partial when the
+    // first computer capability can be served, and this assertion is the thing
+    // that will fail then -- deliberately, because that is a release-visible
+    // change in what the module claims and should be acknowledged rather than
+    // absorbed.
     assert_eq!(
         evidence.scope,
-        ComputerAdvertisementScope::PartialRuntimeAdvertisement
+        ComputerAdvertisementScope::EmptyRuntimeAdvertisement
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
     assert!(!computer_release_evidence_with_exercised_rows(&context, 0).functional_computer_plane);
-    assert!(computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
+
+    // A functional plane needs an exercised row, and a row can only be
+    // exercised once it is advertised. That case is unreachable while nothing
+    // is dispatchable, so what is asserted here is the weaker half that still
+    // holds: claiming exercised rows against an empty advertisement does not
+    // produce a functional claim.
+    assert!(!computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
 }
 
 /// Every tool the module offers in its manifest can actually be served.
@@ -213,7 +243,12 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             }),
             "missing pin {gate} must remain externally unresolved"
         );
-        let advertised = evidence.advertised_capabilities;
+        // Gate behaviour is asserted against the capabilities the GATES admit,
+        // which is what this test is about. Advertisement additionally requires
+        // that dispatch can serve the capability, and no computer capability is
+        // dispatchable yet -- so reading the advertised set here would make every
+        // gate look equally closed and prove nothing about which one closed.
+        let advertised = evidence.gate_admitted_capabilities;
         if matches!(
             gate,
             "attendance_contract_owner"
