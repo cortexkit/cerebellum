@@ -1933,8 +1933,9 @@ mod dispatch_idle_tests {
         loop {
             health_state.stamp_heartbeat_with_clock(clock);
             let frame = loop {
-                // BUG: a fresh read future each wake. Dropping the in-progress
-                // read loses any partial frame bytes already consumed.
+                // The defect being demonstrated: a fresh read future on every
+                // wake, so dropping the in-progress read loses any partial
+                // frame bytes already consumed.
                 let mut read = std::pin::pin!(read_frame(read_half));
                 let wake = idle_wake.next_wake();
                 tokio::select! {
