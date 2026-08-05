@@ -1,15 +1,8 @@
-#[allow(dead_code)]
-#[path = "../src/authorization.rs"]
-mod authorization;
-#[allow(dead_code)]
-#[path = "../src/classification.rs"]
-mod classification;
-
-use authorization::{
+use cerebellum::authorization::{
     effective_severity, Action, ActionGrant, AuthorizationDeniedDetail, AuthorizationRequest,
     GrantStore, Severity, COMPOSE, MUTATE_DURABLE, OBSERVE,
 };
-use classification::{
+use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
     NonTypeClassificationInput, TargetKind,
 };
@@ -194,7 +187,7 @@ fn replacement_before_commit_is_rejected_by_the_commit_guard() {
         .unwrap();
     assert_eq!(
         store.commit(&decision),
-        Err(authorization::AuthorizationCommitError::GrantReplaced)
+        Err(cerebellum::authorization::AuthorizationCommitError::GrantReplaced)
     );
 }
 
@@ -209,7 +202,10 @@ fn missing_grant_is_opaque_and_navigation_has_observe_floor() {
             "bind",
         ))
         .unwrap_err();
-    assert_eq!(error, authorization::AuthorizationError::NoGrant);
+    assert_eq!(
+        error,
+        cerebellum::authorization::AuthorizationError::NoGrant
+    );
     assert_eq!(
         Action::Navigate.floor(),
         Severity::new(OBSERVE, false, false)
