@@ -1,18 +1,8 @@
-extern crate cerebellum_computer;
-
-mod platform {
-    pub use cerebellum_computer::platform::*;
-}
-
-#[allow(dead_code)]
-#[path = "../src/grounding/mod.rs"]
-mod grounding;
-
-use grounding::{
+use cerebellum_computer::grounding::{
     AccessibilityTreeSnapshot, ContainmentRung, GroundingCall, GroundingFailure, GroundingPolicy,
     GroundingRequest, GroundingResolver, RecordingGroundingDriver,
 };
-use platform::ProcessGrant;
+use cerebellum_computer::platform::ProcessGrant;
 
 fn target() -> ProcessGrant {
     ProcessGrant {
@@ -47,13 +37,15 @@ fn coordinate_fallback_is_global_none_and_never_implies_pid_containment() {
     };
     let request = GroundingRequest::coordinate(
         target(),
-        grounding::FallbackGrounding::Pixel(grounding::PixelEvidence {
-            capture_generation: "capture-1".to_string(),
-            target_process_generation: "gen-1".to_string(),
-            window_identifier: "window-1".to_string(),
-            coordinate: grounding::Coordinate::new(4.0, 5.0),
-            captured_at_ms: 0,
-        }),
+        cerebellum_computer::grounding::FallbackGrounding::Pixel(
+            cerebellum_computer::grounding::PixelEvidence {
+                capture_generation: "capture-1".to_string(),
+                target_process_generation: "gen-1".to_string(),
+                window_identifier: "window-1".to_string(),
+                coordinate: cerebellum_computer::grounding::Coordinate::new(4.0, 5.0),
+                captured_at_ms: 0,
+            },
+        ),
     );
     let decision = GroundingResolver::new(GroundingPolicy::default())
         .ground(&mut driver, &request, 1)
@@ -70,14 +62,16 @@ fn stale_generation_refuses_before_any_dispatch_capable_operation() {
     };
     let request = GroundingRequest::coordinate(
         target(),
-        grounding::FallbackGrounding::SetOfMarks(grounding::SetOfMarksEvidence {
-            capture_generation: "capture-1".to_string(),
-            target_process_generation: "gen-2".to_string(),
-            window_identifier: "window-1".to_string(),
-            mark_identifier: "mark-1".to_string(),
-            coordinate: grounding::Coordinate::new(4.0, 5.0),
-            captured_at_ms: 0,
-        }),
+        cerebellum_computer::grounding::FallbackGrounding::SetOfMarks(
+            cerebellum_computer::grounding::SetOfMarksEvidence {
+                capture_generation: "capture-1".to_string(),
+                target_process_generation: "gen-2".to_string(),
+                window_identifier: "window-1".to_string(),
+                mark_identifier: "mark-1".to_string(),
+                coordinate: cerebellum_computer::grounding::Coordinate::new(4.0, 5.0),
+                captured_at_ms: 0,
+            },
+        ),
     );
     let result =
         GroundingResolver::new(GroundingPolicy::default()).ground(&mut driver, &request, 1);
@@ -120,13 +114,15 @@ fn grounding_untrusted_refuses_unauthorized_pixel_before_dispatch() {
     };
     let request = GroundingRequest::coordinate(
         target(),
-        grounding::FallbackGrounding::Pixel(grounding::PixelEvidence {
-            capture_generation: "capture-1".to_string(),
-            target_process_generation: "gen-1".to_string(),
-            window_identifier: "window-1".to_string(),
-            coordinate: grounding::Coordinate::new(4.0, 5.0),
-            captured_at_ms: 0,
-        }),
+        cerebellum_computer::grounding::FallbackGrounding::Pixel(
+            cerebellum_computer::grounding::PixelEvidence {
+                capture_generation: "capture-1".to_string(),
+                target_process_generation: "gen-1".to_string(),
+                window_identifier: "window-1".to_string(),
+                coordinate: cerebellum_computer::grounding::Coordinate::new(4.0, 5.0),
+                captured_at_ms: 0,
+            },
+        ),
     );
     let policy = GroundingPolicy {
         pixel_fallback_eligible: false,
@@ -146,13 +142,15 @@ fn authorized_pixel_fallback_reaches_dispatch_seam() {
     };
     let request = GroundingRequest::coordinate(
         target(),
-        grounding::FallbackGrounding::Pixel(grounding::PixelEvidence {
-            capture_generation: "capture-1".to_string(),
-            target_process_generation: "gen-1".to_string(),
-            window_identifier: "window-1".to_string(),
-            coordinate: grounding::Coordinate::new(4.0, 5.0),
-            captured_at_ms: 0,
-        }),
+        cerebellum_computer::grounding::FallbackGrounding::Pixel(
+            cerebellum_computer::grounding::PixelEvidence {
+                capture_generation: "capture-1".to_string(),
+                target_process_generation: "gen-1".to_string(),
+                window_identifier: "window-1".to_string(),
+                coordinate: cerebellum_computer::grounding::Coordinate::new(4.0, 5.0),
+                captured_at_ms: 0,
+            },
+        ),
     );
     let result = GroundingResolver::new(GroundingPolicy::default()).ground_and_revalidate(
         &mut driver,
