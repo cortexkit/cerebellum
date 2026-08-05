@@ -79,9 +79,10 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// has settled.
 pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
     // The agent orchestrator, being renamed `alfonso-core` -> `prefrontal-core`.
-    // `prefrontal` is a spelling reported earlier in the same rename; it is kept
-    // only until the registered id is confirmed, since admitting an id nobody
-    // uses costs nothing while omitting the real one revokes access silently.
+    // Bare `prefrontal` is a spelling no module registers under, kept only until
+    // the rename settles. An unused id authorizes nobody, because the daemon
+    // issues a reserved principal only for a module it supervises -- so confirm
+    // against the daemon's list of live modules before removing any of these.
     "alfonso-core",
     "prefrontal",
     "prefrontal-core",
@@ -203,5 +204,47 @@ mod tests {
             })),
             PrincipalTrust::Untrusted
         );
+    }
+
+    /// Ids that RESEMBLE a trusted one are refused, because membership is exact
+    /// string equality rather than a prefix, suffix, or substring relation.
+    ///
+    /// Refusing an unrelated id like `unknown-module` does not establish that:
+    /// it fails every matching rule alike. Only a near-miss separates equality
+    /// from the looser rules someone reaches for while a family of names is in
+    /// flux -- and one of these near-misses is real, since the daemon issues
+    /// host-bridge principals as `prefrontal-host:<provider-id>`, a
+    /// first-party-looking prefix whose suffix the caller supplies. A prefix
+    /// match would admit an unbounded set of ids nobody reviewed.
+    #[test]
+    fn ids_resembling_a_trusted_module_are_untrusted() {
+        for module_id in [
+            // Shares a prefix with the orchestrator; the suffix varies per
+            // caller.
+            "prefrontal-host:abc123",
+            // Extends a trusted id.
+            "prefrontal-core-evil",
+            "aft-shim",
+            // Is extended BY a trusted id.
+            "prefront",
+            "af",
+            // Contains a trusted id without being one.
+            "not-prefrontal-core",
+            "evil-aft",
+            // Differs from a trusted id only in content a comparison might
+            // normalize away.
+            "prefrontal-core ",
+            "prefrontal-core\0",
+            "PREFRONTAL-CORE",
+            "",
+        ] {
+            assert_eq!(
+                trust_for_principal(&Some(Principal::Reserved {
+                    module_id: module_id.to_string()
+                })),
+                PrincipalTrust::Untrusted,
+                "{module_id:?} resembles a trusted id but is not one"
+            );
+        }
     }
 }
