@@ -78,12 +78,16 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// therefore carried across a rename, and the old one is dropped once the flip
 /// has settled.
 pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
-    // Both ids are the agent orchestrator, which is being renamed from
-    // `alfonso-core` to `prefrontal`. Drop `alfonso-core` once the rename has
-    // settled.
+    // The agent orchestrator, being renamed `alfonso-core` -> `prefrontal-core`.
+    // `prefrontal` is a spelling reported earlier in the same rename; it is kept
+    // only until the registered id is confirmed, since admitting an id nobody
+    // uses costs nothing while omitting the real one revokes access silently.
     "alfonso-core",
     "prefrontal",
+    "prefrontal-core",
+    // The routing module, renamed in the same flip.
     "alfonso-routing",
+    "prefrontal-routing",
     "aft",
     "broca",
 ];
@@ -125,14 +129,17 @@ mod tests {
     /// the silent revocation this test exists to catch passes. Measured, not
     /// assumed -- an iterating version stayed green for three of the five ids.
     ///
-    /// `alfonso-core` and `prefrontal` are both present because the executive is
-    /// mid-rename; the old id is removed here when it is removed from the list.
+    /// The orchestrator and the routing module each appear under both their old
+    /// and new ids because they are mid-rename; the old ids are removed here
+    /// when they are removed from the list.
     #[test]
     fn each_dependent_module_is_admitted() {
         for module_id in [
             "alfonso-core",
             "prefrontal",
+            "prefrontal-core",
             "alfonso-routing",
+            "prefrontal-routing",
             "aft",
             "broca",
         ] {
