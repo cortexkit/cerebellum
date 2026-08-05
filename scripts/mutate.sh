@@ -11,14 +11,16 @@
 # exactly like source and the next commit ships it. Three endings have to be
 # handled, and only the first is obvious:
 #   - normal exit          -- restore, then verify the file matches the index
-#   - interrupt or SIGTERM -- same, from a trap; this is why the verify command
+#   - a trappable signal   -- same, from a trap; this is why the verify command
 #                             runs in the background and is waited on, since bash
 #                             defers a trap until the current FOREGROUND child
 #                             finishes, and a long test run is precisely the
 #                             window where the break would otherwise survive
-#   - SIGKILL              -- no code runs at all, so nothing here can help; a
-#                             marker file is written up front instead, and the
-#                             test gate refuses while it exists
+#   - an untrappable one   -- SIGKILL runs no code, and INT/QUIT are ignored on
+#                             entry when this runs as a background command, so
+#                             no handler can help; a marker file is written up
+#                             front instead, and the test gate refuses while it
+#                             exists
 #
 # Usage:
 #   scripts/mutate.sh <file> <mutate-command> <verify-command>
@@ -106,7 +108,16 @@ restore() {
   fi
   exit "$status"
 }
-trap restore EXIT INT TERM
+# Every ending a signal can produce, not just the two that come to mind: HUP is
+# what a disconnecting session sends, and it is the one that never shows up in an
+# interactive test of this script because nobody hangs up a terminal by hand.
+#
+# INT and QUIT are listed for the interactive case, where they are what Ctrl-C
+# and Ctrl-\ send. They cannot be caught when this script is run as a BACKGROUND
+# command from a non-interactive shell, because the shell sets both to ignored
+# before exec and a signal ignored at entry cannot be trapped. The marker file is
+# the backstop for that case, as it is for SIGKILL.
+trap restore EXIT INT TERM HUP QUIT
 
 if ! eval "$mutate_command"; then
   echo "mutate: the mutate command failed; nothing was tested" >&2
