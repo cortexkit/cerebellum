@@ -2,14 +2,12 @@
 
 //! Network policy and connector acceptance fixtures.
 //!
-//! This integration test includes the standalone network module directly so it
-//! can run before the crate-root browser-plane module is wired. The same module
-//! is later exported as `cerebellum::network`.
+//! The module is used through the library rather than included by path, so
+//! these fixtures exercise the same code the crate ships. A path include
+//! compiles a second copy with a different set of sibling modules in scope,
+//! which is why the tests could pass over code the library could not build.
 
-#[path = "../src/network/mod.rs"]
-mod network;
-
-use network::{
+use cerebellum::network::{
     address_policy_fixture, parse_canonical_url, AuthorizationDecision, ChildIdentity,
     CommitmentKind, Connector, ConnectorAdmission, ConnectorError, NetworkRequest,
     RequestAttribution, RequestClass, StaticResolver, TransitionTargetCache,
@@ -115,7 +113,7 @@ fn every_precommit_failure_commits_no_request_or_stream_bytes() {
             None,
         )),
         Err(ConnectorError::AddressNotAllowed {
-            address_class: network::AddressClass::Loopback
+            address_class: cerebellum::network::AddressClass::Loopback
         })
     );
     assert_eq!(connector.total_committed_bytes(), 0);

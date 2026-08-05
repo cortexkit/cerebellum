@@ -511,45 +511,7 @@ impl AddressPolicy {
     }
 }
 
-pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
-    fn write(value: &Value, output: &mut String) {
-        match value {
-            Value::Null => output.push_str("null"),
-            Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-            Value::Number(value) => output.push_str(&value.to_string()),
-            Value::String(value) => {
-                output.push_str(&serde_json::to_string(value).expect("string serializes"))
-            }
-            Value::Array(values) => {
-                output.push('[');
-                for (index, value) in values.iter().enumerate() {
-                    if index != 0 {
-                        output.push(',');
-                    }
-                    write(value, output);
-                }
-                output.push(']');
-            }
-            Value::Object(values) => {
-                let mut keys: Vec<_> = values.keys().collect();
-                keys.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-                output.push('{');
-                for (index, key) in keys.into_iter().enumerate() {
-                    if index != 0 {
-                        output.push(',');
-                    }
-                    output.push_str(&serde_json::to_string(key).expect("key serializes"));
-                    output.push(':');
-                    write(&values[key], output);
-                }
-                output.push('}');
-            }
-        }
-    }
-    let mut result = String::new();
-    write(value, &mut result);
-    result.into_bytes()
-}
+pub use crate::custody::canonical_json_bytes;
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

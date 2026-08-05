@@ -244,6 +244,20 @@ pub fn valid_digest(value: &str) -> bool {
 /// Serialize JSON with recursively sorted object keys.  All S2 artifacts are
 /// string/bool/array objects, so serde_json's shortest number representation is
 /// sufficient for the closed artifact vocabulary.
+///
+/// KEYS ARE ORDERED BY UTF-8 BYTES, WHICH IS NOT RFC 8785. That standard orders
+/// by UTF-16 code units, and the two disagree for characters outside the basic
+/// multilingual plane -- an emoji sorts after U+FFFD by bytes and before it by
+/// code units. `classification.rs` and the computer plane's vocabulary artifact
+/// implement the RFC 8785 order instead, so a value containing such a key would
+/// digest differently here than there.
+///
+/// This is safe for the artifacts digested through this function, whose keys are
+/// fixed ASCII identifiers declared in the schemas, and it is NOT safe for input
+/// whose keys come from a page or any other untrusted source. Changing the order
+/// invalidates every digest already computed with it, so a caller needing RFC
+/// 8785 should use the implementation that provides it rather than converting
+/// this one.
 pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     fn write(value: &Value, output: &mut String) {
         match value {
@@ -467,5 +481,59 @@ impl LaunchQuarantine {
         Some(proof.process_id) == self.process_id
             && proof.custody_digest == self.artifact_digest
             && proof.generation == self.generation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This crate canonicalizes JSON two different ways on purpose, and the
+    /// difference is pinned here so that neither can be quietly changed into
+    /// the other.
+    ///
+    /// Object keys are ordered by UTF-8 bytes for custody and address-policy
+    /// artifacts, and by UTF-16 code units -- the RFC 8785 rule -- for
+    /// classification records. The orders agree for ASCII and disagree above
+    /// the basic multilingual plane, so a value carrying such a key digests
+    /// differently under each. Both are correct for their own inputs, and
+    /// changing either invalidates every digest already computed with it.
+    ///
+    /// The divergence is asserted rather than each order separately, because a
+    /// reader who finds two functions named for the same job will otherwise
+    /// read the difference as an inconsistency to tidy up.
+    #[test]
+    fn the_two_canonical_key_orders_are_deliberately_different() {
+        // An emoji sorts after U+FFFD by UTF-8 bytes and before it by UTF-16
+        // code units, so it separates the two orders in one value.
+        let emoji = '\u{1F600}';
+        let replacement = '\u{FFFD}';
+        let value = serde_json::json!({ emoji.to_string(): 1, replacement.to_string(): 2 });
+
+        let by_bytes = String::from_utf8(canonical_json_bytes(&value)).expect("utf8");
+        let by_code_units =
+            String::from_utf8(crate::classification::canonical_json_bytes(&value)).expect("utf8");
+
+        assert!(
+            by_bytes.find(replacement) < by_bytes.find(emoji),
+            "custody orders object keys by UTF-8 bytes: {by_bytes}"
+        );
+        assert!(
+            by_code_units.find(emoji) < by_code_units.find(replacement),
+            "classification orders object keys by UTF-16 code units: {by_code_units}"
+        );
+        assert_ne!(
+            by_bytes, by_code_units,
+            "the two canonical forms must remain distinguishable"
+        );
+
+        // ASCII keys are why the difference is currently harmless: every
+        // digested artifact declares fixed ASCII identifiers, and the two
+        // orders agree there.
+        let ascii = serde_json::json!({ "b": 1, "a": 2 });
+        assert_eq!(
+            canonical_json_bytes(&ascii),
+            crate::classification::canonical_json_bytes(&ascii)
+        );
     }
 }

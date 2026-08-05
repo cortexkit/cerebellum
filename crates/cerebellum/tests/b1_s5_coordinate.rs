@@ -1,10 +1,6 @@
 //! Acceptance tests for screenshot validation, PNG integrity, and coordinate safety.
 
-#[allow(dead_code)]
-#[path = "../src/coordinate.rs"]
-mod coordinate;
-
-use coordinate::{
+use cerebellum::coordinate::{
     capture_from_backend, capture_screenshot, encode_base64, map_pixel_center, round_css_pixel,
     CoordinateError, InputRect, InvalidCoordinatesReason, ScreenshotPayload, ScreenshotSnapshot,
     ScreenshotStore, SnapshotKind, StaleSnapshotReason, TransformInputs, ViewportCaptureBackend,
@@ -104,34 +100,34 @@ fn metadata_reasons_are_closed_and_checked_before_mapping() {
 
 #[test]
 fn canonical_png_checks_base64_structure_crc_and_image_dimensions() {
-    let decoded = coordinate::validate_png_base64(ONE_BY_ONE_PNG_B64, 1, 1).unwrap();
+    let decoded = cerebellum::coordinate::validate_png_base64(ONE_BY_ONE_PNG_B64, 1, 1).unwrap();
     assert!(!decoded.as_bytes().is_empty());
     assert_eq!(
-        coordinate::validate_png_base64(ONE_BY_ONE_PNG_B64, 2, 1),
+        cerebellum::coordinate::validate_png_base64(ONE_BY_ONE_PNG_B64, 2, 1),
         Err(CoordinateError::CdpFailure)
     );
     assert_eq!(
-        coordinate::validate_png_base64("not base64", 1, 1),
+        cerebellum::coordinate::validate_png_base64("not base64", 1, 1),
         Err(CoordinateError::CdpFailure)
     );
     let mut malformed = decoded.into_bytes();
     let last = malformed.len() - 1;
     malformed[last] ^= 1;
     assert_eq!(
-        coordinate::validate_png_base64(&encode_base64(&malformed), 1, 1),
+        cerebellum::coordinate::validate_png_base64(&encode_base64(&malformed), 1, 1),
         Err(CoordinateError::CdpFailure)
     );
 }
 
 #[test]
 fn oversized_encoded_image_is_rejected_before_retention() {
-    let oversized = "A".repeat(coordinate::MAX_ENCODED_PNG_BYTES + 4);
-    let error = coordinate::validate_png_base64(&oversized, 1, 1).unwrap_err();
+    let oversized = "A".repeat(cerebellum::coordinate::MAX_ENCODED_PNG_BYTES + 4);
+    let error = cerebellum::coordinate::validate_png_base64(&oversized, 1, 1).unwrap_err();
     assert_eq!(
         error,
         CoordinateError::ImageTooLarge {
-            encoded_bytes: coordinate::MAX_ENCODED_PNG_BYTES + 4,
-            bound_bytes: coordinate::MAX_ENCODED_PNG_BYTES,
+            encoded_bytes: cerebellum::coordinate::MAX_ENCODED_PNG_BYTES + 4,
+            bound_bytes: cerebellum::coordinate::MAX_ENCODED_PNG_BYTES,
         }
     );
     let store = ScreenshotStore::new(1).unwrap();
