@@ -121,6 +121,15 @@ pub struct ComputerReleaseEvidence {
     pub canonical_row_count: usize,
     pub advertised_row_count: usize,
     pub advertised_capabilities: Vec<String>,
+    /// The capabilities the release gates admit, before requiring that the
+    /// dispatcher can serve them.
+    ///
+    /// Advertisement is the conjunction of the two, so this is always a superset
+    /// of `advertised_capabilities`. It is reported separately because the
+    /// difference is the useful signal: a capability admitted here and missing
+    /// there is one whose release inputs are complete and whose implementation
+    /// is not, which is otherwise indistinguishable from a failed gate.
+    pub gate_admitted_capabilities: Vec<String>,
     pub exercised_row_count: usize,
     pub functional_computer_plane: bool,
     pub scope: ComputerAdvertisementScope,
@@ -357,7 +366,37 @@ fn canonical_declaration_is_complete(declarations: &[ComputerCapabilityDeclarati
         && computer::platform::validate_vocabulary().is_ok()
 }
 
+/// The computer capabilities this module advertises.
+///
+/// Advertisement requires BOTH that the release gates pass AND that the
+/// dispatcher can serve the capability. The second condition is not redundant:
+/// the gates are satisfied by supplying release identifiers, which is a
+/// configuration change, while the ability to serve a capability is a property
+/// of the code -- so without this the identifiers alone would advertise
+/// capabilities that every call to them rejects as an unknown method.
+///
+/// Deriving the advertised set from the dispatchable one, rather than comparing
+/// the two afterwards, is what makes that state unauthorable instead of merely
+/// detectable.
 fn advertised_computer_declarations<'a>(
+    declarations: &'a [ComputerCapabilityDeclaration],
+    context: &ComputerCapabilityAdvertisementContext,
+    outcomes: &[ComputerGateOutcome],
+) -> Vec<&'a ComputerCapabilityDeclaration> {
+    gate_admitted_computer_declarations(declarations, context, outcomes)
+        .into_iter()
+        .filter(|declaration| dispatchable_tool(&declaration.capability_id).is_some())
+        .collect()
+}
+
+/// The declarations the release gates admit, before the dispatchability
+/// requirement is applied.
+///
+/// Kept separate from [`advertised_computer_declarations`] so that gate
+/// behaviour -- which missing release identifier suppresses which capability --
+/// stays observable while no computer capability is dispatchable. Collapsing the
+/// two would make every gate look equally closed and hide which one is.
+fn gate_admitted_computer_declarations<'a>(
     declarations: &'a [ComputerCapabilityDeclaration],
     context: &ComputerCapabilityAdvertisementContext,
     outcomes: &[ComputerGateOutcome],
@@ -456,6 +495,11 @@ pub fn computer_release_evidence_with_exercised_rows(
     exercised_rows: usize,
 ) -> ComputerReleaseEvidence {
     let (declarations, gate_outcomes) = canonical_computer_declarations(context);
+    let gate_admitted_capabilities: Vec<String> =
+        gate_admitted_computer_declarations(&declarations, context, &gate_outcomes)
+            .into_iter()
+            .map(|declaration| declaration.capability_id.clone())
+            .collect();
     let advertised_capabilities: Vec<String> =
         advertised_computer_declarations(&declarations, context, &gate_outcomes)
             .into_iter()
@@ -475,6 +519,7 @@ pub fn computer_release_evidence_with_exercised_rows(
         canonical_row_count,
         advertised_row_count,
         advertised_capabilities,
+        gate_admitted_capabilities,
         exercised_row_count: exercised_rows.min(advertised_row_count),
         functional_computer_plane: exercised_rows > 0 && advertised_row_count > 0,
         scope,
