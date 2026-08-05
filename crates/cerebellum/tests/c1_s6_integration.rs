@@ -117,6 +117,39 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert!(computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
 }
 
+/// Every tool the module offers in its manifest can actually be served.
+///
+/// The manifest and the dispatcher are built from separate lists, so a tool can
+/// be added to one and not the other. The gap is not hypothetical here: the
+/// computer-plane rows are added to the manifest once the release identifiers in
+/// `default_computer_context` are filled in, while dispatch routes browser names
+/// only -- so filling those in would advertise a capability that every call to
+/// it rejects as an unknown method. Offering a caller something it cannot use is
+/// worse than not offering it, because the caller has no way to tell the
+/// difference until it tries.
+///
+/// The check runs against the context the module really ships rather than a
+/// fully populated one, so it fails at the moment those identifiers are
+/// supplied, which is the change that would create the mismatch.
+#[test]
+fn every_shipped_advertisement_can_be_dispatched() {
+    let manifest =
+        build_manifest_with_computer_plane("cerebellum", &cerebellum::default_computer_context());
+    let advertised = tools(&manifest);
+    assert!(
+        !advertised.is_empty(),
+        "an empty manifest would satisfy this vacuously"
+    );
+    for tool in advertised {
+        assert_eq!(
+            cerebellum::dispatchable_tool(&tool.name),
+            Some(tool.name.as_str()),
+            "{} is advertised but dispatch would reject it as an unknown method",
+            tool.name
+        );
+    }
+}
+
 #[test]
 fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_advertisement() {
     let complete = valid_context();
