@@ -1,19 +1,9 @@
-extern crate cerebellum_computer;
-
-mod platform {
-    pub use cerebellum_computer::platform::*;
-}
-
-#[allow(dead_code)]
-#[path = "../src/grounding/mod.rs"]
-mod grounding;
-
-use grounding::{
+use cerebellum_computer::grounding::{
     AccessibilityElement, AccessibilityTreeSnapshot, CenterHitTest, Coordinate, ElementRect,
     FallbackGrounding, GroundingFailure, GroundingRequest, GroundingResolver, PixelEvidence,
     RecordingGroundingDriver,
 };
-use platform::ProcessGrant;
+use cerebellum_computer::platform::ProcessGrant;
 
 fn target() -> ProcessGrant {
     ProcessGrant {
@@ -62,11 +52,13 @@ fn failed_center_hit_test_blocks_ax_coordinate_and_uses_authorized_fallback() {
         .expect("geometry degeneracy authorizes the row's pixel fallback");
     assert!(matches!(
         decision.target,
-        grounding::GroundingTarget::Coordinate(grounding::CoordinateAddress::Pixel(_))
+        cerebellum_computer::grounding::GroundingTarget::Coordinate(
+            cerebellum_computer::grounding::CoordinateAddress::Pixel(_)
+        )
     ));
     assert_eq!(
         decision.containment_rung,
-        grounding::ContainmentRung::GlobalNone
+        cerebellum_computer::grounding::ContainmentRung::GlobalNone
     );
 }
 
@@ -98,7 +90,7 @@ fn failed_center_hit_test_does_not_invalidate_semantic_ax_action() {
         .expect("semantic AX action does not derive a coordinate");
     assert!(matches!(
         decision.target,
-        grounding::GroundingTarget::SemanticElement(_)
+        cerebellum_computer::grounding::GroundingTarget::SemanticElement(_)
     ));
     assert!(!decision.coordinate_addressed);
 }
@@ -119,9 +111,9 @@ fn invalidated_ax_coordinate_is_stale_grounding_not_a_fallback_authorization() {
             semantic_actions: Vec::new(),
             window_identifier: Some("window-1".to_string()),
         }),
-        element_revalidation: grounding::ElementRevalidation {
+        element_revalidation: cerebellum_computer::grounding::ElementRevalidation {
             coordinate_valid: false,
-            ..grounding::ElementRevalidation::valid()
+            ..cerebellum_computer::grounding::ElementRevalidation::valid()
         },
         ..RecordingGroundingDriver::default()
     };

@@ -1,21 +1,14 @@
-#[allow(dead_code, unused_imports)]
-#[path = "../src/dispatch/mod.rs"]
-mod dispatch;
-#[allow(dead_code, unused_imports)]
-#[path = "../src/platform/mod.rs"]
-mod platform;
-
-use dispatch::{
+use cerebellum_computer::dispatch::{
     authorize_escalation, retry_decision, AbortReason, AttemptDisposition, AttendanceContext,
     AttendanceLease, ConsentDecision, DispatchError, DispatchPhase, DispatchRequest, Dispatcher,
     ExpectedPostCondition, FocusCheckPlan, FrozenDispatchRow, ReconciliationResult, RetryDecision,
     SeizeWatcher,
 };
-use platform::containment::{
+use cerebellum_computer::platform::containment::{
     IdentityAtomicBinding, IdentityDiscriminationRequirement, ProcessIdentityEvidence,
     ProcessIdentityObservation, ProcessIdentityPrimitive,
 };
-use platform::*;
+use cerebellum_computer::platform::*;
 use std::collections::VecDeque;
 
 fn target() -> ProcessGrant {
@@ -26,7 +19,7 @@ fn target() -> ProcessGrant {
     }
 }
 
-fn identity() -> platform::containment::IdentityCheckEvidence {
+fn identity() -> cerebellum_computer::platform::containment::IdentityCheckEvidence {
     let primitive = ProcessIdentityPrimitive::pinned_v1()
         .with_identity_to_delivery_binding(IdentityAtomicBinding::Atomic);
     let grant = primitive
@@ -66,7 +59,7 @@ fn fronting(at: u64) -> FrontingSnapshot {
 
 #[derive(Debug)]
 struct RecordingDriver {
-    semantic_result: Result<platform::DispatchResult, DriverError>,
+    semantic_result: Result<cerebellum_computer::platform::DispatchResult, DriverError>,
     effect: Result<EffectObservationResult, DriverError>,
     liveness: InputObserverLiveness,
     input: Result<InputObservationResult, DriverError>,
@@ -82,7 +75,7 @@ struct RecordingDriver {
 impl Default for RecordingDriver {
     fn default() -> Self {
         Self {
-            semantic_result: Ok(platform::DispatchResult {
+            semantic_result: Ok(cerebellum_computer::platform::DispatchResult {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectObserved,
             }),
@@ -138,16 +131,16 @@ impl PlatformDriver for RecordingDriver {
     fn dispatch_semantic(
         &mut self,
         _request: SemanticDispatchRequest,
-    ) -> Result<platform::DispatchResult, DriverError> {
+    ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         self.semantic_calls += 1;
         self.semantic_result.clone()
     }
     fn dispatch_per_pid(
         &mut self,
         _request: SyntheticDispatchRequest,
-    ) -> Result<platform::DispatchResult, DriverError> {
+    ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         self.per_pid_calls += 1;
-        Ok(platform::DispatchResult {
+        Ok(cerebellum_computer::platform::DispatchResult {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
         })
@@ -155,9 +148,9 @@ impl PlatformDriver for RecordingDriver {
     fn dispatch_global(
         &mut self,
         _request: SyntheticDispatchRequest,
-    ) -> Result<platform::DispatchResult, DriverError> {
+    ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         self.global_calls += 1;
-        Ok(platform::DispatchResult {
+        Ok(cerebellum_computer::platform::DispatchResult {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
         })
@@ -218,7 +211,7 @@ struct RecordingConsent {
     decision: ConsentDecision,
 }
 
-impl dispatch::EscalationConsent for RecordingConsent {
+impl cerebellum_computer::dispatch::EscalationConsent for RecordingConsent {
     fn request_consent(&mut self, escalation_id: &str) -> ConsentDecision {
         self.calls.push(escalation_id.to_string());
         self.decision
@@ -302,7 +295,7 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
         .unwrap();
     assert_eq!(
         report.delivery_primitive,
-        platform::containment::DeliveryPrimitive::SemanticAccessibility
+        cerebellum_computer::platform::containment::DeliveryPrimitive::SemanticAccessibility
     );
     assert_eq!(report.effect.status, EffectStatus::NoEffectObserved);
     assert_eq!(report.effect.observation_attempts, 1);
@@ -323,7 +316,7 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
     );
     assert_eq!(
         report.containment.containment_rung,
-        Some(platform::containment::ContainmentRung::SemanticElement)
+        Some(cerebellum_computer::platform::containment::ContainmentRung::SemanticElement)
     );
 }
 
@@ -426,15 +419,15 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
     let report = dispatcher.dispatch(request).unwrap();
     assert_eq!(
         report.delivery_primitive,
-        platform::containment::DeliveryPrimitive::PerPidSynthetic
+        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
     );
     assert_eq!(
         report.containment.containment_rung,
-        Some(platform::containment::ContainmentRung::GlobalNone)
+        Some(cerebellum_computer::platform::containment::ContainmentRung::GlobalNone)
     );
     assert_eq!(
         report.containment.forfeiture_reason,
-        Some(platform::containment::ContainmentForfeitureReason::CoordinateAddressed)
+        Some(cerebellum_computer::platform::containment::ContainmentForfeitureReason::CoordinateAddressed)
     );
 }
 
@@ -502,7 +495,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
 
 #[test]
 fn retry_and_escalation_never_repeat_a_committed_attempt_blindly() {
-    let mut ledger = dispatch::AttemptLedger::new();
+    let mut ledger = cerebellum_computer::dispatch::AttemptLedger::new();
     ledger.record("attempt-1", AttemptDisposition::Committed);
     assert_eq!(
         retry_decision(
@@ -528,7 +521,7 @@ fn retry_and_escalation_never_repeat_a_committed_attempt_blindly() {
     );
 
     struct Consent;
-    impl dispatch::EscalationConsent for Consent {
+    impl cerebellum_computer::dispatch::EscalationConsent for Consent {
         fn request_consent(&mut self, _escalation_id: &str) -> ConsentDecision {
             ConsentDecision::Granted
         }
@@ -561,7 +554,7 @@ fn assert_escalation_refused_before_consent(
     prior_disposition: AttemptDisposition,
     reconciliation: ReconciliationResult,
     retry_class: RetryClass,
-    ledger: &dispatch::AttemptLedger,
+    ledger: &cerebellum_computer::dispatch::AttemptLedger,
     attempt_id: &str,
 ) {
     let mut consent = RecordingConsent {
@@ -577,13 +570,16 @@ fn assert_escalation_refused_before_consent(
         retry_class,
         ledger,
     );
-    assert_eq!(result, Err(dispatch::EscalationError::RetryUnsafe));
+    assert_eq!(
+        result,
+        Err(cerebellum_computer::dispatch::EscalationError::RetryUnsafe)
+    );
     assert_eq!(consent.calls, Vec::<String>::new());
 }
 
 #[test]
 fn escalation_refuses_possible_commit_without_no_effect_reconciliation() {
-    let ledger = dispatch::AttemptLedger::new();
+    let ledger = cerebellum_computer::dispatch::AttemptLedger::new();
     assert_escalation_refused_before_consent(
         AttemptDisposition::MayHaveCommitted,
         ReconciliationResult::EffectIndeterminate,
@@ -595,7 +591,7 @@ fn escalation_refuses_possible_commit_without_no_effect_reconciliation() {
 
 #[test]
 fn every_non_retryable_class_refuses_before_consent() {
-    let ledger = dispatch::AttemptLedger::new();
+    let ledger = cerebellum_computer::dispatch::AttemptLedger::new();
     assert_escalation_refused_before_consent(
         AttemptDisposition::NoEffectObserved,
         ReconciliationResult::NoEffectObserved,
@@ -621,7 +617,7 @@ fn every_non_retryable_class_refuses_before_consent() {
 
 #[test]
 fn permitted_escalation_requests_consent_and_records_a_distinct_attempt() {
-    let ledger = dispatch::AttemptLedger::new();
+    let ledger = cerebellum_computer::dispatch::AttemptLedger::new();
     let mut consent = RecordingConsent {
         calls: Vec::new(),
         decision: ConsentDecision::Granted,
@@ -637,7 +633,7 @@ fn permitted_escalation_requests_consent_and_records_a_distinct_attempt() {
     );
     assert_eq!(
         result,
-        Ok(dispatch::EscalationAttempt {
+        Ok(cerebellum_computer::dispatch::EscalationAttempt {
             escalation_id: "escalation-positive".into(),
             background_attempt_id: "background-attempt".into(),
             observed_attempt_id: Some("escalation-positive:observed".into()),
@@ -707,7 +703,7 @@ fn semantic_unavailability_uses_only_the_selected_background_primitive() {
     let report = dispatcher.dispatch(request).unwrap();
     assert_eq!(
         report.delivery_primitive,
-        platform::containment::DeliveryPrimitive::PerPidSynthetic
+        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
     );
     assert_eq!(dispatcher.driver().semantic_calls, 1);
     assert_eq!(dispatcher.driver().per_pid_calls, 1);
@@ -770,11 +766,11 @@ fn fronting_downgrade_is_a_success_with_exact_global_none_evidence() {
     let report = dispatcher.dispatch(request).unwrap();
     assert_eq!(
         report.containment.containment_rung,
-        Some(platform::containment::ContainmentRung::GlobalNone)
+        Some(cerebellum_computer::platform::containment::ContainmentRung::GlobalNone)
     );
     assert_eq!(
         report.containment.forfeiture_reason,
-        Some(platform::containment::ContainmentForfeitureReason::FrontingDowngradeDetected)
+        Some(cerebellum_computer::platform::containment::ContainmentForfeitureReason::FrontingDowngradeDetected)
     );
     assert_eq!(
         report.fronting.unwrap().comparison,

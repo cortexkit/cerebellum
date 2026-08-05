@@ -1,18 +1,10 @@
-#[allow(dead_code, unused_imports)]
-#[path = "../src/capture/mod.rs"]
-mod capture;
-
-#[allow(dead_code, unused_imports)]
-#[path = "../src/platform/mod.rs"]
-mod platform;
-
-use capture::{
+use cerebellum_computer::capture::{
     BroadDisplayCaptureRequest, BroadDisplayGrant, CaptureArtifact, CaptureError,
     CaptureLeakageFlag, CaptureLeakageReport, CaptureSessionState, EnumeratedWindow,
     InMemoryCaptureBackend, LeakageValue, ScopedCaptureController, TeardownBehavior,
     TeardownProgress, WindowChangeKind, WindowFrame,
 };
-use platform::{PermissionLiveness, ProcessGrant};
+use cerebellum_computer::platform::{PermissionLiveness, ProcessGrant};
 
 fn target() -> ProcessGrant {
     ProcessGrant {
