@@ -1854,6 +1854,56 @@ mod tests {
             .all(|(_, _, schema)| schema["additionalProperties"] == false));
     }
 
+    /// Every capability the dispatcher accepts is also advertised.
+    ///
+    /// `handle_tool` admits any name [`BrowserCapability::parse`] recognizes,
+    /// while the manifest is built from [`tool_definitions`], which is a list
+    /// rather than a match -- so a capability added to the enum and wired
+    /// through dispatch stays dispatchable without ever being declared, and a
+    /// test that only counts the list still sees the expected number. The
+    /// exhaustive match below exists so that adding a variant fails to compile
+    /// here, forcing that decision to be made rather than defaulted.
+    #[test]
+    fn every_dispatchable_capability_is_advertised() {
+        fn enumerate(capability: BrowserCapability) -> BrowserCapability {
+            match capability {
+                BrowserCapability::Navigate
+                | BrowserCapability::Snapshot
+                | BrowserCapability::Click
+                | BrowserCapability::Screenshot
+                | BrowserCapability::ClickPoint
+                | BrowserCapability::WaitFor => capability,
+            }
+        }
+
+        let dispatchable = [
+            BrowserCapability::Navigate,
+            BrowserCapability::Snapshot,
+            BrowserCapability::Click,
+            BrowserCapability::Screenshot,
+            BrowserCapability::ClickPoint,
+            BrowserCapability::WaitFor,
+        ]
+        .map(enumerate);
+
+        let advertised: Vec<&str> = tool_definitions()
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        for capability in dispatchable {
+            assert!(
+                advertised.contains(&capability.name()),
+                "{} is dispatchable but not advertised",
+                capability.name()
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            dispatchable.len(),
+            "a tool is advertised that no capability dispatches"
+        );
+    }
+
     #[tokio::test]
     async fn route_lane_serializes_operation_brackets() {
         let plane = BrowserPlane::new();
