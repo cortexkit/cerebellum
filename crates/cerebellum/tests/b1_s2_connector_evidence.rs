@@ -133,10 +133,39 @@ fn connector_evidence_digest_and_runner_mismatches_are_reported() {
     assert!(report.reasons.contains(&"runner_revision_mismatch"));
 }
 
+/// The digest a caller expects the frozen-type evidence pin to carry.
+fn expected_frozen_type_digest() -> String {
+    cerebellum::browser_type::computed_eligibility_artifact_digest()
+}
+
+/// A pin carrying the expected digest is accepted and retained.
+///
+/// The other cases here cover the three statuses that OMIT the pin. Without
+/// this one the gate could accept nothing at all and they would still pass,
+/// since each asserts only that a bad pin was rejected.
+#[test]
+fn a_frozen_type_evidence_pin_matching_the_expected_digest_is_accepted() {
+    let mut value = serde_json::to_value(pins()).unwrap();
+    let expected = expected_frozen_type_digest();
+    value["browser_type_evidence_eligibility_sha256"] = Value::String(expected.clone());
+    let bytes = cerebellum::manifest::custody::canonical_json_bytes(&value);
+
+    let parsed = parse_manifest_pins(&bytes, &expected).unwrap();
+
+    assert_eq!(
+        parsed.report.frozen_type_evidence,
+        FrozenTypeEvidenceStatus::Accepted
+    );
+    assert_eq!(
+        parsed.pins.browser_type_evidence_eligibility_sha256,
+        Some(expected)
+    );
+}
+
 #[test]
 fn checked_in_manifest_pin_fixture_is_canonical_and_common_valid() {
     let bytes = include_bytes!("../resources/b1_s2_manifest-pins.json");
-    let parsed = parse_manifest_pins(bytes, None).unwrap();
+    let parsed = parse_manifest_pins(bytes, &expected_frozen_type_digest()).unwrap();
     assert_eq!(
         parsed.report.frozen_type_evidence,
         FrozenTypeEvidenceStatus::Absent
@@ -151,7 +180,7 @@ fn optional_frozen_type_evidence_is_reported_and_omitted_without_gating_capabili
     let mut malformed = serde_json::to_value(&base).unwrap();
     malformed["browser_type_evidence_eligibility_sha256"] = Value::Bool(true);
     let malformed_bytes = cerebellum::manifest::custody::canonical_json_bytes(&malformed);
-    let parsed = parse_manifest_pins(&malformed_bytes, Some(&expected)).unwrap();
+    let parsed = parse_manifest_pins(&malformed_bytes, &expected).unwrap();
     assert_eq!(
         parsed.report.frozen_type_evidence,
         FrozenTypeEvidenceStatus::OmittedMalformed
@@ -174,7 +203,7 @@ fn optional_frozen_type_evidence_is_reported_and_omitted_without_gating_capabili
     let mut mismatched = serde_json::to_value(&base).unwrap();
     mismatched["browser_type_evidence_eligibility_sha256"] = Value::String("f".repeat(64));
     let mismatched_bytes = cerebellum::manifest::custody::canonical_json_bytes(&mismatched);
-    let parsed = parse_manifest_pins(&mismatched_bytes, Some(&expected)).unwrap();
+    let parsed = parse_manifest_pins(&mismatched_bytes, &expected).unwrap();
     assert_eq!(
         parsed.report.frozen_type_evidence,
         FrozenTypeEvidenceStatus::OmittedMismatched
@@ -194,7 +223,7 @@ fn missing_required_pin_remains_fail_closed_and_extraction_is_capability_relativ
         .unwrap()
         .remove("browser_custody_sha256");
     let bytes = cerebellum::manifest::custody::canonical_json_bytes(&missing);
-    assert!(parse_manifest_pins(&bytes, None).is_err());
+    assert!(parse_manifest_pins(&bytes, &expected_frozen_type_digest()).is_err());
 
     let mut extraction = base;
     extraction.browser_extraction_corpus_sha256 = Some("3".repeat(64));

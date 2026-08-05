@@ -716,7 +716,7 @@ pub enum ManifestPinError {
 impl ManifestPinSet {
     pub fn parse(
         bytes: &[u8],
-        expected_frozen_type_digest: Option<&str>,
+        expected_frozen_type_digest: &str,
     ) -> Result<ParsedManifestPins, ManifestPinError> {
         parse_manifest_pins(bytes, expected_frozen_type_digest)
     }
@@ -807,9 +807,18 @@ impl ManifestPinSet {
 /// Parse a canonical pin object. The optional pin for the expected frozen
 /// browser type is handled differently: if it is invalid or does not match the
 /// expected digest, report and remove it instead of blocking a minted action.
+///
+/// The expected digest is required rather than optional. It was optional, and a
+/// caller passing nothing got [`FrozenTypeEvidenceStatus::Accepted`] for any
+/// well-formed digest -- a verified-looking answer produced without comparing
+/// anything. A caller that does not know the value it expects is exactly the one
+/// that must not be told the pin was accepted, and it can pass the digest it
+/// believes correct to have that belief checked. Compare
+/// [`browser_type::validate_evidence_eligibility`], which refuses outright when
+/// a digest is missing.
 pub fn parse_manifest_pins(
     bytes: &[u8],
-    expected_frozen_type_digest: Option<&str>,
+    expected_frozen_type_digest: &str,
 ) -> Result<ParsedManifestPins, ManifestPinError> {
     let mut value: Value =
         serde_json::from_slice(bytes).map_err(|_| ManifestPinError::InvalidJson)?;
@@ -843,8 +852,7 @@ pub fn parse_manifest_pins(
     let (status, message) = match candidate {
         None => (FrozenTypeEvidenceStatus::Absent, None),
         Some(Value::String(value))
-            if custody::valid_digest(&value)
-                && expected_frozen_type_digest.is_none_or(|expected| expected == value) =>
+            if custody::valid_digest(&value) && expected_frozen_type_digest == value =>
         {
             (FrozenTypeEvidenceStatus::Accepted, None)
         }
