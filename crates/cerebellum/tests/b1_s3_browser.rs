@@ -191,7 +191,7 @@ async fn same_context_dispatches_serialize_and_different_contexts_do_not() {
     drop(guard_a);
 }
 
-/// A click presses before it releases.
+/// A click presses before it releases, and presses nothing before commitment.
 ///
 /// The ordering is not implied by the outcome: a release recorded before its
 /// press still reports success, still journals a commitment, and still leaves
@@ -202,11 +202,11 @@ async fn same_context_dispatches_serialize_and_different_contexts_do_not() {
 /// path as well; a change that reordered actuation for one of them would have
 /// to reorder it for both.
 ///
-/// Commitment ordering is deliberately not asserted here. The journal records
-/// it and the operation log does not, so a test written over this log could
-/// only check a proxy for it.
+/// The commitment ordering matters for the same reason: an input recorded
+/// before the journal has committed to it is an action the audit trail cannot
+/// account for.
 #[tokio::test]
-async fn a_click_presses_before_it_releases() {
+async fn a_click_presses_before_it_releases_and_only_after_commitment() {
     let plane = BrowserPlane::new();
     let route = identity();
     plane.open_context(route.clone()).await.unwrap();
@@ -267,5 +267,10 @@ async fn a_click_presses_before_it_releases() {
     assert!(
         position(browser::Operation::CdpInputPress) < position(browser::Operation::CdpInputRelease),
         "a button is pressed before it is released: {operations:?}"
+    );
+    assert!(
+        position(browser::Operation::CommitDispatched)
+            < position(browser::Operation::CdpInputPress),
+        "no input is dispatched before the journal commits to it: {operations:?}"
     );
 }
