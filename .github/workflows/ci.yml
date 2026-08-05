@@ -116,3 +116,22 @@ jobs:
       - name: Conformance (live subc daemon)
         if: ${{ !cancelled() }}
         run: cargo test -p cerebellum --features test-observer --test conformance
+
+      # Running the gate verbatim keeps CI and the desk from drifting, but it
+      # also means both share one execution shape and therefore one blind spot:
+      # `cargo test` runs a binary's tests as THREADS IN ONE PROCESS, so a test
+      # that only passes because a sibling left state behind -- a populated
+      # global, an env var, a changed working directory -- passes here and fails
+      # for anyone running that test alone.
+      #
+      # This step runs the same tests one process each, which is the shape that
+      # exposes that dependency and hides the opposite one (a shared-state race
+      # between concurrent tests, which only the threaded shape can show). The
+      # two are complements; neither is the gate.
+      - name: Install nextest
+        if: ${{ !cancelled() }}
+        uses: taiki-e/install-action@nextest
+
+      - name: Test suite, one process per test
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --workspace
