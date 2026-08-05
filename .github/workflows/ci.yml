@@ -19,9 +19,26 @@ jobs:
   # platform driver is a portable surface plus a backend skeleton, with no
   # SkyLight, CoreGraphics or ScreenCaptureKit linkage and no `cfg(target_os)`
   # anywhere in the workspace. THE FIRST SLICE THAT LINKS A REAL macOS FRAMEWORK
-  # BREAKS THIS JOB, and the fix at that point is a macOS runner for the computer
-  # crate rather than target-gating the code, since gating would hide the plane
-  # from the build that is supposed to verify it.
+  # BREAKS THIS JOB.
+  #
+  # DO NOT REACH FOR A macOS RUNNER AT THAT POINT: there is not one to reach for.
+  # Blacksmith offers no macOS machines, and GitHub-hosted macOS is billing-
+  # blocked for this organization (see the note on runners below). A job that
+  # requests a `macos-*` label is ACCEPTED AND NEVER SCHEDULED -- it renders as
+  # queued rather than failed, which reads as "still running" indefinitely and is
+  # a worse outcome than no job at all, since waiting is the one response that
+  # never resolves it.
+  #
+  # The options that actually exist are: narrow this job to the crates that still
+  # build on Linux and accept that the computer plane is verified only by the gate
+  # run on a development machine -- which must then be stated somewhere a reader
+  # will look, because a CI badge covering two of three crates does not say so --
+  # or make macOS runners available (a public repository gets free GitHub-hosted
+  # minutes; an organization billing change gets private ones).
+  #
+  # Do NOT `cfg(target_os)` the plane away to keep this job green. That hides the
+  # code from the build meant to verify it, and green would then mean less than
+  # it does today while looking like more.
   #
   # WHAT A GREEN RUN HERE DOES NOT COVER: the conformance suite spawns a real
   # subc daemon and measures how long the module takes to register, and on macOS
