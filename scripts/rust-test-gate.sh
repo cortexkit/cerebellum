@@ -28,6 +28,25 @@ run_phase() {
   echo "    ok ($((SECONDS - started))s)"
 }
 
+# Phase 0: refuse to certify a tree in which a guard may still be deliberately
+# broken. `scripts/mutate.sh` weakens a mechanism on purpose to see whether any
+# test notices, and restores it afterwards -- but a hard kill runs no restore and
+# prints nothing, leaving a broken guard in a file that still looks like source. The marker survives that kill, so the break announces itself here
+# rather than passing review as ordinary code. This runs first because every
+# later phase would be reporting on the mutated tree.
+check_no_mutation_in_progress() {
+  local marker
+  marker="$(git rev-parse --git-dir)/mutation-in-progress"
+  if [ -e "$marker" ]; then
+    echo "    a mutation run did not confirm its restore:" >&2
+    sed 's/^/    /' "$marker" >&2
+    return 1
+  fi
+}
+
+run_phase "no mutation left in the working tree" \
+  check_no_mutation_in_progress
+
 # Phase 1: formatting check. `cargo fmt --all` must be run before committing;
 # this check fails the gate on an unformatted commit.
 run_phase "cargo fmt --all -- --check" \
