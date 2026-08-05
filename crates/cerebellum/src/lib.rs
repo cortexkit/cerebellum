@@ -502,7 +502,28 @@ pub fn serialize_manifest_with_computer_plane(
     value
 }
 
-fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
+/// The tool names this module can actually serve, or `None` for a name it
+/// cannot.
+///
+/// Named rather than inlined at the dispatch site so that the manifest can be
+/// checked against it. Advertising a tool this rejects would offer the caller a
+/// capability that fails as an unknown method, which is indistinguishable from
+/// the module not having it at all -- except that the caller was told otherwise.
+pub fn dispatchable_tool(name: &str) -> Option<&str> {
+    if name == BROWSER_STATUS_TOOL {
+        Some(BROWSER_STATUS_TOOL)
+    } else if browser::BrowserCapability::parse(name).is_some() {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// The computer-plane advertisement context used when sending HELLO.
+///
+/// Public so that a test can check the manifest this module really sends,
+/// rather than one assembled to look like it.
+pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
     let startup = StartupCapabilityProbe::run(&StartupProbeInput {
         os_major: computer::platform::MACOS_MAJOR_VERSION,
         private_envelope_revision: None,
@@ -1076,13 +1097,7 @@ async fn handle_tool_request(
     // Route admission is completed before decoding capability arguments.
     // Admitted routes may proceed to their handlers; denied routes perform no
     // reservation, context lookup, grant lookup, or CDP work.
-    let known_capability = if name == BROWSER_STATUS_TOOL {
-        Some(BROWSER_STATUS_TOOL)
-    } else if browser::BrowserCapability::parse(name).is_some() {
-        Some(name)
-    } else {
-        None
-    };
+    let known_capability = dispatchable_tool(name);
     let Some(capability_name) = known_capability else {
         return send_route_error(
             writer,
