@@ -1,0 +1,25 @@
+//! Raw readings from macOS frameworks, and nothing else.
+//!
+//! This crate exists so that `cerebellum-computer` can keep
+//! `#![forbid(unsafe_code)]`. That is not a style preference there: it is the
+//! crate that will eventually synthesize input events, and `forbid` cannot be
+//! overridden from inside a crate, so the guarantee holds for every module in
+//! it without anyone having to enforce it. Calling into a C API requires
+//! `unsafe`, so the calls live here instead and the guarantee stays exact.
+//!
+//! The bargain only works if this crate stays small and stays dumb. It reads
+//! what the system reports and returns plain values. It decides nothing: not
+//! which permissions a capability needs, not whether a grant counts, not what a
+//! missing reading implies. Every one of those lives in the platform-neutral
+//! code, which is built and tested on every host rather than only on this one.
+//!
+//! Read anything added here as code that no continuous build can check.
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use macos::{
+    establish_window_server_connection, is_off_main_thread, responsible_process,
+    screen_capture_is_permitted,
+};

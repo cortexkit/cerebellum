@@ -14,3 +14,11 @@ cerebellum-core = { path = "../cerebellum-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+# The framework readings live in their own crate so this one can keep
+# #![forbid(unsafe_code)], which cannot be overridden from inside a crate and so
+# holds for every module here without anyone enforcing it. Needed only where
+# those frameworks exist; every other host builds this crate without it and
+# keeps the typed refusals the platform-neutral modules already return.
+[target.'cfg(target_os = "macos")'.dependencies]
+cerebellum-macos = { path = "../cerebellum-macos" }
