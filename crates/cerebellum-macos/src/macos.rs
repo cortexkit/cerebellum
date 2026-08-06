@@ -189,6 +189,10 @@ pub fn is_off_main_thread() -> bool {
 /// checks its permission concludes it can capture and then fails at the picture.
 /// `None` when there is no graphical session to ask, which is not the same as an
 /// unlocked one: a process with no session cannot capture either.
+///
+/// The system reports this by OMITTING the key while the screen is unlocked
+/// rather than by reporting false, so an absent key inside a real session is
+/// `Some(false)`. Only the absence of the session itself is unknown.
 pub fn screen_is_locked() -> Option<bool> {
     // SAFETY: takes no arguments, and returns either null or a dictionary this
     // frame owns. Released below on every path that reaches it.
@@ -208,8 +212,11 @@ pub fn screen_is_locked() -> Option<bool> {
             0x0800_0100,
         );
         let value = CFDictionaryGetValue(session, key);
+        // An absent key means unlocked. Reporting that as unknown would make
+        // `== Some(false)` a test that never matches, which is worse than
+        // wrong: it reads as a check and is a constant.
         let locked = if value.is_null() {
-            None
+            Some(false)
         } else {
             Some(CFBooleanGetValue(value))
         };
@@ -458,16 +465,17 @@ fn find_window(window_id: u32, timeout: Duration) -> Result<Retained<SCWindow>, 
 /// blocked each other past 60 seconds, on different windows, with no error from
 /// either side.
 ///
-/// THE CONTENTION OUTLIVES THE PROCESS THAT CAUSED IT. A first capture that
-/// takes 0.5 second on an idle machine took 14 seconds immediately after
-/// another process had captured and exited, with no process of that program
-/// left running. So it is the window server's own state that is busy, not a
-/// competing process, and waiting for the other side to exit does not clear it.
+/// IT IS SPECIFICALLY TWO SETUPS AT ONCE, which is narrower than it first
+/// appears and worth stating exactly, since the wider readings are wrong.
+/// Measured on an otherwise busy machine: a first capture takes about 150ms
+/// alone, about the same immediately after another process captured and exited,
+/// and about the same while a warmed process captures in a loop. Only two
+/// processes performing their FIRST capture simultaneously collide, and that
+/// collision is severe rather than slow.
 ///
-/// So the deadline has to cover a wait for the system rather than for the work,
-/// and a caller that wants a bounded first capture should perform one at
-/// startup, when nothing else is competing, rather than on the first request
-/// that needs it.
+/// So the deadline has to cover a wait for another process's setup rather than
+/// for the work, and it is a wait that ends in a refusal rather than a late
+/// picture.
 pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, String> {
     // Before any filter is created. Without a window-server connection the
     // filter constructor does not fail -- it aborts the process, which for a
@@ -979,6 +987,27 @@ mod tests {
             "the child neither captured nor refused: {:?}, {}",
             status.status,
             String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    /// A graphical session reports a definite lock state, never an unknown one.
+    ///
+    /// The system omits the lock key entirely while the screen is unlocked, so
+    /// a reading that treated an absent key as unknown would return `None` in
+    /// the ordinary case and make `== Some(false)` a comparison that never
+    /// matches. This test runs inside a session, so `None` here means that
+    /// mistake rather than a missing session.
+    #[test]
+    fn an_unlocked_screen_reports_unlocked_rather_than_unknown() {
+        // Enumeration succeeding establishes that there IS a session to ask,
+        // which is the only condition under which None would be correct.
+        if enumerate_windows(Duration::from_secs(10)).is_err() {
+            return;
+        }
+        assert_eq!(
+            screen_is_locked(),
+            Some(false),
+            "a session that answers window queries must report a definite lock state"
         );
     }
 
