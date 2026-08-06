@@ -459,13 +459,27 @@ mod tests {
         let mut backend = NativeCaptureBackend::new(timeout());
         let mine = backend.enumerate_windows(&grant).expect("enumerate");
 
+        // The expectation is computed from the system's own list rather than
+        // from the returned windows. Every returned window carries the target's
+        // identity because that field is copied from the grant, so asserting on
+        // it would compare the grant with itself and hold however the list was
+        // filtered.
+        let expected: Vec<String> = all
+            .iter()
+            .filter(|window| window.owner_pid == sample.owner_pid)
+            .map(|window| window.window_id.to_string())
+            .collect();
+        let returned: Vec<String> = mine.iter().map(|window| window.window_id.clone()).collect();
+
+        assert!(!expected.is_empty(), "the target owns at least one window");
         assert!(
-            !mine.is_empty(),
-            "the target owns at least the sampled window"
+            expected.len() < all.len(),
+            "the target owns every window here, so filtering cannot be observed"
         );
-        for window in &mine {
-            assert_eq!(window.owner_identity.pid, sample.owner_pid);
-        }
+        assert_eq!(
+            returned, expected,
+            "the backend returned a different window set than the target owns"
+        );
     }
 
     /// A grant whose generation is wrong yields windows marked unverified.
