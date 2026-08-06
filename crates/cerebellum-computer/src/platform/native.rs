@@ -90,18 +90,51 @@ pub fn grant_for_pid(pid: u32, timeout: Duration) -> Option<ProcessGrant> {
     })
 }
 
-/// Whether the process holding `pid` right now is the one the grant was made
-/// for.
+/// What a fresh reading of a process says about a grant made for it earlier.
 ///
-/// Reads the generation fresh and compares it against the grant's. A process
-/// that cannot be read is NOT verified: an unreadable process is either gone or
-/// not ours to inspect, and neither is evidence of a match.
-fn owner_is_the_granted_process(pid: u32, grant: &ProcessGrant) -> bool {
-    if pid != grant.pid {
-        return false;
+/// The failures are kept apart because a caller acts differently on each: a
+/// replaced target can be worked with again once a new grant is acquired, an
+/// exited one cannot, and a window belonging to another process altogether means
+/// the request named the wrong thing. Collapsing them into one answer leaves the
+/// caller to guess which happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantVerification {
+    /// Same process, same generation: still the thing the grant was made for.
+    Current,
+    /// The pid is held by a process that started at a different moment, so the
+    /// original exited and its pid was reused.
+    TargetReplaced,
+    /// Nothing holds the pid, or it cannot be inspected from here.
+    TargetGone,
+    /// The reading is about a different process than the grant names.
+    DifferentProcess,
+}
+
+impl GrantVerification {
+    fn is_current(self) -> bool {
+        self == Self::Current
     }
-    cerebellum_macos::process_start_time_micros(pid)
-        .is_some_and(|generation| generation.to_string() == grant.process_generation_evidence)
+}
+
+/// Compare a fresh reading of `pid` against a grant made for it earlier.
+///
+/// The generation is read now rather than carried, because a pid on its own
+/// names whoever holds it at this moment — which is exactly the process the
+/// check exists to distinguish from the one the grant was made for.
+fn verify_grant(pid: u32, grant: &ProcessGrant) -> GrantVerification {
+    if pid != grant.pid {
+        return GrantVerification::DifferentProcess;
+    }
+    // An unreadable process is treated as gone rather than as a match: it is
+    // either exited or not ours to inspect, and neither is evidence.
+    let Some(generation) = cerebellum_macos::process_start_time_micros(pid) else {
+        return GrantVerification::TargetGone;
+    };
+    if generation.to_string() == grant.process_generation_evidence {
+        GrantVerification::Current
+    } else {
+        GrantVerification::TargetReplaced
+    }
 }
 
 fn to_frame(window: &cerebellum_macos::RawWindow) -> WindowFrame {
@@ -168,7 +201,7 @@ impl CaptureBackend for NativeCaptureBackend {
         let windows =
             cerebellum_macos::enumerate_windows(self.timeout).map_err(BackendError::Enumeration)?;
 
-        let verified = owner_is_the_granted_process(target.pid, target);
+        let verified = verify_grant(target.pid, target).is_current();
 
         let mine: Vec<EnumeratedWindow> = windows
             .iter()
@@ -248,11 +281,27 @@ impl CaptureBackend for NativeCaptureBackend {
             .map_err(BackendError::Capture)?;
 
         // Read at capture time by the system, not carried from enumeration.
-        if !owner_is_the_granted_process(capture.owner_pid_at_capture, &request.target) {
-            return Err(BackendError::Capture(format!(
-                "window {window_id} is owned by process {} at capture time, not the granted {}",
-                capture.owner_pid_at_capture, request.target.pid
-            )));
+        match verify_grant(capture.owner_pid_at_capture, &request.target) {
+            GrantVerification::Current => {}
+            GrantVerification::TargetReplaced => {
+                return Err(BackendError::Capture(format!(
+                    "window {window_id} is owned by a process that replaced the granted {} at \
+                     capture time, so a new grant is needed",
+                    request.target.pid
+                )))
+            }
+            GrantVerification::TargetGone => {
+                return Err(BackendError::Capture(format!(
+                    "the granted process {} is gone at capture time",
+                    request.target.pid
+                )))
+            }
+            GrantVerification::DifferentProcess => {
+                return Err(BackendError::Capture(format!(
+                    "window {window_id} is owned by process {} at capture time, not the granted {}",
+                    capture.owner_pid_at_capture, request.target.pid
+                )))
+            }
         }
 
         Ok(WindowCaptureFrame {
@@ -391,7 +440,7 @@ mod tests {
             bundle_identity: "irrelevant to generation".to_string(),
             process_generation_evidence: generation.to_string(),
         };
-        assert!(owner_is_the_granted_process(pid, &grant));
+        assert_eq!(verify_grant(pid, &grant), GrantVerification::Current);
     }
 
     /// A grant carrying another process's generation does not verify.
@@ -411,9 +460,11 @@ mod tests {
             // moment, which is what a reused pid holds.
             process_generation_evidence: (generation - 1).to_string(),
         };
-        assert!(
-            !owner_is_the_granted_process(pid, &grant),
-            "a grant from a different generation was accepted for the same pid"
+        assert_eq!(
+            verify_grant(pid, &grant),
+            GrantVerification::TargetReplaced,
+            "a pid held by a process that started at a different moment is a REPLACED target, \
+             which a caller can act on by acquiring a new grant"
         );
     }
 
@@ -425,7 +476,34 @@ mod tests {
             bundle_identity: "gone".to_string(),
             process_generation_evidence: "1".to_string(),
         };
-        assert!(!owner_is_the_granted_process(u32::MAX - 1, &grant));
+        assert_eq!(
+            verify_grant(u32::MAX - 1, &grant),
+            GrantVerification::TargetGone
+        );
+    }
+
+    /// A reading about some other process is not a verdict about the grant.
+    ///
+    /// The fourth outcome, and the one a caller acts on differently from the
+    /// rest: the other three say something about the granted process, while this
+    /// says the reading was about something else entirely and the request named
+    /// the wrong thing.
+    #[test]
+    fn a_reading_about_another_process_is_reported_as_such() {
+        let pid = std::process::id();
+        let Some(generation) = cerebellum_macos::process_start_time_micros(pid) else {
+            return;
+        };
+        let grant = ProcessGrant {
+            pid,
+            bundle_identity: "irrelevant to generation".to_string(),
+            process_generation_evidence: generation.to_string(),
+        };
+        // A pid the grant does not name, checked against that grant.
+        assert_eq!(
+            verify_grant(pid.wrapping_add(1), &grant),
+            GrantVerification::DifferentProcess
+        );
     }
 
     /// Enumeration returns only the target's windows.
