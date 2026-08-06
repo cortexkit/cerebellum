@@ -127,35 +127,21 @@ pub struct NativeCaptureBackend {
 }
 
 impl NativeCaptureBackend {
+    /// No warming step is offered, and the reason is worth stating because the
+    /// absence looks like an oversight.
+    ///
+    /// A process's first capture is what establishes its session with the
+    /// window server, and two processes doing that simultaneously block each
+    /// other badly. Warming would move that cost to startup — but the only way
+    /// to warm is to take a real picture, since creating a filter without
+    /// capturing does not complete the setup. That trades a photograph nobody
+    /// requested, on every boot, against an occasional refusal the caller can
+    /// retry. A first capture otherwise costs about the same as any other.
     pub fn new(timeout: Duration) -> Self {
         Self {
             timeout,
             last_seen: None,
         }
-    }
-
-    /// Perform this process's first capture while nothing is competing for it.
-    ///
-    /// A process's first capture sets up its session with the window server,
-    /// and that setup contends system-wide: while another process is capturing,
-    /// it does not proceed. Two processes starting together have blocked each
-    /// other past 60 seconds on different windows. Doing it at startup means a
-    /// later request waits for the work rather than for whatever else the
-    /// machine happened to be doing when the request arrived.
-    ///
-    /// Returns the error rather than swallowing it, so a caller can decide
-    /// whether a module that cannot capture should come up at all.
-    pub fn warm(&mut self) -> Result<(), BackendError> {
-        let windows =
-            cerebellum_macos::enumerate_windows(self.timeout).map_err(BackendError::Enumeration)?;
-        let Some(window) = windows.iter().find(|window| window.on_screen) else {
-            // Nothing to capture is not a failure to capture. The session stays
-            // cold, and the first real request pays for it.
-            return Ok(());
-        };
-        cerebellum_macos::capture_window(window.window_id, self.timeout)
-            .map(|_| ())
-            .map_err(BackendError::Capture)
     }
 }
 
