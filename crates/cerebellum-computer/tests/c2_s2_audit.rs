@@ -2,21 +2,24 @@ use std::collections::BTreeMap;
 
 use cerebellum_computer::audit::{
     AttemptRole, BackgroundEscalationDescriptor, BackgroundFailureCause, ComputerAudit,
-    ComputerCapability, ComputerPlaneDescriptor, ComputerTerminalKind, ConsentProvenance,
-    EscalationPair, ObservationState, ReauthorizedEscalationDescriptor, TypedCaptureDispatch,
+    ComputerAuditError, ComputerCapability, ComputerJournalCodec, ComputerPlaneDescriptor,
+    ComputerTerminalKind, ConsentProvenance, EscalationPair, ObservationState,
+    ReauthorizedEscalationDescriptor, TypedCaptureDispatch,
 };
 use cerebellum_computer::capture_custody::{
     redact_accessibility_snapshot, AccessibilityRedactionOutcome, AccessibilityRedactionPath,
-    AccessibilitySchema, AccessibilitySnapshot, CaptureCustody, CaptureGrant, CaptureScope,
-    CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority, PixelArtifact,
+    AccessibilitySchema, AccessibilitySnapshot, CaptureCustody, CaptureGrant,
+    CapturePrepareRefusalCause, CaptureScope, CustodyBounds, InMemoryCustodyStorage,
+    InMemoryGrantAuthority, PixelArtifact,
 };
 use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
-    EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalIdentity,
-    LifecycleState, ObservabilityClass, Redactor, SeverityInputs, SeverityRecord,
+    EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalError,
+    JournalIdentity, LifecycleState, ObservabilityClass, Redactor, SeverityInputs, SeverityRecord,
     ValidatedSeverityTaxonomy,
 };
+use serde_json::json;
 
 #[derive(Clone)]
 struct TestRedactor;
@@ -350,6 +353,188 @@ fn consented_escalation_retains_its_reauthorization_descriptor() {
 
     assert_eq!(pair.background, background);
     assert_eq!(pair.reauthorized, Some(reauthorized));
+}
+
+#[test]
+fn successful_dispatch_lifecycle_records_material_and_rejects_recommitment() {
+    let mut audit = audit();
+    let handle = audit
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::SemanticElement,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+    let admission = audit
+        .prepare_capture(handle, CaptureScope::PerWindow, None, 10)
+        .unwrap();
+    let artifact_id = audit
+        .admit_capture(
+            admission,
+            PixelArtifact::per_window(vec![4, 5, 6], 10, "window-1", 42, 3, 1),
+            10,
+        )
+        .unwrap();
+    let dispatch = TypedCaptureDispatch::new(
+        ComputerCapability::Screenshot,
+        ContainmentRung::SemanticElement,
+        ObservationState::HumanObserved,
+    )
+    .dispatch_material(b"dispatch-material".to_vec());
+    let expected_severity_inputs = SeverityInputs {
+        effect_class: EffectClass::Read,
+        isolation_class: IsolationClass::ResourceScoped,
+        observability_class: ObservabilityClass::HumanObserved,
+    };
+
+    let token = audit
+        .commit_dispatched(
+            handle,
+            &dispatch,
+            b"grant-decision".to_vec(),
+            Some(b"observation-42".to_vec()),
+        )
+        .unwrap();
+    let dispatched_record = audit.read_obligation_audit(handle.sequence()).unwrap();
+    assert_eq!(dispatched_record.lifecycle, LifecycleState::Dispatched);
+    assert_eq!(
+        dispatched_record.severity_inputs,
+        Some(expected_severity_inputs)
+    );
+    let dispatched_entry =
+        ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+    assert_eq!(dispatched_entry["phase"], json!("dispatched"));
+    assert_eq!(
+        dispatched_entry["dispatch_material"],
+        json!([100, 105, 115, 112, 97, 116, 99, 104, 45, 109, 97, 116, 101, 114, 105, 97, 108])
+    );
+    assert_eq!(
+        dispatched_entry["severity_inputs"],
+        json!({
+            "effect_class": "read",
+            "isolation_class": "resource_scoped",
+            "observability_class": "human_observed",
+        })
+    );
+    assert_eq!(
+        dispatched_entry["grant_decision"],
+        json!([103, 114, 97, 110, 116, 45, 100, 101, 99, 105, 115, 105, 111, 110])
+    );
+    assert_eq!(
+        dispatched_entry["governing_observation"],
+        json!([111, 98, 115, 101, 114, 118, 97, 116, 105, 111, 110, 45, 52, 50])
+    );
+
+    audit
+        .finalize_dispatched(token, b"completed".to_vec(), b"context-42".to_vec())
+        .unwrap();
+    let record = audit.read_obligation_audit(handle.sequence()).unwrap();
+    assert_eq!(record.lifecycle, LifecycleState::Finalized);
+    assert_eq!(
+        record.terminal_kind.map(ComputerTerminalKind::from),
+        Some(ComputerTerminalKind::FinalizedCommitted)
+    );
+    assert_eq!(record.severity_inputs, Some(expected_severity_inputs));
+    assert_eq!(audit.custody().read_artifact(&artifact_id), None);
+    let finalized_entry =
+        ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+    assert_eq!(finalized_entry["phase"], json!("finalized"));
+    assert_eq!(
+        finalized_entry["dispatch_material"],
+        json!([100, 105, 115, 112, 97, 116, 99, 104, 45, 109, 97, 116, 101, 114, 105, 97, 108])
+    );
+    assert_eq!(
+        finalized_entry["severity_inputs"],
+        json!({
+            "effect_class": "read",
+            "isolation_class": "resource_scoped",
+            "observability_class": "human_observed",
+        })
+    );
+
+    assert_eq!(
+        audit
+            .commit_dispatched(
+                handle,
+                &dispatch,
+                b"retry-grant".to_vec(),
+                Some(b"retry-observation".to_vec()),
+            )
+            .unwrap_err(),
+        ComputerAuditError::Journal(JournalError::ObligationUnknown)
+    );
+}
+
+/// A finalized action admits no further pixels.
+///
+/// Capture admission is gated on the obligation still being active, and
+/// finalizing is what ends that. Without it, an artifact could be attached to an
+/// action whose audit record is already closed and describes a different set of
+/// pixels than the ones retained.
+///
+/// Asserted through the refusal a caller would actually receive, and by its
+/// exact cause: a preparation that failed for some other reason would refuse
+/// too, and would prove nothing about the obligation's state.
+///
+/// TWO PLACES END THE OBLIGATION -- the finalizing call itself, and the
+/// journal's terminal feed a line later -- so removing either alone changes
+/// nothing observable and this test stays green. That is the redundancy working
+/// rather than the test failing to look; it takes removing both to make it red.
+#[test]
+fn a_finalized_action_admits_no_further_capture() {
+    let mut audit = audit();
+    let handle = audit
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::SemanticElement,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+
+    // The positive case uses a SEPARATE obligation. Preparing twice on one
+    // obligation is refused as already-prepared, and admitting twice as
+    // already-admitted, so proving the positive on the same handle would mask
+    // the rule under test behind an unrelated one.
+    let live = audit
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::SemanticElement,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+    audit
+        .prepare_capture(live, CaptureScope::PerWindow, None, 10)
+        .expect("a live obligation admits capture");
+
+    let dispatch = TypedCaptureDispatch::new(
+        ComputerCapability::Screenshot,
+        ContainmentRung::SemanticElement,
+        ObservationState::HumanObserved,
+    )
+    .dispatch_material(b"dispatch-material".to_vec());
+    let token = audit
+        .commit_dispatched(handle, &dispatch, b"grant".to_vec(), None)
+        .unwrap();
+    audit
+        .finalize_dispatched(token, b"completed".to_vec(), b"context".to_vec())
+        .unwrap();
+
+    let refusal = audit
+        .prepare_capture(handle, CaptureScope::PerWindow, None, 20)
+        .expect_err("a finalized action must not admit capture");
+    assert_eq!(
+        refusal.cause,
+        CapturePrepareRefusalCause::ObligationNotActive
+    );
 }
 
 #[test]

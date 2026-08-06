@@ -327,6 +327,17 @@ mod tests {
     /// allows and fail for a reason unrelated to what they assert.
     static FIRST_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Whether this machine can currently produce window pixels at all.
+    ///
+    /// Two states prevent it and they are different: capture may not be
+    /// permitted, or the screen may be locked. A locked screen still answers
+    /// questions about windows while refusing their contents, so a test that
+    /// only checks enumeration would proceed and then fail on the picture.
+    fn pixels_are_obtainable() -> bool {
+        cerebellum_macos::screen_capture_is_permitted()
+            && cerebellum_macos::screen_is_locked() != Some(true)
+    }
+
     fn timeout() -> Duration {
         Duration::from_secs(10)
     }
@@ -516,6 +527,9 @@ mod tests {
     /// Capturing through the backend yields the target's pixels.
     #[test]
     fn capturing_through_the_backend_yields_pixels() {
+        if !pixels_are_obtainable() {
+            return;
+        }
         let _serialized = FIRST_CAPTURE.lock();
         let Ok(all) = cerebellum_macos::enumerate_windows(timeout()) else {
             return;
@@ -558,6 +572,9 @@ mod tests {
     /// tell, since the window id alone is a valid id.
     #[test]
     fn capturing_a_window_owned_by_another_process_refuses() {
+        if !pixels_are_obtainable() {
+            return;
+        }
         let _serialized = FIRST_CAPTURE.lock();
         let Ok(all) = cerebellum_macos::enumerate_windows(timeout()) else {
             return;
