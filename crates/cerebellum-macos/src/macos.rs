@@ -63,6 +63,11 @@ struct ProcBsdInfo {
 const PROC_PIDTBSDINFO: c_int = 3;
 
 extern "C" {
+    /// This thread's `errno`. The kernel calls below report every failure as a
+    /// zero return, so the cause is only available here.
+    #[link_name = "__error"]
+    fn errno_location() -> *mut c_int;
+
     /// The current graphical session's properties, or null outside one.
     fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
     fn CFDictionaryGetValue(
@@ -236,12 +241,41 @@ pub fn screen_is_locked() -> Option<bool> {
 /// `None` when the process is gone or the kernel reports a structure this does
 /// not recognise. Absence rather than a zero, because a zero start time would
 /// compare equal to another zero and read as a match.
-pub fn process_start_time_micros(pid: u32) -> Option<u64> {
+/// What the kernel says when asked when a process started.
+///
+/// The failures are separate because they are not the same news. Only one of
+/// them is about the process; one is about this code being wrong, and reporting
+/// that as "the process is gone" would make a mismatch with a future kernel look
+/// like every process on the machine having exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStartTime {
+    /// Microseconds since the epoch.
+    Started(u64),
+    /// No process holds this id.
+    NoSuchProcess,
+    /// The process exists and this one may not inspect it. NOT the same as
+    /// absent: a caller that treats it as absent concludes a target has exited
+    /// when it is merely out of reach.
+    NotPermitted,
+    /// The kernel wrote a different number of bytes than [`ProcBsdInfo`]
+    /// declares, so its structure is not the one described here and any field
+    /// read out would be some other data. A defect in this module rather than a
+    /// fact about the process, and it would otherwise present as every process
+    /// being gone at once.
+    LayoutMismatch,
+    /// The process reports no start time, or one that does not fit. Two such
+    /// processes would compare as the same generation, so it cannot be used as
+    /// evidence.
+    NoStartTime,
+}
+
+pub fn process_start_time(pid: u32) -> ProcessStartTime {
     let mut info = ProcBsdInfo::default();
     let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
     // SAFETY: the buffer is owned here and its true size is passed, so the call
     // cannot write past it. The pid is passed by value.
     let written = unsafe {
+        errno_location().write(0);
         proc_pidinfo(
             pid as c_int,
             PROC_PIDTBSDINFO,
@@ -251,21 +285,46 @@ pub fn process_start_time_micros(pid: u32) -> Option<u64> {
         )
     };
 
-    // A short write means the kernel's structure is not the one declared above,
-    // so the fields read would be some other data. Refuse rather than interpret.
     if written != size {
-        return None;
+        // The call reports 0 for every failure, so the cause is read from errno.
+        // Measured on macOS 26: ESRCH for a pid nobody holds, EPERM for a
+        // process this one may not inspect, ENOMEM when the buffer is smaller
+        // than the kernel's own structure.
+        // SAFETY: reads a thread-local set by the call above.
+        return match unsafe { errno_location().read() } {
+            3 => ProcessStartTime::NoSuchProcess,
+            1 => ProcessStartTime::NotPermitted,
+            12 => ProcessStartTime::LayoutMismatch,
+            // An unrecognised failure is reported as a layout mismatch rather
+            // than as a missing process, because the one thing known is that
+            // this code did not understand the answer.
+            _ => ProcessStartTime::LayoutMismatch,
+        };
     }
 
-    // A process that reports it started at the epoch is not reporting a start
-    // time, and two such processes would compare as the same generation.
     if info.pbi_start_tvsec == 0 {
-        return None;
+        return ProcessStartTime::NoStartTime;
     }
 
-    info.pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)
+    match info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+    {
+        Some(micros) => ProcessStartTime::Started(micros),
+        None => ProcessStartTime::NoStartTime,
+    }
+}
+
+/// When a process started, or `None` for every reason it cannot be told.
+///
+/// Kept for callers that only need the value. A caller deciding what to do about
+/// a failure should use [`process_start_time`], since the reasons differ.
+pub fn process_start_time_micros(pid: u32) -> Option<u64> {
+    match process_start_time(pid) {
+        ProcessStartTime::Started(micros) => Some(micros),
+        _ => None,
+    }
 }
 
 /// One window as the system reports it.
@@ -1015,6 +1074,37 @@ mod tests {
             screen_is_locked().is_some(),
             "a session that answers window queries must report a definite lock state"
         );
+    }
+
+    /// The reasons a start time cannot be read are told apart.
+    ///
+    /// They are not the same news, and one is not about the process at all: a
+    /// layout mismatch means this module's declaration disagrees with the
+    /// kernel, which reported as absence would look like every process on the
+    /// machine having exited at once. A process this one may not inspect
+    /// matters for the same reason in the other direction: a target that is
+    /// merely out of reach has not exited.
+    ///
+    /// The system reports all three as a zero return, so only errno separates
+    /// them; a test that asserted the return value alone would pass over a
+    /// reading that could not tell them apart.
+    #[test]
+    fn the_reasons_a_start_time_is_unavailable_are_distinguished() {
+        // Above the highest pid this system assigns, so nothing holds it.
+        assert_eq!(
+            process_start_time(u32::MAX - 1),
+            ProcessStartTime::NoSuchProcess
+        );
+
+        // The first process is root-owned, so it exists and cannot be inspected
+        // from here.
+        assert_eq!(process_start_time(1), ProcessStartTime::NotPermitted);
+
+        // A process that can be read reports a time rather than any failure.
+        assert!(matches!(
+            process_start_time(std::process::id()),
+            ProcessStartTime::Started(_)
+        ));
     }
 
     /// A process that does not exist has no start time.
