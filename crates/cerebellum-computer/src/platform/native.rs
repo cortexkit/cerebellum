@@ -104,8 +104,13 @@ pub enum GrantVerification {
     /// The pid is held by a process that started at a different moment, so the
     /// original exited and its pid was reused.
     TargetReplaced,
-    /// Nothing holds the pid, or it cannot be inspected from here.
+    /// Nothing holds the pid.
     TargetGone,
+    /// The process exists and cannot be inspected from here, so whether it is
+    /// still the granted one is unknown. Separate from `TargetGone` because a
+    /// target out of reach has not exited, and a caller told it had would stop
+    /// rather than escalate.
+    TargetUnreadable,
     /// The reading is about a different process than the grant names.
     DifferentProcess,
 }
@@ -125,11 +130,21 @@ fn verify_grant(pid: u32, grant: &ProcessGrant) -> GrantVerification {
     if pid != grant.pid {
         return GrantVerification::DifferentProcess;
     }
-    // An unreadable process is treated as gone rather than as a match: it is
-    // either exited or not ours to inspect, and neither is evidence.
-    let Some(generation) = cerebellum_macos::process_start_time_micros(pid) else {
-        return GrantVerification::TargetGone;
+    // Every failure here refuses; they are told apart because the caller and
+    // anyone reading the journal afterwards act differently on each. In
+    // particular a mismatch between this build and the running kernel would
+    // otherwise present as every target having exited at once, which points an
+    // investigation at the applications instead of at this module.
+    let generation = match cerebellum_macos::process_start_time(pid) {
+        cerebellum_macos::ProcessStartTime::Started(generation) => generation,
+        cerebellum_macos::ProcessStartTime::NoSuchProcess => return GrantVerification::TargetGone,
+        cerebellum_macos::ProcessStartTime::NotPermitted
+        | cerebellum_macos::ProcessStartTime::NoStartTime
+        | cerebellum_macos::ProcessStartTime::LayoutMismatch => {
+            return GrantVerification::TargetUnreadable
+        }
     };
+
     if generation.to_string() == grant.process_generation_evidence {
         GrantVerification::Current
     } else {
@@ -293,6 +308,13 @@ impl CaptureBackend for NativeCaptureBackend {
             GrantVerification::TargetGone => {
                 return Err(BackendError::Capture(format!(
                     "the granted process {} is gone at capture time",
+                    request.target.pid
+                )))
+            }
+            GrantVerification::TargetUnreadable => {
+                return Err(BackendError::Capture(format!(
+                    "the granted process {} cannot be inspected, so whether it is still the \
+                     granted target is unknown",
                     request.target.pid
                 )))
             }
@@ -480,6 +502,22 @@ mod tests {
             verify_grant(u32::MAX - 1, &grant),
             GrantVerification::TargetGone
         );
+    }
+
+    /// A target that cannot be inspected is not reported as one that has gone.
+    ///
+    /// The first process is root-owned, so it exists and this one may not read
+    /// it — the same answer a kernel-layout mismatch would produce, and the
+    /// reason both must stay separate from absence. A caller told a target had
+    /// exited stops; one told it is unreadable can escalate.
+    #[test]
+    fn an_uninspectable_target_is_not_reported_as_gone() {
+        let grant = ProcessGrant {
+            pid: 1,
+            bundle_identity: "root-owned".to_string(),
+            process_generation_evidence: "1".to_string(),
+        };
+        assert_eq!(verify_grant(1, &grant), GrantVerification::TargetUnreadable);
     }
 
     /// A reading about some other process is not a verdict about the grant.
