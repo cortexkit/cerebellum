@@ -10,8 +10,13 @@ use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::AnyThread;
+use objc2_core_graphics::CGImage;
 use objc2_foundation::NSError;
-use objc2_screen_capture_kit::SCShareableContent;
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
+};
 
 /// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
 /// including the two fields this reads.
@@ -331,9 +336,198 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
         .unwrap_or_else(|| Err(format!("the window list did not arrive within {timeout:?}")))
 }
 
+/// One window's pixels, as the system produced them.
+///
+/// The owner is read again at capture time rather than carried over from
+/// enumeration, so a caller can tell whether the window it asked for is still
+/// owned by the process it meant. A window id is reused after its window
+/// closes, so the id alone does not answer that.
+pub struct RawCapture {
+    pub width: usize,
+    pub height: usize,
+    pub bytes_per_row: usize,
+    /// Pixels in BGRA order, as the system delivers them.
+    pub bgra: Vec<u8>,
+    pub owner_pid_at_capture: u32,
+}
+
+/// Look up one window by id, if the system still describes it.
+fn find_window(window_id: u32, timeout: Duration) -> Result<Retained<SCWindow>, String> {
+    let delivery: Arc<Delivery<Result<Option<Retained<SCWindow>>, String>>> = Delivery::new();
+    let sink = delivery.clone();
+
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            // SAFETY: the system passes either a content object or an error, both
+            // valid for this callback. The window is retained before the callback
+            // returns.
+            let outcome = unsafe {
+                if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else if let Some(content) = content.as_ref() {
+                    Ok(content
+                        .windows()
+                        .iter()
+                        .find(|window| window.windowID() == window_id))
+                } else {
+                    Err("the system reported neither content nor an error".to_string())
+                }
+            };
+            sink.deliver(outcome);
+        },
+    );
+
+    // SAFETY: the handler outlives the call through the block's own retain.
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+
+    match delivery.wait(timeout) {
+        Some(Ok(Some(window))) => Ok(window),
+        Some(Ok(None)) => Err(format!("window {window_id} is no longer present")),
+        Some(Err(reason)) => Err(reason),
+        None => Err(format!("the window list did not arrive within {timeout:?}")),
+    }
+}
+
+/// Capture one window's pixels, without bringing it forward.
+///
+/// Scoped to a single window rather than to a display: a display filter
+/// composites in whatever else overlaps that region, so capturing one
+/// application through it would hand back another application's pixels.
+///
+/// The cursor is excluded. It belongs to the user rather than to the window,
+/// and its position at the moment of capture says where the user was pointing,
+/// which is not part of the window's contents.
+///
+/// THE FIRST CAPTURE IN A PROCESS IS NOT LIKE THE REST, and a caller that
+/// treats them alike will misread a healthy system as a broken one. Measured on
+/// macOS 26: once a process has captured once, captures take about 40ms and
+/// several at a time are fine. The FIRST one sets up this process's session
+/// with the window server, and that setup contends system-wide -- while another
+/// process is capturing, it does not proceed. Two processes starting together
+/// blocked each other past 60 seconds, on different windows, with no error from
+/// either side.
+///
+/// So the deadline has to cover a wait for other processes rather than the work
+/// itself, and a caller that wants a bounded first capture should perform one
+/// at startup, when nothing else is competing, rather than on the first request
+/// that needs it.
+pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, String> {
+    // Before any filter is created. Without a window-server connection the
+    // filter constructor does not fail -- it aborts the process, which for a
+    // module means the whole module dies rather than refusing one capture.
+    establish_window_server_connection();
+
+    let window = find_window(window_id, timeout)?;
+    // SAFETY: the window is retained by this frame, so reading its properties
+    // is valid for as long as it is held here.
+    let (owner_pid_at_capture, frame) = unsafe {
+        let owner = window
+            .owningApplication()
+            .and_then(|owner| u32::try_from(owner.processID()).ok())
+            .ok_or_else(|| format!("window {window_id} reports no owning process"))?;
+        (owner, window.frame())
+    };
+    // SAFETY: the window is retained here and outlives the filter's creation.
+    let filter = unsafe {
+        SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
+    };
+
+    // SAFETY: plain object construction and property sets on an object owned
+    // by this frame.
+    let configuration = unsafe {
+        let configuration = SCStreamConfiguration::new();
+        configuration.setWidth((frame.size.width.max(1.0)) as usize);
+        configuration.setHeight((frame.size.height.max(1.0)) as usize);
+        configuration.setShowsCursor(false);
+        configuration
+    };
+
+    let delivery: Arc<Delivery<Result<RawCapture, String>>> = Delivery::new();
+    let sink = delivery.clone();
+    let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+        // SAFETY: the system passes either an image or an error, both valid for
+        // this callback. Pixel bytes are copied out before it returns.
+        let outcome = unsafe {
+            if let Some(error) = error.as_ref() {
+                Err(error.localizedDescription().to_string())
+            } else if let Some(image) = image.as_ref() {
+                read_pixels(image, owner_pid_at_capture)
+            } else {
+                Err("the system reported neither an image nor an error".to_string())
+            }
+        };
+        sink.deliver(outcome);
+    });
+
+    // SAFETY: filter and configuration are owned by this frame and outlive the
+    // call; the handler outlives it through the block's own retain.
+    unsafe {
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+            &filter,
+            &configuration,
+            Some(&handler),
+        )
+    };
+
+    delivery
+        .wait(timeout)
+        .unwrap_or_else(|| Err(format!("the capture did not arrive within {timeout:?}")))
+}
+
+/// Copy an image's pixels out of the system's storage.
+///
+/// # Safety
+///
+/// `image` must be a valid image for the duration of the call.
+unsafe fn read_pixels(image: &CGImage, owner_pid_at_capture: u32) -> Result<RawCapture, String> {
+    let width = CGImage::width(Some(image));
+    let height = CGImage::height(Some(image));
+    let bytes_per_row = CGImage::bytes_per_row(Some(image));
+
+    let provider =
+        CGImage::data_provider(Some(image)).ok_or_else(|| "the image has no pixels".to_string())?;
+    let data = objc2_core_graphics::CGDataProvider::data(Some(&provider))
+        .ok_or_else(|| "the image's pixels could not be read".to_string())?;
+
+    let length = data.length() as usize;
+    let pointer = data.byte_ptr();
+    if pointer.is_null() {
+        return Err("the image's pixels are not readable".to_string());
+    }
+    // SAFETY: the pointer and length come from the same object, which is held
+    // by this frame. The bytes are copied immediately, so nothing outlives it.
+    let bgra = unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec();
+
+    // A row stride shorter than the row means the buffer does not hold what its
+    // dimensions describe, so nothing downstream could index it correctly.
+    if bytes_per_row < width * 4 || bgra.len() < bytes_per_row * height {
+        return Err(format!(
+            "the image's pixels do not match its dimensions: {width}x{height}, \
+             {bytes_per_row} bytes per row, {} bytes total",
+            bgra.len()
+        ));
+    }
+
+    Ok(RawCapture {
+        width,
+        height,
+        bytes_per_row,
+        bgra,
+        owner_pid_at_capture,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that cause a FIRST capture in some process.
+    ///
+    /// A process's first capture waits for any other process that is capturing,
+    /// so two of these running at once block each other for as long as the
+    /// deadline allows and fail for a reason unrelated to what they assert.
+    /// Tests run as threads in one process, so a lock here is enough.
+    static FIRST_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The attribution resolves to a real executable on this system.
     ///
@@ -503,6 +697,190 @@ mod tests {
         assert!(
             enumerate_windows(Duration::ZERO).is_err(),
             "an expired deadline produced a window list, so it was not applied"
+        );
+    }
+
+    /// A captured window yields pixels matching the size it reported.
+    ///
+    /// Skipped where capture is not granted: the property is about what a
+    /// capture returns, and a machine that refuses to capture has nothing to
+    /// say about it.
+    #[test]
+    fn a_captured_window_yields_pixels_of_its_own_size() {
+        // Held for the whole test: the child performs a first capture too.
+        let _serialized = FIRST_CAPTURE.lock();
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            return;
+        };
+        // A window with area, since a zero-sized one would satisfy any claim
+        // about its pixels.
+        let Some(window) = windows
+            .iter()
+            .find(|window| window.on_screen && window.width >= 64.0 && window.height >= 64.0)
+        else {
+            return;
+        };
+
+        let capture = capture_window(window.window_id, Duration::from_secs(10))
+            .expect("a window the system just listed can be captured");
+
+        assert_eq!(
+            capture.owner_pid_at_capture, window.owner_pid,
+            "captured a window owned by a different process than the one enumerated"
+        );
+        assert!(capture.width > 0 && capture.height > 0);
+        // Four bytes per pixel, so a buffer holding fewer than that is not the
+        // image it claims to be.
+        assert!(
+            capture.bgra.len() >= capture.bytes_per_row * capture.height,
+            "{}x{} at {} bytes per row cannot fit in {} bytes",
+            capture.width,
+            capture.height,
+            capture.bytes_per_row,
+            capture.bgra.len()
+        );
+        assert!(capture.bytes_per_row >= capture.width * 4);
+    }
+
+    /// Capturing a window that no longer exists refuses.
+    ///
+    /// Window ids are reused, so a request naming a departed window must not be
+    /// answered with whatever now holds that id.
+    #[test]
+    fn capturing_a_window_that_is_gone_refuses() {
+        // Above any id the window server has assigned on a running system.
+        assert!(capture_window(u32::MAX - 1, Duration::from_secs(10)).is_err());
+    }
+
+    /// Creating a capture filter without the window-server connection kills the
+    /// process, which is why [`capture_window`] establishes it first.
+    ///
+    /// The connection is established by a call whose result is discarded, so it
+    /// reads like a line with no effect and invites removal. This asserts what
+    /// removing it costs: not a failed capture but a dead process, which for a
+    /// module means every capability it serves goes down with it.
+    ///
+    /// Run in a child process because the failure is an abort, which an
+    /// in-process test cannot survive to assert anything about. The parent
+    /// chooses the window and passes its id, so the child performs exactly one
+    /// enumeration -- the same number [`capture_window`] performs, and the most
+    /// that reliably completes in a process that has never reached the window
+    /// server.
+    #[test]
+    fn creating_a_filter_without_the_window_server_connection_kills_the_process() {
+        // Held for the whole test: the child performs a first capture too.
+        let _serialized = FIRST_CAPTURE.lock();
+        use std::os::unix::process::ExitStatusExt;
+
+        const TARGET_WINDOW: &str = "CK_UNGUARDED_FILTER_PROBE_WINDOW";
+
+        if let Ok(window_id) = std::env::var(TARGET_WINDOW) {
+            let window_id: u32 = window_id.parse().expect("the parent passes a window id");
+            // Deliberately WITHOUT establish_window_server_connection().
+            let Ok(window) = find_window(window_id, Duration::from_secs(10)) else {
+                // Could not reach the filter, so this run proves nothing. Exit
+                // cleanly and let the parent report a skip rather than treating
+                // an unrelated failure as a confirmation.
+                std::process::exit(0);
+            };
+            // SAFETY: the window is retained by this frame. This is expected to
+            // abort, which is the point of the test.
+            let _filter = unsafe {
+                SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
+            };
+            std::process::exit(0);
+        }
+
+        // Skip where capture is not permitted: the child cannot look up a
+        // window, so it cannot reach the filter.
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            return;
+        };
+        let Some(window) = windows.first() else {
+            return;
+        };
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .args([
+            "--exact",
+            "macos::tests::creating_a_filter_without_the_window_server_connection_kills_the_process",
+        ])
+        .env(TARGET_WINDOW, window.window_id.to_string())
+        .output()
+        .expect("run the probe in a child process");
+
+        // SIGABRT specifically, rather than "did not succeed": a child that
+        // panicked for an unrelated reason, or failed to look up the window,
+        // must not read as a confirmation.
+        assert_eq!(
+            status.status.signal(),
+            Some(6),
+            "expected the child to abort; it exited with {:?} and said: {}",
+            status.status,
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    /// [`capture_window`] survives in a process that has established nothing.
+    ///
+    /// The companion to the test above, and the one that fences the CALL SITE
+    /// rather than the hazard. Removing the establishing call from
+    /// [`capture_window`] cannot be detected in this process: tests run as
+    /// threads in one process, so a sibling that establishes the connection
+    /// leaves it established for everyone, and the removed call looks
+    /// redundant precisely because something else already did its work.
+    ///
+    /// The child process establishes nothing, so the call inside
+    /// [`capture_window`] is the only thing standing between it and an abort.
+    #[test]
+    fn capturing_establishes_the_window_server_connection_itself() {
+        // Held for the whole test: the child performs a first capture too.
+        let _serialized = FIRST_CAPTURE.lock();
+        use std::os::unix::process::ExitStatusExt;
+
+        const TARGET_WINDOW: &str = "CK_CAPTURE_SURVIVAL_PROBE_WINDOW";
+        const CAPTURE_REFUSED: i32 = 3;
+
+        if let Ok(window_id) = std::env::var(TARGET_WINDOW) {
+            let window_id: u32 = window_id.parse().expect("the parent passes a window id");
+            match capture_window(window_id, Duration::from_secs(10)) {
+                Ok(_) => std::process::exit(0),
+                // A typed refusal is still a survival, and it is reported
+                // separately so the parent does not read it as a capture.
+                Err(_) => std::process::exit(CAPTURE_REFUSED),
+            }
+        }
+
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            return;
+        };
+        let Some(window) = windows.iter().find(|window| window.on_screen) else {
+            return;
+        };
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .args([
+            "--exact",
+            "macos::tests::capturing_establishes_the_window_server_connection_itself",
+        ])
+        .env(TARGET_WINDOW, window.window_id.to_string())
+        .output()
+        .expect("run the probe in a child process");
+
+        assert_ne!(
+            status.status.signal(),
+            Some(6),
+            "capturing aborted the child, so it did not establish the window-server connection"
+        );
+        assert!(
+            matches!(status.status.code(), Some(0) | Some(CAPTURE_REFUSED)),
+            "the child neither captured nor refused: {:?}, {}",
+            status.status,
+            String::from_utf8_lossy(&status.stderr)
         );
     }
 
