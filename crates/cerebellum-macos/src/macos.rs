@@ -993,20 +993,26 @@ mod tests {
     /// A graphical session reports a definite lock state, never an unknown one.
     ///
     /// The system omits the lock key entirely while the screen is unlocked, so
-    /// a reading that treated an absent key as unknown would return `None` in
-    /// the ordinary case and make `== Some(false)` a comparison that never
-    /// matches. This test runs inside a session, so `None` here means that
-    /// mistake rather than a missing session.
+    /// a reading that treated an absent key as unknown would answer `None` in
+    /// the ordinary case, and `== Some(false)` would be a comparison that never
+    /// matches. `None` is reserved for having no session to ask.
+    ///
+    /// The assertion does not name WHICH state, because the machine may be in
+    /// either and a test demanding one fails when someone locks the screen.
+    /// That costs some strength honestly: while the screen is locked the key is
+    /// present and the answer was already definite, so this only discriminates
+    /// in the unlocked case.
     #[test]
-    fn an_unlocked_screen_reports_unlocked_rather_than_unknown() {
+    fn a_session_reports_a_definite_lock_state() {
         // Enumeration succeeding establishes that there IS a session to ask,
-        // which is the only condition under which None would be correct.
+        // which is the only condition under which None would be correct. It
+        // does NOT establish that the screen is unlocked: a locked screen
+        // answers questions about windows and refuses only their contents.
         if enumerate_windows(Duration::from_secs(10)).is_err() {
             return;
         }
-        assert_eq!(
-            screen_is_locked(),
-            Some(false),
+        assert!(
+            screen_is_locked().is_some(),
             "a session that answers window queries must report a definite lock state"
         );
     }
