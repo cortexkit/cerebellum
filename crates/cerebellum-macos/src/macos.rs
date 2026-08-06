@@ -8,7 +8,58 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Once;
 
+/// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
+/// including the two fields this reads.
+///
+/// Declared in full rather than as an opaque buffer with offsets, because a
+/// field added upstream would shift an offset silently while a named field
+/// keeps its meaning. The size is asserted against what the kernel reports it
+/// wrote, so a layout that disagrees with this system is refused rather than
+/// interpreted.
+#[repr(C)]
+#[derive(Default)]
+struct ProcBsdInfo {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    /// `MAXCOMLEN`.
+    pbi_comm: [c_char; 16],
+    /// `2 * MAXCOMLEN`.
+    pbi_name: [c_char; 32],
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    /// Process start time, seconds since the epoch.
+    pbi_start_tvsec: u64,
+    /// Process start time, microseconds within the second.
+    pbi_start_tvusec: u64,
+}
+
+/// `PROC_PIDTBSDINFO` from `<sys/proc_info.h>`.
+const PROC_PIDTBSDINFO: c_int = 3;
+
 extern "C" {
+    /// Kernel process information. Returns the byte count written, or 0.
+    fn proc_pidinfo(
+        pid: c_int,
+        flavor: c_int,
+        arg: u64,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: c_int,
+    ) -> c_int;
+
     /// The process the system attributes our permission grants to.
     ///
     /// Taking a grant to belong to the calling binary is wrong for anything
@@ -105,6 +156,48 @@ pub fn is_off_main_thread() -> bool {
     unsafe { pthread_main_np() == 0 }
 }
 
+/// When a process was started, as kernel-sourced microseconds since the epoch.
+///
+/// This is the discriminator that survives pid reuse. A pid alone identifies
+/// whoever holds it now, which is exactly the process an identity check exists
+/// to distinguish from the one that held it earlier; the start time separates
+/// them because the replacement cannot share it.
+///
+/// `None` when the process is gone or the kernel reports a structure this does
+/// not recognise. Absence rather than a zero, because a zero start time would
+/// compare equal to another zero and read as a match.
+pub fn process_start_time_micros(pid: u32) -> Option<u64> {
+    let mut info = ProcBsdInfo::default();
+    let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
+    // SAFETY: the buffer is owned here and its true size is passed, so the call
+    // cannot write past it. The pid is passed by value.
+    let written = unsafe {
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut ProcBsdInfo as *mut std::ffi::c_void,
+            size,
+        )
+    };
+
+    // A short write means the kernel's structure is not the one declared above,
+    // so the fields read would be some other data. Refuse rather than interpret.
+    if written != size {
+        return None;
+    }
+
+    // A process that reports it started at the epoch is not reporting a start
+    // time, and two such processes would compare as the same generation.
+    if info.pbi_start_tvsec == 0 {
+        return None;
+    }
+
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +240,81 @@ mod tests {
     #[test]
     fn the_capture_permission_query_returns() {
         let _ = screen_capture_is_permitted();
+    }
+
+    /// Start times order the way process creation did.
+    ///
+    /// A child cannot start before its parent, so the comparison holds on any
+    /// machine. It is asserted because it is the available check that a WRONG
+    /// field is being read: a misread offset still yields a plausible-looking
+    /// number, and a bound like "after 2020" would accept one, while an
+    /// ordering two independent readings must satisfy would not.
+    ///
+    /// A child is used rather than the system's first process, which is owned
+    /// by root and whose information the kernel declines to report here.
+    #[test]
+    fn start_times_order_the_way_process_creation_did() {
+        let this_process =
+            process_start_time_micros(std::process::id()).expect("this process exists");
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a child to compare against");
+        let child_start = process_start_time_micros(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let child_start = child_start.expect("a running child has a start time");
+        assert!(
+            this_process < child_start,
+            "a child cannot predate its parent: {this_process} vs {child_start}"
+        );
+    }
+
+    /// The reading is a wall-clock time in the past, at microsecond scale.
+    ///
+    /// Ordering alone would be satisfied by any two values with the right
+    /// relation, including counters that are not times at all. This pins the
+    /// units and the epoch, so a field holding something else has to coincide
+    /// with a plausible recent timestamp to pass.
+    #[test]
+    fn a_start_time_is_a_past_wall_clock_time_in_microseconds() {
+        let start = process_start_time_micros(std::process::id()).expect("this process exists");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_micros() as u64;
+
+        assert!(start < now, "a process cannot start in the future");
+        // This process was started by the test run, so its age is bounded by
+        // how long a test binary plausibly runs rather than by machine uptime.
+        assert!(
+            now - start < 3_600_000_000,
+            "a just-started process reporting an age over an hour is not reporting its start"
+        );
+    }
+
+    /// The same process reads the same start time every time.
+    ///
+    /// A value that varied between readings could not discriminate a process
+    /// from its replacement, which is the only thing this is for.
+    #[test]
+    fn a_start_time_is_stable_across_readings() {
+        let pid = std::process::id();
+        let first = process_start_time_micros(pid);
+        let second = process_start_time_micros(pid);
+        assert_eq!(first, second);
+        assert!(first.is_some());
+    }
+
+    /// A process that does not exist has no start time.
+    ///
+    /// Absence rather than a zero: a zero would compare equal to another zero
+    /// and read as two processes sharing a generation.
+    #[test]
+    fn a_process_that_does_not_exist_reports_no_start_time() {
+        // Above the system maximum, so it cannot be assigned.
+        assert_eq!(process_start_time_micros(u32::MAX - 1), None);
     }
 }
