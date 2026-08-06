@@ -1,12 +1,17 @@
 //! The framework calls themselves.
 //!
-//! Only the three C functions declared below need `unsafe`; the CoreGraphics
-//! entry points are safe bindings. Every `unsafe` block here is therefore a
-//! real one, which is the point of keeping them few.
+//! Only the C functions declared below need `unsafe`; the CoreGraphics entry
+//! points are safe bindings. Every `unsafe` block here is therefore a real one,
+//! which is the point of keeping them few.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint};
-use std::sync::Once;
+use std::sync::{Arc, Condvar, Mutex, Once};
+use std::time::{Duration, Instant};
+
+use block2::RcBlock;
+use objc2_foundation::NSError;
+use objc2_screen_capture_kit::SCShareableContent;
 
 /// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
 /// including the two fields this reads.
@@ -200,6 +205,120 @@ pub fn process_start_time_micros(pid: u32) -> Option<u64> {
         .checked_add(info.pbi_start_tvusec)
 }
 
+/// One window as the system reports it.
+///
+/// Deliberately without the window title. A title is readable only with a
+/// permission this module may not hold, and it is chosen by the application, so
+/// it is not identity evidence: two windows can carry the same one, and any
+/// application can present a title belonging to another.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawWindow {
+    pub window_id: u32,
+    pub owner_pid: u32,
+    pub owner_bundle_identifier: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub on_screen: bool,
+}
+
+/// Delivers one callback result to a waiting thread.
+struct Delivery<T> {
+    slot: Mutex<Option<T>>,
+    ready: Condvar,
+}
+
+impl<T> Delivery<T> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(None),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn deliver(&self, value: T) {
+        *self.slot.lock().unwrap() = Some(value);
+        self.ready.notify_all();
+    }
+
+    /// Waits for a value, or gives up at the deadline.
+    ///
+    /// The bound exists because the callback is invoked by the system: if the
+    /// window server never answers, an unbounded wait holds this thread
+    /// forever, and the caller cannot distinguish that from slow work.
+    fn wait(&self, timeout: Duration) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self.slot.lock().unwrap();
+        while slot.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, _) = self.ready.wait_timeout(slot, remaining).unwrap();
+            slot = next;
+        }
+        slot.take()
+    }
+}
+
+/// Every window the system is willing to describe to this process.
+///
+/// Returns an error rather than an empty list when the system declines, because
+/// "no windows" and "not permitted to look" are different answers and only one
+/// of them is about the machine's contents.
+///
+/// Unfiltered by owner: the caller matches against its own grant, so the
+/// filtering happens where the grant is known rather than here.
+pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
+    let delivery: Arc<Delivery<Result<Vec<RawWindow>, String>>> = Delivery::new();
+    let sink = delivery.clone();
+
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            // SAFETY: the system passes either a content object or an error, both
+            // valid for the duration of this callback. Neither is retained beyond
+            // it: every value read below is copied into an owned RawWindow.
+            let outcome = unsafe {
+                if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else if let Some(content) = content.as_ref() {
+                    Ok(content
+                        .windows()
+                        .iter()
+                        .filter_map(|window| {
+                            let owner = window.owningApplication()?;
+                            let frame = window.frame();
+                            Some(RawWindow {
+                                window_id: window.windowID(),
+                                owner_pid: u32::try_from(owner.processID()).ok()?,
+                                owner_bundle_identifier: owner.bundleIdentifier().to_string(),
+                                x: frame.origin.x,
+                                y: frame.origin.y,
+                                width: frame.size.width,
+                                height: frame.size.height,
+                                on_screen: window.isOnScreen(),
+                            })
+                        })
+                        .collect())
+                } else {
+                    Err("the system reported neither content nor an error".to_string())
+                }
+            };
+            sink.deliver(outcome);
+        },
+    );
+
+    // SAFETY: the handler outlives the call through the block's own retain, and
+    // the delivery it writes into is kept alive by this frame until the wait
+    // below returns.
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+
+    delivery
+        .wait(timeout)
+        .unwrap_or_else(|| Err(format!("the window list did not arrive within {timeout:?}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +427,60 @@ mod tests {
         let second = process_start_time_micros(pid);
         assert_eq!(first, second);
         assert!(first.is_some());
+    }
+
+    /// Enumeration agrees with the permission query.
+    ///
+    /// Asserted as an equivalence rather than as an outcome, because the answer
+    /// depends on whether this machine has granted capture and a test demanding
+    /// one would fail honestly on the other kind of machine. The equivalence
+    /// holds either way, and it is the property the advertisement gate rests
+    /// on: a capability advertised because the query said yes must not then
+    /// fail at use.
+    #[test]
+    fn enumeration_agrees_with_the_permission_query() {
+        let permitted = screen_capture_is_permitted();
+        let enumerated = enumerate_windows(Duration::from_secs(10));
+
+        assert_eq!(
+            permitted,
+            enumerated.is_ok(),
+            "permission query said {permitted} but enumeration returned {enumerated:?}"
+        );
+    }
+
+    /// A granted machine reports windows that carry an owner.
+    ///
+    /// Skipped rather than failed where capture is not granted: the property is
+    /// about the shape of what enumeration returns, and a machine that refuses
+    /// to answer has nothing to say about it.
+    #[test]
+    fn enumerated_windows_carry_an_owning_process() {
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            return;
+        };
+        assert!(!windows.is_empty(), "a running desktop has windows");
+        for window in &windows {
+            assert_ne!(window.owner_pid, 0, "a window with no owner: {window:?}");
+            assert_ne!(window.window_id, 0, "a window with no id: {window:?}");
+        }
+    }
+
+    /// A deadline that has already passed produces an error, not a wait.
+    ///
+    /// The bound is the only thing standing between a system that never answers
+    /// and a thread held forever, so it has to be load-bearing rather than
+    /// advisory.
+    #[test]
+    fn an_expired_deadline_refuses_rather_than_waits() {
+        let started = Instant::now();
+        let result = enumerate_windows(Duration::ZERO);
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a zero deadline waited {:?}",
+            started.elapsed()
+        );
     }
 
     /// A process that does not exist has no start time.

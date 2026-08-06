@@ -16,3 +16,6 @@ path = "src/lib.rs"
 # Pinned exactly: these crates are pre-1.0 and break across minor versions.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-graphics = "=0.3.2"
+objc2-screen-capture-kit = "=0.3.2"
+objc2-foundation = "=0.3.2"
+block2 = "=0.6.2"
