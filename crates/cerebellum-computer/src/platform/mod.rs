@@ -13,6 +13,14 @@ pub mod containment;
 pub use containment::*;
 pub mod macos;
 
+/// Converts raw operating-system permission readings into the
+/// [`PermissionProbeResult`] values the startup probe consumes.
+///
+/// Compiled only on platforms that provide those readings; everything else in
+/// this module is platform-neutral and built on every host.
+#[cfg(target_os = "macos")]
+pub mod native;
+
 pub use macos::{
     MacOs26PlatformDriver, PrivateEnvelopeStartupProbe, StartupCapabilityProbe, StartupProbeInput,
     MACOS_MAJOR_VERSION,

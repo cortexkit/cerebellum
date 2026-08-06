@@ -1,0 +1,18 @@
+[package]
+name = "cerebellum-macos"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Raw macOS framework readings for ck-cerebellum. The only crate in the workspace permitted to contain unsafe code."
+
+[lib]
+name = "cerebellum_macos"
+path = "src/lib.rs"
+
+# Framework bindings are needed only where the frameworks exist. On every other
+# host this crate compiles to nothing, so the workspace still builds and tests
+# there without them.
+#
+# Pinned exactly: these crates are pre-1.0 and break across minor versions.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-graphics = "=0.3.2"
