@@ -573,10 +573,33 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 /// cannot be asked has not refused.
 #[cfg(target_os = "macos")]
 fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>) {
-    (
-        computer::platform::native::probe_permissions(),
-        computer::platform::native::responsible_process(),
-    )
+    // Taken on a background thread, because a reading from the main thread is
+    // discarded: the main thread of this process runs the module's event loop,
+    // and what it can do is not evidence about the threads that will actually
+    // perform captures. Probing here rather than on the startup thread is what
+    // makes the reading count -- a probe taken on the main thread reports a
+    // granted permission and the policy resolves it to unknown, so the plane
+    // would advertise nothing on a machine where capture works.
+    //
+    // Joined immediately: this runs once at startup, and the answer is needed
+    // before the manifest can be built.
+    //
+    // NO TEST HERE CAN CATCH THE REMOVAL OF THIS THREAD. The test harness runs
+    // every test on a thread of its own -- including under --test-threads=1 --
+    // so a reading taken on the caller's thread is already off-main and the
+    // policy accepts it either way. The case only arises in the real binary,
+    // where startup runs on the main thread. Verified there by running this
+    // path inside the same runtime the binary uses: without the thread the
+    // resolved liveness is unknown while the raw reading says granted, and with
+    // it the resolved liveness is granted.
+    std::thread::spawn(|| {
+        (
+            computer::platform::native::probe_permissions(),
+            computer::platform::native::responsible_process(),
+        )
+    })
+    .join()
+    .unwrap_or_else(|_| (Vec::new(), None))
 }
 
 #[cfg(not(target_os = "macos"))]
