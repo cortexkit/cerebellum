@@ -565,17 +565,43 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
     }
 }
 
+/// What this system reports about the permissions the computer plane needs, and
+/// which process it attributes them to.
+///
+/// Empty where there is nothing to ask. An empty reading resolves every service
+/// to unknown rather than to denied, which is the honest answer: a host that
+/// cannot be asked has not refused.
+#[cfg(target_os = "macos")]
+fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>) {
+    (
+        computer::platform::native::probe_permissions(),
+        computer::platform::native::responsible_process(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>) {
+    (Vec::new(), None)
+}
+
 /// The computer-plane advertisement context used when sending HELLO.
 ///
 /// Public so that a test can check the manifest this module really sends,
 /// rather than one assembled to look like it.
+///
+/// The permission state is read from the system here rather than supplied,
+/// because a capability is advertised on the strength of a grant and a grant
+/// that is merely assumed is not one. The readings are cheap queries -- no
+/// capture is performed, so this does not pay the first-capture cost that
+/// contends with other processes.
 pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
+    let (permission_results, responsible_process) = computer_permission_readings();
     let startup = StartupCapabilityProbe::run(&StartupProbeInput {
         os_major: computer::platform::MACOS_MAJOR_VERSION,
         private_envelope_revision: None,
         resolved_private_symbols: BTreeSet::new(),
-        permission_results: Vec::new(),
-        responsible_process: None,
+        permission_results,
+        responsible_process,
     });
     ComputerCapabilityAdvertisementContext {
         inputs: ComputerReleaseInputs::default(),

@@ -149,6 +149,45 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert!(!computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
 }
 
+/// The advertisement context reports what the system says, not a placeholder.
+///
+/// The context is what the module sends on HELLO, and its permission half used
+/// to be supplied empty, so every service resolved to unknown regardless of what
+/// the machine had granted. That is indistinguishable from a machine that has
+/// granted nothing, which is why it went unnoticed.
+///
+/// Asserted as an agreement with a direct query rather than as a particular
+/// answer, so it holds on a machine in either permission state and fails only
+/// if the context stops reflecting the system.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_advertisement_context_reflects_this_system() {
+    let context = cerebellum::default_computer_context();
+    let granted = cerebellum_computer::platform::native::probe_permissions()
+        .iter()
+        .any(|result| {
+            result.service == PermissionService::ScreenRecording
+                && result.liveness == PermissionLiveness::Live
+        });
+
+    let reported = context
+        .permissions
+        .state(PermissionService::ScreenRecording);
+    if granted {
+        assert_eq!(
+            reported,
+            PermissionLiveness::Live,
+            "the system grants screen recording and the context does not say so"
+        );
+    } else {
+        assert_ne!(
+            reported,
+            PermissionLiveness::Live,
+            "the context claims a grant the system does not report"
+        );
+    }
+}
+
 /// Every tool the module offers in its manifest can actually be served.
 ///
 /// The manifest and the dispatcher are built from separate lists, so a tool can
