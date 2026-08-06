@@ -9,9 +9,9 @@ use cerebellum::{
     COMPUTER_PERMISSION_MATRIX_REVISION,
 };
 use cerebellum_computer::platform::{
-    containment::PROCESS_IDENTITY_PRIMITIVE_REVISION, PermissionLiveness, PermissionProbeResult,
-    PermissionService, StartupCapabilityProbe, StartupProbeInput, VocabularyDigestInputs,
-    COMPUTER_ACTION_VOCABULARY_REVISION, COMPUTER_ACTION_VOCABULARY_SHA256,
+    containment::PROCESS_IDENTITY_PRIMITIVE_REVISION, MacOs26PlatformDriver, PermissionLiveness,
+    PermissionProbeResult, PermissionService, StartupCapabilityProbe, StartupProbeInput,
+    VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION, COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 use subc_protocol::manifest::{ProviderRole, Tool};
 
@@ -147,6 +147,85 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // holds: claiming exercised rows against an empty advertisement does not
     // produce a functional claim.
     assert!(!computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
+}
+
+/// A suppressed capability says which condition suppressed it.
+///
+/// The reason exists so an operator can tell a missing build input from an
+/// ungranted permission: one is fixed by a release, the other by the person at
+/// the machine. A single reason naming both leaves them to rule out the wrong
+/// one by hand.
+///
+/// Each case is produced by spoiling exactly one condition of an otherwise
+/// valid context, so the reason is attributable to the clause under test rather
+/// than to whichever check happens to run first.
+#[test]
+fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
+    let declaration_reason = |context: &ComputerCapabilityAdvertisementContext| {
+        MacOs26PlatformDriver::new(&StartupProbeInput {
+            os_major: 26,
+            private_envelope_revision: Some("skylight-macos26-v1".into()),
+            resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
+            permission_results: Vec::new(),
+            responsible_process: None,
+        })
+        .declarations(context)
+        .into_iter()
+        .find(|declaration| declaration.capability_id == "computer.screenshot")
+        .expect("the frozen rows always include screenshot")
+        .suppression_reason
+    };
+
+    // The permission is granted and every input present, so nothing is
+    // suppressed. Without this the cases below would all pass against a
+    // capability that is never advertised for some fourth reason.
+    assert_eq!(declaration_reason(&valid_context()), None);
+
+    let mut missing_capture_input = valid_context();
+    missing_capture_input.inputs.capture_review_revision = None;
+    assert_eq!(
+        declaration_reason(&missing_capture_input),
+        Some("capture release input unresolved".to_string())
+    );
+
+    let mut permission_denied = valid_context();
+    let denied = StartupCapabilityProbe::run(&StartupProbeInput {
+        os_major: 26,
+        private_envelope_revision: Some("skylight-macos26-v1".into()),
+        resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
+        permission_results: vec![PermissionProbeResult {
+            service: PermissionService::ScreenRecording,
+            liveness: PermissionLiveness::Unavailable,
+            responsible_process: "ck-subc".into(),
+            off_main: true,
+        }],
+        responsible_process: Some("ck-subc".into()),
+    });
+    permission_denied.permissions = denied.permissions.clone();
+    permission_denied.startup = denied;
+    assert_eq!(
+        declaration_reason(&permission_denied),
+        Some("screen recording permission is not granted".to_string())
+    );
+
+    // An unresolved permission is a DIFFERENT case from a denied one: nothing
+    // said no, the reading was never accepted. Reporting them alike would send
+    // someone to the permission settings for a probe that ran in the wrong
+    // place.
+    let mut permission_unresolved = valid_context();
+    let unresolved = StartupCapabilityProbe::run(&StartupProbeInput {
+        os_major: 26,
+        private_envelope_revision: Some("skylight-macos26-v1".into()),
+        resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
+        permission_results: Vec::new(),
+        responsible_process: Some("ck-subc".into()),
+    });
+    permission_unresolved.permissions = unresolved.permissions.clone();
+    permission_unresolved.startup = unresolved;
+    assert_eq!(
+        declaration_reason(&permission_unresolved),
+        Some("screen recording permission is not established".to_string())
+    );
 }
 
 /// The advertisement context reports what the system says, not a placeholder.

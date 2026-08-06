@@ -175,15 +175,44 @@ impl MacOs26PlatformDriver {
             suppression_reason =
                 (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
         } else if id == "computer.screenshot" {
-            advertised = context.inputs.vocabulary_ready()
-                && context.inputs.capture_ready()
-                && context
-                    .startup
-                    .permissions
-                    .state(PermissionService::ScreenRecording)
-                    == PermissionLiveness::Live;
-            suppression_reason = (!advertised)
-                .then(|| "capture release input or liveness probe unresolved".to_string());
+            // Named separately rather than as one combined reason. The
+            // conditions fail for unrelated causes -- a missing release input is
+            // a build-time omission, an unresolved permission is a property of
+            // the machine -- and a reader given one message for both has to
+            // rule out the other by hand.
+            let liveness = context
+                .startup
+                .permissions
+                .state(PermissionService::ScreenRecording);
+            suppression_reason = if !context.inputs.vocabulary_ready() {
+                Some("computer action vocabulary input unresolved".to_string())
+            } else if !context.inputs.capture_ready() {
+                Some("capture release input unresolved".to_string())
+            } else {
+                // Matching on the state rather than testing it against Live
+                // keeps the accepting case an ordinary arm. A branch that can
+                // "never" be reached is a crash waiting for the day the
+                // surrounding condition changes.
+                match liveness {
+                    PermissionLiveness::Live => None,
+                    PermissionLiveness::Unavailable => {
+                        Some("screen recording permission is not granted".to_string())
+                    }
+                    PermissionLiveness::GrantedPendingRelaunch => Some(
+                        "screen recording permission is granted but not usable until this \
+                         process restarts"
+                            .to_string(),
+                    ),
+                    // Nothing denied the permission; no usable reading was
+                    // recorded for it. A reading is discarded when it comes from
+                    // the process main thread, or when the system attributes the
+                    // grant to a process other than the one expected here.
+                    PermissionLiveness::Unresolved => {
+                        Some("screen recording permission is not established".to_string())
+                    }
+                }
+            };
+            advertised = suppression_reason.is_none();
         }
         // Evaluate the dispatch release gate even though this slice deliberately
         // leaves dispatch rows unadvertised; later slices consume this same gate.
