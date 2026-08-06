@@ -31,9 +31,9 @@ struct ProcBsdInfo {
     pbi_svuid: u32,
     pbi_svgid: u32,
     rfu_1: u32,
-    /// `MAXCOMLEN`.
+    /// The kernel's process command-name buffer, `MAXCOMLEN` (16) bytes.
     pbi_comm: [c_char; 16],
-    /// `2 * MAXCOMLEN`.
+    /// The kernel's process-name buffer, `2 * MAXCOMLEN` (32) bytes.
     pbi_name: [c_char; 32],
     pbi_nfiles: u32,
     pbi_pgid: u32,
@@ -47,7 +47,9 @@ struct ProcBsdInfo {
     pbi_start_tvusec: u64,
 }
 
-/// `PROC_PIDTBSDINFO` from `<sys/proc_info.h>`.
+/// The `proc_pidinfo` flavor asking the kernel to fill a BSD process-information
+/// structure, which is what [`ProcBsdInfo`] mirrors. `PROC_PIDTBSDINFO` from
+/// `<sys/proc_info.h>`.
 const PROC_PIDTBSDINFO: c_int = 3;
 
 extern "C" {
@@ -314,7 +316,8 @@ mod tests {
     /// and read as two processes sharing a generation.
     #[test]
     fn a_process_that_does_not_exist_reports_no_start_time() {
-        // Above the system maximum, so it cannot be assigned.
+        // Above the highest pid this system can assign, so it identifies no
+        // process.
         assert_eq!(process_start_time_micros(u32::MAX - 1), None);
     }
 }
