@@ -125,28 +125,44 @@ fn a_grant_attributed_to_another_process_is_not_counted() {
 /// Not knowing which process holds our grants is different from knowing and
 /// finding no match, but both must refuse: a live result cannot be counted
 /// when there is nothing to check it against.
+///
+/// The results deliberately name DIFFERENT processes, one of them this module.
+/// A single name would let the check pass for the wrong reason, since a
+/// substituted default would discard a result naming anything else and reach
+/// the same answer by filtering rather than by refusing.
 #[test]
 fn an_unestablished_attribution_counts_no_grant_at_all() {
     let input = StartupProbeInput {
         os_major: 26,
         private_envelope_revision: None,
         resolved_private_symbols: Default::default(),
-        permission_results: vec![PermissionProbeResult {
-            service: PermissionService::ScreenRecording,
-            liveness: PermissionLiveness::Live,
-            responsible_process: "ck-subc".to_string(),
-            off_main: true,
-        }],
+        permission_results: vec![
+            PermissionProbeResult {
+                service: PermissionService::ScreenRecording,
+                liveness: PermissionLiveness::Live,
+                responsible_process: "ck-subc".to_string(),
+                off_main: true,
+            },
+            PermissionProbeResult {
+                service: PermissionService::Accessibility,
+                liveness: PermissionLiveness::Live,
+                responsible_process: "cerebellum-computer".to_string(),
+                off_main: true,
+            },
+        ],
         responsible_process: None,
     };
     let driver = MacOs26PlatformDriver::new(&input);
-    assert_eq!(
-        driver
-            .startup_probe()
-            .permissions
-            .state(PermissionService::ScreenRecording),
-        PermissionLiveness::Unresolved
-    );
+    for service in [
+        PermissionService::ScreenRecording,
+        PermissionService::Accessibility,
+    ] {
+        assert_eq!(
+            driver.startup_probe().permissions.state(service),
+            PermissionLiveness::Unresolved,
+            "{service:?} was credited without an established attribution"
+        );
+    }
 }
 
 #[test]
