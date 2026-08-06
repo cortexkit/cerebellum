@@ -34,6 +34,9 @@ fn vocabulary_requires_all_three_digest_sources() {
 
 #[test]
 fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
+    // The grant is attributed to the launching process rather than to this
+    // module, so the fixture names a launcher. A fixture naming the module
+    // would agree with any code that assumed the same thing.
     let input = StartupProbeInput {
         os_major: 26,
         private_envelope_revision: Some("skylight-macos26-v1".to_string()),
@@ -41,9 +44,10 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
         permission_results: vec![PermissionProbeResult {
             service: PermissionService::ScreenRecording,
             liveness: PermissionLiveness::Live,
-            responsible_process: "cerebellum-computer".to_string(),
+            responsible_process: "ck-subc".to_string(),
             off_main: true,
         }],
+        responsible_process: Some("ck-subc".to_string()),
     };
     let driver = MacOs26PlatformDriver::new(&input);
     assert!(driver.startup_probe().private_envelope_recognized);
@@ -84,6 +88,65 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
         .iter()
         .filter(|declaration| declaration.capability_id != "computer.wait")
         .all(|declaration| !declaration.advertised));
+}
+
+/// A grant belonging to some other process is not evidence about ours.
+///
+/// The probe filters by the process the system attributes grants to, so a
+/// result naming a different one is discarded and the service reads as
+/// unresolved. Without this, the filter could be deleted and every existing
+/// case would still pass, because they all supply a matching process.
+#[test]
+fn a_grant_attributed_to_another_process_is_not_counted() {
+    let input = StartupProbeInput {
+        os_major: 26,
+        private_envelope_revision: None,
+        resolved_private_symbols: Default::default(),
+        permission_results: vec![PermissionProbeResult {
+            service: PermissionService::ScreenRecording,
+            liveness: PermissionLiveness::Live,
+            responsible_process: "some-other-launcher".to_string(),
+            off_main: true,
+        }],
+        responsible_process: Some("ck-subc".to_string()),
+    };
+    let driver = MacOs26PlatformDriver::new(&input);
+    assert_eq!(
+        driver
+            .startup_probe()
+            .permissions
+            .state(PermissionService::ScreenRecording),
+        PermissionLiveness::Unresolved
+    );
+}
+
+/// Until the attribution is established, no grant can be credited to us.
+///
+/// Not knowing which process holds our grants is different from knowing and
+/// finding no match, but both must refuse: a live result cannot be counted
+/// when there is nothing to check it against.
+#[test]
+fn an_unestablished_attribution_counts_no_grant_at_all() {
+    let input = StartupProbeInput {
+        os_major: 26,
+        private_envelope_revision: None,
+        resolved_private_symbols: Default::default(),
+        permission_results: vec![PermissionProbeResult {
+            service: PermissionService::ScreenRecording,
+            liveness: PermissionLiveness::Live,
+            responsible_process: "ck-subc".to_string(),
+            off_main: true,
+        }],
+        responsible_process: None,
+    };
+    let driver = MacOs26PlatformDriver::new(&input);
+    assert_eq!(
+        driver
+            .startup_probe()
+            .permissions
+            .state(PermissionService::ScreenRecording),
+        PermissionLiveness::Unresolved
+    );
 }
 
 #[test]

@@ -430,6 +430,7 @@ fn canonical_computer_declarations(
             BTreeSet::new()
         },
         permission_results: Vec::new(),
+        responsible_process: None,
     });
     let declarations = driver.declarations(context);
     let outcomes = computer_gate_outcomes(context);
@@ -574,6 +575,7 @@ pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
         private_envelope_revision: None,
         resolved_private_symbols: BTreeSet::new(),
         permission_results: Vec::new(),
+        responsible_process: None,
     });
     ComputerCapabilityAdvertisementContext {
         inputs: ComputerReleaseInputs::default(),

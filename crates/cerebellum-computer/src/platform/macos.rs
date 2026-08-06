@@ -16,6 +16,21 @@ pub struct StartupProbeInput {
     pub private_envelope_revision: Option<String>,
     pub resolved_private_symbols: BTreeSet<String>,
     pub permission_results: Vec<PermissionProbeResult>,
+    /// The process this system attributes our permission grants to, resolved at
+    /// runtime rather than assumed, and `None` until it has been.
+    ///
+    /// It is NOT this module. macOS attributes a grant to the process
+    /// responsible for launching ours, so for a daemon-launched module the
+    /// grants belong to the daemon, and a probe reporting that truthfully has
+    /// to be counted rather than discarded. Naming a fixed process here would
+    /// suppress every capability that depends on a grant, silently and
+    /// permanently.
+    ///
+    /// `None` means the attribution has not been established, which is not the
+    /// same as knowing it and finding no match: an unestablished attribution
+    /// admits no probe result at all, because a grant cannot be credited to a
+    /// process nobody has identified.
+    pub responsible_process: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,10 +89,13 @@ pub struct StartupCapabilityProbe {
 impl StartupCapabilityProbe {
     pub fn run(input: &StartupProbeInput) -> Self {
         let envelope = PrivateEnvelopeStartupProbe::default();
-        let permissions = PermissionLivenessProbe {
-            responsible_process: "cerebellum-computer".to_string(),
-        }
-        .run(&input.permission_results);
+        let permissions = match input.responsible_process.as_deref() {
+            Some(process) => PermissionLivenessProbe {
+                responsible_process: process.to_string(),
+            }
+            .run(&input.permission_results),
+            None => PermissionLivenessReport::default(),
+        };
         Self {
             os_major: input.os_major,
             private_envelope_recognized: envelope.run(input),
@@ -206,6 +224,7 @@ impl Default for MacOs26PlatformDriver {
             private_envelope_revision: None,
             resolved_private_symbols: BTreeSet::new(),
             permission_results: Vec::new(),
+            responsible_process: None,
         })
     }
 }

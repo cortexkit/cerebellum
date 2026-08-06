@@ -46,9 +46,10 @@ fn valid_context() -> ComputerCapabilityAdvertisementContext {
         permission_results: vec![PermissionProbeResult {
             service: PermissionService::ScreenRecording,
             liveness: PermissionLiveness::Live,
-            responsible_process: "cerebellum-computer".into(),
+            responsible_process: "ck-subc".into(),
             off_main: true,
         }],
+        responsible_process: Some("ck-subc".into()),
     });
     ComputerCapabilityAdvertisementContext {
         inputs: valid_inputs(),
@@ -74,6 +75,7 @@ fn empty_runtime_advertisement_reports_frozen_eight_row_scope_without_functional
             private_envelope_revision: None,
             resolved_private_symbols: BTreeSet::new(),
             permission_results: Vec::new(),
+            responsible_process: None,
         }),
     };
     let evidence = computer_release_evidence(&context);
