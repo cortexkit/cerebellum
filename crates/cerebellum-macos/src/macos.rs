@@ -407,9 +407,15 @@ fn find_window(window_id: u32, timeout: Duration) -> Result<Retained<SCWindow>, 
 /// blocked each other past 60 seconds, on different windows, with no error from
 /// either side.
 ///
-/// So the deadline has to cover a wait for other processes rather than the work
-/// itself, and a caller that wants a bounded first capture should perform one
-/// at startup, when nothing else is competing, rather than on the first request
+/// THE CONTENTION OUTLIVES THE PROCESS THAT CAUSED IT. A first capture that
+/// takes 0.5 second on an idle machine took 14 seconds immediately after
+/// another process had captured and exited, with no process of that program
+/// left running. So it is the window server's own state that is busy, not a
+/// competing process, and waiting for the other side to exit does not clear it.
+///
+/// So the deadline has to cover a wait for the system rather than for the work,
+/// and a caller that wants a bounded first capture should perform one at
+/// startup, when nothing else is competing, rather than on the first request
 /// that needs it.
 pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, String> {
     // Before any filter is created. Without a window-server connection the
@@ -521,13 +527,16 @@ unsafe fn read_pixels(image: &CGImage, owner_pid_at_capture: u32) -> Result<RawC
 mod tests {
     use super::*;
 
-    /// Serializes the tests that cause a FIRST capture in some process.
+    /// Serializes every test that talks to the window server.
     ///
-    /// A process's first capture waits for any other process that is capturing,
-    /// so two of these running at once block each other for as long as the
-    /// deadline allows and fail for a reason unrelated to what they assert.
-    /// Tests run as threads in one process, so a lock here is enough.
-    static FIRST_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Window-server work contends system-wide and the contention outlasts the
+    /// process that caused it: an operation taking half a second on an idle
+    /// machine took fourteen after another process had captured and exited.
+    /// So the lock is held by tests that merely SUFFER the contention as well as
+    /// by those that cause it, or the former wait out the latter and fail for a
+    /// reason unrelated to what they assert. Tests run as threads in one
+    /// process, so a lock here covers them.
+    static WINDOW_SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The attribution resolves to a real executable on this system.
     ///
@@ -645,6 +654,7 @@ mod tests {
     /// fail at use.
     #[test]
     fn enumeration_agrees_with_the_permission_query() {
+        let _serialized = WINDOW_SERVER.lock();
         let permitted = screen_capture_is_permitted();
         let enumerated = enumerate_windows(Duration::from_secs(10));
 
@@ -662,6 +672,7 @@ mod tests {
     /// to answer has nothing to say about it.
     #[test]
     fn enumerated_windows_carry_an_owning_process() {
+        let _serialized = WINDOW_SERVER.lock();
         let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
             return;
         };
@@ -691,6 +702,7 @@ mod tests {
     /// there rather than claiming a result.
     #[test]
     fn an_expired_deadline_refuses_rather_than_waits() {
+        let _serialized = WINDOW_SERVER.lock();
         if enumerate_windows(Duration::from_secs(10)).is_err() {
             return;
         }
@@ -707,8 +719,7 @@ mod tests {
     /// say about it.
     #[test]
     fn a_captured_window_yields_pixels_of_its_own_size() {
-        // Held for the whole test: the child performs a first capture too.
-        let _serialized = FIRST_CAPTURE.lock();
+        let _serialized = WINDOW_SERVER.lock();
         let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
             return;
         };
@@ -748,6 +759,7 @@ mod tests {
     /// answered with whatever now holds that id.
     #[test]
     fn capturing_a_window_that_is_gone_refuses() {
+        let _serialized = WINDOW_SERVER.lock();
         // Above any id the window server has assigned on a running system.
         assert!(capture_window(u32::MAX - 1, Duration::from_secs(10)).is_err());
     }
@@ -768,8 +780,7 @@ mod tests {
     /// server.
     #[test]
     fn creating_a_filter_without_the_window_server_connection_kills_the_process() {
-        // Held for the whole test: the child performs a first capture too.
-        let _serialized = FIRST_CAPTURE.lock();
+        let _serialized = WINDOW_SERVER.lock();
         use std::os::unix::process::ExitStatusExt;
 
         const TARGET_WINDOW: &str = "CK_UNGUARDED_FILTER_PROBE_WINDOW";
@@ -836,8 +847,7 @@ mod tests {
     /// [`capture_window`] is the only thing standing between it and an abort.
     #[test]
     fn capturing_establishes_the_window_server_connection_itself() {
-        // Held for the whole test: the child performs a first capture too.
-        let _serialized = FIRST_CAPTURE.lock();
+        let _serialized = WINDOW_SERVER.lock();
         use std::os::unix::process::ExitStatusExt;
 
         const TARGET_WINDOW: &str = "CK_CAPTURE_SURVIVAL_PROBE_WINDOW";
