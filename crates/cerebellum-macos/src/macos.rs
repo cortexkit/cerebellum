@@ -63,6 +63,20 @@ struct ProcBsdInfo {
 const PROC_PIDTBSDINFO: c_int = 3;
 
 extern "C" {
+    /// The current graphical session's properties, or null outside one.
+    fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
+    fn CFDictionaryGetValue(
+        dictionary: *const std::ffi::c_void,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFBooleanGetValue(value: *const std::ffi::c_void) -> bool;
+    fn CFStringCreateWithCString(
+        allocator: *const std::ffi::c_void,
+        cstr: *const c_char,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
+    fn CFRelease(value: *const std::ffi::c_void);
+
     /// Kernel process information. Returns the byte count written, or 0.
     fn proc_pidinfo(
         pid: c_int,
@@ -166,6 +180,43 @@ pub fn is_off_main_thread() -> bool {
     // SAFETY: takes no arguments, returns a plain integer, and is callable from
     // any thread.
     unsafe { pthread_main_np() == 0 }
+}
+
+/// Whether the screen is locked.
+///
+/// A locked screen still answers questions ABOUT windows -- the list, their
+/// owners, their sizes -- while refusing their CONTENTS, so a caller that only
+/// checks its permission concludes it can capture and then fails at the picture.
+/// `None` when there is no graphical session to ask, which is not the same as an
+/// unlocked one: a process with no session cannot capture either.
+pub fn screen_is_locked() -> Option<bool> {
+    // SAFETY: takes no arguments, and returns either null or a dictionary this
+    // frame owns. Released below on every path that reaches it.
+    let session = unsafe { CGSessionCopyCurrentDictionary() };
+    if session.is_null() {
+        return None;
+    }
+
+    // SAFETY: the key is a NUL-terminated literal and the dictionary is
+    // non-null. The value is borrowed from the dictionary, so it is read before
+    // the release. Both objects created here are released on every path.
+    unsafe {
+        // 0x08000100 is kCFStringEncodingUTF8.
+        let key = CFStringCreateWithCString(
+            std::ptr::null(),
+            c"CGSSessionScreenIsLocked".as_ptr(),
+            0x0800_0100,
+        );
+        let value = CFDictionaryGetValue(session, key);
+        let locked = if value.is_null() {
+            None
+        } else {
+            Some(CFBooleanGetValue(value))
+        };
+        CFRelease(key);
+        CFRelease(session);
+        locked
+    }
 }
 
 /// When a process was started, as kernel-sourced microseconds since the epoch.
@@ -475,9 +526,22 @@ pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, S
         )
     };
 
-    delivery
+    let outcome = delivery
         .wait(timeout)
-        .unwrap_or_else(|| Err(format!("the capture did not arrive within {timeout:?}")))
+        .unwrap_or_else(|| Err(format!("the capture did not arrive within {timeout:?}")));
+
+    // A locked screen refuses pixel contents while still answering questions
+    // ABOUT windows, and it does so with a generic stream failure that reads
+    // like a fault in the capture itself. The state is read AFTER the failure
+    // rather than checked before it, so what is reported is the state that
+    // actually applied rather than one that may have changed since.
+    outcome.map_err(|reason| {
+        if screen_is_locked() == Some(true) {
+            format!("the screen is locked, so window contents are not readable ({reason})")
+        } else {
+            reason
+        }
+    })
 }
 
 /// Copy an image's pixels out of the system's storage.
@@ -537,6 +601,21 @@ mod tests {
     /// reason unrelated to what they assert. Tests run as threads in one
     /// process, so a lock here covers them.
     static WINDOW_SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Whether this machine can currently produce window pixels at all.
+    ///
+    /// Two states prevent it and they are different: capture may not be
+    /// permitted, or the screen may be locked. A locked screen still answers
+    /// questions about windows while refusing their contents, so a test that
+    /// only checks enumeration would proceed and then fail on the picture.
+    ///
+    /// Tests asserting a property OF a capture stop when this is false, since a
+    /// machine that cannot capture has nothing to say about it. Tests asserting
+    /// a REFUSAL do not need it: they are about what is refused, and both
+    /// states refuse.
+    fn pixels_are_obtainable() -> bool {
+        screen_capture_is_permitted() && screen_is_locked() != Some(true)
+    }
 
     /// The attribution resolves to a real executable on this system.
     ///
@@ -719,6 +798,9 @@ mod tests {
     /// say about it.
     #[test]
     fn a_captured_window_yields_pixels_of_its_own_size() {
+        if !pixels_are_obtainable() {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
             return;
@@ -780,6 +862,9 @@ mod tests {
     /// server.
     #[test]
     fn creating_a_filter_without_the_window_server_connection_kills_the_process() {
+        if !pixels_are_obtainable() {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         use std::os::unix::process::ExitStatusExt;
 
@@ -847,6 +932,9 @@ mod tests {
     /// [`capture_window`] is the only thing standing between it and an abort.
     #[test]
     fn capturing_establishes_the_window_server_connection_itself() {
+        if !pixels_are_obtainable() {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         use std::os::unix::process::ExitStatusExt;
 

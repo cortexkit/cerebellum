@@ -21,6 +21,6 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
     capture_window, enumerate_windows, establish_window_server_connection, is_off_main_thread,
-    process_start_time_micros, responsible_process, screen_capture_is_permitted, RawCapture,
-    RawWindow,
+    process_start_time_micros, responsible_process, screen_capture_is_permitted, screen_is_locked,
+    RawCapture, RawWindow,
 };
