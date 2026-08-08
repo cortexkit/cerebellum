@@ -49,15 +49,29 @@ fn has_browser_type(manifest: &ModuleManifest) -> bool {
 
 #[test]
 fn advertisement_suppressed_when_a_gate_fails() {
-    // Every gate passing advertises browser.type.
-    assert!(has_browser_type(&build_with_unfenceable_evidence(
+    // Every gate passing ADMITS browser.type. Admission is asserted through the
+    // gate report rather than through the manifest, because advertising also
+    // requires that the capability can be dispatched, and browser.type has no
+    // dispatch route. Reading the manifest here would find it absent for that
+    // reason and hold however the gates behaved, which is the assertion this
+    // test exists to make.
+    assert!(evaluate_unfenceable_gates(&valid_inputs()).passed());
+
+    // And nothing is advertised that could not be served: with the gates fully
+    // satisfied, browser.type stays out of the manifest because no dispatch
+    // route exists for it. When one is added, this line is what fails, which is
+    // the moment the evidence gate stops being theoretical.
+    assert!(!has_browser_type(&build_with_unfenceable_evidence(
         &valid_inputs()
     )));
 
-    // Suppressing the immutable B1 pin (absent) keeps it unadvertised.
+    // Suppressing any single gate withholds admission. Asserted through the
+    // report for the same reason: browser.type is absent from the manifest
+    // whatever the gates say, so a manifest assertion would pass with the gate
+    // deleted.
     let mut no_pin = valid_inputs();
     no_pin.b1_pin = None;
-    assert!(!has_browser_type(&build_with_unfenceable_evidence(&no_pin)));
+    assert!(!evaluate_unfenceable_gates(&no_pin).passed());
 
     // A present-but-incompatible B1 pin (conformance not proved) also suppresses.
     let mut bad_pin = valid_inputs();
@@ -65,16 +79,12 @@ fn advertisement_suppressed_when_a_gate_fails() {
         revision_or_digest: "b1-rev-1".to_string(),
         conformance_passed: false,
     });
-    assert!(!has_browser_type(&build_with_unfenceable_evidence(
-        &bad_pin
-    )));
+    assert!(!evaluate_unfenceable_gates(&bad_pin).passed());
 
     // Suppressing the journal deployment bounds keeps it unadvertised.
     let mut no_bounds = valid_inputs();
     no_bounds.journal_bounds = None;
-    assert!(!has_browser_type(&build_with_unfenceable_evidence(
-        &no_bounds
-    )));
+    assert!(!evaluate_unfenceable_gates(&no_bounds).passed());
 }
 
 #[test]

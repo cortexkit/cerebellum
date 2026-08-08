@@ -345,12 +345,27 @@ pub fn evaluate_unfenceable_gates(inputs: &UnfenceableReleaseInputs) -> ReleaseR
     ReleaseReport { outcomes }
 }
 
-/// Compatibility helper that preserves the old evidence-gated browser.type
-/// descriptor so a frozen manifest fixture can compare its historical output.
-/// Production manifest builders omit browser.type.
+/// The evidence-gated manifest for `browser.type`, which production does not
+/// build.
+///
+/// Advertising requires BOTH that the release gates pass AND that the capability
+/// can be dispatched. The second condition is not redundant: the gates are
+/// satisfied by supplying release evidence, which is a deployment act, while
+/// being dispatchable is a property of the code. Without it, supplying evidence
+/// alone would advertise a capability that every call to it rejects as an
+/// unknown method — and this one accepts typed text, so the caller would be told
+/// it has a facility for entering text that does not exist.
+///
+/// Today `browser.type` has no dispatch route, so this advertises nothing
+/// whatever the evidence says. Adding one is what makes the gate live, which is
+/// the point at which its evidence requirements have to be met rather than
+/// merely defined.
 pub fn build_with_unfenceable_evidence(inputs: &UnfenceableReleaseInputs) -> ModuleManifest {
     let mut manifest = build("cerebellum");
     if !evaluate_unfenceable_gates(inputs).passed() {
+        return manifest;
+    }
+    if crate::dispatchable_tool(BROWSER_TYPE_TOOL).is_none() {
         return manifest;
     }
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
@@ -548,32 +563,39 @@ mod tests {
 
     #[test]
     fn unfenceable_advertisement_requires_every_gate_to_pass() {
-        // This test exercises the historical evidence-gated fixture; normal
-        // production registration uses the current browser-route composition path instead.
-        assert!(has_browser_type(&build_with_unfenceable_evidence(
-            &valid_inputs()
-        )));
+        // Every gate passing ADMITS browser.type, asserted through the gate
+        // report. The manifest cannot carry the positive case: advertising also
+        // requires a dispatch route, and browser.type has none, so reading the
+        // manifest here would find it absent for that reason and hold however
+        // the gates behaved.
+        assert!(evaluate_unfenceable_gates(&valid_inputs()).passed());
 
-        // Suppressing any single gate keeps browser.type absent.
+        // Suppressing any single gate withholds admission. Also asserted
+        // through the report rather than through the manifest: browser.type is
+        // absent from the manifest whatever the gates say, so a manifest
+        // assertion here would pass with the gate deleted.
         let mut no_evidence = valid_inputs();
         no_evidence.evidence = None;
-        assert!(!has_browser_type(&build_with_unfenceable_evidence(
-            &no_evidence
-        )));
+        assert!(!evaluate_unfenceable_gates(&no_evidence).passed());
 
         let mut no_pin = valid_inputs();
         no_pin.b1_pin = None;
-        assert!(!has_browser_type(&build_with_unfenceable_evidence(&no_pin)));
+        assert!(!evaluate_unfenceable_gates(&no_pin).passed());
 
         let mut no_bounds = valid_inputs();
         no_bounds.journal_bounds = None;
-        assert!(!has_browser_type(&build_with_unfenceable_evidence(
-            &no_bounds
-        )));
+        assert!(!evaluate_unfenceable_gates(&no_bounds).passed());
 
         let mut no_fit = valid_inputs();
         no_fit.computed_max_entry_bytes = None;
-        assert!(!has_browser_type(&build_with_unfenceable_evidence(&no_fit)));
+        assert!(!evaluate_unfenceable_gates(&no_fit).passed());
+
+        // And the manifest carries none of it, on inputs that pass every gate,
+        // so this fails when a dispatch route is added rather than silently
+        // starting to advertise.
+        assert!(!has_browser_type(&build_with_unfenceable_evidence(
+            &valid_inputs()
+        )));
     }
 
     #[test]
