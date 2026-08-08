@@ -774,13 +774,19 @@ impl ManifestPinSet {
         Ok(())
     }
 
+    /// Whether the extraction pins are present and usable as a group.
+    ///
+    /// The three are eligible together or not at all. A partly supplied group is
+    /// refused for the same reason an absent one is, which is deliberate: the
+    /// pins describe one artifact set, and two of three would gate a capability
+    /// on evidence that does not cover it.
     pub fn extraction_group_eligible(&self) -> bool {
         let extraction = [
             self.browser_extraction_corpus_sha256.as_ref(),
             self.browser_extraction_evidence_sha256.as_ref(),
             self.browser_extraction_runner_revision.as_ref(),
         ];
-        if extraction.iter().all(Option::is_none) || extraction.iter().any(Option::is_none) {
+        if extraction.iter().any(Option::is_none) {
             return false;
         }
         let (Some(corpus), Some(evidence), Some(revision)) = (
