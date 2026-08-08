@@ -436,25 +436,46 @@ impl Default for GroundingPolicy {
     }
 }
 
+/// What grounding a capability requires.
+///
+/// Three outcomes rather than a policy-or-nothing, because two of them are not
+/// the same news. A capability that addresses no element legitimately has no
+/// grounding policy and the caller proceeds; a capability this module does not
+/// serve means the caller and the action vocabulary disagree, and proceeding
+/// grounds nothing for a reason nobody chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroundingRequirement {
+    /// The capability addresses an element, resolved under this policy.
+    Grounded(GroundingPolicy),
+    /// The capability addresses no element, so there is nothing to ground.
+    /// Keyboard shortcuts and cursor movement have no target, drag and pointer
+    /// movement are coordinate-addressed, and observing actions address nothing.
+    NotGrounded,
+    /// Not a capability this module serves.
+    UnknownCapability,
+}
+
 impl GroundingPolicy {
-    pub fn for_capability(capability_id: &str) -> Option<Self> {
+    pub fn for_capability(capability_id: &str) -> GroundingRequirement {
         let mut policy = Self::default();
         match capability_id {
-            "computer.click" | "computer.scroll" => Some(policy),
+            "computer.click" | "computer.scroll" => GroundingRequirement::Grounded(policy),
             "computer.type" => {
+                // Typing resolves through the accessibility tree only. A pixel
+                // fallback would let text reach a field identified by position
+                // rather than by identity, which is how a credential field gets
+                // typed into without ever being classified as one.
                 policy.eligible_paths = [GroundingPath::AccessibilityElement].into_iter().collect();
                 policy.pixel_fallback_eligible = false;
-                Some(policy)
+                GroundingRequirement::Grounded(policy)
             }
-            "computer.keys" | "computer.move" => None,
-            "computer.drag" => None,
-            "computer.screenshot" | "computer.wait" => None,
-            _ => None,
+            "computer.keys"
+            | "computer.move"
+            | "computer.drag"
+            | "computer.screenshot"
+            | "computer.wait" => GroundingRequirement::NotGrounded,
+            _ => GroundingRequirement::UnknownCapability,
         }
-    }
-
-    pub fn from_capability(capability_id: &str) -> Option<Self> {
-        Self::for_capability(capability_id)
     }
 
     pub fn fallback_allowed(&self, path: GroundingPath) -> bool {
@@ -1194,6 +1215,64 @@ impl GroundingDriver for RecordingGroundingDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// All three grounding outcomes are reachable, and they are different.
+    ///
+    /// The distinction exists so that a capability with nothing to ground and a
+    /// capability this module does not serve are not answered alike. Asserting
+    /// only the grounded case would leave that collapse indistinguishable from
+    /// correct behaviour, since both of the others simply decline to ground.
+    ///
+    /// The capability names tested here are the module's whole action
+    /// vocabulary. Moving one between the grounded and not-grounded groups
+    /// changes whether its target is resolved by identity or by position, so it
+    /// should be a deliberate change rather than a consequence of another one.
+    #[test]
+    fn every_grounding_outcome_is_reachable_and_distinct() {
+        assert!(matches!(
+            GroundingPolicy::for_capability("computer.click"),
+            GroundingRequirement::Grounded(_)
+        ));
+
+        // Typing resolves by identity only. A pixel fallback here would let
+        // text reach a field picked out by position.
+        let GroundingRequirement::Grounded(typing) =
+            GroundingPolicy::for_capability("computer.type")
+        else {
+            panic!("typing is grounded");
+        };
+        assert!(!typing.pixel_fallback_eligible);
+        assert_eq!(
+            typing.eligible_paths,
+            [GroundingPath::AccessibilityElement].into_iter().collect()
+        );
+
+        for capability in [
+            "computer.keys",
+            "computer.move",
+            "computer.drag",
+            "computer.screenshot",
+            "computer.wait",
+        ] {
+            assert_eq!(
+                GroundingPolicy::for_capability(capability),
+                GroundingRequirement::NotGrounded,
+                "{capability} addresses no element, so it has nothing to ground"
+            );
+        }
+
+        // A name outside the vocabulary is its own answer. Reported as
+        // not-grounded, it would read as a normal capability that happens to
+        // need no grounding, and the caller would proceed.
+        assert_eq!(
+            GroundingPolicy::for_capability("computer.launch_missiles"),
+            GroundingRequirement::UnknownCapability
+        );
+        assert_eq!(
+            GroundingPolicy::for_capability("browser.click"),
+            GroundingRequirement::UnknownCapability
+        );
+    }
 
     fn grant() -> ProcessGrant {
         ProcessGrant {
