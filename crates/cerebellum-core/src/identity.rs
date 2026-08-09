@@ -188,6 +188,19 @@ pub struct AcceptedBindFacts {
     /// `None` means the legacy bind had no explicit scope and receives the
     /// module's first-party default. `Some(empty)` is an explicitly empty scope.
     pub effective_capability_scope: Option<Vec<String>>,
+    /// Reverse-request families the consumer declared it can service, such as
+    /// asking a human a question.
+    ///
+    /// A DECLARATION, NOT A GRANT, and the distinction decides how it may be
+    /// used. The consumer states this about itself and nothing verifies it, so
+    /// its presence is not evidence that anyone is listening — a consumer that
+    /// over-declares produces a question nobody answers. It may therefore be
+    /// read to decide whether asking is worth attempting, and never to conclude
+    /// that an unanswered question means refusal.
+    ///
+    /// Absent means no capability rather than an unknown one, so a bind that
+    /// omits it is treated exactly as one that declares nothing.
+    pub consumer_capabilities: Vec<String>,
 }
 
 impl AcceptedBindFacts {
@@ -195,12 +208,23 @@ impl AcceptedBindFacts {
         identity: &BindIdentity,
         principal: Option<Principal>,
         admission_facts: Option<&Value>,
+        consumer_capabilities: Option<&[String]>,
     ) -> Self {
         Self {
             identity: RouteIdentity::from_accepted_bind(identity, &principal, admission_facts),
             principal,
             effective_capability_scope: effective_capability_scope_from_facts(admission_facts),
+            consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
         }
+    }
+
+    /// Whether the consumer declared it can relay a question to a human.
+    ///
+    /// True means asking is worth attempting, never that an answer will arrive.
+    pub fn declares_elicitation(&self) -> bool {
+        self.consumer_capabilities
+            .iter()
+            .any(|family| family == ELICITATION_CAPABILITY)
     }
 
     /// Whether the accepted scope permits a capability. This uses only facts
@@ -216,6 +240,10 @@ impl AcceptedBindFacts {
         })
     }
 }
+
+/// The reverse-request family that carries a question to a human, as spelled on
+/// the wire.
+pub const ELICITATION_CAPABILITY: &str = "elicitation";
 
 fn admission_object(facts: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
     let root = facts?.as_object()?;
@@ -499,8 +527,50 @@ mod tests {
             Some(&serde_json::json!({
                 "effective_capability_scope": ["other.capability"]
             })),
+            None,
         );
         assert!(!accepted.allows_capability("browser.status"));
+    }
+
+    /// A consumer that declares nothing can relay nothing.
+    ///
+    /// Absence must not read as an unknown the module resolves optimistically:
+    /// attempting to ask a consumer that never claimed it could relay produces a
+    /// question nobody receives, and the silence is indistinguishable from a
+    /// human declining.
+    #[test]
+    fn a_bind_declaring_no_capabilities_cannot_relay_a_question() {
+        let bind = bind_identity("/tmp/project", "conversation-1");
+        let absent = AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None);
+        assert!(!absent.declares_elicitation());
+
+        let empty = AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, Some(&[]));
+        assert!(!empty.declares_elicitation());
+    }
+
+    /// The declaration is read per family, not as a blanket claim.
+    ///
+    /// A consumer that services sampling has said nothing about reaching a
+    /// human, so treating any non-empty declaration as elicitation would ask a
+    /// consumer that never offered to answer.
+    #[test]
+    fn only_the_elicitation_family_admits_asking_a_human() {
+        let bind = bind_identity("/tmp/project", "conversation-1");
+        let other = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            None,
+            Some(&["sampling".to_string(), "roots".to_string()]),
+        );
+        assert!(!other.declares_elicitation());
+
+        let declared = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            None,
+            Some(&["sampling".to_string(), "elicitation".to_string()]),
+        );
+        assert!(declared.declares_elicitation());
     }
 
     #[test]

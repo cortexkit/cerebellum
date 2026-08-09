@@ -1032,6 +1032,7 @@ async fn handle_control_request(
             principal,
             identity,
             admission_facts,
+            consumer_capabilities,
             ..
         } => {
             // In-module principal default-deny backstop: the gateway policy
@@ -1056,6 +1057,7 @@ async fn handle_control_request(
                 &identity,
                 principal.clone(),
                 admission_facts.as_ref(),
+                consumer_capabilities.as_deref(),
             );
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
@@ -1470,7 +1472,12 @@ pub async fn handle_tool_request_for_test(
     route_bindings.insert(
         frame.header.channel,
         frame.header.epoch,
-        AcceptedBindFacts::from_bind(&identity, Some(subc_protocol::Principal::Direct), None),
+        AcceptedBindFacts::from_bind(
+            &identity,
+            Some(subc_protocol::Principal::Direct),
+            None,
+            None,
+        ),
     );
     handle_tool_request(
         frame,
