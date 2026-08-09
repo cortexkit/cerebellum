@@ -25,9 +25,42 @@ pub enum InvalidCoordinatesReason {
     NonFiniteMetadata,
     NonPositiveDimensions,
     ConversionFailure,
+    /// The caller addressed a differently-sized copy of the image.
+    ///
+    /// A pixel coordinate means nothing without the image it indexes, and the
+    /// two sizes disagreeing is the only evidence available that the caller was
+    /// looking at a different one. It is worth refusing rather than scaling,
+    /// because a coordinate from a copy this module never produced cannot be
+    /// mapped: nothing here knows how that copy was derived.
+    ImageSizeMismatch,
 }
 
 impl InvalidCoordinatesReason {
+    /// What the caller should do, rather than what went wrong.
+    ///
+    /// A caller told only the name of a rejection still has to work out the
+    /// remedy, and the natural guess after a coordinate rejection is to try a
+    /// different coordinate, which does not help for any of these.
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::PointOutOfBounds => {
+                "address a pixel inside the declared image: 0 <= x < image_width_px and \
+                 0 <= y < image_height_px"
+            }
+            Self::NonFiniteMetadata | Self::ConversionFailure => {
+                "take a fresh screenshot: this one's retained geometry cannot be mapped"
+            }
+            Self::NonPositiveDimensions => {
+                "take a fresh screenshot: this one reports no area to address"
+            }
+            Self::ImageSizeMismatch => {
+                "send coordinates in the space of the image this module declared, and pass its \
+                 image_width_px and image_height_px. If a model was shown a resized copy, \
+                 multiply its coordinates by declared/shown before sending them."
+            }
+        }
+    }
+
     /// The caller-visible wire spelling of this reason.
     pub const fn reason_code(self) -> &'static str {
         match self {
@@ -35,6 +68,7 @@ impl InvalidCoordinatesReason {
             Self::NonFiniteMetadata => "non_finite_metadata",
             Self::NonPositiveDimensions => "non_positive_dimensions",
             Self::ConversionFailure => "conversion_failure",
+            Self::ImageSizeMismatch => "image_size_mismatch",
         }
     }
 }
