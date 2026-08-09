@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane};
 use cerebellum::cdp::{Attachment, CdpTransport, IdentityMap};
+use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
 use cerebellum::snapshot_store::{AxRecord, RefRecord, SnapshotKind, SnapshotRef};
 use cerebellum::RouteIdentity;
 use serde_json::json;
@@ -15,6 +16,93 @@ fn identity() -> RouteIdentity {
         },
         &Some(subc_protocol::Principal::Direct),
     )
+}
+
+/// A click whose coordinates came from a differently-sized copy is refused.
+///
+/// The endpoint that shows a screenshot to a model downscales it first, so the
+/// coordinates it reports index that smaller copy. They still land inside the
+/// image retained here, which is why nothing downstream objects: the transform
+/// validates and the click actuates somewhere the caller never chose.
+///
+/// Driven through the dispatch surface rather than the mapping helper, because
+/// what matters is that no click is dispatched. A check that computed the
+/// mismatch correctly and then proceeded would satisfy an assertion about the
+/// returned value alone.
+#[tokio::test]
+async fn a_click_addressing_a_differently_sized_image_is_refused_before_dispatch() {
+    const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    let plane = BrowserPlane::new();
+    let route = identity();
+    plane.open_context(route.clone()).await.unwrap();
+
+    // The context's own epoch, so the snapshot is not refused as stale before
+    // the check under test is reached.
+    let view = ViewportObservation::new(
+        0,
+        TransformInputs::from_values(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+    );
+    let retained = plane
+        .retain_screenshot(
+            &route,
+            ScreenshotPayload::new(ONE_BY_ONE_PNG_B64, 1, 1),
+            view,
+            view,
+            false,
+        )
+        .await
+        .expect("a coherent screenshot is retained");
+    let snapshot_id = retained["snapshot_id"]
+        .as_str()
+        .expect("the retained screenshot carries its id")
+        .to_string();
+
+    // Reserving and rejecting a request are themselves logged, so the fence is
+    // the absence of INPUT rather than the absence of activity.
+    fn input_operations(log: &[(String, browser::Operation)]) -> usize {
+        log.iter()
+            .filter(|(_, operation)| {
+                matches!(
+                    operation,
+                    browser::Operation::CdpInputPress
+                        | browser::Operation::CdpInputRelease
+                        | browser::Operation::CommitDispatched
+                )
+            })
+            .count()
+    }
+    let input_before = input_operations(&plane.operation_log().await);
+
+    // The only pixel that exists, addressed as though the image were larger:
+    // the shape a model-reported coordinate takes after a server-side resize.
+    let refusal = plane
+        .dispatch(
+            &route,
+            BrowserCapability::ClickPoint,
+            &json!({
+                "snapshot_id": snapshot_id,
+                "x_px": 0,
+                "y_px": 0,
+                "image_width_px": 2,
+                "image_height_px": 2,
+                "intent": "press what the model saw",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    // dispatch answers with a body rather than a Result, so the refusal is read
+    // from the outcome it reports.
+    assert_eq!(
+        refusal["detail"]["reason_code"], "image_size_mismatch",
+        "refused for an unrelated reason: {refusal}"
+    );
+    assert_eq!(
+        input_operations(&plane.operation_log().await),
+        input_before,
+        "the refusal committed or actuated a click anyway"
+    );
 }
 
 #[tokio::test]
