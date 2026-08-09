@@ -462,8 +462,12 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
 pub struct RawCapture {
     pub width: usize,
     pub height: usize,
-    pub bytes_per_row: usize,
-    /// Pixels in BGRA order, as the system delivers them.
+    /// Pixels in BGRA order, tightly packed: exactly `width * height * 4` bytes,
+    /// with no padding between rows.
+    ///
+    /// The system delivers rows padded to a stride of its own choosing; that
+    /// padding is removed before this is built, so the buffer can be indexed
+    /// from the dimensions alone.
     pub bgra: Vec<u8>,
     pub owner_pid_at_capture: u32,
 }
@@ -632,26 +636,53 @@ unsafe fn read_pixels(image: &CGImage, owner_pid_at_capture: u32) -> Result<RawC
         return Err("the image's pixels are not readable".to_string());
     }
     // SAFETY: the pointer and length come from the same object, which is held
-    // by this frame. The bytes are copied immediately, so nothing outlives it.
-    let bgra = unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec();
+    // by this frame. The bytes are read here and copied below, so nothing
+    // borrowed outlives this frame.
+    let source = unsafe { std::slice::from_raw_parts(pointer, length) };
 
     // A row stride shorter than the row means the buffer does not hold what its
     // dimensions describe, so nothing downstream could index it correctly.
-    if bytes_per_row < width * 4 || bgra.len() < bytes_per_row * height {
+    if bytes_per_row < width * 4 || source.len() < bytes_per_row * height {
         return Err(format!(
             "the image's pixels do not match its dimensions: {width}x{height}, \
              {bytes_per_row} bytes per row, {} bytes total",
-            bgra.len()
+            source.len()
         ));
     }
 
     Ok(RawCapture {
         width,
         height,
-        bytes_per_row,
-        bgra,
+        bgra: repack_rows(source, width, height, bytes_per_row),
         owner_pid_at_capture,
     })
+}
+
+/// Drop the padding the system leaves at the end of each row.
+///
+/// Rows arrive padded to a stride of the system's choosing, wider than the image
+/// whenever the width is not a convenient multiple. Removing it here, at the one
+/// place the stride is known, means what leaves this module is exactly
+/// `width * height * 4` bytes and can be indexed from the dimensions alone.
+///
+/// The alternative -- carrying the stride alongside the buffer -- makes every
+/// consumer responsible for a layout detail of one operating system's graphics
+/// stack, and a consumer that assumes the obvious packing decodes a
+/// progressively skewed image rather than failing outright. There is nothing in
+/// the padding worth preserving.
+///
+/// Separate from the capture that calls it so the arithmetic can be checked
+/// against a constructed buffer: the capture path needs a real screen and an
+/// unlocked one, which makes it unavailable exactly when a regression would be
+/// introduced.
+fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize) -> Vec<u8> {
+    let row_bytes = width * 4;
+    let mut packed = Vec::with_capacity(row_bytes * height);
+    for row in 0..height {
+        let start = row * bytes_per_row;
+        packed.extend_from_slice(&source[start..start + row_bytes]);
+    }
+    packed
 }
 
 #[cfg(test)]
@@ -889,17 +920,94 @@ mod tests {
             "captured a window owned by a different process than the one enumerated"
         );
         assert!(capture.width > 0 && capture.height > 0);
-        // Four bytes per pixel, so a buffer holding fewer than that is not the
-        // image it claims to be.
-        assert!(
-            capture.bgra.len() >= capture.bytes_per_row * capture.height,
-            "{}x{} at {} bytes per row cannot fit in {} bytes",
+        // Exactly four bytes per pixel with nothing between rows. Asserted as
+        // equality rather than a lower bound: the system pads rows to a stride
+        // of its own choosing, and a buffer still carrying that padding would
+        // satisfy "at least" while decoding to a skewed image.
+        assert_eq!(
+            capture.bgra.len(),
+            capture.width * capture.height * 4,
+            "{}x{} should be tightly packed, got {} bytes",
             capture.width,
             capture.height,
-            capture.bytes_per_row,
             capture.bgra.len()
         );
-        assert!(capture.bytes_per_row >= capture.width * 4);
+    }
+
+    /// Padding is dropped and the pixels keep their order.
+    ///
+    /// Built from a constructed buffer rather than a capture, so it holds on a
+    /// locked screen and on a machine with no capture permission -- the
+    /// conditions under which the capture-based tests here silently skip.
+    ///
+    /// The row marker is what makes this more than a length check: a repack that
+    /// dropped the wrong end of each row, or read from the wrong offset, still
+    /// produces a buffer of the right size.
+    #[test]
+    fn repacking_drops_the_padding_and_keeps_the_pixel_order() {
+        let (width, height) = (3usize, 4usize);
+        let row_bytes = width * 4;
+        let stride = row_bytes + 7;
+
+        let mut source = Vec::new();
+        for row in 0..height {
+            // First byte of each row identifies it; the rest of the pixel data
+            // is distinct from the padding that follows.
+            source.push(row as u8);
+            source.extend(std::iter::repeat_n(0xAA, row_bytes - 1));
+            source.extend(std::iter::repeat_n(0xFF, stride - row_bytes));
+        }
+
+        let packed = repack_rows(&source, width, height, stride);
+
+        assert_eq!(packed.len(), row_bytes * height);
+        assert!(!packed.contains(&0xFF), "padding survived the repack");
+        for row in 0..height {
+            assert_eq!(
+                packed[row * row_bytes],
+                row as u8,
+                "row {row} is not where it should be"
+            );
+        }
+    }
+
+    /// A buffer with no padding is returned unchanged.
+    #[test]
+    fn repacking_an_unpadded_buffer_changes_nothing() {
+        let (width, height) = (2usize, 2usize);
+        let row_bytes = width * 4;
+        let source: Vec<u8> = (0..(row_bytes * height) as u8).collect();
+        assert_eq!(repack_rows(&source, width, height, row_bytes), source);
+    }
+
+    /// Padding is removed for a width the system is known to pad.
+    ///
+    /// The window in the test above may happen to have a width the system does
+    /// not pad, in which case it passes whether or not the padding is stripped.
+    /// This looks for a window whose tight row length is not a multiple of the
+    /// 16-byte alignment CoreGraphics uses, so the source buffer is genuinely
+    /// wider than the image and the equality above can only hold if the repack
+    /// happened.
+    #[test]
+    fn a_padded_width_is_repacked_rather_than_carried() {
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            return;
+        };
+        let Some(window) = windows.iter().find(|window| {
+            window.on_screen
+                && window.width >= 8.0
+                && !(window.width as usize * 4).is_multiple_of(16)
+        }) else {
+            // No window on this screen has a padded width, so the property
+            // cannot be observed here. Skipped rather than asserted, since a
+            // pass would say nothing.
+            return;
+        };
+
+        let Ok(capture) = capture_window(window.window_id, Duration::from_secs(10)) else {
+            return;
+        };
+        assert_eq!(capture.bgra.len(), capture.width * capture.height * 4);
     }
 
     /// Capturing a window that no longer exists refuses.
