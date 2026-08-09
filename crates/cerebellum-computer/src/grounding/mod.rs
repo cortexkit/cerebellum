@@ -823,7 +823,11 @@ impl GroundingResolver {
         if element.target_process_generation != request.target.process_generation_evidence {
             return Err(GroundingFailure::StaleGrounding);
         }
-        if age_ms(now_ms, element.resolved_at_ms) > self.policy.age_bounds.element_ms {
+        if !within_age_bound(
+            now_ms,
+            element.resolved_at_ms,
+            self.policy.age_bounds.element_ms,
+        ) {
             return Err(GroundingFailure::StaleElement);
         }
 
@@ -887,7 +891,11 @@ impl GroundingResolver {
         if !tree.is_absent() && degeneracy.is_empty() {
             return Err(GroundingFailure::GroundingUntrusted);
         }
-        if age_ms(now_ms, fallback.captured_at_ms()) > self.policy.age_bounds.non_element_ms {
+        if !within_age_bound(
+            now_ms,
+            fallback.captured_at_ms(),
+            self.policy.age_bounds.non_element_ms,
+        ) {
             return Err(GroundingFailure::StaleGrounding);
         }
         let evidence_identifiers_present = match fallback {
@@ -929,7 +937,11 @@ impl GroundingResolver {
     ) -> GroundingResult {
         match &decision.target {
             GroundingTarget::SemanticElement(element) => {
-                if age_ms(now_ms, element.resolved_at_ms) > self.policy.age_bounds.element_ms {
+                if !within_age_bound(
+                    now_ms,
+                    element.resolved_at_ms,
+                    self.policy.age_bounds.element_ms,
+                ) {
                     return Err(GroundingFailure::StaleElement);
                 }
                 let evidence = driver.revalidate_element(element);
@@ -949,9 +961,11 @@ impl GroundingResolver {
                         element,
                         coordinate,
                     } => {
-                        if age_ms(now_ms, element.resolved_at_ms)
-                            > self.policy.age_bounds.element_ms
-                        {
+                        if !within_age_bound(
+                            now_ms,
+                            element.resolved_at_ms,
+                            self.policy.age_bounds.element_ms,
+                        ) {
                             return Err(GroundingFailure::StaleElement);
                         }
                         let evidence = driver.revalidate_element(element);
@@ -989,7 +1003,11 @@ impl GroundingResolver {
         now_ms: u64,
         target_process_generation: &str,
     ) -> Result<(), GroundingFailure> {
-        if age_ms(now_ms, evidence.captured_at_ms) > self.policy.age_bounds.non_element_ms {
+        if !within_age_bound(
+            now_ms,
+            evidence.captured_at_ms,
+            self.policy.age_bounds.non_element_ms,
+        ) {
             return Err(GroundingFailure::StaleGrounding);
         }
         if evidence.capture_generation.is_empty()
@@ -1020,7 +1038,11 @@ impl GroundingResolver {
         now_ms: u64,
         target_process_generation: &str,
     ) -> Result<(), GroundingFailure> {
-        if age_ms(now_ms, evidence.captured_at_ms) > self.policy.age_bounds.non_element_ms {
+        if !within_age_bound(
+            now_ms,
+            evidence.captured_at_ms,
+            self.policy.age_bounds.non_element_ms,
+        ) {
             return Err(GroundingFailure::StaleGrounding);
         }
         if evidence.capture_generation.is_empty()
@@ -1093,8 +1115,71 @@ impl GroundingResolver {
     }
 }
 
-fn age_ms(now_ms: u64, captured_at_ms: u64) -> u64 {
-    now_ms.saturating_sub(captured_at_ms)
+/// How old a piece of grounding evidence is, or `None` if it claims to have
+/// been captured after the moment being checked.
+///
+/// Every caller compares this against a freshness bound, so saturating an
+/// inverted subtraction to zero would report evidence from the future as the
+/// freshest possible and pass every one of those bounds. The inversion means
+/// the two readings do not share a clock, and a duration between readings on
+/// different clocks measures nothing — including when it happens to look
+/// plausible.
+///
+/// Absence rather than a large number, so a caller cannot compare its way past
+/// the question: there is no age to test, and each caller refuses.
+fn age_ms(now_ms: u64, captured_at_ms: u64) -> Option<u64> {
+    now_ms.checked_sub(captured_at_ms)
+}
+
+/// Whether evidence captured at `captured_at_ms` is within `bound_ms` of now.
+///
+/// False when the age cannot be computed at all, which keeps the refusal at the
+/// same call sites that already refuse stale evidence rather than adding a
+/// second failure path for a condition with the same remedy: capture again.
+fn within_age_bound(now_ms: u64, captured_at_ms: u64, bound_ms: u64) -> bool {
+    age_ms(now_ms, captured_at_ms).is_some_and(|age| age <= bound_ms)
+}
+
+#[cfg(test)]
+mod age_tests {
+    use super::*;
+
+    /// Evidence claiming to be from the future has no age, rather than the
+    /// freshest possible one.
+    ///
+    /// Every caller compares an age against a freshness bound, so saturating the
+    /// inverted subtraction to zero would pass all of them. An inversion means
+    /// the two readings did not share a clock, and a duration measured across
+    /// two clocks means nothing even when it looks plausible.
+    #[test]
+    fn evidence_from_the_future_has_no_age() {
+        assert_eq!(age_ms(1_000, 2_000), None);
+        assert_eq!(age_ms(1_000, 1_001), None);
+    }
+
+    /// An age that cannot be computed is not within any bound.
+    ///
+    /// Including a generous one: the check is not "is this recent enough" but
+    /// "is this measurable at all", and no bound can rescue an unmeasurable age.
+    #[test]
+    fn an_unmeasurable_age_is_within_no_bound() {
+        assert!(!within_age_bound(1_000, 2_000, 0));
+        assert!(!within_age_bound(1_000, 2_000, u64::MAX));
+    }
+
+    /// Ordinary ages compare against the bound as expected.
+    ///
+    /// The accepting case, so the refusals above cannot be satisfied by a
+    /// predicate that refuses everything.
+    #[test]
+    fn measurable_ages_compare_against_the_bound() {
+        assert_eq!(age_ms(2_000, 1_000), Some(1_000));
+        assert!(within_age_bound(2_000, 1_000, 1_000));
+        assert!(within_age_bound(2_000, 1_000, 1_001));
+        assert!(!within_age_bound(2_000, 1_000, 999));
+        // Same instant is age zero, which is measurable and fresh.
+        assert!(within_age_bound(1_000, 1_000, 0));
+    }
 }
 
 /// A deterministic driver useful for conformance fixtures and downstream slices.
