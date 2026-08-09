@@ -38,6 +38,45 @@ fn retained_snapshot(generation: u64) -> ScreenshotSnapshot {
     .unwrap()
 }
 
+/// The mapping is a ratio over the image's own width, so a coordinate taken
+/// from a differently-sized copy lands somewhere plausible instead of failing.
+///
+/// This is the reason `browser.click_point` requires the caller to echo the
+/// image dimensions it addressed: nothing about the coordinate itself reveals
+/// which copy it came from, and every guard here passes.
+///
+/// The numbers are the real ones. A 1728x1117 capture is resized by Anthropic's
+/// vision endpoint to 1372x887 before a model sees it, so a model naming the
+/// centre of what it saw reports (686, 443).
+#[test]
+fn a_coordinate_from_a_resized_copy_maps_in_bounds_and_wrong() {
+    let transform = TransformInputs::from_values(0.0, 0.0, 1728.0, 1117.0, 1.0, 1.0);
+
+    // What the model saw, and what it would report for the centre of that view.
+    let (seen_w, seen_h) = (1372.0_f64, 887.0_f64);
+    let (model_x, model_y) = (686_i64, 443_i64);
+
+    // Taken verbatim, as if it addressed the image we produced.
+    let verbatim = map_pixel_center(transform, 1728, 1117, model_x, model_y)
+        .expect("the coordinate is inside the image we retained, so nothing refuses it");
+
+    // Converted the way Anthropic documents: to a relative position in the
+    // image the model saw, then onto the image we produced.
+    let intended_x = (model_x as f64 / seen_w) * 1728.0;
+    let intended_y = (model_y as f64 / seen_h) * 1117.0;
+
+    let error_x = (verbatim.x_css - intended_x).abs();
+    let error_y = (verbatim.y_css - intended_y).abs();
+
+    // Asserted as a magnitude rather than a bare inequality: the point of the
+    // check is that the error is large enough to hit a different control, not
+    // merely that two numbers differ.
+    assert!(
+        error_x > 100.0 && error_y > 100.0,
+        "expected a large mis-click, got {error_x} across and {error_y} down"
+    );
+}
+
 #[test]
 fn device_scale_and_visual_viewport_scale_are_retained_but_not_multiplied() {
     let first = TransformInputs::from_values(4.0, 8.0, 200.0, 100.0, 1.0, 1.0);

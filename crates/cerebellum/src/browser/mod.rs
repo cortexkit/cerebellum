@@ -18,8 +18,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::authorization::{AuthorizationRequest, GrantStore, Severity};
 use crate::coordinate::{
-    capture_screenshot, map_pixel_center, CoordinateError, ScreenshotPayload, TransformInputs,
-    ViewportObservation,
+    capture_screenshot, map_pixel_center, CoordinateError, InvalidCoordinatesReason,
+    ScreenshotPayload, TransformInputs, ViewportObservation,
 };
 use crate::journal;
 use crate::journal::reservation::{
@@ -1213,7 +1213,18 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, BrowserError> {
         let object = self
-            .validate_request(args, &["snapshot_id", "x_px", "y_px", "intent", "severity"])
+            .validate_request(
+                args,
+                &[
+                    "snapshot_id",
+                    "x_px",
+                    "y_px",
+                    "image_width_px",
+                    "image_height_px",
+                    "intent",
+                    "severity",
+                ],
+            )
             .await?;
         let snapshot_id = required_string(object, "snapshot_id", 32, 32)?;
         if !snapshot_store::valid_snapshot_id(snapshot_id) {
@@ -1224,6 +1235,12 @@ impl BrowserPlane {
         }
         let x = required_signed_integer(object, "x_px")?;
         let y = required_signed_integer(object, "y_px")?;
+        // The image the caller was addressing. A pixel coordinate means nothing
+        // without the image it indexes, and these two numbers disagreeing with
+        // what was retained is the only evidence available that the caller was
+        // looking at a different copy of it.
+        let addressed_width = required_signed_integer(object, "image_width_px")?;
+        let addressed_height = required_signed_integer(object, "image_height_px")?;
         bounded_string(object, "intent", 0, 512)?;
         let requested_severity = parse_severity(object)?;
         self.reserve(identity, BrowserCapability::ClickPoint)
@@ -1259,6 +1276,18 @@ impl BrowserPlane {
                     return Err(map_snapshot_error(SnapshotError::WrongKind))
                 }
             };
+            // Checked before the coordinate is mapped and before anything is
+            // dispatched. A coordinate from a differently-sized copy lands
+            // inside the bounds of the retained image, so the mapping below
+            // would succeed and actuate at a point the caller never chose.
+            if i128::from(screenshot.image_width_px) != addressed_width
+                || i128::from(screenshot.image_height_px) != addressed_height
+            {
+                return Err(BrowserError::InvalidCoordinates {
+                    reason_code: InvalidCoordinatesReason::ImageSizeMismatch.reason_code(),
+                });
+            }
+
             let transform = TransformInputs::new(
                 screenshot.input_rect,
                 screenshot.device_scale_factor,
@@ -1547,8 +1576,8 @@ pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             CLICK_POINT,
-            "Click a retained screenshot pixel.",
-            json!({"type":"object","properties":{"snapshot_id":{"type":"string"},"x_px":{"type":"integer"},"y_px":{"type":"integer"},"intent":{"type":"string"},"severity":severity_schema()},"required":["snapshot_id","x_px","y_px","intent","severity"],"additionalProperties":false}),
+            "Click a retained screenshot pixel. Coordinates address the image this module declared; pass its image_width_px and image_height_px so a coordinate taken from a resized copy is refused rather than mis-clicked.",
+            json!({"type":"object","properties":{"snapshot_id":{"type":"string"},"x_px":{"type":"integer"},"y_px":{"type":"integer"},"image_width_px":{"type":"integer"},"image_height_px":{"type":"integer"},"intent":{"type":"string"},"severity":severity_schema()},"required":["snapshot_id","x_px","y_px","image_width_px","image_height_px","intent","severity"],"additionalProperties":false}),
         ),
         (
             WAIT_FOR,
