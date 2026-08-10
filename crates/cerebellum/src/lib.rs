@@ -1771,14 +1771,27 @@ pub async fn handle_tool_request_for_test_with_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerebellum_computer::platform::TargetResolution;
     use subc_protocol::Principal;
 
-    /// A management plane whose resolver finds nothing, for frame-level tests
-    /// that never reach a target.
+    /// A resolver that answers without consulting the machine.
+    ///
+    /// The real one reads the window server, which makes a test of frame
+    /// ROUTING depend on which applications happen to be running and on a call
+    /// that takes seconds. What is under test here is where a request is sent,
+    /// so the answer it eventually gets should be a fixture rather than a
+    /// property of the desk it runs on.
+    struct NothingRunning;
+
+    impl management::TargetResolver for NothingRunning {
+        fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+            TargetResolution::NotRunning
+        }
+    }
+
+    /// A management plane for frame-level tests, resolving nothing.
     fn test_management_plane() -> Arc<ManagementPlane> {
-        Arc::new(ManagementPlane::new(Arc::new(
-            management::PlatformResolver::new(),
-        )))
+        Arc::new(ManagementPlane::new(Arc::new(NothingRunning)))
     }
 
     /// An answer arriving on a route reaches the question that asked it.
