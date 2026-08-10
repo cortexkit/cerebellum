@@ -101,3 +101,15 @@ check_build_rewrote_nothing() {
 
 run_phase "the build rewrote no generated file" \
   check_build_rewrote_nothing
+
+# A single line naming the outcome, so a caller reading a filtered view of this
+# output can find it by looking for one fixed word rather than by anticipating
+# every way a phase can fail.
+#
+# The exit status is the real contract and this changes nothing about it. It
+# exists because the output is routinely read through a filter, and a filter
+# that greps for the failures its author expected reports the ones they did not
+# as success: `cargo fmt` announces a problem with a diff and no error word at
+# all. A phase that fails never reaches this line, so its ABSENCE is as
+# meaningful as its presence.
+echo "GATE PASSED: all phases green"
