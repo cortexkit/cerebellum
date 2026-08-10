@@ -16,6 +16,7 @@ pub mod classification;
 pub mod connector_evidence;
 pub mod coordinate;
 pub mod custody;
+pub mod elicit;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
@@ -36,6 +37,8 @@ use serde_json::json;
 use serde_json::Value;
 
 pub use cerebellum_computer as computer;
+
+use crate::elicit::{Elicitor, SharedElicitor};
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -708,6 +711,7 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let health_state = Arc::new(HealthState::with_config(config.health));
     let route_bindings = Arc::new(RouteBindings::new());
     let browser_plane = Arc::new(BrowserPlane::new());
+    let elicitor: SharedElicitor = Arc::new(Elicitor::new());
     let loop_result = module_loop(
         &mut read_half,
         tx.clone(),
@@ -715,6 +719,7 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
         Arc::clone(&health_state),
         Arc::clone(&route_bindings),
         browser_plane,
+        elicitor,
     )
     .await;
     drop(tx);
@@ -787,6 +792,7 @@ async fn module_loop<R>(
     health_state: Arc<HealthState>,
     route_bindings: Arc<RouteBindings>,
     browser_plane: Arc<BrowserPlane>,
+    elicitor: SharedElicitor,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -804,12 +810,14 @@ where
     let handler_health = Arc::clone(&health_state);
     let handler_routes = Arc::clone(&route_bindings);
     let handler_browser = Arc::clone(&browser_plane);
+    let handler_elicitor = Arc::clone(&elicitor);
     let handler = move |frame: Frame| {
         let writer = writer.clone();
         let health = Arc::clone(&handler_health);
         let routes = Arc::clone(&handler_routes);
         let browser = Arc::clone(&handler_browser);
-        async move { handle_frame(frame, &writer, &health, &routes, &browser).await }
+        let elicitor = Arc::clone(&handler_elicitor);
+        async move { handle_frame(frame, &writer, &health, &routes, &browser, &elicitor).await }
     };
 
     run_dispatch_loop(read_half, &health_state, &clock, &mut idle_wake, handler).await
@@ -974,6 +982,7 @@ async fn handle_frame(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
     browser_plane: &Arc<BrowserPlane>,
+    elicitor: &SharedElicitor,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -988,6 +997,25 @@ async fn handle_frame(
             )
             .map_err(|e| ModuleError::Message(e.to_string()))?;
             send(writer, pong).await?;
+            Ok(true)
+        }
+        // An answer to a question this module asked. Requests are what we
+        // ANSWER and responses are what we RECEIVE, so an inbound response can
+        // only belong to an exchange we opened; the direction settles ownership
+        // without a private correlation space.
+        //
+        // Without this arm the frame fell through to the catch-all and was
+        // dropped, so a question waited out its whole deadline and reported that
+        // nobody replied. That is indistinguishable from a consumer ignoring it,
+        // which is why the absence could not have been noticed from the outside.
+        FrameType::Response => {
+            let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
+            if !elicitor.deliver(frame.header.channel, frame.header.corr, body) {
+                // Nobody was waiting: an answer that arrived after its deadline,
+                // or a correlation this module never sent. Dropped deliberately
+                // rather than acted on, because there is no exchange to complete
+                // and a late answer must not revive an abandoned one.
+            }
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
@@ -1509,6 +1537,100 @@ pub async fn handle_tool_request_for_test_with_bindings(
 mod tests {
     use super::*;
     use subc_protocol::Principal;
+
+    /// An answer arriving on a route reaches the question that asked it.
+    ///
+    /// The frame dispatcher previously had no arm for a response: it fell through
+    /// to the catch-all and was dropped, so a question waited out its whole
+    /// deadline and reported that nobody replied. That is indistinguishable from
+    /// a consumer ignoring the question, which is why nothing outside the module
+    /// could have detected the missing arm.
+    ///
+    /// Driven through `handle_frame` rather than through the elicitor directly,
+    /// because the elicitor's own tests already pass with no arm at all. What is
+    /// under test is the dispatcher routing the frame there.
+    #[tokio::test]
+    async fn a_response_frame_reaches_the_question_that_asked_it() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let elicitor: SharedElicitor = Arc::new(Elicitor::new());
+        let health = Arc::new(HealthState::default());
+        let routes = Arc::new(RouteBindings::new());
+        let browser = Arc::new(BrowserPlane::new());
+
+        // A question is outstanding, so there is something for the answer to
+        // reach. Asked on its own task because it waits for the reply.
+        let asking = {
+            let elicitor = Arc::clone(&elicitor);
+            let writer_tx = writer_tx.clone();
+            tokio::spawn(async move {
+                elicitor
+                    .ask(
+                        &writer_tx,
+                        4,
+                        1,
+                        json!({"method": "elicitation/create"}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        let question = writer_rx.recv().await.expect("the question is sent");
+
+        let answer = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr,
+            br#"{"decision":"allow"}"#.to_vec(),
+        )
+        .unwrap();
+
+        let keep_going = handle_frame(answer, &writer_tx, &health, &routes, &browser, &elicitor)
+            .await
+            .expect("an answer is handled");
+        assert!(keep_going, "handling an answer closed the connection");
+
+        assert_eq!(
+            asking.await.unwrap(),
+            crate::elicit::AskOutcome::Answered(json!({"decision": "allow"})),
+            "the answer did not reach the question"
+        );
+    }
+
+    /// An answer nobody is waiting for is dropped without disturbing the loop.
+    ///
+    /// A late reply, or a correlation this module never sent. It must neither
+    /// revive an abandoned question nor take the connection down: an unsolicited
+    /// frame is a normal event on a shared route.
+    #[tokio::test]
+    async fn an_unsolicited_answer_is_dropped_without_closing_the_route() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(8);
+        let elicitor: SharedElicitor = Arc::new(Elicitor::new());
+
+        let answer = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            9_999,
+            br#"{"decision":"allow"}"#.to_vec(),
+        )
+        .unwrap();
+
+        let keep_going = handle_frame(
+            answer,
+            &writer_tx,
+            &Arc::new(HealthState::default()),
+            &Arc::new(RouteBindings::new()),
+            &Arc::new(BrowserPlane::new()),
+            &elicitor,
+        )
+        .await
+        .expect("an unsolicited answer is handled");
+        assert!(keep_going, "an unsolicited answer closed the connection");
+        assert_eq!(elicitor.outstanding(), 0);
+    }
 
     #[test]
     fn parse_subc_arg_accepts_space_separated() {
