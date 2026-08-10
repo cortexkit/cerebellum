@@ -19,6 +19,8 @@ fn pixel() -> FallbackGrounding {
         target_process_generation: "gen-1".to_string(),
         window_identifier: "window-1".to_string(),
         coordinate: Coordinate::new(12.0, 14.0),
+        read_from_width_px: 1920,
+        read_from_height_px: 1080,
         captured_at_ms: 0,
     })
 }
