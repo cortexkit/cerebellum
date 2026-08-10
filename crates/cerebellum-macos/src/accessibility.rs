@@ -982,6 +982,32 @@ mod tests {
         }
     }
 
+    fn populated_node(
+        prefix: &str,
+        enabled: bool,
+        focused: bool,
+        frame: AxFrame,
+        children: Vec<usize>,
+    ) -> ElementSnapshot<usize> {
+        ElementSnapshot {
+            // Distinct labels make field swaps visible rather than merely proving
+            // that some string survived the traversal.
+            role: Some(format!("{prefix}-role")),
+            subrole: Some(format!("{prefix}-subrole")),
+            title: Some(format!("{prefix}-title")),
+            value_description: Some(format!("{prefix}-value-description")),
+            identifier: Some(format!("{prefix}-identifier")),
+            enabled: Some(enabled),
+            focused: Some(focused),
+            frame: Some(frame),
+            actions: vec![
+                format!("{prefix}-first-action"),
+                format!("{prefix}-second-action"),
+            ],
+            children,
+        }
+    }
+
     fn options(max_depth: usize, max_elements: usize) -> AxReadOptions {
         AxReadOptions {
             timeout: Duration::from_secs(1),
@@ -1009,6 +1035,59 @@ mod tests {
                 actions: Vec::new(),
                 children: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn populated_parent_and_child_values_round_trip_without_swaps_or_loss() {
+        let parent_frame = AxFrame {
+            x: 11.0,
+            y: 22.0,
+            width: 33.0,
+            height: 44.0,
+        };
+        let child_frame = AxFrame {
+            x: 55.0,
+            y: 66.0,
+            width: 77.0,
+            height: 88.0,
+        };
+        let mut source = FakeSource::with_nodes(vec![
+            populated_node("parent", true, false, parent_frame, vec![1]),
+            populated_node("child", false, true, child_frame, Vec::new()),
+        ]);
+
+        assert_eq!(
+            read_tree_from(&mut source, 42, options(1, 2)),
+            Ok(AxElement {
+                role: Some("parent-role".to_string()),
+                subrole: Some("parent-subrole".to_string()),
+                title: Some("parent-title".to_string()),
+                value_description: Some("parent-value-description".to_string()),
+                identifier: Some("parent-identifier".to_string()),
+                enabled: Some(true),
+                focused: Some(false),
+                frame: Some(parent_frame),
+                actions: vec![
+                    "parent-first-action".to_string(),
+                    "parent-second-action".to_string(),
+                ],
+                children: vec![AxElement {
+                    role: Some("child-role".to_string()),
+                    subrole: Some("child-subrole".to_string()),
+                    title: Some("child-title".to_string()),
+                    value_description: Some("child-value-description".to_string()),
+                    identifier: Some("child-identifier".to_string()),
+                    enabled: Some(false),
+                    focused: Some(true),
+                    frame: Some(child_frame),
+                    actions: vec![
+                        "child-first-action".to_string(),
+                        "child-second-action".to_string(),
+                    ],
+                    children: Vec::new(),
+                }],
+            })
         );
     }
 
@@ -1146,6 +1225,9 @@ mod tests {
         );
     }
 
+    /// Reads a real tree only when the process hosting this test binary has been
+    /// granted macOS Accessibility permission and exposes an application root.
+    /// The grant belongs to that host process, not to this Rust crate.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_test_process_tree_is_read_when_it_exposes_accessibility_values() {
@@ -1166,12 +1248,12 @@ mod tests {
             }
             Err(AxReadError::PermissionNotGranted) => {
                 eprintln!(
-                    "SKIPPED real accessibility tree read: this test process has no accessibility permission"
+                    "SKIPPED — LIVE AX TREE NOT TESTED: Accessibility permission is not granted to the process hosting this test binary"
                 );
             }
             Err(AxReadError::ProcessNotAccessible { ax_error, .. }) => {
                 eprintln!(
-                    "SKIPPED real accessibility tree read: the test binary exposes no application tree (AX error {ax_error})"
+                    "SKIPPED — LIVE AX TREE NOT TESTED: the host test process exposes no application tree (AX error {ax_error})"
                 );
             }
             Err(other) => panic!("reading the live test process failed unexpectedly: {other}"),
