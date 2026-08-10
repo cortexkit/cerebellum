@@ -290,6 +290,21 @@ pub struct PixelEvidence {
     pub target_process_generation: String,
     pub window_identifier: String,
     pub coordinate: Coordinate,
+    /// The size of the image the coordinate was read from.
+    ///
+    /// A pixel coordinate means nothing without the image it indexes, and this
+    /// is not implied by `capture_generation`: a model shown a downscaled copy
+    /// of a capture reports coordinates in the copy's space while the capture
+    /// itself is unchanged, so the generation matches and the point is wrong.
+    /// Nothing about the coordinate reveals which copy produced it, and a
+    /// coordinate from a smaller copy still falls inside the capture, so no
+    /// bounds check refuses it.
+    ///
+    /// Recording the frame is what makes the comparison expressible: a consumer
+    /// holding the capture can require these to match its own dimensions, and
+    /// refuse rather than actuate at a point the caller never chose.
+    pub read_from_width_px: u32,
+    pub read_from_height_px: u32,
     pub captured_at_ms: u64,
 }
 
@@ -301,6 +316,11 @@ pub struct SetOfMarksEvidence {
     pub window_identifier: String,
     pub mark_identifier: String,
     pub coordinate: Coordinate,
+    /// The size of the image the coordinate was read from, for the same reason
+    /// [`PixelEvidence`] carries it: a mark selected on a downscaled copy yields
+    /// a coordinate in the copy's space, and the capture is unchanged.
+    pub read_from_width_px: u32,
+    pub read_from_height_px: u32,
     pub captured_at_ms: u64,
 }
 
@@ -613,6 +633,20 @@ pub enum CoordinateAddress {
     SetOfMarks(SetOfMarksEvidence),
 }
 
+impl PixelEvidence {
+    /// Whether this records the image its coordinate indexes.
+    pub const fn frame_is_present(&self) -> bool {
+        self.read_from_width_px > 0 && self.read_from_height_px > 0
+    }
+}
+
+impl SetOfMarksEvidence {
+    /// Whether this records the image its coordinate indexes.
+    pub const fn frame_is_present(&self) -> bool {
+        self.read_from_width_px > 0 && self.read_from_height_px > 0
+    }
+}
+
 impl CoordinateAddress {
     pub fn coordinate(&self) -> Coordinate {
         match self {
@@ -898,12 +932,20 @@ impl GroundingResolver {
         ) {
             return Err(GroundingFailure::StaleGrounding);
         }
+        // The frame is required alongside the identifiers, because a coordinate
+        // whose image is unknown cannot be checked by anything downstream: the
+        // driver's capture comparison has nothing to compare, and every bounds
+        // check passes on a point from a smaller copy.
         let evidence_identifiers_present = match fallback {
             FallbackGrounding::Pixel(evidence) => {
-                !evidence.capture_generation.is_empty() && !evidence.window_identifier.is_empty()
+                !evidence.capture_generation.is_empty()
+                    && !evidence.window_identifier.is_empty()
+                    && evidence.frame_is_present()
             }
             FallbackGrounding::SetOfMarks(evidence) => {
-                !evidence.capture_generation.is_empty() && !evidence.window_identifier.is_empty()
+                !evidence.capture_generation.is_empty()
+                    && !evidence.window_identifier.is_empty()
+                    && evidence.frame_is_present()
             }
         };
         if !evidence_identifiers_present
@@ -1182,6 +1224,49 @@ mod age_tests {
     }
 }
 
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    fn evidence(width: u32, height: u32) -> PixelEvidence {
+        PixelEvidence {
+            capture_generation: "capture-1".to_string(),
+            target_process_generation: "generation".to_string(),
+            window_identifier: "window".to_string(),
+            coordinate: Coordinate::new(30.0, 40.0),
+            read_from_width_px: width,
+            read_from_height_px: height,
+            captured_at_ms: 0,
+        }
+    }
+
+    /// Pixel evidence without the size of the image it was read from is refused.
+    ///
+    /// A coordinate is an index into an image, and every other field here
+    /// describes the CAPTURE rather than the image a coordinate was read from.
+    /// Those differ whenever the reader was shown a scaled copy: the capture is
+    /// unchanged, so its generation still matches, while the coordinate belongs
+    /// to a smaller picture and lands inside the capture's bounds anyway.
+    ///
+    /// Refused rather than defaulted, because there is no size that can stand in
+    /// for an unknown one: assuming the capture's own dimensions is exactly the
+    /// assumption that produces the wrong point.
+    #[test]
+    fn pixel_evidence_without_its_frame_is_refused() {
+        assert!(!evidence(0, 1080).frame_is_present());
+        assert!(!evidence(1920, 0).frame_is_present());
+        assert!(!evidence(0, 0).frame_is_present());
+    }
+
+    /// Evidence carrying a frame is accepted, so the refusals above are not
+    /// satisfied by a check that refuses everything.
+    #[test]
+    fn pixel_evidence_with_a_frame_is_accepted() {
+        assert!(evidence(1920, 1080).frame_is_present());
+        assert!(evidence(1, 1).frame_is_present());
+    }
+}
+
 /// A deterministic driver useful for conformance fixtures and downstream slices.
 /// It records the call sequence so tests can prove the handshake preceded tree
 /// classification and that revalidation happened before dispatch.
@@ -1373,6 +1458,8 @@ mod tests {
             target_process_generation: "generation".to_string(),
             window_identifier: "window".to_string(),
             coordinate: Coordinate::new(30.0, 40.0),
+            read_from_width_px: 1920,
+            read_from_height_px: 1080,
             captured_at_ms: 0,
         })
     }
