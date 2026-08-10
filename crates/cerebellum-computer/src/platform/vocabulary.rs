@@ -1,9 +1,12 @@
 //! Digest-pinned, canonical computer action vocabulary validation.
 
+use super::PermissionService;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::OnceLock;
 
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
 pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v1";
@@ -444,4 +447,192 @@ fn hex(bytes: &[u8]) -> String {
             ]
         })
         .collect()
+}
+
+/// Why a capability's required permissions could not be read from the frozen
+/// vocabulary. A shorter list is never a valid answer: dropping a service is
+/// how a real OS requirement becomes invisible to probes and to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VocabularyPermissionError {
+    /// The capability id is not one of the frozen rows.
+    UnknownCapability(String),
+    /// A row named a service the `PermissionService` enum does not have.
+    UnrecognizedService(String),
+    /// The embedded artifact could not be interpreted as the expected table.
+    MalformedArtifact(String),
+}
+
+impl fmt::Display for VocabularyPermissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for VocabularyPermissionError {}
+
+fn parse_permission_service(name: &str) -> Result<PermissionService, VocabularyPermissionError> {
+    match name {
+        "accessibility" => Ok(PermissionService::Accessibility),
+        "post_event" => Ok(PermissionService::PostEvent),
+        "input_monitoring" => Ok(PermissionService::InputMonitoring),
+        "screen_recording" => Ok(PermissionService::ScreenRecording),
+        // RawHidObservation exists on the enum for probe results but is not a
+        // vocabulary-row requirement today; an unknown string must still refuse
+        // rather than map onto it by guess.
+        other => Err(VocabularyPermissionError::UnrecognizedService(
+            other.to_string(),
+        )),
+    }
+}
+
+/// Build the capability → required-services table from vocabulary bytes.
+///
+/// Every string in `required_permission_services` must map to a known
+/// `PermissionService`. Skipping an unknown name would shrink the list and
+/// hide a real OS requirement — the same class of defect as hard-coding a
+/// shorter set in the driver.
+fn parse_permission_table(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, Vec<PermissionService>>, VocabularyPermissionError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| VocabularyPermissionError::MalformedArtifact(error.to_string()))?;
+    let rows = value
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| VocabularyPermissionError::MalformedArtifact("missing rows array".into()))?;
+    let mut table = BTreeMap::new();
+    for row in rows {
+        let id = row
+            .get("capability_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                VocabularyPermissionError::MalformedArtifact("row missing capability_id".into())
+            })?
+            .to_string();
+        let services = row
+            .get("required_permission_services")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                VocabularyPermissionError::MalformedArtifact(format!(
+                    "{id} missing required_permission_services",
+                ))
+            })?;
+        let mut parsed = Vec::with_capacity(services.len());
+        for service in services {
+            let name = service.as_str().ok_or_else(|| {
+                VocabularyPermissionError::MalformedArtifact(format!(
+                    "{id} has a non-string permission service",
+                ))
+            })?;
+            parsed.push(parse_permission_service(name)?);
+        }
+        table.insert(id, parsed);
+    }
+    Ok(table)
+}
+
+fn permission_table(
+) -> Result<&'static BTreeMap<String, Vec<PermissionService>>, VocabularyPermissionError> {
+    static TABLE: OnceLock<
+        Result<BTreeMap<String, Vec<PermissionService>>, VocabularyPermissionError>,
+    > = OnceLock::new();
+    match TABLE.get_or_init(|| parse_permission_table(COMPUTER_ACTION_VOCABULARY_ARTIFACT)) {
+        Ok(table) => Ok(table),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// Required OS permission services for a frozen capability, taken from the
+/// digest-locked vocabulary rather than restated beside the driver.
+///
+/// Unknown capability ids and unrecognised service names both refuse: there is
+/// no default set to fall back to, because inventing one is how the driver and
+/// the contract drift apart.
+pub fn required_permission_services(
+    capability_id: &str,
+) -> Result<Vec<PermissionService>, VocabularyPermissionError> {
+    let table = permission_table()?;
+    table
+        .get(capability_id)
+        .cloned()
+        .ok_or_else(|| VocabularyPermissionError::UnknownCapability(capability_id.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_rows_require_exactly_the_services_the_vocabulary_lists() {
+        assert_eq!(
+            required_permission_services("computer.click").expect("click"),
+            vec![
+                PermissionService::Accessibility,
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+        );
+        assert_eq!(
+            required_permission_services("computer.type").expect("type"),
+            vec![
+                PermissionService::Accessibility,
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+        );
+        assert_eq!(
+            required_permission_services("computer.keys").expect("keys"),
+            vec![
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+        );
+        assert_eq!(
+            required_permission_services("computer.scroll").expect("scroll"),
+            vec![
+                PermissionService::Accessibility,
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+        );
+        assert_eq!(
+            required_permission_services("computer.move").expect("move"),
+            vec![PermissionService::InputMonitoring]
+        );
+        assert_eq!(
+            required_permission_services("computer.drag").expect("drag"),
+            vec![
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+        );
+        assert_eq!(
+            required_permission_services("computer.screenshot").expect("screenshot"),
+            vec![PermissionService::ScreenRecording]
+        );
+        assert_eq!(
+            required_permission_services("computer.wait").expect("wait"),
+            Vec::<PermissionService>::new()
+        );
+    }
+
+    #[test]
+    fn an_unknown_capability_has_no_permission_list() {
+        assert_eq!(
+            required_permission_services("computer.nope"),
+            Err(VocabularyPermissionError::UnknownCapability(
+                "computer.nope".into(),
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_permission_service_is_refused() {
+        let bytes = br#"{"rows":[{"capability_id":"computer.wait","required_permission_services":["telepathy"]}]}"#;
+        assert_eq!(
+            parse_permission_table(bytes),
+            Err(VocabularyPermissionError::UnrecognizedService(
+                "telepathy".into(),
+            ))
+        );
+    }
 }

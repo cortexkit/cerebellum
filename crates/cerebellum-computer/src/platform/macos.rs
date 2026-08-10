@@ -159,14 +159,14 @@ impl MacOs26PlatformDriver {
             "computer.move" | "computer.screenshot" | "computer.wait" => RetryClass::Idempotent,
             _ => RetryClass::NeverAutomaticRetry,
         };
-        let permissions = match id {
-            "computer.screenshot" => vec![PermissionService::ScreenRecording],
-            "computer.wait" => vec![],
-            _ => vec![
-                PermissionService::Accessibility,
-                PermissionService::PostEvent,
-            ],
-        };
+        // Taken from the frozen vocabulary rather than restated here: a second
+        // hand-written table drifts the moment a row changes, and the digest
+        // would still only pin the document. An unknown id or unrecognised
+        // service name refuses inside the lookup; there is no default set.
+        let permissions =
+            super::vocabulary::required_permission_services(id).unwrap_or_else(|error| {
+                panic!("frozen vocabulary permission lookup failed for {id}: {error}")
+            });
         let mut advertised = false;
         let mut suppression_reason =
             Some("dispatch advertisement belongs to a later C1 slice".to_string());

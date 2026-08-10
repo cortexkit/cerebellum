@@ -275,39 +275,21 @@ fn known_wait_audit_obligation_disagreement_remains_asserted() {
     assert_eq!(implemented, AuditObligation::Required);
 }
 
-/// The keys permission exception remains explicit: the frozen row requires
-/// post-event plus input-monitoring, while the platform declaration supplies
-/// accessibility plus post-event. This must fail when those lists agree.
+/// Platform declarations require exactly the permission services each frozen
+/// row lists. Deriving them from the vocabulary is what keeps a missing service
+/// (for example input monitoring) from being something the driver never probes
+/// for and never reports as absent.
 #[test]
-fn known_keys_permission_services_disagreement_remains_asserted() {
+fn permission_services_agree_with_the_frozen_vocabulary() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
-    let keys = vocabulary["rows"]
-        .as_array()
-        .expect("rows")
-        .iter()
-        .find(|row| row["capability_id"].as_str() == Some("computer.keys"))
-        .expect("the frozen vocabulary contains keys");
-    let frozen = frozen_permission_services(keys);
-    let implemented = code_permission_services("computer.keys");
-
-    assert_eq!(
-        frozen,
-        vec![
-            PermissionService::PostEvent,
-            PermissionService::InputMonitoring,
-        ]
-    );
-    assert_ne!(
-        frozen, implemented,
-        "keys permission services now agree; remove this asserted exception"
-    );
-    assert_eq!(
-        implemented,
-        vec![
-            PermissionService::Accessibility,
-            PermissionService::PostEvent,
-        ]
-    );
+    for row in vocabulary["rows"].as_array().expect("rows") {
+        let capability = row["capability_id"].as_str().expect("a capability id");
+        assert_eq!(
+            code_permission_services(capability),
+            frozen_permission_services(row),
+            "{capability} has different frozen and declared permission services"
+        );
+    }
 }
 
 /// Every capability the vocabulary names is one the code serves, so a frozen
