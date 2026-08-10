@@ -730,10 +730,13 @@ mod platform {
             if result == 0 {
                 true
             } else {
-                // ESRCH is the only answer that says no process exists. EPERM and
-                // any other failure still describe a pid held by a process.
+                // `ESRCH` is the only answer meaning no process exists. `EPERM`
+                // and every other failure still describe a pid that some
+                // process holds, which this call cannot signal rather than one
+                // that is absent.
                 // SAFETY: reads thread-local errno set by `process_signal` above.
-                unsafe { errno_location().read() != 3 }
+                const ESRCH: c_int = 3;
+                unsafe { errno_location().read() != ESRCH }
             }
         }
 
