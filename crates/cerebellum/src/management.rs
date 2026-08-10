@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cerebellum_computer::platform::{TargetCandidate, TargetResolution};
+use cerebellum_computer::platform::{ProcessGrant, TargetCandidate, TargetResolution};
 use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::consent::{ActionKind, ConsentLeases, GrantKind, LeaseKey, Opening};
 use serde_json::{json, Value};
@@ -40,6 +40,19 @@ pub fn action_kind_from_wire(kind: &str) -> Option<ActionKind> {
         "compose" => Some(ActionKind::Compose),
         "mutate_durable" => Some(ActionKind::MutateDurable),
         _ => None,
+    }
+}
+
+/// How an action kind is spelled on the wire.
+///
+/// The inverse of [`action_kind_from_wire`], so a refusal can name the value a
+/// caller should send back. A refusal that describes the remedy in different
+/// words than the request accepts is a remedy the caller cannot follow.
+pub fn action_kind_to_wire(kind: ActionKind) -> &'static str {
+    match kind {
+        ActionKind::Observe => "observe",
+        ActionKind::Compose => "compose",
+        ActionKind::MutateDurable => "mutate_durable",
     }
 }
 
@@ -277,6 +290,74 @@ pub struct Question {
     pub ask_id: String,
     pub body: Value,
     pub deadline: Duration,
+}
+
+/// What authority an action has over an application, at the moment it asks.
+///
+/// The refusal carries the way out rather than only the diagnosis. An explicit
+/// opening step can be forgotten, and an agent that forgot it learns from this
+/// refusal in one round trip instead of needing to have read the manual first,
+/// which is what makes requiring the explicit step affordable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionAuthority {
+    /// A lease admits this action against the named process.
+    Admitted(ProcessGrant),
+    /// Nothing admits it. Carries the operation to call and what to name.
+    Refused(Value),
+}
+
+impl ManagementPlane {
+    /// Find the lease an action runs under, or refuse with the way to get one.
+    ///
+    /// Requests that carry no target of their own resolve to the application
+    /// most recently opened for this action kind, which is the agent's own last
+    /// deliberate act rather than a property of the machine.
+    ///
+    /// The target is resolved again here rather than carried from the opening: a
+    /// lease records that the user agreed, and resolving says the process they
+    /// agreed about is still the one answering to that name. A process that
+    /// exited and had its identifier reused would otherwise inherit a grant made
+    /// for something else.
+    pub async fn authority_for<C: MonotonicClock>(
+        &self,
+        grantee: &str,
+        action_kind: ActionKind,
+        clock: &C,
+    ) -> ActionAuthority {
+        let focused = {
+            let mut leases = self.leases.lock().await;
+            leases.focused(grantee, action_kind, clock)
+        };
+        let Some(key) = focused else {
+            return ActionAuthority::Refused(json!({
+                "outcome": "no_lease",
+                "remedy": format!(
+                    "call {OPEN_TARGET} with the bundle_identity of the application and \
+                     action_kind '{}', then retry",
+                    action_kind_to_wire(action_kind)
+                ),
+            }));
+        };
+
+        match self.resolver.resolve(&key.bundle_identity) {
+            TargetResolution::Resolved(grant) => ActionAuthority::Admitted(grant),
+            // The lease is held and the thing it was granted over is gone. Not
+            // reported as a missing lease: the remedy is to start the
+            // application, and telling the agent to ask again for permission it
+            // already holds would send it to the user for nothing.
+            TargetResolution::NotRunning => ActionAuthority::Refused(json!({
+                "outcome": "target_not_running",
+                "bundle_identity": key.bundle_identity,
+                "remedy": "start the application, then retry",
+            })),
+            TargetResolution::Ambiguous(candidates) => ActionAuthority::Refused(json!({
+                "outcome": "ambiguous",
+                "bundle_identity": key.bundle_identity,
+                "instances": describe(&candidates),
+                "remedy": "quit all but one instance, then retry",
+            })),
+        }
+    }
 }
 
 /// The question put to the user.
@@ -572,6 +653,148 @@ mod tests {
         assert!(grant_from_answer(&json!({"decision": "yes"}), &clock).is_none());
         assert!(grant_from_answer(&json!({"decision": "allow_forever"}), &clock).is_none());
         assert!(grant_from_answer(&json!({"decision": "allow_once"}), &clock).is_some());
+    }
+
+    /// An action with no lease is refused with the way to get one.
+    ///
+    /// The remedy names the operation AND the exact value to send: a refusal
+    /// that describes the remedy in different words than the request accepts is
+    /// one the caller cannot follow.
+    #[tokio::test]
+    async fn an_unleased_action_is_refused_with_the_recipe() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let ActionAuthority::Refused(refusal) = plane
+            .authority_for("pj-example", ActionKind::Observe, &clock)
+            .await
+        else {
+            panic!("an action with no lease must be refused");
+        };
+
+        assert_eq!(refusal["outcome"], "no_lease");
+        let remedy = refusal["remedy"].as_str().unwrap();
+        assert!(remedy.contains(OPEN_TARGET), "{remedy}");
+        assert!(remedy.contains("bundle_identity"), "{remedy}");
+        // The wire spelling, so following the remedy produces a valid request.
+        assert!(remedy.contains("'observe'"), "{remedy}");
+        assert!(action_kind_from_wire("observe").is_some());
+    }
+
+    /// Once consent is given, the action runs against the process named by it.
+    #[tokio::test]
+    async fn a_granted_action_names_the_process_it_runs_against() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let (reply, _) = open(&plane, &clock).await;
+        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
+        plane
+            .settle(
+                &ask_id,
+                Some(&json!({"decision": "allow_10_minutes"})),
+                &clock,
+            )
+            .await;
+
+        let ActionAuthority::Admitted(grant) = plane
+            .authority_for("pj-example", ActionKind::Observe, &clock)
+            .await
+        else {
+            panic!("a granted action must be admitted");
+        };
+        assert_eq!(grant.pid, 4242);
+        assert_eq!(grant.bundle_identity, "com.apple.Safari");
+    }
+
+    /// A grant to look does not admit an action that touches.
+    #[tokio::test]
+    async fn looking_consent_does_not_admit_composing() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let (reply, _) = open(&plane, &clock).await;
+        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
+        plane
+            .settle(
+                &ask_id,
+                Some(&json!({"decision": "allow_10_minutes"})),
+                &clock,
+            )
+            .await;
+
+        let ActionAuthority::Refused(refusal) = plane
+            .authority_for("pj-example", ActionKind::Compose, &clock)
+            .await
+        else {
+            panic!("permission to look admitted an action that touches");
+        };
+        assert_eq!(refusal["outcome"], "no_lease");
+        assert!(refusal["remedy"].as_str().unwrap().contains("'compose'"));
+    }
+
+    /// A lease whose application has since quit is not reported as unleased.
+    ///
+    /// The remedy differs: this one is answered by starting the application, and
+    /// sending the agent back to the user for permission it already holds would
+    /// prompt for nothing.
+    #[tokio::test]
+    async fn a_lease_over_a_departed_application_says_so() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let (reply, _) = open(&plane, &clock).await;
+        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
+        plane
+            .settle(
+                &ask_id,
+                Some(&json!({"decision": "allow_10_minutes"})),
+                &clock,
+            )
+            .await;
+
+        // The lease survives; the application does not.
+        let departed = ManagementPlane::new(Arc::new(Fixed(TargetResolution::NotRunning)));
+        {
+            let mut from = plane.leases.lock().await;
+            let mut into = departed.leases.lock().await;
+            std::mem::swap(&mut *from, &mut *into);
+        }
+
+        let ActionAuthority::Refused(refusal) = departed
+            .authority_for("pj-example", ActionKind::Observe, &clock)
+            .await
+        else {
+            panic!("an action over a departed application must be refused");
+        };
+        assert_eq!(refusal["outcome"], "target_not_running");
+        assert!(refusal["remedy"].as_str().unwrap().contains("start"));
+    }
+
+    /// An expired lease refuses, rather than admitting on a stale focus.
+    #[tokio::test]
+    async fn an_expired_lease_admits_nothing() {
+        let plane = plane(one_instance());
+        let mut clock = FakeClock::new();
+
+        let (reply, _) = open(&plane, &clock).await;
+        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
+        plane
+            .settle(
+                &ask_id,
+                Some(&json!({"decision": "allow_10_minutes"})),
+                &clock,
+            )
+            .await;
+
+        clock.advance(Duration::from_secs(600));
+        let ActionAuthority::Refused(refusal) = plane
+            .authority_for("pj-example", ActionKind::Observe, &clock)
+            .await
+        else {
+            panic!("an expired lease admitted an action");
+        };
+        assert_eq!(refusal["outcome"], "no_lease");
     }
 
     /// An answer to a question nobody asked grants nothing.

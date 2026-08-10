@@ -186,6 +186,25 @@ impl Opening {
 #[derive(Debug, Default)]
 pub struct ConsentLeases {
     leases: HashMap<LeaseKey, Lease>,
+    /// The application a targetless request means, per grantee and action kind.
+    ///
+    /// Some requests carry no target by design: a screenshot names a scope and
+    /// nothing else, so that a caller cannot point the plane at a process by
+    /// naming it. That leaves the question of WHICH leased application such a
+    /// request refers to when several are held, and the frozen request schema
+    /// has nowhere to answer it.
+    ///
+    /// Answered by the most recent opening rather than by a rule about the
+    /// machine's state. Choosing the frontmost or the oldest lease would derive
+    /// it from something the agent did not say and the user did not decide,
+    /// which is the objection that rules out frontmost-application targeting.
+    /// The most recent opening is an act the agent performed deliberately.
+    ///
+    /// Cheap to change and never a second prompt: re-opening an application
+    /// still under consent is admitted from the lease that already exists, so
+    /// an agent working across two applications pays a round trip to switch and
+    /// the user is asked once per application.
+    focus: HashMap<(String, ActionKind), String>,
     /// Asks put to the user and not yet answered.
     ///
     /// Keyed by the FULL lease key rather than by grantee and application alone.
@@ -280,6 +299,10 @@ impl ConsentLeases {
         mint_ask_id: F,
     ) -> Opening {
         if let Admission::Admitted(lease) = self.admits(&key, clock) {
+            self.focus.insert(
+                (key.grantee.clone(), key.action_kind),
+                key.bundle_identity.clone(),
+            );
             return Opening::AlreadyHeld(lease);
         }
         // A request for something already being asked about joins that ask. The
@@ -316,7 +339,15 @@ impl ConsentLeases {
             .find(|(_, pending)| pending.ask_id == ask_id)
             .map(|(key, _)| key.clone())?;
         self.pending.remove(&key);
-        granted.map(|kind| self.grant(key, kind, clock).0)
+        granted.map(|kind| {
+            // Focus follows the grant, so the application a user has just
+            // approved is the one a targetless request means.
+            self.focus.insert(
+                (key.grantee.clone(), key.action_kind),
+                key.bundle_identity.clone(),
+            );
+            self.grant(key, kind, clock).0
+        })
     }
 
     /// How long until a lease stops admitting, from the caller's point of view.
@@ -349,8 +380,33 @@ impl ConsentLeases {
         self.pending.contains_key(key)
     }
 
+    /// Which application a targetless request means, if any is admitted.
+    ///
+    /// Returns nothing when the focused application's lease no longer admits,
+    /// rather than falling back to another one that happens to be held. A
+    /// caller that asked about one application must not silently be answered
+    /// about a different one.
+    pub fn focused<C: MonotonicClock>(
+        &mut self,
+        grantee: &str,
+        action_kind: ActionKind,
+        clock: &C,
+    ) -> Option<LeaseKey> {
+        let bundle_identity = self
+            .focus
+            .get(&(grantee.to_string(), action_kind))
+            .cloned()?;
+        let key = LeaseKey {
+            grantee: grantee.to_string(),
+            bundle_identity,
+            action_kind,
+        };
+        self.admits(&key, clock).is_admitted().then_some(key)
+    }
+
     /// Drop a lease, returning it if one was held.
     pub fn revoke(&mut self, key: &LeaseKey) -> Option<Lease> {
+        self.focus.remove(&(key.grantee.clone(), key.action_kind));
         self.leases.remove(key)
     }
 
@@ -671,6 +727,105 @@ mod tests {
 
         let (once, _) = leases.grant(key(ActionKind::Compose), GrantKind::Once, &clock);
         assert_eq!(ConsentLeases::remaining(&once, &clock), None);
+    }
+
+    /// A targetless request means the application most recently opened.
+    ///
+    /// Several leases can be held at once, and a request that carries no target
+    /// has to mean one of them. The most recent opening is the agent's own act,
+    /// where the frontmost window or the oldest lease would be a property of the
+    /// machine that nobody chose.
+    #[test]
+    fn the_most_recently_opened_application_is_the_focused_one() {
+        let mut leases = ConsentLeases::new();
+        let clock = FakeClock::new();
+
+        let safari = key(ActionKind::Observe);
+        let mail = LeaseKey {
+            bundle_identity: "com.apple.Mail".to_string(),
+            ..key(ActionKind::Observe)
+        };
+
+        leases.grant(safari.clone(), GrantKind::Until(at(10_000)), &clock);
+        leases.grant(mail.clone(), GrantKind::Until(at(10_000)), &clock);
+
+        // Granting alone does not focus: opening is what an agent does.
+        let _ = leases.open(safari.clone(), &clock, unreachable_ask);
+        assert_eq!(
+            leases.focused("pj-example", ActionKind::Observe, &clock),
+            Some(safari.clone())
+        );
+
+        let _ = leases.open(mail.clone(), &clock, unreachable_ask);
+        assert_eq!(
+            leases.focused("pj-example", ActionKind::Observe, &clock),
+            Some(mail)
+        );
+
+        // Switching back costs no prompt, because the lease still admits.
+        let opening = leases.open(safari.clone(), &clock, unreachable_ask);
+        assert!(matches!(opening, Opening::AlreadyHeld(_)));
+        assert_eq!(
+            leases.focused("pj-example", ActionKind::Observe, &clock),
+            Some(safari)
+        );
+    }
+
+    /// Focus does not survive its lease.
+    ///
+    /// Once the focused application's lease stops admitting, a targetless
+    /// request has no answer rather than quietly meaning some other application
+    /// that happens to still be leased.
+    #[test]
+    fn focus_does_not_outlive_the_lease_it_names() {
+        let mut leases = ConsentLeases::new();
+        let mut clock = FakeClock::new();
+
+        let safari = key(ActionKind::Observe);
+        let mail = LeaseKey {
+            bundle_identity: "com.apple.Mail".to_string(),
+            ..key(ActionKind::Observe)
+        };
+        leases.grant(mail, GrantKind::Until(at(60_000)), &clock);
+        leases.grant(safari.clone(), GrantKind::Until(at(10_000)), &clock);
+        let _ = leases.open(safari, &clock, unreachable_ask);
+
+        clock.advance(Duration::from_millis(10_000));
+        assert_eq!(
+            leases.focused("pj-example", ActionKind::Observe, &clock),
+            None,
+            "an expired focus fell back to another application"
+        );
+    }
+
+    /// Looking and touching are focused separately.
+    #[test]
+    fn each_action_kind_has_its_own_focus() {
+        let mut leases = ConsentLeases::new();
+        let clock = FakeClock::new();
+
+        let observing = key(ActionKind::Observe);
+        let composing = LeaseKey {
+            bundle_identity: "com.apple.Mail".to_string(),
+            ..key(ActionKind::Compose)
+        };
+        leases.grant(observing.clone(), GrantKind::Until(at(10_000)), &clock);
+        leases.grant(composing.clone(), GrantKind::Until(at(10_000)), &clock);
+        let _ = leases.open(observing.clone(), &clock, unreachable_ask);
+        let _ = leases.open(composing.clone(), &clock, unreachable_ask);
+
+        assert_eq!(
+            leases.focused("pj-example", ActionKind::Observe, &clock),
+            Some(observing)
+        );
+        assert_eq!(
+            leases.focused("pj-example", ActionKind::Compose, &clock),
+            Some(composing)
+        );
+    }
+
+    fn unreachable_ask() -> String {
+        panic!("a held lease must not ask")
     }
 
     /// Re-granting hands back the lease it replaced, and only one remains.
