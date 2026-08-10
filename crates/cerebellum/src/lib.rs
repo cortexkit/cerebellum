@@ -40,6 +40,9 @@ use serde_json::Value;
 pub use cerebellum_computer as computer;
 
 use crate::elicit::{Elicitor, SharedElicitor};
+use crate::management::ManagementPlane;
+use cerebellum_core::clock::SystemClock;
+use cerebellum_core::identity::RouteSurface;
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -710,19 +713,8 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let health_state = Arc::new(HealthState::with_config(config.health));
-    let route_bindings = Arc::new(RouteBindings::new());
-    let browser_plane = Arc::new(BrowserPlane::new());
-    let elicitor: SharedElicitor = Arc::new(Elicitor::new());
-    let loop_result = module_loop(
-        &mut read_half,
-        tx.clone(),
-        &config,
-        Arc::clone(&health_state),
-        Arc::clone(&route_bindings),
-        browser_plane,
-        elicitor,
-    )
-    .await;
+    let planes = Planes::new(Arc::clone(&health_state));
+    let loop_result = module_loop(&mut read_half, tx.clone(), &config, planes.clone()).await;
     drop(tx);
 
     let writer_result = writer
@@ -790,10 +782,7 @@ async fn module_loop<R>(
     read_half: &mut R,
     writer: mpsc::Sender<Frame>,
     config: &ModuleConfig,
-    health_state: Arc<HealthState>,
-    route_bindings: Arc<RouteBindings>,
-    browser_plane: Arc<BrowserPlane>,
-    elicitor: SharedElicitor,
+    planes: Planes,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -806,22 +795,16 @@ where
     };
     // Stamp and age the heartbeat with the SAME clock the insulated health lane
     // uses internally, so stamped instants and computed ages share one epoch.
-    let clock = health_state.clock().clone();
+    let clock = planes.health.clock().clone();
 
-    let handler_health = Arc::clone(&health_state);
-    let handler_routes = Arc::clone(&route_bindings);
-    let handler_browser = Arc::clone(&browser_plane);
-    let handler_elicitor = Arc::clone(&elicitor);
+    let handler_planes = planes.clone();
     let handler = move |frame: Frame| {
         let writer = writer.clone();
-        let health = Arc::clone(&handler_health);
-        let routes = Arc::clone(&handler_routes);
-        let browser = Arc::clone(&handler_browser);
-        let elicitor = Arc::clone(&handler_elicitor);
-        async move { handle_frame(frame, &writer, &health, &routes, &browser, &elicitor).await }
+        let planes = handler_planes.clone();
+        async move { handle_frame(frame, &writer, &planes).await }
     };
 
-    run_dispatch_loop(read_half, &health_state, &clock, &mut idle_wake, handler).await
+    run_dispatch_loop(read_half, &planes.health, &clock, &mut idle_wake, handler).await
 }
 
 /// The bounded-idle-wake dispatch loop.
@@ -976,14 +959,53 @@ where
     }
 }
 
+/// The long-lived state a running module serves requests from.
+///
+/// Bundled rather than passed separately because these travel together
+/// everywhere: the loop, the frame dispatcher, and each surface's handler all
+/// need the same set, and threading them one by one meant every new one touched
+/// every signature in the chain.
+pub struct Planes {
+    pub health: Arc<HealthState>,
+    pub routes: Arc<RouteBindings>,
+    pub browser: Arc<BrowserPlane>,
+    pub management: Arc<ManagementPlane>,
+    /// Questions this module has put to whoever is on the other end of a route.
+    pub elicitor: SharedElicitor,
+}
+
+impl Planes {
+    /// The set a running module uses.
+    pub fn new(health: Arc<HealthState>) -> Self {
+        Self {
+            health,
+            routes: Arc::new(RouteBindings::new()),
+            browser: Arc::new(BrowserPlane::new()),
+            management: Arc::new(ManagementPlane::new(Arc::new(
+                management::PlatformResolver::new(),
+            ))),
+            elicitor: Arc::new(Elicitor::new()),
+        }
+    }
+}
+
+impl Clone for Planes {
+    fn clone(&self) -> Self {
+        Self {
+            health: Arc::clone(&self.health),
+            routes: Arc::clone(&self.routes),
+            browser: Arc::clone(&self.browser),
+            management: Arc::clone(&self.management),
+            elicitor: Arc::clone(&self.elicitor),
+        }
+    }
+}
+
 /// Returns `Ok(false)` to stop the loop (graceful goodbye / EOF).
 async fn handle_frame(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
-    health_state: &Arc<HealthState>,
-    route_bindings: &Arc<RouteBindings>,
-    browser_plane: &Arc<BrowserPlane>,
-    elicitor: &SharedElicitor,
+    planes: &Planes,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -1011,7 +1033,10 @@ async fn handle_frame(
         // which is why the absence could not have been noticed from the outside.
         FrameType::Response => {
             let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
-            if !elicitor.deliver(frame.header.channel, frame.header.corr, body) {
+            if !planes
+                .elicitor
+                .deliver(frame.header.channel, frame.header.corr, body)
+            {
                 // Nobody was waiting: an answer that arrived after its deadline,
                 // or a correlation this module never sent. Dropped deliberately
                 // rather than acted on, because there is no exchange to complete
@@ -1022,28 +1047,233 @@ async fn handle_frame(
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => Ok(true),
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, health_state, route_bindings).await?;
+            handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
             Ok(true)
         }
         FrameType::Request => {
             let writer = writer.clone();
-            let health_state = Arc::clone(health_state);
-            let route_bindings = Arc::clone(route_bindings);
-            let browser_plane = Arc::clone(browser_plane);
+            let planes = planes.clone();
             tokio::spawn(async move {
-                let _ = handle_tool_request(
-                    frame,
-                    &writer,
-                    &health_state,
-                    &route_bindings,
-                    &browser_plane,
-                )
-                .await;
+                let _ = handle_route_request(frame, &writer, &planes).await;
             });
             Ok(true)
         }
         _ => Ok(true),
     }
+}
+
+/// Send a request to the surface its route was bound to.
+///
+/// The surface is read before the body is parsed, because the two surfaces take
+/// different envelopes and neither can be decoded without knowing which arrived.
+/// Parsing first and inferring the surface from the shape would let a caller
+/// reach one surface by sending the other's envelope.
+async fn handle_route_request(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<(), ModuleError> {
+    let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+
+    let Some(facts) = planes.routes.get(channel, epoch) else {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "route_not_bound",
+            "a request requires an accepted route.bind",
+        )
+        .await;
+    };
+
+    match facts.surface {
+        RouteSurface::Tools => {
+            handle_tool_request(
+                frame,
+                writer,
+                &planes.health,
+                &planes.routes,
+                &planes.browser,
+            )
+            .await
+        }
+        RouteSurface::Management => handle_management_request(frame, writer, &facts, planes).await,
+        // A route bound to a surface this module does not advertise. Refused
+        // with the surface named rather than served as one of the others, which
+        // would answer a caller from an envelope it did not use.
+        RouteSurface::Unsupported => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "unsupported_surface",
+                "this route is bound to a surface this module does not serve",
+            )
+            .await
+        }
+    }
+}
+
+/// Serve one management operation.
+async fn handle_management_request(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    facts: &AcceptedBindFacts,
+    planes: &Planes,
+) -> Result<(), ModuleError> {
+    let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(&frame.body) else {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "request body not decodable",
+        )
+        .await;
+    };
+    let Some(object) = request.as_object() else {
+        return send_invalid_request_response(writer, ver, channel, epoch, corr, "$", "wrong_type")
+            .await;
+    };
+
+    // Closed envelope, as on the tool surface: an unknown member is a caller
+    // meaning something this module will not do, and accepting it silently would
+    // serve a request different from the one sent.
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "method" | "params"))
+        .min()
+    {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            field,
+            "unknown_field",
+        )
+        .await;
+    }
+
+    let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "method",
+            "missing_field",
+        )
+        .await;
+    };
+    if method != management::OPEN_TARGET {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "unknown_method",
+            &format!("unknown method '{method}'"),
+        )
+        .await;
+    }
+
+    let params = object
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let Some(bundle_identity) = params
+        .get("bundle_identity")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "bundle_identity",
+            "missing_field",
+        )
+        .await;
+    };
+
+    let Some(action_kind) = params
+        .get("action_kind")
+        .and_then(serde_json::Value::as_str)
+        .and_then(management::action_kind_from_wire)
+    else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "action_kind",
+            "missing_field",
+        )
+        .await;
+    };
+
+    // The grantee is the identity the daemon stamped, never anything the request
+    // carries: a permission written against a caller-chosen identity is a
+    // permission granted to whoever asked for it.
+    let grantee = facts.identity.agent_project_id.clone();
+
+    let clock = SystemClock::default();
+    let (reply, question) = planes
+        .management
+        .open_target(
+            &grantee,
+            bundle_identity,
+            action_kind,
+            facts.declares_elicitation(),
+            &clock,
+        )
+        .await;
+
+    if let Some(question) = question {
+        // Asked on its own task: the answer may be minutes away while this
+        // caller is owed a reply now. The reply already says the request is
+        // pending, so nothing is waiting on the question here.
+        let elicitor = Arc::clone(&planes.elicitor);
+        let management_plane = Arc::clone(&planes.management);
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            let outcome = elicitor
+                .ask(&writer, channel, epoch, question.body, question.deadline)
+                .await;
+            let answer = match outcome {
+                elicit::AskOutcome::Answered(body) => Some(body),
+                // Silence and an undeliverable question are both not-granted
+                // here. They are distinguished where they happen, and by the
+                // time an answer is being applied only the decision matters.
+                elicit::AskOutcome::NoAnswer | elicit::AskOutcome::Undeliverable => None,
+            };
+            management_plane
+                .settle(&question.ask_id, answer.as_ref(), &SystemClock::default())
+                .await;
+        });
+    }
+
+    send_tool_response(writer, ver, channel, epoch, corr, reply).await
 }
 
 async fn handle_control_request(
@@ -1543,6 +1773,14 @@ mod tests {
     use super::*;
     use subc_protocol::Principal;
 
+    /// A management plane whose resolver finds nothing, for frame-level tests
+    /// that never reach a target.
+    fn test_management_plane() -> Arc<ManagementPlane> {
+        Arc::new(ManagementPlane::new(Arc::new(
+            management::PlatformResolver::new(),
+        )))
+    }
+
     /// An answer arriving on a route reaches the question that asked it.
     ///
     /// The frame dispatcher previously had no arm for a response: it fell through
@@ -1591,7 +1829,14 @@ mod tests {
         )
         .unwrap();
 
-        let keep_going = handle_frame(answer, &writer_tx, &health, &routes, &browser, &elicitor)
+        let planes = Planes {
+            health,
+            routes,
+            browser,
+            management: test_management_plane(),
+            elicitor: Arc::clone(&elicitor),
+        };
+        let keep_going = handle_frame(answer, &writer_tx, &planes)
             .await
             .expect("an answer is handled");
         assert!(keep_going, "handling an answer closed the connection");
@@ -1623,16 +1868,16 @@ mod tests {
         )
         .unwrap();
 
-        let keep_going = handle_frame(
-            answer,
-            &writer_tx,
-            &Arc::new(HealthState::default()),
-            &Arc::new(RouteBindings::new()),
-            &Arc::new(BrowserPlane::new()),
-            &elicitor,
-        )
-        .await
-        .expect("an unsolicited answer is handled");
+        let planes = Planes {
+            health: Arc::new(HealthState::default()),
+            routes: Arc::new(RouteBindings::new()),
+            browser: Arc::new(BrowserPlane::new()),
+            management: test_management_plane(),
+            elicitor: Arc::clone(&elicitor),
+        };
+        let keep_going = handle_frame(answer, &writer_tx, &planes)
+            .await
+            .expect("an unsolicited answer is handled");
         assert!(keep_going, "an unsolicited answer closed the connection");
         assert_eq!(elicitor.outstanding(), 0);
     }

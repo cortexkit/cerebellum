@@ -25,6 +25,24 @@ use cerebellum_core::consent::{ActionKind, ConsentLeases, GrantKind, LeaseKey, O
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+/// The one operation this surface serves.
+pub const OPEN_TARGET: &str = "computer.open_target";
+
+/// Read an action kind from its wire spelling.
+///
+/// `None` for anything unrecognised, so a kind this module does not know is
+/// refused rather than resolved to a default. Defaulting would put a request
+/// under whichever gate the default names, and the plausible default is the
+/// permissive one.
+pub fn action_kind_from_wire(kind: &str) -> Option<ActionKind> {
+    match kind {
+        "observe" => Some(ActionKind::Observe),
+        "compose" => Some(ActionKind::Compose),
+        "mutate_durable" => Some(ActionKind::MutateDurable),
+        _ => None,
+    }
+}
+
 /// How long a consent question may stay unanswered before it stops being one.
 ///
 /// Long enough for a person to notice a prompt and decide; short enough that an
@@ -49,6 +67,38 @@ const GRANT_DURATION: Duration = Duration::from_secs(600);
 /// compiles.
 pub trait TargetResolver: Send + Sync {
     fn resolve(&self, bundle_identity: &str) -> TargetResolution;
+}
+
+/// Resolves application names against this machine.
+///
+/// The macOS reading and a refusal elsewhere are the two halves: a host with no
+/// window server cannot say an application is absent, only that it cannot look,
+/// and reporting "not running" would be a claim rather than a reading. Both
+/// answers refuse; only one of them is evidence.
+#[derive(Debug, Default)]
+pub struct PlatformResolver {
+    timeout: Duration,
+}
+
+impl PlatformResolver {
+    pub fn new() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl TargetResolver for PlatformResolver {
+    #[cfg(target_os = "macos")]
+    fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+        cerebellum_computer::platform::native::resolve_target(bundle_identity, self.timeout)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+        let _ = self.timeout;
+        TargetResolution::NotRunning
+    }
 }
 
 /// The state a management route needs.

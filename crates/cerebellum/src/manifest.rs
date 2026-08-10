@@ -33,8 +33,9 @@ use crate::browser_type::{
 };
 use crate::journal::JournalConfig;
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-    ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
+    ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+    StorageScope, Tool, TrustTier,
 };
 use subc_protocol::PROTOCOL_VERSION;
 
@@ -47,35 +48,68 @@ pub const BROWSER_STATUS: &str = "browser.status";
 /// browser.status tool (`execution_mode: pure`). Minted browser routes are added
 /// only by `build_with_browser_plane_pins` after their independent release gates
 /// pass; this builder never adds the legacy type route.
+/// The management operations this module serves.
+///
+/// Built from the same names the dispatcher matches on, so an operation cannot
+/// be advertised without being routable: the list and the routing read one
+/// constant rather than two that agree until someone edits one.
+///
+/// Separate from the tool surface because the two differ in kind, not only in
+/// envelope. A tool call acts; a management operation arranges the authority
+/// under which acting is possible. Keeping them apart also means an operation
+/// never appears in a tool listing, so an agent enumerating its capabilities
+/// does not find one it could mistake for an action.
+fn management_surface() -> ProviderRole {
+    ProviderRole::ManagementSurface {
+        operations: vec![ManagementOperation {
+            name: crate::management::OPEN_TARGET.to_string(),
+            // A query: it reports what authority exists and, when none does,
+            // arranges for the user to be asked. It changes nothing on the
+            // machine it is asked about.
+            kind: ManagementOperationKind::Query,
+        }],
+        config_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+        observability: Vec::new(),
+        identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
+    }
+}
+
 pub fn build(module_id: &str) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: BROWSER_STATUS.to_string(),
-                description: Some(
-                    "Report the browser-plane session status and profile disposition \
+        provides: vec![
+            ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: BROWSER_STATUS.to_string(),
+                    description: Some(
+                        "Report the browser-plane session status and profile disposition \
                      without opening a browser."
-                        .to_string(),
-                ),
-                execution_mode: ExecutionMode::Pure,
-                // Closed schema: the request is `{}` (empty); unknown fields are
-                // rejected at the application level. The schema declares no
-                // properties and forbids additional properties.
-                schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                }),
-            }],
-            identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: false,
-            sub_supervises: false,
-        }],
+                            .to_string(),
+                    ),
+                    execution_mode: ExecutionMode::Pure,
+                    // Closed schema: the request is `{}` (empty); unknown fields are
+                    // rejected at the application level. The schema declares no
+                    // properties and forbids additional properties.
+                    schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false,
+                    }),
+                }],
+                identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: false,
+                sub_supervises: false,
+            },
+            management_surface(),
+        ],
         consumes: Vec::new(),
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -414,12 +448,57 @@ mod tests {
     #[test]
     fn manifest_advertises_exactly_one_capability() {
         let manifest = build("cerebellum");
-        assert_eq!(manifest.provides.len(), 1);
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
         };
         assert_eq!(tools.len(), 1, "exactly one application capability");
         assert_eq!(tools[0].name, BROWSER_STATUS);
+    }
+
+    /// The management surface advertises only what the dispatcher will serve.
+    ///
+    /// Both read one constant, so the two cannot drift: an operation added to
+    /// this list without a route to serve it would have to be added to the
+    /// routing as well, because there is only one name to add.
+    ///
+    /// The reverse case is what makes it worth asserting. A capability that is
+    /// advertised and cannot be served fails at the moment a caller believes it
+    /// can be, which is later and further from the change that caused it.
+    #[test]
+    fn every_advertised_operation_is_one_the_dispatcher_serves() {
+        let manifest = build("cerebellum");
+        let Some(ProviderRole::ManagementSurface { operations, .. }) = manifest
+            .provides
+            .iter()
+            .find(|role| matches!(role, ProviderRole::ManagementSurface { .. }))
+        else {
+            panic!("expected a ManagementSurface role");
+        };
+
+        let advertised: Vec<&str> = operations
+            .iter()
+            .map(|operation| operation.name.as_str())
+            .collect();
+        assert_eq!(advertised, vec![crate::management::OPEN_TARGET]);
+    }
+
+    /// Opening a target is advertised as a query.
+    ///
+    /// It reports what authority exists and, when none does, arranges for the
+    /// user to be asked. Nothing about the machine it names is changed, and the
+    /// distinction is not cosmetic: whether a call is a query decides whether
+    /// its response body is written to durable storage as it is forwarded.
+    #[test]
+    fn opening_a_target_is_a_query() {
+        let manifest = build("cerebellum");
+        let Some(ProviderRole::ManagementSurface { operations, .. }) = manifest
+            .provides
+            .iter()
+            .find(|role| matches!(role, ProviderRole::ManagementSurface { .. }))
+        else {
+            panic!("expected a ManagementSurface role");
+        };
+        assert_eq!(operations[0].kind, ManagementOperationKind::Query);
     }
 
     #[test]
