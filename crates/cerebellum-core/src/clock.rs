@@ -38,6 +38,16 @@ impl MonoInstant {
     pub fn from_nanos(nanos: u64) -> Self {
         Self::from_duration(Duration::from_nanos(nanos))
     }
+
+    /// The instant `after` later than this one, on the same clock.
+    ///
+    /// Saturating, so a deadline far enough ahead to overflow becomes the
+    /// furthest representable instant rather than wrapping to the past. Wrapping
+    /// would turn a long grant into one that had already expired, which reads as
+    /// a revocation nobody performed.
+    pub fn saturating_add(&self, after: Duration) -> Self {
+        Self(self.0.saturating_add(after))
+    }
 }
 
 /// A monotonic clock that can be sampled for the current instant and can

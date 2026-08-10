@@ -150,13 +150,31 @@ pub struct PendingAsk {
 }
 
 /// What a request to reach an application resolves to.
+///
+/// The two pending outcomes are separate because the caller must act
+/// differently: one has to put the question to the user, and the other must not.
+/// Collapsing them would make a repeat request re-prompt for something already
+/// on screen, which is how joining an ask in flight stops meaning anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Opening {
     /// A lease already covers this, with no need to ask.
     AlreadyHeld(Lease),
-    /// The user is being asked. Carries the ask so a caller can follow it, and
-    /// so a repeat request joins this one instead of starting another.
-    Pending(PendingAsk),
+    /// Nothing covers this and nothing is being asked, so the question is the
+    /// caller's to put.
+    AskNeeded(PendingAsk),
+    /// This is already being asked. The caller waits for that answer rather than
+    /// asking again.
+    AlreadyAsking(PendingAsk),
+}
+
+impl Opening {
+    /// The ask this resolves to, if it is not already covered.
+    pub fn pending(&self) -> Option<&PendingAsk> {
+        match self {
+            Self::AlreadyHeld(_) => None,
+            Self::AskNeeded(ask) | Self::AlreadyAsking(ask) => Some(ask),
+        }
+    }
 }
 
 /// The leases a module currently holds.
@@ -268,7 +286,7 @@ impl ConsentLeases {
         // alternative forks consent state: two asks over one key can be answered
         // differently, and nothing here could say which answer governs.
         if let Some(pending) = self.pending.get(&key) {
-            return Opening::Pending(pending.clone());
+            return Opening::AlreadyAsking(pending.clone());
         }
         let pending = PendingAsk {
             key: key.clone(),
@@ -276,7 +294,7 @@ impl ConsentLeases {
             asked_at: clock.now(),
         };
         self.pending.insert(key, pending.clone());
-        Opening::Pending(pending)
+        Opening::AskNeeded(pending)
     }
 
     /// Record the user's answer to a pending ask.
@@ -535,14 +553,17 @@ mod tests {
         let clock = FakeClock::new();
         let target = key(ActionKind::Observe);
 
-        let Opening::Pending(first) = leases.open(target.clone(), &clock, || "ask-1".to_string())
+        let Opening::AskNeeded(first) = leases.open(target.clone(), &clock, || "ask-1".to_string())
         else {
-            panic!("an unleased target must ask");
+            panic!("an unleased target must need an ask");
         };
-        let Opening::Pending(second) =
+        // The second request must report that the question is ALREADY being
+        // asked, not that one is needed: a caller told a question is needed puts
+        // it, and the user would see the same prompt twice.
+        let Opening::AlreadyAsking(second) =
             leases.open(target, &clock, || panic!("a second ask was minted"))
         else {
-            panic!("a pending target must stay pending");
+            panic!("a repeat request must join the ask in flight");
         };
         assert_eq!(first.ask_id, second.ask_id);
     }
@@ -558,12 +579,12 @@ mod tests {
         let mut leases = ConsentLeases::new();
         let clock = FakeClock::new();
 
-        let Opening::Pending(observing) = leases.open(key(ActionKind::Observe), &clock, || {
+        let Opening::AskNeeded(observing) = leases.open(key(ActionKind::Observe), &clock, || {
             "ask-observe".to_string()
         }) else {
-            panic!("an unleased target must ask");
+            panic!("an unleased target must need an ask");
         };
-        let Opening::Pending(composing) = leases.open(key(ActionKind::Compose), &clock, || {
+        let Opening::AskNeeded(composing) = leases.open(key(ActionKind::Compose), &clock, || {
             "ask-compose".to_string()
         }) else {
             panic!("a different action kind must ask separately");
