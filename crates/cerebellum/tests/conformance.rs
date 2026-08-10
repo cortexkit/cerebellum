@@ -72,10 +72,18 @@ async fn hello_body_matches_wire_v2_contract() {
     assert_eq!(body["manifest"]["trust_tier"], "first_party");
 
     // Exactly one application capability: browser.status, execution_mode pure.
+    //
+    // Counted within the tool role rather than across the manifest, because a
+    // management operation is not an application capability: it arranges the
+    // authority under which acting is possible rather than acting. Counting
+    // roles would make this assertion fail on a change that adds no capability
+    // at all.
     let provides = body["manifest"]["provides"].as_array().unwrap();
-    assert_eq!(provides.len(), 1);
-    assert_eq!(provides[0]["role"], "tool_provider");
-    let tools = provides[0]["tools"].as_array().unwrap();
+    let tool_role = provides
+        .iter()
+        .find(|role| role["role"] == "tool_provider")
+        .expect("a tool_provider role");
+    let tools = tool_role["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1, "exactly one application capability");
     assert_eq!(tools[0]["name"], "browser.status");
     assert_eq!(tools[0]["execution_mode"], "pure");
@@ -765,12 +773,25 @@ async fn live_daemon_registers_and_serves_browser_status() {
         .iter()
         .find(|module| module.module_id == MODULE_ID)
         .expect("real subc catalog must contain cerebellum");
-    assert_eq!(entry.roles.len(), 1);
-    let role = entry
+    // Both roles survive registration with a real daemon and come back in its
+    // catalogue. Asserted against the DAEMON's view rather than the manifest
+    // builder's, which is the difference between advertising a surface and the
+    // daemon accepting one: a role it declined would be absent here while every
+    // local test still passed.
+    let Some(ProviderRole::ManagementSurface { operations, .. }) = entry
         .roles
-        .first()
-        .expect("cerebellum must advertise a provider role");
-    let ProviderRole::ToolProvider { tools, .. } = role else {
+        .iter()
+        .find(|role| matches!(role, ProviderRole::ManagementSurface { .. }))
+    else {
+        panic!("a real subc catalogue must carry cerebellum's management surface");
+    };
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].name, "computer.open_target");
+
+    let Some(tools) = entry.roles.iter().find_map(|role| match role {
+        ProviderRole::ToolProvider { tools, .. } => Some(tools),
+        _ => None,
+    }) else {
         panic!("cerebellum must register as a tool provider");
     };
     assert_eq!(tools.len(), 1);
