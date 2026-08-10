@@ -28,6 +28,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod consent;
 pub mod dispatch;
 pub mod health;
 pub mod identity;
