@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use subc_protocol::{BindIdentity, Principal};
+use subc_protocol::{BindIdentity, Principal, RouteTarget};
 
 /// The alfonso-core-stamped session kind, read verbatim from the bind facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +180,43 @@ impl RouteIdentity {
     }
 }
 
+/// Which of this module's advertised surfaces a route reaches.
+///
+/// The daemon binds a route to one surface, and the two this module could serve
+/// take DIFFERENT REQUEST ENVELOPES: a tool call carries `{name, arguments}`
+/// while a management operation carries `{method, params}`. So a request cannot
+/// be parsed until the surface is known.
+///
+/// Retained from the bind rather than inferred from the request, because
+/// inferring it means accepting whichever envelope a body happens to resemble —
+/// and a caller could then reach a management operation by sending a tool-shaped
+/// body, or the reverse. Which surface a caller reached is the daemon's
+/// statement, and it belongs to the route rather than to any request on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSurface {
+    /// Tool calls.
+    Tools,
+    /// Management operations.
+    Management,
+    /// A surface this module does not advertise.
+    ///
+    /// Kept as a value rather than refused at bind, so a request arriving on
+    /// such a route is refused with the surface named. Treating it as either of
+    /// the others would serve one surface's callers from the other's envelope.
+    Unsupported,
+}
+
+impl RouteSurface {
+    /// Read the surface from the target the daemon bound.
+    pub fn from_target(target: &RouteTarget) -> Self {
+        match target {
+            RouteTarget::ToolProvider { .. } => Self::Tools,
+            RouteTarget::ManagementSurface { .. } => Self::Management,
+            RouteTarget::InternalService { .. } => Self::Unsupported,
+        }
+    }
+}
+
 /// Facts retained after a route bind has passed principal admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedBindFacts {
@@ -201,6 +238,9 @@ pub struct AcceptedBindFacts {
     /// Absent means no capability rather than an unknown one, so a bind that
     /// omits it is treated exactly as one that declares nothing.
     pub consumer_capabilities: Vec<String>,
+    /// Which surface this route reaches, so a request on it is parsed as the
+    /// envelope that surface uses rather than as whichever one it resembles.
+    pub surface: RouteSurface,
 }
 
 impl AcceptedBindFacts {
@@ -209,12 +249,14 @@ impl AcceptedBindFacts {
         principal: Option<Principal>,
         admission_facts: Option<&Value>,
         consumer_capabilities: Option<&[String]>,
+        target: &RouteTarget,
     ) -> Self {
         Self {
             identity: RouteIdentity::from_accepted_bind(identity, &principal, admission_facts),
             principal,
             effective_capability_scope: effective_capability_scope_from_facts(admission_facts),
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
+            surface: RouteSurface::from_target(target),
         }
     }
 
@@ -404,6 +446,12 @@ pub fn take_test_observations() -> Vec<IdentityResolutionObservation> {
 mod tests {
     use super::*;
 
+    fn tool_route() -> RouteTarget {
+        RouteTarget::ToolProvider {
+            module_id: "cerebellum".to_string(),
+        }
+    }
+
     fn bind_identity(project_root: &str, session: &str) -> BindIdentity {
         BindIdentity {
             project_root: PathBuf::from(project_root),
@@ -528,8 +576,63 @@ mod tests {
                 "effective_capability_scope": ["other.capability"]
             })),
             None,
+            &tool_route(),
         );
         assert!(!accepted.allows_capability("browser.status"));
+    }
+
+    /// The surface a route reaches is read from the bind, not from a request.
+    ///
+    /// The two surfaces this module could serve take different request
+    /// envelopes, so parsing a request requires knowing which one arrived on.
+    /// Inferring it from the body would let a caller reach one surface by
+    /// sending the other's shape.
+    #[test]
+    fn each_route_target_names_its_surface() {
+        let bind = bind_identity("/tmp/project", "conversation-1");
+
+        let tools = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            None,
+            None,
+            &RouteTarget::ToolProvider {
+                module_id: "cerebellum".to_string(),
+            },
+        );
+        assert_eq!(tools.surface, RouteSurface::Tools);
+
+        let management = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            None,
+            None,
+            &RouteTarget::ManagementSurface {
+                module_id: "cerebellum".to_string(),
+            },
+        );
+        assert_eq!(management.surface, RouteSurface::Management);
+    }
+
+    /// A surface this module does not advertise is named as unsupported.
+    ///
+    /// Not folded into either served surface: a request arriving on it must be
+    /// refused with the surface named, and mapping it onto one of the others
+    /// would serve that surface's callers from a route bound to something else.
+    #[test]
+    fn an_unadvertised_surface_is_neither_of_the_served_ones() {
+        let bind = bind_identity("/tmp/project", "conversation-1");
+        let internal = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            None,
+            None,
+            &RouteTarget::InternalService {
+                module_id: "cerebellum".to_string(),
+                service_id: "anything".to_string(),
+            },
+        );
+        assert_eq!(internal.surface, RouteSurface::Unsupported);
     }
 
     /// A consumer that declares nothing can relay nothing.
@@ -541,10 +644,17 @@ mod tests {
     #[test]
     fn a_bind_declaring_no_capabilities_cannot_relay_a_question() {
         let bind = bind_identity("/tmp/project", "conversation-1");
-        let absent = AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None);
+        let absent =
+            AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None, &tool_route());
         assert!(!absent.declares_elicitation());
 
-        let empty = AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, Some(&[]));
+        let empty = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            None,
+            Some(&[]),
+            &tool_route(),
+        );
         assert!(!empty.declares_elicitation());
     }
 
@@ -561,6 +671,7 @@ mod tests {
             Some(Principal::Direct),
             None,
             Some(&["sampling".to_string(), "roots".to_string()]),
+            &tool_route(),
         );
         assert!(!other.declares_elicitation());
 
@@ -569,6 +680,7 @@ mod tests {
             Some(Principal::Direct),
             None,
             Some(&["sampling".to_string(), "elicitation".to_string()]),
+            &tool_route(),
         );
         assert!(declared.declares_elicitation());
     }

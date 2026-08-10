@@ -1061,7 +1061,7 @@ async fn handle_control_request(
             identity,
             admission_facts,
             consumer_capabilities,
-            ..
+            target,
         } => {
             // In-module principal default-deny backstop: the gateway policy
             // (subc-mcp) is the primary exclusion of cerebellum capabilities
@@ -1086,6 +1086,7 @@ async fn handle_control_request(
                 principal.clone(),
                 admission_facts.as_ref(),
                 consumer_capabilities.as_deref(),
+                &target,
             );
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
@@ -1505,6 +1506,9 @@ pub async fn handle_tool_request_for_test(
             Some(subc_protocol::Principal::Direct),
             None,
             None,
+            &subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".to_string(),
+            },
         ),
     );
     handle_tool_request(
