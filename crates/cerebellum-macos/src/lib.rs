@@ -15,9 +15,18 @@
 //!
 //! Read anything added here as code that no continuous build can check.
 
+// The accessibility traversal is compiled for unit tests on every host, so its
+// input-bound checks run even where the macOS framework APIs are unavailable.
+#[cfg(any(target_os = "macos", test))]
+mod accessibility;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+pub use accessibility::{
+    accessibility_is_permitted, read_accessibility_tree, AxElement, AxFrame, AxReadError,
+    AxReadOptions,
+};
 #[cfg(target_os = "macos")]
 pub use macos::{
     capture_window, encode_png, enumerate_windows, establish_window_server_connection,
