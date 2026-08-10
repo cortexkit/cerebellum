@@ -458,21 +458,59 @@ impl Default for GroundingPolicy {
 
 /// What grounding a capability requires.
 ///
-/// Three outcomes rather than a policy-or-nothing, because two of them are not
-/// the same news. A capability that addresses no element legitimately has no
-/// grounding policy and the caller proceeds; a capability this module does not
-/// serve means the caller and the action vocabulary disagree, and proceeding
-/// grounds nothing for a reason nobody chose.
+/// A capability may require an element, address no element, or prefer an
+/// element while retaining a coordinate-addressed path. Those outcomes are
+/// distinct: treating the last case as a pixel fallback would let a coordinate
+/// action claim the containment of an element it never resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroundingRequirement {
     /// The capability addresses an element, resolved under this policy.
     Grounded(GroundingPolicy),
+    /// The capability may resolve an element, or address a coordinate when no
+    /// element is available.
+    ElementOrCoordinateAddressed(GroundingPolicy),
     /// The capability addresses no element, so there is nothing to ground.
-    /// Keyboard shortcuts and cursor movement have no target, drag and pointer
-    /// movement are coordinate-addressed, and observing actions address nothing.
+    /// Keyboard shortcuts, pointer movement, and observing actions may use their
+    /// own non-element addressing modes without an element-resolution policy.
     NotGrounded,
     /// Not a capability this module serves.
     UnknownCapability,
+}
+
+/// The path a caller actually used after considering element availability.
+///
+/// Keeping the coordinate case separate makes its weakest containment rung
+/// explicit. An element path can be revalidated and recorded by what moved;
+/// a coordinate path can only be recorded by where it acted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroundingResolutionPath {
+    Element(GroundingPolicy),
+    CoordinateAddressed { containment_rung: ContainmentRung },
+}
+
+impl GroundingRequirement {
+    /// Select the actual path for a capability that can resolve an element.
+    ///
+    /// `None` means this requirement does not authorize element resolution for
+    /// the supplied availability state. Callers retain the returned value with
+    /// their result so later auditing can distinguish an element target from a
+    /// coordinate-addressed target.
+    pub fn resolution_path(&self, element_available: bool) -> Option<GroundingResolutionPath> {
+        match self {
+            Self::Grounded(policy) if element_available => {
+                Some(GroundingResolutionPath::Element(policy.clone()))
+            }
+            Self::ElementOrCoordinateAddressed(policy) if element_available => {
+                Some(GroundingResolutionPath::Element(policy.clone()))
+            }
+            Self::ElementOrCoordinateAddressed(_) => {
+                Some(GroundingResolutionPath::CoordinateAddressed {
+                    containment_rung: ContainmentRung::GlobalNone,
+                })
+            }
+            Self::Grounded(_) | Self::NotGrounded | Self::UnknownCapability => None,
+        }
+    }
 }
 
 impl GroundingPolicy {
@@ -489,12 +527,38 @@ impl GroundingPolicy {
                 policy.pixel_fallback_eligible = false;
                 GroundingRequirement::Grounded(policy)
             }
-            "computer.keys"
-            | "computer.move"
-            | "computer.drag"
-            | "computer.screenshot"
-            | "computer.wait" => GroundingRequirement::NotGrounded,
+            "computer.drag" => {
+                // Element aiming lets a drag be revalidated before dispatch and
+                // recorded by what it moved. Without an element it remains
+                // coordinate-addressed, so it can only be recorded by where it
+                // acted at the weakest containment rung. Drag is the only action
+                // in this vocabulary that makes durable changes, so it must not
+                // let a pixel match pretend to be an element target.
+                policy.eligible_paths = [GroundingPath::AccessibilityElement].into_iter().collect();
+                policy.pixel_fallback_eligible = false;
+                GroundingRequirement::ElementOrCoordinateAddressed(policy)
+            }
+            "computer.keys" | "computer.move" | "computer.screenshot" | "computer.wait" => {
+                GroundingRequirement::NotGrounded
+            }
             _ => GroundingRequirement::UnknownCapability,
+        }
+    }
+
+    /// Whether a capability may name its target with a screen coordinate rather
+    /// than resolving an element. This is separate from pixel fallback: pixels
+    /// are weaker evidence for an element, while a coordinate names no element
+    /// and therefore remains on the weakest containment rung.
+    pub fn coordinate_addressable_for_capability(capability_id: &str) -> Option<bool> {
+        match capability_id {
+            "computer.move" | "computer.drag" => Some(true),
+            "computer.click"
+            | "computer.type"
+            | "computer.keys"
+            | "computer.scroll"
+            | "computer.screenshot"
+            | "computer.wait" => Some(false),
+            _ => None,
         }
     }
 
@@ -1386,7 +1450,7 @@ impl GroundingDriver for RecordingGroundingDriver {
 mod tests {
     use super::*;
 
-    /// All three grounding outcomes are reachable, and they are different.
+    /// All four grounding outcomes are reachable, and they are different.
     ///
     /// The distinction exists so that a capability with nothing to ground and a
     /// capability this module does not serve are not answered alike. Asserting
@@ -1394,9 +1458,9 @@ mod tests {
     /// correct behaviour, since both of the others simply decline to ground.
     ///
     /// The capability names tested here are the module's whole action
-    /// vocabulary. Moving one between the grounded and not-grounded groups
-    /// changes whether its target is resolved by identity or by position, so it
-    /// should be a deliberate change rather than a consequence of another one.
+    /// vocabulary. Moving one between the outcomes changes whether its target
+    /// is resolved by identity or by position, so it should be a deliberate
+    /// change rather than a consequence of another one.
     #[test]
     fn every_grounding_outcome_is_reachable_and_distinct() {
         assert!(matches!(
@@ -1417,10 +1481,28 @@ mod tests {
             [GroundingPath::AccessibilityElement].into_iter().collect()
         );
 
+        // Drag is the one durable action that can preserve an element target
+        // when available but must remain coordinate-addressed otherwise.
+        let GroundingRequirement::ElementOrCoordinateAddressed(drag) =
+            GroundingPolicy::for_capability("computer.drag")
+        else {
+            panic!("drag resolves an element or addresses a coordinate");
+        };
+        assert_eq!(
+            drag.eligible_paths,
+            [GroundingPath::AccessibilityElement].into_iter().collect()
+        );
+        assert!(!drag.pixel_fallback_eligible);
+        assert_eq!(
+            GroundingPolicy::for_capability("computer.drag").resolution_path(false),
+            Some(GroundingResolutionPath::CoordinateAddressed {
+                containment_rung: ContainmentRung::GlobalNone,
+            })
+        );
+
         for capability in [
             "computer.keys",
             "computer.move",
-            "computer.drag",
             "computer.screenshot",
             "computer.wait",
         ] {
