@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use super::{PermissionLiveness, PermissionProbeResult, PermissionService, ProcessGrant};
+use super::{
+    PermissionLiveness, PermissionProbeResult, PermissionService, ProcessGrant, TargetResolution,
+};
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
     CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,
@@ -87,6 +89,29 @@ pub fn grant_for_pid(pid: u32, timeout: Duration) -> Option<ProcessGrant> {
         pid,
         bundle_identity,
         process_generation_evidence: generation.to_string(),
+    })
+}
+
+/// Resolve a bundle identity against the windows this system currently reports.
+///
+/// Thin on purpose: the decision lives in [`TargetResolution::decide`], which is
+/// platform-neutral and therefore built and tested on every host. This half only
+/// supplies the readings, and it is the half no continuous build compiles.
+pub fn resolve_target(bundle_identity: &str, timeout: Duration) -> TargetResolution {
+    let Ok(windows) = cerebellum_macos::enumerate_windows(timeout) else {
+        // The window list is unavailable — capture is not permitted, or the
+        // window server did not answer. Reported as not running rather than as
+        // ambiguity: nothing was seen, so nothing can be said about how many
+        // instances exist.
+        return TargetResolution::NotRunning;
+    };
+    let owners: Vec<(u32, String)> = windows
+        .into_iter()
+        .map(|window| (window.owner_pid, window.owner_bundle_identifier))
+        .collect();
+
+    TargetResolution::decide(bundle_identity, &owners, |pid| {
+        cerebellum_macos::process_start_time_micros(pid).map(|micros| micros.to_string())
     })
 }
 
