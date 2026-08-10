@@ -20,6 +20,7 @@ pub mod elicit;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
+pub mod management;
 pub mod manifest;
 pub mod network;
 pub mod profile;
