@@ -205,6 +205,93 @@ pub struct CapabilityAdvertisementContext {
 }
 
 /// A stable process identity tuple. The raw pid is intentionally not sufficient.
+/// One process that answers to a bundle identity, before any grant is made.
+///
+/// Carries only what a person needs to tell two instances apart. The generation
+/// evidence that makes a grant is deliberately absent: resolution decides WHICH
+/// process is meant, and reading identity evidence for a target that turns out to
+/// be ambiguous would be work done for a request that cannot be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCandidate {
+    pub pid: u32,
+    /// How many windows this instance currently owns, so an operator choosing
+    /// between two can tell a working instance from a stray one.
+    pub window_count: usize,
+}
+
+/// What a bundle identity names right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetResolution {
+    /// Exactly one process answers to it.
+    Resolved(ProcessGrant),
+    /// Nothing running answers to it.
+    ///
+    /// Distinct from ambiguity because the remedy differs: this one is answered
+    /// by starting the application, and no choice by the user can resolve it.
+    NotRunning,
+    /// Several processes answer to it, so the identity does not name one.
+    ///
+    /// Refused rather than resolved to the frontmost, the oldest, or the first
+    /// seen. Any of those derives the target from state the user did not choose
+    /// and would not experience as a decision, which is the same objection that
+    /// rules out taking the frontmost application as the target.
+    ///
+    /// The candidates travel with the refusal so a person can act on it. A bare
+    /// "ambiguous" makes them reconstruct which instances exist before they can
+    /// do anything about it.
+    Ambiguous(Vec<TargetCandidate>),
+}
+
+impl TargetResolution {
+    /// Decide what a bundle identity names, given every window on the machine.
+    ///
+    /// Takes the whole window list rather than a filtered one so the ambiguity
+    /// is visible here: a caller that filtered first would have to decide which
+    /// instance to filter for, which is the question being answered.
+    ///
+    /// `read_generation` runs only for a single resolved instance, so the
+    /// ambiguous and not-running paths cost nothing.
+    pub fn decide<F: FnOnce(u32) -> Option<String>>(
+        bundle_identity: &str,
+        windows: &[(u32, String)],
+        read_generation: F,
+    ) -> Self {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for (pid, identity) in windows {
+            if identity == bundle_identity {
+                *counts.entry(*pid).or_default() += 1;
+            }
+        }
+
+        let mut instances = counts.into_iter();
+        let Some((pid, window_count)) = instances.next() else {
+            return Self::NotRunning;
+        };
+        let rest: Vec<(u32, usize)> = instances.collect();
+        if !rest.is_empty() {
+            let mut candidates = vec![TargetCandidate { pid, window_count }];
+            candidates.extend(
+                rest.into_iter()
+                    .map(|(pid, window_count)| TargetCandidate { pid, window_count }),
+            );
+            return Self::Ambiguous(candidates);
+        }
+
+        // A process that owns windows but whose start time cannot be read is
+        // treated as not running rather than resolved: a grant without
+        // generation evidence cannot survive the target being replaced, which is
+        // the whole reason the evidence is carried.
+        match read_generation(pid) {
+            Some(process_generation_evidence) => Self::Resolved(ProcessGrant {
+                pid,
+                bundle_identity: bundle_identity.to_string(),
+                process_generation_evidence,
+            }),
+            None => Self::NotRunning,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessGrant {
     pub pid: u32,
@@ -470,6 +557,100 @@ pub const COMPUTER_PLANE_TYPE_IDENTIFIERS: &[&str] = &[
     "StartupCapabilityProbe",
     "FrontingSnapshot",
 ];
+
+#[cfg(test)]
+mod target_resolution_tests {
+    use super::*;
+
+    fn windows() -> Vec<(u32, String)> {
+        vec![
+            (100, "com.apple.Safari".to_string()),
+            (100, "com.apple.Safari".to_string()),
+            (200, "com.apple.Mail".to_string()),
+        ]
+    }
+
+    fn generation(_pid: u32) -> Option<String> {
+        Some("1700000000000000".to_string())
+    }
+
+    /// One instance resolves to a grant naming it.
+    ///
+    /// The accepting case, asserted because every other test here is a refusal:
+    /// without it, resolution could refuse everything and they would all pass.
+    #[test]
+    fn a_single_instance_resolves() {
+        let resolution = TargetResolution::decide("com.apple.Safari", &windows(), generation);
+        let TargetResolution::Resolved(grant) = resolution else {
+            panic!("one instance must resolve, got {resolution:?}");
+        };
+        assert_eq!(grant.pid, 100);
+        assert_eq!(grant.bundle_identity, "com.apple.Safari");
+        assert!(grant.validate().is_ok());
+    }
+
+    /// Two instances refuse, and the refusal names both.
+    ///
+    /// Naming them is what makes the refusal actionable: a person choosing
+    /// between instances needs to know they exist and which is which, and a bare
+    /// "ambiguous" makes them reconstruct that before they can do anything.
+    #[test]
+    fn two_instances_refuse_and_name_themselves() {
+        let mut many = windows();
+        many.push((101, "com.apple.Safari".to_string()));
+
+        let resolution = TargetResolution::decide("com.apple.Safari", &many, |_| {
+            panic!("identity evidence was read for a target that cannot be served")
+        });
+        let TargetResolution::Ambiguous(candidates) = resolution else {
+            panic!("two instances must refuse, got {resolution:?}");
+        };
+
+        let named: Vec<u32> = candidates.iter().map(|candidate| candidate.pid).collect();
+        assert_eq!(named, vec![100, 101]);
+        assert_eq!(
+            candidates[0].window_count, 2,
+            "the refusal should say how many windows each instance owns"
+        );
+        assert_eq!(candidates[1].window_count, 1);
+    }
+
+    /// An identity nothing answers to is not running, rather than ambiguous.
+    ///
+    /// The two refusals have different remedies: this one is answered by
+    /// starting the application, and no choice by the user resolves it.
+    #[test]
+    fn an_identity_nothing_answers_to_is_not_running() {
+        assert_eq!(
+            TargetResolution::decide("com.example.Absent", &windows(), generation),
+            TargetResolution::NotRunning
+        );
+    }
+
+    /// An instance whose start time cannot be read does not resolve.
+    ///
+    /// A grant without generation evidence cannot tell the target from a
+    /// replacement that inherits its process id, which is the whole reason the
+    /// evidence is carried. Reported as not running because that is what the
+    /// caller can act on: the process this identity named is not usable.
+    #[test]
+    fn an_instance_without_generation_evidence_does_not_resolve() {
+        assert_eq!(
+            TargetResolution::decide("com.apple.Safari", &windows(), |_| None),
+            TargetResolution::NotRunning
+        );
+    }
+
+    /// Windows owned by other applications do not affect the decision.
+    #[test]
+    fn another_applications_windows_are_not_counted() {
+        let resolution = TargetResolution::decide("com.apple.Mail", &windows(), generation);
+        let TargetResolution::Resolved(grant) = resolution else {
+            panic!("one instance must resolve, got {resolution:?}");
+        };
+        assert_eq!(grant.pid, 200);
+    }
+}
 
 #[cfg(test)]
 mod tests {
