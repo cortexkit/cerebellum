@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_core_graphics::CGImage;
+use objc2_core_foundation::{CFData, CFRetained, CFString};
+use objc2_core_graphics::{
+    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
+};
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
@@ -62,7 +65,34 @@ struct ProcBsdInfo {
 /// `<sys/proc_info.h>`.
 const PROC_PIDTBSDINFO: c_int = 3;
 
+// The system's image encoders, which is why no encoding crate is vendored.
+#[link(name = "ImageIO", kind = "framework")]
 extern "C" {
+    /// A destination that writes an encoded image into a buffer.
+    fn CGImageDestinationCreateWithData(
+        data: *mut std::ffi::c_void,
+        ty: *const std::ffi::c_void,
+        count: usize,
+        options: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn CGImageDestinationAddImage(
+        destination: *mut std::ffi::c_void,
+        image: *const std::ffi::c_void,
+        properties: *const std::ffi::c_void,
+    );
+    /// Writes everything added so far. False means nothing usable was produced.
+    fn CGImageDestinationFinalize(destination: *mut std::ffi::c_void) -> bool;
+}
+
+extern "C" {
+    /// A growable buffer for an encoder to write into.
+    fn CFDataCreateMutable(
+        allocator: *const std::ffi::c_void,
+        capacity: isize,
+    ) -> *mut std::ffi::c_void;
+    fn CFDataGetLength(data: *const std::ffi::c_void) -> isize;
+    fn CFDataGetBytePtr(data: *const std::ffi::c_void) -> *const u8;
+
     /// This thread's `errno`. The kernel calls below report every failure as a
     /// zero return, so the cause is only available here.
     #[link_name = "__error"]
@@ -185,6 +215,104 @@ pub fn is_off_main_thread() -> bool {
     // SAFETY: takes no arguments, returns a plain integer, and is callable from
     // any thread.
     unsafe { pthread_main_np() == 0 }
+}
+
+/// Encode tightly-packed BGRA pixels as a PNG.
+///
+/// PNG rather than a lossy format, and the reason is not size: a model reading
+/// a screenshot is reading small text, and the artifacts a lossy encoder leaves
+/// around glyph edges are exactly what degrades that. It is also not a cost
+/// difference — an image is charged by its dimensions rather than its bytes, so
+/// the compression choice changes what is sent and not what is paid.
+///
+/// Uses the platform's own encoder rather than a third-party one, so nothing is
+/// added to the dependency set for a facility the system already provides.
+///
+/// Expects the tight packing [`capture_window`] produces: exactly
+/// `width * height * 4` bytes. A buffer still carrying the row padding the
+/// system leaves would encode as a progressively skewed image rather than fail,
+/// so the length is checked rather than trusted.
+pub fn encode_png(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| format!("{width}x{height} is too large to describe"))?;
+    if bgra.len() != expected {
+        return Err(format!(
+            "{width}x{height} needs exactly {expected} tightly-packed bytes, got {}",
+            bgra.len()
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err("an image with no area cannot be encoded".to_string());
+    }
+
+    let data = CFData::from_bytes(bgra);
+    let provider = CGDataProvider::with_cf_data(Some(&data))
+        .ok_or_else(|| "the pixels could not be wrapped for encoding".to_string())?;
+    let color_space = CGColorSpace::new_device_rgb()
+        .ok_or_else(|| "the device colour space is unavailable".to_string())?;
+
+    // Little-endian 32-bit, alpha last: the order the capture path delivers.
+    let bitmap_info = CGBitmapInfo(2 | (2 << 12));
+    // SAFETY: the provider holds the pixels for the lifetime of the image, and
+    // the dimensions match the buffer length checked above. The decode array is
+    // null, which the constructor documents as permitted.
+    let image = unsafe {
+        CGImage::new(
+            width,
+            height,
+            8,
+            32,
+            width * 4,
+            Some(&color_space),
+            bitmap_info,
+            Some(&provider),
+            std::ptr::null(),
+            false,
+            CGColorRenderingIntent::RenderingIntentDefault,
+        )
+    }
+    .ok_or_else(|| "the pixels could not be read as an image".to_string())?;
+
+    let png_type = CFString::from_static_str("public.png");
+    // SAFETY: every object created here is released on every path out,
+    // including the early return. The encoded bytes are copied before the
+    // buffer holding them is released.
+    unsafe {
+        let out = CFDataCreateMutable(std::ptr::null(), 0);
+        if out.is_null() {
+            return Err("no buffer could be allocated for the encoded image".to_string());
+        }
+        let destination = CGImageDestinationCreateWithData(
+            out,
+            CFRetained::as_ptr(&png_type).as_ptr().cast(),
+            1,
+            std::ptr::null(),
+        );
+        if destination.is_null() {
+            CFRelease(out.cast());
+            return Err("the system offers no PNG encoder".to_string());
+        }
+
+        CGImageDestinationAddImage(
+            destination,
+            CFRetained::as_ptr(&image).as_ptr().cast(),
+            std::ptr::null(),
+        );
+        let finalized = CGImageDestinationFinalize(destination);
+        let length = CFDataGetLength(out.cast()) as usize;
+        let encoded = if finalized && length > 0 {
+            Some(std::slice::from_raw_parts(CFDataGetBytePtr(out.cast()), length).to_vec())
+        } else {
+            None
+        };
+
+        CFRelease(destination.cast());
+        CFRelease(out.cast());
+
+        encoded.ok_or_else(|| "the image could not be encoded".to_string())
+    }
 }
 
 /// Whether the screen is locked.
@@ -1155,6 +1283,69 @@ mod tests {
             status.status,
             String::from_utf8_lossy(&status.stderr)
         );
+    }
+
+    /// Pixels encode to a real PNG, smaller than the bytes they came from.
+    ///
+    /// Built from a constructed buffer rather than a capture, so it holds on a
+    /// locked screen and with no capture permission — the conditions under
+    /// which the capture-based tests here skip and prove nothing.
+    #[test]
+    fn pixels_encode_to_a_png() {
+        // A width that is not a convenient multiple, and a pattern with
+        // structure: a uniform block would survive most encoding bugs.
+        let (width, height) = (37usize, 11usize);
+        let mut bgra = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                bgra.extend_from_slice(&[(x * 7) as u8, (y * 23) as u8, 0x40, 0xFF]);
+            }
+        }
+
+        let png = encode_png(&bgra, width, height).expect("pixels encode");
+
+        // The signature, so this asserts the FORMAT rather than that some bytes
+        // came back.
+        assert_eq!(
+            &png[..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+            "the encoded bytes are not a PNG"
+        );
+        assert!(
+            png.len() < bgra.len(),
+            "encoding {} bytes produced {}, which is not compression",
+            bgra.len(),
+            png.len()
+        );
+
+        // The dimensions are carried in the header, immediately after the
+        // signature and an 8-byte chunk prefix, big-endian. Asserted because an
+        // encoder given the wrong stride produces a valid PNG of the wrong
+        // shape rather than an error.
+        let header_width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let header_height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+        assert_eq!((header_width, header_height), (width as u32, height as u32));
+    }
+
+    /// A buffer that does not match its dimensions is refused.
+    ///
+    /// The case that matters is a buffer still carrying the row padding the
+    /// system leaves: it is LARGER than the image describes, and encoding it
+    /// anyway produces a progressively skewed picture rather than a failure.
+    #[test]
+    fn a_buffer_that_does_not_match_its_dimensions_is_refused() {
+        let (width, height) = (37usize, 11usize);
+        let tight = width * height * 4;
+
+        // Padded to a wider stride, as the system delivers.
+        let padded = vec![0u8; (width * 4 + 7) * height];
+        assert!(encode_png(&padded, width, height).is_err());
+
+        // Short by one pixel.
+        assert!(encode_png(&vec![0u8; tight - 4], width, height).is_err());
+
+        // No area at all.
+        assert!(encode_png(&[], 0, 10).is_err());
     }
 
     /// A graphical session reports a definite lock state, never an unknown one.
