@@ -351,6 +351,16 @@ impl CaptureBackend for NativeCaptureBackend {
             }
         }
 
+        // Encoded here rather than downstream, because this is the last point
+        // that holds raw pixels and everything past it accounts for what it is
+        // given. The journal charges an artifact by its size against a
+        // retention budget, so admitting ~31MB of raw pixels where ~1MB of PNG
+        // would do distorts every eviction decision made afterwards. The wire
+        // also refuses an image over 16 MiB outright, which raw pixels for one
+        // large window exceed.
+        let png = cerebellum_macos::encode_png(&capture.bgra, capture.width, capture.height)
+            .map_err(BackendError::Capture)?;
+
         Ok(WindowCaptureFrame {
             owner_identity: request.target.clone(),
             owner_identity_verified: true,
@@ -361,7 +371,7 @@ impl CaptureBackend for NativeCaptureBackend {
                 height: capture.height as u32,
             },
             captured_at_ms: request.captured_at_ms,
-            artifact: CaptureArtifact::Bytes(capture.bgra),
+            artifact: CaptureArtifact::Bytes(png),
             accessibility_root: None,
         })
     }
@@ -686,8 +696,22 @@ mod tests {
         assert!(frame.owner_identity_verified);
         assert_eq!(frame.captured_at_ms, 1234);
         assert!(frame.frame.width > 0 && frame.frame.height > 0);
+        // A PNG rather than raw pixels, asserted by its signature: everything
+        // downstream accounts for what it is handed, and raw pixels for one
+        // large window exceed the wire's own image limit before any budget is
+        // consulted.
         match &frame.artifact {
-            CaptureArtifact::Bytes(bytes) => assert!(!bytes.is_empty()),
+            CaptureArtifact::Bytes(bytes) => {
+                assert_eq!(
+                    &bytes[..8],
+                    &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+                    "the backend handed over something that is not a PNG"
+                );
+                assert!(
+                    bytes.len() < frame.frame.width as usize * frame.frame.height as usize * 4,
+                    "the encoded image is not smaller than the pixels it came from"
+                );
+            }
             CaptureArtifact::Reference(_) => panic!("this backend returns pixels, not a reference"),
         }
     }
