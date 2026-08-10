@@ -1882,6 +1882,137 @@ mod tests {
         assert_eq!(elicitor.outstanding(), 0);
     }
 
+    /// A management route is served by the management surface, not the tool one.
+    ///
+    /// The two take different envelopes, so a management request reaching the
+    /// tool path is rejected as a malformed tool call: the caller is told its
+    /// request was invalid when the module simply sent it to the wrong place.
+    ///
+    /// Driven through the real entry point, because a test calling the
+    /// management handler directly would pass however the routing behaved.
+    #[tokio::test]
+    async fn a_management_route_is_served_by_the_management_surface() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let planes = management_bound_planes(4, 1);
+
+        let request = serde_json::json!({
+            "method": management::OPEN_TARGET,
+            "params": {
+                "bundle_identity": "com.example.Nothing",
+                "action_kind": "observe",
+            },
+        });
+        let frame = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            77,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+
+        handle_route_request(frame, &writer_tx, &planes)
+            .await
+            .expect("a management request is served");
+
+        let response = writer_rx.recv().await.expect("a response frame");
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        // The operation ran: it resolved the name and found nothing running.
+        // Served by the tool path this would be a rejected envelope instead.
+        assert_eq!(
+            body["outcome"], "not_running",
+            "a management request was not served by the management surface: {body}"
+        );
+    }
+
+    /// A route bound to a surface this module does not serve is refused as such.
+    ///
+    /// Not served as either of the surfaces it does: answering from an envelope
+    /// the caller did not use produces a reply about a request nobody made.
+    #[tokio::test]
+    async fn an_unsupported_surface_is_refused_by_name() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let planes = Planes {
+            health: Arc::new(HealthState::default()),
+            routes: Arc::new(RouteBindings::new()),
+            browser: Arc::new(BrowserPlane::new()),
+            management: test_management_plane(),
+            elicitor: Arc::new(Elicitor::new()),
+        };
+        planes.routes.insert(
+            6,
+            1,
+            AcceptedBindFacts::from_bind(
+                &bind_identity_for_test(),
+                Some(Principal::Direct),
+                None,
+                None,
+                &subc_protocol::RouteTarget::InternalService {
+                    module_id: "cerebellum".to_string(),
+                    service_id: "anything".to_string(),
+                },
+            ),
+        );
+
+        let frame = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            6,
+            1,
+            78,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+
+        handle_route_request(frame, &writer_tx, &planes)
+            .await
+            .expect("an unsupported surface is answered");
+
+        // A transport-level error rather than an application outcome: no
+        // operation ran, so there is no result to report. The surface is named
+        // in the code so a caller can tell this from a request it got wrong.
+        let response = writer_rx.recv().await.expect("a response frame");
+        assert_eq!(response.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "unsupported_surface", "{body}");
+    }
+
+    fn bind_identity_for_test() -> subc_protocol::BindIdentity {
+        subc_protocol::BindIdentity {
+            project_root: PathBuf::from("/test/project"),
+            harness: "test".to_string(),
+            session: "test-session".to_string(),
+        }
+    }
+
+    /// Planes whose only route is bound to the management surface.
+    fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
+        let planes = Planes {
+            health: Arc::new(HealthState::default()),
+            routes: Arc::new(RouteBindings::new()),
+            browser: Arc::new(BrowserPlane::new()),
+            management: test_management_plane(),
+            elicitor: Arc::new(Elicitor::new()),
+        };
+        planes.routes.insert(
+            channel,
+            epoch,
+            AcceptedBindFacts::from_bind(
+                &bind_identity_for_test(),
+                Some(Principal::Direct),
+                None,
+                None,
+                &subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+        planes
+    }
+
     #[test]
     fn parse_subc_arg_accepts_space_separated() {
         let args = vec!["--subc".to_string().into(), "/tmp/conn.json".into()];
