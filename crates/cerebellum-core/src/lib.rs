@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ask;
 pub mod clock;
 pub mod config;
 pub mod consent;
