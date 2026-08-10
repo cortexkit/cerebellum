@@ -305,8 +305,16 @@ impl ConsentLeases {
     ///
     /// A duration rather than the expiry instant, because an instant is
     /// comparable only to others from the same clock and a caller reading this
-    /// over a wire has no access to that clock. Handing one out would look
-    /// sufficient and mean nothing.
+    /// elsewhere has no access to that clock. Handing one out would look
+    /// sufficient and mean nothing: nothing at the far end fails, the caller
+    /// compares it against its own clock, and the answer is plausible and wrong.
+    ///
+    /// IT IS AN UPPER BOUND, NOT A FENCE. The value is already stale when it
+    /// arrives — by however long it took to get there, plus whatever the caller
+    /// does before acting — so it is worth planning against and not worth
+    /// relying on. The expiry comparison made here at the moment of use stays
+    /// the authority, and a caller acting on a nearly-expired lease should
+    /// expect the refusal rather than try to beat it.
     ///
     /// `None` for a single-use grant, which is not bounded by time at all.
     pub fn remaining<C: MonotonicClock>(lease: &Lease, clock: &C) -> Option<core::time::Duration> {
