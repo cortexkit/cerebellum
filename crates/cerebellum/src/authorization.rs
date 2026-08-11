@@ -750,6 +750,56 @@ impl std::error::Error for AuthorizationCommitError {}
 
 #[cfg(test)]
 mod tests {
+
+    /// Both planes number the fleet severity tiers identically.
+    ///
+    /// The browser plane declares these constants and the computer plane's
+    /// severity table carries tier numbers of its own, and both say they speak
+    /// `ck-action-severity/v1`. Nothing else holds the two together, so a
+    /// renumbering on either side would leave each plane internally consistent
+    /// and mean different things by the same number.
+    ///
+    /// That failure is silent in the worst way: severity is what a decision
+    /// plane reads to judge how consequential an action is, so a mismatch does
+    /// not produce an error, it produces a wrong judgement. A browser action
+    /// recorded as tier 4 would be read against the computer plane's meaning of
+    /// 4, and any policy keyed on the number would admit or refuse the wrong
+    /// thing.
+    ///
+    /// Asserted against the loaded taxonomy rather than the computer plane's
+    /// own constants, because the taxonomy is the data a consumer reads.
+    #[test]
+    fn the_two_planes_agree_on_what_each_severity_tier_means() {
+        use cerebellum_computer::platform::severity::{
+            load_severity_taxonomy, FLEET_SEVERITY_SCHEMA_ID,
+        };
+
+        // The same schema is claimed on both sides, which is what makes the
+        // numbers comparable at all.
+        assert_eq!(FLEET_SEVERITY_SCHEMA_ID, "ck-action-severity/v1");
+
+        let taxonomy = load_severity_taxonomy().expect("the computer plane's table loads");
+
+        // Every tier the computer plane can produce is one this plane names.
+        for (inputs, record) in taxonomy.table() {
+            let tier = SeverityTier::try_from(record.tier).unwrap_or_else(|_| {
+                panic!(
+                    "{inputs:?} resolves to tier {}, which the browser plane does not name",
+                    record.tier
+                )
+            });
+            assert_eq!(tier.as_u8(), record.tier);
+        }
+
+        // And the numbering itself, stated as literals rather than derived from
+        // the constants under test: deriving them would pass however they were
+        // renumbered.
+        assert_eq!(SeverityTier::Observe.as_u8(), 1);
+        assert_eq!(SeverityTier::Compose.as_u8(), 2);
+        assert_eq!(SeverityTier::MutateReversible.as_u8(), 3);
+        assert_eq!(SeverityTier::MutateDurable.as_u8(), 4);
+        assert_eq!(SeverityTier::Actuate.as_u8(), 5);
+    }
     use super::*;
     use crate::classification::{
         classify_click, ElementClassificationInput, NodeIdentityInput, NonTypeClassificationInput,
