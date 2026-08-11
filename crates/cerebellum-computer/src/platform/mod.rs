@@ -434,6 +434,14 @@ pub struct InputObservationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectObservationRequest {
+    /// Which application to read when checking the condition.
+    ///
+    /// Carried rather than inferred: an observer that read whichever
+    /// application was frontmost would check the condition against a window the
+    /// action never touched, and report an effect belonging to something else.
+    /// The grant is the only statement of which process the action was
+    /// authorised against.
+    pub target: ProcessGrant,
     pub predicate: String,
     pub deadline_ms: u32,
 }

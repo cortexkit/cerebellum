@@ -70,6 +70,12 @@ struct RecordingDriver {
     per_pid_calls: usize,
     global_calls: usize,
     effect_calls: usize,
+    /// Which application each observation was asked to read.
+    ///
+    /// Recorded rather than counted, because an observation that ran against
+    /// the wrong application returns an answer of exactly the same shape as one
+    /// that ran against the right one.
+    effect_targets: Vec<ProcessGrant>,
 }
 
 impl Default for RecordingDriver {
@@ -83,6 +89,7 @@ impl Default for RecordingDriver {
                 status: EffectStatus::EffectObserved,
                 failure_reason: None,
             }),
+            effect_targets: Vec::new(),
             liveness: InputObserverLiveness {
                 session_tap_live: true,
                 raw_hid_live: true,
@@ -192,9 +199,10 @@ impl PlatformDriver for RecordingDriver {
     }
     fn observe_effect(
         &mut self,
-        _request: EffectObservationRequest,
+        request: EffectObservationRequest,
     ) -> Result<EffectObservationResult, DriverError> {
         self.effect_calls += 1;
+        self.effect_targets.push(request.target);
         self.effect.clone()
     }
     fn verify_attendance(
@@ -861,5 +869,32 @@ fn an_unadvertised_action_does_not_take_the_semantic_path() {
     assert_eq!(
         report.delivery_primitive,
         cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+    );
+}
+
+/// The effect is checked in the application the action was authorised against.
+///
+/// An observation carries the grant rather than letting the observer decide
+/// which application to read. An observer that read whichever application was
+/// frontmost would check the condition against a window the action never
+/// touched — and since the answer has the same shape either way, a wrong
+/// reading is indistinguishable from a right one at every layer above.
+///
+/// The failure this prevents is worse than a missed effect: an action that did
+/// nothing would be reported as having worked, because something else on the
+/// screen happened to satisfy the condition.
+#[test]
+fn the_effect_is_observed_in_the_authorised_application() {
+    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    dispatcher
+        .dispatch(semantic_request(
+            FrozenDispatchRow::for_capability("computer.click").unwrap(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        dispatcher.driver().effect_targets,
+        vec![target()],
+        "the effect was checked somewhere other than the authorised application"
     );
 }
