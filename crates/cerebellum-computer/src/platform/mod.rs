@@ -466,11 +466,55 @@ pub struct AttendancePreconditionResult {
     pub age_ms: Option<u64>,
 }
 
+/// Why an accessibility tree could not be read.
+///
+/// These outcomes name the remedy available to a caller rather than the
+/// framework status that produced them. A target that has exited, for example,
+/// cannot become readable by retrying, while a deadline can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessibilityReadFailure {
+    PermissionRequired,
+    TargetGone,
+    TargetReplaced,
+    TargetNotInspectable,
+    RetryableDeadlineExceeded,
+    TreeExceedsBound,
+    IncompatiblePlatformValue,
+    PlatformReadFailed,
+}
+
+impl fmt::Display for AccessibilityReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::PermissionRequired => "accessibility permission is required",
+            Self::TargetGone => "target process is gone",
+            Self::TargetReplaced => "target process was replaced",
+            Self::TargetNotInspectable => "target process cannot be inspected",
+            Self::RetryableDeadlineExceeded => "accessibility read deadline exceeded",
+            Self::TreeExceedsBound => "accessibility tree exceeds the read bound",
+            Self::IncompatiblePlatformValue => {
+                "platform returned an incompatible accessibility value"
+            }
+            Self::PlatformReadFailed => "platform failed while reading accessibility data",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverError {
     Unsupported(&'static str),
     InvalidRequest(&'static str),
     StartupRefused(&'static str),
+    /// The accessibility tree could not be read.
+    AccessibilityUnreadable(AccessibilityReadFailure),
+    /// The tree was read and the named element is not in it.
+    ElementNotFound,
+}
+
+impl From<AccessibilityReadFailure> for DriverError {
+    fn from(failure: AccessibilityReadFailure) -> Self {
+        Self::AccessibilityUnreadable(failure)
+    }
 }
 
 impl fmt::Display for DriverError {
@@ -479,6 +523,10 @@ impl fmt::Display for DriverError {
             Self::Unsupported(op) => write!(f, "unsupported platform operation: {op}"),
             Self::InvalidRequest(reason) => write!(f, "invalid platform request: {reason}"),
             Self::StartupRefused(reason) => write!(f, "platform startup refused: {reason}"),
+            Self::AccessibilityUnreadable(failure) => {
+                write!(f, "accessibility tree unreadable: {failure}")
+            }
+            Self::ElementNotFound => f.write_str("accessibility element not found"),
         }
     }
 }

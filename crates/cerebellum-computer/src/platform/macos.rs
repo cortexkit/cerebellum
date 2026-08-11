@@ -4,7 +4,8 @@
 //! grants and envelope drift without linking macOS frameworks on other hosts.
 
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 pub const MACOS_MAJOR_VERSION: u16 = 26;
 pub const PRIVATE_ENVELOPE_REVISION: &str = "skylight-macos26-v1";
@@ -104,15 +105,154 @@ impl StartupCapabilityProbe {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedAccessibilityElement {
+    identifier: Option<String>,
+    actions: Vec<String>,
+    children: Vec<CachedAccessibilityElement>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAccessibilityTree {
+    target: ProcessGrant,
+    tree: CachedAccessibilityElement,
+}
+
 #[derive(Debug, Clone)]
 pub struct MacOs26PlatformDriver {
     startup: StartupCapabilityProbe,
+    accessibility_trees: BTreeMap<String, CachedAccessibilityTree>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessibilityReaderFailure {
+    PermissionDenied,
+    ProcessGone,
+    ProcessNotInspectable,
+    DeadlineExceeded,
+    BoundExceeded,
+    IncompatibleValue,
+    SystemFailure,
+}
+
+impl From<AccessibilityReaderFailure> for AccessibilityReadFailure {
+    fn from(failure: AccessibilityReaderFailure) -> Self {
+        match failure {
+            AccessibilityReaderFailure::PermissionDenied => Self::PermissionRequired,
+            AccessibilityReaderFailure::ProcessGone => Self::TargetGone,
+            AccessibilityReaderFailure::ProcessNotInspectable => Self::TargetNotInspectable,
+            AccessibilityReaderFailure::DeadlineExceeded => Self::RetryableDeadlineExceeded,
+            // A depth and an element-count limit both mean the reader's bounded
+            // traversal policy must change; neither says anything about target liveness.
+            AccessibilityReaderFailure::BoundExceeded => Self::TreeExceedsBound,
+            AccessibilityReaderFailure::IncompatibleValue => Self::IncompatiblePlatformValue,
+            AccessibilityReaderFailure::SystemFailure => Self::PlatformReadFailed,
+        }
+    }
+}
+
+fn accessibility_read_timeout(settle_interval_ms: u32) -> Result<Duration, DriverError> {
+    // The interval caps how long AX may block this read. Waiting beforehand
+    // would only age the tree and would not make a rejected read more usable.
+    <MacOs26PlatformDriver as PlatformDriver>::bounded_duration(u64::from(settle_interval_ms))
+}
+
+fn root_cache_key(target: &ProcessGrant) -> String {
+    // AX identifiers are optional and application-controlled. The granted PID
+    // plus its kernel generation identifies this application's root until that
+    // process exits or is replaced, and lets resolution retrieve the same cache.
+    format!(
+        "accessibility-root:{}:{}",
+        target.pid, target.process_generation_evidence
+    )
+}
+
+fn root_degenerate_reason(child_count: u32) -> Option<String> {
+    (child_count == 0).then(|| "missing_children_for_nontrivial_window".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn map_ax_read_error(error: cerebellum_macos::AxReadError) -> DriverError {
+    let failure = match error {
+        cerebellum_macos::AxReadError::PermissionNotGranted => {
+            AccessibilityReaderFailure::PermissionDenied
+        }
+        cerebellum_macos::AxReadError::NoSuchProcess { .. } => {
+            AccessibilityReaderFailure::ProcessGone
+        }
+        cerebellum_macos::AxReadError::ProcessNotAccessible { .. } => {
+            AccessibilityReaderFailure::ProcessNotInspectable
+        }
+        cerebellum_macos::AxReadError::DeadlineExceeded { .. } => {
+            AccessibilityReaderFailure::DeadlineExceeded
+        }
+        cerebellum_macos::AxReadError::DepthLimitExceeded { .. }
+        | cerebellum_macos::AxReadError::ElementLimitExceeded { .. } => {
+            AccessibilityReaderFailure::BoundExceeded
+        }
+        cerebellum_macos::AxReadError::UnexpectedValueType { .. } => {
+            AccessibilityReaderFailure::IncompatibleValue
+        }
+        cerebellum_macos::AxReadError::SystemCallFailed { .. } => {
+            AccessibilityReaderFailure::SystemFailure
+        }
+    };
+    AccessibilityReadFailure::from(failure).into()
+}
+
+#[cfg(target_os = "macos")]
+fn cache_ax_element(element: cerebellum_macos::AxElement) -> CachedAccessibilityElement {
+    CachedAccessibilityElement {
+        identifier: element.identifier,
+        actions: element.actions,
+        children: element.children.into_iter().map(cache_ax_element).collect(),
+    }
+}
+
+fn find_cached_element<'a>(
+    element: &'a CachedAccessibilityElement,
+    identifier: &str,
+) -> Option<&'a CachedAccessibilityElement> {
+    if element.identifier.as_deref() == Some(identifier) {
+        return Some(element);
+    }
+    element
+        .children
+        .iter()
+        .find_map(|child| find_cached_element(child, identifier))
+}
+
+fn resolve_cached_element<'a>(
+    tree: &'a CachedAccessibilityTree,
+    request: &ElementResolutionRequest,
+) -> Result<&'a CachedAccessibilityElement, DriverError> {
+    find_cached_element(&tree.tree, &request.element_identifier).ok_or(DriverError::ElementNotFound)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_cached_tree_owner(target: &ProcessGrant) -> Result<(), DriverError> {
+    match super::native::verify_grant(target.pid, target) {
+        super::native::GrantVerification::Current => Ok(()),
+        super::native::GrantVerification::TargetReplaced => {
+            Err(AccessibilityReadFailure::TargetReplaced.into())
+        }
+        super::native::GrantVerification::TargetGone => {
+            Err(AccessibilityReadFailure::TargetGone.into())
+        }
+        super::native::GrantVerification::TargetUnreadable => {
+            Err(AccessibilityReadFailure::TargetNotInspectable.into())
+        }
+        super::native::GrantVerification::DifferentProcess => Err(DriverError::InvalidRequest(
+            "cached accessibility root belongs to another process",
+        )),
+    }
 }
 
 impl MacOs26PlatformDriver {
     pub fn new(input: &StartupProbeInput) -> Self {
         Self {
             startup: StartupCapabilityProbe::run(input),
+            accessibility_trees: BTreeMap::new(),
         }
     }
 
@@ -288,15 +428,70 @@ impl PlatformDriver for MacOs26PlatformDriver {
 
     fn read_accessibility_tree(
         &mut self,
-        _request: AccessibilityTreeRequest,
+        request: AccessibilityTreeRequest,
     ) -> Result<AccessibilityTreeResult, DriverError> {
-        Err(DriverError::Unsupported("accessibility tree read"))
+        request.target.validate()?;
+        let timeout = accessibility_read_timeout(request.settle_interval_ms)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let tree = cerebellum_macos::read_accessibility_tree(
+                request.target.pid,
+                cerebellum_macos::AxReadOptions {
+                    timeout,
+                    ..Default::default()
+                },
+            )
+            .map_err(map_ax_read_error)?;
+            let child_count = u32::try_from(tree.children.len())
+                .expect("the reader's element bound keeps child count within u32");
+            let root_identifier = root_cache_key(&request.target);
+            self.accessibility_trees.insert(
+                root_identifier.clone(),
+                CachedAccessibilityTree {
+                    target: request.target,
+                    tree: cache_ax_element(tree),
+                },
+            );
+            Ok(AccessibilityTreeResult {
+                root_identifier: Some(root_identifier),
+                child_count,
+                handshake_attempted: true,
+                degenerate_reason: root_degenerate_reason(child_count),
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = timeout;
+            Err(DriverError::Unsupported("accessibility tree read"))
+        }
     }
     fn resolve_element(
         &mut self,
-        _request: ElementResolutionRequest,
+        request: ElementResolutionRequest,
     ) -> Result<ElementResolutionResult, DriverError> {
-        Err(DriverError::Unsupported("element resolution"))
+        #[cfg(target_os = "macos")]
+        {
+            let Some(cached) = self.accessibility_trees.get(&request.root_identifier) else {
+                return Err(DriverError::ElementNotFound);
+            };
+            verify_cached_tree_owner(&cached.target)?;
+            let element = resolve_cached_element(cached, &request)?;
+            Ok(ElementResolutionResult {
+                element_identifier: request.element_identifier,
+                // Cloning occurs only after the kernel generation check above;
+                // otherwise a reused PID could be reported as the old grant.
+                owning_process: cached.target.clone(),
+                semantic_actions: element.actions.clone(),
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("element resolution"))
+        }
     }
     fn dispatch_semantic(
         &mut self,
@@ -437,5 +632,203 @@ mod tests {
                 PermissionService::InputMonitoring,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+
+    #[test]
+    fn reader_failures_map_to_distinct_typed_driver_errors() {
+        let cases = [
+            (
+                AccessibilityReaderFailure::PermissionDenied,
+                AccessibilityReadFailure::PermissionRequired,
+            ),
+            (
+                AccessibilityReaderFailure::ProcessGone,
+                AccessibilityReadFailure::TargetGone,
+            ),
+            (
+                AccessibilityReaderFailure::ProcessNotInspectable,
+                AccessibilityReadFailure::TargetNotInspectable,
+            ),
+            (
+                AccessibilityReaderFailure::DeadlineExceeded,
+                AccessibilityReadFailure::RetryableDeadlineExceeded,
+            ),
+            (
+                AccessibilityReaderFailure::BoundExceeded,
+                AccessibilityReadFailure::TreeExceedsBound,
+            ),
+            (
+                AccessibilityReaderFailure::IncompatibleValue,
+                AccessibilityReadFailure::IncompatiblePlatformValue,
+            ),
+            (
+                AccessibilityReaderFailure::SystemFailure,
+                AccessibilityReadFailure::PlatformReadFailed,
+            ),
+        ];
+
+        for (reader_failure, expected) in cases {
+            assert_eq!(
+                DriverError::from(AccessibilityReadFailure::from(reader_failure)),
+                DriverError::AccessibilityUnreadable(expected),
+                "the reader failure {reader_failure:?} did not retain its caller-visible remedy"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_interval_bounds_the_read_without_a_pre_read_wait() {
+        assert_eq!(
+            accessibility_read_timeout(500),
+            Ok(Duration::from_millis(500))
+        );
+        assert_eq!(
+            accessibility_read_timeout(300_001),
+            Err(DriverError::InvalidRequest(
+                "duration exceeds vocabulary bound"
+            ))
+        );
+    }
+
+    #[test]
+    fn root_handle_binds_the_cache_to_the_granted_process_generation() {
+        let first = ProcessGrant {
+            pid: 41,
+            bundle_identity: "com.example.reader".to_string(),
+            process_generation_evidence: "generation-a".to_string(),
+        };
+        let replacement = ProcessGrant {
+            process_generation_evidence: "generation-b".to_string(),
+            ..first.clone()
+        };
+
+        assert_eq!(root_cache_key(&first), "accessibility-root:41:generation-a");
+        assert_ne!(root_cache_key(&first), root_cache_key(&replacement));
+    }
+
+    #[test]
+    fn an_empty_root_uses_the_closed_degeneracy_vocabulary() {
+        assert_eq!(
+            root_degenerate_reason(0),
+            Some("missing_children_for_nontrivial_window".to_string())
+        );
+        assert_eq!(root_degenerate_reason(1), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_raw_read_error_preserves_its_typed_remedy() {
+        let cases = [
+            (
+                cerebellum_macos::AxReadError::PermissionNotGranted,
+                AccessibilityReadFailure::PermissionRequired,
+            ),
+            (
+                cerebellum_macos::AxReadError::NoSuchProcess { pid: 41 },
+                AccessibilityReadFailure::TargetGone,
+            ),
+            (
+                cerebellum_macos::AxReadError::ProcessNotAccessible {
+                    pid: 41,
+                    ax_error: -25204,
+                },
+                AccessibilityReadFailure::TargetNotInspectable,
+            ),
+            (
+                cerebellum_macos::AxReadError::DeadlineExceeded {
+                    timeout: Duration::from_millis(500),
+                },
+                AccessibilityReadFailure::RetryableDeadlineExceeded,
+            ),
+            (
+                cerebellum_macos::AxReadError::DepthLimitExceeded {
+                    max_depth: 4,
+                    attempted_depth: 5,
+                },
+                AccessibilityReadFailure::TreeExceedsBound,
+            ),
+            (
+                cerebellum_macos::AxReadError::ElementLimitExceeded {
+                    max_elements: 4,
+                    attempted_elements: 5,
+                },
+                AccessibilityReadFailure::TreeExceedsBound,
+            ),
+            (
+                cerebellum_macos::AxReadError::UnexpectedValueType {
+                    attribute: "AXChildren",
+                },
+                AccessibilityReadFailure::IncompatiblePlatformValue,
+            ),
+            (
+                cerebellum_macos::AxReadError::SystemCallFailed {
+                    operation: "AXUIElementCopyAttributeValue",
+                    ax_error: -25205,
+                },
+                AccessibilityReadFailure::PlatformReadFailed,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                map_ax_read_error(error),
+                DriverError::AccessibilityUnreadable(expected)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cached_element_tests {
+    use super::*;
+
+    fn cached_tree() -> CachedAccessibilityTree {
+        CachedAccessibilityTree {
+            target: ProcessGrant {
+                pid: 41,
+                bundle_identity: "com.example.reader".to_string(),
+                process_generation_evidence: "generation-a".to_string(),
+            },
+            tree: CachedAccessibilityElement {
+                identifier: Some("root-actual-id".to_string()),
+                actions: Vec::new(),
+                children: vec![CachedAccessibilityElement {
+                    identifier: Some("child-actual-id".to_string()),
+                    actions: vec!["AXPress".to_string()],
+                    children: Vec::new(),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn missing_element_is_distinct_from_an_unreadable_tree() {
+        let request = ElementResolutionRequest {
+            root_identifier: "accessibility-root:41:generation-a".to_string(),
+            element_identifier: "missing".to_string(),
+        };
+
+        assert_eq!(
+            resolve_cached_element(&cached_tree(), &request),
+            Err(DriverError::ElementNotFound)
+        );
+    }
+
+    #[test]
+    fn cached_element_preserves_advertised_action_names() {
+        let request = ElementResolutionRequest {
+            root_identifier: "accessibility-root:41:generation-a".to_string(),
+            element_identifier: "child-actual-id".to_string(),
+        };
+
+        let tree = cached_tree();
+        let element = resolve_cached_element(&tree, &request)
+            .expect("the constructed cache contains the named child");
+        assert_eq!(element.actions, vec!["AXPress"]);
     }
 }
