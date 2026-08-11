@@ -1087,3 +1087,85 @@ async fn feature_gated_identity_observer_records_resolved_facts() {
                 ))
     }));
 }
+
+/// A computer capability is served by the computer plane, not the browser one.
+///
+/// The two planes share a request envelope and nothing else, so a computer
+/// capability that fell through to the browser handler would come back as an
+/// unknown method -- a refusal naming the wrong subsystem, and indistinguishable
+/// from the module not having the capability at all.
+///
+/// The plane refuses this particular request, because the test module holds no
+/// lease. That refusal is the evidence: only the computer plane produces it, so
+/// receiving it establishes which handler ran.
+#[tokio::test]
+async fn a_computer_capability_reaches_the_computer_plane() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    let request = json!({
+        "name": "computer.wait",
+        "arguments": { "duration_ms": 5 },
+    });
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        6,
+        1,
+        101,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+
+    cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+        .await
+        .unwrap();
+
+    let response = rx.recv().await.expect("a response frame");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+
+    // Waiting needs no lease and no target, so the computer plane completes it.
+    // The browser handler has no such capability and would refuse.
+    assert_eq!(
+        body["outcome"], "completed",
+        "computer.wait was not served by the computer plane: {body}"
+    );
+    assert_eq!(body["waited_ms"], 5);
+}
+
+/// A capability that actuates is refused as an unknown method.
+///
+/// No input path exists to serve one, so it must not be dispatchable. Asserted
+/// through the wire rather than through `servable`, because the property that
+/// matters is what a caller receives: a capability the module cannot perform
+/// must refuse before it reaches a handler that would have to decline it.
+#[tokio::test]
+async fn an_actuating_computer_capability_is_not_dispatchable() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    let request = json!({
+        "name": "computer.click",
+        "arguments": {},
+    });
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        7,
+        1,
+        102,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+
+    cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+        .await
+        .unwrap();
+
+    let response = rx.recv().await.expect("a response frame");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(
+        body["code"], "unknown_method",
+        "an actuating capability was dispatchable: {body}"
+    );
+}
