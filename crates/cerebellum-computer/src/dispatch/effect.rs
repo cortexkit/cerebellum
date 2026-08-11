@@ -4,27 +4,41 @@
 //! and serialized before the delivery call; observation is then attempted once
 //! with the row's deadline and produces one of the three closed statuses.
 
+use crate::dispatch::post_condition::PostCondition;
 use crate::platform::{EffectObservationRequest, EffectStatus, PlatformDriver};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// What an action claims will be observably true once it has taken effect.
+///
+/// The condition is drawn from a closed vocabulary rather than written as free
+/// text. An observer handed text it does not recognise cannot say whether the
+/// condition held, and the honest answer it must give -- indeterminate -- is
+/// indistinguishable from an action that genuinely could not be observed. So an
+/// undecidable condition is unconstructible rather than discovered at
+/// observation time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedPostCondition {
     pub schema_id: String,
-    pub predicate: String,
+    pub condition: PostCondition,
 }
 
 impl ExpectedPostCondition {
-    pub fn new(schema_id: impl Into<String>, predicate: impl Into<String>) -> Self {
+    pub fn new(schema_id: impl Into<String>, condition: PostCondition) -> Self {
         Self {
             schema_id: schema_id.into(),
-            predicate: predicate.into(),
+            condition,
         }
     }
 
+    /// The element this condition will be checked against.
+    pub fn element_identifier(&self) -> &str {
+        self.condition.element_identifier()
+    }
+
     pub fn serialize_before_dispatch(&self) -> Result<Vec<u8>, EffectError> {
-        if self.schema_id.is_empty() || self.predicate.is_empty() {
+        if self.schema_id.is_empty() {
             return Err(EffectError::PredicateUndeclarable);
         }
         serde_json::to_vec(self).map_err(|_| EffectError::PredicateUndeclarable)

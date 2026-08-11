@@ -1,3 +1,4 @@
+use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
     authorize_escalation, retry_decision, AbortReason, AttemptDisposition, AttendanceContext,
     AttendanceLease, ConsentDecision, DispatchError, DispatchPhase, DispatchRequest, Dispatcher,
@@ -259,7 +260,13 @@ fn semantic_request(row: FrozenDispatchRow) -> DispatchRequest {
         row,
         DispatchMode::Background,
         target(),
-        ExpectedPostCondition::new("computer-effect-v1", "pressed == true"),
+        ExpectedPostCondition::new(
+            "computer-effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::background(
             "conversation-1",
             target(),
@@ -338,7 +345,13 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         row,
         DispatchMode::Background,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         background_attendance(),
         0,
     )
@@ -359,7 +372,13 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         row,
         DispatchMode::Observed,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
@@ -388,7 +407,13 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         row,
         DispatchMode::Observed,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
@@ -418,7 +443,13 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
         row,
         DispatchMode::Background,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         background_attendance(),
         0,
     )
@@ -456,7 +487,13 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         row.clone(),
         DispatchMode::Background,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::background(
             "conversation-1",
             target(),
@@ -479,7 +516,13 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         row,
         DispatchMode::Background,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::background(
             "conversation-1",
             target(),
@@ -660,7 +703,13 @@ fn seize_latency_must_fit_between_observed_posts() {
         row.clone(),
         DispatchMode::Observed,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
@@ -670,7 +719,13 @@ fn seize_latency_must_fit_between_observed_posts() {
         row,
         DispatchMode::Observed,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::observed("conversation-1", target(), "process-1", 1, 1, true),
         1,
     )
@@ -701,7 +756,13 @@ fn semantic_unavailability_uses_only_the_selected_background_primitive() {
         FrozenDispatchRow::for_capability("computer.click").unwrap(),
         DispatchMode::Background,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         background_attendance(),
         0,
     )
@@ -730,7 +791,13 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         FrozenDispatchRow::for_capability("computer.click").unwrap(),
         DispatchMode::Observed,
         target(),
-        ExpectedPostCondition::new("effect-v1", "clicked == true"),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element_identifier: "element-1".into(),
+                expected: true,
+            },
+        ),
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
@@ -897,4 +964,46 @@ fn the_effect_is_observed_in_the_authorised_application() {
         vec![target()],
         "the effect was checked somewhere other than the authorised application"
     );
+}
+
+/// A recorded condition can be decided by whoever reads it back.
+///
+/// The condition is written down before an action and read again afterwards by
+/// an observer that must answer whether it held. Free text could be recorded
+/// and could not be answered, so the observer's only honest reply would be
+/// indeterminate — indistinguishable from an action that could not be observed
+/// at all, and the two call for opposite responses.
+///
+/// This asserts the round trip yields a condition the evaluator accepts, which
+/// is what makes recording it worth anything.
+#[test]
+fn a_recorded_condition_can_be_decided_when_it_is_read_back() {
+    use cerebellum_computer::dispatch::post_condition::{
+        evaluate, ConditionOutcome, ObservedElement,
+    };
+
+    let expected = ExpectedPostCondition::new(
+        "computer-effect-v1",
+        PostCondition::ElementValueEquals {
+            element_identifier: "field-1".into(),
+            expected: "typed".into(),
+        },
+    );
+    let bytes = expected.serialize_before_dispatch().expect("serializes");
+
+    let restored: ExpectedPostCondition = serde_json::from_slice(&bytes).expect("reads back");
+    assert_eq!(restored, expected);
+
+    // The restored condition gets a definite outcome rather than the
+    // indeterminate one an undecidable condition would produce.
+    let outcome = evaluate(
+        &restored.condition,
+        &ObservedElement {
+            present: true,
+            focused: None,
+            enabled: None,
+            value: Some("typed".into()),
+        },
+    );
+    assert_eq!(outcome, ConditionOutcome::Satisfied);
 }
