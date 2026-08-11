@@ -36,6 +36,83 @@ use crate::management::{ActionAuthority, ManagementPlane};
 /// rather than the request.
 pub const MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The computer plane as a running module holds it.
+///
+/// The parameters are fixed here rather than left open at every call site: the
+/// severity table, redaction policy and storage are decisions this module makes
+/// once, and spelling them at each use invites a caller substituting a different
+/// redaction policy without that reading as a change of policy.
+#[cfg(target_os = "macos")]
+pub type RunningComputerPlane = ComputerPlane<
+    cerebellum_computer::platform::native::NativeCaptureBackend,
+    cerebellum_computer::audit::redaction::ExcludeApplicationText,
+    cerebellum_core::journal::ValidatedSeverityTaxonomy,
+    cerebellum_core::journal::InMemoryJournalStorage,
+>;
+
+/// The audit a running module uses for the computer plane.
+///
+/// Every part is chosen so the capability gate can be satisfied honestly rather
+/// than satisfied at all costs: the severity table is the pinned artifact, and
+/// the redaction policy withholds application text rather than truncating it.
+/// Binding a truncating policy here would satisfy the same gate while making an
+/// application's own words durable in the journal.
+///
+/// Storage is in memory, matching the browser plane. The journal survives for
+/// the life of the process and no longer, which is a real limit on what these
+/// records are worth after a restart and is stated here rather than discovered.
+#[cfg(target_os = "macos")]
+pub fn production_audit() -> Option<
+    ComputerAudit<
+        cerebellum_computer::audit::redaction::ExcludeApplicationText,
+        cerebellum_core::journal::ValidatedSeverityTaxonomy,
+        cerebellum_core::journal::InMemoryJournalStorage,
+    >,
+> {
+    use cerebellum_computer::capture_custody::{
+        CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+    };
+    use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
+
+    // A table that will not load leaves the plane without severity, and the
+    // gate then withholds every capability. Returning None rather than
+    // substituting a default keeps that refusal visible: a fabricated table
+    // would let capabilities advertise while scoring their actions wrongly.
+    let severity = cerebellum_computer::platform::severity::load_severity_taxonomy().ok()?;
+
+    let custody = CaptureCustody::new(
+        CustodyBounds {
+            // How long a capture may take to be verified against its grant
+            // before the verification is abandoned. The bound exists so a
+            // window server that stops answering cannot hold a verification
+            // open; the value is a starting point rather than a measurement.
+            maximum_verification_duration_ms: 5_000,
+            // How long a captured artifact may stay pinned awaiting its journal
+            // entry. Bounded so a failure mid-write cannot retain pixels
+            // indefinitely.
+            maximum_pin_lifetime_ms: 30_000,
+            maximum_concurrently_pinned_artifacts: 8,
+            maximum_total_pinned_artifact_bytes: 64 * 1024 * 1024,
+            maximum_custody_attachment_bytes: 16 * 1024 * 1024,
+        },
+        InMemoryGrantAuthority::default(),
+        InMemoryCustodyStorage::new(),
+    )
+    .ok()?;
+
+    ComputerAudit::new(
+        cerebellum_computer::audit::redaction::ExcludeApplicationText,
+        severity,
+        JournalConfig {
+            journal_retention_bytes: 8 * 1024 * 1024,
+            journal_max_entry_bytes: 64 * 1024,
+        },
+        InMemoryJournalStorage::new(),
+        custody,
+    )
+    .ok()
+}
+
 /// A capability this module can serve, which cannot be constructed any other way.
 ///
 /// A newtype rather than a plain capability because the alternative is a comment
