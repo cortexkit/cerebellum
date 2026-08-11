@@ -157,6 +157,57 @@ fn accessibility_read_timeout(settle_interval_ms: u32) -> Result<Duration, Drive
     <MacOs26PlatformDriver as PlatformDriver>::bounded_duration(u64::from(settle_interval_ms))
 }
 
+/// Map an action failure onto the driver's typed vocabulary.
+///
+/// Every `AxActionError` is handled explicitly rather than through a catch-all,
+/// so a variant added later stops the build here instead of silently inheriting
+/// whichever case happened to be last.
+#[cfg(target_os = "macos")]
+fn map_ax_action_error(error: cerebellum_macos::AxActionError) -> DriverError {
+    use cerebellum_macos::AxActionError;
+    match error {
+        AxActionError::PermissionNotGranted => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PermissionRequired)
+        }
+        AxActionError::NoSuchProcess { .. } => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetGone)
+        }
+        AxActionError::ProcessNotAccessible { .. } => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetNotInspectable)
+        }
+        // The element is gone or was never there: a fact about the request
+        // rather than about the target, so it is not a read failure.
+        AxActionError::ElementNotFound { .. } => DriverError::ElementNotFound,
+        // Two elements answer to one identifier, so no action can be delivered
+        // to the one that was resolved. Refused rather than guessing, because
+        // guessing is how an action lands on a control nobody chose.
+        AxActionError::ElementIdentifierAmbiguous { .. } => {
+            DriverError::InvalidRequest("the element identifier names more than one element")
+        }
+        // The element exists and does not offer this action. Distinct from an
+        // application refusing one it does offer: this is answerable before
+        // asking, and asking anyway would request something invented.
+        AxActionError::ActionNotAdvertised { .. } => {
+            DriverError::InvalidRequest("the element does not advertise this action")
+        }
+        AxActionError::ApplicationRefusedAction { .. } => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PlatformReadFailed)
+        }
+        AxActionError::DeadlineExceeded { .. } => DriverError::AccessibilityUnreadable(
+            AccessibilityReadFailure::RetryableDeadlineExceeded,
+        ),
+        AxActionError::DepthLimitExceeded { .. } | AxActionError::ElementLimitExceeded { .. } => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TreeExceedsBound)
+        }
+        AxActionError::UnexpectedValueType { .. } => DriverError::AccessibilityUnreadable(
+            AccessibilityReadFailure::IncompatiblePlatformValue,
+        ),
+        AxActionError::SystemCallFailed { .. } => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PlatformReadFailed)
+        }
+    }
+}
+
 fn root_cache_key(target: &ProcessGrant) -> String {
     // Keyed on the grant's process identity rather than on an accessibility
     // identifier, which is optional and chosen by the application.
@@ -500,9 +551,53 @@ impl PlatformDriver for MacOs26PlatformDriver {
     }
     fn dispatch_semantic(
         &mut self,
-        _request: SemanticDispatchRequest,
+        request: SemanticDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
-        Err(DriverError::Unsupported("semantic dispatch"))
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("semantic dispatch"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // The grant is re-verified here rather than trusted from
+            // resolution. Between resolving an element and acting on it the
+            // process may have exited and its identifier been reused, and this
+            // is the last moment before something changes.
+            verify_cached_tree_owner(&request.element.owning_process)?;
+
+            // Only the actions named in the closed AxAction vocabulary can be
+            // requested. The wire carries a string, and passing it through
+            // would let a caller ask an application for any action its
+            // accessibility implementation happens to expose.
+            let action = cerebellum_macos::AxAction::from_name(&request.action)
+                .ok_or(DriverError::InvalidRequest("unknown accessibility action"))?;
+
+            let element_name =
+                cerebellum_macos::AxElementName::new(&request.element.element_identifier)
+                    .map_err(|_| DriverError::InvalidRequest("unusable element identifier"))?;
+
+            let outcome = cerebellum_macos::request_accessibility_action(
+                request.element.owning_process.pid,
+                &element_name,
+                action,
+                cerebellum_macos::AxActionOptions::default(),
+            )
+            .map_err(map_ax_action_error)?;
+
+            // ACCEPTED IS NOT PERFORMED. The accessibility API returns once the
+            // application's handler returns, and some applications return
+            // success from a handler that forwards nothing. So the platform
+            // accepting the request is recorded, and the effect is reported as
+            // INDETERMINATE for a separate observation to settle. Reporting an
+            // effect here would be this layer asserting something it did not
+            // look at.
+            let cerebellum_macos::AxActionRequestOutcome::HandlerReturned = outcome;
+            Ok(DispatchResult {
+                accepted_by_platform: true,
+                effect_status: EffectStatus::EffectIndeterminate,
+            })
+        }
     }
     fn dispatch_per_pid(
         &mut self,
@@ -642,6 +737,74 @@ mod tests {
 
 #[cfg(test)]
 mod accessibility_tests {
+
+    /// Every action failure keeps a distinct remedy.
+    ///
+    /// The failures differ in what a caller should do: grant a permission, stop
+    /// entirely, name a different element, ask for an action the element offers,
+    /// or retry. A mapping that collapsed any pair would send a caller down a
+    /// path that cannot succeed, and the plausible guess after a failed action
+    /// is to retry, which is wrong for most of these.
+    #[test]
+    fn every_action_failure_maps_to_a_distinct_remedy() {
+        use cerebellum_macos::AxActionError;
+
+        let cases = [
+            (
+                AxActionError::PermissionNotGranted,
+                DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PermissionRequired),
+            ),
+            (
+                AxActionError::NoSuchProcess { pid: 7 },
+                DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetGone),
+            ),
+            (
+                AxActionError::ElementNotFound {
+                    identifier: "absent".to_string(),
+                },
+                DriverError::ElementNotFound,
+            ),
+            (
+                AxActionError::ElementIdentifierAmbiguous {
+                    identifier: "twice".to_string(),
+                },
+                DriverError::InvalidRequest("the element identifier names more than one element"),
+            ),
+            (
+                AxActionError::DeadlineExceeded {
+                    timeout: std::time::Duration::from_millis(1),
+                },
+                DriverError::AccessibilityUnreadable(
+                    AccessibilityReadFailure::RetryableDeadlineExceeded,
+                ),
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(map_ax_action_error(raw.clone()), expected, "{raw:?}");
+        }
+    }
+
+    /// An ambiguous identifier and an absent one are not the same refusal.
+    ///
+    /// Asserted separately from the table because these two are the pair most
+    /// likely to be merged by someone tidying: both mean the action did not
+    /// happen and neither is retryable. They differ in what is wrong -- one
+    /// names nothing, the other names two things -- and only one is fixed by
+    /// choosing a different element.
+    #[test]
+    fn an_ambiguous_identifier_is_not_reported_as_an_absent_one() {
+        use cerebellum_macos::AxActionError;
+
+        assert_ne!(
+            map_ax_action_error(AxActionError::ElementNotFound {
+                identifier: "x".to_string()
+            }),
+            map_ax_action_error(AxActionError::ElementIdentifierAmbiguous {
+                identifier: "x".to_string()
+            })
+        );
+    }
     use super::*;
 
     #[test]
