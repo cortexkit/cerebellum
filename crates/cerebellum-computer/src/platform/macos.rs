@@ -182,6 +182,41 @@ const fn dispatch_result_for_accepted_action(
     }
 }
 
+/// Find an element by exact identifier in a freshly read tree.
+///
+/// Returns the observation for the condition to be checked against, or absence
+/// when the element is not there. Absence is a real observation rather than a
+/// failure: an element that has gone answers an absence condition and fails
+/// every other, which the evaluator decides.
+///
+/// A duplicate identifier yields NO observation rather than the first match.
+/// Two elements answering to one name means the condition cannot be checked
+/// against the element it was written about, and picking one would report an
+/// effect belonging to whichever the walk reached first.
+#[cfg(target_os = "macos")]
+fn observe_element(
+    element: &cerebellum_macos::AxElement,
+    identifier: &str,
+    found: &mut Option<crate::dispatch::post_condition::ObservedElement>,
+    duplicate: &mut bool,
+) {
+    if element.identifier.as_deref() == Some(identifier) {
+        if found.is_some() {
+            *duplicate = true;
+            return;
+        }
+        *found = Some(crate::dispatch::post_condition::ObservedElement {
+            present: true,
+            focused: element.focused,
+            enabled: element.enabled,
+            value: element.value_description.clone(),
+        });
+    }
+    for child in &element.children {
+        observe_element(child, identifier, found, duplicate);
+    }
+}
+
 /// Map an action failure onto the driver's typed vocabulary.
 ///
 /// Every `AxActionError` is handled explicitly rather than through a catch-all,
@@ -668,9 +703,89 @@ impl PlatformDriver for MacOs26PlatformDriver {
     }
     fn observe_effect(
         &mut self,
-        _request: EffectObservationRequest,
+        request: EffectObservationRequest,
     ) -> Result<EffectObservationResult, DriverError> {
-        Err(DriverError::Unsupported("effect observation"))
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("effect observation"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::dispatch::post_condition::{evaluate, ConditionOutcome, ObservedElement};
+            use crate::dispatch::ExpectedPostCondition;
+
+            // A condition this driver cannot decide is reported as
+            // INDETERMINATE rather than refused. The action already happened;
+            // the caller needs to know that its effect is unestablished, which
+            // is a different fact from the observation machinery being broken.
+            // Deserialized into the type that WROTE it, rather than a local copy
+            // of its shape: a second definition of the same envelope drifts
+            // silently, and the failure would be a condition that reads back
+            // wrong rather than one that fails to read.
+            let Ok(envelope) = serde_json::from_str::<ExpectedPostCondition>(&request.predicate)
+            else {
+                return Ok(EffectObservationResult {
+                    status: EffectStatus::EffectIndeterminate,
+                    failure_reason: Some("post_condition_undeclarable".to_string()),
+                });
+            };
+
+            // Read FRESH rather than consulting the cached tree. The cache was
+            // populated before the action, so answering from it would report
+            // the state the action was meant to change.
+            let tree = match cerebellum_macos::read_accessibility_tree(
+                request.target.pid,
+                cerebellum_macos::AxReadOptions {
+                    timeout: Duration::from_millis(u64::from(request.deadline_ms)),
+                    ..Default::default()
+                },
+            ) {
+                Ok(tree) => tree,
+                Err(cerebellum_macos::AxReadError::DeadlineExceeded { .. }) => {
+                    return Ok(EffectObservationResult {
+                        status: EffectStatus::EffectIndeterminate,
+                        failure_reason: Some("deadline_exceeded".to_string()),
+                    })
+                }
+                Err(_) => {
+                    return Ok(EffectObservationResult {
+                        status: EffectStatus::EffectIndeterminate,
+                        failure_reason: Some("observation_primitive_unavailable".to_string()),
+                    })
+                }
+            };
+
+            let identifier = envelope.condition.element_identifier();
+            let mut found = None;
+            let mut duplicate = false;
+            observe_element(&tree, identifier, &mut found, &mut duplicate);
+            if duplicate {
+                return Ok(EffectObservationResult {
+                    status: EffectStatus::EffectIndeterminate,
+                    failure_reason: Some("post_condition_undeclarable".to_string()),
+                });
+            }
+
+            let observed = found.unwrap_or_else(ObservedElement::absent);
+            let status = match evaluate(&envelope.condition, &observed) {
+                ConditionOutcome::Satisfied => EffectStatus::EffectObserved,
+                ConditionOutcome::Unsatisfied => EffectStatus::NoEffectObserved,
+                ConditionOutcome::Indeterminate => EffectStatus::EffectIndeterminate,
+            };
+            let failure_reason = match status {
+                // The application does not report the attribute the condition
+                // is about, so nothing here can say whether the action worked.
+                EffectStatus::EffectIndeterminate => {
+                    Some("post_condition_undeclarable".to_string())
+                }
+                _ => None,
+            };
+            Ok(EffectObservationResult {
+                status,
+                failure_reason,
+            })
+        }
     }
     fn verify_attendance(
         &mut self,
@@ -751,6 +866,115 @@ mod tests {
 
 #[cfg(test)]
 mod accessibility_tests {
+
+    /// An element is observed by exact identifier, with its attributes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn observing_an_element_reports_the_attributes_a_condition_reads() {
+        let tree = cerebellum_macos::AxElement {
+            role: None,
+            subrole: None,
+            title: None,
+            value_description: Some("typed".to_string()),
+            identifier: Some("field-1".to_string()),
+            enabled: Some(true),
+            focused: Some(true),
+            frame: None,
+            actions: Vec::new(),
+            children: Vec::new(),
+        };
+
+        let mut found = None;
+        let mut duplicate = false;
+        observe_element(&tree, "field-1", &mut found, &mut duplicate);
+
+        assert!(!duplicate);
+        assert_eq!(
+            found,
+            Some(crate::dispatch::post_condition::ObservedElement {
+                present: true,
+                focused: Some(true),
+                enabled: Some(true),
+                value: Some("typed".to_string()),
+            })
+        );
+    }
+
+    /// Two elements answering to one identifier yield no observation.
+    ///
+    /// Picking the first would check the condition against whichever element
+    /// the walk reached, and report an effect that may belong to the other. The
+    /// caller receives INDETERMINATE, which is true: the condition was written
+    /// about one element and the tree offers two.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_duplicate_identifier_yields_no_observation_rather_than_the_first_match() {
+        fn node(identifier: &str, focused: bool) -> cerebellum_macos::AxElement {
+            cerebellum_macos::AxElement {
+                role: None,
+                subrole: None,
+                title: None,
+                value_description: None,
+                identifier: Some(identifier.to_string()),
+                enabled: None,
+                focused: Some(focused),
+                frame: None,
+                actions: Vec::new(),
+                children: Vec::new(),
+            }
+        }
+        let tree = cerebellum_macos::AxElement {
+            role: None,
+            subrole: None,
+            title: None,
+            value_description: None,
+            identifier: None,
+            enabled: None,
+            focused: None,
+            frame: None,
+            actions: Vec::new(),
+            // The two disagree, so picking either would give a different answer.
+            children: vec![node("button-1", true), node("button-1", false)],
+        };
+
+        let mut found = None;
+        let mut duplicate = false;
+        observe_element(&tree, "button-1", &mut found, &mut duplicate);
+
+        assert!(
+            duplicate,
+            "a duplicate identifier was resolved to a single element"
+        );
+    }
+
+    /// An element that is not in the tree is absent rather than missing.
+    ///
+    /// Absence is a real observation: it satisfies a condition expecting the
+    /// element to be gone and fails every other. Reporting it as a failed read
+    /// would make a successful dismissal indistinguishable from a broken one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_element_outside_the_tree_produces_no_observation() {
+        let tree = cerebellum_macos::AxElement {
+            role: None,
+            subrole: None,
+            title: None,
+            value_description: None,
+            identifier: Some("other".to_string()),
+            enabled: None,
+            focused: None,
+            frame: None,
+            actions: Vec::new(),
+            children: Vec::new(),
+        };
+
+        let mut found = None;
+        let mut duplicate = false;
+        observe_element(&tree, "gone", &mut found, &mut duplicate);
+
+        assert!(found.is_none());
+        assert!(!duplicate);
+    }
 
     /// A platform acceptance does not claim an effect.
     ///
