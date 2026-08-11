@@ -465,11 +465,26 @@ where
             first.frame.width,
             first.frame.height,
         );
-        if let Err(refusal) = audit.admit_capture(admission, artifact, now_ms) {
+        let artifact_id = match audit.admit_capture(admission, artifact, now_ms) {
+            Ok(artifact_id) => artifact_id,
+            Err(refusal) => {
+                let _ = audit.finalize_rejected(handle, b"capture-not-retained".to_vec());
+                return json!({
+                    "outcome": "capture_not_retained",
+                    "detail": format!("{:?}", refusal.cause),
+                });
+            }
+        };
+
+        // Custody must hold what is about to be returned. Checked rather than
+        // assumed because admission is the step that makes the pixels
+        // accountable, and a reply carrying an image custody never took is
+        // indistinguishable from a correct one at the wire.
+        if !audit.custody().artifact_readable(&artifact_id) {
             let _ = audit.finalize_rejected(handle, b"capture-not-retained".to_vec());
             return json!({
                 "outcome": "capture_not_retained",
-                "detail": format!("{:?}", refusal.cause),
+                "detail": "the capture was not retained by custody",
             });
         }
 
