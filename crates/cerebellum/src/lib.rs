@@ -402,8 +402,9 @@ fn advertised_computer_declarations<'a>(
 ///
 /// Kept separate from [`advertised_computer_declarations`] so that gate
 /// behaviour -- which missing release identifier suppresses which capability --
-/// stays observable while no computer capability is dispatchable. Collapsing the
-/// two would make every gate look equally closed and hide which one is.
+/// stays observable independently of whether a capability can be served.
+/// Collapsing the two would make an unserved capability indistinguishable from a
+/// closed gate, and every gate would then look equally closed.
 fn gate_admitted_computer_declarations<'a>(
     declarations: &'a [ComputerCapabilityDeclaration],
     context: &ComputerCapabilityAdvertisementContext,
@@ -568,6 +569,13 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
         Some(BROWSER_STATUS_TOOL)
     } else if browser::BrowserCapability::parse(name).is_some() {
         Some(name)
+    } else if computer_capability::servable(name).is_some() {
+        // A computer capability is dispatchable when this module can serve it,
+        // which is a property of the code rather than of the host. Whether it is
+        // ADVERTISED depends further on the audit gate and on this being macOS;
+        // those are checked where the manifest is built, so a host that cannot
+        // serve one never offers it.
+        Some(name)
     } else {
         None
     }
@@ -592,14 +600,13 @@ fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>
     // Joined immediately: this runs once at startup, and the answer is needed
     // before the manifest can be built.
     //
-    // NO TEST HERE CAN CATCH THE REMOVAL OF THIS THREAD. The test harness runs
-    // every test on a thread of its own -- including under --test-threads=1 --
-    // so a reading taken on the caller's thread is already off-main and the
-    // policy accepts it either way. The case only arises in the real binary,
-    // where startup runs on the main thread. Verified there by running this
-    // path inside the same runtime the binary uses: without the thread the
-    // resolved liveness is unknown while the raw reading says granted, and with
-    // it the resolved liveness is granted.
+    // NO TEST HERE CAN CATCH THE REMOVAL OF THIS THREAD, which is why it must
+    // not be read as ceremony. The test harness runs every test on a thread of
+    // its own -- including under --test-threads=1 -- so a reading taken on the
+    // caller's thread is already off-main and the policy accepts it either way.
+    // The case arises only in the real binary, where startup runs on the main
+    // thread: there, without this thread, the raw reading says granted and the
+    // resolved liveness is unknown, so nothing is advertised.
     std::thread::spawn(|| {
         (
             computer::platform::native::probe_permissions(),
@@ -971,6 +978,13 @@ pub struct Planes {
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
     pub management: Arc<ManagementPlane>,
+    /// The computer plane, when this host can serve it.
+    ///
+    /// Absent rather than a plane that refuses everything, so the reason for
+    /// absence is one thing rather than one per capability: this host is not
+    /// macOS, or the audit could not be built from its pinned parts.
+    #[cfg(target_os = "macos")]
+    pub computer: Option<Arc<computer_capability::RunningComputerPlane>>,
     /// Questions this module has put to whoever is on the other end of a route.
     pub elicitor: SharedElicitor,
 }
@@ -985,6 +999,9 @@ impl Planes {
             management: Arc::new(ManagementPlane::new(Arc::new(
                 management::PlatformResolver::new(),
             ))),
+            #[cfg(target_os = "macos")]
+            computer: computer_capability::production_audit()
+                .map(|audit| Arc::new(computer_capability::ComputerPlane::new(audit))),
             elicitor: Arc::new(Elicitor::new()),
         }
     }
@@ -997,6 +1014,8 @@ impl Clone for Planes {
             routes: Arc::clone(&self.routes),
             browser: Arc::clone(&self.browser),
             management: Arc::clone(&self.management),
+            #[cfg(target_os = "macos")]
+            computer: self.computer.clone(),
             elicitor: Arc::clone(&self.elicitor),
         }
     }
@@ -1093,16 +1112,7 @@ async fn handle_route_request(
     };
 
     match facts.surface {
-        RouteSurface::Tools => {
-            handle_tool_request(
-                frame,
-                writer,
-                &planes.health,
-                &planes.routes,
-                &planes.browser,
-            )
-            .await
-        }
+        RouteSurface::Tools => handle_tool_request(frame, writer, planes).await,
         RouteSurface::Management => handle_management_request(frame, writer, &facts, planes).await,
         // A route bound to a surface this module does not advertise. Refused
         // with the surface named rather than served as one of the others, which
@@ -1379,10 +1389,10 @@ async fn send_principal_denied(
 async fn handle_tool_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
-    _health_state: &Arc<HealthState>,
-    route_bindings: &Arc<RouteBindings>,
-    browser_plane: &Arc<BrowserPlane>,
+    planes: &Planes,
 ) -> Result<(), ModuleError> {
+    let route_bindings = &planes.routes;
+    let browser_plane = &planes.browser;
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
@@ -1510,6 +1520,65 @@ async fn handle_tool_request(
 
     if name == BROWSER_STATUS_TOOL {
         let result = handle_browser_status_for_identity(arguments, &accepted_facts.identity);
+        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
+    }
+
+    // Routed by which plane serves the capability, before the browser handler
+    // sees it. The two planes share a request envelope and nothing else, so a
+    // computer capability reaching the browser handler would be reported as an
+    // unknown method -- a refusal that describes the wrong subsystem.
+    #[cfg(target_os = "macos")]
+    if let Some(servable) = computer_capability::servable(name) {
+        let clock = cerebellum_core::clock::SystemClock::new();
+        let Some(plane) = planes.computer.as_ref() else {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "capability_unavailable",
+                "the computer plane is not available on this host",
+            )
+            .await;
+        };
+        let result = plane
+            .serve(
+                servable,
+                arguments,
+                computer_capability::ServeContext {
+                    // The durable agent identity, taken from the accepted bind
+                    // rather than from the request: an identity a caller could
+                    // choose is a lease granted to whoever asks for it.
+                    grantee: &accepted_facts.identity.agent_project_id,
+                    identity: cerebellum_core::journal::JournalIdentity {
+                        principal: accepted_facts
+                            .principal
+                            .as_ref()
+                            .map(|principal| format!("{principal:?}"))
+                            .unwrap_or_default(),
+                        conversation_key: accepted_facts.identity.conversation_key.clone(),
+                        agent_project_id: accepted_facts.identity.agent_project_id.clone(),
+                        session_kind: accepted_facts.identity.session_kind,
+                    },
+                    management: &planes.management,
+                    clock: &clock,
+                    // Wall-clock rather than the lease clock: this stamps a
+                    // journal entry a person may later read against other
+                    // records, where the lease clock only answers whether one
+                    // moment came after another inside this process.
+                    now_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|since| since.as_millis() as u64)
+                        .unwrap_or_default(),
+                },
+                |_grant| {
+                    cerebellum_computer::platform::native::NativeCaptureBackend::new(
+                        std::time::Duration::from_secs(10),
+                    )
+                },
+            )
+            .await;
         return send_tool_response(writer, ver, channel, epoch, corr, result).await;
     }
 
@@ -1743,14 +1812,9 @@ pub async fn handle_tool_request_for_test(
             },
         ),
     );
-    handle_tool_request(
-        frame,
-        writer,
-        health_state,
-        &route_bindings,
-        &Arc::new(BrowserPlane::new()),
-    )
-    .await
+    let mut planes = Planes::new(Arc::clone(health_state));
+    planes.routes = route_bindings;
+    handle_tool_request(frame, writer, &planes).await
 }
 
 pub async fn handle_tool_request_for_test_with_bindings(
@@ -1759,14 +1823,9 @@ pub async fn handle_tool_request_for_test_with_bindings(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    handle_tool_request(
-        frame,
-        writer,
-        health_state,
-        route_bindings,
-        &Arc::new(BrowserPlane::new()),
-    )
-    .await
+    let mut planes = Planes::new(Arc::clone(health_state));
+    planes.routes = Arc::clone(route_bindings);
+    handle_tool_request(frame, writer, &planes).await
 }
 
 #[cfg(test)]
@@ -1848,6 +1907,8 @@ mod tests {
             routes,
             browser,
             management: test_management_plane(),
+            #[cfg(target_os = "macos")]
+            computer: None,
             elicitor: Arc::clone(&elicitor),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -1887,6 +1948,8 @@ mod tests {
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
             management: test_management_plane(),
+            #[cfg(target_os = "macos")]
+            computer: None,
             elicitor: Arc::clone(&elicitor),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -1953,6 +2016,8 @@ mod tests {
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
             management: test_management_plane(),
+            #[cfg(target_os = "macos")]
+            computer: None,
             elicitor: Arc::new(Elicitor::new()),
         };
         planes.routes.insert(
@@ -2009,6 +2074,8 @@ mod tests {
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
             management: test_management_plane(),
+            #[cfg(target_os = "macos")]
+            computer: None,
             elicitor: Arc::new(Elicitor::new()),
         };
         planes.routes.insert(

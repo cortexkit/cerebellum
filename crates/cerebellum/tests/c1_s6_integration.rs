@@ -112,8 +112,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         vec!["computer.screenshot", "computer.wait"]
     );
 
-    // No computer capability is dispatchable yet, so none is advertised. When
-    // the first one is served, it appears here without this test changing.
+    // Everything advertised can be dispatched. The advertised set is DERIVED
+    // from the dispatchable one rather than compared against it, so a capability
+    // cannot be offered that dispatch would reject as an unknown method.
     let manifest = build_manifest_with_computer_plane("cerebellum", &context);
     let computer_tools: Vec<String> = tools(&manifest)
         .into_iter()
@@ -127,26 +128,51 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.frozen_row_count, 8);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
-    // The scope describes what is advertised, not what the identifiers admit,
-    // so it is empty while nothing is dispatchable. It becomes partial when the
-    // first computer capability can be served, and this assertion is the thing
-    // that will fail then -- deliberately, because that is a release-visible
-    // change in what the module claims and should be acknowledged rather than
-    // absorbed.
+    // The scope describes what is advertised rather than what the identifiers
+    // admit. It is PARTIAL: the two observing capabilities are served, and the
+    // six that actuate are not, because no input path exists to serve them.
+    //
+    // PARTIAL rather than EMPTY is a release-visible claim: it says a caller can
+    // act on the computer plane rather than only read its declarations. Changing
+    // this expectation means changing what the module tells the fleet it can do,
+    // which is why the scope is asserted exactly rather than as "not empty".
     assert_eq!(
         evidence.scope,
-        ComputerAdvertisementScope::EmptyRuntimeAdvertisement
+        ComputerAdvertisementScope::PartialRuntimeAdvertisement
+    );
+    assert_eq!(
+        computer_tools,
+        vec!["computer.screenshot", "computer.wait"],
+        "the advertised set is no longer exactly the two observing capabilities"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
     assert!(!computer_release_evidence_with_exercised_rows(&context, 0).functional_computer_plane);
 
-    // A functional plane needs an exercised row, and a row can only be
-    // exercised once it is advertised. That case is unreachable while nothing
-    // is dispatchable, so what is asserted here is the weaker half that still
-    // holds: claiming exercised rows against an empty advertisement does not
-    // produce a functional claim.
-    assert!(!computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
+    // A functional plane needs BOTH an advertised row and an exercised one, so
+    // both halves are asserted: either alone is a claim the other does not
+    // support.
+    assert!(computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
+
+    // Advertising without exercising is not a functional claim. This is the
+    // half that matters: a module that offered capabilities nobody had run
+    // would otherwise report itself working on the strength of its own manifest.
+    assert!(!computer_release_evidence_with_exercised_rows(&context, 0).functional_computer_plane);
+
+    // And exercising against an empty advertisement is not one either, which is
+    // what this line asserted before either half was reachable.
+    let empty = ComputerCapabilityAdvertisementContext {
+        inputs: ComputerReleaseInputs::default(),
+        permissions: Default::default(),
+        startup: StartupCapabilityProbe::run(&StartupProbeInput {
+            os_major: 26,
+            private_envelope_revision: None,
+            resolved_private_symbols: BTreeSet::new(),
+            permission_results: Vec::new(),
+            responsible_process: None,
+        }),
+    };
+    assert!(!computer_release_evidence_with_exercised_rows(&empty, 1).functional_computer_plane);
 }
 
 /// A suppressed capability says which condition suppressed it.
@@ -365,9 +391,9 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         );
         // Gate behaviour is asserted against the capabilities the GATES admit,
         // which is what this test is about. Advertisement additionally requires
-        // that dispatch can serve the capability, and no computer capability is
-        // dispatchable yet -- so reading the advertised set here would make every
-        // gate look equally closed and prove nothing about which one closed.
+        // that dispatch can serve the capability, so reading the advertised set
+        // here would conflate a closed gate with an unserved capability and
+        // prove nothing about which gate closed.
         let advertised = evidence.gate_admitted_capabilities;
         if matches!(
             gate,
