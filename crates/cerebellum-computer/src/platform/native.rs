@@ -52,18 +52,39 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
 
     let off_main = cerebellum_macos::is_off_main_thread();
 
-    vec![PermissionProbeResult {
-        service: PermissionService::ScreenRecording,
-        liveness: if cerebellum_macos::screen_capture_is_permitted() {
-            PermissionLiveness::Live
-        } else {
-            // A denied permission is a state the plane handles, not a failure
-            // of the probe.
-            PermissionLiveness::Unavailable
+    // Both services are read, because the action vocabulary requires different
+    // ones per capability: capture needs screen recording, and every capability
+    // that acts on an application needs accessibility. Reading only one leaves
+    // the other's absence to surface as a runtime failure at the moment an
+    // action is attempted, rather than as a capability that was never offered.
+    vec![
+        PermissionProbeResult {
+            service: PermissionService::ScreenRecording,
+            liveness: if cerebellum_macos::screen_capture_is_permitted() {
+                PermissionLiveness::Live
+            } else {
+                // A denied permission is a state the plane handles, not a
+                // failure of the probe.
+                PermissionLiveness::Unavailable
+            },
+            responsible_process: attributed_to.clone(),
+            off_main,
         },
-        responsible_process: attributed_to,
-        off_main,
-    }]
+        PermissionProbeResult {
+            service: PermissionService::Accessibility,
+            // Non-prompting: this asks whether the grant exists rather than
+            // requesting it. A probe that raised a system dialog would put a
+            // permission prompt in front of the user at module startup, for a
+            // capability nobody asked for yet.
+            liveness: if cerebellum_macos::accessibility_is_permitted() {
+                PermissionLiveness::Live
+            } else {
+                PermissionLiveness::Unavailable
+            },
+            responsible_process: attributed_to,
+            off_main,
+        },
+    ]
 }
 
 /// Capture the identity of a running process, for later comparison.
@@ -410,6 +431,63 @@ impl CaptureBackend for NativeCaptureBackend {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every service this driver can exercise is probed, and the rest are named.
+    ///
+    /// A permission that is required but never read leaves its absence to
+    /// surface when an action is attempted, which is later and harder to
+    /// attribute than a capability that was never offered.
+    ///
+    /// The vocabulary also requires two permissions for synthetic input, which
+    /// has no implementation here: nothing in this driver posts an event or
+    /// observes input. They are listed explicitly rather than skipped, so the
+    /// list must be shortened deliberately when a path that needs them is
+    /// written -- and this test fails if one is probed while still listed,
+    /// rather than leaving a stale exemption behind.
+    #[test]
+    fn every_service_the_vocabulary_requires_is_probed() {
+        use std::collections::BTreeSet;
+
+        let probed: BTreeSet<_> = probe_permissions()
+            .into_iter()
+            .map(|result| result.service)
+            .collect();
+
+        // An empty probe means the host process could not be identified at all,
+        // so no permission can be attributed to anything and there is no
+        // coverage to check. The neighbouring attribution test asserts that
+        // this case produces no results rather than results claiming nothing.
+        if probed.is_empty() {
+            return;
+        }
+
+        let mut required = BTreeSet::new();
+        for capability in crate::audit::ComputerCapability::ALL {
+            let services = crate::platform::vocabulary::required_permission_services(
+                capability.capability_id(),
+            )
+            .expect("the vocabulary lists every frozen capability");
+            required.extend(services);
+        }
+
+        // Required by capabilities that actuate through synthetic input. No code
+        // in this driver posts an event or observes input, so probing for these
+        // would ask about a facility that does not exist.
+        let unimplemented: BTreeSet<_> = [
+            PermissionService::PostEvent,
+            PermissionService::InputMonitoring,
+        ]
+        .into_iter()
+        .collect();
+
+        let unprobed: BTreeSet<_> = required.difference(&probed).copied().collect();
+        assert_eq!(
+            unprobed, unimplemented,
+            "the set of required-but-unprobed permissions changed: either a service this driver \
+             now exercises is going unprobed, or one listed as unimplemented is being probed and \
+             should be removed from that list"
+        );
+    }
     use super::*;
 
     /// Serializes the tests that cause a first capture in this process.
@@ -434,11 +512,16 @@ mod tests {
         Duration::from_secs(10)
     }
 
-    /// Probing reports the attribution it read, for the service it read.
+    /// Every result reports the attribution that was read.
     ///
-    /// The liveness value is deliberately not asserted: it depends on whether
-    /// this machine has granted capture, and demanding one answer would fail
-    /// honestly on the other kind of machine.
+    /// The liveness value is deliberately not asserted: it depends on what this
+    /// machine has granted, and demanding one answer would fail honestly on a
+    /// machine that granted the other.
+    ///
+    /// Asserted per result rather than against a count, so adding a service
+    /// does not require editing a number that carries no meaning. A result
+    /// claiming a different attribution than the probe resolved would name the
+    /// wrong process as the one a grant belongs to.
     #[test]
     fn probing_reports_the_attribution_it_read() {
         let results = probe_permissions();
@@ -449,9 +532,17 @@ mod tests {
             );
             return;
         };
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].service, PermissionService::ScreenRecording);
-        assert_eq!(results[0].responsible_process, expected);
+        assert!(
+            !results.is_empty(),
+            "an attribution resolved, so at least one service must be reported"
+        );
+        for result in &results {
+            assert_eq!(
+                result.responsible_process, expected,
+                "{:?} claims an attribution the probe did not resolve",
+                result.service
+            );
+        }
     }
 
     /// The reading is one the plane's own policy accepts.
