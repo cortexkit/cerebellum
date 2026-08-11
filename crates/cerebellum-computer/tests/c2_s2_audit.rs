@@ -22,6 +22,31 @@ use cerebellum_core::journal::{
 use serde_json::json;
 
 #[derive(Clone)]
+/// A redactor that cannot redact, to prove what happens when the policy fails.
+///
+/// Its counterpart always succeeds, and a suite holding only that one never
+/// reaches the code that handles a refusal. That path is where an unredacted
+/// value would otherwise be copied into a durable record, so the failing case
+/// is the one worth constructing.
+struct UnavailableRedactor;
+
+impl Redactor for UnavailableRedactor {
+    fn available(&self) -> bool {
+        // Available, and unable to produce a value. The two are separate: a
+        // policy can be bound and still fail on a particular input, which is
+        // the case a bound check alone does not cover.
+        true
+    }
+
+    fn redact(
+        &self,
+        _input: &str,
+        _max_bytes: usize,
+    ) -> Result<String, cerebellum_core::journal::RedactionUnavailable> {
+        Err(cerebellum_core::journal::RedactionUnavailable)
+    }
+}
+
 struct TestRedactor;
 
 impl Redactor for TestRedactor {
@@ -644,4 +669,45 @@ fn broad_grant_capture_without_its_grant_is_refused() {
             10
         )
         .is_ok());
+}
+
+/// A field that cannot be redacted refuses, and carries no input onward.
+///
+/// The refusal is the whole mechanism: when a policy cannot redact, the only
+/// safe output is none. Copying the value through -- which is what an
+/// `unwrap_or_else` here would do -- writes application text verbatim into a
+/// durable record, and does it precisely when the protection was unavailable.
+///
+/// Asserted as an exact outcome AND as the absence of the input in the error
+/// path, because a refusal that still returned the value would satisfy a check
+/// that only looked at the outcome.
+#[test]
+fn a_field_that_cannot_be_redacted_refuses_rather_than_passing_the_value_through() {
+    let schema =
+        AccessibilitySchema::new("computer-ax-v1", ["title".to_string(), "body".to_string()]);
+    let snapshot = AccessibilitySnapshot::new(
+        "computer-ax-v1",
+        BTreeMap::from([
+            ("body".to_string(), "secret body".to_string()),
+            ("title".to_string(), "safe title".to_string()),
+        ]),
+    );
+
+    let outcome = redact_accessibility_snapshot(
+        snapshot,
+        &schema,
+        &UnavailableRedactor,
+        "redactor-v1",
+        100,
+        500,
+        AccessibilityRedactionPath::Durable,
+    );
+
+    assert_eq!(
+        outcome,
+        Err(
+            cerebellum_computer::capture_custody::AccessibilityRedactionError::RedactionUnavailable
+        ),
+        "a snapshot survived a redaction policy that could not redact"
+    );
 }
