@@ -490,6 +490,23 @@ impl CaptureCustody {
         &mut self.authority
     }
 
+    /// Whether custody can retain a captured artifact at all.
+    ///
+    /// Read rather than asserted by a caller: whoever is deciding whether to
+    /// offer a capture capability should not also be stating the answer, or the
+    /// two can disagree with nothing to catch it.
+    pub fn is_available(&self) -> bool {
+        self.available
+    }
+
+    /// Whether custody has a clock, which every lifetime bound depends on.
+    ///
+    /// Separate from availability because the remedies differ: a storage fault
+    /// and a missing clock disable the same capability for unrelated reasons.
+    pub fn clock_is_available(&self) -> bool {
+        self.clock_available
+    }
+
     pub fn set_available(&mut self, available: bool) {
         self.available = available;
     }
