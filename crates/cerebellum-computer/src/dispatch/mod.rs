@@ -8,6 +8,7 @@
 
 mod attendance;
 mod effect;
+pub mod post_condition;
 mod retry;
 mod seize;
 
