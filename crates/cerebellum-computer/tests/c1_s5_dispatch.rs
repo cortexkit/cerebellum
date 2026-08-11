@@ -777,3 +777,89 @@ fn fronting_downgrade_is_a_success_with_exact_global_none_evidence() {
         FrontingComparison::DowngradeDetected
     );
 }
+
+/// An element belonging to another process is not acted on through this grant.
+///
+/// The containment boundary itself. A grant names one process, and an element
+/// resolved from a different one is outside what the user permitted -- so
+/// dispatching it semantically would deliver an action to an application nobody
+/// authorised, while the journal recorded the authorised target.
+///
+/// Falling through to synthetic is correct rather than a workaround: synthetic
+/// delivery is addressed to the grant's own process, so the action stays inside
+/// the boundary and merely loses the containment dividend it could not earn.
+#[test]
+fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
+    let mut request =
+        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+    let foreign = ProcessGrant {
+        pid: 99,
+        bundle_identity: "com.example.other".into(),
+        process_generation_evidence: "generation-9".into(),
+    };
+    request = request
+        .with_semantic(
+            ElementResolutionResult {
+                element_identifier: "element-1".into(),
+                owning_process: foreign,
+                semantic_actions: vec!["press".into()],
+            },
+            "press",
+        )
+        .with_synthetic(1, false);
+
+    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let report = dispatcher.dispatch(request).unwrap();
+
+    assert_eq!(
+        dispatcher.driver().semantic_calls,
+        0,
+        "an element owned by another process reached the semantic path"
+    );
+    assert_eq!(
+        report.delivery_primitive,
+        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+    );
+    assert_ne!(
+        report.containment.containment_rung,
+        Some(cerebellum_computer::platform::containment::ContainmentRung::SemanticElement),
+        "the semantic containment dividend was claimed without a semantic dispatch"
+    );
+}
+
+/// An action the element does not advertise does not take the semantic path.
+///
+/// Asking an application to perform an action it never offered is asking it to
+/// do something the caller invented. The lower layer refuses this too, and the
+/// refusals are not redundant: this one decides which PATH is taken, and a
+/// decision that reached the driver and was refused there would report a
+/// semantic attempt that could never have worked.
+#[test]
+fn an_unadvertised_action_does_not_take_the_semantic_path() {
+    let mut request =
+        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+    request = request
+        .with_semantic(
+            ElementResolutionResult {
+                element_identifier: "element-1".into(),
+                owning_process: target(),
+                // The element offers only "press".
+                semantic_actions: vec!["press".into()],
+            },
+            "confirm",
+        )
+        .with_synthetic(1, false);
+
+    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let report = dispatcher.dispatch(request).unwrap();
+
+    assert_eq!(
+        dispatcher.driver().semantic_calls,
+        0,
+        "an action the element does not advertise reached the semantic path"
+    );
+    assert_eq!(
+        report.delivery_primitive,
+        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+    );
+}
