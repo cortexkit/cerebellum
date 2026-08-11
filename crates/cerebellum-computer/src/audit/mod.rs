@@ -6,6 +6,8 @@
 //! closed computer action, containment, and observation domains to the neutral
 //! severity inputs.
 
+pub mod redaction;
+
 use crate::grounding::ContainmentRung;
 use crate::platform::ActionKind;
 use cerebellum_core::identity::SessionKind;
@@ -827,6 +829,26 @@ mod gate_tests {
                 capability.capability_id()
             );
         }
+    }
+
+    /// With a policy that excludes application text, capture is offerable.
+    ///
+    /// The exclusion policy is always able to answer, so binding it satisfies
+    /// the redaction obligation without any classifier existing. A policy that
+    /// truncated instead would satisfy this same gate while making a prefix of
+    /// whatever it was given durable, which is why the gate alone is not
+    /// evidence that application text is protected.
+    #[test]
+    fn a_policy_that_excludes_application_text_lets_capture_be_offered() {
+        let audit = audit_with(crate::audit::redaction::ExcludeApplicationText);
+        let gate = audit.capability_gate();
+
+        assert!(gate.redactor_available);
+        assert!(
+            gate.advertised(ComputerCapability::Screenshot),
+            "capture is still withheld with a redaction policy bound"
+        );
+        assert!(gate.advertised(ComputerCapability::Wait));
     }
 
     /// Custody losing its storage withholds capture and leaves waiting alone.
