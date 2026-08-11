@@ -49,6 +49,13 @@ struct MockRegistry {
     lock: LockAcquisition,
     record: RecordOpenability,
     revalidated_record: RecordOpenability,
+    /// Makes the registry unable to mint a disposable identity.
+    ///
+    /// Every other failure switch here concerns a step AFTER an identity
+    /// exists. Without this one nothing reaches the arm that handles a registry
+    /// which cannot produce one, and that arm is what stops an open proceeding
+    /// under an identity the registry never issued.
+    fail_create_disposable: bool,
     fail_commit: bool,
     fail_attach: bool,
     fail_transfer: bool,
@@ -71,6 +78,7 @@ impl MockRegistry {
             lock: LockAcquisition::Acquired,
             record: RecordOpenability::Openable,
             revalidated_record: RecordOpenability::Openable,
+            fail_create_disposable: false,
             fail_commit: false,
             fail_attach: false,
             fail_transfer: false,
@@ -110,6 +118,9 @@ impl RegistrySeam for MockRegistry {
         _facts: &ValidatedStampedFacts,
     ) -> Result<RegistryIdentityEvidence, RegistryResult> {
         self.event("registry.create_disposable");
+        if self.fail_create_disposable {
+            return Err(RegistryResult::Unavailable);
+        }
         Ok(self.disposable.clone())
     }
 
@@ -904,4 +915,32 @@ fn all_ckcred_results_are_closed_without_dependency_types() {
     let result: CkcredResult<()> = CkcredResult::Unavailable(CkcredUnavailable::Ambiguous);
     assert!(matches!(result, CkcredResult::Unavailable(_)));
     let _ = HashMap::<String, String>::new();
+}
+
+/// A registry that cannot mint a disposable identity refuses the open.
+///
+/// The alternative is proceeding under an identity the registry never issued,
+/// which is not a degraded open but an unowned one: nothing downstream can
+/// attach, revalidate or release a profile the registry has no record of, and
+/// the failure would surface later as a profile nobody can account for.
+///
+/// Every other failure in this mock concerns a step after an identity exists,
+/// so without this case the handler for a registry that cannot produce one is
+/// unreachable from any test.
+#[test]
+fn a_registry_that_cannot_mint_a_disposable_identity_refuses_rather_than_inventing_one() {
+    let trace = new_trace();
+    let mut registry = MockRegistry::existing(trace.clone(), "disp-uuid", "disp-retry");
+    registry.fail_create_disposable = true;
+    let custody = MockCustody::available(trace);
+    let mut coordinator = make_coordinator(registry, custody);
+
+    let outcome = coordinator
+        .prepare(
+            &facts(SessionKind::Subagent, ProfileDisposition::Disposable),
+            "disposable-registry-outage",
+        )
+        .expect_err("an open proceeded without a registry-issued identity");
+
+    assert_storage(&outcome, FailureOrigin::RegistryOrStorage);
 }
