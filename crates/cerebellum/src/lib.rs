@@ -13,6 +13,7 @@ pub mod browser_type;
 pub mod capability;
 pub mod cdp;
 pub mod classification;
+pub mod computer_capability;
 pub mod connector_evidence;
 pub mod coordinate;
 pub mod custody;
