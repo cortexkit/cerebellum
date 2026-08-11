@@ -120,9 +120,11 @@ impl MacOs26PlatformDriver {
         &self.startup
     }
 
-    /// Return all eight frozen rows as declarations, while advertising only
-    /// read-only rows in this slice. Later slices add dispatch advertisement
-    /// after their executor and audit gates exist.
+    /// Describe all eight actions, advertising only the ones that can be served.
+    ///
+    /// A declaration says what an action WOULD need; advertising says it can be
+    /// used now. The actions that actuate are described and not advertised,
+    /// because no input path exists to serve them yet.
     pub fn declarations(
         &self,
         context: &CapabilityAdvertisementContext,
@@ -163,14 +165,27 @@ impl MacOs26PlatformDriver {
         // hand-written table drifts the moment a row changes, and the digest
         // would still only pin the document. An unknown id or unrecognised
         // service name refuses inside the lookup; there is no default set.
-        let permissions =
-            super::vocabulary::required_permission_services(id).unwrap_or_else(|error| {
-                panic!("frozen vocabulary permission lookup failed for {id}: {error}")
-            });
+        //
+        // A lookup that fails SUPPRESSES the capability rather than ending the
+        // process. Not knowing which permissions an action needs is a reason not
+        // to offer it, and taking the module down would take every other
+        // capability with it — including the ones whose permissions resolved.
+        let (permissions, permission_lookup_failure) =
+            match super::vocabulary::required_permission_services(id) {
+                Ok(permissions) => (permissions, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!("required permissions are not resolvable: {error}")),
+                ),
+            };
         let mut advertised = false;
-        let mut suppression_reason =
-            Some("dispatch advertisement belongs to a later C1 slice".to_string());
-        if id == "computer.wait" {
+        let mut suppression_reason = permission_lookup_failure
+            .clone()
+            .or_else(|| Some("no input dispatch path exists yet".to_string()));
+        if permission_lookup_failure.is_some() {
+            // Left as it is: the reason below would overwrite a fact the caller
+            // needs more than a release-input note.
+        } else if id == "computer.wait" {
             advertised = context.inputs.vocabulary_ready();
             suppression_reason =
                 (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
@@ -214,8 +229,9 @@ impl MacOs26PlatformDriver {
             };
             advertised = suppression_reason.is_none();
         }
-        // Evaluate the dispatch release gate even though this slice deliberately
-        // leaves dispatch rows unadvertised; later slices consume this same gate.
+        // Evaluated even though nothing here advertises a dispatch row, so the
+        // gate is exercised by the same path that will eventually consult it
+        // rather than first running when something depends on its answer.
         let _dispatch_inputs_resolved = context.inputs.input_dispatch_ready();
         CapabilityDeclaration {
             capability_id: id.to_string(),
@@ -240,7 +256,11 @@ impl MacOs26PlatformDriver {
             synthetic_observed: SupportState::ConsentGated,
             required_permissions: permissions,
             retry_class,
-            advertised,
+            // A capability whose permission requirements could not be read is
+            // never advertised, whatever the rest of the gate concluded: a
+            // permission that is not known cannot be checked, and offering the
+            // capability would promise a check nobody performs.
+            advertised: advertised && permission_lookup_failure.is_none(),
             suppression_reason,
         }
     }
@@ -348,5 +368,74 @@ impl PlatformDriver for MacOs26PlatformDriver {
         _request: AttendancePreconditionRequest,
     ) -> Result<AttendancePreconditionResult, DriverError> {
         Err(DriverError::Unsupported("attendance verification"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capability whose permission requirements cannot be read is suppressed,
+    /// not advertised, and the process survives.
+    ///
+    /// The lookup reads the action vocabulary, which contains every id this
+    /// driver asks about, so this cannot happen through `declarations` — which
+    /// is exactly why it is worth a test. That branch is unreachable there, so
+    /// nothing else can tell whether it suppresses, advertises, or ends the
+    /// process. Ending it would take down every other capability along with the
+    /// one whose permissions could not be read.
+    #[test]
+    fn a_capability_with_unreadable_permissions_is_suppressed_rather_than_fatal() {
+        let driver = MacOs26PlatformDriver::default();
+        let context = CapabilityAdvertisementContext {
+            inputs: ImmutableReleaseInputs::default(),
+            permissions: PermissionLivenessReport::default(),
+            startup: driver.startup_probe().clone(),
+        };
+
+        let declaration = driver.declaration("computer.not-in-the-vocabulary", &context);
+
+        assert!(
+            !declaration.advertised,
+            "a capability with unknown permission requirements was advertised"
+        );
+        assert!(
+            declaration.required_permissions.is_empty(),
+            "an unresolvable lookup produced a permission list"
+        );
+        // The reason names the missing fact rather than the release-input note
+        // that would otherwise overwrite it: a reader told the wrong cause looks
+        // for a build omission instead of a vocabulary one.
+        let reason = declaration
+            .suppression_reason
+            .expect("a suppressed capability states why");
+        assert!(
+            reason.contains("required permissions are not resolvable"),
+            "the suppression reason does not name the permission lookup: {reason}"
+        );
+    }
+
+    /// A capability in the vocabulary carries the permissions it lists.
+    ///
+    /// The accepting case. Without it, a driver that suppressed EVERY capability
+    /// would satisfy the refusal test and look correct.
+    #[test]
+    fn a_frozen_capability_carries_the_permissions_the_vocabulary_lists() {
+        let driver = MacOs26PlatformDriver::default();
+        let context = CapabilityAdvertisementContext {
+            inputs: ImmutableReleaseInputs::default(),
+            permissions: PermissionLivenessReport::default(),
+            startup: driver.startup_probe().clone(),
+        };
+
+        let declaration = driver.declaration("computer.click", &context);
+        assert_eq!(
+            declaration.required_permissions,
+            vec![
+                PermissionService::Accessibility,
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+        );
     }
 }
