@@ -158,9 +158,14 @@ fn accessibility_read_timeout(settle_interval_ms: u32) -> Result<Duration, Drive
 }
 
 fn root_cache_key(target: &ProcessGrant) -> String {
-    // AX identifiers are optional and application-controlled. The granted PID
-    // plus its kernel generation identifies this application's root until that
-    // process exits or is replaced, and lets resolution retrieve the same cache.
+    // Keyed on the grant's process identity rather than on an accessibility
+    // identifier, which is optional and chosen by the application.
+    //
+    // Including the generation alongside the pid keeps two generations of the
+    // same pid on separate keys, so a cache entry cannot be retrieved for a
+    // process that merely inherited the identifier. Whether the process behind a
+    // key is still the granted one is established by verifying the grant at use,
+    // not by this key.
     format!(
         "accessibility-root:{}:{}",
         target.pid, target.process_generation_evidence
