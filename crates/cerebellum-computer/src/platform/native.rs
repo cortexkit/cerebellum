@@ -123,7 +123,7 @@ pub fn resolve_target(bundle_identity: &str, timeout: Duration) -> TargetResolut
 /// the request named the wrong thing. Collapsing them into one answer leaves the
 /// caller to guess which happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantVerification {
+pub(crate) enum GrantVerification {
     /// Same process, same generation: still the thing the grant was made for.
     Current,
     /// The pid is held by a process that started at a different moment, so the
@@ -141,7 +141,7 @@ pub enum GrantVerification {
 }
 
 impl GrantVerification {
-    fn is_current(self) -> bool {
+    pub(crate) fn is_current(self) -> bool {
         self == Self::Current
     }
 }
@@ -151,7 +151,7 @@ impl GrantVerification {
 /// The generation is read now rather than carried, because a pid on its own
 /// names whoever holds it at this moment — which is exactly the process the
 /// check exists to distinguish from the one the grant was made for.
-fn verify_grant(pid: u32, grant: &ProcessGrant) -> GrantVerification {
+pub(crate) fn verify_grant(pid: u32, grant: &ProcessGrant) -> GrantVerification {
     if pid != grant.pid {
         return GrantVerification::DifferentProcess;
     }
