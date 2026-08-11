@@ -430,17 +430,40 @@ where
 
         // Admitted to custody before the result is built, so the pixels handed
         // back are the ones the journal accounts for.
-        let artifact = PixelArtifact::per_window(
-            Vec::new(),
-            now_ms,
+        //
+        // A capture that produced no window with pixels has nothing to account
+        // for, and an artifact describing no image is refused by custody rather
+        // than stored as an empty one. Reported as its own outcome, because a
+        // target with no capturable window is a fact about the target rather
+        // than a failure to retain what was captured.
+        let Some((first, first_bytes)) =
             captured
                 .windows
-                .first()
-                .map(|window| window.window_id.clone())
-                .unwrap_or_default(),
+                .iter()
+                .find_map(|window| match &window.artifact {
+                    CaptureArtifact::Bytes(bytes) => Some((window, bytes)),
+                    _ => None,
+                })
+        else {
+            let _ = audit.finalize_rejected(handle, b"no-window-captured".to_vec());
+            return json!({
+                "outcome": "no_window_captured",
+                "remedy": "the target has no capturable window: open one, or capture a \
+                           different application",
+            });
+        };
+
+        // The artifact carries the encoded bytes and the dimensions they
+        // describe. Custody charges the retention budget by size and refuses a
+        // descriptor whose dimensions are zero, so passing a placeholder here
+        // would both defeat that refusal and account for nothing.
+        let artifact = PixelArtifact::per_window(
+            first_bytes.clone(),
+            now_ms,
+            first.window_id.clone(),
             grant.pid,
-            0,
-            0,
+            first.frame.width,
+            first.frame.height,
         );
         if let Err(refusal) = audit.admit_capture(admission, artifact, now_ms) {
             let _ = audit.finalize_rejected(handle, b"capture-not-retained".to_vec());
