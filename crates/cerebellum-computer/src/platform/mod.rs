@@ -10,6 +10,7 @@ use std::fmt;
 use std::time::Duration;
 
 pub mod containment;
+pub mod severity;
 pub use containment::*;
 pub mod macos;
 
