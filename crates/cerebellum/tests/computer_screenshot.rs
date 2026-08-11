@@ -9,7 +9,8 @@ use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
 use cerebellum_computer::capture::{
-    BackendError, CaptureBackend, EnumeratedWindow, InMemoryCaptureBackend, WindowFrame,
+    BackendError, CaptureArtifact, CaptureBackend, EnumeratedWindow, InMemoryCaptureBackend,
+    WindowFrame,
 };
 use cerebellum_computer::capture_custody::{
     CaptureCustody, CaptureGrant, CaptureScope, CustodyBounds, InMemoryCustodyStorage,
@@ -130,6 +131,70 @@ struct Fixed(TargetResolution);
 impl TargetResolver for Fixed {
     fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
         self.0.clone()
+    }
+}
+
+/// A backend that captures successfully, to prove what a real capture produces.
+///
+/// Its counterpart refuses everything, and a suite holding only that one cannot
+/// reach the code that builds a result from pixels: every test ends at the
+/// failure branch. That gap let an artifact built with no bytes and zero
+/// dimensions ship, which custody refused on the first real capture.
+struct CapturingBackend {
+    windows: Vec<EnumeratedWindow>,
+    png: Vec<u8>,
+}
+
+impl CaptureBackend for CapturingBackend {
+    fn screen_recording_liveness(&self) -> cerebellum_computer::platform::PermissionLiveness {
+        cerebellum_computer::platform::PermissionLiveness::Live
+    }
+    fn enumerate_windows(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Vec<EnumeratedWindow>, BackendError> {
+        Ok(self.windows.clone())
+    }
+    fn poll_window_change(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<cerebellum_computer::capture::WindowChange>, BackendError> {
+        Ok(None)
+    }
+    fn capture_window(
+        &mut self,
+        request: &cerebellum_computer::capture::WindowCaptureRequest,
+    ) -> Result<cerebellum_computer::capture::WindowCaptureFrame, BackendError> {
+        let window = self
+            .windows
+            .iter()
+            .find(|window| window.window_id == request.filter.window_id)
+            .ok_or_else(|| BackendError::Capture("no such window".into()))?;
+        Ok(cerebellum_computer::capture::WindowCaptureFrame {
+            owner_identity: window.owner_identity.clone(),
+            owner_identity_verified: true,
+            frame: window.frame,
+            captured_at_ms: request.captured_at_ms,
+            artifact: CaptureArtifact::Bytes(self.png.clone()),
+            accessibility_root: None,
+        })
+    }
+    fn capture_display(
+        &mut self,
+        _request: &cerebellum_computer::capture::BroadDisplayCaptureRequest,
+    ) -> Result<cerebellum_computer::capture::CaptureArtifact, BackendError> {
+        Err(BackendError::Capture("not served".into()))
+    }
+    fn begin_teardown(
+        &mut self,
+    ) -> Result<cerebellum_computer::capture::BackendTeardownProgress, BackendError> {
+        Ok(cerebellum_computer::capture::BackendTeardownProgress::Complete)
+    }
+    fn poll_teardown(
+        &mut self,
+        _elapsed_ms: u64,
+    ) -> Result<cerebellum_computer::capture::BackendTeardownProgress, BackendError> {
+        Ok(cerebellum_computer::capture::BackendTeardownProgress::Complete)
     }
 }
 
@@ -422,4 +487,105 @@ async fn leased_management(clock: &FakeClock) -> Arc<ManagementPlane> {
         )
         .await;
     management
+}
+
+/// A successful capture is retained, and the retained artifact describes it.
+///
+/// The artifact handed to custody carries the encoded bytes and the dimensions
+/// they describe. An artifact built with no bytes and zero dimensions passes
+/// every check in this handler and is refused by custody at the moment of
+/// retention, which returns a capture the caller never receives -- so the
+/// assertion is on the RESULT reaching the caller, not merely on custody
+/// having been called.
+#[tokio::test]
+async fn a_successful_capture_is_retained_and_returned() {
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4, 5, 6, 7, 8];
+
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &leased_management(&clock).await,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: vec![EnumeratedWindow {
+                    window_id: "window-1".to_string(),
+                    owner_identity: grant(),
+                    owner_identity_verified: true,
+                    frame: WindowFrame {
+                        x: 0,
+                        y: 0,
+                        width: 800,
+                        height: 600,
+                    },
+                    accessibility_root: None,
+                }],
+                png: png.clone(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        reply["outcome"], "captured",
+        "capture was not retained: {reply}"
+    );
+
+    let windows = reply["windows"].as_array().expect("windows are returned");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["width_px"], 800);
+    assert_eq!(windows[0]["height_px"], 600);
+    assert!(
+        !windows[0]["image_png_b64"]
+            .as_str()
+            .expect("an encoded image")
+            .is_empty(),
+        "the reply carried no image"
+    );
+}
+
+/// A target whose windows carry no pixels is reported as such.
+///
+/// Distinct from a capture that failed: there was nothing to capture rather
+/// than an attempt that went wrong, and the remedies differ -- open a window,
+/// versus retry or check permissions.
+#[tokio::test]
+async fn a_target_with_no_capturable_window_says_so() {
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &leased_management(&clock).await,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: Vec::new(),
+                png: Vec::new(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        reply["outcome"], "no_window_captured",
+        "unexpected: {reply}"
+    );
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .is_some_and(|remedy| !remedy.is_empty()),
+        "the refusal named no way forward"
+    );
 }
