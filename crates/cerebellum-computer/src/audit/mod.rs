@@ -718,6 +718,130 @@ impl AuditCapabilityGate {
     }
 }
 
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::capture_custody::{CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority};
+    use cerebellum_core::journal::{
+        InMemoryJournalStorage, JournalConfig, UnavailablePolicy, ValidatedSeverityTaxonomy,
+    };
+
+    fn taxonomy() -> ValidatedSeverityTaxonomy {
+        crate::platform::severity::load_severity_taxonomy().expect("the pinned table loads")
+    }
+
+    fn custody() -> CaptureCustody {
+        CaptureCustody::new(
+            CustodyBounds {
+                maximum_verification_duration_ms: 100,
+                maximum_pin_lifetime_ms: 50,
+                maximum_concurrently_pinned_artifacts: 4,
+                maximum_total_pinned_artifact_bytes: 10_000,
+                maximum_custody_attachment_bytes: 2_000,
+            },
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .expect("custody constructs")
+    }
+
+    fn audit_with<R: Redactor>(
+        redactor: R,
+    ) -> ComputerAudit<R, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
+        ComputerAudit::new(
+            redactor,
+            taxonomy(),
+            JournalConfig {
+                journal_retention_bytes: 200_000,
+                journal_max_entry_bytes: 40_000,
+            },
+            InMemoryJournalStorage::new(),
+            custody(),
+        )
+        .expect("the audit constructs")
+    }
+
+    /// Without a redaction policy, capture is withheld and waiting is not.
+    ///
+    /// The two capabilities depend on different things, and reporting one answer
+    /// for both would either withhold a capability that works or offer one whose
+    /// obligations cannot be met. Waiting records a duration; capturing produces
+    /// material that has to be redactable before it is retained.
+    #[test]
+    fn a_missing_redaction_policy_withholds_capture_but_not_waiting() {
+        let audit = audit_with(UnavailablePolicy);
+        let gate = audit.capability_gate();
+
+        assert!(!gate.redactor_available);
+        assert!(
+            !gate.advertised(ComputerCapability::Screenshot),
+            "capture was offered with no redaction policy bound"
+        );
+        assert!(
+            gate.advertised(ComputerCapability::Wait),
+            "waiting was withheld for a policy it does not need"
+        );
+    }
+
+    /// The gate reports what the audit holds rather than what a caller says.
+    ///
+    /// Every field is read from a part the audit owns. A caller supplying them
+    /// would be restating what the audit already knows, and the restatement can
+    /// drift from it while both continue to look correct.
+    #[test]
+    fn the_gate_is_read_from_the_parts_the_audit_holds() {
+        let audit = audit_with(UnavailablePolicy);
+        let gate = audit.capability_gate();
+
+        assert!(gate.journal_available);
+        assert!(gate.severity_available, "a severity table is bound");
+        assert!(gate.custody_available);
+        assert!(gate.clock_available);
+        assert!(gate.grant_authority_available);
+    }
+
+    /// A journal with no severity table withholds every capability.
+    ///
+    /// Severity is what a decision plane reads to judge an action. Offering a
+    /// capability whose actions cannot be scored promises a judgement nobody can
+    /// make, so this is the one condition that withholds even waiting.
+    #[test]
+    fn no_severity_table_withholds_everything() {
+        let audit = ComputerAudit::new(
+            UnavailablePolicy,
+            UnavailablePolicy,
+            JournalConfig {
+                journal_retention_bytes: 200_000,
+                journal_max_entry_bytes: 40_000,
+            },
+            InMemoryJournalStorage::new(),
+            custody(),
+        )
+        .expect("the audit constructs");
+
+        let gate = audit.capability_gate();
+        for capability in ComputerCapability::ALL {
+            assert!(
+                !gate.advertised(capability),
+                "{} was offered with no severity table",
+                capability.capability_id()
+            );
+        }
+    }
+
+    /// Custody losing its storage withholds capture and leaves waiting alone.
+    #[test]
+    fn unavailable_custody_withholds_capture_only() {
+        let mut audit = audit_with(UnavailablePolicy);
+        audit.custody_mut().set_available(false);
+
+        let gate = audit.capability_gate();
+        assert!(!gate.custody_available);
+        assert!(!gate.advertised(ComputerCapability::Screenshot));
+        assert!(gate.advertised(ComputerCapability::Wait));
+    }
+}
+
 /// Neutral recovery mapping is exhaustive and does not silently default.
 pub const fn recovery_surface(
     classification: RecoveryClassification,
@@ -880,6 +1004,39 @@ where
         &mut self,
     ) -> &mut cerebellum_core::journal::JournalBinding<ComputerJournalCodec, R, T, S> {
         &mut self.journal
+    }
+
+    /// What this audit can support, read from the parts it holds.
+    ///
+    /// Derived rather than supplied, because a caller that fills these in is
+    /// stating a second time what the audit already knows, and the two can
+    /// disagree while both look correct: the gate would then advertise a
+    /// capability whose journal cannot record it, or withhold one that works.
+    ///
+    /// The grant authority travels with custody rather than being separately
+    /// optional, so its availability is custody's.
+    pub fn capability_gate(&self) -> AuditCapabilityGate {
+        AuditCapabilityGate {
+            journal_available: true,
+            // Asked by RESOLVING rather than by checking that something is
+            // bound. A policy that reports itself unavailable still answers the
+            // question "is a taxonomy present" with a version string, so
+            // presence would read as availability for a table that scores
+            // nothing. The tables are total by construction, so any input is a
+            // sufficient probe.
+            severity_available: self
+                .journal
+                .resolve_severity(SeverityInputs {
+                    effect_class: EffectClass::Read,
+                    isolation_class: IsolationClass::ResourceScoped,
+                    observability_class: ObservabilityClass::HumanUnobserved,
+                })
+                .is_some(),
+            custody_available: self.custody.is_available(),
+            clock_available: self.custody.clock_is_available(),
+            grant_authority_available: self.custody.is_available(),
+            redactor_available: self.journal.redactor_available(),
+        }
     }
 
     pub fn custody(&self) -> &CaptureCustody {
