@@ -777,9 +777,33 @@ impl PlatformDriver for MacOs26PlatformDriver {
     }
     fn verify_attendance(
         &mut self,
-        _request: AttendancePreconditionRequest,
+        request: AttendancePreconditionRequest,
     ) -> Result<AttendancePreconditionResult, DriverError> {
-        Err(DriverError::Unsupported("attendance verification"))
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("attendance verification"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // What this adds to the caller's own lease checks: whether the
+            // TARGET is still the process the lease was granted for. The caller
+            // can see that its lease has not expired and belongs to this
+            // conversation, and cannot see that the process behind the
+            // identifier was replaced in the meantime -- which is the failure a
+            // lease alone cannot detect, because the replacement inherits the
+            // identifier the lease names.
+            let verification = super::native::verify_grant(request.target.pid, &request.target);
+            Ok(AttendancePreconditionResult {
+                valid: verification.is_current(),
+                // Not reported: the lease's own generation and age are the
+                // caller's, and echoing them back would present the caller's
+                // input as an independent reading. This answers one question,
+                // and says nothing about the rest.
+                lease_generation: None,
+                age_ms: None,
+            })
+        }
     }
 }
 
@@ -854,6 +878,79 @@ mod tests {
 
 #[cfg(test)]
 mod accessibility_tests {
+
+    /// A replaced target fails attendance even when the lease is otherwise good.
+    ///
+    /// This is what the platform check adds. A lease can be unexpired and
+    /// correctly bound to its conversation while the process behind the
+    /// identifier has been replaced, because a replacement inherits the
+    /// identifier the lease names. The caller cannot see that, and acting on it
+    /// delivers to whatever holds the identifier now.
+    ///
+    /// Constructed against an identifier this process can read: a grant whose
+    /// recorded generation cannot match the running process stands for the
+    /// replacement case, since the two are the same observation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_target_whose_generation_does_not_match_fails_attendance() {
+        let mut driver = MacOs26PlatformDriver::new(&crate::platform::StartupProbeInput {
+            os_major: 26,
+            private_envelope_revision: None,
+            resolved_private_symbols: Default::default(),
+            permission_results: Vec::new(),
+            responsible_process: None,
+        });
+
+        let stale = ProcessGrant {
+            pid: std::process::id(),
+            bundle_identity: "com.example.self".into(),
+            process_generation_evidence: "generation-that-never-was".into(),
+        };
+        let result = driver
+            .verify_attendance(AttendancePreconditionRequest {
+                conversation_id: "conversation-1".into(),
+                target: stale,
+                maximum_lease_age_ms: 300_000,
+            })
+            .expect("the check answers rather than refusing");
+        assert!(
+            !result.valid,
+            "a target whose generation does not match was reported as current"
+        );
+
+        // Nothing about the lease is echoed back: this check answers one
+        // question, and reporting the caller's own values would present them as
+        // an independent reading.
+        assert_eq!(result.lease_generation, None);
+        assert_eq!(result.age_ms, None);
+    }
+
+    /// A process that no longer exists fails attendance.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_target_that_is_gone_fails_attendance() {
+        let mut driver = MacOs26PlatformDriver::new(&crate::platform::StartupProbeInput {
+            os_major: 26,
+            private_envelope_revision: None,
+            resolved_private_symbols: Default::default(),
+            permission_results: Vec::new(),
+            responsible_process: None,
+        });
+
+        let result = driver
+            .verify_attendance(AttendancePreconditionRequest {
+                conversation_id: "conversation-1".into(),
+                // A pid the kernel will not resolve to a running process.
+                target: ProcessGrant {
+                    pid: u32::MAX - 1,
+                    bundle_identity: "com.example.gone".into(),
+                    process_generation_evidence: "generation-1".into(),
+                },
+                maximum_lease_age_ms: 300_000,
+            })
+            .expect("the check answers rather than refusing");
+        assert!(!result.valid);
+    }
 
     /// An element is observed by exact identifier, with its attributes.
     #[cfg(target_os = "macos")]
