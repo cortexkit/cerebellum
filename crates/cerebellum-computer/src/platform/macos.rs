@@ -157,6 +157,31 @@ fn accessibility_read_timeout(settle_interval_ms: u32) -> Result<Duration, Drive
     <MacOs26PlatformDriver as PlatformDriver>::bounded_duration(u64::from(settle_interval_ms))
 }
 
+/// What a platform acceptance means for the caller's dispatch result.
+///
+/// ACCEPTED IS NOT PERFORMED. The accessibility API returns once the
+/// application's handler returns, and some applications return success from a
+/// handler that forwards nothing. So acceptance is recorded and the effect is
+/// left INDETERMINATE for a separate observation to settle: reporting an effect
+/// here would be this layer asserting something it never looked at, and a
+/// caller reading that would skip the check that establishes it.
+///
+/// A separate function rather than a literal at the call site, because the call
+/// site can only run against a live application with a granted permission,
+/// which no test on an arbitrary machine has. Written here, the meaning of an
+/// acceptance is checkable everywhere.
+#[cfg(target_os = "macos")]
+const fn dispatch_result_for_accepted_action(
+    outcome: cerebellum_macos::AxActionRequestOutcome,
+) -> DispatchResult {
+    match outcome {
+        cerebellum_macos::AxActionRequestOutcome::HandlerReturned => DispatchResult {
+            accepted_by_platform: true,
+            effect_status: EffectStatus::EffectIndeterminate,
+        },
+    }
+}
+
 /// Map an action failure onto the driver's typed vocabulary.
 ///
 /// Every `AxActionError` is handled explicitly rather than through a catch-all,
@@ -585,18 +610,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             )
             .map_err(map_ax_action_error)?;
 
-            // ACCEPTED IS NOT PERFORMED. The accessibility API returns once the
-            // application's handler returns, and some applications return
-            // success from a handler that forwards nothing. So the platform
-            // accepting the request is recorded, and the effect is reported as
-            // INDETERMINATE for a separate observation to settle. Reporting an
-            // effect here would be this layer asserting something it did not
-            // look at.
-            let cerebellum_macos::AxActionRequestOutcome::HandlerReturned = outcome;
-            Ok(DispatchResult {
-                accepted_by_platform: true,
-                effect_status: EffectStatus::EffectIndeterminate,
-            })
+            Ok(dispatch_result_for_accepted_action(outcome))
         }
     }
     fn dispatch_per_pid(
@@ -737,6 +751,22 @@ mod tests {
 
 #[cfg(test)]
 mod accessibility_tests {
+
+    /// A platform acceptance does not claim an effect.
+    ///
+    /// The single most important property here: the accessibility API returns
+    /// when the application's handler returns, so acceptance is evidence the
+    /// request was delivered and nothing more. A caller told the effect was
+    /// OBSERVED would skip the observation that establishes it, and would do so
+    /// exactly against the applications whose handlers return without acting.
+    #[test]
+    fn platform_acceptance_leaves_the_effect_unclaimed() {
+        let result = dispatch_result_for_accepted_action(
+            cerebellum_macos::AxActionRequestOutcome::HandlerReturned,
+        );
+        assert!(result.accepted_by_platform);
+        assert_eq!(result.effect_status, EffectStatus::EffectIndeterminate);
+    }
 
     /// Every action failure keeps a distinct remedy.
     ///
