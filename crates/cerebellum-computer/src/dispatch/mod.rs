@@ -381,6 +381,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
 
         let effect = EffectEvidence::observe_serialized(
             &mut self.driver,
+            // The grant the action was authorised against, so the condition is
+            // checked in the application the action was aimed at.
+            &request.target,
             &request.expected_post_condition,
             predicate_bytes.clone(),
             &request.row.effect_observation,

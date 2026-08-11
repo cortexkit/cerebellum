@@ -32,10 +32,12 @@ impl ExpectedPostCondition {
 
     pub fn observation_request(
         &self,
+        target: &crate::platform::ProcessGrant,
         serialized: &[u8],
         deadline_ms: u32,
     ) -> Result<EffectObservationRequest, EffectError> {
         Ok(EffectObservationRequest {
+            target: target.clone(),
             predicate: String::from_utf8(serialized.to_vec())
                 .map_err(|_| EffectError::PredicateUndeclarable)?,
             deadline_ms,
@@ -71,11 +73,13 @@ pub struct EffectEvidence {
 impl EffectEvidence {
     pub fn observe_serialized<D: PlatformDriver>(
         driver: &mut D,
+        target: &crate::platform::ProcessGrant,
         predicate: &ExpectedPostCondition,
         predicate_bytes: Vec<u8>,
         policy: &EffectObservationPolicy,
     ) -> Result<Self, EffectError> {
-        let request = predicate.observation_request(&predicate_bytes, policy.deadline_ms)?;
+        let request =
+            predicate.observation_request(target, &predicate_bytes, policy.deadline_ms)?;
         let result = match driver.observe_effect(request) {
             Ok(result) => result,
             Err(_) if policy.allow_indeterminate => {
@@ -105,11 +109,12 @@ impl EffectEvidence {
 
     pub fn observe<D: PlatformDriver>(
         driver: &mut D,
+        target: &crate::platform::ProcessGrant,
         predicate: &ExpectedPostCondition,
         policy: &EffectObservationPolicy,
     ) -> Result<Self, EffectError> {
         let bytes = predicate.serialize_before_dispatch()?;
-        Self::observe_serialized(driver, predicate, bytes, policy)
+        Self::observe_serialized(driver, target, predicate, bytes, policy)
     }
 }
 
