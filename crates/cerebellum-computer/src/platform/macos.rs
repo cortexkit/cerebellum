@@ -664,18 +664,6 @@ impl PlatformDriver for MacOs26PlatformDriver {
             "global dispatch is skeleton-only",
         ))
     }
-    fn enumerate_scoped_windows(
-        &mut self,
-        _request: ScopedWindowEnumerationRequest,
-    ) -> Result<Vec<String>, DriverError> {
-        Err(DriverError::Unsupported("scoped window enumeration"))
-    }
-    fn capture_scoped_windows(
-        &mut self,
-        _request: ScopedWindowCaptureRequest,
-    ) -> Result<ScopedCaptureResult, DriverError> {
-        Err(DriverError::Unsupported("scoped capture"))
-    }
     fn query_focus(
         &mut self,
         _request: FocusQueryRequest,

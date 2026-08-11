@@ -361,26 +361,6 @@ pub struct DispatchResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScopedWindowEnumerationRequest {
-    pub target: ProcessGrant,
-    pub generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScopedWindowCaptureRequest {
-    pub target: ProcessGrant,
-    pub window_ids: Vec<String>,
-    pub include_cursor: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScopedCaptureResult {
-    pub generation: u64,
-    pub window_count: u32,
-    pub cursor_composited: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusQueryRequest {
     pub target: ProcessGrant,
 }
@@ -567,14 +547,6 @@ pub trait PlatformDriver {
         &mut self,
         request: SyntheticDispatchRequest,
     ) -> Result<DispatchResult, DriverError>;
-    fn enumerate_scoped_windows(
-        &mut self,
-        request: ScopedWindowEnumerationRequest,
-    ) -> Result<Vec<String>, DriverError>;
-    fn capture_scoped_windows(
-        &mut self,
-        request: ScopedWindowCaptureRequest,
-    ) -> Result<ScopedCaptureResult, DriverError>;
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)
         -> Result<FrontingSnapshot, DriverError>;

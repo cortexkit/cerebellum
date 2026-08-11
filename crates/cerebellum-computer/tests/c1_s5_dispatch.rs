@@ -163,18 +163,6 @@ impl PlatformDriver for RecordingDriver {
             effect_status: EffectStatus::EffectIndeterminate,
         })
     }
-    fn enumerate_scoped_windows(
-        &mut self,
-        _request: ScopedWindowEnumerationRequest,
-    ) -> Result<Vec<String>, DriverError> {
-        Err(DriverError::Unsupported("windows"))
-    }
-    fn capture_scoped_windows(
-        &mut self,
-        _request: ScopedWindowCaptureRequest,
-    ) -> Result<ScopedCaptureResult, DriverError> {
-        Err(DriverError::Unsupported("capture"))
-    }
     fn query_focus(
         &mut self,
         _request: FocusQueryRequest,
