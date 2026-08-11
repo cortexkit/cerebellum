@@ -1169,3 +1169,52 @@ async fn an_actuating_computer_capability_is_not_dispatchable() {
         "an actuating capability was dispatchable: {body}"
     );
 }
+
+/// A capability the release gates withhold is not served on request.
+///
+/// Advertisement derives from dispatchability, which stops the module offering
+/// something it cannot serve. It does not stop the reverse: a build whose
+/// release identifiers are unbound advertises nothing, and until this check
+/// existed it still served a capability a caller named directly.
+///
+/// The manifest is not a secret. Every capability name is frozen in the action
+/// vocabulary, so withholding one from the manifest hides nothing from a caller
+/// who reads the vocabulary — it only hides it from one who looks at the
+/// manifest. A gate that governs what the module SAYS rather than what it DOES
+/// is not a gate.
+#[tokio::test]
+async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    let request = json!({
+        "name": "computer.wait",
+        "arguments": { "duration_ms": 5 },
+    });
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        6,
+        1,
+        101,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+
+    // Admitting nothing, which is what an unbound release build resolves to.
+    cerebellum::handle_tool_request_for_test_admitting(frame, &tx, &health_state, &[])
+        .await
+        .unwrap();
+
+    let response = rx.recv().await.expect("a response frame");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+
+    assert_eq!(
+        body["code"], "capability_unavailable",
+        "a withheld capability was served on request: {body}"
+    );
+    assert_ne!(
+        body["outcome"], "completed",
+        "the request was carried out despite the gate withholding it"
+    );
+}

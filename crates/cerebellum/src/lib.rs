@@ -985,6 +985,15 @@ pub struct Planes {
     /// macOS, or the audit could not be built from its pinned parts.
     #[cfg(target_os = "macos")]
     pub computer: Option<Arc<computer_capability::RunningComputerPlane>>,
+    /// The computer capabilities this build's release gates admit.
+    ///
+    /// Held so that DISPATCH can consult the same admission the manifest is
+    /// built from. Advertisement already derives from dispatchability; without
+    /// this the derivation runs one way only, and a build whose release
+    /// identifiers are unbound advertises nothing while still serving a
+    /// capability a caller names directly.
+    #[cfg(target_os = "macos")]
+    pub computer_admitted: Arc<std::collections::BTreeSet<String>>,
     /// Questions this module has put to whoever is on the other end of a route.
     pub elicitor: SharedElicitor,
 }
@@ -1002,9 +1011,32 @@ impl Planes {
             #[cfg(target_os = "macos")]
             computer: computer_capability::production_audit()
                 .map(|audit| Arc::new(computer_capability::ComputerPlane::new(audit))),
+            #[cfg(target_os = "macos")]
+            computer_admitted: Arc::new(
+                computer_release_evidence(&default_computer_context())
+                    .gate_admitted_capabilities
+                    .into_iter()
+                    .collect(),
+            ),
             elicitor: Arc::new(Elicitor::new()),
         }
     }
+}
+
+/// The computer capabilities a test module admits.
+///
+/// Production reads this from the release gates. A test that went through those
+/// gates would exercise release binding rather than the behaviour under test,
+/// and would go silently green the day an identifier came unbound: every
+/// request refused, and every assertion about a refusal still passing.
+#[cfg(target_os = "macos")]
+pub fn test_admitted_computer_capabilities() -> Arc<std::collections::BTreeSet<String>> {
+    Arc::new(
+        ["computer.screenshot", "computer.wait"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 impl Clone for Planes {
@@ -1016,6 +1048,8 @@ impl Clone for Planes {
             management: Arc::clone(&self.management),
             #[cfg(target_os = "macos")]
             computer: self.computer.clone(),
+            #[cfg(target_os = "macos")]
+            computer_admitted: Arc::clone(&self.computer_admitted),
             elicitor: Arc::clone(&self.elicitor),
         }
     }
@@ -1530,6 +1564,27 @@ async fn handle_tool_request(
     #[cfg(target_os = "macos")]
     if let Some(servable) = computer_capability::servable(name) {
         let clock = cerebellum_core::clock::SystemClock::new();
+
+        // Refused unless the release gates admitted it, so serving and
+        // advertising answer to the same authority.
+        //
+        // Withholding a capability from the manifest is not by itself a gate.
+        // Every capability name is fixed in the action vocabulary, which is a
+        // published artifact, so a caller can name one without having seen it
+        // in a manifest -- and before this check such a request was served.
+        if !planes.computer_admitted.contains(name) {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "capability_unavailable",
+                "this build does not offer that capability",
+            )
+            .await;
+        }
+
         let Some(plane) = planes.computer.as_ref() else {
             return send_route_error(
                 writer,
@@ -1785,15 +1840,11 @@ pub async fn handle_control_request_for_test_with_bindings(
     handle_control_request(frame, writer, health_state, route_bindings).await
 }
 
-pub async fn handle_tool_request_for_test(
-    frame: Frame,
-    writer: &mpsc::Sender<Frame>,
-    health_state: &Arc<HealthState>,
-) -> Result<(), ModuleError> {
-    let route_bindings = Arc::new(RouteBindings::new());
-    // Older unit fixtures invoke only the data-plane helper. Install a
-    // synthetic accepted first-party bind so they still exercise the real
-    // bound-route path without weakening the production handler.
+/// Install a synthetic accepted first-party bind for a test frame.
+///
+/// Older fixtures invoke only the data-plane helper, so this lets them exercise
+/// the real bound-route path without weakening the production handler.
+fn install_test_bind(route_bindings: &Arc<RouteBindings>, frame: &Frame) {
     let identity = subc_protocol::BindIdentity {
         project_root: PathBuf::from("/test/project"),
         harness: "test".to_string(),
@@ -1812,8 +1863,44 @@ pub async fn handle_tool_request_for_test(
             },
         ),
     );
+}
+
+pub async fn handle_tool_request_for_test(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    health_state: &Arc<HealthState>,
+) -> Result<(), ModuleError> {
+    let route_bindings = Arc::new(RouteBindings::new());
+    install_test_bind(&route_bindings, &frame);
     let mut planes = Planes::new(Arc::clone(health_state));
     planes.routes = route_bindings;
+    #[cfg(target_os = "macos")]
+    {
+        planes.computer_admitted = test_admitted_computer_capabilities();
+    }
+    handle_tool_request(frame, writer, &planes).await
+}
+
+/// Drive one tool request with an explicit admitted set.
+///
+/// Lets a test state which capabilities this build's release gates admit,
+/// including none, which is what an unbound release resolves to.
+pub async fn handle_tool_request_for_test_admitting(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    health_state: &Arc<HealthState>,
+    admitted: &[&str],
+) -> Result<(), ModuleError> {
+    let route_bindings = Arc::new(RouteBindings::new());
+    install_test_bind(&route_bindings, &frame);
+    let mut planes = Planes::new(Arc::clone(health_state));
+    planes.routes = route_bindings;
+    #[cfg(target_os = "macos")]
+    {
+        planes.computer_admitted = Arc::new(admitted.iter().map(|name| name.to_string()).collect());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = admitted;
     handle_tool_request(frame, writer, &planes).await
 }
 
@@ -1825,6 +1912,10 @@ pub async fn handle_tool_request_for_test_with_bindings(
 ) -> Result<(), ModuleError> {
     let mut planes = Planes::new(Arc::clone(health_state));
     planes.routes = Arc::clone(route_bindings);
+    #[cfg(target_os = "macos")]
+    {
+        planes.computer_admitted = test_admitted_computer_capabilities();
+    }
     handle_tool_request(frame, writer, &planes).await
 }
 
@@ -1903,6 +1994,8 @@ mod tests {
         .unwrap();
 
         let planes = Planes {
+            #[cfg(target_os = "macos")]
+            computer_admitted: test_admitted_computer_capabilities(),
             health,
             routes,
             browser,
@@ -1944,6 +2037,8 @@ mod tests {
         .unwrap();
 
         let planes = Planes {
+            #[cfg(target_os = "macos")]
+            computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
@@ -2012,6 +2107,8 @@ mod tests {
     async fn an_unsupported_surface_is_refused_by_name() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = Planes {
+            #[cfg(target_os = "macos")]
+            computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
@@ -2070,6 +2167,8 @@ mod tests {
     /// Planes whose only route is bound to the management surface.
     fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
         let planes = Planes {
+            #[cfg(target_os = "macos")]
+            computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
