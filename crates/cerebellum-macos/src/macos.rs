@@ -729,18 +729,32 @@ pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, S
         .wait(timeout)
         .unwrap_or_else(|| Err(format!("the capture did not arrive within {timeout:?}")));
 
-    // A locked screen refuses pixel contents while still answering questions
-    // ABOUT windows, and it does so with a generic stream failure that reads
-    // like a fault in the capture itself. The state is read AFTER the failure
-    // rather than checked before it, so what is reported is the state that
-    // actually applied rather than one that may have changed since.
-    outcome.map_err(|reason| {
-        if screen_is_locked() == Some(true) {
-            format!("the screen is locked, so window contents are not readable ({reason})")
-        } else {
-            reason
-        }
-    })
+    outcome.map_err(|reason| explain_capture_failure(reason, screen_is_locked()))
+}
+
+/// Explain a failed capture when the screen being locked is what caused it.
+///
+/// A locked screen refuses pixel contents while still answering questions ABOUT
+/// windows, and it does so with a generic stream failure that reads like a
+/// fault in the capture itself. Without this, the operator sees a transport
+/// error and looks for a broken capture path.
+///
+/// Separated from the capture call so the decision is decidable without a
+/// window server: the call needs a real screen, which is exactly the condition
+/// under which nobody can run it.
+///
+/// The state is read AFTER the failure rather than checked before it, so what
+/// is reported is the state that actually applied rather than one that may have
+/// changed since.
+fn explain_capture_failure(reason: String, locked: Option<bool>) -> String {
+    if locked == Some(true) {
+        format!("the screen is locked, so window contents are not readable ({reason})")
+    } else {
+        // Not locked, or the session could not be read. Neither is evidence
+        // about the capture, so the original reason stands rather than being
+        // replaced by a guess.
+        reason
+    }
 }
 
 /// Copy an image's pixels out of the system's storage.
@@ -815,6 +829,37 @@ fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize)
 
 #[cfg(test)]
 mod tests {
+
+    /// A capture that failed because the screen is locked says so.
+    ///
+    /// The system reports a generic stream failure, which reads like a broken
+    /// capture path and sends an operator looking in the wrong place. Only the
+    /// locked case is rewritten: an unknown session state is not evidence about
+    /// the capture, so the original reason stands rather than being replaced by
+    /// a guess.
+    #[test]
+    fn a_locked_screen_explains_a_capture_failure_and_nothing_else_does() {
+        let raw = "stream stopped with error".to_string();
+
+        assert!(
+            explain_capture_failure(raw.clone(), Some(true)).contains("the screen is locked"),
+            "a locked screen did not explain the failure"
+        );
+        assert!(
+            explain_capture_failure(raw.clone(), Some(true)).contains(&raw),
+            "the original reason was discarded rather than kept alongside"
+        );
+        assert_eq!(
+            explain_capture_failure(raw.clone(), Some(false)),
+            raw,
+            "an unlocked screen rewrote a failure it did not cause"
+        );
+        assert_eq!(
+            explain_capture_failure(raw.clone(), None),
+            raw,
+            "an unknown session state was reported as a locked screen"
+        );
+    }
     use super::*;
 
     /// Serializes every test that talks to the window server.
