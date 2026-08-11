@@ -239,6 +239,47 @@ impl NativeCaptureBackend {
     }
 }
 
+/// Whether a captured window may be handed back, given who owned it at capture.
+///
+/// Separated from the capture call because that call needs a live window
+/// server, so the decision would otherwise be reachable only on a machine with
+/// a real screen — and this is the check that stops pixels belonging to one
+/// process being returned under another's grant. Written here, it is decidable
+/// anywhere.
+///
+/// Each refusal names a different remedy: a replaced target needs a new grant,
+/// a gone one needs nothing, an unreadable one is unknown rather than wrong,
+/// and a different owner means the window was never the target's.
+fn capture_ownership_verdict(
+    window_id: u32,
+    owner_pid_at_capture: u32,
+    target: &ProcessGrant,
+    verification: GrantVerification,
+) -> Result<(), BackendError> {
+    match verification {
+        GrantVerification::Current => Ok(()),
+        GrantVerification::TargetReplaced => Err(BackendError::Capture(format!(
+            "window {window_id} is owned by a process that replaced the granted {} at capture \
+             time, so a new grant is needed",
+            target.pid
+        ))),
+        GrantVerification::TargetGone => Err(BackendError::Capture(format!(
+            "the granted process {} is gone at capture time",
+            target.pid
+        ))),
+        GrantVerification::TargetUnreadable => Err(BackendError::Capture(format!(
+            "the granted process {} cannot be inspected, so whether it is still the granted \
+             target is unknown",
+            target.pid
+        ))),
+        GrantVerification::DifferentProcess => Err(BackendError::Capture(format!(
+            "window {window_id} is owned by process {owner_pid_at_capture} at capture time, not \
+             the granted {}",
+            target.pid
+        ))),
+    }
+}
+
 impl CaptureBackend for NativeCaptureBackend {
     fn screen_recording_liveness(&self) -> PermissionLiveness {
         if cerebellum_macos::screen_capture_is_permitted() {
@@ -342,35 +383,12 @@ impl CaptureBackend for NativeCaptureBackend {
             .map_err(BackendError::Capture)?;
 
         // Read at capture time by the system, not carried from enumeration.
-        match verify_grant(capture.owner_pid_at_capture, &request.target) {
-            GrantVerification::Current => {}
-            GrantVerification::TargetReplaced => {
-                return Err(BackendError::Capture(format!(
-                    "window {window_id} is owned by a process that replaced the granted {} at \
-                     capture time, so a new grant is needed",
-                    request.target.pid
-                )))
-            }
-            GrantVerification::TargetGone => {
-                return Err(BackendError::Capture(format!(
-                    "the granted process {} is gone at capture time",
-                    request.target.pid
-                )))
-            }
-            GrantVerification::TargetUnreadable => {
-                return Err(BackendError::Capture(format!(
-                    "the granted process {} cannot be inspected, so whether it is still the \
-                     granted target is unknown",
-                    request.target.pid
-                )))
-            }
-            GrantVerification::DifferentProcess => {
-                return Err(BackendError::Capture(format!(
-                    "window {window_id} is owned by process {} at capture time, not the granted {}",
-                    capture.owner_pid_at_capture, request.target.pid
-                )))
-            }
-        }
+        capture_ownership_verdict(
+            window_id,
+            capture.owner_pid_at_capture,
+            &request.target,
+            verify_grant(capture.owner_pid_at_capture, &request.target),
+        )?;
 
         // Encoded here rather than downstream, because this is the last point
         // that holds raw pixels and everything past it accounts for what it is
@@ -431,6 +449,80 @@ impl CaptureBackend for NativeCaptureBackend {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pixels are handed back only when the owner at capture is the granted one.
+    ///
+    /// This is what stops one process's window contents being returned under
+    /// another's grant. A window id is resolved before the capture and the
+    /// owner is read during it, so the two can disagree: the process may have
+    /// exited and its identifier been reused, or the window may never have
+    /// belonged to the target.
+    ///
+    /// Every verification state is covered, because a mutation that collapsed
+    /// any refusal into acceptance would otherwise pass on the cases nobody
+    /// wrote.
+    #[test]
+    fn a_capture_is_returned_only_when_the_owner_is_still_the_granted_process() {
+        let target = ProcessGrant {
+            pid: 42,
+            bundle_identity: "com.example.target".into(),
+            process_generation_evidence: "generation-1".into(),
+        };
+
+        assert!(
+            capture_ownership_verdict(7, 42, &target, GrantVerification::Current).is_ok(),
+            "a capture whose owner is the granted process was refused"
+        );
+
+        for refused in [
+            GrantVerification::TargetReplaced,
+            GrantVerification::TargetGone,
+            GrantVerification::TargetUnreadable,
+            GrantVerification::DifferentProcess,
+        ] {
+            assert!(
+                capture_ownership_verdict(7, 99, &target, refused).is_err(),
+                "{refused:?} did not refuse the capture"
+            );
+        }
+    }
+
+    /// Each refusal says something different about what went wrong.
+    ///
+    /// The remedies differ -- acquire a new grant, stop, or treat the answer as
+    /// unknown -- so a caller handed one message for all four cannot choose
+    /// between them.
+    #[test]
+    fn the_capture_refusals_are_distinguishable_from_one_another() {
+        let target = ProcessGrant {
+            pid: 42,
+            bundle_identity: "com.example.target".into(),
+            process_generation_evidence: "generation-1".into(),
+        };
+
+        let messages: Vec<String> = [
+            GrantVerification::TargetReplaced,
+            GrantVerification::TargetGone,
+            GrantVerification::TargetUnreadable,
+            GrantVerification::DifferentProcess,
+        ]
+        .into_iter()
+        .map(|verification| {
+            format!(
+                "{:?}",
+                capture_ownership_verdict(7, 99, &target, verification)
+                    .expect_err("this verification refuses")
+            )
+        })
+        .collect();
+
+        let distinct: std::collections::BTreeSet<&String> = messages.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            messages.len(),
+            "two capture refusals report the same thing: {messages:?}"
+        );
+    }
 
     /// Every service this driver can exercise is probed, and the rest are named.
     ///
