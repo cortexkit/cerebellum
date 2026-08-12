@@ -1288,7 +1288,6 @@ mod live_chrome_test {
         fs::create_dir(&profile).expect("create real Chrome profile");
         let arguments = vec![
             OsString::from("--remote-debugging-pipe"),
-            OsString::from("--headless=new"),
             OsString::from("--no-first-run"),
             OsString::from("--no-default-browser-check"),
             OsString::from(format!("--user-data-dir={}", profile.display())),
