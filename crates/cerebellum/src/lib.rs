@@ -591,7 +591,21 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
     if name == BROWSER_STATUS_TOOL {
         Some(BROWSER_STATUS_TOOL)
     } else if browser::BrowserCapability::parse(name).is_some() {
-        Some(name)
+        // Parsing is not serving. The browser drive capabilities are built as a
+        // state machine with NO CONNECTOR: nothing in this crate opens a socket
+        // to a browser, and `Operation::CdpNavigate` records an intent in a Vec
+        // rather than dispatching one.
+        //
+        // Admitting them here let a caller name one and receive a plausible
+        // success -- `outcome: "ok"` with a `url_final` and a lifecycle event --
+        // for a navigation that never happened. A refusal would have been
+        // recoverable; an affirmative answer about a browser that does not exist
+        // is acted upon.
+        //
+        // They become dispatchable when a connector exists to carry them, and
+        // the manifest is what says so: this module advertises exactly
+        // `browser.status` today.
+        None
     } else if computer_capability::servable(name).is_some() {
         // A computer capability is dispatchable when this module can serve it,
         // which is a property of the code rather than of the host. Whether it is
