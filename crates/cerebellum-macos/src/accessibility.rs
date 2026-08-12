@@ -57,13 +57,11 @@ pub struct AxAccessibilityTree {
     pub completeness: AxTreeCompleteness,
 }
 
-impl std::ops::Deref for AxAccessibilityTree {
-    type Target = AxElement;
-
-    fn deref(&self) -> &Self::Target {
-        &self.root
-    }
-}
+// This type deliberately does NOT deref to its root. Reaching the elements
+// through `.root` costs one word and makes a caller name the thing it is
+// skipping; a deref would let a partial tree be used exactly like a complete
+// one, which is how "no element matched" comes to be reported for a tree that
+// never read the part the element was in.
 
 /// Resource bounds applied to one accessibility-tree read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

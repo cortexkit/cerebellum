@@ -31,6 +31,7 @@ fn main() {
     let started = std::time::Instant::now();
     match cerebellum_macos::read_accessibility_tree(pid, Default::default()) {
         Ok(tree) => {
+            let complete = tree.completeness == cerebellum_macos::AxTreeCompleteness::Complete;
             let mut elements = 0usize;
             let mut with_actions = 0usize;
             let mut identified = 0usize;
@@ -73,7 +74,7 @@ fn main() {
                 }
             }
             walk(
-                &tree,
+                &tree.root,
                 0,
                 &mut elements,
                 &mut with_actions,
@@ -83,6 +84,7 @@ fn main() {
             );
 
             println!("read in {:?}", started.elapsed());
+            println!("  complete:            {complete}   <- an incomplete tree cannot establish uniqueness, so no action may be requested against it");
             println!("  elements:            {elements}");
             println!("  max depth:           {depth}");
             println!("  advertise an action: {with_actions}");
