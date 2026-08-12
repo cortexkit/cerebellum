@@ -116,7 +116,11 @@ struct CachedAccessibilityElement {
 struct CachedAccessibilityTree {
     target: ProcessGrant,
     tree: CachedAccessibilityElement,
+    unreadable_subtrees: usize,
 }
+
+const INCOMPLETE_TREE_UNIQUENESS: &str =
+    "element uniqueness cannot be established from an incomplete accessibility tree";
 
 #[derive(Debug, Clone)]
 pub struct MacOs26PlatformDriver {
@@ -217,6 +221,19 @@ fn observe_element(
     }
 }
 
+/// Return an observation root only when absence and uniqueness can be decided.
+/// A readable node in a partial tree cannot establish either fact because a
+/// matching node may be present below an unreadable element.
+#[cfg(target_os = "macos")]
+fn observable_ax_root(
+    tree: &cerebellum_macos::AxAccessibilityTree,
+) -> Option<&cerebellum_macos::AxElement> {
+    match tree.completeness {
+        cerebellum_macos::AxTreeCompleteness::Complete => Some(&tree.root),
+        cerebellum_macos::AxTreeCompleteness::Incomplete { .. } => None,
+    }
+}
+
 /// Map an action failure onto the driver's typed vocabulary.
 ///
 /// Every `AxActionError` is handled explicitly rather than through a catch-all,
@@ -243,6 +260,9 @@ fn map_ax_action_error(error: cerebellum_macos::AxActionError) -> DriverError {
         // guessing is how an action lands on a control nobody chose.
         AxActionError::ElementIdentifierAmbiguous { .. } => {
             DriverError::InvalidRequest("the element identifier names more than one element")
+        }
+        AxActionError::ElementUniquenessUnestablished { .. } => {
+            DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS)
         }
         // The element exists and does not offer this action. Distinct from an
         // application refusing one it does offer: this is answerable before
@@ -283,8 +303,14 @@ fn root_cache_key(target: &ProcessGrant) -> String {
     )
 }
 
-fn root_degenerate_reason(child_count: u32) -> Option<String> {
-    (child_count == 0).then(|| "missing_children_for_nontrivial_window".to_string())
+fn root_degenerate_reason(child_count: u32, unreadable_subtrees: usize) -> Option<String> {
+    if unreadable_subtrees > 0 {
+        Some(format!(
+            "incomplete_accessibility_tree:{unreadable_subtrees}_unreadable_subtrees"
+        ))
+    } else {
+        (child_count == 0).then(|| "missing_children_for_nontrivial_window".to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -342,6 +368,11 @@ fn resolve_cached_element<'a>(
     tree: &'a CachedAccessibilityTree,
     request: &ElementResolutionRequest,
 ) -> Result<&'a CachedAccessibilityElement, DriverError> {
+    // Resolution feeds semantic actuation. A first visible match cannot be used
+    // when another matching element may be hidden below an unreadable subtree.
+    if tree.unreadable_subtrees > 0 {
+        return Err(DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS));
+    }
     find_cached_element(&tree.tree, &request.element_identifier).ok_or(DriverError::ElementNotFound)
 }
 
@@ -559,21 +590,34 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 },
             )
             .map_err(map_ax_read_error)?;
-            let child_count = u32::try_from(tree.children.len())
+            let unreadable_subtrees = match tree.completeness {
+                cerebellum_macos::AxTreeCompleteness::Complete => 0,
+                cerebellum_macos::AxTreeCompleteness::Incomplete {
+                    unreadable_subtrees,
+                } => unreadable_subtrees,
+            };
+            let root_child_count = tree
+                .root
+                .children
+                .len()
+                .checked_add(tree.root.unreadable_children.len())
+                .expect("the reader's element bound keeps child count within usize");
+            let child_count = u32::try_from(root_child_count)
                 .expect("the reader's element bound keeps child count within u32");
             let root_identifier = root_cache_key(&request.target);
             self.accessibility_trees.insert(
                 root_identifier.clone(),
                 CachedAccessibilityTree {
                     target: request.target,
-                    tree: cache_ax_element(tree),
+                    tree: cache_ax_element(tree.root),
+                    unreadable_subtrees,
                 },
             );
             Ok(AccessibilityTreeResult {
                 root_identifier: Some(root_identifier),
                 child_count,
                 handshake_attempted: true,
-                degenerate_reason: root_degenerate_reason(child_count),
+                degenerate_reason: root_degenerate_reason(child_count, unreadable_subtrees),
             })
         }
 
@@ -744,10 +788,17 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 }
             };
 
+            let Some(root) = observable_ax_root(&tree) else {
+                return Ok(EffectObservationResult {
+                    status: EffectStatus::EffectIndeterminate,
+                    failure_reason: Some("observation_tree_incomplete".to_string()),
+                });
+            };
+
             let identifier = envelope.condition.element_identifier();
             let mut found = None;
             let mut duplicate = false;
-            observe_element(&tree, identifier, &mut found, &mut duplicate);
+            observe_element(root, identifier, &mut found, &mut duplicate);
             if duplicate {
                 return Ok(EffectObservationResult {
                     status: EffectStatus::EffectIndeterminate,
@@ -967,6 +1018,7 @@ mod accessibility_tests {
             frame: None,
             actions: Vec::new(),
             children: Vec::new(),
+            unreadable_children: Vec::new(),
         };
 
         let mut found = None;
@@ -1006,6 +1058,7 @@ mod accessibility_tests {
                 frame: None,
                 actions: Vec::new(),
                 children: Vec::new(),
+                unreadable_children: Vec::new(),
             }
         }
         let tree = cerebellum_macos::AxElement {
@@ -1020,6 +1073,7 @@ mod accessibility_tests {
             actions: Vec::new(),
             // The two disagree, so picking either would give a different answer.
             children: vec![node("button-1", true), node("button-1", false)],
+            unreadable_children: Vec::new(),
         };
 
         let mut found = None;
@@ -1051,6 +1105,7 @@ mod accessibility_tests {
             frame: None,
             actions: Vec::new(),
             children: Vec::new(),
+            unreadable_children: Vec::new(),
         };
 
         let mut found = None;
@@ -1059,6 +1114,39 @@ mod accessibility_tests {
 
         assert!(found.is_none());
         assert!(!duplicate);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_complete_tree_can_supply_an_observation_root() {
+        fn tree(
+            completeness: cerebellum_macos::AxTreeCompleteness,
+        ) -> cerebellum_macos::AxAccessibilityTree {
+            cerebellum_macos::AxAccessibilityTree {
+                root: cerebellum_macos::AxElement {
+                    role: None,
+                    subrole: None,
+                    title: None,
+                    value_description: None,
+                    identifier: Some("readable-root".to_string()),
+                    enabled: None,
+                    focused: None,
+                    frame: None,
+                    actions: Vec::new(),
+                    children: Vec::new(),
+                    unreadable_children: Vec::new(),
+                },
+                completeness,
+            }
+        }
+
+        let complete = tree(cerebellum_macos::AxTreeCompleteness::Complete);
+        assert_eq!(observable_ax_root(&complete), Some(&complete.root));
+
+        let incomplete = tree(cerebellum_macos::AxTreeCompleteness::Incomplete {
+            unreadable_subtrees: 1,
+        });
+        assert_eq!(observable_ax_root(&incomplete), None);
     }
 
     /// A platform acceptance does not claim an effect.
@@ -1110,6 +1198,13 @@ mod accessibility_tests {
                 DriverError::InvalidRequest("the element identifier names more than one element"),
             ),
             (
+                AxActionError::ElementUniquenessUnestablished {
+                    identifier: "partially-seen".to_string(),
+                    unreadable_subtrees: 1,
+                },
+                DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS),
+            ),
+            (
                 AxActionError::DeadlineExceeded {
                     timeout: std::time::Duration::from_millis(1),
                 },
@@ -1124,25 +1219,30 @@ mod accessibility_tests {
         }
     }
 
-    /// An ambiguous identifier and an absent one are not the same refusal.
+    /// Absence, ambiguity, and an incomplete search require different remedies.
     ///
-    /// Asserted separately from the table because these two are the pair most
-    /// likely to be merged by someone tidying: both mean the action did not
-    /// happen and neither is retryable. They differ in what is wrong -- one
-    /// names nothing, the other names two things -- and only one is fixed by
-    /// choosing a different element.
+    /// An absent name can be corrected by naming an existing element, an
+    /// ambiguous name by choosing one element, and an incomplete search only by
+    /// obtaining a complete tree. Collapsing them would make at least one remedy
+    /// unsafe or ineffective.
     #[test]
-    fn an_ambiguous_identifier_is_not_reported_as_an_absent_one() {
+    fn incomplete_ambiguous_and_absent_action_targets_remain_distinct() {
         use cerebellum_macos::AxActionError;
 
-        assert_ne!(
-            map_ax_action_error(AxActionError::ElementNotFound {
-                identifier: "x".to_string()
-            }),
-            map_ax_action_error(AxActionError::ElementIdentifierAmbiguous {
-                identifier: "x".to_string()
-            })
-        );
+        let absent = map_ax_action_error(AxActionError::ElementNotFound {
+            identifier: "x".to_string(),
+        });
+        let ambiguous = map_ax_action_error(AxActionError::ElementIdentifierAmbiguous {
+            identifier: "x".to_string(),
+        });
+        let incomplete = map_ax_action_error(AxActionError::ElementUniquenessUnestablished {
+            identifier: "x".to_string(),
+            unreadable_subtrees: 1,
+        });
+
+        assert_ne!(absent, ambiguous);
+        assert_ne!(absent, incomplete);
+        assert_ne!(ambiguous, incomplete);
     }
     use super::*;
 
@@ -1221,10 +1321,14 @@ mod accessibility_tests {
     #[test]
     fn an_empty_root_uses_the_closed_degeneracy_vocabulary() {
         assert_eq!(
-            root_degenerate_reason(0),
+            root_degenerate_reason(0, 0),
             Some("missing_children_for_nontrivial_window".to_string())
         );
-        assert_eq!(root_degenerate_reason(1), None);
+        assert_eq!(root_degenerate_reason(1, 0), None);
+        assert_eq!(
+            root_degenerate_reason(2, 3),
+            Some("incomplete_accessibility_tree:3_unreadable_subtrees".to_string())
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1310,6 +1414,7 @@ mod cached_element_tests {
                     children: Vec::new(),
                 }],
             },
+            unreadable_subtrees: 0,
         }
     }
 
@@ -1323,6 +1428,21 @@ mod cached_element_tests {
         assert_eq!(
             resolve_cached_element(&cached_tree(), &request),
             Err(DriverError::ElementNotFound)
+        );
+    }
+
+    #[test]
+    fn an_incomplete_cached_tree_cannot_establish_element_uniqueness() {
+        let request = ElementResolutionRequest {
+            root_identifier: "accessibility-root:41:generation-a".to_string(),
+            element_identifier: "child-actual-id".to_string(),
+        };
+        let mut tree = cached_tree();
+        tree.unreadable_subtrees = 1;
+
+        assert_eq!(
+            resolve_cached_element(&tree, &request),
+            Err(DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS))
         );
     }
 
