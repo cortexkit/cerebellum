@@ -25,6 +25,8 @@
 #[cfg(any(target_os = "macos", test))]
 mod accessibility;
 #[cfg(target_os = "macos")]
+mod launch;
+#[cfg(target_os = "macos")]
 mod macos;
 
 #[cfg(target_os = "macos")]
@@ -33,6 +35,11 @@ pub use accessibility::{
     AxAccessibilityTree, AxAction, AxActionError, AxActionOptions, AxActionRequestOutcome,
     AxElement, AxElementName, AxElementNameError, AxElementReadFailure, AxFrame, AxReadError,
     AxReadOptions, AxTreeCompleteness,
+};
+#[cfg(target_os = "macos")]
+pub use launch::{
+    executed_image_identity, process_descriptors, spawn_barred, BarredChild, ExecutedImageIdentity,
+    ImageIdentityError, ProcessControlError, ProcessGeneration, ReleasedChild, SpawnError,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
