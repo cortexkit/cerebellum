@@ -70,13 +70,35 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v1"
 
 # ---------------------------------------------------------------------------
 
+# The identifiers the compiler reads. Kept as one list so the loop below and
+# the check after it cannot disagree about what exists.
+readonly ATTESTATIONS=(
+  CEREBELLUM_CAPTURE_REVIEW_REVISION
+  CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
+  CEREBELLUM_INPUT_REVIEW_REVISION
+  CEREBELLUM_ATTENDANCE_CONTRACT_OWNER
+  CEREBELLUM_ATTENDANCE_CONTRACT_REVISION
+)
+
+# A misspelled export sets a variable the compiler never reads, so the gate it
+# was meant to satisfy reports a missing input and the capability is withheld.
+# That fails closed, which is why it is dangerous: the build succeeds, ships
+# less than intended, and the report blames an absent attestation for one that
+# was supplied. Caught here rather than left to be noticed.
+for exported in $(compgen -v | grep '^CEREBELLUM_' || true); do
+  known=no
+  for name in "${ATTESTATIONS[@]}"; do
+    [[ "$exported" == "$name" ]] && known=yes && break
+  done
+  if [[ "$known" == no ]]; then
+    echo "error: $exported is set and the compiler reads no such attestation." >&2
+    echo "       Compare it against the names in compiled_release_inputs." >&2
+    exit 1
+  fi
+done
+
 echo "==> building with the attestations that exist"
-for name in \
-  CEREBELLUM_CAPTURE_REVIEW_REVISION \
-  CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION \
-  CEREBELLUM_INPUT_REVIEW_REVISION \
-  CEREBELLUM_ATTENDANCE_CONTRACT_OWNER \
-  CEREBELLUM_ATTENDANCE_CONTRACT_REVISION; do
+for name in "${ATTESTATIONS[@]}"; do
   printf '    %-48s %s\n' "$name" "${!name:-<unbound>}"
 done
 
