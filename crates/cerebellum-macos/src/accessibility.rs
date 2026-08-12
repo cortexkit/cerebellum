@@ -2472,6 +2472,47 @@ mod tests {
         assert_eq!(AxAction::from_name("axpress"), None);
     }
 
+    /// An element reachable by two paths is still entered on both of them.
+    ///
+    /// The cycle check is scoped to the CURRENT ANCESTOR PATH. Were it a global
+    /// visited set, the second parent would find its child already seen and skip
+    /// it, so the search would report ONE match where two paths reach the name
+    /// and would actuate on an identifier whose uniqueness it never established.
+    /// Refusing is the safe answer: this reader cannot tell one element reached
+    /// twice from two elements answering to one name, and acting on either
+    /// reading is how an action lands on a control nobody chose.
+    ///
+    /// The tree read has its own DAG fixture; this one drives the ACTION SEARCH,
+    /// because that is the path where uniqueness is decided.
+    #[test]
+    fn an_element_reachable_by_two_paths_is_entered_on_both() {
+        // root -> {left, right}, and BOTH point at the same `shared` node, which
+        // carries the identifier being searched for.
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("root"), &[], vec![1, 2]),
+            action_node(Some("left"), &[], vec![3]),
+            action_node(Some("right"), &[], vec![3]),
+            action_node(Some("target"), &[AxAction::Press], vec![]),
+        ]);
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &element_name("target"),
+                AxAction::Press,
+                action_options(usize::MAX, usize::MAX),
+            ),
+            Err(AxActionError::ElementIdentifierAmbiguous {
+                identifier: "target".to_string(),
+            })
+        );
+        assert!(
+            source.performed_actions.is_empty(),
+            "an action ran on an identifier whose uniqueness was not established"
+        );
+    }
+
     #[test]
     fn action_refinding_stops_an_ancestor_cycle_without_losing_uniqueness() {
         let mut source = FakeSource::with_nodes(vec![
