@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 
 use cerebellum_core::journal::{
-    InMemoryJournalStorage, JournalBinding, JournalConfig as CoreJournalConfig,
-    JournalError as CoreError, JournalIdentity as CoreIdentity,
+    journal_data_path, DurableState, FilesystemJournalStorage, InMemoryJournalStorage,
+    JournalBinding, JournalConfig as CoreJournalConfig, JournalError as CoreError,
+    JournalIdentity as CoreIdentity, JournalStorage, StorageError,
 };
 
 use super::reservation::ReservationHandle;
@@ -38,11 +39,33 @@ impl FaultInjector {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum BrowserJournalStorage {
+    Filesystem(FilesystemJournalStorage),
+    Memory(InMemoryJournalStorage),
+}
+
+impl JournalStorage for BrowserJournalStorage {
+    fn load(&self) -> Result<DurableState, StorageError> {
+        match self {
+            Self::Filesystem(storage) => storage.load(),
+            Self::Memory(storage) => storage.load(),
+        }
+    }
+
+    fn save(&self, state: &DurableState) -> Result<(), StorageError> {
+        match self {
+            Self::Filesystem(storage) => storage.save(state),
+            Self::Memory(storage) => storage.save(state),
+        }
+    }
+}
+
 pub type BrowserCoreStore = JournalBinding<
     super::core_adapter::BrowserJournalCodec,
     cerebellum_core::journal::UnavailablePolicy,
     cerebellum_core::journal::UnavailablePolicy,
-    InMemoryJournalStorage,
+    BrowserJournalStorage,
 >;
 
 /// The browser-facing store translates the compatibility API into the shared
@@ -62,11 +85,34 @@ impl JournalStore {
             journal_retention_bytes: config.journal_retention_bytes,
             journal_max_entry_bytes: config.journal_max_entry_bytes,
         };
-        let core = super::core_adapter::open_browser_core_journal(
+        let path =
+            journal_data_path("browser.json").map_err(|_| JournalError::internal_failure())?;
+        let storage = FilesystemJournalStorage::prepare(path)
+            .map(BrowserJournalStorage::Filesystem)
+            .map_err(|_| JournalError::internal_failure())?;
+        Self::open(config, core_config, storage)
+    }
+
+    /// Open an isolated fixture binding without touching production journal data.
+    pub fn new_in_memory(config: JournalConfig) -> Result<Self, JournalError> {
+        let core_config = CoreJournalConfig {
+            journal_retention_bytes: config.journal_retention_bytes,
+            journal_max_entry_bytes: config.journal_max_entry_bytes,
+        };
+        Self::open(
+            config,
             core_config,
-            InMemoryJournalStorage::new(),
+            BrowserJournalStorage::Memory(InMemoryJournalStorage::new()),
         )
-        .map_err(|_| JournalError::internal_failure())?;
+    }
+
+    fn open(
+        config: JournalConfig,
+        core_config: CoreJournalConfig,
+        storage: BrowserJournalStorage,
+    ) -> Result<Self, JournalError> {
+        let core = super::core_adapter::open_browser_core_journal(core_config, storage)
+            .map_err(|_| JournalError::internal_failure())?;
         Ok(Self {
             core,
             faults: FaultInjector::default(),
