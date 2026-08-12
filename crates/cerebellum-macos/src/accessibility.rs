@@ -93,7 +93,7 @@ impl Default for AxReadOptions {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(3),
-            max_depth: 64,
+            max_depth: MAX_RECURSIVE_TREE_DEPTH,
             max_elements: 10_000,
         }
     }
@@ -201,10 +201,20 @@ impl Default for AxActionOptions {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(3),
-            max_depth: 64,
+            max_depth: MAX_RECURSIVE_TREE_DEPTH,
             max_elements: 10_000,
         }
     }
+}
+
+// Traversal and destruction both recurse through `AxElement::children`. Keeping
+// the process-wide ceiling at the default depth bounds both call stacks even
+// when a caller supplies `usize::MAX`; a returned bound names this effective
+// ceiling so partial reads cannot masquerade as complete ones.
+const MAX_RECURSIVE_TREE_DEPTH: usize = 32;
+
+fn supported_tree_depth(requested: usize) -> usize {
+    requested.min(MAX_RECURSIVE_TREE_DEPTH)
 }
 
 /// What a successful accessibility action request establishes.
@@ -499,6 +509,10 @@ struct ElementSnapshot<Handle> {
 enum ElementRead {
     Readable(Box<AxElement>),
     Unreadable(AxElementReadFailure),
+    // Re-entering an ancestor loses no subtree: the same element is already
+    // being traversed higher on this path. It must not share the unreadable
+    // outcome used by lossy resource bounds.
+    ReenteredAncestor,
 }
 
 struct TreeReadState<'a> {
@@ -546,6 +560,8 @@ impl ChildBudget {
 trait ElementSource {
     type Handle: Clone;
 
+    /// Whether two handles denote the same live accessibility element.
+    fn same_element(&self, left: &Self::Handle, right: &Self::Handle) -> bool;
     fn process_exists(&mut self, pid: u32) -> bool;
     fn accessibility_is_permitted(&mut self) -> bool;
     fn application(&mut self, pid: u32, deadline: &Deadline) -> Result<Self::Handle, SourceError>;
@@ -730,8 +746,18 @@ fn find_action_target<Source: ActionSource>(
     source: &mut Source,
     handle: &Source::Handle,
     depth: usize,
+    ancestors: &mut Vec<Source::Handle>,
     state: &mut ActionSearchState<'_, Source::Handle>,
 ) -> Result<(), ActionSearchError> {
+    // Identity is checked before bounds because revisiting an ancestor needs no
+    // read and consumes no budget. Reporting that lossless stop as a depth or
+    // element failure would make a fully explored cyclic graph look partial.
+    if ancestors
+        .iter()
+        .any(|ancestor| source.same_element(handle, ancestor))
+    {
+        return Ok(());
+    }
     if depth > state.options.max_depth {
         return Err(ActionSearchError::Read(AxReadError::DepthLimitExceeded {
             max_depth: state.options.max_depth,
@@ -784,9 +810,11 @@ fn find_action_target<Source: ActionSource>(
         state.found = Some(handle.clone());
     }
 
+    ancestors.push(handle.clone());
     for child in &snapshot.children {
-        find_action_target(source, child, next_depth, state)?;
+        find_action_target(source, child, next_depth, ancestors, state)?;
     }
+    ancestors.pop();
     Ok(())
 }
 
@@ -848,6 +876,10 @@ fn request_action_from<Source: ActionSource>(
     action: AxAction,
     options: AxActionOptions,
 ) -> Result<AxActionRequestOutcome, AxActionError> {
+    let options = AxActionOptions {
+        max_depth: supported_tree_depth(options.max_depth),
+        ..options
+    };
     if !source.process_exists(pid) {
         return Err(AxActionError::NoSuchProcess { pid });
     }
@@ -869,7 +901,7 @@ fn request_action_from<Source: ActionSource>(
         options,
         deadline: &deadline,
     };
-    match find_action_target(source, &root, 0, &mut search) {
+    match find_action_target(source, &root, 0, &mut Vec::new(), &mut search) {
         Ok(()) => {}
         Err(ActionSearchError::Read(error)) => return Err(error.into()),
         Err(ActionSearchError::AmbiguousIdentifier) => {
@@ -925,6 +957,10 @@ fn read_tree_from<Source: ElementSource>(
     pid: u32,
     options: AxReadOptions,
 ) -> Result<AxAccessibilityTree, AxReadError> {
+    let options = AxReadOptions {
+        max_depth: supported_tree_depth(options.max_depth),
+        ..options
+    };
     if !source.process_exists(pid) {
         return Err(AxReadError::NoSuchProcess { pid });
     }
@@ -944,9 +980,9 @@ fn read_tree_from<Source: ElementSource>(
         options,
         deadline: &deadline,
     };
-    let root = match read_element(source, &root, 0, &mut state)? {
+    let root = match read_element(source, &root, 0, &mut Vec::new(), &mut state)? {
         ElementRead::Readable(root) => *root,
-        ElementRead::Unreadable(_) => {
+        ElementRead::Unreadable(_) | ElementRead::ReenteredAncestor => {
             unreachable!("the application root is never converted into a partial read")
         }
     };
@@ -964,8 +1000,20 @@ fn read_element<Source: ElementSource>(
     source: &mut Source,
     handle: &Source::Handle,
     depth: usize,
+    ancestors: &mut Vec<Source::Handle>,
     state: &mut TreeReadState<'_>,
 ) -> Result<ElementRead, AxReadError> {
+    // Identity is checked before bounds because revisiting an ancestor needs no
+    // read and consumes no budget. A bound omits an unexplored subtree and is
+    // therefore incomplete; a cycle edge merely points back into a subtree that
+    // this path is already traversing.
+    if ancestors
+        .iter()
+        .any(|ancestor| source.same_element(handle, ancestor))
+    {
+        return Ok(ElementRead::ReenteredAncestor);
+    }
+
     // A bound marks THIS subtree unreadable rather than discarding the whole
     // read. Everything already traversed is still true, and a caller that
     // receives an incomplete tree already refuses the decisions that need a
@@ -1024,12 +1072,15 @@ fn read_element<Source: ElementSource>(
     };
     let mut children = Vec::with_capacity(snapshot.children.len());
     let mut unreadable_children = Vec::new();
+    ancestors.push(handle.clone());
     for child in &snapshot.children {
-        match read_element(source, child, next_depth, state)? {
+        match read_element(source, child, next_depth, ancestors, state)? {
             ElementRead::Readable(child) => children.push(*child),
             ElementRead::Unreadable(failure) => unreadable_children.push(failure),
+            ElementRead::ReenteredAncestor => {}
         }
     }
+    ancestors.pop();
 
     Ok(ElementRead::Readable(Box::new(AxElement {
         role: snapshot.role,
@@ -1097,6 +1148,7 @@ mod platform {
     extern "C" {
         fn CFRetain(value: CfTypeRef) -> CfTypeRef;
         fn CFRelease(value: CfTypeRef);
+        fn CFEqual(left: CfTypeRef, right: CfTypeRef) -> bool;
         fn CFGetTypeID(value: CfTypeRef) -> usize;
         fn CFStringGetTypeID() -> usize;
         fn CFStringGetLength(value: CfTypeRef) -> isize;
@@ -1409,6 +1461,12 @@ mod platform {
 
     impl ElementSource for MacElementSource {
         type Handle = OwnedCf;
+
+        fn same_element(&self, left: &Self::Handle, right: &Self::Handle) -> bool {
+            // SAFETY: both wrappers retain non-null Core Foundation values for
+            // the duration of the comparison. `CFEqual` does not consume them.
+            unsafe { CFEqual(left.as_ptr(), right.as_ptr()) }
+        }
 
         fn process_exists(&mut self, pid: u32) -> bool {
             let Ok(pid) = c_int::try_from(pid) else {
@@ -1743,6 +1801,10 @@ mod tests {
 
     impl ElementSource for FakeSource {
         type Handle = usize;
+
+        fn same_element(&self, left: &Self::Handle, right: &Self::Handle) -> bool {
+            left == right
+        }
 
         fn process_exists(&mut self, _pid: u32) -> bool {
             self.process_exists
@@ -2103,6 +2165,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_ancestor_cycle_is_lossless_and_keeps_the_tree_complete() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("application"), &[], vec![1]),
+            action_node(Some("window"), &[], vec![0]),
+        ]);
+
+        let tree = read_tree_from(&mut source, 42, options(usize::MAX, usize::MAX))
+            .expect("an ancestor edge is a lossless traversal stop");
+
+        assert_eq!(tree.completeness, AxTreeCompleteness::Complete);
+        assert_eq!(tree.root.identifier.as_deref(), Some("application"));
+        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(tree.root.children[0].identifier.as_deref(), Some("window"));
+        assert_eq!(tree.root.children[0].children, Vec::new());
+        assert_eq!(tree.root.children[0].unreadable_children, Vec::new());
+        assert_eq!(source.calls, 2, "each cyclic element is read exactly once");
+    }
+
+    #[test]
+    fn a_shared_dag_child_is_read_once_under_each_parent() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("root"), &[], vec![1, 2]),
+            action_node(Some("left"), &[], vec![3]),
+            action_node(Some("right"), &[], vec![3]),
+            action_node(Some("shared"), &[], vec![]),
+        ]);
+
+        let tree = read_tree_from(&mut source, 42, options(usize::MAX, usize::MAX))
+            .expect("sharing outside the current path is not a cycle");
+
+        assert_eq!(tree.completeness, AxTreeCompleteness::Complete);
+        assert_eq!(tree.root.children.len(), 2);
+        assert_eq!(
+            tree.root.children[0].children[0].identifier.as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            tree.root.children[1].children[0].identifier.as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            source.calls, 5,
+            "the shared element must be read along both non-cyclic paths"
+        );
+    }
+
+    #[test]
+    fn caller_supplied_depth_is_capped_at_the_stack_safe_limit() {
+        let mut nodes: Vec<_> = (0..128).map(|index| node(vec![index + 1])).collect();
+        nodes.push(node(vec![]));
+        let mut source = FakeSource::with_nodes(nodes);
+
+        let tree = read_tree_from(&mut source, 42, options(usize::MAX, usize::MAX))
+            .expect("the structural depth cap returns a partial tree");
+        let mut deepest = &tree.root;
+        let mut elements = 1;
+        while let Some(child) = deepest.children.first() {
+            elements += 1;
+            deepest = child;
+        }
+
+        assert_eq!(elements, MAX_RECURSIVE_TREE_DEPTH + 1);
+        assert_eq!(
+            deepest.unreadable_children,
+            vec![AxElementReadFailure::DepthLimitReached {
+                max_depth: MAX_RECURSIVE_TREE_DEPTH,
+            }]
+        );
+        assert_eq!(
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_ten_thousand_element_chain_reads_and_drops_on_a_small_stack() {
+        const ELEMENTS: usize = 10_000;
+        let thread = std::thread::Builder::new()
+            .name("bounded-ax-deep-chain".to_string())
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut nodes: Vec<_> = (0..ELEMENTS - 1)
+                    .map(|index| node(vec![index + 1]))
+                    .collect();
+                nodes.push(node(vec![]));
+                let mut source = FakeSource::with_nodes(nodes);
+                let tree = read_tree_from(&mut source, 42, options(usize::MAX, usize::MAX))
+                    .expect("a deep source is bounded before either recursive stack grows");
+                assert_eq!(
+                    tree.completeness,
+                    AxTreeCompleteness::Incomplete {
+                        unreadable_subtrees: 1,
+                    }
+                );
+                assert_eq!(source.calls, MAX_RECURSIVE_TREE_DEPTH + 1);
+                drop(tree);
+            })
+            .expect("create a small-stack thread");
+
+        match thread.join() {
+            Ok(()) => {}
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     /// Reaching the depth bound stops that subtree and keeps the rest.
     ///
     /// The bound is OUR limit rather than the application's failure, so what was
@@ -2300,6 +2470,27 @@ mod tests {
         assert_eq!(AxAction::from_name("AXRaise"), None);
         assert_eq!(AxAction::from_name("AXAppPrivateAction"), None);
         assert_eq!(AxAction::from_name("axpress"), None);
+    }
+
+    #[test]
+    fn action_refinding_stops_an_ancestor_cycle_without_losing_uniqueness() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1]),
+            action_node(Some("target"), &[AxAction::Press], vec![0]),
+        ]);
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &element_name("target"),
+                AxAction::Press,
+                action_options(usize::MAX, usize::MAX),
+            ),
+            Ok(AxActionRequestOutcome::HandlerReturned)
+        );
+        assert_eq!(source.action_search_calls, 2);
+        assert_eq!(source.performed_actions, vec![(1, AxAction::Press)]);
     }
 
     #[test]
