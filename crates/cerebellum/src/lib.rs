@@ -9,6 +9,7 @@
 
 pub mod authorization;
 pub mod browser;
+pub mod browser_launch;
 pub mod browser_type;
 pub mod capability;
 pub mod cdp;
