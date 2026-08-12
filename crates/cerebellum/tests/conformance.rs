@@ -1224,3 +1224,108 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
         "the request was carried out despite the gate withholding it"
     );
 }
+
+/// A browser capability with no connector behind it is refused at the wire.
+///
+/// The browser drive capabilities are a state machine with nothing underneath:
+/// no socket is opened anywhere in this crate, and the operation recorded for a
+/// navigation is pushed to a Vec rather than dispatched. Until a connector
+/// exists to carry them, naming one must not reach the handler.
+///
+/// This is the refusal a fabricated success would replace. Driven over the wire
+/// with a FULLY VALID request, because an invalid one is refused by schema
+/// validation and would pass this test while the defect remained: the earlier
+/// probe returned `outcome: "ok"` with a url_final and a lifecycle event for a
+/// navigation that never happened, and it took a well-formed request to see it.
+#[tokio::test]
+async fn a_browser_capability_with_no_connector_is_refused_at_the_wire() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    let request = json!({
+        "name": "browser.navigate",
+        "arguments": {
+            "url": "https://example.com/",
+            "intent": "probe",
+            "wait": "none",
+            "severity": { "tier": 1, "credential": false, "financial": false },
+        },
+    });
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        6,
+        1,
+        101,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+
+    cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+        .await
+        .unwrap();
+
+    let response = rx.recv().await.expect("a response frame");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+
+    assert_eq!(
+        body["code"], "unknown_method",
+        "a browser capability with no connector was served: {body}"
+    );
+    // The specific claim that must never appear: a navigation reporting where it
+    // landed. Asserted separately from the refusal because a future change could
+    // return a different error while still having reached the state machine.
+    assert!(
+        body.get("url_final").is_none(),
+        "a navigation reported a final url without a browser: {body}"
+    );
+}
+
+/// Advertisement and dispatch agree about the browser surface.
+///
+/// Both sets are derived from the manifest rather than restated, so they cannot
+/// drift: every advertised capability must be served, and every served
+/// capability must be advertised. Both directions are checked because they fail
+/// independently — a capability can be offered and refused, or served and never
+/// offered, and neither implies the other.
+#[test]
+fn every_advertised_browser_tool_is_dispatchable_and_no_other_is() {
+    let context = cerebellum::default_computer_context();
+    let manifest = cerebellum::build_manifest_with_computer_plane("cerebellum", &context);
+
+    let advertised: Vec<String> = manifest
+        .provides
+        .iter()
+        .flat_map(|role| match role {
+            subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } => {
+                tools.iter().map(|tool| tool.name.clone()).collect()
+            }
+            _ => Vec::new(),
+        })
+        .filter(|name| name.starts_with("browser."))
+        .collect();
+
+    for name in &advertised {
+        assert!(
+            cerebellum::dispatchable_tool(name).is_some(),
+            "{name} is advertised and would be refused at dispatch"
+        );
+    }
+
+    // The reverse direction: every browser capability the parser recognises must
+    // either be advertised, or refused at dispatch when it is not.
+    for name in [
+        "browser.navigate",
+        "browser.click",
+        "browser.click_point",
+        "browser.snapshot",
+        "browser.type",
+    ] {
+        if !advertised.iter().any(|a| a == name) {
+            assert!(
+                cerebellum::dispatchable_tool(name).is_none(),
+                "{name} is not advertised yet dispatch would serve it"
+            );
+        }
+    }
+}
