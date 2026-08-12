@@ -12,7 +12,7 @@ pub struct AxFrame {
     pub height: f64,
 }
 
-/// One accessibility element and the descendants reported beneath it.
+/// One readable accessibility element and the descendants reported beneath it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AxElement {
     pub role: Option<String>,
@@ -25,6 +25,44 @@ pub struct AxElement {
     pub frame: Option<AxFrame>,
     pub actions: Vec<String>,
     pub children: Vec<AxElement>,
+    /// Elements reported directly beneath this one whose values could not be
+    /// read. Their descendants are not visited because no successful snapshot
+    /// established an `AXChildren` list that could bound a traversal.
+    pub unreadable_children: Vec<AxElementReadFailure>,
+}
+
+/// The framework failure that made one reported element unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxElementReadFailure {
+    Accessibility {
+        operation: &'static str,
+        ax_error: i32,
+    },
+    UnexpectedValueType {
+        attribute: &'static str,
+    },
+}
+
+/// Whether every subtree reported during one read was readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxTreeCompleteness {
+    Complete,
+    Incomplete { unreadable_subtrees: usize },
+}
+
+/// A readable application root and the completeness of its traversal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxAccessibilityTree {
+    pub root: AxElement,
+    pub completeness: AxTreeCompleteness,
+}
+
+impl std::ops::Deref for AxAccessibilityTree {
+    type Target = AxElement;
+
+    fn deref(&self) -> &Self::Target {
+        &self.root
+    }
 }
 
 /// Resource bounds applied to one accessibility-tree read.
@@ -180,6 +218,10 @@ pub enum AxActionError {
     ElementIdentifierAmbiguous {
         identifier: String,
     },
+    ElementUniquenessUnestablished {
+        identifier: String,
+        unreadable_subtrees: usize,
+    },
     ActionNotAdvertised {
         identifier: String,
         action: AxAction,
@@ -226,6 +268,14 @@ impl fmt::Display for AxActionError {
             Self::ElementIdentifierAmbiguous { identifier } => write!(
                 formatter,
                 "more than one element reports AXIdentifier {identifier:?}"
+            ),
+            Self::ElementUniquenessUnestablished {
+                identifier,
+                unreadable_subtrees,
+            } => write!(
+                formatter,
+                "AXIdentifier uniqueness for {identifier:?} could not be established because \
+                 {unreadable_subtrees} subtrees were unreadable"
             ),
             Self::ActionNotAdvertised { identifier, action } => write!(
                 formatter,
@@ -432,6 +482,19 @@ struct ElementSnapshot<Handle> {
     children: Vec<Handle>,
 }
 
+enum ElementRead {
+    Readable(Box<AxElement>),
+    Unreadable(AxElementReadFailure),
+}
+
+struct TreeReadState<'a> {
+    pid: u32,
+    count: usize,
+    unreadable_subtrees: usize,
+    options: AxReadOptions,
+    deadline: &'a Deadline,
+}
+
 #[derive(Debug, Clone)]
 enum SourceError {
     Ax {
@@ -578,15 +641,58 @@ fn map_source_error<Source: ElementSource>(
     }
 }
 
+/// Separate a failed element reading from a failure of the process-wide read.
+///
+/// Only copy operations directed at the current element can make that element a
+/// partial result. The mapped error is still consulted because the same call can
+/// reveal that the process exited, permission was revoked, or the deadline
+/// elapsed; those facts concern the whole traversal and must remain typed errors.
+fn element_read_failure<Source: ElementSource>(
+    source: &mut Source,
+    pid: u32,
+    deadline: &Deadline,
+    error: SourceError,
+) -> Result<AxElementReadFailure, AxReadError> {
+    let element_failure = match &error {
+        SourceError::Ax { operation, code }
+            if matches!(
+                *operation,
+                "AXUIElementCopyAttributeValue" | "AXUIElementCopyActionNames"
+            ) =>
+        {
+            Some(AxElementReadFailure::Accessibility {
+                operation,
+                ax_error: *code,
+            })
+        }
+        SourceError::UnexpectedValueType { attribute } => {
+            Some(AxElementReadFailure::UnexpectedValueType { attribute })
+        }
+        _ => None,
+    };
+    let mapped = map_source_error(source, pid, deadline, error);
+    match (element_failure, mapped) {
+        (
+            Some(failure),
+            AxReadError::ProcessNotAccessible { .. }
+            | AxReadError::UnexpectedValueType { .. }
+            | AxReadError::SystemCallFailed { .. },
+        ) => Ok(failure),
+        (_, error) => Err(error),
+    }
+}
+
 enum ActionSearchError {
-    Source(SourceError),
+    Read(AxReadError),
     AmbiguousIdentifier,
 }
 
 struct ActionSearchState<'a, Handle> {
+    pid: u32,
     element_name: &'a AxElementName,
     count: usize,
     found: Option<Handle>,
+    unreadable_subtrees: usize,
     options: AxActionOptions,
     deadline: &'a Deadline,
 }
@@ -598,24 +704,22 @@ fn find_action_target<Source: ActionSource>(
     state: &mut ActionSearchState<'_, Source::Handle>,
 ) -> Result<(), ActionSearchError> {
     if depth > state.options.max_depth {
-        return Err(ActionSearchError::Source(SourceError::DepthLimitExceeded {
+        return Err(ActionSearchError::Read(AxReadError::DepthLimitExceeded {
             max_depth: state.options.max_depth,
             attempted_depth: depth,
         }));
     }
     if state.count >= state.options.max_elements {
-        return Err(ActionSearchError::Source(
-            SourceError::ElementLimitExceeded {
-                max_elements: state.options.max_elements,
-                attempted_elements: state.count.saturating_add(1),
-            },
-        ));
+        return Err(ActionSearchError::Read(AxReadError::ElementLimitExceeded {
+            max_elements: state.options.max_elements,
+            attempted_elements: state.count.saturating_add(1),
+        }));
     }
     state.count += 1;
     state
         .deadline
         .remaining()
-        .map_err(|_| ActionSearchError::Source(SourceError::Deadline))?;
+        .map_err(ActionSearchError::Read)?;
 
     let next_depth = depth.saturating_add(1);
     let child_budget = ChildBudget {
@@ -624,9 +728,26 @@ fn find_action_target<Source: ActionSource>(
         max_elements: state.options.max_elements,
         counted_elements: state.count,
     };
-    let snapshot = source
-        .action_search_snapshot(handle, state.deadline, child_budget)
-        .map_err(ActionSearchError::Source)?;
+    let snapshot = match source.action_search_snapshot(handle, state.deadline, child_budget) {
+        Ok(snapshot) => snapshot,
+        Err(error) if depth > 0 => {
+            match element_read_failure(source, state.pid, state.deadline, error) {
+                Ok(_) => {
+                    state.unreadable_subtrees += 1;
+                    return Ok(());
+                }
+                Err(error) => return Err(ActionSearchError::Read(error)),
+            }
+        }
+        Err(error) => {
+            return Err(ActionSearchError::Read(map_source_error(
+                source,
+                state.pid,
+                state.deadline,
+                error,
+            )))
+        }
+    };
     if snapshot.identifier.as_deref() == Some(state.element_name.identifier()) {
         if state.found.is_some() {
             return Err(ActionSearchError::AmbiguousIdentifier);
@@ -711,22 +832,31 @@ fn request_action_from<Source: ActionSource>(
         .application(pid, &deadline)
         .map_err(|error| AxActionError::from(map_source_error(source, pid, &deadline, error)))?;
     let mut search = ActionSearchState {
+        pid,
         element_name,
         count: 0,
         found: None,
+        unreadable_subtrees: 0,
         options,
         deadline: &deadline,
     };
     match find_action_target(source, &root, 0, &mut search) {
         Ok(()) => {}
-        Err(ActionSearchError::Source(error)) => {
-            return Err(map_source_error(source, pid, &deadline, error).into());
-        }
+        Err(ActionSearchError::Read(error)) => return Err(error.into()),
         Err(ActionSearchError::AmbiguousIdentifier) => {
             return Err(AxActionError::ElementIdentifierAmbiguous {
                 identifier: element_name.identifier().to_owned(),
             });
         }
+    }
+    // A visible match is not unique when another match could be hidden beneath
+    // an unreadable element. Refuse before inspecting its actions so no handler
+    // can run on a name whose uniqueness was not established.
+    if search.unreadable_subtrees > 0 {
+        return Err(AxActionError::ElementUniquenessUnestablished {
+            identifier: element_name.identifier().to_owned(),
+            unreadable_subtrees: search.unreadable_subtrees,
+        });
     }
     let element = search.found.ok_or_else(|| AxActionError::ElementNotFound {
         identifier: element_name.identifier().to_owned(),
@@ -765,7 +895,7 @@ fn read_tree_from<Source: ElementSource>(
     source: &mut Source,
     pid: u32,
     options: AxReadOptions,
-) -> Result<AxElement, AxReadError> {
+) -> Result<AxAccessibilityTree, AxReadError> {
     if !source.process_exists(pid) {
         return Err(AxReadError::NoSuchProcess { pid });
     }
@@ -778,52 +908,79 @@ fn read_tree_from<Source: ElementSource>(
     let root = source
         .application(pid, &deadline)
         .map_err(|error| map_source_error(source, pid, &deadline, error))?;
-    let mut count = 0;
-    read_element(source, pid, &root, 0, &mut count, options, &deadline)
+    let mut state = TreeReadState {
+        pid,
+        count: 0,
+        unreadable_subtrees: 0,
+        options,
+        deadline: &deadline,
+    };
+    let root = match read_element(source, &root, 0, &mut state)? {
+        ElementRead::Readable(root) => *root,
+        ElementRead::Unreadable(_) => {
+            unreachable!("the application root is never converted into a partial read")
+        }
+    };
+    let completeness = if state.unreadable_subtrees == 0 {
+        AxTreeCompleteness::Complete
+    } else {
+        AxTreeCompleteness::Incomplete {
+            unreadable_subtrees: state.unreadable_subtrees,
+        }
+    };
+    Ok(AxAccessibilityTree { root, completeness })
 }
 
 fn read_element<Source: ElementSource>(
     source: &mut Source,
-    pid: u32,
     handle: &Source::Handle,
     depth: usize,
-    count: &mut usize,
-    options: AxReadOptions,
-    deadline: &Deadline,
-) -> Result<AxElement, AxReadError> {
-    if depth > options.max_depth {
+    state: &mut TreeReadState<'_>,
+) -> Result<ElementRead, AxReadError> {
+    if depth > state.options.max_depth {
         return Err(AxReadError::DepthLimitExceeded {
-            max_depth: options.max_depth,
+            max_depth: state.options.max_depth,
             attempted_depth: depth,
         });
     }
-    if *count >= options.max_elements {
+    if state.count >= state.options.max_elements {
         return Err(AxReadError::ElementLimitExceeded {
-            max_elements: options.max_elements,
-            attempted_elements: count.saturating_add(1),
+            max_elements: state.options.max_elements,
+            attempted_elements: state.count.saturating_add(1),
         });
     }
-    *count += 1;
-    deadline.remaining()?;
+    state.count += 1;
+    state.deadline.remaining()?;
 
     let next_depth = depth.saturating_add(1);
     let child_budget = ChildBudget {
-        max_depth: options.max_depth,
+        max_depth: state.options.max_depth,
         attempted_depth: next_depth,
-        max_elements: options.max_elements,
-        counted_elements: *count,
+        max_elements: state.options.max_elements,
+        counted_elements: state.count,
     };
-    let snapshot = source
-        .snapshot(handle, deadline, child_budget)
-        .map_err(|error| map_source_error(source, pid, deadline, error))?;
+    let snapshot = match source.snapshot(handle, state.deadline, child_budget) {
+        Ok(snapshot) => snapshot,
+        // The parent already established that this descendant exists. Preserve
+        // that fact as an unreadable entry rather than turning it into an absent
+        // child or ending the application-wide read.
+        Err(error) if depth > 0 => {
+            let failure = element_read_failure(source, state.pid, state.deadline, error)?;
+            state.unreadable_subtrees += 1;
+            return Ok(ElementRead::Unreadable(failure));
+        }
+        Err(error) => return Err(map_source_error(source, state.pid, state.deadline, error)),
+    };
     let mut children = Vec::with_capacity(snapshot.children.len());
+    let mut unreadable_children = Vec::new();
     for child in &snapshot.children {
-        children.push(read_element(
-            source, pid, child, next_depth, count, options, deadline,
-        )?);
+        match read_element(source, child, next_depth, state)? {
+            ElementRead::Readable(child) => children.push(*child),
+            ElementRead::Unreadable(failure) => unreadable_children.push(failure),
+        }
     }
 
-    Ok(AxElement {
+    Ok(ElementRead::Readable(Box::new(AxElement {
         role: snapshot.role,
         subrole: snapshot.subrole,
         title: snapshot.title,
@@ -834,7 +991,8 @@ fn read_element<Source: ElementSource>(
         frame: snapshot.frame,
         actions: snapshot.actions,
         children,
-    })
+        unreadable_children,
+    })))
 }
 
 #[cfg(target_os = "macos")]
@@ -845,10 +1003,10 @@ mod platform {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGSize};
 
     use super::{
-        ActionSearchSnapshot, ActionSource, AxAction, AxActionError, AxActionOptions,
-        AxActionRequestOutcome, AxElement, AxElementName, AxFrame, AxReadError, AxReadOptions,
-        ChildBudget, Deadline, ElementSnapshot, ElementSource, PerformSourceError, SourceError,
-        AX_ERROR_API_DISABLED,
+        ActionSearchSnapshot, ActionSource, AxAccessibilityTree, AxAction, AxActionError,
+        AxActionOptions, AxActionRequestOutcome, AxElementName, AxFrame, AxReadError,
+        AxReadOptions, ChildBudget, Deadline, ElementSnapshot, ElementSource, PerformSourceError,
+        SourceError, AX_ERROR_API_DISABLED,
     };
 
     type CfTypeRef = *const c_void;
@@ -1440,7 +1598,7 @@ mod platform {
     pub fn read_accessibility_tree(
         pid: u32,
         options: AxReadOptions,
-    ) -> Result<AxElement, AxReadError> {
+    ) -> Result<AxAccessibilityTree, AxReadError> {
         super::read_tree_from(&mut MacElementSource::new(), pid, options)
     }
 
@@ -1481,9 +1639,13 @@ mod tests {
         permitted: bool,
         nodes: Vec<ElementSnapshot<usize>>,
         snapshot_error: Option<SourceError>,
+        snapshot_error_at: Option<(usize, SourceError)>,
         snapshot_delay: Duration,
+        process_disappears_on_snapshot_error: bool,
+        permission_revoked_on_snapshot_error: bool,
         calls: usize,
         action_search_error: Option<SourceError>,
+        action_search_error_at: Option<(usize, SourceError)>,
         action_search_delay: Duration,
         action_name_error: Option<SourceError>,
         perform_error: Option<PerformSourceError>,
@@ -1505,9 +1667,13 @@ mod tests {
                 permitted: true,
                 nodes,
                 snapshot_error: None,
+                snapshot_error_at: None,
                 snapshot_delay: Duration::ZERO,
+                process_disappears_on_snapshot_error: false,
+                permission_revoked_on_snapshot_error: false,
                 calls: 0,
                 action_search_error: None,
+                action_search_error_at: None,
                 action_search_delay: Duration::ZERO,
                 action_name_error: None,
                 perform_error: None,
@@ -1552,8 +1718,21 @@ mod tests {
         ) -> Result<ElementSnapshot<Self::Handle>, SourceError> {
             self.calls += 1;
             std::thread::sleep(self.snapshot_delay);
-            if let Some(error) = &self.snapshot_error {
-                return Err(error.clone());
+            let error = self.snapshot_error.clone().or_else(|| {
+                self.snapshot_error_at
+                    .as_ref()
+                    .and_then(|(failing_element, error)| {
+                        (element == failing_element).then(|| error.clone())
+                    })
+            });
+            if let Some(error) = error {
+                if self.process_disappears_on_snapshot_error {
+                    self.process_exists = false;
+                }
+                if self.permission_revoked_on_snapshot_error {
+                    self.permitted = false;
+                }
+                return Err(error);
             }
             Ok(self.nodes[*element].clone())
         }
@@ -1570,6 +1749,11 @@ mod tests {
             std::thread::sleep(self.action_search_delay);
             if let Some(error) = &self.action_search_error {
                 return Err(error.clone());
+            }
+            if let Some((failing_element, error)) = &self.action_search_error_at {
+                if element == failing_element {
+                    return Err(error.clone());
+                }
             }
             let node = &self.nodes[*element];
             Ok(ActionSearchSnapshot {
@@ -1698,17 +1882,21 @@ mod tests {
 
         assert_eq!(
             tree,
-            AxElement {
-                role: None,
-                subrole: None,
-                title: None,
-                value_description: None,
-                identifier: None,
-                enabled: None,
-                focused: None,
-                frame: None,
-                actions: Vec::new(),
-                children: Vec::new(),
+            AxAccessibilityTree {
+                root: AxElement {
+                    role: None,
+                    subrole: None,
+                    title: None,
+                    value_description: None,
+                    identifier: None,
+                    enabled: None,
+                    focused: None,
+                    frame: None,
+                    actions: Vec::new(),
+                    children: Vec::new(),
+                    unreadable_children: Vec::new(),
+                },
+                completeness: AxTreeCompleteness::Complete,
             }
         );
     }
@@ -1734,35 +1922,133 @@ mod tests {
 
         assert_eq!(
             read_tree_from(&mut source, 42, options(1, 2)),
-            Ok(AxElement {
-                role: Some("parent-role".to_string()),
-                subrole: Some("parent-subrole".to_string()),
-                title: Some("parent-title".to_string()),
-                value_description: Some("parent-value-description".to_string()),
-                identifier: Some("parent-identifier".to_string()),
-                enabled: Some(true),
-                focused: Some(false),
-                frame: Some(parent_frame),
-                actions: vec![
-                    "parent-first-action".to_string(),
-                    "parent-second-action".to_string(),
-                ],
-                children: vec![AxElement {
-                    role: Some("child-role".to_string()),
-                    subrole: Some("child-subrole".to_string()),
-                    title: Some("child-title".to_string()),
-                    value_description: Some("child-value-description".to_string()),
-                    identifier: Some("child-identifier".to_string()),
-                    enabled: Some(false),
-                    focused: Some(true),
-                    frame: Some(child_frame),
+            Ok(AxAccessibilityTree {
+                root: AxElement {
+                    role: Some("parent-role".to_string()),
+                    subrole: Some("parent-subrole".to_string()),
+                    title: Some("parent-title".to_string()),
+                    value_description: Some("parent-value-description".to_string()),
+                    identifier: Some("parent-identifier".to_string()),
+                    enabled: Some(true),
+                    focused: Some(false),
+                    frame: Some(parent_frame),
                     actions: vec![
-                        "child-first-action".to_string(),
-                        "child-second-action".to_string(),
+                        "parent-first-action".to_string(),
+                        "parent-second-action".to_string(),
                     ],
-                    children: Vec::new(),
-                }],
+                    children: vec![AxElement {
+                        role: Some("child-role".to_string()),
+                        subrole: Some("child-subrole".to_string()),
+                        title: Some("child-title".to_string()),
+                        value_description: Some("child-value-description".to_string()),
+                        identifier: Some("child-identifier".to_string()),
+                        enabled: Some(false),
+                        focused: Some(true),
+                        frame: Some(child_frame),
+                        actions: vec![
+                            "child-first-action".to_string(),
+                            "child-second-action".to_string(),
+                        ],
+                        children: Vec::new(),
+                        unreadable_children: Vec::new(),
+                    }],
+                    unreadable_children: Vec::new(),
+                },
+                completeness: AxTreeCompleteness::Complete,
             })
+        );
+    }
+
+    #[test]
+    fn a_named_unreadable_element_preserves_readable_siblings_and_marks_tree_incomplete() {
+        let mut source = FakeSource::with_nodes(vec![
+            node(vec![1, 2, 3]),
+            action_node(Some("readable-before"), &[], vec![]),
+            action_node(Some("unreadable-named"), &[], vec![]),
+            action_node(Some("readable-after"), &[], vec![]),
+        ]);
+        source.snapshot_error_at = Some((
+            2,
+            SourceError::Ax {
+                operation: "AXUIElementCopyAttributeValue",
+                code: AX_ERROR_FAILURE,
+            },
+        ));
+
+        let tree = read_tree_from(&mut source, 42, options(1, 4))
+            .expect("one unreadable descendant must not abort the tree read");
+
+        assert_eq!(
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1,
+            }
+        );
+        assert_eq!(
+            tree.root.children,
+            vec![
+                AxElement {
+                    role: None,
+                    subrole: None,
+                    title: None,
+                    value_description: None,
+                    identifier: Some("readable-before".to_string()),
+                    enabled: None,
+                    focused: None,
+                    frame: None,
+                    actions: Vec::new(),
+                    children: Vec::new(),
+                    unreadable_children: Vec::new(),
+                },
+                AxElement {
+                    role: None,
+                    subrole: None,
+                    title: None,
+                    value_description: None,
+                    identifier: Some("readable-after".to_string()),
+                    enabled: None,
+                    focused: None,
+                    frame: None,
+                    actions: Vec::new(),
+                    children: Vec::new(),
+                    unreadable_children: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(
+            tree.root.unreadable_children,
+            vec![AxElementReadFailure::Accessibility {
+                operation: "AXUIElementCopyAttributeValue",
+                ax_error: AX_ERROR_FAILURE,
+            }]
+        );
+        assert_eq!(
+            source.calls, 4,
+            "the fixture must exercise readable elements on both sides of the failure"
+        );
+    }
+
+    #[test]
+    fn process_and_permission_loss_during_a_descendant_read_remain_whole_tree_errors() {
+        let failure = SourceError::Ax {
+            operation: "AXUIElementCopyAttributeValue",
+            code: AX_ERROR_FAILURE,
+        };
+
+        let mut gone = FakeSource::with_nodes(vec![node(vec![1]), node(vec![])]);
+        gone.snapshot_error_at = Some((1, failure.clone()));
+        gone.process_disappears_on_snapshot_error = true;
+        assert_eq!(
+            read_tree_from(&mut gone, 42, options(1, 2)),
+            Err(AxReadError::NoSuchProcess { pid: 42 })
+        );
+
+        let mut denied = FakeSource::with_nodes(vec![node(vec![1]), node(vec![])]);
+        denied.snapshot_error_at = Some((1, failure));
+        denied.permission_revoked_on_snapshot_error = true;
+        assert_eq!(
+            read_tree_from(&mut denied, 42, options(1, 2)),
+            Err(AxReadError::PermissionNotGranted)
         );
     }
 
@@ -2007,6 +2293,42 @@ mod tests {
             Err(AxActionError::ElementIdentifierAmbiguous {
                 identifier: "duplicate".to_owned(),
             })
+        );
+        assert_eq!(source.action_name_calls, 0);
+        assert!(source.perform_attempts.is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_action_search_refuses_without_claiming_uniqueness() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1, 2]),
+            action_node(Some("target"), &[AxAction::Press], vec![]),
+            action_node(Some("unreadable-named"), &[AxAction::Press], vec![]),
+        ]);
+        source.action_search_error_at = Some((
+            2,
+            SourceError::Ax {
+                operation: "AXUIElementCopyAttributeValue",
+                code: AX_ERROR_FAILURE,
+            },
+        ));
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &element_name("target"),
+                AxAction::Press,
+                action_options(1, 3),
+            ),
+            Err(AxActionError::ElementUniquenessUnestablished {
+                identifier: "target".to_owned(),
+                unreadable_subtrees: 1,
+            })
+        );
+        assert_eq!(
+            source.action_search_calls, 3,
+            "the fixture must exercise successful and failed action-search reads"
         );
         assert_eq!(source.action_name_calls, 0);
         assert!(source.perform_attempts.is_empty());
@@ -2399,15 +2721,15 @@ mod tests {
         match read_accessibility_tree(pid, options(16, 1_000)) {
             Ok(tree) => {
                 assert_eq!(
-                    tree.role.as_deref(),
+                    tree.root.role.as_deref(),
                     Some("AXApplication"),
                     "the application root reports its AX role"
                 );
                 eprintln!(
                     "REAL AX SAMPLE pid={pid} role={:?} title={:?} children={}",
-                    tree.role,
-                    tree.title,
-                    tree.children.len()
+                    tree.root.role,
+                    tree.root.title,
+                    tree.root.children.len()
                 );
             }
             Err(AxReadError::PermissionNotGranted) => {
