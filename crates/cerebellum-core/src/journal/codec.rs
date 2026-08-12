@@ -5,10 +5,13 @@
 //! here deliberately small prevents the lifecycle from learning action or
 //! wire vocabulary.
 
+use serde::{Deserialize, Serialize};
+
 use super::{JournalIdentity, SeverityInputs};
 
 /// Exact bytes and accounting returned by a plane-owned journal codec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncodedJournalState {
     pub durable_bytes: Vec<u8>,
     pub accounted_serialized_size: u64,

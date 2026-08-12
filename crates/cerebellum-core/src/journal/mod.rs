@@ -5,6 +5,8 @@
 //! types in this module do not interpret their bytes.
 
 use std::collections::BTreeMap;
+use std::io;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +48,9 @@ pub use severity::{
     taxonomy_digest, EffectClass, IsolationClass, ObservabilityClass, SeverityInputs,
     SeverityRecord, SeverityTaxonomy, TaxonomyError, ValidatedSeverityTaxonomy,
 };
-pub use storage::{InMemoryJournalStorage, JournalStorage};
+pub use storage::{
+    journal_data_path, FilesystemJournalStorage, InMemoryJournalStorage, JournalStorage,
+};
 
 pub type ActionObligationId = u64;
 pub type AttachmentRevision = u64;
@@ -135,20 +139,84 @@ impl JournalError {
 }
 
 /// Failure while opening a binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {
     InvalidConfiguration,
-    StorageUnavailable,
+    Storage(StorageError),
 }
 
-/// Storage failure independent of any plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Owned diagnostic details retained from an operating-system I/O error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoDiagnostic {
+    pub kind: io::ErrorKind,
+    pub message: String,
+}
+
+/// Storage failures are separated by remedy so absence can never be confused
+/// with damaged or temporarily inaccessible history.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
-    Unavailable,
+    Missing {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    Unreadable {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    Corrupt {
+        path: PathBuf,
+        source: String,
+    },
+    UnknownSchemaVersion {
+        path: PathBuf,
+        found: u64,
+        supported: u64,
+    },
+    HomeDirectoryUnavailable {
+        variable: String,
+    },
+    CreateDirectory {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    ProbeWrite {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    ProbeCleanup {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    Serialization {
+        path: PathBuf,
+        source: String,
+    },
+    TemporaryWrite {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    FileSync {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        source: IoDiagnostic,
+    },
+    DirectorySync {
+        path: PathBuf,
+        source: IoDiagnostic,
+    },
+    LockPoisoned {
+        binding: String,
+    },
 }
 
 /// A lifecycle state visible from the read-only audit surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
     Active,
     Dispatched,
@@ -159,7 +227,8 @@ pub enum LifecycleState {
 
 /// Durable terminal transition kinds. The publication cursor is independent of
 /// the obligation identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TerminalKind {
     FinalizedCommitted,
     RejectedCommitted,
@@ -222,7 +291,8 @@ pub struct ObligationAuditRecord {
 }
 
 /// Durable position in the terminal publication feed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalTransition {
     pub cursor: u64,
     pub action_obligation_id: u64,
@@ -265,7 +335,8 @@ impl DispatchCommitmentToken {
 pub struct Committed;
 
 /// Opaque dispatch material and normalized policy inputs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DispatchMaterial {
     pub dispatch_material: Vec<u8>,
     pub severity_inputs: Option<SeverityInputs>,
@@ -286,25 +357,29 @@ pub struct FinalContextAssociation {
 }
 
 /// Opaque pre-dispatch rejection material.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RejectionMaterial {
     pub rejection_material: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum ReservationMarker {
     Rejection(RejectionMaterial),
     DispatchCommitment,
     Reduced(JournalReason),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttachmentState {
     revision: u64,
     opaque_bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReservationRecord {
     identity: JournalIdentity,
     invocation_descriptor: Vec<u8>,
@@ -317,7 +392,8 @@ struct ReservationRecord {
     attachments: BTreeMap<String, AttachmentState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminalRecord {
     identity: JournalIdentity,
     invocation_descriptor: Vec<u8>,
@@ -342,7 +418,8 @@ struct TerminalCommit {
 }
 
 /// Durable state shared by a storage binding.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableState {
     next_sequence: u64,
     next_cursor: u64,
@@ -350,6 +427,10 @@ pub struct DurableState {
     reservations: BTreeMap<u64, ReservationRecord>,
     transitions: Vec<TerminalTransition>,
     oversize_flag: bool,
+    // Fault injection is a process-local test control, not audit history. Not
+    // persisting it prevents an intentionally armed failure from surprising a
+    // production process after restart.
+    #[serde(skip, default)]
     faults: BTreeMap<String, usize>,
 }
 
@@ -390,14 +471,10 @@ where
         storage: S,
     ) -> Result<Self, BindingError> {
         config.validate()?;
-        let mut state = storage
-            .load()
-            .map_err(|_| BindingError::StorageUnavailable)?;
+        let mut state = storage.load().map_err(BindingError::Storage)?;
         if state.next_sequence == 0 {
             state = DurableState::fresh();
-            storage
-                .save(&state)
-                .map_err(|_| BindingError::StorageUnavailable)?;
+            storage.save(&state).map_err(BindingError::Storage)?;
         }
         Ok(Self {
             codec,
