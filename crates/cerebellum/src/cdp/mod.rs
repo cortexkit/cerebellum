@@ -334,6 +334,14 @@ impl CdpTransport {
         result
     }
 
+    /// Consume a valid response without closing the transport for an invalid
+    /// observation. Browser startup must keep listening after arbitrary frames,
+    /// while established sessions continue to use [`Self::take_response`] and
+    /// fail closed on the same protocol errors.
+    pub fn observe_response(&mut self, bytes: &[u8]) -> Result<CdpResponse, CdpError> {
+        self.take_response_inner(bytes)
+    }
+
     fn take_response_inner(&mut self, bytes: &[u8]) -> Result<CdpResponse, CdpError> {
         let value = parse_json_message(bytes)?;
         let object = value
@@ -353,11 +361,10 @@ impl CdpTransport {
         }
         let pending = self
             .pending
-            .remove(&id)
+            .get(&id)
             .ok_or(CdpError::UnknownResponseId(id))?;
         let session_id = parse_optional_string(object.get("sessionId"))?;
         if session_id != pending.command.session_id {
-            self.closed = true;
             return Err(CdpError::SessionMismatch);
         }
         let result = match object.get("result") {
@@ -375,6 +382,7 @@ impl CdpTransport {
                 "cdp response must contain exactly one of result or error",
             ));
         }
+        self.pending.remove(&id);
         self.completed.insert(id, ());
         Ok(CdpResponse {
             id,
@@ -390,6 +398,12 @@ impl CdpTransport {
             self.closed = true;
         }
         result
+    }
+
+    /// Queue a valid startup event without making a malformed observation close
+    /// the transport. Events remain bounded by the normal event queue limit.
+    pub fn observe_event(&mut self, bytes: &[u8]) -> Result<CdpEvent, CdpError> {
+        self.accept_event_inner(bytes)
     }
 
     fn accept_event_inner(&mut self, bytes: &[u8]) -> Result<CdpEvent, CdpError> {
@@ -416,7 +430,6 @@ impl CdpTransport {
         };
         let session_id = parse_optional_string(object.get("sessionId"))?;
         if self.events.len() >= self.event_limit.min(MAX_QUEUED_EVENTS) {
-            self.closed = true;
             return Err(CdpError::ProtocolFailure("cdp event queue overflow"));
         }
         let event = CdpEvent {
