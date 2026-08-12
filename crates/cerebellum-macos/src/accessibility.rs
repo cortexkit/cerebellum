@@ -41,6 +41,22 @@ pub enum AxElementReadFailure {
     UnexpectedValueType {
         attribute: &'static str,
     },
+    /// The traversal stopped here because it had gone as deep as it may.
+    ///
+    /// Distinct from an accessibility failure because the cause is OURS: the
+    /// application answered, and the reader declined to go further. Real trees
+    /// have been observed extending past any depth set, which a bound is the
+    /// only defence against — and a recursive reader that kept descending would
+    /// exhaust the stack and abort the process rather than refuse.
+    DepthLimitReached {
+        max_depth: usize,
+    },
+    /// The traversal stopped here because the whole read had produced as many
+    /// elements as it may. Unlike the depth bound this is a shared budget, so
+    /// once it is reached no further subtree is descended anywhere.
+    ElementLimitReached {
+        max_elements: usize,
+    },
 }
 
 /// Whether every subtree reported during one read was readable.
@@ -666,6 +682,19 @@ fn element_read_failure<Source: ElementSource>(
         SourceError::UnexpectedValueType { attribute } => {
             Some(AxElementReadFailure::UnexpectedValueType { attribute })
         }
+        // The source refuses to descend past a bound before it allocates for
+        // any child. That refusal is about THIS subtree, so it stops the
+        // descent here rather than discarding everything already read.
+        SourceError::DepthLimitExceeded { max_depth, .. } => {
+            Some(AxElementReadFailure::DepthLimitReached {
+                max_depth: *max_depth,
+            })
+        }
+        SourceError::ElementLimitExceeded { max_elements, .. } => {
+            Some(AxElementReadFailure::ElementLimitReached {
+                max_elements: *max_elements,
+            })
+        }
         _ => None,
     };
     let mapped = map_source_error(source, pid, deadline, error);
@@ -674,7 +703,9 @@ fn element_read_failure<Source: ElementSource>(
             Some(failure),
             AxReadError::ProcessNotAccessible { .. }
             | AxReadError::UnexpectedValueType { .. }
-            | AxReadError::SystemCallFailed { .. },
+            | AxReadError::SystemCallFailed { .. }
+            | AxReadError::DepthLimitExceeded { .. }
+            | AxReadError::ElementLimitExceeded { .. },
         ) => Ok(failure),
         (_, error) => Err(error),
     }
@@ -935,13 +966,35 @@ fn read_element<Source: ElementSource>(
     depth: usize,
     state: &mut TreeReadState<'_>,
 ) -> Result<ElementRead, AxReadError> {
+    // A bound marks THIS subtree unreadable rather than discarding the whole
+    // read. Everything already traversed is still true, and a caller that
+    // receives an incomplete tree already refuses the decisions that need a
+    // complete one — whereas an aborted read tells it nothing at all. The root
+    // itself is exempt below, since a tree with no root is not a partial
+    // result.
     if depth > state.options.max_depth {
+        if depth > 0 {
+            state.unreadable_subtrees += 1;
+            return Ok(ElementRead::Unreadable(
+                AxElementReadFailure::DepthLimitReached {
+                    max_depth: state.options.max_depth,
+                },
+            ));
+        }
         return Err(AxReadError::DepthLimitExceeded {
             max_depth: state.options.max_depth,
             attempted_depth: depth,
         });
     }
     if state.count >= state.options.max_elements {
+        if depth > 0 {
+            state.unreadable_subtrees += 1;
+            return Ok(ElementRead::Unreadable(
+                AxElementReadFailure::ElementLimitReached {
+                    max_elements: state.options.max_elements,
+                },
+            ));
+        }
         return Err(AxReadError::ElementLimitExceeded {
             max_elements: state.options.max_elements,
             attempted_elements: state.count.saturating_add(1),
@@ -2050,27 +2103,72 @@ mod tests {
         );
     }
 
+    /// Reaching the depth bound stops that subtree and keeps the rest.
+    ///
+    /// The bound is OUR limit rather than the application's failure, so what was
+    /// already read is still true and is returned. Real trees have been observed
+    /// extending past every depth tried, so discarding the read would mean
+    /// returning nothing at all for such an application.
+    ///
+    /// The tree is marked incomplete, which is what makes this safe: a caller
+    /// that needs uniqueness or absence refuses on an incomplete tree rather
+    /// than concluding from a partial one.
     #[test]
-    fn depth_beyond_the_bound_is_an_exact_error() {
+    fn reaching_the_depth_bound_stops_that_subtree_and_keeps_the_rest() {
         let mut source = FakeSource::with_nodes(vec![node(vec![1]), node(vec![2]), node(vec![])]);
+        let tree = read_tree_from(&mut source, 42, options(1, 10)).expect("the read completes");
+
         assert_eq!(
-            read_tree_from(&mut source, 42, options(1, 10)),
-            Err(AxReadError::DepthLimitExceeded {
-                max_depth: 1,
-                attempted_depth: 2,
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1
+            }
+        );
+        // The element AT the bound is present; only its children are missing,
+        // and they are named as bounded rather than reported as absent.
+        assert_eq!(tree.root.children.len(), 1);
+        assert!(tree.root.children[0].children.is_empty());
+        assert_eq!(
+            tree.root.children[0].unreadable_children,
+            vec![AxElementReadFailure::DepthLimitReached { max_depth: 1 }]
+        );
+    }
+
+    /// The root itself hitting the bound is still a whole-read error.
+    ///
+    /// A tree with no root is not a partial result: there is nothing to return
+    /// and nothing a caller could do with it.
+    #[test]
+    fn a_bound_that_stops_the_root_is_a_whole_read_error() {
+        let mut source = FakeSource::with_nodes(vec![node(vec![])]);
+        assert_eq!(
+            read_tree_from(&mut source, 42, options(0, 0)),
+            Err(AxReadError::ElementLimitExceeded {
+                max_elements: 0,
+                attempted_elements: 1,
             })
         );
     }
 
+    /// Reaching the element budget stops further subtrees and keeps the rest.
+    ///
+    /// Unlike the depth bound this budget is shared across the whole read, so
+    /// once it is reached nothing further is descended anywhere.
     #[test]
-    fn elements_beyond_the_bound_are_an_exact_error() {
+    fn reaching_the_element_budget_stops_further_subtrees_and_keeps_the_rest() {
         let mut source = FakeSource::with_nodes(vec![node(vec![1, 2]), node(vec![]), node(vec![])]);
+        let tree = read_tree_from(&mut source, 42, options(10, 2)).expect("the read completes");
+
         assert_eq!(
-            read_tree_from(&mut source, 42, options(10, 2)),
-            Err(AxReadError::ElementLimitExceeded {
-                max_elements: 2,
-                attempted_elements: 3,
-            })
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1
+            }
+        );
+        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(
+            tree.root.unreadable_children,
+            vec![AxElementReadFailure::ElementLimitReached { max_elements: 2 }]
         );
     }
 
