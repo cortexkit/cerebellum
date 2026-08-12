@@ -33,6 +33,9 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cerebellum-macos = { path = "../cerebellum-macos" }
+
 [dev-dependencies]
 subc-control = { workspace = true }
 subc-core = { workspace = true }
