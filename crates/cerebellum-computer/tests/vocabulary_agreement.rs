@@ -93,18 +93,29 @@ fn implemented_synthetic_paths(capability: &str) -> BTreeSet<SyntheticPath> {
     paths
 }
 
+/// When a row's audit record must exist relative to the action.
+///
+/// The two required forms are DIFFERENT GUARANTEES and are kept apart. Before
+/// dispatch means the intent is recorded before the machine changes, so an
+/// action that crashes mid-flight still left a statement that it was about to
+/// happen. Before result means the observation is accounted for before anyone
+/// is told about it, which is weaker: nothing was going to change anyway.
+///
+/// Collapsing them would let a row be implemented with the wrong one and still
+/// report agreement — and the wrong one for an actuating row is the weaker one,
+/// which is the direction a mistake naturally takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuditObligation {
     None,
-    Required,
+    RequiredBeforeDispatch,
+    RequiredBeforeResult,
 }
 
 fn frozen_audit_obligation(row: &Value) -> AuditObligation {
     match row["audit_obligation"].as_str() {
         Some("none") => AuditObligation::None,
-        Some("required_before_dispatch") | Some("required_before_result") => {
-            AuditObligation::Required
-        }
+        Some("required_before_dispatch") => AuditObligation::RequiredBeforeDispatch,
+        Some("required_before_result") => AuditObligation::RequiredBeforeResult,
         Some(obligation) => panic!("{obligation} is not a frozen audit obligation"),
         None => panic!("every audit obligation is a string"),
     }
@@ -120,7 +131,11 @@ fn code_requires_wait_audit() -> AuditObligation {
         redactor_available: false,
     };
     if gate.advertised(ComputerCapability::Wait) {
-        AuditObligation::Required
+        // The gate answers whether an audit is required at all, and cannot say
+        // WHEN. Waiting changes nothing, so before-result is the only form its
+        // obligation could take; a row that actuates would need the ordering
+        // read from its dispatch path rather than from this gate.
+        AuditObligation::RequiredBeforeResult
     } else {
         AuditObligation::None
     }
@@ -272,7 +287,7 @@ fn known_wait_audit_obligation_disagreement_remains_asserted() {
         frozen, implemented,
         "wait audit obligations now agree; remove this asserted exception"
     );
-    assert_eq!(implemented, AuditObligation::Required);
+    assert_eq!(implemented, AuditObligation::RequiredBeforeResult);
 }
 
 /// Platform declarations require exactly the permission services each frozen
@@ -307,4 +322,50 @@ fn the_code_serves_every_capability_the_vocabulary_names() {
             "{capability} is frozen in the vocabulary and unknown to the code"
         );
     }
+}
+
+/// The two required audit obligations stay distinct from one another.
+///
+/// Six rows require a record BEFORE DISPATCH and one requires it before the
+/// RESULT, and those are different guarantees: the first says the intent was
+/// written down before the machine changed, so an action that dies mid-flight
+/// still left a statement it was about to happen; the second only says an
+/// observation was accounted for before anyone was told, which costs nothing
+/// because nothing was going to change.
+///
+/// Asserted because a reader who sees two names for "an audit is required" has
+/// every reason to simplify them into one, and the collapse is invisible: every
+/// row still reports agreement, and the first implementation of an actuating
+/// row would be free to take the weaker ordering.
+#[test]
+fn the_two_required_audit_obligations_are_not_interchangeable() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+
+    let mut before_dispatch = 0;
+    let mut before_result = 0;
+    for row in vocabulary["rows"].as_array().expect("rows") {
+        match frozen_audit_obligation(row) {
+            AuditObligation::RequiredBeforeDispatch => before_dispatch += 1,
+            AuditObligation::RequiredBeforeResult => before_result += 1,
+            AuditObligation::None => {}
+        }
+    }
+
+    assert_ne!(
+        AuditObligation::RequiredBeforeDispatch,
+        AuditObligation::RequiredBeforeResult,
+        "the two required obligations compare equal, so no row can be checked \
+         against the ordering it was frozen with"
+    );
+
+    // Absolute counts rather than "at least one of each": a mapping that sent
+    // every row to the same variant would satisfy a presence check.
+    assert_eq!(
+        before_dispatch, 6,
+        "six actuating rows must record intent before the machine changes"
+    );
+    assert_eq!(
+        before_result, 1,
+        "only the observing row may account for its record after the fact"
+    );
 }
