@@ -1,10 +1,21 @@
-//! Drive a real screenshot through the path a wire request takes.
+//! Drive a real screenshot through the plane, from target to reply.
 //!
 //! Every automated test of this path uses a fixture capture backend, which
 //! proves the plumbing and cannot prove that a real capture survives it. This
 //! runs the actual sequence against a real window: resolve a target, mint a
 //! lease through consent, check authority, reserve the journal, capture, encode,
 //! admit to custody, finalize, and read the reply.
+//!
+//! It calls the plane directly rather than going through the wire, so it does
+//! NOT exercise the release-gate admission a dispatched request must pass. That
+//! is deliberate: this probe answers whether a real capture survives the
+//! machinery, and requiring a build-time attestation to ask that question would
+//! make it unrunnable during development, which is when the answer is wanted.
+//!
+//! The consequence is worth stating rather than leaving to be discovered: a
+//! green run here does NOT mean a caller can obtain a screenshot. Whether the
+//! module OFFERS the capability is a separate question, answered by the
+//! what_ships probe, and both must be green for a caller to get a picture.
 //!
 //! A probe rather than a test. It needs an unlocked screen, a granted capture
 //! permission and a named application running, so as a test it would skip in
