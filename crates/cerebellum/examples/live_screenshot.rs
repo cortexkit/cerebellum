@@ -52,9 +52,12 @@ fn main() {
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     runtime.block_on(async move {
-        let Some(audit) = cerebellum::computer_capability::production_audit() else {
-            println!("FAILED: the production audit could not be assembled");
-            return;
+        let audit = match cerebellum::computer_capability::production_audit() {
+            Ok(audit) => audit,
+            Err(reason) => {
+                println!("FAILED: the production audit could not be assembled: {reason}");
+                return;
+            }
         };
         let plane: cerebellum::computer_capability::RunningComputerPlane =
             ComputerPlane::new(audit);

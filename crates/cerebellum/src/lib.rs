@@ -1056,13 +1056,15 @@ pub struct Planes {
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
     pub management: Arc<ManagementPlane>,
-    /// The computer plane, when this host can serve it.
+    /// The computer plane or the single typed reason it was withheld.
     ///
-    /// Absent rather than a plane that refuses everything, so the reason for
-    /// absence is one thing rather than one per capability: this host is not
-    /// macOS, or the audit could not be built from its pinned parts.
+    /// Keeping the outcome in one field prevents availability and its diagnostic
+    /// from drifting into contradictory states.
     #[cfg(target_os = "macos")]
-    pub computer: Option<Arc<computer_capability::RunningComputerPlane>>,
+    pub computer: Result<
+        Arc<computer_capability::RunningComputerPlane>,
+        computer_capability::ComputerPlaneUnavailable,
+    >,
     /// The computer capabilities this build's release gates admit.
     ///
     /// Held so that DISPATCH can consult the same admission the manifest is
@@ -1663,17 +1665,20 @@ async fn handle_tool_request(
             .await;
         }
 
-        let Some(plane) = planes.computer.as_ref() else {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "capability_unavailable",
-                "the computer plane is not available on this host",
-            )
-            .await;
+        let plane = match planes.computer.as_ref() {
+            Ok(plane) => plane,
+            Err(reason) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "capability_unavailable",
+                    &reason.to_string(),
+                )
+                .await;
+            }
         };
         let result = plane
             .serve(
@@ -2121,7 +2126,7 @@ mod tests {
             browser,
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
-            computer: None,
+            computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             elicitor: Arc::clone(&elicitor),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -2164,7 +2169,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
-            computer: None,
+            computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             elicitor: Arc::clone(&elicitor),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -2234,7 +2239,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
-            computer: None,
+            computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             elicitor: Arc::new(Elicitor::new()),
         };
         planes.routes.insert(
@@ -2294,7 +2299,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
-            computer: None,
+            computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             elicitor: Arc::new(Elicitor::new()),
         };
         planes.routes.insert(
