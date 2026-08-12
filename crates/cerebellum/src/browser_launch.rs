@@ -14,6 +14,8 @@ use cerebellum_core::journal::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use crate::browser_launch_readiness::*;
+
 const GENERATION_SLOT: &str = "browser.launch.generation";
 const ATTESTATION_SLOT: &str = "browser.launch.attestation";
 const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v1";
@@ -251,6 +253,8 @@ pub trait BarredProcessLauncher {
 pub struct ReleasedAttestedBrowser<P> {
     pub attestation: LaunchAttestationRecord,
     pub process: P,
+    /// Monotonic instant sampled immediately after the barrier release returns.
+    pub released_at: std::time::Instant,
 }
 
 /// Execute the crash-safe ordering state machine.
@@ -271,6 +275,23 @@ pub fn launch_attested_with<J, L>(
 where
     J: LaunchJournalPort,
     L: BarredProcessLauncher,
+{
+    launch_attested_with_release_clock(journal, launcher, request, std::time::Instant::now)
+}
+
+pub(crate) fn launch_attested_with_release_clock<J, L, F>(
+    journal: &mut J,
+    launcher: &mut L,
+    request: &AttestedLaunchRequest,
+    mut released_at: F,
+) -> Result<
+    ReleasedAttestedBrowser<<L::Process as BarredLaunchProcess>::Released>,
+    AttestedLaunchError,
+>
+where
+    J: LaunchJournalPort,
+    L: BarredProcessLauncher,
+    F: FnMut() -> std::time::Instant,
 {
     let intent = request.durable_intent();
     let mut handle =
@@ -351,6 +372,7 @@ where
     Ok(ReleasedAttestedBrowser {
         attestation,
         process,
+        released_at: released_at(),
     })
 }
 
@@ -622,6 +644,29 @@ impl BarredLaunchProcess for MacOsBarredProcess {
     fn release(self) -> Result<Self::Released, PlatformLaunchError> {
         self.0
             .release()
+            .map_err(|_| PlatformLaunchError::ProcessControl)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl HandshakeProcess for cerebellum_macos::ReleasedChild {
+    fn observe_exit(&mut self) -> Option<ChildExitStatus> {
+        let generation = self.generation();
+        if cerebellum_macos::process_start_time_micros(generation.pid)
+            == Some(generation.start_time_micros)
+        {
+            None
+        } else {
+            Some(ChildExitStatus::Unknown)
+        }
+    }
+
+    fn wait_and_reap(self) -> Result<(), PlatformLaunchError> {
+        self.wait().map_err(|_| PlatformLaunchError::ProcessControl)
+    }
+
+    fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
+        self.terminate_and_reap()
             .map_err(|_| PlatformLaunchError::ProcessControl)
     }
 }
