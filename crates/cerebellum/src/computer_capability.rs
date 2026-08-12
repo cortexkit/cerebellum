@@ -10,6 +10,7 @@
 //! An observation that reached the caller while leaving no durable record is one
 //! nobody can account for later.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cerebellum_computer::audit::{
@@ -47,8 +48,39 @@ pub type RunningComputerPlane = ComputerPlane<
     cerebellum_computer::platform::native::NativeCaptureBackend,
     cerebellum_computer::audit::redaction::ExcludeApplicationText,
     cerebellum_core::journal::ValidatedSeverityTaxonomy,
-    cerebellum_core::journal::InMemoryJournalStorage,
+    cerebellum_core::journal::FilesystemJournalStorage,
 >;
+
+/// Why the computer plane cannot be assembled at boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComputerPlaneUnavailable {
+    SeverityTaxonomy(cerebellum_computer::platform::severity::SeverityArtifactError),
+    JournalStorage {
+        path: PathBuf,
+        error: cerebellum_core::journal::StorageError,
+    },
+    InvalidJournalConfiguration,
+    CaptureCustody,
+}
+
+impl std::fmt::Display for ComputerPlaneUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeverityTaxonomy(error) => {
+                write!(formatter, "the severity taxonomy is unloadable: {error}")
+            }
+            Self::JournalStorage { path, error } => write!(
+                formatter,
+                "journal storage at {} is unavailable: {error:?}",
+                path.display()
+            ),
+            Self::InvalidJournalConfiguration => {
+                formatter.write_str("the production journal configuration is invalid")
+            }
+            Self::CaptureCustody => formatter.write_str("capture custody could not be initialized"),
+        }
+    }
+}
 
 /// The audit a running module uses for the computer plane.
 ///
@@ -58,27 +90,47 @@ pub type RunningComputerPlane = ComputerPlane<
 /// Binding a truncating policy here would satisfy the same gate while making an
 /// application's own words durable in the journal.
 ///
-/// Storage is in memory, matching the browser plane. The journal survives for
-/// the life of the process and no longer, which is a real limit on what these
-/// records are worth after a restart and is stated here rather than discovered.
+/// The journal lives under `~/.local/share/cortexkit/journal/computer.json`:
+/// audit records are application data, not configuration. Initialization probes
+/// that directory before capabilities are offered and preserves the exact refusal
+/// reason instead of silently substituting process-local storage.
 #[cfg(target_os = "macos")]
-pub fn production_audit() -> Option<
+pub fn production_audit() -> Result<
     ComputerAudit<
         cerebellum_computer::audit::redaction::ExcludeApplicationText,
         cerebellum_core::journal::ValidatedSeverityTaxonomy,
-        cerebellum_core::journal::InMemoryJournalStorage,
+        cerebellum_core::journal::FilesystemJournalStorage,
     >,
+    ComputerPlaneUnavailable,
 > {
     use cerebellum_computer::capture_custody::{
         CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
     };
-    use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
+    use cerebellum_core::journal::{
+        journal_data_path, BindingError, FilesystemJournalStorage, JournalConfig,
+    };
 
-    // A table that will not load leaves the plane without severity, and the
-    // gate then withholds every capability. Returning None rather than
-    // substituting a default keeps that refusal visible: a fabricated table
-    // would let capabilities advertise while scoring their actions wrongly.
-    let severity = cerebellum_computer::platform::severity::load_severity_taxonomy().ok()?;
+    // When the severity table cannot load, the computer plane has no severity
+    // taxonomy, so initialization withholds every computer capability. Preserving
+    // the typed failure rather than substituting a default keeps that refusal
+    // diagnosable: a fabricated table would let capabilities advertise while
+    // scoring their actions wrongly.
+    let severity = cerebellum_computer::platform::severity::load_severity_taxonomy()
+        .map_err(ComputerPlaneUnavailable::SeverityTaxonomy)?;
+
+    let unresolved_path = PathBuf::from("~/.local/share/cortexkit/journal/computer.json");
+    let path = journal_data_path("computer.json").map_err(|error| {
+        ComputerPlaneUnavailable::JournalStorage {
+            path: unresolved_path,
+            error,
+        }
+    })?;
+    let storage = FilesystemJournalStorage::prepare(&path).map_err(|error| {
+        ComputerPlaneUnavailable::JournalStorage {
+            path: path.clone(),
+            error,
+        }
+    })?;
 
     let custody = CaptureCustody::new(
         CustodyBounds {
@@ -98,7 +150,7 @@ pub fn production_audit() -> Option<
         InMemoryGrantAuthority::default(),
         InMemoryCustodyStorage::new(),
     )
-    .ok()?;
+    .map_err(|_| ComputerPlaneUnavailable::CaptureCustody)?;
 
     ComputerAudit::new(
         cerebellum_computer::audit::redaction::ExcludeApplicationText,
@@ -107,10 +159,13 @@ pub fn production_audit() -> Option<
             journal_retention_bytes: 8 * 1024 * 1024,
             journal_max_entry_bytes: 64 * 1024,
         },
-        InMemoryJournalStorage::new(),
+        storage,
         custody,
     )
-    .ok()
+    .map_err(|error| match error {
+        BindingError::Storage(error) => ComputerPlaneUnavailable::JournalStorage { path, error },
+        BindingError::InvalidConfiguration => ComputerPlaneUnavailable::InvalidJournalConfiguration,
+    })
 }
 
 /// A capability this module can serve, which cannot be constructed any other way.

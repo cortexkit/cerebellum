@@ -31,7 +31,7 @@ fn identity() -> JournalIdentity {
 }
 
 fn store() -> JournalStore {
-    JournalStore::new(JournalConfig {
+    JournalStore::new_in_memory(JournalConfig {
         journal_retention_bytes: 1_000_000,
         journal_max_entry_bytes: 100_000,
     })

@@ -3,9 +3,13 @@
 //! The interesting properties here are about ORDER and about what happens when
 //! a step fails, neither of which an assertion on the returned outcome can see.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
+use cerebellum::computer_capability::{
+    servable, ComputerPlane, ComputerPlaneUnavailable, ServeContext,
+};
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
 use cerebellum_computer::capture::{
@@ -20,8 +24,9 @@ use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
-    EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalIdentity,
-    ObservabilityClass, Redactor, SeverityInputs, SeverityRecord, ValidatedSeverityTaxonomy,
+    DurableState, EffectClass, InMemoryJournalStorage, IoDiagnostic, IsolationClass, JournalConfig,
+    JournalIdentity, JournalStorage, ObservabilityClass, Redactor, SeverityInputs, SeverityRecord,
+    StorageError, ValidatedSeverityTaxonomy,
 };
 use serde_json::{json, Value};
 
@@ -103,7 +108,7 @@ fn bounds() -> CustodyBounds {
     }
 }
 
-fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
+fn custody() -> CaptureCustody {
     let mut authority = InMemoryGrantAuthority::default();
     authority.insert(CaptureGrant::new(
         "grant-1",
@@ -111,7 +116,10 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
         0,
         1_000,
     ));
-    let custody = CaptureCustody::new(bounds(), authority, InMemoryCustodyStorage::new()).unwrap();
+    CaptureCustody::new(bounds(), authority, InMemoryCustodyStorage::new()).unwrap()
+}
+
+fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
     ComputerAudit::new(
         TestRedactor,
         taxonomy(),
@@ -120,9 +128,34 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
             journal_max_entry_bytes: 4_000,
         },
         InMemoryJournalStorage::new(),
-        custody,
+        custody(),
     )
     .unwrap()
+}
+
+#[derive(Clone, Debug)]
+struct FailAfterInitialization {
+    saves: Arc<AtomicUsize>,
+}
+
+impl JournalStorage for FailAfterInitialization {
+    fn load(&self) -> Result<DurableState, StorageError> {
+        Ok(DurableState::default())
+    }
+
+    fn save(&self, _state: &DurableState) -> Result<(), StorageError> {
+        if self.saves.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(StorageError::TemporaryWrite {
+                path: PathBuf::from("/unwritable/journal.tmp"),
+                source: IoDiagnostic {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    message: "permission denied".to_string(),
+                },
+            })
+        }
+    }
 }
 
 /// A resolver that answers from a fixture instead of the window server.
@@ -261,6 +294,27 @@ fn management() -> Arc<ManagementPlane> {
 
 fn request() -> Value {
     json!({ "scope": "target_windows", "include_cursor": false })
+}
+
+#[test]
+fn journal_boot_failure_message_names_its_path_and_typed_cause() {
+    let path = PathBuf::from("/unwritable/cortexkit/journal/computer.json");
+    let reason = ComputerPlaneUnavailable::JournalStorage {
+        path: path.clone(),
+        error: StorageError::CreateDirectory {
+            path: path.parent().expect("journal directory").to_path_buf(),
+            source: IoDiagnostic {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: "permission denied".to_string(),
+            },
+        },
+    };
+
+    let message = reason.to_string();
+
+    assert!(message.contains(path.to_str().expect("UTF-8 fixture path")));
+    assert!(message.contains("CreateDirectory"));
+    assert!(message.contains("PermissionDenied"));
 }
 
 /// Only the two capabilities with no input path are servable.
@@ -461,6 +515,51 @@ async fn a_failed_capture_is_still_recorded() {
         "a capture that failed left no record, so the journal was reserved after the pixels \
          rather than before them"
     );
+}
+
+/// A runtime journal write failure refuses before the capture backend is built.
+#[tokio::test]
+async fn runtime_journal_save_failure_prevents_capture() {
+    let clock = FakeClock::new();
+    let storage = FailAfterInitialization {
+        saves: Arc::new(AtomicUsize::new(0)),
+    };
+    let audit = ComputerAudit::new(
+        TestRedactor,
+        taxonomy(),
+        JournalConfig {
+            journal_retention_bytes: 20_000,
+            journal_max_entry_bytes: 4_000,
+        },
+        storage,
+        custody(),
+    )
+    .expect("initial journal state is writable");
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit);
+    let backend_built = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&backend_built);
+
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &request(),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &leased_management(&clock).await,
+                clock: &clock,
+                now_ms: 10,
+            },
+            move |_| {
+                observed.store(true, Ordering::SeqCst);
+                InMemoryCaptureBackend::default()
+            },
+        )
+        .await;
+
+    assert_eq!(reply["outcome"], "audit_unavailable");
+    assert_eq!(reply["detail"], "Journal(StorageUnavailable)");
+    assert!(!backend_built.load(Ordering::SeqCst));
 }
 
 /// A management plane holding a live observing lease for the fixture target.
