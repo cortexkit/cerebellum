@@ -29,9 +29,10 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use accessibility::{
-    accessibility_is_permitted, read_accessibility_tree, request_accessibility_action, AxAction,
-    AxActionError, AxActionOptions, AxActionRequestOutcome, AxElement, AxElementName,
-    AxElementNameError, AxFrame, AxReadError, AxReadOptions,
+    accessibility_is_permitted, read_accessibility_tree, request_accessibility_action,
+    AxAccessibilityTree, AxAction, AxActionError, AxActionOptions, AxActionRequestOutcome,
+    AxElement, AxElementName, AxElementNameError, AxElementReadFailure, AxFrame, AxReadError,
+    AxReadOptions, AxTreeCompleteness,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
