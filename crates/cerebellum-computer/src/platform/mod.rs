@@ -132,51 +132,34 @@ impl PermissionLivenessReport {
     }
 }
 
-/// Immutable release inputs are optional until release binding. No field has an
-/// implementation default: an absent value suppresses only rows that consume it.
+/// Immutable release inputs are optional until release binding. External values
+/// attest to work performed outside this repository, so an absent value suppresses
+/// only rows that consume it. The vocabulary digests are mirrors of checked-in
+/// artifacts and are bound by the module from their independent local sources.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImmutableReleaseInputs {
-    pub computer_action_vocabulary_revision: Option<String>,
-    pub permission_matrix_revision: Option<String>,
-    pub process_identity_primitive_revision: Option<String>,
-    pub capture_residual_leakage_revision: Option<String>,
     pub attendance_contract_owner: Option<String>,
-    pub attendance_contract_schema_id: Option<String>,
     pub attendance_contract_revision: Option<String>,
     pub input_review_revision: Option<String>,
     pub capture_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
-    pub cerebellum_core_contract_revision: Option<String>,
-    pub c2_journal_pin_schema_id: Option<String>,
-    pub c2_journal_pin_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
 }
 
 impl ImmutableReleaseInputs {
     fn vocabulary_ready(&self) -> bool {
-        self.computer_action_vocabulary_revision.as_deref()
-            == Some(COMPUTER_ACTION_VOCABULARY_REVISION)
-            && validate_vocabulary_digests(&self.vocabulary_digests).is_ok()
+        validate_vocabulary_digests(&self.vocabulary_digests).is_ok()
     }
 
     fn input_dispatch_ready(&self) -> bool {
-        self.permission_matrix_revision.is_some()
-            && self.process_identity_primitive_revision.is_some()
-            && self.attendance_contract_owner.is_some()
-            && self.attendance_contract_schema_id.is_some()
+        self.attendance_contract_owner.is_some()
             && self.attendance_contract_revision.is_some()
             && self.input_review_revision.is_some()
             && self.release_signing_topology_revision.is_some()
-            && self.cerebellum_core_contract_revision.is_some()
-            && self.c2_journal_pin_schema_id.is_some()
-            && self.c2_journal_pin_revision.is_some()
     }
 
     fn capture_ready(&self) -> bool {
-        self.permission_matrix_revision.is_some()
-            && self.capture_residual_leakage_revision.is_some()
-            && self.capture_review_revision.is_some()
-            && self.release_signing_topology_revision.is_some()
+        self.capture_review_revision.is_some() && self.release_signing_topology_revision.is_some()
     }
 }
 

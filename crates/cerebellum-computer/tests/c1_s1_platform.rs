@@ -4,8 +4,7 @@ use cerebellum_computer::platform::{
     computed_vocabulary_sha256, validate_vocabulary, validate_vocabulary_digests,
     CapabilityAdvertisementContext, ImmutableReleaseInputs, MacOs26PlatformDriver,
     PermissionLiveness, PermissionLivenessReport, PermissionProbeResult, PermissionService,
-    StartupProbeInput, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION,
-    COMPUTER_ACTION_VOCABULARY_SHA256,
+    StartupProbeInput, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 
 #[test]
@@ -60,7 +59,6 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
     );
 
     let unresolved = ImmutableReleaseInputs {
-        computer_action_vocabulary_revision: Some(COMPUTER_ACTION_VOCABULARY_REVISION.to_string()),
         vocabulary_digests: VocabularyDigestInputs {
             manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
             source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),

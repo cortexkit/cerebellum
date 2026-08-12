@@ -794,9 +794,15 @@ async fn live_daemon_registers_and_serves_browser_status() {
     }) else {
         panic!("cerebellum must register as a tool provider");
     };
-    assert_eq!(tools.len(), 1);
+    // The vocabulary mirrors come from checked-in release artifacts, so their
+    // release gates can enable `computer.wait` without external attestations.
+    // Other computer rows remain suppressed because their required compile-time
+    // attestations are still unbound.
+    assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name, "browser.status");
     assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
+    assert_eq!(tools[1].name, "computer.wait");
+    assert_eq!(tools[1].execution_mode, ExecutionMode::Pure);
 
     let route = open_live_route(&mut client, 2).await;
     let invalid_response =
