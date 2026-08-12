@@ -4,32 +4,21 @@ use cerebellum::{
     build_manifest_with_computer_plane, computer_release_evidence,
     computer_release_evidence_with_exercised_rows, ComputerAdvertisementScope,
     ComputerCapabilityAdvertisementContext, ComputerGateOutcome, ComputerReleaseInputs,
-    CEREBELLUM_CORE_CONTRACT_REVISION, COMPUTER_ATTENDANCE_SCHEMA_ID, COMPUTER_C2_JOURNAL_REVISION,
-    COMPUTER_C2_JOURNAL_SCHEMA_ID, COMPUTER_CAPTURE_LEAKAGE_REVISION,
-    COMPUTER_PERMISSION_MATRIX_REVISION,
 };
 use cerebellum_computer::platform::{
-    containment::PROCESS_IDENTITY_PRIMITIVE_REVISION, MacOs26PlatformDriver, PermissionLiveness,
-    PermissionProbeResult, PermissionService, StartupCapabilityProbe, StartupProbeInput,
-    VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION, COMPUTER_ACTION_VOCABULARY_SHA256,
+    MacOs26PlatformDriver, PermissionLiveness, PermissionProbeResult, PermissionService,
+    StartupCapabilityProbe, StartupProbeInput, VocabularyDigestInputs,
+    COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 use subc_protocol::manifest::{ProviderRole, Tool};
 
 fn valid_inputs() -> ComputerReleaseInputs {
     ComputerReleaseInputs {
-        computer_action_vocabulary_revision: Some(COMPUTER_ACTION_VOCABULARY_REVISION.into()),
-        permission_matrix_revision: Some(COMPUTER_PERMISSION_MATRIX_REVISION.into()),
-        process_identity_primitive_revision: Some(PROCESS_IDENTITY_PRIMITIVE_REVISION.into()),
-        capture_residual_leakage_revision: Some(COMPUTER_CAPTURE_LEAKAGE_REVISION.into()),
-        attendance_contract_owner: Some("attendance-owner".into()),
-        attendance_contract_schema_id: Some(COMPUTER_ATTENDANCE_SCHEMA_ID.into()),
-        attendance_contract_revision: Some("attendance-contract-v1".into()),
-        input_review_revision: Some("input-review-v1".into()),
-        capture_review_revision: Some("capture-review-v1".into()),
-        release_signing_topology_revision: Some("signing-topology-v1".into()),
-        cerebellum_core_contract_revision: Some(CEREBELLUM_CORE_CONTRACT_REVISION.into()),
-        c2_journal_pin_schema_id: Some(COMPUTER_C2_JOURNAL_SCHEMA_ID.into()),
-        c2_journal_pin_revision: Some(COMPUTER_C2_JOURNAL_REVISION.into()),
+        attendance_contract_owner: Some("fixture-attendance-owner".into()),
+        attendance_contract_revision: Some("fixture-attendance-contract-v1".into()),
+        input_review_revision: Some("fixture-input-review-v1".into()),
+        capture_review_revision: Some("fixture-capture-review-v1".into()),
+        release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
         vocabulary_digests: VocabularyDigestInputs {
             manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
             source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
@@ -329,40 +318,26 @@ fn every_shipped_advertisement_can_be_dispatched() {
 #[test]
 fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_advertisement() {
     let complete = valid_context();
+    assert_eq!(
+        computer_release_evidence(&complete).gate_outcomes,
+        vec![ComputerGateOutcome::Pass; 8],
+        "the complete fixture must prove the passing direction before it is spoiled"
+    );
+
     let fields = [
-        ("computer_action_vocabulary_revision", 0),
-        ("cerebellum_core_contract_revision", 1),
-        ("c2_journal_pin_schema_id", 2),
-        ("c2_journal_pin_revision", 3),
-        ("process_identity_primitive_revision", 4),
-        ("capture_residual_leakage_revision", 5),
-        ("permission_matrix_revision", 6),
-        ("attendance_contract_owner", 7),
-        ("attendance_contract_schema_id", 8),
-        ("attendance_contract_revision", 9),
-        ("input_review_revision", 10),
-        ("capture_review_revision", 11),
-        ("release_signing_topology_revision", 12),
-        ("vocabulary_manifest_digest", 13),
-        ("vocabulary_source_lock_digest", 14),
-        ("vocabulary_computed_artifact_digest", 15),
+        "attendance_contract_owner",
+        "attendance_contract_revision",
+        "input_review_revision",
+        "capture_review_revision",
+        "release_signing_topology_revision",
+        "vocabulary_manifest_digest",
+        "vocabulary_source_lock_digest",
+        "vocabulary_computed_artifact_digest",
     ];
-    for (gate, _) in fields {
+    for gate in fields {
         let mut inputs = complete.inputs.clone();
         match gate {
-            "computer_action_vocabulary_revision" => {
-                inputs.computer_action_vocabulary_revision = None
-            }
-            "cerebellum_core_contract_revision" => inputs.cerebellum_core_contract_revision = None,
-            "c2_journal_pin_schema_id" => inputs.c2_journal_pin_schema_id = None,
-            "c2_journal_pin_revision" => inputs.c2_journal_pin_revision = None,
-            "process_identity_primitive_revision" => {
-                inputs.process_identity_primitive_revision = None
-            }
-            "capture_residual_leakage_revision" => inputs.capture_residual_leakage_revision = None,
-            "permission_matrix_revision" => inputs.permission_matrix_revision = None,
             "attendance_contract_owner" => inputs.attendance_contract_owner = None,
-            "attendance_contract_schema_id" => inputs.attendance_contract_schema_id = None,
             "attendance_contract_revision" => inputs.attendance_contract_revision = None,
             "input_review_revision" => inputs.input_review_revision = None,
             "capture_review_revision" => inputs.capture_review_revision = None,
@@ -380,12 +355,16 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             startup: complete.startup.clone(),
         };
         let evidence = computer_release_evidence(&context);
-        assert!(
-            evidence.gate_outcomes.iter().any(|outcome| {
-                matches!(
-                    outcome,
-                    ComputerGateOutcome::MissingExternalInput { gate: found } if found == gate
-                )
+        let actual = evidence.gate_outcomes.iter().find(|outcome| {
+            matches!(
+                outcome,
+                ComputerGateOutcome::MissingExternalInput { gate: found } if found == gate
+            )
+        });
+        assert_eq!(
+            actual,
+            Some(&ComputerGateOutcome::MissingExternalInput {
+                gate: gate.to_string(),
             }),
             "missing pin {gate} must remain externally unresolved"
         );
@@ -394,32 +373,25 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         // that dispatch can serve the capability, so reading the advertised set
         // here would conflate a closed gate with an unserved capability and
         // prove nothing about which gate closed.
-        let advertised = evidence.gate_admitted_capabilities;
+        let admitted = evidence.gate_admitted_capabilities;
         if matches!(
             gate,
-            "attendance_contract_owner"
-                | "attendance_contract_schema_id"
-                | "attendance_contract_revision"
-                | "input_review_revision"
+            "attendance_contract_owner" | "attendance_contract_revision" | "input_review_revision"
         ) {
             // These pins apply to the currently unadvertised input declarations;
             // the read-only rows remain available, while the affected input
             // capability is absent from the manifest.
-            assert!(!advertised.iter().any(|id| id == "computer.click"));
-            assert!(advertised.iter().any(|id| id == "computer.wait"));
+            assert!(!admitted.iter().any(|id| id == "computer.click"));
+            assert!(admitted.iter().any(|id| id == "computer.wait"));
         } else if matches!(
             gate,
-            "process_identity_primitive_revision"
-                | "capture_residual_leakage_revision"
-                | "permission_matrix_revision"
-                | "capture_review_revision"
-                | "release_signing_topology_revision"
+            "capture_review_revision" | "release_signing_topology_revision"
         ) {
-            assert!(!advertised.iter().any(|id| id == "computer.screenshot"));
-            assert!(advertised.iter().any(|id| id == "computer.wait"));
+            assert!(!admitted.iter().any(|id| id == "computer.screenshot"));
+            assert!(admitted.iter().any(|id| id == "computer.wait"));
         } else {
             assert!(
-                advertised.is_empty(),
+                admitted.is_empty(),
                 "common missing pin {gate} must suppress rows"
             );
         }
@@ -427,30 +399,38 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
 }
 
 #[test]
-fn supplied_incompatible_pin_is_an_implementation_failure_not_an_unresolved_input() {
-    let mut inputs = valid_inputs();
-    inputs.c2_journal_pin_revision = Some("wrong-revision".into());
-    let context = ComputerCapabilityAdvertisementContext {
-        inputs,
-        permissions: valid_context().permissions,
-        startup: valid_context().startup,
-    };
-    let evidence = computer_release_evidence(&context);
-    assert!(evidence.gate_outcomes.iter().any(|outcome| {
-        matches!(
-            outcome,
-            ComputerGateOutcome::ImplementationFailure { gate } if gate == "c2_journal_pin_revision"
-        )
-    }));
-    assert!(!evidence.gate_outcomes.iter().any(|outcome| {
-        matches!(
-            outcome,
-            ComputerGateOutcome::MissingExternalInput { gate } if gate == "c2_journal_pin_revision"
-        )
-    }));
-    assert!(
-        tools(&build_manifest_with_computer_plane("cerebellum", &context))
+fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresolved_input() {
+    for invalid_value in ["placeholder", "tbd", "unknown"] {
+        let mut inputs = valid_inputs();
+        inputs.capture_review_revision = Some(invalid_value.into());
+        let context = ComputerCapabilityAdvertisementContext {
+            inputs,
+            permissions: valid_context().permissions,
+            startup: valid_context().startup,
+        };
+        let evidence = computer_release_evidence(&context);
+        let actual = evidence.gate_outcomes.iter().find(|outcome| {
+            matches!(
+                outcome,
+                ComputerGateOutcome::ImplementationFailure { gate }
+                    if gate == "capture_review_revision"
+            )
+        });
+        assert_eq!(
+            actual,
+            Some(&ComputerGateOutcome::ImplementationFailure {
+                gate: "capture_review_revision".to_string(),
+            }),
+            "{invalid_value} must not be accepted as a review attestation"
+        );
+        assert_eq!(
+            evidence.gate_outcomes.iter().find(|outcome| matches!(outcome, ComputerGateOutcome::MissingExternalInput { gate } if gate == "capture_review_revision")),
+            None,
+            "a supplied {invalid_value} value must not be classified as an absent review"
+        );
+        assert!(!evidence
+            .gate_admitted_capabilities
             .iter()
-            .all(|tool| !tool.name.starts_with("computer."))
-    );
+            .any(|id| id == "computer.screenshot"));
+    }
 }

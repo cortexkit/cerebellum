@@ -29,7 +29,7 @@ pub mod profile_custody;
 pub mod snapshot_store;
 pub mod wire;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -90,18 +90,6 @@ const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 const BROWSER_STATUS_TOOL: &str = "browser.status";
-
-/// The immutable substrate contract consumed by the computer adapter.  The
-/// computer crate depends one-way on cerebellum-core; this crate only binds the
-/// release identifier into the module manifest.
-pub const CEREBELLUM_CORE_CONTRACT_REVISION: &str = "cerebellum-core-contract-v1";
-/// The schema and revision identifiers used to describe computer capability
-/// rows in release and audit evidence.
-pub const COMPUTER_C2_JOURNAL_SCHEMA_ID: &str = "ck-computer-descriptor/v1";
-pub const COMPUTER_C2_JOURNAL_REVISION: &str = "ck-computer-journal/v1";
-pub const COMPUTER_CAPTURE_LEAKAGE_REVISION: &str = "capture-residual-leakage-v1";
-pub const COMPUTER_PERMISSION_MATRIX_REVISION: &str = "permission-matrix-macos26-v1";
-pub const COMPUTER_ATTENDANCE_SCHEMA_ID: &str = "ck-attendance-contract/v1";
 
 pub use computer::platform::{
     CapabilityAdvertisementContext as ComputerCapabilityAdvertisementContext,
@@ -164,6 +152,110 @@ const COMPUTER_CAPABILITY_IDS: [&str; COMPUTER_FROZEN_ROW_COUNT] = [
     "computer.wait",
 ];
 
+type ComputerGateOutcomes = BTreeMap<&'static str, ComputerGateOutcome>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComputerReleaseGateSource {
+    External,
+    VocabularyManifestDigest,
+    VocabularySourceLockDigest,
+    VocabularyComputedArtifactDigest,
+    StruckSelfReferential { reason: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComputerReleaseGate {
+    name: &'static str,
+    source: ComputerReleaseGateSource,
+}
+
+/// Every release gate is listed here, including entries intentionally marked as
+/// struck and excluded from evaluation because they lack independent evidence.
+/// Keeping them in the table prevents a future change from restoring an
+/// unsupported comparison.
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 16] = [
+    ComputerReleaseGate {
+        name: "vocabulary_manifest_digest",
+        source: ComputerReleaseGateSource::VocabularyManifestDigest,
+    },
+    ComputerReleaseGate {
+        name: "vocabulary_source_lock_digest",
+        source: ComputerReleaseGateSource::VocabularySourceLockDigest,
+    },
+    ComputerReleaseGate {
+        name: "vocabulary_computed_artifact_digest",
+        source: ComputerReleaseGateSource::VocabularyComputedArtifactDigest,
+    },
+    ComputerReleaseGate {
+        name: "attendance_contract_owner",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "attendance_contract_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "input_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "capture_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "release_signing_topology_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "computer_action_vocabulary_revision",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "The frozen artifact revision is independently validated by validate_vocabulary; this comparison only repeated an in-repository literal.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "permission_matrix_revision",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "capture_residual_leakage_revision",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "process_identity_primitive_revision",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "cerebellum_core_contract_revision",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "c2_journal_pin_schema_id",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "c2_journal_pin_revision",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+    ComputerReleaseGate {
+        name: "attendance_contract_schema_id",
+        source: ComputerReleaseGateSource::StruckSelfReferential {
+            reason: "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing.",
+        },
+    },
+];
+
 fn pin_outcome(
     gate: &'static str,
     value: Option<&str>,
@@ -192,131 +284,67 @@ fn pin_outcome(
 
 fn computer_gate_outcomes(
     context: &ComputerCapabilityAdvertisementContext,
-) -> Vec<ComputerGateOutcome> {
+) -> ComputerGateOutcomes {
     let inputs = &context.inputs;
-    let mut outcomes = vec![
-        pin_outcome(
-            "computer_action_vocabulary_revision",
-            inputs.computer_action_vocabulary_revision.as_deref(),
-            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_REVISION),
-        ),
-        pin_outcome(
-            "cerebellum_core_contract_revision",
-            inputs.cerebellum_core_contract_revision.as_deref(),
-            Some(CEREBELLUM_CORE_CONTRACT_REVISION),
-        ),
-        pin_outcome(
-            "c2_journal_pin_schema_id",
-            inputs.c2_journal_pin_schema_id.as_deref(),
-            Some(COMPUTER_C2_JOURNAL_SCHEMA_ID),
-        ),
-        pin_outcome(
-            "c2_journal_pin_revision",
-            inputs.c2_journal_pin_revision.as_deref(),
-            Some(COMPUTER_C2_JOURNAL_REVISION),
-        ),
-        pin_outcome(
-            "process_identity_primitive_revision",
-            inputs.process_identity_primitive_revision.as_deref(),
-            Some(computer::platform::containment::PROCESS_IDENTITY_PRIMITIVE_REVISION),
-        ),
-        pin_outcome(
-            "capture_residual_leakage_revision",
-            inputs.capture_residual_leakage_revision.as_deref(),
-            Some(COMPUTER_CAPTURE_LEAKAGE_REVISION),
-        ),
-        pin_outcome(
-            "permission_matrix_revision",
-            inputs.permission_matrix_revision.as_deref(),
-            Some(COMPUTER_PERMISSION_MATRIX_REVISION),
-        ),
-        pin_outcome(
-            "attendance_contract_owner",
-            inputs.attendance_contract_owner.as_deref(),
-            None,
-        ),
-        pin_outcome(
-            "attendance_contract_schema_id",
-            inputs.attendance_contract_schema_id.as_deref(),
-            Some(COMPUTER_ATTENDANCE_SCHEMA_ID),
-        ),
-        pin_outcome(
-            "attendance_contract_revision",
-            inputs.attendance_contract_revision.as_deref(),
-            None,
-        ),
-        pin_outcome(
-            "input_review_revision",
-            inputs.input_review_revision.as_deref(),
-            None,
-        ),
-        pin_outcome(
-            "capture_review_revision",
-            inputs.capture_review_revision.as_deref(),
-            None,
-        ),
-        pin_outcome(
-            "release_signing_topology_revision",
-            inputs.release_signing_topology_revision.as_deref(),
-            None,
-        ),
-    ];
-    let digest_inputs = &inputs.vocabulary_digests;
-    outcomes.extend([
-        pin_outcome(
-            "vocabulary_manifest_digest",
-            digest_inputs.manifest_digest.as_deref(),
-            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
-        ),
-        pin_outcome(
-            "vocabulary_source_lock_digest",
-            digest_inputs.source_lock_digest.as_deref(),
-            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
-        ),
-        pin_outcome(
-            "vocabulary_computed_artifact_digest",
-            digest_inputs.computed_artifact_digest.as_deref(),
-            Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
-        ),
-    ]);
-    outcomes
+    COMPUTER_RELEASE_GATE_TABLE
+        .iter()
+        .filter_map(|gate| {
+            let outcome = match gate.source {
+                ComputerReleaseGateSource::External => {
+                    pin_outcome(gate.name, external_release_input(inputs, gate.name), None)
+                }
+                ComputerReleaseGateSource::VocabularyManifestDigest => pin_outcome(
+                    gate.name,
+                    inputs.vocabulary_digests.manifest_digest.as_deref(),
+                    Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
+                ),
+                ComputerReleaseGateSource::VocabularySourceLockDigest => pin_outcome(
+                    gate.name,
+                    inputs.vocabulary_digests.source_lock_digest.as_deref(),
+                    Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
+                ),
+                ComputerReleaseGateSource::VocabularyComputedArtifactDigest => pin_outcome(
+                    gate.name,
+                    inputs
+                        .vocabulary_digests
+                        .computed_artifact_digest
+                        .as_deref(),
+                    Some(computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256),
+                ),
+                ComputerReleaseGateSource::StruckSelfReferential { reason } => {
+                    // The entry is kept as an auditable record, not evaluated as a
+                    // release gate. Reading the reason here keeps the table's
+                    // documentation coupled to the code that deliberately omits it.
+                    let _ = reason;
+                    return None;
+                }
+            };
+            Some((gate.name, outcome))
+        })
+        .collect()
 }
 
-fn gate_passes(outcomes: &[ComputerGateOutcome], gate: &str) -> bool {
-    let index = match gate {
-        "computer_action_vocabulary_revision" => 0,
-        "cerebellum_core_contract_revision" => 1,
-        "c2_journal_pin_schema_id" => 2,
-        "c2_journal_pin_revision" => 3,
-        "process_identity_primitive_revision" => 4,
-        "capture_residual_leakage_revision" => 5,
-        "permission_matrix_revision" => 6,
-        "attendance_contract_owner" => 7,
-        "attendance_contract_schema_id" => 8,
-        "attendance_contract_revision" => 9,
-        "input_review_revision" => 10,
-        "capture_review_revision" => 11,
-        "release_signing_topology_revision" => 12,
-        "vocabulary_manifest_digest" => 13,
-        "vocabulary_source_lock_digest" => 14,
-        "vocabulary_computed_artifact_digest" => 15,
-        _ => return false,
-    };
-    outcomes
-        .get(index)
-        .is_some_and(|outcome| matches!(outcome, ComputerGateOutcome::Pass))
+fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> Option<&'a str> {
+    match gate {
+        "attendance_contract_owner" => inputs.attendance_contract_owner.as_deref(),
+        "attendance_contract_revision" => inputs.attendance_contract_revision.as_deref(),
+        "input_review_revision" => inputs.input_review_revision.as_deref(),
+        "capture_review_revision" => inputs.capture_review_revision.as_deref(),
+        "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
+        _ => unreachable!("every external release gate has a bound input"),
+    }
+}
+
+fn gate_passes(outcomes: &ComputerGateOutcomes, gate: &str) -> bool {
+    matches!(outcomes.get(gate), Some(ComputerGateOutcome::Pass))
 }
 
 fn declaration_gate_passes(
     declaration: &ComputerCapabilityDeclaration,
     context: &ComputerCapabilityAdvertisementContext,
-    outcomes: &[ComputerGateOutcome],
+    outcomes: &ComputerGateOutcomes,
 ) -> bool {
     let common = [
-        "computer_action_vocabulary_revision",
-        "cerebellum_core_contract_revision",
-        "c2_journal_pin_schema_id",
-        "c2_journal_pin_revision",
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
         "vocabulary_computed_artifact_digest",
@@ -332,8 +360,6 @@ fn declaration_gate_passes(
             .state(PermissionService::ScreenRecording)
             == PermissionLiveness::Live
             && [
-                "process_identity_primitive_revision",
-                "capture_residual_leakage_revision",
                 "capture_review_revision",
                 "release_signing_topology_revision",
             ]
@@ -349,10 +375,7 @@ fn declaration_gate_passes(
             | "computer.drag"
     ) {
         [
-            "process_identity_primitive_revision",
-            "permission_matrix_revision",
             "attendance_contract_owner",
-            "attendance_contract_schema_id",
             "attendance_contract_revision",
             "input_review_revision",
             "release_signing_topology_revision",
@@ -389,7 +412,7 @@ fn canonical_declaration_is_complete(declarations: &[ComputerCapabilityDeclarati
 fn advertised_computer_declarations<'a>(
     declarations: &'a [ComputerCapabilityDeclaration],
     context: &ComputerCapabilityAdvertisementContext,
-    outcomes: &[ComputerGateOutcome],
+    outcomes: &ComputerGateOutcomes,
 ) -> Vec<&'a ComputerCapabilityDeclaration> {
     gate_admitted_computer_declarations(declarations, context, outcomes)
         .into_iter()
@@ -408,7 +431,7 @@ fn advertised_computer_declarations<'a>(
 fn gate_admitted_computer_declarations<'a>(
     declarations: &'a [ComputerCapabilityDeclaration],
     context: &ComputerCapabilityAdvertisementContext,
-    outcomes: &[ComputerGateOutcome],
+    outcomes: &ComputerGateOutcomes,
 ) -> Vec<&'a ComputerCapabilityDeclaration> {
     if !canonical_declaration_is_complete(declarations) {
         return Vec::new();
@@ -423,7 +446,7 @@ fn gate_admitted_computer_declarations<'a>(
 
 fn canonical_computer_declarations(
     context: &ComputerCapabilityAdvertisementContext,
-) -> (Vec<ComputerCapabilityDeclaration>, Vec<ComputerGateOutcome>) {
+) -> (Vec<ComputerCapabilityDeclaration>, ComputerGateOutcomes) {
     let driver = computer::platform::MacOs26PlatformDriver::new(&StartupProbeInput {
         os_major: context.startup.os_major,
         private_envelope_revision: if context.startup.private_envelope_recognized {
@@ -533,7 +556,7 @@ pub fn computer_release_evidence_with_exercised_rows(
         exercised_row_count: exercised_rows.min(advertised_row_count),
         functional_computer_plane: exercised_rows > 0 && advertised_row_count > 0,
         scope,
-        gate_outcomes,
+        gate_outcomes: gate_outcomes.into_values().collect(),
     }
 }
 
@@ -622,6 +645,47 @@ fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>
     (Vec::new(), None)
 }
 
+/// Collect the release attestations supplied to the compiler and derive the
+/// vocabulary mirrors from their independent checked-in sources.
+///
+/// The five external identifiers use `option_env!` so a release invocation must
+/// supply each attestation before compilation. Starting a binary with a new
+/// environment value cannot manufacture a review after the binary was built.
+fn compiled_release_inputs() -> ComputerReleaseInputs {
+    release_inputs_from_build_bindings(
+        option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_OWNER"),
+        option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_REVISION"),
+        option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
+        option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
+        option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION"),
+    )
+}
+
+fn release_inputs_from_build_bindings(
+    attendance_contract_owner: Option<&str>,
+    attendance_contract_revision: Option<&str>,
+    input_review_revision: Option<&str>,
+    capture_review_revision: Option<&str>,
+    release_signing_topology_revision: Option<&str>,
+) -> ComputerReleaseInputs {
+    let computed_vocabulary_digest = computer::platform::computed_vocabulary_sha256();
+    ComputerReleaseInputs {
+        attendance_contract_owner: attendance_contract_owner.map(str::to_owned),
+        attendance_contract_revision: attendance_contract_revision.map(str::to_owned),
+        input_review_revision: input_review_revision.map(str::to_owned),
+        capture_review_revision: capture_review_revision.map(str::to_owned),
+        release_signing_topology_revision: release_signing_topology_revision.map(str::to_owned),
+        vocabulary_digests: computer::platform::VocabularyDigestInputs {
+            // The manifest and computed-artifact mirrors are recalculated from
+            // the frozen vocabulary, while the source-lock digest comes from its
+            // separate checked-in file. Each is compared with its expected digest.
+            manifest_digest: Some(computed_vocabulary_digest.clone()),
+            source_lock_digest: computer::platform::implementation_source_lock_digest(),
+            computed_artifact_digest: Some(computed_vocabulary_digest),
+        },
+    }
+}
+
 /// The computer-plane advertisement context used when sending HELLO.
 ///
 /// Public so that a test can check the manifest this module really sends,
@@ -642,7 +706,7 @@ pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
         responsible_process,
     });
     ComputerCapabilityAdvertisementContext {
-        inputs: ComputerReleaseInputs::default(),
+        inputs: compiled_release_inputs(),
         permissions: startup.permissions.clone(),
         startup,
     }
@@ -2276,10 +2340,108 @@ mod tests {
             declaration.advertised = true;
         }
         declarations[0].capability_id = "computer.wait".to_string();
-        let outcomes = (0..16)
-            .map(|_| ComputerGateOutcome::Pass)
-            .collect::<Vec<_>>();
+        let outcomes = COMPUTER_RELEASE_GATE_TABLE
+            .iter()
+            .filter(|gate| {
+                !matches!(
+                    gate.source,
+                    ComputerReleaseGateSource::StruckSelfReferential { .. }
+                )
+            })
+            .map(|gate| (gate.name, ComputerGateOutcome::Pass))
+            .collect::<ComputerGateOutcomes>();
         assert!(advertised_computer_declarations(&declarations, &context, &outcomes).is_empty());
+    }
+
+    #[test]
+    fn build_bindings_preserve_absence_and_bind_only_the_supplied_capture_review() {
+        let inputs = release_inputs_from_build_bindings(
+            None,
+            None,
+            None,
+            Some("cerebellum-capture-review/v1@cb1f669"),
+            None,
+        );
+        assert_eq!(
+            inputs,
+            ComputerReleaseInputs {
+                attendance_contract_owner: None,
+                attendance_contract_revision: None,
+                input_review_revision: None,
+                capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669".to_string()),
+                release_signing_topology_revision: None,
+                vocabulary_digests: computer::platform::VocabularyDigestInputs {
+                    manifest_digest: Some(
+                        computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256.to_string(),
+                    ),
+                    source_lock_digest: Some(
+                        computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256.to_string(),
+                    ),
+                    computed_artifact_digest: Some(
+                        computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256.to_string(),
+                    ),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn struck_gates_remain_recorded_and_are_not_evaluated() {
+        let struck: Vec<_> = COMPUTER_RELEASE_GATE_TABLE
+            .iter()
+            .filter_map(|gate| match gate.source {
+                ComputerReleaseGateSource::StruckSelfReferential { reason } => {
+                    Some((gate.name, reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            struck.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                "computer_action_vocabulary_revision",
+                "permission_matrix_revision",
+                "capture_residual_leakage_revision",
+                "process_identity_primitive_revision",
+                "cerebellum_core_contract_revision",
+                "c2_journal_pin_schema_id",
+                "c2_journal_pin_revision",
+                "attendance_contract_schema_id",
+            ]
+        );
+        assert_eq!(
+            struck[0].1,
+            "The frozen artifact revision is independently validated by validate_vocabulary; this comparison only repeated an in-repository literal."
+        );
+        for (_, reason) in struck.iter().skip(1) {
+            assert_eq!(
+                *reason,
+                "No production behavior reads this identifier; the former comparison repeated one in-repository literal and checked nothing."
+            );
+        }
+
+        let context = ComputerCapabilityAdvertisementContext {
+            inputs: release_inputs_from_build_bindings(
+                Some("fixture-attendance-owner"),
+                Some("fixture-attendance-revision"),
+                Some("fixture-input-review"),
+                Some("fixture-capture-review"),
+                Some("fixture-signing-topology"),
+            ),
+            permissions: Default::default(),
+            startup: StartupCapabilityProbe::run(&StartupProbeInput {
+                os_major: computer::platform::MACOS_MAJOR_VERSION,
+                private_envelope_revision: None,
+                resolved_private_symbols: BTreeSet::new(),
+                permission_results: Vec::new(),
+                responsible_process: None,
+            }),
+        };
+        let outcomes = computer_gate_outcomes(&context);
+        assert_eq!(
+            outcomes.into_values().collect::<Vec<_>>(),
+            vec![ComputerGateOutcome::Pass; 8]
+        );
     }
 }
 
