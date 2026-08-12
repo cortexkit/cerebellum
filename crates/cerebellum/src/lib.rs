@@ -1985,6 +1985,48 @@ pub async fn handle_tool_request_for_test_with_bindings(
 
 #[cfg(test)]
 mod tests {
+
+    /// The build script names exactly the attestations the compiler reads.
+    ///
+    /// The names live in two places: `option_env!` calls here, and exports in
+    /// the release build script. Nothing else connects them, so a misspelling
+    /// in either sets or reads a variable the other does not know.
+    ///
+    /// It fails CLOSED, which is what makes it worth a test: the build
+    /// succeeds, the capability is silently withheld, and the gate report
+    /// blames a missing attestation for one that was supplied. Measured before
+    /// this existed -- a single transposed letter dropped computer.screenshot
+    /// from a release build with no error anywhere.
+    ///
+    /// The script rejects an unknown CEREBELLUM_ variable at run time, which
+    /// catches a typo in the script. This catches the other direction: a name
+    /// changed here and not there.
+    #[test]
+    fn the_release_script_names_every_attestation_the_compiler_reads() {
+        let source = include_str!("lib.rs");
+        let script = include_str!("../../../scripts/release-build.sh");
+
+        let read_here: std::collections::BTreeSet<&str> = source
+            .split("option_env!(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|name| name.starts_with("CEREBELLUM_"))
+            .collect();
+
+        assert_eq!(
+            read_here.len(),
+            5,
+            "expected five attestations, found {read_here:?}"
+        );
+
+        for name in &read_here {
+            assert!(
+                script.contains(name),
+                "{name} is read by the compiler and absent from the release script, \
+                 so a release cannot bind it"
+            );
+        }
+    }
     use super::*;
     use cerebellum_computer::platform::TargetResolution;
     use subc_protocol::Principal;
