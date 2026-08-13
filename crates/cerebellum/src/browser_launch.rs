@@ -3,11 +3,13 @@
 //! This module owns ordering and policy. Platform code returns process and
 //! code-signing facts; the journal decides whether release may be reached.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use cerebellum_core::journal::{
-    DispatchMaterial, EncodedJournalState, JournalBinding, JournalCodecError,
+    CompletedResult, DispatchCommitmentToken as CoreDispatchCommitmentToken, DispatchMaterial,
+    EncodedJournalState, FinalContextAssociation, JournalBinding, JournalCodecError,
     JournalConfig as CoreJournalConfig, JournalError as CoreJournalError, JournalIdentity,
     JournalStorage, PlaneJournalCodec, ProvisionalInput, RejectionInput, RejectionMaterial,
     UnavailablePolicy,
@@ -127,6 +129,28 @@ pub struct LaunchGenerationRecord {
 pub struct LaunchAttestationRecord {
     pub generation: LaunchGenerationRecord,
     pub observed_executable_identity: ExecutableIdentity,
+}
+
+/// Durable result recorded when the launched browser session ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchSessionCompletion {
+    pub format_version: String,
+    pub launch_attempt_id: String,
+    pub terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome,
+}
+
+impl LaunchSessionCompletion {
+    fn new(
+        launch_attempt_id: &str,
+        terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome,
+    ) -> Self {
+        Self {
+            format_version: LAUNCH_CODEC_VERSION.to_string(),
+            launch_attempt_id: launch_attempt_id.to_string(),
+            terminal_outcome,
+        }
+    }
 }
 
 /// Terminal mismatch record. The process is still barred when this is written.
@@ -455,6 +479,7 @@ impl LaunchIntentHandle {
 /// Durable launch records implemented on the filesystem-backed journal substrate.
 pub struct DurableLaunchJournal<S: JournalStorage> {
     core: LaunchCoreJournal<S>,
+    dispatched: HashMap<String, CoreDispatchCommitmentToken>,
 }
 
 impl<S: JournalStorage> DurableLaunchJournal<S> {
@@ -469,7 +494,35 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
             config,
             storage,
         )?;
-        Ok(Self { core })
+        Ok(Self {
+            core,
+            dispatched: HashMap::new(),
+        })
+    }
+
+    pub fn finalize_session(
+        &mut self,
+        launch_attempt_id: &str,
+        terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome,
+    ) -> Result<(), CoreJournalError> {
+        let token = self
+            .dispatched
+            .get(launch_attempt_id)
+            .copied()
+            .ok_or(CoreJournalError::InvalidHandle)?;
+        let completion = LaunchSessionCompletion::new(launch_attempt_id, terminal_outcome);
+        let bytes = serde_json::to_vec(&completion).map_err(|_| CoreJournalError::CodecFailed)?;
+        self.core.finalize_dispatched(
+            token,
+            CompletedResult {
+                completed_result: bytes.clone(),
+            },
+            FinalContextAssociation {
+                final_context: bytes,
+            },
+        )?;
+        self.dispatched.remove(launch_attempt_id);
+        Ok(())
     }
 
     pub fn read_attempt(
@@ -548,7 +601,7 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
         if revision != 1 {
             return Err(CoreJournalError::AttachmentFailed);
         }
-        self.core.commit_dispatched(
+        let commitment = self.core.commit_dispatched(
             handle.reservation,
             DispatchMaterial {
                 dispatch_material: bytes,
@@ -557,6 +610,10 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
                 governing_observation: None,
             },
         )?;
+        self.dispatched.insert(
+            record.generation.intent.launch_attempt_id.clone(),
+            commitment,
+        );
         Ok(())
     }
 
@@ -877,6 +934,41 @@ mod tests {
         }
     }
 
+    fn dispatch_attempt(
+        journal: &mut DurableLaunchJournal<InMemoryJournalStorage>,
+        request: &AttestedLaunchRequest,
+    ) -> (u64, LaunchAttestationRecord) {
+        let intent = request.durable_intent();
+        let mut handle = journal.record_intent(&intent).expect("record intent");
+        let sequence = handle.sequence();
+        let generation = LaunchGenerationRecord {
+            intent,
+            process_generation: BrowserProcessGeneration {
+                pid: 42,
+                start_time_micros: sequence,
+            },
+        };
+        journal
+            .record_generation(&mut handle, &generation)
+            .expect("record generation");
+        let attestation = LaunchAttestationRecord {
+            generation,
+            observed_executable_identity: identity(),
+        };
+        journal
+            .commit_attestation(&mut handle, &attestation)
+            .expect("commit attestation");
+        (sequence, attestation)
+    }
+
+    fn terminal_completion(
+        journal: &DurableLaunchJournal<InMemoryJournalStorage>,
+        sequence: u64,
+    ) -> LaunchSessionCompletion {
+        assert_eq!(sequence, 1);
+        serde_json::from_slice(&journal.core.export_bytes()).expect("decode launch completion")
+    }
+
     fn harness(
         fail: FailJournalAt,
         observed: Result<ExecutableIdentity, PlatformLaunchError>,
@@ -1081,6 +1173,150 @@ mod tests {
         let decoded: LaunchAttestationRecord =
             serde_json::from_slice(&stored.opaque_bytes).expect("decode attestation");
         assert_eq!(decoded, attestation);
+    }
+
+    #[test]
+    fn finalized_session_releases_exact_active_charge_and_records_typed_outcome() {
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            InMemoryJournalStorage::new(),
+        )
+        .expect("open launch journal");
+        assert_eq!(journal.core.active_reserved_bytes(), 0);
+        assert_eq!(journal.core.retained_bytes(), 0);
+
+        let request = request();
+        let (sequence, attestation) = dispatch_attempt(&mut journal, &request);
+        let dispatched_charge = serde_json::to_vec(&attestation).unwrap().len() as u64;
+        assert_eq!(journal.core.active_reserved_bytes(), dispatched_charge);
+        assert_eq!(journal.core.retained_bytes(), dispatched_charge);
+
+        journal
+            .finalize_session(
+                &request.launch_attempt_id,
+                crate::browser_session::BrowserSessionTerminalOutcome::ModuleShutdown,
+            )
+            .expect("finalize launch session");
+        let expected = LaunchSessionCompletion {
+            format_version: LAUNCH_CODEC_VERSION.to_string(),
+            launch_attempt_id: request.launch_attempt_id.clone(),
+            terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome::ModuleShutdown,
+        };
+        let expected_terminal_bytes = serde_json::to_vec(&expected).unwrap().len() as u64;
+        assert_eq!(journal.core.active_reserved_bytes(), 0);
+        assert_eq!(journal.core.retained_bytes(), expected_terminal_bytes);
+        assert_eq!(journal.core.status().active_reservation_count, 0);
+        assert_eq!(journal.core.status().entry_count, 1);
+        assert_eq!(terminal_completion(&journal, sequence), expected);
+    }
+
+    #[test]
+    fn repeated_launch_and_close_stays_within_retention_bound() {
+        const RETENTION_BOUND: u64 = 16 * 1024;
+        const CYCLES: usize = 256;
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: RETENTION_BOUND,
+                journal_max_entry_bytes: RETENTION_BOUND,
+            },
+            InMemoryJournalStorage::new(),
+        )
+        .expect("open launch journal");
+
+        for cycle in 0..CYCLES {
+            let mut request = request();
+            request.launch_attempt_id = format!("attempt-{cycle}");
+            let (_, attestation) = dispatch_attempt(&mut journal, &request);
+            assert_eq!(
+                journal.core.active_reserved_bytes(),
+                serde_json::to_vec(&attestation).unwrap().len() as u64
+            );
+            journal
+                .finalize_session(
+                    &request.launch_attempt_id,
+                    crate::browser_session::BrowserSessionTerminalOutcome::Closed,
+                )
+                .expect("finalize launch session");
+            assert_eq!(journal.core.active_reserved_bytes(), 0);
+        }
+
+        let status = journal.core.status();
+        assert_eq!(status.active_reservation_count, 0);
+        assert_eq!(status.active_reserved_bytes, 0);
+        assert!(status.retained_bytes <= RETENTION_BOUND);
+        assert!(status.entry_count < CYCLES);
+    }
+
+    #[test]
+    fn failed_session_finalization_keeps_exact_charge_for_retry() {
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            InMemoryJournalStorage::new(),
+        )
+        .expect("open launch journal");
+        let request = request();
+        let (_, attestation) = dispatch_attempt(&mut journal, &request);
+        let dispatched_charge = serde_json::to_vec(&attestation).unwrap().len() as u64;
+        journal.core.arm_fault("commit_finalization", 1);
+
+        assert_eq!(
+            journal.finalize_session(
+                &request.launch_attempt_id,
+                crate::browser_session::BrowserSessionTerminalOutcome::Closed,
+            ),
+            Err(CoreJournalError::FinalizationPending)
+        );
+        assert_eq!(journal.core.active_reserved_bytes(), dispatched_charge);
+        assert_eq!(journal.core.retained_bytes(), dispatched_charge);
+        assert_eq!(journal.core.status().entry_count, 1);
+        assert_eq!(journal.core.status().active_reservation_count, 1);
+
+        assert_eq!(
+            journal.finalize_session(
+                &request.launch_attempt_id,
+                crate::browser_session::BrowserSessionTerminalOutcome::Closed,
+            ),
+            Ok(())
+        );
+        assert_eq!(journal.core.active_reserved_bytes(), 0);
+        assert_eq!(journal.core.status().entry_count, 1);
+    }
+
+    #[test]
+    fn second_session_finalization_is_refused_without_double_counting() {
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            InMemoryJournalStorage::new(),
+        )
+        .expect("open launch journal");
+        let request = request();
+        let _ = dispatch_attempt(&mut journal, &request);
+        assert_eq!(
+            journal.finalize_session(
+                &request.launch_attempt_id,
+                crate::browser_session::BrowserSessionTerminalOutcome::Closed,
+            ),
+            Ok(())
+        );
+        let retained_after_first = journal.core.retained_bytes();
+        assert_eq!(
+            journal.finalize_session(
+                &request.launch_attempt_id,
+                crate::browser_session::BrowserSessionTerminalOutcome::Closed,
+            ),
+            Err(CoreJournalError::InvalidHandle)
+        );
+        assert_eq!(journal.core.retained_bytes(), retained_after_first);
+        assert_eq!(journal.core.status().entry_count, 1);
     }
 
     #[test]
