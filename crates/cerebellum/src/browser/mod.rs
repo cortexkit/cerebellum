@@ -90,6 +90,7 @@ pub enum BrowserError {
         reason_code: &'static str,
     },
     NoSession,
+    BrowserLaunchPending,
     StaleSnapshot {
         reason_code: &'static str,
     },
@@ -130,6 +131,7 @@ impl BrowserError {
         match self {
             Self::InvalidRequest { .. } => "invalid_request",
             Self::NoSession => "no_session",
+            Self::BrowserLaunchPending => "browser_launch_pending",
             Self::StaleSnapshot { .. } => "stale_snapshot",
             Self::RefNotFound { .. } => "ref_not_found",
             Self::RefAmbiguous { .. } => "ref_ambiguous",
@@ -168,6 +170,7 @@ impl BrowserError {
             Self::NavigationPolicyRejected { reason_code } => json!({"reason_code":reason_code}),
             Self::Internal { reason_code } => json!({"reason_code":reason_code.as_str()}),
             Self::NoSession => json!({"reason_code":"no_session"}),
+            Self::BrowserLaunchPending => json!({"reason_code":"browser_launch_pending"}),
             Self::ElementIntercepted => json!({}),
             Self::BrowserCrashed => json!({"reason_code":"browser_crashed"}),
         })
@@ -483,6 +486,10 @@ pub struct BrowserPlane {
     journal_config: Option<journal::JournalConfig>,
     journals: Arc<Mutex<HashMap<String, JournalInvocation>>>,
     authorization_enabled: bool,
+    session_gate: Option<(
+        crate::browser_session::BrowserSessions,
+        Arc<cerebellum_core::clock::SystemClock>,
+    )>,
 }
 
 impl BrowserPlane {
@@ -497,8 +504,19 @@ impl BrowserPlane {
             journal_config: None,
             journals: Arc::new(Mutex::new(HashMap::new())),
             authorization_enabled: true,
+            session_gate: None,
         }
     }
+    pub fn with_session_gate(
+        sessions: crate::browser_session::BrowserSessions,
+        clock: Arc<cerebellum_core::clock::SystemClock>,
+    ) -> Self {
+        Self {
+            session_gate: Some((sessions, clock)),
+            ..Self::default()
+        }
+    }
+
     pub fn with_journal(config: journal::JournalConfig) -> Self {
         Self {
             journal_config: Some(config),
@@ -720,7 +738,20 @@ impl BrowserPlane {
         &self,
         identity: &RouteIdentity,
         capability: BrowserCapability,
-    ) -> Result<(), BrowserError> {
+    ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
+        let operation = if let Some((sessions, clock)) = &self.session_gate {
+            match sessions.accept_dispatch(&identity.conversation_key, clock.as_ref()) {
+                crate::browser_session::DispatchAdmission::Accepted(guard) => Some(guard),
+                crate::browser_session::DispatchAdmission::LaunchPending => {
+                    return Err(BrowserError::BrowserLaunchPending)
+                }
+                crate::browser_session::DispatchAdmission::NoSession => {
+                    return Err(BrowserError::NoSession)
+                }
+            }
+        } else {
+            None
+        };
         if let Some(config) = self.journal_config {
             let mut journals = self.journals.lock().await;
             let entry = journals
@@ -737,7 +768,7 @@ impl BrowserPlane {
         }
         let mut state = self.state.lock().await;
         Self::op(&mut state, &identity.conversation_key, Operation::Reserve);
-        Ok(())
+        Ok(operation)
     }
     async fn commit(
         &self,
@@ -871,7 +902,6 @@ impl BrowserPlane {
                 reason_code: "unsupported_value",
             });
         }
-        self.reserve(identity, BrowserCapability::Navigate).await?;
         if self.authorization_enabled {
             let decision = self
                 .grants
@@ -896,6 +926,7 @@ impl BrowserPlane {
                 reason_code: "scheme_not_allowed",
             });
         }
+        let _session_operation = self.reserve(identity, BrowserCapability::Navigate).await?;
         self.commit(identity, BrowserCapability::Navigate).await?;
         let tracker = {
             let mut state = self.state.lock().await;
@@ -966,6 +997,7 @@ impl BrowserPlane {
         };
         let _max_bytes =
             optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
+        let _session_operation = self.reserve(identity, BrowserCapability::Snapshot).await?;
         let mut state = self.state.lock().await;
         Self::op(
             &mut state,
@@ -1133,7 +1165,6 @@ impl BrowserPlane {
         }
         bounded_string(object, "intent", 0, 512)?;
         let requested_severity = parse_severity(object)?;
-        self.reserve(identity, BrowserCapability::Click).await?;
         if requested_severity.tier < 2 {
             return Err(BrowserError::InvalidRequest {
                 field: "severity".into(),
@@ -1163,6 +1194,7 @@ impl BrowserPlane {
                 });
             }
         }
+        let _session_operation = self.reserve(identity, BrowserCapability::Click).await?;
         let mut state = self.state.lock().await;
         Self::op(
             &mut state,
@@ -1188,6 +1220,9 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, BrowserError> {
         let _ = self.validate_request(args, &[]).await?;
+        let _session_operation = self
+            .reserve(identity, BrowserCapability::Screenshot)
+            .await?;
         let mut state = self.state.lock().await;
         let ended = state
             .contexts
@@ -1243,8 +1278,6 @@ impl BrowserPlane {
         let addressed_height = required_signed_integer(object, "image_height_px")?;
         bounded_string(object, "intent", 0, 512)?;
         let requested_severity = parse_severity(object)?;
-        self.reserve(identity, BrowserCapability::ClickPoint)
-            .await?;
         if requested_severity.tier < 2 {
             return Err(BrowserError::InvalidRequest {
                 field: "severity".into(),
@@ -1302,6 +1335,9 @@ impl BrowserPlane {
             )
             .map_err(map_coordinate_error)?;
         }
+        let _session_operation = self
+            .reserve(identity, BrowserCapability::ClickPoint)
+            .await?;
         let mut state = self.state.lock().await;
         Self::op(
             &mut state,
@@ -1328,6 +1364,7 @@ impl BrowserPlane {
     ) -> Result<Value, BrowserError> {
         let object = self.validate_request(args, &["deadline_ms"]).await?;
         let deadline = optional_integer(object, "deadline_ms", 0, 30_000)?.unwrap_or(30_000);
+        let _session_operation = self.reserve(identity, BrowserCapability::WaitFor).await?;
         let mut state = self.state.lock().await;
         if let Some(events) = state.late_events.get_mut(&identity.conversation_key) {
             if let Some(event) = events.pop_front() {
@@ -1775,6 +1812,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::RefAmbiguous { .. }
         | BrowserError::ElementIntercepted => Outcome::StaleSnapshot,
         BrowserError::NoSession
+        | BrowserError::BrowserLaunchPending
         | BrowserError::Internal { .. }
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }

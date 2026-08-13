@@ -9,8 +9,12 @@
 
 pub mod authorization;
 pub mod browser;
+pub mod browser_config;
 pub mod browser_launch;
 pub mod browser_launch_readiness;
+#[cfg(target_os = "macos")]
+pub mod browser_launch_service;
+pub mod browser_session;
 pub mod browser_type;
 pub mod capability;
 pub mod cdp;
@@ -59,6 +63,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 pub use browser::{handle_tool as handle_browser_tool, BrowserCapability, BrowserPlane};
+pub use browser_config::{BrowserConfig, BrowserConfigError};
 pub use browser_type::{
     browser_type_dispatch_eligible, browser_type_eligibility, browser_type_geometry_eligible,
     browser_type_revalidation_eligible, BrowserTypeAuthorizer, BrowserTypeDriver,
@@ -91,7 +96,6 @@ pub use wire::{build_error_frame, control_flags};
 const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
-const BROWSER_STATUS_TOOL: &str = "browser.status";
 
 pub use computer::platform::{
     CapabilityAdvertisementContext as ComputerCapabilityAdvertisementContext,
@@ -569,7 +573,38 @@ pub fn serialize_manifest_with_computer_plane(
     module_id: &str,
     context: &ComputerCapabilityAdvertisementContext,
 ) -> Value {
-    let manifest = build_manifest_with_computer_plane(module_id, context);
+    serialize_manifest_with_computer_plane_configured(module_id, context, false)
+}
+
+pub fn serialize_manifest_with_browser_configuration(
+    module_id: &str,
+    browser_configured: bool,
+) -> Value {
+    serialize_manifest_with_computer_plane_configured(
+        module_id,
+        &default_computer_context(),
+        browser_configured,
+    )
+}
+
+fn serialize_manifest_with_computer_plane_configured(
+    module_id: &str,
+    context: &ComputerCapabilityAdvertisementContext,
+    browser_configured: bool,
+) -> Value {
+    let mut manifest = build_manifest_with_computer_plane(module_id, context);
+    if browser_configured {
+        let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } =
+            &mut manifest.provides[0]
+        else {
+            return serde_json::to_value(manifest).expect("module manifest serializes");
+        };
+        tools.extend(
+            manifest::browser_control_tools()
+                .into_iter()
+                .filter(|tool| dispatchable_tool_with_browser(&tool.name, true).is_some()),
+        );
+    }
     let mut value = serde_json::to_value(manifest).expect("module manifest serializes");
     value
         .as_object_mut()
@@ -590,24 +625,12 @@ pub fn serialize_manifest_with_computer_plane(
 /// capability that fails as an unknown method, which is indistinguishable from
 /// the module not having it at all -- except that the caller was told otherwise.
 pub fn dispatchable_tool(name: &str) -> Option<&str> {
-    if name == BROWSER_STATUS_TOOL {
-        Some(BROWSER_STATUS_TOOL)
-    } else if browser::BrowserCapability::parse(name).is_some() {
-        // Parsing is not serving. The browser drive capabilities are built as a
-        // state machine with NO CONNECTOR: nothing in this crate opens a socket
-        // to a browser, and `Operation::CdpNavigate` records an intent in a Vec
-        // rather than dispatching one.
-        //
-        // Admitting them here let a caller name one and receive a plausible
-        // success -- `outcome: "ok"` with a `url_final` and a lifecycle event --
-        // for a navigation that never happened. A refusal would have been
-        // recoverable; an affirmative answer about a browser that does not exist
-        // is acted upon.
-        //
-        // They become dispatchable when a connector exists to carry them, and
-        // the manifest is what says so: this module advertises exactly
-        // `browser.status` today.
-        None
+    dispatchable_tool_with_browser(name, false)
+}
+
+fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
+    if browser_configured && browser_session::CONTROL_TOOLS.contains(&name) {
+        Some(name)
     } else if computer_capability::servable(name).is_some() {
         // A computer capability is dispatchable when this module can serve it,
         // which is a property of the code rather than of the host. Whether it is
@@ -755,6 +778,13 @@ impl RouteBindings {
             .ok()
             .and_then(|routes| routes.get(&(channel, epoch)).cloned())
     }
+
+    fn remove(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
+        self.inner
+            .write()
+            .ok()
+            .and_then(|mut routes| routes.remove(&(channel, epoch)))
+    }
 }
 
 /// The binary entry point: read config from env, load the health config
@@ -769,6 +799,7 @@ struct ModuleConfig {
     connection_file_path: PathBuf,
     module_id: String,
     health: HealthConfig,
+    browser: Option<BrowserConfig>,
 }
 
 impl ModuleConfig {
@@ -783,13 +814,14 @@ impl ModuleConfig {
         // rather than silently falling back (Spec A: zero, negative,
         // fractional, non-numeric, and unknown-member values are
         // configuration errors).
-        let health = cerebellum_core::config::load_config_file()
-            .map_err(ModuleError::Config)?
-            .health;
+        let parsed = cerebellum_core::config::load_config_file().map_err(ModuleError::Config)?;
+        let browser =
+            browser_config::load_browser_config_file().map_err(ModuleError::BrowserConfig)?;
         Ok(Self {
             connection_file_path,
             module_id,
-            health,
+            health: parsed.health,
+            browser,
         })
     }
 }
@@ -801,8 +833,37 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let health_state = Arc::new(HealthState::with_config(config.health));
-    let planes = Planes::new(Arc::clone(&health_state));
+    let planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
+    let idle_enforcer = config.browser.clone().map(|browser| {
+        let sessions = planes.sessions.clone();
+        let clock = Arc::clone(&planes.lease_clock);
+        tokio::spawn(async move {
+            let period = Duration::from_millis(
+                browser
+                    .browser_idle_timeout_ms
+                    .min(browser.browser_exit_observation_deadline_ms)
+                    .min(50),
+            );
+            loop {
+                tokio::time::sleep(period).await;
+                let sessions = sessions.clone();
+                let clock = Arc::clone(&clock);
+                let browser = browser.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    sessions.observe_exits_all(&browser);
+                    sessions.expire_all(clock.as_ref(), &browser);
+                })
+                .await;
+            }
+        })
+    });
     let loop_result = module_loop(&mut read_half, tx.clone(), &config, planes.clone()).await;
+    if let Some(enforcer) = idle_enforcer {
+        enforcer.abort();
+    }
+    if let Some(browser) = config.browser.as_ref() {
+        planes.sessions.teardown_all(browser);
+    }
     drop(tx);
 
     let writer_result = writer
@@ -1015,8 +1076,11 @@ async fn send_hello(
             .filter(|value| !value.is_empty()),
     })
     .map_err(ModuleError::Json)?;
-    body["manifest"] =
-        serialize_manifest_with_computer_plane(&config.module_id, &default_computer_context());
+    body["manifest"] = serialize_manifest_with_computer_plane_configured(
+        &config.module_id,
+        &default_computer_context(),
+        config.browser.is_some(),
+    );
     let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -1057,6 +1121,10 @@ pub struct Planes {
     pub health: Arc<HealthState>,
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
+    pub browser_config: Option<BrowserConfig>,
+    pub sessions: browser_session::BrowserSessions,
+    pub lease_clock: Arc<cerebellum_core::clock::SystemClock>,
+    pub launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>>,
     pub management: Arc<ManagementPlane>,
     /// The computer plane or the single typed reason it was withheld.
     ///
@@ -1083,10 +1151,58 @@ pub struct Planes {
 impl Planes {
     /// The set a running module uses.
     pub fn new(health: Arc<HealthState>) -> Self {
+        Self::with_browser_config(
+            health,
+            Some(BrowserConfig {
+                executable_path: None,
+                expected_identity: None,
+                launch_handshake_deadline_ms: 100,
+                termination_grace_period_ms: 100,
+                browser_idle_timeout_ms: 30_000,
+                browser_exit_observation_deadline_ms: 100,
+                navigation_settle_deadline_ms: 100,
+            }),
+        )
+    }
+
+    pub fn with_browser_config(
+        health: Arc<HealthState>,
+        browser_config: Option<BrowserConfig>,
+    ) -> Self {
+        #[cfg(target_os = "macos")]
+        let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
+            browser_config
+                .clone()
+                .filter(|config| {
+                    config
+                        .executable_path
+                        .as_ref()
+                        .is_some_and(|path| path.is_file())
+                })
+                .map(browser_launch_service::ProductionLaunchService::open)
+                .map(|service| {
+                    Arc::new(service) as Arc<dyn browser_session::BrowserSessionLauncher>
+                });
+        #[cfg(not(target_os = "macos"))]
+        let launch_service = None;
+        let sessions = browser_session::BrowserSessions::default();
+        let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
+        let browser = if browser_config.is_some() {
+            Arc::new(BrowserPlane::with_session_gate(
+                sessions.clone(),
+                Arc::clone(&lease_clock),
+            ))
+        } else {
+            Arc::new(BrowserPlane::new())
+        };
         Self {
             health,
             routes: Arc::new(RouteBindings::new()),
-            browser: Arc::new(BrowserPlane::new()),
+            browser,
+            browser_config,
+            sessions,
+            lease_clock,
+            launch_service,
             management: Arc::new(ManagementPlane::new(Arc::new(
                 management::PlatformResolver::new(),
             ))),
@@ -1127,6 +1243,10 @@ impl Clone for Planes {
             health: Arc::clone(&self.health),
             routes: Arc::clone(&self.routes),
             browser: Arc::clone(&self.browser),
+            browser_config: self.browser_config.clone(),
+            sessions: self.sessions.clone(),
+            lease_clock: Arc::clone(&self.lease_clock),
+            launch_service: self.launch_service.clone(),
             management: Arc::clone(&self.management),
             #[cfg(target_os = "macos")]
             computer: self.computer.clone(),
@@ -1181,7 +1301,21 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
-        FrameType::Goodbye => Ok(true),
+        FrameType::Goodbye => {
+            if let Some(facts) = planes
+                .routes
+                .remove(frame.header.channel, frame.header.epoch)
+            {
+                if let Some(config) = planes.browser_config.as_ref() {
+                    planes.sessions.teardown_route(
+                        &facts.identity.conversation_key,
+                        browser_session::BrowserSessionTerminalOutcome::RouteUnbound,
+                        config,
+                    );
+                }
+            }
+            Ok(true)
+        }
         FrameType::Request if frame.header.channel == 0 => {
             handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
             Ok(true)
@@ -1582,7 +1716,7 @@ async fn handle_tool_request(
     // Route admission is completed before decoding capability arguments.
     // Admitted routes may proceed to their handlers; denied routes perform no
     // reservation, context lookup, grant lookup, or CDP work.
-    let known_capability = dispatchable_tool(name);
+    let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some());
     let Some(capability_name) = known_capability else {
         return send_route_error(
             writer,
@@ -1634,8 +1768,12 @@ async fn handle_tool_request(
         .await;
     };
 
-    if name == BROWSER_STATUS_TOOL {
-        let result = handle_browser_status_for_identity(arguments, &accepted_facts.identity);
+    if browser_session::CONTROL_TOOLS.contains(&name) {
+        let result = if accepted_facts.allows_control_operation(name) {
+            handle_browser_control(name, arguments, &accepted_facts, planes).await
+        } else {
+            json!({"outcome": "authorization_denied"})
+        };
         return send_tool_response(writer, ver, channel, epoch, corr, result).await;
     }
 
@@ -1722,9 +1860,158 @@ async fn handle_tool_request(
         return send_tool_response(writer, ver, channel, epoch, corr, result).await;
     }
 
-    let result =
-        browser::handle_tool(browser_plane, &accepted_facts.identity, name, arguments).await;
+    let Some(capability) = browser::BrowserCapability::parse(name) else {
+        let result =
+            browser::handle_tool(browser_plane, &accepted_facts.identity, name, arguments).await;
+        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
+    };
+    let result = browser_plane
+        .dispatch(&accepted_facts.identity, capability, arguments)
+        .await;
     send_tool_response(writer, ver, channel, epoch, corr, result).await
+}
+
+async fn handle_browser_control(
+    name: &str,
+    arguments: &Value,
+    accepted: &AcceptedBindFacts,
+    planes: &Planes,
+) -> Value {
+    let Some(config) = planes.browser_config.as_ref() else {
+        return json!({"outcome": "internal_failure"});
+    };
+    let clock = planes.lease_clock.as_ref();
+    match name {
+        browser_session::BROWSER_STATUS => {
+            if let Some(invalid) = browser_session::validate_empty_object(arguments) {
+                return invalid;
+            }
+            planes.sessions.status(
+                &accepted.identity.conversation_key,
+                clock,
+                std::time::SystemTime::now(),
+            )
+        }
+        browser_session::BROWSER_CLOSE => {
+            let browser_session_id = match browser_session::validate_close(arguments) {
+                Ok(id) => id,
+                Err(invalid) => return invalid,
+            };
+            let result = planes.sessions.close(
+                &accepted.identity.conversation_key,
+                browser_session_id,
+                config,
+            );
+            if result["outcome"] == "closed" {
+                planes.browser.end_context(&accepted.identity, false).await;
+            }
+            result
+        }
+        browser_session::BROWSER_LAUNCH => {
+            if let Some(invalid) = browser_session::validate_empty_object(arguments) {
+                return invalid;
+            }
+            if accepted.identity.profile_disposition == ProfileDisposition::None {
+                return json!({"outcome": "no_profile", "profile_disposition": "none"});
+            }
+            let browser_session_id = match planes
+                .sessions
+                .acquire_launch_slot(&accepted.identity.conversation_key)
+            {
+                browser_session::LaunchSlot::Occupied { browser_session_id } => {
+                    return json!({
+                        "outcome": "browser_session_exists",
+                        "browser_session_id": browser_session_id,
+                    })
+                }
+                browser_session::LaunchSlot::Acquired { browser_session_id } => browser_session_id,
+            };
+            let launch = if let Some(service) = planes.launch_service.clone() {
+                let accepted = accepted.clone();
+                let id = browser_session_id.clone();
+                match tokio::task::spawn_blocking(move || service.launch(&accepted, &id)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(json!({"outcome": "internal_failure"})),
+                }
+            } else if config.executable_path.is_none() {
+                Err(json!({"outcome": "executable_missing"}))
+            } else if let Some(path) = config
+                .executable_path
+                .as_ref()
+                .filter(|path| !path.is_file())
+            {
+                Err(json!({"outcome": "executable_missing", "expected_path": path}))
+            } else {
+                Err(json!({"outcome": "profile_storage_unavailable"}))
+            };
+            match launch {
+                Ok((process, cleanup)) => {
+                    let Some((id, lease, cancelled)) = planes.sessions.establish_ready(
+                        &accepted.identity.conversation_key,
+                        accepted.identity.profile_disposition,
+                        config,
+                        clock,
+                        process,
+                        cleanup,
+                    ) else {
+                        planes
+                            .sessions
+                            .abandon_launch_slot(&accepted.identity.conversation_key);
+                        planes.browser.end_context(&accepted.identity, false).await;
+                        return json!({"outcome": "internal_failure"});
+                    };
+                    if cancelled {
+                        let sessions = planes.sessions.clone();
+                        let route_key = accepted.identity.conversation_key.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            sessions.wait_until_inactive(&route_key)
+                        })
+                        .await;
+                        planes.browser.end_context(&accepted.identity, false).await;
+                        return json!({
+                            "outcome": "launch_cancelled",
+                            "browser_session_id": id,
+                        });
+                    }
+                    if planes
+                        .browser
+                        .open_context(accepted.identity.clone())
+                        .await
+                        .is_err()
+                    {
+                        planes.sessions.teardown_route(
+                            &accepted.identity.conversation_key,
+                            browser_session::BrowserSessionTerminalOutcome::CdpFailure,
+                            config,
+                        );
+                        let terminal = planes.sessions.status(
+                            &accepted.identity.conversation_key,
+                            clock,
+                            std::time::SystemTime::now(),
+                        );
+                        return if terminal["outcome"] == "cleanup_failure" {
+                            terminal
+                        } else {
+                            json!({"outcome": "internal_failure"})
+                        };
+                    }
+                    json!({
+                        "outcome": "launched",
+                        "browser_session_id": id,
+                        "profile_disposition": accepted.identity.profile_disposition.as_str(),
+                        "lease": lease.as_json(clock, std::time::SystemTime::now()),
+                    })
+                }
+                Err(outcome) => {
+                    planes
+                        .sessions
+                        .abandon_launch_slot(&accepted.identity.conversation_key);
+                    outcome
+                }
+            }
+        }
+        _ => json!({"outcome": "internal_failure"}),
+    }
 }
 
 async fn send_invalid_request_response(
@@ -1824,6 +2111,7 @@ pub enum ModuleError {
     Message(String),
     Json(serde_json::Error),
     Config(ConfigError),
+    BrowserConfig(BrowserConfigError),
 }
 
 impl std::fmt::Display for ModuleError {
@@ -1832,6 +2120,7 @@ impl std::fmt::Display for ModuleError {
             Self::Message(m) => write!(f, "{m}"),
             Self::Json(e) => write!(f, "json: {e}"),
             Self::Config(e) => write!(f, "config: {e}"),
+            Self::BrowserConfig(e) => write!(f, "config: {e}"),
         }
     }
 }
@@ -1941,13 +2230,107 @@ fn install_test_bind(route_bindings: &Arc<RouteBindings>, frame: &Frame) {
         AcceptedBindFacts::from_bind(
             &identity,
             Some(subc_protocol::Principal::Direct),
-            None,
+            Some(&json!({
+                "agentProjectId": "test-project",
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["*"],
+                "browserControlOperations": [
+                    "browser.launch",
+                    "browser.status",
+                    "browser.close"
+                ]
+            })),
             None,
             &subc_protocol::RouteTarget::ToolProvider {
                 module_id: "cerebellum".to_string(),
             },
         ),
     );
+}
+
+pub fn install_browser_test_bind(
+    route_bindings: &Arc<RouteBindings>,
+    channel: u16,
+    epoch: u32,
+    browser_control_operations: &[&str],
+) {
+    let identity = subc_protocol::BindIdentity {
+        project_root: PathBuf::from("/test/project"),
+        harness: "test".to_string(),
+        session: "test-session".to_string(),
+    };
+    route_bindings.insert(
+        channel,
+        epoch,
+        AcceptedBindFacts::from_bind(
+            &identity,
+            Some(subc_protocol::Principal::Direct),
+            Some(&json!({
+                "agentProjectId": "test-project",
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["*"],
+                "browserControlOperations": browser_control_operations,
+            })),
+            None,
+            &subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".to_string(),
+            },
+        ),
+    );
+}
+
+pub fn install_browser_compatibility_test_bind(
+    route_bindings: &Arc<RouteBindings>,
+    channel: u16,
+    epoch: u32,
+) {
+    let identity = subc_protocol::BindIdentity {
+        project_root: PathBuf::from("/caller/chosen/project"),
+        harness: "test".to_string(),
+        session: "test-session".to_string(),
+    };
+    route_bindings.insert(
+        channel,
+        epoch,
+        AcceptedBindFacts::from_bind(
+            &identity,
+            Some(subc_protocol::Principal::Direct),
+            Some(&json!({
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["*"],
+                "browserControlOperations": ["browser.launch"],
+            })),
+            None,
+            &subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".to_string(),
+            },
+        ),
+    );
+}
+
+pub async fn handle_frame_for_test(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<bool, ModuleError> {
+    handle_frame(frame, writer, planes).await
+}
+
+pub async fn handle_tool_request_for_test_with_planes(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<(), ModuleError> {
+    install_test_bind(&planes.routes, &frame);
+    handle_tool_request(frame, writer, planes).await
+}
+
+pub async fn handle_tool_request_for_test_with_existing_planes(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<(), ModuleError> {
+    handle_tool_request(frame, writer, planes).await
 }
 
 pub async fn handle_tool_request_for_test(
@@ -2126,6 +2509,10 @@ mod tests {
             health,
             routes,
             browser,
+            browser_config: None,
+            sessions: browser_session::BrowserSessions::default(),
+            lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
+            launch_service: None,
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
@@ -2169,6 +2556,10 @@ mod tests {
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
+            browser_config: None,
+            sessions: browser_session::BrowserSessions::default(),
+            lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
+            launch_service: None,
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
@@ -2239,6 +2630,10 @@ mod tests {
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
+            browser_config: None,
+            sessions: browser_session::BrowserSessions::default(),
+            lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
+            launch_service: None,
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
@@ -2299,6 +2694,10 @@ mod tests {
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
             browser: Arc::new(BrowserPlane::new()),
+            browser_config: None,
+            sessions: browser_session::BrowserSessions::default(),
+            lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
+            launch_service: None,
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
@@ -2357,7 +2756,7 @@ mod tests {
 
     #[test]
     fn browser_status_is_the_single_capability() {
-        assert_eq!(BROWSER_STATUS_TOOL, "browser.status");
+        assert_eq!(browser_session::BROWSER_STATUS, "browser.status");
     }
 
     #[test]

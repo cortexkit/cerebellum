@@ -1579,8 +1579,12 @@ pub struct InvocationToken {
     id: String,
 }
 impl InvocationToken {
-    pub fn for_test(id: impl Into<String>) -> Self {
+    pub(crate) fn from_trusted_invocation(id: impl Into<String>) -> Self {
         Self { id: id.into() }
+    }
+
+    pub fn for_test(id: impl Into<String>) -> Self {
+        Self::from_trusted_invocation(id)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1589,11 +1593,18 @@ pub struct JournalReservationHandle {
     id: String,
 }
 impl JournalReservationHandle {
-    pub fn for_test(invocation: &InvocationToken, id: impl Into<String>) -> Self {
+    pub(crate) fn from_recorded_reservation(
+        invocation: &InvocationToken,
+        id: impl Into<String>,
+    ) -> Self {
         Self {
             invocation_id: invocation.id.clone(),
             id: id.into(),
         }
+    }
+
+    pub fn for_test(invocation: &InvocationToken, id: impl Into<String>) -> Self {
+        Self::from_recorded_reservation(invocation, id)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1603,7 +1614,7 @@ pub struct DispatchCommitmentToken {
     id: String,
 }
 impl DispatchCommitmentToken {
-    pub fn for_test(
+    pub(crate) fn from_durable_commitment(
         invocation: &InvocationToken,
         reservation: &JournalReservationHandle,
         id: impl Into<String>,
@@ -1613,6 +1624,14 @@ impl DispatchCommitmentToken {
             reservation_id: reservation.id.clone(),
             id: id.into(),
         }
+    }
+
+    pub fn for_test(
+        invocation: &InvocationToken,
+        reservation: &JournalReservationHandle,
+        id: impl Into<String>,
+    ) -> Self {
+        Self::from_durable_commitment(invocation, reservation, id)
     }
 }
 

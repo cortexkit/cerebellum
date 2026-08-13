@@ -71,22 +71,19 @@ async fn hello_body_matches_wire_v2_contract() {
     assert_eq!(body["manifest"]["module_id"], MODULE_ID);
     assert_eq!(body["manifest"]["trust_tier"], "first_party");
 
-    // Exactly one application capability: browser.status, execution_mode pure.
-    //
-    // Counted within the tool role rather than across the manifest, because a
-    // management operation is not an application capability: it arranges the
-    // authority under which acting is possible rather than acting. Counting
-    // roles would make this assertion fail on a change that adds no capability
-    // at all.
+    // An absent browser member keeps every browser operation unadvertised. The
+    // tool role remains so independently gated computer capabilities can still
+    // be composed by the production HELLO path.
     let provides = body["manifest"]["provides"].as_array().unwrap();
     let tool_role = provides
         .iter()
         .find(|role| role["role"] == "tool_provider")
         .expect("a tool_provider role");
     let tools = tool_role["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1, "exactly one application capability");
-    assert_eq!(tools[0]["name"], "browser.status");
-    assert_eq!(tools[0]["execution_mode"], "pure");
+    assert!(
+        tools.is_empty(),
+        "absent browser config advertises no browser tool"
+    );
 
     // Control ops are advertised but are NOT application capabilities.
     let control_ops = body["control_ops"].as_array().unwrap();
@@ -95,17 +92,14 @@ async fn hello_body_matches_wire_v2_contract() {
     assert!(control_ops.contains(&json!("health.check")));
 }
 
-/// The manifest advertises exactly one application capability. Standard
-/// wire-v2 health, discovery, and control surfaces are not counted.
+/// The base manifest is the absent-browser configuration path.
 #[tokio::test]
-async fn manifest_advertises_exactly_one_application_capability() {
+async fn manifest_omits_browser_capabilities_without_browser_configuration() {
     let manifest = manifest::build(MODULE_ID);
     let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
         panic!("expected ToolProvider");
     };
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name, "browser.status");
-    assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
+    assert!(tools.is_empty());
 }
 
 /// A first-party route.bind (Direct principal) is acked with a RouteBindAck
@@ -300,8 +294,8 @@ async fn health_check_returns_insulated_report() {
     }
 }
 
-/// browser.status returns a flat result body with `no_session` and a resolved
-/// context (no `{result}` wrapper, no echo of caller-supplied identity).
+/// When no browser session exists, `browser.status` returns only the flat
+/// no-session result and omits profile-related fields from older status responses.
 #[tokio::test]
 async fn browser_status_returns_flat_no_session_result() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
@@ -335,12 +329,7 @@ async fn browser_status_returns_flat_no_session_result() {
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert!(body.get("result").is_none(), "no {{result}} wrapper");
     assert_eq!(body["outcome"], "no_session");
-    assert!(body["context"].is_object(), "context must be resolved");
-    assert_eq!(body["context"]["session_kind_effective"], "primary");
-    assert_eq!(body["context"]["profile_disposition"], "durable");
-    assert_eq!(body["context"]["profile_uuid"], Value::Null);
-    assert_eq!(body["session"], Value::Null);
-    assert_field_set(&body, &["outcome", "context", "session"]);
+    assert_field_set(&body, &["outcome"]);
     assert_ne!(body["outcome"], "ok");
 }
 
@@ -382,11 +371,9 @@ async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     );
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["outcome"], "invalid_request");
-    assert_eq!(body["context"], Value::Null);
-    assert_eq!(body["session"], Value::Null);
     assert_eq!(body["detail"]["field"], "alpha");
     assert_eq!(body["detail"]["reason_code"], "unknown_field");
-    assert_field_set(&body, &["outcome", "context", "session", "detail"]);
+    assert_field_set(&body, &["outcome", "detail"]);
 }
 
 /// The management-surface method/params envelope is not accepted on a tool
@@ -506,9 +493,7 @@ async fn browser_status_top_level_wrong_types_return_response_frames() {
         assert_eq!(body["outcome"], "invalid_request");
         assert_eq!(body["detail"]["field"], "$");
         assert_eq!(body["detail"]["reason_code"], "wrong_type");
-        assert_eq!(body["context"], Value::Null);
-        assert_eq!(body["session"], Value::Null);
-        assert_field_set(&body, &["outcome", "context", "session", "detail"]);
+        assert_field_set(&body, &["outcome", "detail"]);
     }
 }
 
@@ -625,6 +610,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
             "agentProjectId": "pj-accepted",
             "sessionKind": "subagent",
             "effectiveCapabilityScope": ["browser.status"],
+            "browserControlOperations": ["browser.status"],
         })),
     };
     let bind_frame = Frame::build_with_version(
@@ -674,12 +660,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
     let response = rx.recv().await.expect("status response");
     assert_eq!(response.header.ty, FrameType::Response);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body["outcome"], "no_session");
-    assert_eq!(body["context"]["session_kind_effective"], "subagent");
-    assert_eq!(body["context"]["profile_disposition"], "disposable");
-    assert_eq!(body["context"]["profile_name"], "default");
-    assert!(!body.to_string().contains("pj-accepted"));
-    assert!(!body.to_string().contains("conversation-subagent"));
+    assert_eq!(body, json!({"outcome": "no_session"}));
 }
 
 /// A bind with an explicit empty effective scope denies browser.status even
@@ -761,7 +742,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
 /// registration, route binding, and the flat capability response survive the
 /// actual daemon splice without opening a browser.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_daemon_registers_and_serves_browser_status() {
+async fn live_daemon_registers_without_browser_controls_when_config_is_absent() {
     let (mut daemon, connection) = start_live_daemon().await;
     let mut client = connect_client(&connection).await;
 
@@ -798,30 +779,22 @@ async fn live_daemon_registers_and_serves_browser_status() {
     // release gates can enable `computer.wait` without external attestations.
     // Other computer rows remain suppressed because their required compile-time
     // attestations are still unbound.
-    assert_eq!(tools.len(), 2);
-    assert_eq!(tools[0].name, "browser.status");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "computer.wait");
     assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
-    assert_eq!(tools[1].name, "computer.wait");
-    assert_eq!(tools[1].execution_mode, ExecutionMode::Pure);
 
     let route = open_live_route(&mut client, 2).await;
     let invalid_response =
         send_live_tool_request(&mut client, route, 3, json!({"unexpected": true})).await;
-    assert_eq!(invalid_response.header.ty, FrameType::Response);
-    let invalid_body: Value = serde_json::from_slice(&invalid_response.body).unwrap();
-    assert_eq!(invalid_body["outcome"], "invalid_request");
-    assert_eq!(invalid_body["detail"]["field"], "unexpected");
-    assert_eq!(invalid_body["detail"]["reason_code"], "unknown_field");
+    assert_eq!(invalid_response.header.ty, FrameType::Error);
+    let invalid_body: subc_protocol::ErrorBody =
+        serde_json::from_slice(&invalid_response.body).unwrap();
+    assert_eq!(invalid_body.code, "unknown_method");
 
     let response = send_live_tool_request(&mut client, route, 4, json!({})).await;
-    assert_eq!(response.header.ty, FrameType::Response);
-    let body: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body["outcome"], "no_session");
-    assert!(body["context"].is_object());
-    assert_eq!(body["context"]["session_kind_effective"], "primary");
-    assert_eq!(body["context"]["profile_disposition"], "durable");
-    assert_eq!(body["session"], Value::Null);
-    assert!(body.get("result").is_none(), "response body is flat");
+    assert_eq!(response.header.ty, FrameType::Error);
+    let body: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body.code, "unknown_method");
 
     // Close the client before the daemon and module guards are dropped so the
     // daemon can release the route deterministically.
