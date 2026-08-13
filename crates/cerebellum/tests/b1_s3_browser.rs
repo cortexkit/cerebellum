@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
 use cerebellum::browser_session::{
-    BrowserSessions, CleanupStage, LaunchSlot, NavigationDriveError, NavigationWait,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+    BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage, ClickDriveError,
+    LaunchSlot, NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
+    SessionCleanup,
 };
 use cerebellum::cdp::{Attachment, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
@@ -236,6 +237,52 @@ impl OwnedBrowserProcess for SnapshotProcess {
         _: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         Ok(self.observation.clone())
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ClickProcess {
+    result: Result<BrowserClickPosition, ClickDriveError>,
+    input_events: Arc<std::sync::Mutex<Vec<BrowserInputEvent>>>,
+}
+
+impl OwnedBrowserProcess for ClickProcess {
+    fn click(
+        &mut self,
+        _: &str,
+        _: &BackendNodeIdentity,
+        _: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let position = self.result?;
+        for event in [
+            BrowserInputEvent::Press(position),
+            BrowserInputEvent::Release(position),
+        ] {
+            self.input_events.lock().unwrap().push(event);
+            input_dispatched(event);
+        }
+        Ok(position)
     }
 
     fn generation_matches(&self) -> bool {
@@ -720,29 +767,11 @@ async fn same_context_dispatches_serialize_and_different_contexts_do_not() {
     drop(guard_a);
 }
 
-/// A click presses before it releases, and presses nothing before commitment.
-///
-/// The ordering is not implied by the outcome: a release recorded before its
-/// press still reports success, still journals a commitment, and still leaves
-/// the same set of operations behind, so nothing about the returned value can
-/// distinguish it. Only the sequence can.
-///
-/// Both click paths share one actuation helper, so this covers the coordinate
-/// path as well; a change that reordered actuation for one of them would have
-/// to reorder it for both.
-///
-/// The commitment ordering matters for the same reason: an input recorded
-/// before the journal has committed to it is an action the audit trail cannot
-/// account for.
-#[tokio::test]
-async fn a_click_presses_before_it_releases_and_only_after_commitment() {
-    let plane = BrowserPlane::new();
-    let route = identity();
-    plane.open_context(route.clone()).await.unwrap();
+async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> String {
     let reference = SnapshotRef::new("e1", "button", "Save", 0).unwrap();
-    let snapshot_id = plane
+    plane
         .retain_text_snapshot(
-            &route,
+            route,
             SnapshotKind::Ax,
             &[AxRecord {
                 depth: 0,
@@ -754,10 +783,12 @@ async fn a_click_presses_before_it_releases_and_only_after_commitment() {
             None,
             vec![RefRecord {
                 captured: reference,
-                frame_path: vec![],
-                backend_identity: None,
-                raw_role: None,
-                raw_name: None,
+                frame_path: vec!["frame-main".into()],
+                backend_identity: Some(
+                    BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap(),
+                ),
+                raw_role: Some("button".into()),
+                raw_name: Some("Save".into()),
             }],
             4096,
         )
@@ -765,21 +796,53 @@ async fn a_click_presses_before_it_releases_and_only_after_commitment() {
         .unwrap()["snapshot_id"]
         .as_str()
         .unwrap()
-        .to_string();
+        .to_string()
+}
 
-    plane
+fn click_arguments(snapshot_id: &str) -> Value {
+    json!({
+        "ref": "e1",
+        "snapshot_id": snapshot_id,
+        "intent": "click",
+        "severity": {"tier": 2, "credential": false, "financial": false}
+    })
+}
+
+#[tokio::test]
+async fn a_click_presses_before_it_releases_and_only_after_commitment() {
+    let route = identity();
+    let input_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let position = BrowserClickPosition {
+        x_css: 22.0,
+        y_css: 36.0,
+    };
+    let plane = plane_with_process(
+        &route,
+        Box::new(ClickProcess {
+            result: Ok(position),
+            input_events: Arc::clone(&input_events),
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    let snapshot_id = retain_click_snapshot(&plane, &route).await;
+
+    let result = plane
         .dispatch(
             &route,
             BrowserCapability::Click,
-            &json!({
-                "ref": "e1",
-                "snapshot_id": snapshot_id,
-                "intent": "click",
-                "severity": {"tier": 2, "credential": false, "financial": false}
-            }),
+            &click_arguments(&snapshot_id),
         )
         .await;
 
+    assert_eq!(result["outcome"], "ok");
+    assert_eq!(
+        *input_events.lock().unwrap(),
+        vec![
+            BrowserInputEvent::Press(position),
+            BrowserInputEvent::Release(position),
+        ]
+    );
     let operations: Vec<browser::Operation> = plane
         .operation_log()
         .await
@@ -801,5 +864,99 @@ async fn a_click_presses_before_it_releases_and_only_after_commitment() {
         position(browser::Operation::CommitDispatched)
             < position(browser::Operation::CdpInputPress),
         "no input is dispatched before the journal commits to it: {operations:?}"
+    );
+    assert_eq!(
+        plane
+            .text_snapshot_pin_count_for_test(&route, &snapshot_id)
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_click_without_a_resolvable_position_is_named_and_unpinned_without_input() {
+    let route = identity();
+    let input_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plane = plane_with_process(
+        &route,
+        Box::new(ClickProcess {
+            result: Err(ClickDriveError::NoPosition),
+            input_events: Arc::clone(&input_events),
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    let snapshot_id = retain_click_snapshot(&plane, &route).await;
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &click_arguments(&snapshot_id),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "element_intercepted");
+    assert!(input_events.lock().unwrap().is_empty());
+    let operations = plane.operation_log().await;
+    assert!(operations.iter().all(|(_, operation)| !matches!(
+        operation,
+        browser::Operation::CdpInputPress | browser::Operation::CdpInputRelease
+    )));
+    assert_eq!(
+        plane
+            .text_snapshot_pin_count_for_test(&route, &snapshot_id)
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_stale_text_snapshot_refuses_before_any_input_is_dispatched() {
+    let route = identity();
+    let input_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plane = plane_with_process(
+        &route,
+        Box::new(ClickProcess {
+            result: Ok(BrowserClickPosition {
+                x_css: 22.0,
+                y_css: 36.0,
+            }),
+            input_events: Arc::clone(&input_events),
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    let snapshot_id = retain_click_snapshot(&plane, &route).await;
+    plane
+        .replace_document(
+            &route,
+            cerebellum::snapshot_store::DocumentTransition::TopLevelDocumentReplaced,
+        )
+        .await
+        .unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &click_arguments(&snapshot_id),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "stale_snapshot");
+    assert_eq!(result["detail"]["reason_code"], "snapshot_evicted");
+    assert!(input_events.lock().unwrap().is_empty());
+    assert!(plane.operation_log().await.iter().all(|(_, operation)| {
+        !matches!(
+            operation,
+            browser::Operation::CdpInputPress | browser::Operation::CdpInputRelease
+        )
+    }));
+    assert_eq!(
+        plane
+            .text_snapshot_pin_count_for_test(&route, &snapshot_id)
+            .await,
+        0
     );
 }

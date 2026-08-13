@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::browser::navigation::BrowserSnapshotObservation;
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
-use crate::snapshot_store::SnapshotKind;
+use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 use cerebellum_core::clock::{MonoInstant, MonotonicClock};
 use serde_json::{json, Value};
 
@@ -162,6 +162,24 @@ pub enum NavigationWait {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrowserClickPosition {
+    pub x_css: f64,
+    pub y_css: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BrowserInputEvent {
+    Press(BrowserClickPosition),
+    Release(BrowserClickPosition),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickDriveError {
+    NoPosition,
+    Navigation(NavigationDriveError),
+}
+
 pub trait OwnedBrowserProcess: Send {
     /// Drive through the process-owned CDP connection. The default keeps test
     /// and non-production process adapters explicitly non-dispatchable.
@@ -187,6 +205,20 @@ pub trait OwnedBrowserProcess: Send {
         _deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Resolve and click one snapshot-backed DOM identity through the process-owned
+    /// CDP driver. The callback records input only after its frame reaches the pipe.
+    fn click(
+        &mut self,
+        _context_key: &str,
+        _identity: &BackendNodeIdentity,
+        _deadline_ms: u64,
+        _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        Err(ClickDriveError::Navigation(
+            NavigationDriveError::Unavailable,
+        ))
     }
 
     fn generation_matches(&self) -> bool;
@@ -324,6 +356,31 @@ impl OperationGuard {
             .and_then(|session| session.process.as_mut())
             .ok_or(NavigationDriveError::Unavailable)?;
         process.snapshot(context_key, mode, deadline_ms)
+    }
+
+    pub(crate) fn click(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let mut state = self
+            .sessions
+            .inner
+            .0
+            .lock()
+            .map_err(|_| ClickDriveError::Navigation(NavigationDriveError::Unavailable))?;
+        let process = state
+            .routes
+            .get_mut(&self.route_key)
+            .and_then(|route| route.active.as_mut())
+            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
+            .and_then(|session| session.process.as_mut())
+            .ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::Unavailable,
+            ))?;
+        process.click(context_key, identity, deadline_ms, input_dispatched)
     }
 
     fn release(&mut self) {

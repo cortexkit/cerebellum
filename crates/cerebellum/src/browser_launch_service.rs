@@ -26,9 +26,9 @@ use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
 };
 use crate::browser_session::{
-    BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, LaunchedBrowser,
-    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
-    SessionCleanup,
+    BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher, BrowserSessionTerminalOutcome,
+    CleanupStage, ClickDriveError, LaunchedBrowser, NavigationDriveError, NavigationWait,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
 };
 use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
@@ -40,7 +40,7 @@ use crate::profile_custody::{
     ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
     ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
 };
-use crate::snapshot_store::SnapshotKind;
+use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 
 type ProductionLaunchJournal =
     DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage>;
@@ -543,6 +543,21 @@ impl OwnedBrowserProcess for ProductionProcess {
             .as_mut()
             .ok_or(NavigationDriveError::Unavailable)?
             .snapshot(context_key, mode, deadline_ms)
+    }
+
+    fn click(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::Unavailable,
+            ))?
+            .click(context_key, identity, deadline_ms, input_dispatched)
     }
 
     fn generation_matches(&self) -> bool {
