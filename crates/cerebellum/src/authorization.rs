@@ -686,9 +686,18 @@ pub fn target_hazards(
     classification: Option<&NonTypeClassificationRecord>,
 ) -> Result<BTreeSet<HazardClass>, AuthorizationError> {
     match (action, classification) {
-        (Action::Navigate, _) | (Action::ClickPoint, _) => Ok(BTreeSet::new()),
-        (Action::Click, None) => Ok(BTreeSet::from([HazardClass::UnverifiedFormContents])),
-        (Action::Click, Some(record)) => {
+        (Action::Navigate, _) => Ok(BTreeSet::new()),
+        // click_point shares this arm with click deliberately. A coordinate
+        // click hit-tests to a control and can activate the same submit button
+        // a ref click would, so disclosing one and not the other would let a
+        // caller reach a credential-bearing form through the geometry path
+        // using a grant that never named the hazard. `computed_required_severity`
+        // already derives severity identically for both; this keeps disclosure
+        // in step with it.
+        (Action::Click | Action::ClickPoint, None) => {
+            Ok(BTreeSet::from([HazardClass::UnverifiedFormContents]))
+        }
+        (Action::Click | Action::ClickPoint, Some(record)) => {
             record
                 .validate()
                 .map_err(|_| AuthorizationError::SeverityUnclassifiable)?;
@@ -978,6 +987,51 @@ mod tests {
             .unwrap();
         assert_eq!(first.id, "grant-a");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_point_click_discloses_the_same_hazards_as_a_ref_click() {
+        // A coordinate click resolves to a control and can activate the same
+        // submit button a ref click reaches. Disclosure has to follow, or the
+        // geometry path becomes a way to touch a credential-bearing form
+        // holding a grant that never named the hazard.
+        let target = ElementClassificationInput::new(
+            NodeIdentityInput::new("target", "frame", 1),
+            TargetKind::Button,
+        )
+        .associated_control(
+            crate::classification::AssociatedFormControlInput::new(NodeIdentityInput::new(
+                "target", "frame", 2,
+            ))
+            .with_password(true),
+        );
+        let record = classify_click(&NonTypeClassificationInput::new(
+            1,
+            target,
+            "https://example.test",
+        ))
+        .unwrap();
+
+        let by_ref = target_hazards(Action::Click, Some(&record)).unwrap();
+        let by_point = target_hazards(Action::ClickPoint, Some(&record)).unwrap();
+
+        assert!(
+            by_ref.contains(&HazardClass::CredentialFormSubmit),
+            "the fixture no longer classifies as credential-bearing, so this \
+             test cannot detect a disclosure gap: {by_ref:?}"
+        );
+        assert_eq!(
+            by_ref, by_point,
+            "a point click disclosed different hazards than a ref click on the \
+             same classified target"
+        );
+
+        // The same parity where nothing could be classified: unknown is its own
+        // hazard on both paths, never an empty set.
+        assert_eq!(
+            target_hazards(Action::ClickPoint, None).unwrap(),
+            BTreeSet::from([HazardClass::UnverifiedFormContents])
+        );
     }
 
     #[test]
