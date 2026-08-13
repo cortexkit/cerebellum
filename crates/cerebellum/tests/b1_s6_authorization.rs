@@ -213,3 +213,93 @@ fn missing_grant_is_opaque_and_navigation_has_observe_floor() {
 
     let _ = effective_severity;
 }
+
+/// Nothing in production mints an `ActionGrant`, so every authorized browser
+/// action is refused for want of a covering grant.  That is fail-closed and
+/// deliberate: consent for an act-on-world capability must be attributable to a
+/// human decision at a point in time, and no such path exists yet.
+///
+/// This test exists to redden on the day someone builds one, because the grant
+/// that path mints carries a requirement that is invisible from the mint site.
+/// The failure message is the delivery mechanism for it.
+///
+/// The scan skips exactly the brace-balanced extent of each `#[cfg(test)]`
+/// module rather than everything following the marker, because top-level code
+/// placed after a test module is production code and a marker-offset scan reads
+/// it as test code -- a blind spot measured with a mutation, not assumed.
+#[test]
+fn no_production_path_mints_an_action_grant() {
+    let mut wired: Vec<String> = Vec::new();
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            let mut in_test_module = false;
+            let mut depth: i32 = 0;
+            for (index, line) in text.lines().enumerate() {
+                if !in_test_module && line.trim_start().starts_with("#[cfg(test)]") {
+                    in_test_module = true;
+                    depth = 0;
+                    continue;
+                }
+                if in_test_module {
+                    depth += line.matches('{').count() as i32;
+                    depth -= line.matches('}').count() as i32;
+                    if depth <= 0 && line.contains('}') {
+                        in_test_module = false;
+                    }
+                    continue;
+                }
+                for ctor in ["ActionGrant::new", "GrantStore::new"] {
+                    if line.contains(ctor) {
+                        wired.push(format!(
+                            "{}:{} calls {ctor}",
+                            path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                                .unwrap_or(&path)
+                                .display(),
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        wired.is_empty(),
+        "A production path now mints browser action grants:\n  {}\n\n\
+         Before this ships, the minting path must carry the disclosure scope \
+         ruled on 2026-08-13, because the hazard is a property of the TARGET \
+         while the grant is issued AHEAD of the action:\n\
+         \x20 1. The grant carries a SET of disclosed hazard classes, not a \
+         boolean.  `unverified_form_contents` is its own member: a grant \
+         covering `credential_form_submit` must NOT cover a form whose \
+         classification could not be determined.  Unknown is a distinct thing \
+         to consent to.\n\
+         \x20 2. Coverage is subset semantics — the target's classified hazards \
+         must be a subset of the grant's disclosed hazards, evaluated at \
+         dispatch against the pinned snapshot's classification so the existing \
+         TOCTOU revalidation fences it.\n\
+         \x20 3. A dispatch refusal must NAME the missing hazard class.  The \
+         refusal is what triggers re-elicitation, and an error carrying the \
+         fact needed to act keeps that loop one round instead of a guess.\n\
+         \x20 4. Mint-time text renders the hazard set verbatim to the human, so \
+         the wire and the words cannot drift.\n\n\
+         Grants are minted through the same elicitation machinery the computer \
+         plane uses (elicit.rs + AskRegistry), never carried on config or bind: \
+         consent must be attributable to a human decision at a point in time.\n\n\
+         If you are wiring this deliberately and have satisfied the above, \
+         update this test to assert the disclosure scope instead of deleting it.",
+        wired.join("\n  ")
+    );
+}
