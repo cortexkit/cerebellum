@@ -9,6 +9,16 @@
 
 use std::collections::HashMap;
 
+mod holder_lock;
+
+pub use holder_lock::{
+    classify_supervisor_start_time, current_supervisor_generation, FilesystemProfileCustodyJournal,
+    HolderId, KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyClaim,
+    ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey,
+    ProfileCustodyLockError, ProfileCustodyLocks, ProfileCustodyRelease, SupervisorGeneration,
+    SupervisorLiveness, SupervisorLivenessProbe,
+};
+
 /// The caller-visible reason for an unavailable profile-storage operation.
 pub const PROFILE_STORAGE_UNAVAILABLE_REASON: &str = "profile_storage_unavailable";
 /// The caller-visible reason for a durable grant that was not affirmatively
