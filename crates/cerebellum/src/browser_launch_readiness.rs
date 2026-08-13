@@ -306,6 +306,18 @@ pub trait FailedLaunchRollback {
         &mut self,
         failure: &ProfileStartupIndeterminate,
     ) -> Result<(), PlatformLaunchError>;
+
+    /// A failure before readiness can still leave the prepared profile owned by
+    /// the launch operation, even when no child was created. The default does
+    /// nothing for existing adapters; adapters that own a profile must finish its
+    /// rollback.
+    fn rollback_attested(
+        &mut self,
+        failure: &AttestedLaunchError,
+    ) -> Result<(), PlatformLaunchError> {
+        let _ = failure;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +469,10 @@ where
 pub enum AttestedReadinessError {
     AttestedLaunch(AttestedLaunchError),
     Readiness(LaunchReadinessError),
+    CleanupFailed {
+        primary: AttestedLaunchError,
+        stage: ReadinessCleanupStage,
+    },
 }
 
 pub fn launch_attested_to_readiness_with<J, L, IO, C, R>(
@@ -479,13 +495,29 @@ where
     C: HandshakeClock,
     R: FailedLaunchRollback,
 {
-    let released = crate::browser_launch::launch_attested_with_release_clock(
+    let released = match crate::browser_launch::launch_attested_with_release_clock(
         journal,
         launcher,
         request,
         || clock.now(),
-    )
-    .map_err(AttestedReadinessError::AttestedLaunch)?;
+    ) {
+        Ok(released) => released,
+        Err(primary) => {
+            // For these errors, either no child was created, or the child was
+            // already terminated and reaped. If termination or reaping failed,
+            // process ownership remains unresolved, so the profile must not be
+            // mutated.
+            if !matches!(primary, AttestedLaunchError::TerminationOrReapFailed)
+                && rollback.rollback_attested(&primary).is_err()
+            {
+                return Err(AttestedReadinessError::CleanupFailed {
+                    primary,
+                    stage: ReadinessCleanupStage::Rollback,
+                });
+            }
+            return Err(AttestedReadinessError::AttestedLaunch(primary));
+        }
+    };
     complete_pipe_handshake(released, pipe, deadline_ms, clock, rollback)
         .map_err(AttestedReadinessError::Readiness)
 }
@@ -870,6 +902,14 @@ mod tests {
             self.events.push("rollback_completed");
             Ok(())
         }
+
+        fn rollback_attested(
+            &mut self,
+            _failure: &AttestedLaunchError,
+        ) -> Result<(), PlatformLaunchError> {
+            self.events.push("rollback_completed");
+            Ok(())
+        }
     }
 
     fn executable_identity() -> ExecutableIdentity {
@@ -1162,7 +1202,9 @@ mod tests {
         let pipe = FakePipe::new([], events.clone());
         let writes = pipe.writes.clone();
         let mut clock = FakeClock { now: instant() };
-        let mut rollback = RecordingRollback { events };
+        let mut rollback = RecordingRollback {
+            events: events.clone(),
+        };
 
         let outcome = launch_attested_to_readiness_with(
             &mut FailingIntentJournal,
@@ -1183,6 +1225,7 @@ mod tests {
             ))
         ));
         assert!(writes.lock().expect("writes").is_empty());
+        assert_eq!(events.snapshot(), vec!["rollback_completed"]);
     }
 }
 
