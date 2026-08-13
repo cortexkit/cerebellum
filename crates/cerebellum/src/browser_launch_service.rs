@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -14,9 +14,11 @@ use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
 use serde_json::{json, Value};
 
 use crate::browser_launch::{
-    AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome, DurableLaunchJournal,
+    recover_browser_launches, AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome,
+    BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
     ExecutableIdentity, LaunchProfileIdentity, LaunchRouteIdentity, MacOsProcessLauncher,
-    ProfileBoundLaunch,
+    OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
+    OrphanProfileCustodyFailure, ProfileBoundLaunch,
 };
 use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
@@ -30,8 +32,9 @@ use crate::profile::{
     ProfileLifecycle, RegistryConfig, StampedBindContext,
 };
 use crate::profile_custody::{
-    FilesystemProfileCustodyJournal, KernelSupervisorLiveness, ProfileCustodyKey,
-    ProfileCustodyLocks,
+    current_supervisor_generation, FilesystemProfileCustodyJournal, KernelSupervisorLiveness,
+    ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
+    ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
 };
 
 type ProductionLaunchJournal =
@@ -39,16 +42,66 @@ type ProductionLaunchJournal =
 
 type SharedLaunchJournal = Arc<Mutex<Option<ProductionLaunchJournal>>>;
 
+const BROWSER_LAUNCH_RECOVERY_FAILED: &str = "browser_launch_recovery_failed";
+const PROFILE_CUSTODY_DIRECTORY: &str = ".ck-browser-profile-custody";
+
 pub struct ProductionLaunchService {
     config: BrowserConfig,
     journal: SharedLaunchJournal,
+    startup_failure: Option<BrowserLaunchRecoveryFailure>,
 }
 
 impl ProductionLaunchService {
+    /// Open and recover the launch journal before returning a service that can be
+    /// published to request handlers. Keeping recovery synchronous here means no
+    /// caller can obtain the service while an orphan still contends with a fresh
+    /// spawn for the same profile.
     pub fn open(config: BrowserConfig) -> Self {
+        Self::open_with_recovery(config, |config| {
+            let mut startup_failure = None;
+            let journal = match DurableLaunchJournal::open_filesystem(launch_journal_config()) {
+                Ok(mut journal) => {
+                    let mut process = MacOsOrphanProcessControl {
+                        reap_deadline: Duration::from_millis(config.termination_grace_period_ms),
+                    };
+                    let mut custody = ProductionOrphanProfileCustody;
+                    if let Err(failure) =
+                        recover_browser_launches(&mut journal, &mut process, &mut custody)
+                    {
+                        startup_failure = Some(failure);
+                    }
+                    Some(journal)
+                }
+                Err(_) => {
+                    startup_failure = Some(BrowserLaunchRecoveryFailure::JournalOpen);
+                    None
+                }
+            };
+            (journal, startup_failure)
+        })
+    }
+
+    fn require_recovered_startup(&self) -> Result<(), Value> {
+        match self.startup_failure {
+            Some(_) => Err(launch_recovery_refusal()),
+            None => Ok(()),
+        }
+    }
+
+    fn open_with_recovery<F>(config: BrowserConfig, recover: F) -> Self
+    where
+        F: FnOnce(
+            &BrowserConfig,
+        ) -> (
+            Option<ProductionLaunchJournal>,
+            Option<BrowserLaunchRecoveryFailure>,
+        ),
+    {
+        let (journal, startup_failure) = recover(&config);
         Self {
             config,
-            journal: Arc::new(Mutex::new(None)),
+            journal: Arc::new(Mutex::new(journal)),
+            startup_failure,
         }
     }
 
@@ -57,6 +110,7 @@ impl ProductionLaunchService {
         accepted: &AcceptedBindFacts,
         browser_session_id: &str,
     ) -> Result<ReadyProductionBrowser, Value> {
+        self.require_recovered_startup()?;
         let Some(executable) = self.config.executable_path.as_ref() else {
             return Err(json!({"outcome": "executable_missing"}));
         };
@@ -228,17 +282,6 @@ impl ProductionLaunchService {
         let mut journal_guard = self.journal.lock().map_err(|_| {
             cleanup_before_spawn(rollback.clone(), json!({"outcome": "internal_failure"}))
         })?;
-        if journal_guard.is_none() {
-            let opened =
-                DurableLaunchJournal::open_filesystem(cerebellum_core::journal::JournalConfig {
-                    journal_retention_bytes: 16 * 1024 * 1024,
-                    journal_max_entry_bytes: 1024 * 1024,
-                })
-                .map_err(|_| {
-                    cleanup_before_spawn(rollback.clone(), json!({"outcome": "internal_failure"}))
-                })?;
-            *journal_guard = Some(opened);
-        }
         let journal = journal_guard
             .as_mut()
             .ok_or_else(|| json!({"outcome": "internal_failure"}))?;
@@ -278,6 +321,160 @@ impl BrowserSessionLauncher for ProductionLaunchService {
     ) -> Result<LaunchedBrowser, Value> {
         ProductionLaunchService::launch(self, accepted, browser_session_id)
             .map(ReadyProductionBrowser::into_parts)
+    }
+}
+
+fn launch_recovery_refusal() -> Value {
+    json!({
+        "outcome": "internal_failure",
+        "reason_code": BROWSER_LAUNCH_RECOVERY_FAILED,
+    })
+}
+
+fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
+    cerebellum_core::journal::JournalConfig {
+        journal_retention_bytes: 16 * 1024 * 1024,
+        journal_max_entry_bytes: 1024 * 1024,
+    }
+}
+
+struct MacOsOrphanProcessControl {
+    reap_deadline: Duration,
+}
+
+impl MacOsOrphanProcessControl {
+    fn generation_still_matches(generation: BrowserProcessGeneration) -> Result<bool, ()> {
+        match cerebellum_macos::process_start_time(generation.pid) {
+            cerebellum_macos::ProcessStartTime::Started(start_time) => {
+                Ok(start_time == generation.start_time_micros)
+            }
+            cerebellum_macos::ProcessStartTime::NoSuchProcess => Ok(false),
+            cerebellum_macos::ProcessStartTime::NotPermitted
+            | cerebellum_macos::ProcessStartTime::LayoutMismatch
+            | cerebellum_macos::ProcessStartTime::NoStartTime => Err(()),
+        }
+    }
+}
+
+impl OrphanBrowserProcessControl for MacOsOrphanProcessControl {
+    fn observed_start_time_micros(
+        &mut self,
+        pid: u32,
+    ) -> Result<Option<u64>, OrphanProcessControlFailure> {
+        match cerebellum_macos::process_start_time(pid) {
+            cerebellum_macos::ProcessStartTime::Started(start_time) => Ok(Some(start_time)),
+            cerebellum_macos::ProcessStartTime::NoSuchProcess => Ok(None),
+            cerebellum_macos::ProcessStartTime::NotPermitted
+            | cerebellum_macos::ProcessStartTime::LayoutMismatch
+            | cerebellum_macos::ProcessStartTime::NoStartTime => Err(OrphanProcessControlFailure),
+        }
+    }
+
+    fn terminate_and_reap(
+        &mut self,
+        generation: BrowserProcessGeneration,
+    ) -> Result<(), OrphanProcessControlFailure> {
+        // Repeat the generation check immediately before invoking `kill`. The
+        // journal check authorizes this call, while this second read closes the
+        // interval in which the old process could exit and its PID be recycled.
+        if !Self::generation_still_matches(generation).map_err(|_| OrphanProcessControlFailure)? {
+            return Ok(());
+        }
+        let status = std::process::Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(generation.pid.to_string())
+            .status()
+            .map_err(|_| OrphanProcessControlFailure)?;
+        if !status.success()
+            && Self::generation_still_matches(generation)
+                .map_err(|_| OrphanProcessControlFailure)?
+        {
+            return Err(OrphanProcessControlFailure);
+        }
+
+        let deadline = Instant::now() + self.reap_deadline;
+        loop {
+            if !Self::generation_still_matches(generation)
+                .map_err(|_| OrphanProcessControlFailure)?
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(OrphanProcessControlFailure);
+            }
+            // The surviving guardian owns `waitpid` authority. Waiting until the
+            // exact generation disappears observes its reap without pretending a
+            // restarted module can reap a process that is not its child.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+struct ExactRecoveryCustodyJournal {
+    durable: FilesystemProfileCustodyJournal,
+    expected_holder_id: String,
+}
+
+impl ProfileCustodyJournal for ExactRecoveryCustodyJournal {
+    fn record(&mut self, event: &ProfileCustodyEvent) -> io::Result<()> {
+        // A profile key can outlive several launch attempts. Refuse the stale
+        // break before mutation unless the installed lock names the same holder
+        // as the launch journal, so recovery cannot release a later attempt's
+        // lock merely because it selected the same durable profile.
+        if event.kind == ProfileCustodyEventKind::StaleBreak
+            && event.holder_id.as_str() != self.expected_holder_id.as_str()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "profile custody holder differs from launch attestation",
+            ));
+        }
+        self.durable.record(event)
+    }
+}
+
+struct ProductionOrphanProfileCustody;
+
+impl OrphanProfileCustody for ProductionOrphanProfileCustody {
+    fn release(
+        &mut self,
+        intent: &crate::browser_launch::AuthorizedLaunchIntent,
+    ) -> Result<(), OrphanProfileCustodyFailure> {
+        let root = browser_data_root().map_err(|_| OrphanProfileCustodyFailure)?;
+        release_orphan_profile_custody_at(&root, intent).map_err(|_| OrphanProfileCustodyFailure)
+    }
+}
+
+fn release_orphan_profile_custody_at(
+    root: &Path,
+    intent: &crate::browser_launch::AuthorizedLaunchIntent,
+) -> Result<(), ()> {
+    let supervisor = current_supervisor_generation().map_err(|_| ())?;
+    let durable = FilesystemProfileCustodyJournal::open(root.join(PROFILE_CUSTODY_DIRECTORY))
+        .map_err(|_| ())?;
+    let journal = ExactRecoveryCustodyJournal {
+        durable,
+        expected_holder_id: intent.holder_id.clone(),
+    };
+    let mut locks = ProfileCustodyLocks::open(root, supervisor, journal, KernelSupervisorLiveness)
+        .map_err(|_| ())?;
+    let key = match intent.profile.disposition {
+        ProfileDisposition::Durable => ProfileCustodyKey::durable(&intent.route.agent_project_id),
+        ProfileDisposition::Disposable => ProfileCustodyKey::disposable_route(
+            &intent.route.agent_project_id,
+            &intent.route.conversation_key,
+            &intent.launch_attempt_id,
+        ),
+        ProfileDisposition::None => return Err(()),
+    };
+    let temporary_holder = locks.mint_holder().map_err(|_| ())?;
+    let claim = match locks.acquire(key, temporary_holder).map_err(|_| ())? {
+        ProfileCustodyAcquisition::Acquired(claim) => claim,
+        ProfileCustodyAcquisition::ProfileBusy { .. } => return Err(()),
+    };
+    match locks.release_exact(&claim).map_err(|_| ())? {
+        ProfileCustodyRelease::Released => Ok(()),
+        ProfileCustodyRelease::HolderMismatch { .. } | ProfileCustodyRelease::Missing => Err(()),
     }
 }
 
@@ -768,5 +965,194 @@ mod cleanup_ordering_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod orphan_recovery_tests {
+    use super::*;
+    use crate::browser_launch::{
+        AuthorizedLaunchIntent, LaunchProfileIdentity, LaunchRouteIdentity, VerifiedLaunchVector,
+    };
+    use crate::profile_custody::{
+        SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
+    };
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cerebellum-orphan-recovery-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("create test root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct NoLiveSupervisor;
+
+    impl SupervisorLivenessProbe for NoLiveSupervisor {
+        fn observe(&self, _generation: SupervisorGeneration) -> SupervisorLiveness {
+            SupervisorLiveness::NotLive
+        }
+    }
+
+    fn installed_durable_claim(root: &Path) -> AuthorizedLaunchIntent {
+        let old_supervisor = SupervisorGeneration {
+            pid: u32::MAX,
+            start_time: 17,
+        };
+        let journal = FilesystemProfileCustodyJournal::open(root.join(PROFILE_CUSTODY_DIRECTORY))
+            .expect("open custody journal");
+        let mut locks = ProfileCustodyLocks::open(root, old_supervisor, journal, NoLiveSupervisor)
+            .expect("open old custody locks");
+        let holder = locks.mint_holder().expect("mint holder");
+        let claim = match locks
+            .acquire(ProfileCustodyKey::durable("project-1"), holder)
+            .expect("acquire old claim")
+        {
+            ProfileCustodyAcquisition::Acquired(claim) => claim,
+            ProfileCustodyAcquisition::ProfileBusy { .. } => panic!("empty root was busy"),
+        };
+        AuthorizedLaunchIntent {
+            format_version: "ck-browser-launch-attestation/v1".to_string(),
+            launch_attempt_id: "attempt-1".to_string(),
+            holder_id: claim.holder_id().as_str().to_string(),
+            route: LaunchRouteIdentity {
+                principal: "direct:agent".to_string(),
+                conversation_key: "conversation-1".to_string(),
+                agent_project_id: "project-1".to_string(),
+                session_kind: cerebellum_core::identity::SessionKind::Primary,
+            },
+            profile: LaunchProfileIdentity {
+                profile_uuid: "profile-1".to_string(),
+                canonical_profile_path: path_bytes(&root.join("profiles/profile-1")),
+                disposition: ProfileDisposition::Durable,
+            },
+            verified_executable_identity: ExecutableIdentity {
+                signing_identifier: "com.example.browser".to_string(),
+                unique_code_hash: "abc123".to_string(),
+            },
+            launch_vector: VerifiedLaunchVector {
+                executable: b"/Applications/Browser".to_vec(),
+                arguments: Vec::new(),
+                environment: Vec::new(),
+            },
+        }
+    }
+
+    fn test_config() -> BrowserConfig {
+        BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 100,
+        }
+    }
+
+    fn lock_count(root: &Path) -> usize {
+        std::fs::read_dir(root.join(PROFILE_CUSTODY_DIRECTORY))
+            .expect("read custody directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.len() == 69 && name.ends_with(".lock"))
+            })
+            .count()
+    }
+
+    #[test]
+    fn startup_recovery_releases_the_exact_recorded_profile_holder() {
+        let root = TestRoot::new("exact-holder");
+        let intent = installed_durable_claim(&root.0);
+        assert_eq!(lock_count(&root.0), 1);
+
+        let result = release_orphan_profile_custody_at(&root.0, &intent);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(lock_count(&root.0), 0);
+    }
+
+    #[test]
+    fn startup_recovery_never_releases_a_different_profile_holder() {
+        let root = TestRoot::new("different-holder");
+        let mut intent = installed_durable_claim(&root.0);
+        intent.holder_id = "holder-from-another-attempt".to_string();
+        assert_eq!(lock_count(&root.0), 1);
+
+        let result = release_orphan_profile_custody_at(&root.0, &intent);
+
+        assert_eq!(result, Err(()));
+        assert_eq!(lock_count(&root.0), 1);
+    }
+
+    #[test]
+    fn launch_service_is_not_published_while_startup_recovery_is_running() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (service_tx, service_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let service = ProductionLaunchService::open_with_recovery(test_config(), |_| {
+                entered_tx.send(()).expect("announce recovery start");
+                release_rx.recv().expect("finish recovery");
+                (
+                    None,
+                    Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
+                )
+            });
+            service_tx.send(service).expect("publish recovered service");
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup recovery did not begin");
+        assert!(matches!(
+            service_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).expect("release startup recovery");
+        let service = service_rx.recv().expect("receive recovered service");
+        worker.join().expect("join recovery worker");
+        assert_eq!(
+            service.startup_failure,
+            Some(BrowserLaunchRecoveryFailure::JournalTerminalization)
+        );
+    }
+
+    #[test]
+    fn failed_startup_recovery_has_an_exact_named_launch_refusal() {
+        let service = ProductionLaunchService::open_with_recovery(test_config(), |_| {
+            (
+                None,
+                Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
+            )
+        });
+
+        assert_eq!(
+            service.require_recovered_startup(),
+            Err(json!({
+                "outcome": "internal_failure",
+                "reason_code": "browser_launch_recovery_failed",
+            }))
+        );
     }
 }
