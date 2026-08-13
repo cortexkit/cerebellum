@@ -7,6 +7,7 @@
 
 pub mod extraction;
 pub mod geometry;
+pub mod navigation;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -169,7 +170,9 @@ impl BrowserError {
             }
             Self::NavigationPolicyRejected { reason_code } => json!({"reason_code":reason_code}),
             Self::Internal { reason_code } => json!({"reason_code":reason_code.as_str()}),
-            Self::NoSession => json!({"reason_code":"no_session"}),
+            Self::NoSession => {
+                json!({"reason_code":"no_session","reason":"no browser session is open"})
+            }
             Self::BrowserLaunchPending => json!({"reason_code":"browser_launch_pending"}),
             Self::ElementIntercepted => json!({}),
             Self::BrowserCrashed => json!({"reason_code":"browser_crashed"}),
@@ -489,6 +492,7 @@ pub struct BrowserPlane {
     session_gate: Option<(
         crate::browser_session::BrowserSessions,
         Arc<cerebellum_core::clock::SystemClock>,
+        u64,
     )>,
 }
 
@@ -510,9 +514,10 @@ impl BrowserPlane {
     pub fn with_session_gate(
         sessions: crate::browser_session::BrowserSessions,
         clock: Arc<cerebellum_core::clock::SystemClock>,
+        navigation_settle_deadline_ms: u64,
     ) -> Self {
         Self {
-            session_gate: Some((sessions, clock)),
+            session_gate: Some((sessions, clock, navigation_settle_deadline_ms)),
             ..Self::default()
         }
     }
@@ -739,16 +744,22 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         capability: BrowserCapability,
     ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
-        let operation = if let Some((sessions, clock)) = &self.session_gate {
+        let operation = if let Some((sessions, clock, _)) = &self.session_gate {
             match sessions.accept_dispatch(&identity.conversation_key, clock.as_ref()) {
                 crate::browser_session::DispatchAdmission::Accepted(guard) => Some(guard),
                 crate::browser_session::DispatchAdmission::LaunchPending => {
-                    return Err(BrowserError::BrowserLaunchPending)
+                    return if capability == BrowserCapability::Navigate {
+                        Err(BrowserError::NoSession)
+                    } else {
+                        Err(BrowserError::BrowserLaunchPending)
+                    }
                 }
                 crate::browser_session::DispatchAdmission::NoSession => {
                     return Err(BrowserError::NoSession)
                 }
             }
+        } else if capability == BrowserCapability::Navigate {
+            return Err(BrowserError::NoSession);
         } else {
             None
         };
@@ -843,8 +854,13 @@ impl BrowserPlane {
         let url = required_string(object, "url", 1, 4096)?;
         let _intent = bounded_string(object, "intent", 0, 512)?;
         let wait = match object.get("wait") {
-            None => "settle",
-            Some(Value::String(value)) if value == "settle" || value == "none" => value.as_str(),
+            None => crate::browser_session::NavigationWait::Settle,
+            Some(Value::String(value)) if value == "settle" => {
+                crate::browser_session::NavigationWait::Settle
+            }
+            Some(Value::String(value)) if value == "none" => {
+                crate::browser_session::NavigationWait::None
+            }
             Some(Value::String(_)) => {
                 return Err(BrowserError::InvalidRequest {
                     field: "wait".into(),
@@ -926,7 +942,11 @@ impl BrowserPlane {
                 reason_code: "scheme_not_allowed",
             });
         }
-        let _session_operation = self.reserve(identity, BrowserCapability::Navigate).await?;
+        let Some(mut session_operation) =
+            self.reserve(identity, BrowserCapability::Navigate).await?
+        else {
+            return Err(BrowserError::NoSession);
+        };
         self.commit(identity, BrowserCapability::Navigate).await?;
         let tracker = {
             let mut state = self.state.lock().await;
@@ -935,21 +955,11 @@ impl BrowserPlane {
                     .contexts
                     .entry(identity.conversation_key.clone())
                     .or_insert_with(|| ContextState::new(identity.clone()));
-                if context.tracker.url_final.is_some()
-                    && same_document_url(
-                        context.tracker.url_final.as_deref().unwrap_or_default(),
-                        url,
-                    )
-                {
-                    context.tracker.url_final = Some(url.to_string());
-                } else {
-                    let _ = context
-                        .epoch
-                        .replace(DocumentTransition::TopLevelDocumentReplaced);
-                    context.tracker = Tracker::default();
-                    context.tracker.url_final = Some(url.to_string());
-                    context.tracker.token("navigation_started");
-                }
+                let _ = context
+                    .epoch
+                    .replace(DocumentTransition::TopLevelDocumentReplaced);
+                context.tracker = Tracker::default();
+                context.tracker.token("navigation_started");
                 context.tracker.clone()
             };
             Self::op(
@@ -959,13 +969,48 @@ impl BrowserPlane {
             );
             tracker
         };
-        let outcome = if wait == "settle" && !tracker.settled {
+        let deadline_ms = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+            .ok_or(BrowserError::NoSession)?;
+        let route_key = identity.conversation_key.clone();
+        let requested_url = url.to_string();
+        let driven = tokio::task::spawn_blocking(move || {
+            let mut tracker = tracker;
+            let result = session_operation.navigate(
+                &route_key,
+                &requested_url,
+                wait,
+                deadline_ms,
+                &mut tracker,
+            );
+            (session_operation, tracker, result)
+        })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        let (session_operation, tracker, drive_result) = driven;
+        session_operation.finish();
+        {
+            let mut state = self.state.lock().await;
+            let context = state
+                .contexts
+                .get_mut(&identity.conversation_key)
+                .ok_or(BrowserError::NoSession)?;
+            context.tracker = tracker.clone();
+        }
+        drive_result.map_err(map_navigation_drive_error)?;
+
+        let should_settle = wait == crate::browser_session::NavigationWait::Settle;
+        let outcome = if should_settle && !tracker.settled {
             Outcome::InternalError
         } else {
             Outcome::Success
         };
-        self.finalize(identity, BrowserCapability::Navigate, outcome, json!({"outcome":if wait == "settle" && !tracker.settled {"not_settled"} else {"ok"},"url_final":tracker.url_final,"lifecycle":tracker.lifecycle})).await?;
-        if wait == "settle" && !tracker.settled {
+        self.finalize(identity, BrowserCapability::Navigate, outcome, json!({"outcome":if should_settle && !tracker.settled {"not_settled"} else {"ok"},"url_final":tracker.url_final,"lifecycle":tracker.lifecycle})).await?;
+        if should_settle && !tracker.settled {
             return Ok(
                 json!({"outcome":"not_settled","url_final":tracker.url_final,"lifecycle":tracker.lifecycle}),
             );
@@ -1764,9 +1809,6 @@ fn required_signed_integer(object: &Map<String, Value>, field: &str) -> Result<i
     }
     Ok(value as i128)
 }
-fn same_document_url(previous: &str, next: &str) -> bool {
-    previous.split('#').next() == next.split('#').next()
-}
 fn map_authorization_error(error: crate::authorization::AuthorizationError) -> BrowserError {
     match error {
         crate::authorization::AuthorizationError::NoGrant => {
@@ -1836,6 +1878,18 @@ fn map_journal_error(error: JournalError) -> BrowserError {
         reason_code: error.reason_code,
     }
 }
+
+fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveError) -> BrowserError {
+    let reason_code = match error {
+        crate::browser_session::NavigationDriveError::Unavailable
+        | crate::browser_session::NavigationDriveError::ConnectorFailure => {
+            JournalReasonCode::ConnectorFailure
+        }
+        crate::browser_session::NavigationDriveError::CdpFailure => JournalReasonCode::CdpFailure,
+    };
+    BrowserError::Internal { reason_code }
+}
+
 fn map_snapshot_error(error: SnapshotError) -> BrowserError {
     match error {
         SnapshotError::WrongKind => BrowserError::StaleSnapshot {
@@ -1963,7 +2017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_lane_serializes_operation_brackets() {
+    async fn navigation_without_a_session_never_opens_an_operation_bracket() {
         let plane = BrowserPlane::new();
         let identity = identity();
         plane.open_context(identity.clone()).await.unwrap();
@@ -1971,16 +2025,9 @@ mod tests {
         let result = plane
             .dispatch(&identity, BrowserCapability::Navigate, &request)
             .await;
-        assert_eq!(result["outcome"], "ok");
-        let operations = plane.operation_log().await;
-        let commit = operations
-            .iter()
-            .position(|(_, op)| *op == Operation::CommitDispatched)
-            .unwrap();
-        let input = operations
-            .iter()
-            .position(|(_, op)| *op == Operation::CdpInputPress);
-        assert!(input.is_none() || commit < input.unwrap());
+
+        assert_eq!(result["outcome"], "no_session");
+        assert!(plane.operation_log().await.is_empty());
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::browser::navigation::CdpNavigationDriver;
+use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
 use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
 use serde_json::{json, Value};
@@ -25,8 +27,10 @@ use crate::browser_launch_readiness::{
 };
 use crate::browser_session::{
     BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, LaunchedBrowser,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
+    SessionCleanup,
 };
+use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
     BindFacts, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
     ProfileLifecycle, RegistryConfig, StampedBindContext,
@@ -303,6 +307,8 @@ impl ProductionLaunchService {
         Ok(ReadyProductionBrowser {
             process: Some(ready.process),
             pipe: Some(ready.pipe),
+            transport: Some(ready.transport),
+            decoder: Some(ready.decoder),
             cleanup: Some(ProductionSessionCleanup {
                 journal: Arc::clone(&self.journal),
                 launch_attempt_id: browser_session_id.to_string(),
@@ -482,6 +488,8 @@ fn release_orphan_profile_custody_at(
 pub struct ReadyProductionBrowser {
     process: Option<cerebellum_macos::ReleasedChild>,
     pipe: Option<UnixCdpPipe>,
+    transport: Option<CdpTransport>,
+    decoder: Option<CdpFrameDecoder>,
     cleanup: Option<ProductionSessionCleanup>,
 }
 
@@ -490,7 +498,12 @@ impl ReadyProductionBrowser {
         (
             Box::new(ProductionProcess {
                 process: self.process,
-                pipe: self.pipe,
+                driver: Some(CdpNavigationDriver::new(
+                    self.pipe.expect("ready browser owns its CDP pipe"),
+                    self.transport
+                        .expect("ready browser owns its CDP correlator"),
+                    self.decoder.expect("ready browser owns its CDP decoder"),
+                )),
                 reaped: false,
             }),
             Box::new(self.cleanup.expect("ready browser owns profile cleanup")),
@@ -500,11 +513,25 @@ impl ReadyProductionBrowser {
 
 struct ProductionProcess {
     process: Option<cerebellum_macos::ReleasedChild>,
-    pipe: Option<UnixCdpPipe>,
+    driver: Option<CdpNavigationDriver<UnixCdpPipe>>,
     reaped: bool,
 }
 
 impl OwnedBrowserProcess for ProductionProcess {
+    fn navigate(
+        &mut self,
+        context_key: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline_ms: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .navigate(context_key, url, wait, deadline_ms, tracker)
+    }
+
     fn generation_matches(&self) -> bool {
         self.process.as_ref().is_some_and(|process| {
             let generation = process.generation();
@@ -514,23 +541,10 @@ impl OwnedBrowserProcess for ProductionProcess {
     }
 
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
-        use crate::browser_launch_readiness::CdpPipeIo;
-        self.pipe
+        self.driver
             .as_mut()
             .ok_or(ProcessControlFailure)?
-            // A small request id, because Chrome does not act on this command
-            // when the id is near the top of the u64 range: measured against
-            // Chrome 151, an id of 2 exits in under a second while
-            // 18446744073709551614 leaves the browser running indefinitely.
-            // JSON numbers that large do not survive a double, which is what a
-            // JavaScript-derived protocol implementation parses them into.
-            //
-            // This is load-bearing rather than cosmetic. When the graceful
-            // request does nothing, every teardown falls through to force
-            // termination, and a force-killed browser loses the profile writes
-            // it had not yet flushed — on a durable profile, that is the logged
-            // in state this whole path exists to keep.
-            .write_frame(b"{\"id\":2,\"method\":\"Browser.close\"}\0")
+            .request_browser_close()
             .map_err(|_| ProcessControlFailure)
     }
 
