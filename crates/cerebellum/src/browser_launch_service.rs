@@ -545,10 +545,33 @@ impl OwnedBrowserProcess for ProductionProcess {
             .snapshot(context_key, mode, deadline_ms)
     }
 
-    fn click(
+    fn snapshot_classified(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .snapshot_classified(
+                context_key,
+                mode,
+                document_epoch,
+                current_origin,
+                deadline_ms,
+            )
+    }
+
+    fn click_classified(
         &mut self,
         context_key: &str,
         identity: &BackendNodeIdentity,
+        document_epoch: u64,
+        current_origin: &str,
+        expected: Option<&crate::classification::NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickPosition, ClickDriveError> {
@@ -557,7 +580,15 @@ impl OwnedBrowserProcess for ProductionProcess {
             .ok_or(ClickDriveError::Navigation(
                 NavigationDriveError::Unavailable,
             ))?
-            .click(context_key, identity, deadline_ms, input_dispatched)
+            .click_classified(
+                context_key,
+                identity,
+                document_epoch,
+                current_origin,
+                expected,
+                deadline_ms,
+                input_dispatched,
+            )
     }
 
     fn generation_matches(&self) -> bool {

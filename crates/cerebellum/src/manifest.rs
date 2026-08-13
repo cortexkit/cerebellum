@@ -98,13 +98,19 @@ pub fn browser_control_tools() -> Vec<Tool> {
 /// does not find one it could mistake for an action.
 fn management_surface() -> ProviderRole {
     ProviderRole::ManagementSurface {
-        operations: vec![ManagementOperation {
-            name: crate::management::OPEN_TARGET.to_string(),
-            // A query: it reports what authority exists and, when none does,
-            // arranges for the user to be asked. It changes nothing on the
-            // machine it is asked about.
+        operations: [
+            crate::management::OPEN_TARGET,
+            crate::management::OPEN_GRANT,
+        ]
+        .into_iter()
+        .map(|name| ManagementOperation {
+            name: name.to_string(),
+            // Both operations return before a person answers. They report the
+            // pending request and arrange authority without performing the
+            // browser or computer action the authority may later admit.
             kind: ManagementOperationKind::Query,
-        }],
+        })
+        .collect(),
         config_schema: json!({
             "type": "object",
             "properties": {},
@@ -519,7 +525,13 @@ mod tests {
             .iter()
             .map(|operation| operation.name.as_str())
             .collect();
-        assert_eq!(advertised, vec![crate::management::OPEN_TARGET]);
+        assert_eq!(
+            advertised,
+            vec![
+                crate::management::OPEN_TARGET,
+                crate::management::OPEN_GRANT
+            ]
+        );
     }
 
     /// Opening a target is advertised as a query.

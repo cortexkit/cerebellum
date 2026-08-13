@@ -232,6 +232,57 @@ mod tests {
     /// consumer as unresponsive for our own failure, and it would take the whole
     /// deadline to say so.
     #[tokio::test]
+    async fn a_browser_grant_question_that_times_out_mints_nothing() {
+        let management = crate::management::ManagementPlane::new(Arc::new(
+            crate::management::PlatformResolver::new(),
+        ));
+        let question = management
+            .browser_grant_question_for_test(
+                "conversation",
+                vec!["https://example.test".to_string()],
+                vec![crate::authorization::HazardClass::CredentialFormSubmit],
+            )
+            .await;
+        let elicitor = Elicitor::new();
+        let (tx, _rx) = writer();
+
+        let outcome = elicitor
+            .ask(&tx, 7, 1, question.body, Duration::from_millis(10))
+            .await;
+        assert_eq!(outcome, AskOutcome::NoAnswer);
+        management
+            .settle_browser_grant(&question.ask_id, None)
+            .await;
+        assert_eq!(management.browser_grant_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_browser_grant_question_that_is_undeliverable_mints_nothing() {
+        let management = crate::management::ManagementPlane::new(Arc::new(
+            crate::management::PlatformResolver::new(),
+        ));
+        let question = management
+            .browser_grant_question_for_test(
+                "conversation",
+                vec!["https://example.test".to_string()],
+                vec![crate::authorization::HazardClass::UnverifiedFormContents],
+            )
+            .await;
+        let elicitor = Elicitor::new();
+        let (tx, rx) = writer();
+        drop(rx);
+
+        let outcome = elicitor
+            .ask(&tx, 7, 1, question.body, Duration::from_secs(1))
+            .await;
+        assert_eq!(outcome, AskOutcome::Undeliverable);
+        management
+            .settle_browser_grant(&question.ask_id, None)
+            .await;
+        assert_eq!(management.browser_grant_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn a_question_that_cannot_be_sent_is_not_reported_as_silence() {
         let elicitor = Elicitor::new();
         let (tx, rx) = writer();

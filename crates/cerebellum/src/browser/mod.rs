@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::authorization::{AuthorizationRequest, GrantStore, Severity};
+use crate::authorization::{AuthorizationRequest, GrantStore, HazardClass, Severity};
 use crate::coordinate::{
     capture_screenshot, map_pixel_center, CoordinateError, InvalidCoordinatesReason,
     ScreenshotPayload, TransformInputs, ViewportObservation,
@@ -112,6 +112,9 @@ pub enum BrowserError {
     AuthorizationDenied {
         reason: &'static str,
     },
+    HazardNotDisclosed {
+        missing: HazardClass,
+    },
     NavigationPolicyRejected {
         reason_code: &'static str,
     },
@@ -139,7 +142,9 @@ impl BrowserError {
             Self::ElementIntercepted => "element_intercepted",
             Self::InvalidCoordinates { .. } => "invalid_coordinates",
             Self::ImageTooLarge { .. } => "image_too_large",
-            Self::AuthorizationDenied { .. } => "authorization_denied",
+            Self::AuthorizationDenied { .. } | Self::HazardNotDisclosed { .. } => {
+                "authorization_denied"
+            }
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
             Self::NotSettled { .. } => "not_settled",
             Self::BrowserCrashed => "browser_crashed",
@@ -160,6 +165,9 @@ impl BrowserError {
                 bound_bytes,
             } => json!({"encoded_bytes":encoded_bytes,"bound_bytes":bound_bytes}),
             Self::AuthorizationDenied { reason } => json!({"reason":reason}),
+            Self::HazardNotDisclosed { missing } => {
+                json!({"reason":"hazard_not_disclosed","missing_hazard":missing.as_str()})
+            }
             Self::NotSettled {
                 url_final,
                 lifecycle,
@@ -529,6 +537,16 @@ impl BrowserPlane {
     pub fn with_grants_installed(mut self, grants: GrantStore) -> Self {
         self.grants = Arc::new(Mutex::new(grants));
         self
+    }
+
+    pub(crate) fn with_shared_grants(mut self, grants: Arc<Mutex<GrantStore>>) -> Self {
+        self.grants = grants;
+        self
+    }
+
+    #[cfg(test)]
+    pub async fn grant_count_for_test(&self) -> usize {
+        self.grants.lock().await.current_grants().count()
     }
 
     pub fn with_journal(config: journal::JournalConfig) -> Self {
@@ -1055,6 +1073,22 @@ impl BrowserPlane {
         };
         let max_bytes =
             optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
+        let (document_epoch, source_origin) = {
+            let state = self.state.lock().await;
+            let context = state
+                .contexts
+                .get(&identity.conversation_key)
+                .filter(|context| !context.ended)
+                .ok_or(BrowserError::NoSession)?;
+            (
+                context.epoch.value(),
+                context
+                    .tracker
+                    .url_final
+                    .clone()
+                    .unwrap_or_else(|| "null".into()),
+            )
+        };
         let Some(mut session_operation) =
             self.reserve(identity, BrowserCapability::Snapshot).await?
         else {
@@ -1077,7 +1111,13 @@ impl BrowserPlane {
             .ok_or(BrowserError::NoSession)?;
         let route_key = identity.conversation_key.clone();
         let driven = tokio::task::spawn_blocking(move || {
-            let result = session_operation.snapshot(&route_key, kind, deadline_ms);
+            let result = session_operation.snapshot_classified(
+                &route_key,
+                kind,
+                document_epoch,
+                &source_origin,
+                deadline_ms,
+            );
             (session_operation, result)
         })
         .await
@@ -1284,7 +1324,7 @@ impl BrowserPlane {
                 reason_code: "severity_below_floor",
             });
         }
-        let backend_identity = {
+        let (backend_identity, classification, document_epoch, source_origin) = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
@@ -1311,8 +1351,54 @@ impl BrowserPlane {
                 context.snapshots.unpin(snapshot_id);
                 return Err(BrowserError::ElementIntercepted);
             };
-            backend_identity
+            (
+                backend_identity,
+                record.classification.as_deref().cloned(),
+                snapshot.document_epoch,
+                snapshot.source_origin.clone(),
+            )
         };
+
+        let deadline_ms = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms);
+        // Snapshot capture stores either validated form facts or `None` when the
+        // DOM could not be classified. Authorization treats `None` as the distinct
+        // unverified-form hazard. Before mouse input, `click_classified` recomputes
+        // the record and refuses if it differs from this snapshot-time value.
+
+        let authorization = {
+            let grants = self.grants.lock().await;
+            let request = match classification.as_ref() {
+                Some(classification) => AuthorizationRequest::click(
+                    &identity.conversation_key,
+                    requested_severity,
+                    snapshot_id,
+                    &identity.agent_project_id,
+                    classification,
+                ),
+                None => AuthorizationRequest::click_unverified(
+                    &identity.conversation_key,
+                    requested_severity,
+                    snapshot_id,
+                    &identity.agent_project_id,
+                ),
+            };
+            grants.authorize(request).and_then(|decision| {
+                decision
+                    .evaluate_origin_scope(&origin_from_url(&source_origin))
+                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+                grants
+                    .commit(&decision)
+                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+                Ok(decision)
+            })
+        };
+        if let Err(error) = authorization {
+            self.unpin_text_snapshot(identity, snapshot_id).await;
+            return Err(map_authorization_error(error));
+        }
 
         let reservation = self.reserve(identity, BrowserCapability::Click).await;
         let mut session_operation = match reservation {
@@ -1340,17 +1426,15 @@ impl BrowserPlane {
             );
         }
 
-        let Some(deadline_ms) = self
-            .session_gate
-            .as_ref()
-            .map(|(_, _, deadline_ms)| *deadline_ms)
-        else {
+        let Some(deadline_ms) = deadline_ms else {
             session_operation.finish();
             self.unpin_text_snapshot(identity, snapshot_id).await;
             return Err(BrowserError::NoSession);
         };
         let state = Arc::clone(&self.state);
         let route_key = identity.conversation_key.clone();
+        let expected_classification = classification;
+        let origin = source_origin;
         let driven = tokio::task::spawn_blocking(move || {
             let mut input_dispatched = |event| {
                 let operation = match event {
@@ -1362,9 +1446,12 @@ impl BrowserPlane {
                 let mut state = state.blocking_lock();
                 Self::op(&mut state, &route_key, operation);
             };
-            let result = session_operation.click(
+            let result = session_operation.click_classified(
                 &route_key,
                 &backend_identity,
+                document_epoch,
+                &origin,
+                expected_classification.as_ref(),
                 deadline_ms,
                 &mut input_dispatched,
             );
@@ -1394,6 +1481,18 @@ impl BrowserPlane {
                 )
                 .await?;
                 return Err(BrowserError::ElementIntercepted);
+            }
+            Err(crate::browser_session::ClickDriveError::ClassificationChanged) => {
+                self.finalize(
+                    identity,
+                    BrowserCapability::Click,
+                    Outcome::StaleSnapshot,
+                    json!({"reason_code":"classification_changed"}),
+                )
+                .await?;
+                return Err(BrowserError::StaleSnapshot {
+                    reason_code: "classification_changed",
+                });
             }
             Err(crate::browser_session::ClickDriveError::Navigation(error)) => {
                 return Err(map_navigation_drive_error(error));
@@ -1964,6 +2063,9 @@ fn map_authorization_error(error: crate::authorization::AuthorizationError) -> B
         crate::authorization::AuthorizationError::NoGrant => {
             BrowserError::AuthorizationDenied { reason: "no_grant" }
         }
+        crate::authorization::AuthorizationError::HazardNotDisclosed(missing) => {
+            BrowserError::HazardNotDisclosed { missing }
+        }
         crate::authorization::AuthorizationError::SeverityBelowFloor => {
             BrowserError::InvalidRequest {
                 field: "severity".into(),
@@ -1998,7 +2100,9 @@ fn origin_from_url(url: &str) -> String {
 fn journal_outcome(error: &BrowserError) -> Outcome {
     match error {
         BrowserError::InvalidRequest { .. } => Outcome::InvalidRequest,
-        BrowserError::AuthorizationDenied { .. } => Outcome::Denied,
+        BrowserError::AuthorizationDenied { .. } | BrowserError::HazardNotDisclosed { .. } => {
+            Outcome::Denied
+        }
         BrowserError::StaleSnapshot { .. }
         | BrowserError::RefNotFound { .. }
         | BrowserError::RefAmbiguous { .. }

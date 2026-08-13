@@ -126,6 +126,9 @@ pub struct RefRecord {
     pub backend_identity: Option<BackendNodeIdentity>,
     pub raw_role: Option<String>,
     pub raw_name: Option<String>,
+    /// Form facts captured from the same document epoch as this reference.
+    /// Absence is an unknown classification, not an assertion that no hazard exists.
+    pub classification: Option<Box<crate::classification::NonTypeClassificationRecord>>,
 }
 
 impl RefRecord {
@@ -156,7 +159,7 @@ pub struct RefCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefResolution {
-    Resolved(RefRecord),
+    Resolved(Box<RefRecord>),
     NotFound,
     Ambiguous { candidate_count: usize },
 }
@@ -473,7 +476,7 @@ impl BrowserSnapshotStore {
                 .filter(|candidate| candidate.identity.as_ref() == Some(identity))
                 .collect::<Vec<_>>();
             if matches.len() == 1 {
-                return Ok(RefResolution::Resolved(captured.clone()));
+                return Ok(RefResolution::Resolved(Box::new(captured.clone())));
             }
             if matches.len() > 1 {
                 return Ok(RefResolution::Ambiguous {
@@ -508,7 +511,7 @@ impl BrowserSnapshotStore {
         }
         let selected = candidates.get(captured.captured.nth as usize);
         Ok(selected
-            .map(|_| RefResolution::Resolved(captured.clone()))
+            .map(|_| RefResolution::Resolved(Box::new(captured.clone())))
             .unwrap_or(RefResolution::NotFound))
     }
 
@@ -774,6 +777,7 @@ mod tests {
                     backend_identity: None,
                     raw_role: None,
                     raw_name: None,
+                    classification: None,
                 }],
             })
             .unwrap();
@@ -797,7 +801,7 @@ mod tests {
             store
                 .resolve_ref(&snapshot_id, "e1", 0, &candidates)
                 .unwrap(),
-            RefResolution::Resolved(store.records[&snapshot_id].refs["e1"].clone())
+            RefResolution::Resolved(Box::new(store.records[&snapshot_id].refs["e1"].clone(),))
         );
         let mut ambiguous = candidates.clone();
         ambiguous[1].traversal_index = 0;

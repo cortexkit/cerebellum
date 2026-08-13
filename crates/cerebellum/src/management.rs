@@ -16,6 +16,7 @@
 //! this operation and the application it needs, so forgetting costs one round
 //! trip and teaches.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,8 +26,15 @@ use cerebellum_core::consent::{ActionKind, ConsentLeases, GrantKind, LeaseKey, O
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-/// The one operation this surface serves.
+use crate::authorization::{
+    ActionGrant, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE,
+};
+use crate::classification::canonical_origin;
+
+/// The computer-target operation this surface serves.
 pub const OPEN_TARGET: &str = "computer.open_target";
+/// Ask a person to issue a hazard-scoped browser action grant.
+pub const OPEN_GRANT: &str = "browser.open_grant";
 
 /// Read an action kind from its wire spelling.
 ///
@@ -118,6 +126,16 @@ impl TargetResolver for PlatformResolver {
 pub struct ManagementPlane {
     leases: Mutex<ConsentLeases>,
     resolver: Arc<dyn TargetResolver>,
+    browser_grants: Arc<Mutex<GrantStore>>,
+    pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingBrowserGrant {
+    conversation_key: String,
+    authorized_origins: Vec<String>,
+    disclosed_hazards: BTreeSet<HazardClass>,
+    severity: Severity,
 }
 
 impl ManagementPlane {
@@ -125,7 +143,136 @@ impl ManagementPlane {
         Self {
             leases: Mutex::new(ConsentLeases::new()),
             resolver,
+            browser_grants: Arc::new(Mutex::new(GrantStore::default())),
+            pending_browser_grants: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn browser_grants(&self) -> Arc<Mutex<GrantStore>> {
+        Arc::clone(&self.browser_grants)
+    }
+
+    /// Prepare an attributed browser grant question without waiting for a person.
+    pub async fn open_browser_grant(
+        &self,
+        conversation_key: &str,
+        origins: Vec<String>,
+        hazards: Vec<HazardClass>,
+        can_relay_to_a_person: bool,
+    ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
+        if conversation_key.is_empty()
+            || origins.is_empty()
+            || origins.len() > crate::authorization::MAX_ORIGINS
+        {
+            return Err(BrowserGrantRequestError::InvalidOrigins);
+        }
+        let mut seen_origins = HashSet::new();
+        let mut authorized_origins = Vec::with_capacity(origins.len());
+        for origin in origins {
+            let canonical =
+                canonical_origin(&origin).ok_or(BrowserGrantRequestError::InvalidOrigins)?;
+            if canonical != origin || !seen_origins.insert(canonical.clone()) {
+                return Err(BrowserGrantRequestError::InvalidOrigins);
+            }
+            authorized_origins.push(canonical);
+        }
+        let mut disclosed_hazards = BTreeSet::new();
+        let mut disclosed_hazards_wire = Vec::with_capacity(hazards.len());
+        for hazard in hazards {
+            if !disclosed_hazards.insert(hazard) {
+                return Err(BrowserGrantRequestError::InvalidHazards);
+            }
+            disclosed_hazards_wire.push(hazard.as_str().to_string());
+        }
+        let severity = browser_grant_severity(&disclosed_hazards);
+        let severity_value = browser_grant_severity_value(severity);
+
+        if !can_relay_to_a_person {
+            return Ok((
+                json!({
+                    "outcome": "consent_unavailable",
+                    "origins": authorized_origins,
+                    "hazards": disclosed_hazards_wire,
+                    "severity_ceiling": severity_value,
+                    "remedy": "reconnect declaring the ability to relay a question to a person",
+                }),
+                None,
+            ));
+        }
+
+        let ask_id = new_browser_grant_ask_id();
+        let pending = PendingBrowserGrant {
+            conversation_key: conversation_key.to_string(),
+            authorized_origins: authorized_origins.clone(),
+            disclosed_hazards,
+            severity,
+        };
+        self.pending_browser_grants
+            .lock()
+            .await
+            .insert(ask_id.clone(), pending);
+        let question = Question {
+            ask_id: ask_id.clone(),
+            body: browser_grant_question(
+                &ask_id,
+                &authorized_origins,
+                &disclosed_hazards_wire,
+                severity,
+            ),
+            deadline: CONSENT_DEADLINE,
+        };
+        Ok((
+            json!({
+                "outcome": "consent_pending",
+                "ask_id": ask_id,
+                "origins": authorized_origins,
+                "hazards": disclosed_hazards_wire,
+                "severity_ceiling": severity_value,
+                "remedy": "retry the browser action after the request has been answered",
+            }),
+            Some(question),
+        ))
+    }
+
+    /// Apply exactly one human answer to the browser scope recorded at ask time.
+    pub async fn settle_browser_grant(&self, ask_id: &str, answer: Option<&Value>) -> bool {
+        let Some(pending) = self.pending_browser_grants.lock().await.remove(ask_id) else {
+            return false;
+        };
+        if answer
+            .and_then(|body| body.get("decision"))
+            .and_then(Value::as_str)
+            != Some("allow")
+        {
+            return true;
+        }
+
+        let grant = ActionGrant::new(
+            format!("grant-{ask_id}"),
+            1,
+            pending.conversation_key,
+            pending.severity,
+            pending.authorized_origins,
+        )
+        .with_disclosed_hazards(pending.disclosed_hazards);
+        self.browser_grants.lock().await.replace(grant).is_ok()
+    }
+
+    pub async fn browser_grant_question_for_test(
+        &self,
+        conversation_key: &str,
+        origins: Vec<String>,
+        hazards: Vec<HazardClass>,
+    ) -> Question {
+        let (_, question) = self
+            .open_browser_grant(conversation_key, origins, hazards, true)
+            .await
+            .expect("test browser grant scope is valid");
+        question.expect("an elicitable browser grant produces a question")
+    }
+
+    pub async fn browser_grant_count(&self) -> usize {
+        self.browser_grants.lock().await.current_grants().count()
     }
 
     /// Resolve an application name and report what authority exists over it.
@@ -300,6 +447,79 @@ impl ManagementPlane {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserGrantRequestError {
+    InvalidOrigins,
+    InvalidHazards,
+}
+
+fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
+    if hazards.is_empty() {
+        Severity::new(COMPOSE, false, false)
+    } else {
+        Severity::new(
+            MUTATE_DURABLE,
+            hazards.contains(&HazardClass::CredentialFormSubmit)
+                || hazards.contains(&HazardClass::UnverifiedFormContents),
+            hazards.contains(&HazardClass::FinancialFormSubmit)
+                || hazards.contains(&HazardClass::UnverifiedFormContents),
+        )
+    }
+}
+
+fn browser_grant_severity_value(severity: Severity) -> Value {
+    json!({
+        "tier": severity.tier,
+        "name": if severity.tier == COMPOSE { "compose" } else { "mutate_durable" },
+        "credential": severity.credential,
+        "financial": severity.financial,
+    })
+}
+
+fn browser_grant_question(
+    ask_id: &str,
+    origins: &[String],
+    hazards: &[String],
+    severity: Severity,
+) -> Value {
+    let origins_text = origins.join(", ");
+    let hazards_text = hazards.join(", ");
+    let severity_value = browser_grant_severity_value(severity);
+    json!({
+        "jsonrpc": "2.0",
+        "id": ask_id,
+        "method": "elicitation/create",
+        "params": {
+            "message": format!(
+                "Allow this agent to perform browser actions on origins [{origins_text}]? \
+                 Disclosed hazard classes: [{hazards_text}]. Severity ceiling: {} (tier {}; \
+                 credential={}; financial={}).",
+                severity_value["name"].as_str().unwrap_or_default(),
+                severity.tier,
+                severity.credential,
+                severity.financial,
+            ),
+            // These values are the exact scope that an affirmative answer mints.
+            // Keeping them beside the prose lets a relay render structured scope
+            // without translating or reconstructing the grant.
+            "origins": origins,
+            "hazards": hazards,
+            "severity_ceiling": severity_value,
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["allow", "deny"],
+                    }
+                },
+                "required": ["decision"],
+                "additionalProperties": false,
+            },
+        },
+    })
+}
+
 /// A question to put to the user, and how long it stays one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Question {
@@ -456,6 +676,15 @@ fn describe(candidates: &[TargetCandidate]) -> Vec<Value> {
 }
 
 /// A fresh identity for a question, unique across this module's lifetime.
+fn new_browser_grant_ask_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "browser-grant-consent-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed) + 1
+    )
+}
+
 fn new_ask_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -498,6 +727,104 @@ mod tests {
                 clock,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn browser_grant_question_renders_and_mints_the_exact_disclosed_scope() {
+        let plane = plane(TargetResolution::NotRunning);
+        let (reply, question) = plane
+            .open_browser_grant(
+                "conversation",
+                vec![
+                    "https://login.example".to_string(),
+                    "https://pay.example".to_string(),
+                ],
+                vec![
+                    HazardClass::CredentialFormSubmit,
+                    HazardClass::FinancialFormSubmit,
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let question = question.unwrap();
+        assert_eq!(reply["outcome"], "consent_pending");
+        assert_eq!(question.body["params"]["origins"], reply["origins"]);
+        assert_eq!(question.body["params"]["hazards"], reply["hazards"]);
+        assert_eq!(
+            question.body["params"]["severity_ceiling"],
+            reply["severity_ceiling"]
+        );
+        let message = question.body["params"]["message"].as_str().unwrap();
+        for scope in [
+            "https://login.example",
+            "https://pay.example",
+            "credential_form_submit",
+            "financial_form_submit",
+            "mutate_durable",
+        ] {
+            assert!(
+                message.contains(scope),
+                "question omitted {scope}: {message}"
+            );
+        }
+
+        assert!(
+            plane
+                .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+                .await
+        );
+        let grants = plane.browser_grants.lock().await;
+        let grant = grants.current_grants().next().unwrap();
+        assert_eq!(
+            grant.authorized_origins,
+            vec!["https://login.example", "https://pay.example",]
+        );
+        assert_eq!(
+            grant.disclosed_hazards,
+            BTreeSet::from([
+                HazardClass::CredentialFormSubmit,
+                HazardClass::FinancialFormSubmit,
+            ])
+        );
+        assert_eq!(grant.severity, Severity::new(MUTATE_DURABLE, true, true));
+    }
+
+    #[tokio::test]
+    async fn browser_grant_refusal_and_no_relay_each_leave_the_store_empty() {
+        let plane = plane(TargetResolution::NotRunning);
+        let (reply, question) = plane
+            .open_browser_grant(
+                "conversation",
+                vec!["https://example.test".to_string()],
+                vec![HazardClass::CredentialFormSubmit],
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["outcome"], "consent_pending");
+        assert!(
+            plane
+                .settle_browser_grant(
+                    &question.unwrap().ask_id,
+                    Some(&json!({"decision": "deny"}))
+                )
+                .await
+        );
+        assert_eq!(plane.browser_grant_count().await, 0);
+
+        let (unavailable, question) = plane
+            .open_browser_grant(
+                "conversation",
+                vec!["https://example.test".to_string()],
+                vec![HazardClass::UnverifiedFormContents],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable["outcome"], "consent_unavailable");
+        assert!(question.is_none());
+        assert_eq!(plane.browser_grant_count().await, 0);
     }
 
     /// An unleased application asks, and hands back the question to put.

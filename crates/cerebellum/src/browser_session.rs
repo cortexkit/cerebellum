@@ -177,6 +177,7 @@ pub enum BrowserInputEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickDriveError {
     NoPosition,
+    ClassificationChanged,
     Navigation(NavigationDriveError),
 }
 
@@ -207,6 +208,18 @@ pub trait OwnedBrowserProcess: Send {
         Err(NavigationDriveError::Unavailable)
     }
 
+    /// Capture form classifications with refs from the same document epoch.
+    fn snapshot_classified(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        _document_epoch: u64,
+        _current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.snapshot(context_key, mode, deadline_ms)
+    }
+
     /// Resolve and click one snapshot-backed DOM identity through the process-owned
     /// CDP driver. The callback records input only after its frame reaches the pipe.
     fn click(
@@ -219,6 +232,23 @@ pub trait OwnedBrowserProcess: Send {
         Err(ClickDriveError::Navigation(
             NavigationDriveError::Unavailable,
         ))
+    }
+
+    /// Reclassify immediately before input and require the pinned classification
+    /// to still describe the target. A process adapter that cannot perform that
+    /// check must refuse rather than inherit the earlier authorization.
+    #[allow(clippy::too_many_arguments)]
+    fn click_classified(
+        &mut self,
+        _context_key: &str,
+        _identity: &BackendNodeIdentity,
+        _document_epoch: u64,
+        _current_origin: &str,
+        _expected: Option<&crate::classification::NonTypeClassificationRecord>,
+        _deadline_ms: u64,
+        _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        Err(ClickDriveError::ClassificationChanged)
     }
 
     fn generation_matches(&self) -> bool;
@@ -336,10 +366,12 @@ impl OperationGuard {
         process.navigate(context_key, url, wait, deadline_ms, tracker)
     }
 
-    pub(crate) fn snapshot(
+    pub(crate) fn snapshot_classified(
         &mut self,
         context_key: &str,
         mode: SnapshotKind,
+        document_epoch: u64,
+        current_origin: &str,
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         let mut state = self
@@ -355,13 +387,23 @@ impl OperationGuard {
             .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
             .and_then(|session| session.process.as_mut())
             .ok_or(NavigationDriveError::Unavailable)?;
-        process.snapshot(context_key, mode, deadline_ms)
+        process.snapshot_classified(
+            context_key,
+            mode,
+            document_epoch,
+            current_origin,
+            deadline_ms,
+        )
     }
 
-    pub(crate) fn click(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn click_classified(
         &mut self,
         context_key: &str,
         identity: &BackendNodeIdentity,
+        document_epoch: u64,
+        current_origin: &str,
+        expected: Option<&crate::classification::NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickPosition, ClickDriveError> {
@@ -380,7 +422,15 @@ impl OperationGuard {
             .ok_or(ClickDriveError::Navigation(
                 NavigationDriveError::Unavailable,
             ))?;
-        process.click(context_key, identity, deadline_ms, input_dispatched)
+        process.click_classified(
+            context_key,
+            identity,
+            document_epoch,
+            current_origin,
+            expected,
+            deadline_ms,
+            input_dispatched,
+        )
     }
 
     fn release(&mut self) {
