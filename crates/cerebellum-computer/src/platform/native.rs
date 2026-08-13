@@ -119,22 +119,21 @@ pub fn grant_for_pid(pid: u32, timeout: Duration) -> Option<ProcessGrant> {
 /// platform-neutral and therefore built and tested on every host. This half only
 /// supplies the readings, and it is the half no continuous build compiles.
 pub fn resolve_target(bundle_identity: &str, timeout: Duration) -> TargetResolution {
-    let Ok(windows) = cerebellum_macos::enumerate_windows(timeout) else {
-        // Nothing was seen, so nothing can be said — neither how many instances
-        // exist nor whether any do. Reported as unreadable rather than as not
-        // running, because the second is a claim about the world that this
-        // reading cannot support: a transient window-server failure arrives
-        // here indistinguishable from a permission denial, and calling either
-        // one "not running" tells someone to start an application that may
-        // already be in front of them.
-        return TargetResolution::Unreadable;
-    };
-    let owners: Vec<(u32, String)> = windows
-        .into_iter()
-        .map(|window| (window.owner_pid, window.owner_bundle_identifier))
-        .collect();
+    // A failed reading is passed through as absence rather than converted here,
+    // so the decision that a silent window server is not the same as an absent
+    // application lives in the platform-neutral half that every host tests. This
+    // half only supplies the reading.
+    let owners: Option<Vec<(u32, String)>> =
+        cerebellum_macos::enumerate_windows(timeout)
+            .ok()
+            .map(|windows| {
+                windows
+                    .into_iter()
+                    .map(|window| (window.owner_pid, window.owner_bundle_identifier))
+                    .collect()
+            });
 
-    TargetResolution::decide(bundle_identity, &owners, |pid| {
+    TargetResolution::decide(bundle_identity, owners.as_deref(), |pid| {
         cerebellum_macos::process_start_time_micros(pid).map(|micros| micros.to_string())
     })
 }

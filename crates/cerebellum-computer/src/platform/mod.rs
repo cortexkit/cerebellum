@@ -250,9 +250,18 @@ impl TargetResolution {
     /// ambiguous and not-running paths cost nothing.
     pub fn decide<F: FnOnce(u32) -> Option<String>>(
         bundle_identity: &str,
-        windows: &[(u32, String)],
+        windows: Option<&[(u32, String)]>,
         read_generation: F,
     ) -> Self {
+        // The reading arrives as an Option rather than a slice so that the
+        // difference between "the window server said there are no windows" and
+        // "the window server did not answer" is decided here, in the half that
+        // every host compiles and tests, rather than at the platform call site
+        // that only macOS builds. Those two are one keystroke apart and mean
+        // opposite things to whoever receives the answer.
+        let Some(windows) = windows else {
+            return Self::Unreadable;
+        };
         let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
         for (pid, identity) in windows {
             if identity == bundle_identity {
@@ -605,7 +614,7 @@ mod target_resolution_tests {
     /// without it, resolution could refuse everything and they would all pass.
     #[test]
     fn a_single_instance_resolves() {
-        let resolution = TargetResolution::decide("com.apple.Safari", &windows(), generation);
+        let resolution = TargetResolution::decide("com.apple.Safari", Some(&windows()), generation);
         let TargetResolution::Resolved(grant) = resolution else {
             panic!("one instance must resolve, got {resolution:?}");
         };
@@ -624,7 +633,7 @@ mod target_resolution_tests {
         let mut many = windows();
         many.push((101, "com.apple.Safari".to_string()));
 
-        let resolution = TargetResolution::decide("com.apple.Safari", &many, |_| {
+        let resolution = TargetResolution::decide("com.apple.Safari", Some(&many), |_| {
             panic!("identity evidence was read for a target that cannot be served")
         });
         let TargetResolution::Ambiguous(candidates) = resolution else {
@@ -647,7 +656,7 @@ mod target_resolution_tests {
     #[test]
     fn an_identity_nothing_answers_to_is_not_running() {
         assert_eq!(
-            TargetResolution::decide("com.example.Absent", &windows(), generation),
+            TargetResolution::decide("com.example.Absent", Some(&windows()), generation),
             TargetResolution::NotRunning
         );
     }
@@ -661,15 +670,55 @@ mod target_resolution_tests {
     #[test]
     fn an_instance_without_generation_evidence_does_not_resolve() {
         assert_eq!(
-            TargetResolution::decide("com.apple.Safari", &windows(), |_| None),
+            TargetResolution::decide("com.apple.Safari", Some(&windows()), |_| None),
             TargetResolution::NotRunning
         );
+    }
+
+    /// A window list that could not be read is not the application being absent.
+    ///
+    /// The two answers send a person in opposite directions: absence is answered
+    /// by starting the application, while an unreadable list says nothing about
+    /// whether it is running at all. They are one keystroke apart at the call
+    /// site, which is why the distinction is decided here rather than in the
+    /// platform half that only one operating system compiles.
+    ///
+    /// Measured, not hypothetical: under concurrent load the screen-capture
+    /// permission query reported permitted while enumeration failed in the same
+    /// instant with a declined-permission error. Calling that "not running"
+    /// tells someone to start a second copy of an application already in front
+    /// of them, and the second copy then makes the target ambiguous.
+    #[test]
+    fn an_unread_window_list_is_unreadable_and_never_not_running() {
+        let resolution = TargetResolution::decide("com.apple.Safari", None, |_| {
+            panic!("a generation was read for a target nothing could see")
+        });
+
+        assert_eq!(resolution, TargetResolution::Unreadable);
+        assert_ne!(
+            resolution,
+            TargetResolution::NotRunning,
+            "an unreadable window list claimed the application is absent"
+        );
+    }
+
+    /// An EMPTY window list, by contrast, is a real reading: the window server
+    /// answered and nothing matched. This is the companion the previous test
+    /// needs, because a decide that returned Unreadable for both would satisfy
+    /// it while destroying the ability to say an application is not running.
+    #[test]
+    fn an_empty_window_list_is_a_reading_and_means_not_running() {
+        let resolution = TargetResolution::decide("com.apple.Safari", Some(&[]), |_| {
+            panic!("a generation was read for an absent target")
+        });
+
+        assert_eq!(resolution, TargetResolution::NotRunning);
     }
 
     /// Windows owned by other applications do not affect the decision.
     #[test]
     fn another_applications_windows_are_not_counted() {
-        let resolution = TargetResolution::decide("com.apple.Mail", &windows(), generation);
+        let resolution = TargetResolution::decide("com.apple.Mail", Some(&windows()), generation);
         let TargetResolution::Resolved(grant) = resolution else {
             panic!("one instance must resolve, got {resolution:?}");
         };
