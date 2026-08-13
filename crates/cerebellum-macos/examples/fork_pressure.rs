@@ -76,6 +76,74 @@ fn main() {
 
     let shell = PathBuf::from("/bin/sh");
     let args: Vec<OsString> = vec![OsString::from("-c"), OsString::from("exit 0")];
+    // Fork from SEVERAL threads at once when asked. The suite does this and the
+    // earlier runs of this probe did not: libtest runs tests on parallel
+    // threads, and more than one launch test spawns a process, so the real
+    // condition is concurrent forks from one process rather than a loop on a
+    // single thread. `fork()` clones only the calling thread, so two threads
+    // forking while a third holds a lock is a different situation from one
+    // thread forking while others merely work.
+    let concurrent_forkers: usize = std::env::args()
+        .position(|argument| argument == "--forkers")
+        .and_then(|at| std::env::args().nth(at + 1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+
+    if concurrent_forkers > 1 {
+        let failures = Arc::new(AtomicU64::new(0));
+        let each = attempts / concurrent_forkers;
+        let mut forkers = Vec::new();
+        for _ in 0..concurrent_forkers {
+            let shell = shell.clone();
+            let args = args.clone();
+            let failures = Arc::clone(&failures);
+            forkers.push(std::thread::spawn(move || {
+                for _ in 0..each {
+                    let (command_child, _command_parent) =
+                        UnixStream::pair().expect("command pair");
+                    let (_response_parent, response_child) =
+                        UnixStream::pair().expect("response pair");
+                    match cerebellum_macos::spawn_barred(
+                        &shell,
+                        &args,
+                        &[],
+                        command_child.as_raw_fd(),
+                        response_child.as_raw_fd(),
+                    ) {
+                        Ok(child) => {
+                            let _ = child.terminate_and_reap();
+                        }
+                        Err(error) => {
+                            failures.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("concurrent fork failed: {error:?}");
+                        }
+                    }
+                }
+            }));
+        }
+        for forker in forkers {
+            let _ = forker.join();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for worker in workers {
+            let _ = worker.join();
+        }
+        let failed = failures.load(Ordering::Relaxed);
+        println!(
+            "forkers={concurrent_forkers} threads={threads} attempts={} failures={failed}",
+            each * concurrent_forkers
+        );
+        println!(
+            "VERDICT: {}",
+            if failed == 0 {
+                "no failure under concurrent forking"
+            } else {
+                "CONCURRENT FORKING REPRODUCES THE FAILURE"
+            }
+        );
+        return;
+    }
+
     let mut failures = 0usize;
     let mut kinds: Vec<String> = Vec::new();
     for attempt in 0..attempts {
