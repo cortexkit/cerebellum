@@ -1294,6 +1294,10 @@ impl HeldOpenedProfile {
     pub fn opened(&self) -> &OpenedContext {
         &self.opened
     }
+
+    pub fn profile_directory(&self) -> &Path {
+        self.attempt.directory()
+    }
 }
 
 pub struct ProfileBoundLaunch<'a, J, P>

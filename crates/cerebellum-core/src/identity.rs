@@ -222,6 +222,15 @@ impl RouteSurface {
 pub struct AcceptedBindFacts {
     pub identity: RouteIdentity,
     pub principal: Option<Principal>,
+    /// True only when the project id came from daemon admission facts rather
+    /// than the caller-controlled project-root compatibility fallback.
+    pub agent_project_id_attested: bool,
+    /// True only when daemon facts explicitly identify the session kind; the
+    /// compatibility default to `primary` is not attested and therefore must not
+    /// authorize durable storage.
+    pub session_kind_attested: bool,
+    /// Exact control-operation identifiers admitted by daemon authority.
+    pub control_operations: Vec<String>,
     /// `None` means the legacy bind had no explicit scope and receives the
     /// module's first-party default. `Some(empty)` is an explicitly empty scope.
     pub effective_capability_scope: Option<Vec<String>>,
@@ -254,6 +263,9 @@ impl AcceptedBindFacts {
         Self {
             identity: RouteIdentity::from_accepted_bind(identity, &principal, admission_facts),
             principal,
+            agent_project_id_attested: admitted_agent_project_id(admission_facts).is_some(),
+            session_kind_attested: admitted_session_kind(admission_facts).is_some(),
+            control_operations: control_operations_from_facts(admission_facts),
             effective_capability_scope: effective_capability_scope_from_facts(admission_facts),
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
             surface: RouteSurface::from_target(target),
@@ -267,6 +279,17 @@ impl AcceptedBindFacts {
         self.consumer_capabilities
             .iter()
             .any(|family| family == ELICITATION_CAPABILITY)
+    }
+
+    /// Whether daemon-attested bind facts admit this control operation. Caller
+    /// request fields cannot substitute for missing identity or authority facts.
+    pub fn allows_control_operation(&self, operation: &str) -> bool {
+        self.agent_project_id_attested
+            && self.session_kind_attested
+            && self
+                .control_operations
+                .iter()
+                .any(|allowed| allowed == operation)
     }
 
     /// Whether the accepted scope permits a capability. This uses only facts
@@ -312,7 +335,7 @@ fn fact<'a>(facts: Option<&'a Value>, names: &[&str]) -> Option<&'a Value> {
     None
 }
 
-fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -> String {
+fn admitted_agent_project_id(facts: Option<&Value>) -> Option<&str> {
     fact(
         facts,
         &[
@@ -324,22 +347,32 @@ fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -
     )
     .and_then(Value::as_str)
     .filter(|value| !value.is_empty())
-    .map(ToOwned::to_owned)
-    // Old wire fixtures predate the admitted project id. Keeping a stable
-    // project-root fallback preserves those fixtures; admitted facts always win.
-    //
-    // SAFETY OF THIS FALLBACK IS NOT LOCAL. `project_root` arrives in
-    // `BindIdentity`, which the daemon relays verbatim from the caller, so a
-    // substituted value is caller-chosen rather than attested. What keeps that
-    // out of durable storage is that both durable paths refuse a bind whose
-    // facts are not daemon-attested BEFORE reading this field:
-    // `profile::StampedBindContext::validate` and `journal_pin`'s
-    // `validate_bind_facts` each require attested provenance and a present
-    // `agent_project_id`, with no substitution of their own. This value
-    // therefore reaches only policy resolution that opens no profile storage.
-    // Extending a compatibility path to durable state means reproducing those
-    // refusals, not reusing this fallback.
-    .unwrap_or_else(|| identity.project_root.to_string_lossy().into_owned())
+}
+
+fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -> String {
+    admitted_agent_project_id(facts)
+        .map(ToOwned::to_owned)
+        // Old wire fixtures predate the admitted project id. Keeping a stable
+        // project-root fallback preserves those fixtures; admitted facts always win.
+        //
+        // SAFETY OF THIS FALLBACK IS NOT LOCAL. `project_root` arrives in
+        // `BindIdentity`, which the daemon relays verbatim from the caller, so a
+        // substituted value is caller-chosen rather than attested. What keeps that
+        // out of durable storage is that both durable paths refuse a bind whose
+        // facts are not daemon-attested BEFORE reading this field:
+        // `profile::StampedBindContext::validate` and `journal_pin`'s
+        // `validate_bind_facts` each require attested provenance and a present
+        // `agent_project_id`, with no substitution of their own. This value
+        // therefore reaches only policy resolution that opens no profile storage.
+        // Extending a compatibility path to durable state means reproducing those
+        // refusals, not reusing this fallback.
+        .unwrap_or_else(|| identity.project_root.to_string_lossy().into_owned())
+}
+
+fn admitted_session_kind(facts: Option<&Value>) -> Option<SessionKind> {
+    fact(facts, &["sessionKind", "session_kind"])
+        .and_then(Value::as_str)
+        .and_then(SessionKind::from_str)
 }
 
 fn session_kind_from_facts(facts: Option<&Value>) -> SessionKind {
@@ -348,10 +381,26 @@ fn session_kind_from_facts(facts: Option<&Value>) -> SessionKind {
     // for the reason given above `agent_project_id_from_facts`: the durable
     // validators require a present, attested `session_kind` and refuse rather
     // than defaulting, so a defaulted kind never selects durable storage.
-    fact(facts, &["sessionKind", "session_kind"])
-        .and_then(Value::as_str)
-        .and_then(SessionKind::from_str)
-        .unwrap_or(SessionKind::Primary)
+    admitted_session_kind(facts).unwrap_or(SessionKind::Primary)
+}
+
+fn control_operations_from_facts(facts: Option<&Value>) -> Vec<String> {
+    fact(facts, &["browserControlOperations"])
+        .and_then(Value::as_array)
+        .map(|operations| {
+            operations
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|operation| {
+                    matches!(
+                        *operation,
+                        "browser.launch" | "browser.status" | "browser.close"
+                    )
+                })
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn effective_capability_scope_from_facts(facts: Option<&Value>) -> Option<Vec<String>> {
@@ -564,6 +613,47 @@ mod tests {
         );
         assert_eq!(route.agent_project_id, "pj-accepted");
         assert_eq!(route.conversation_key, "conversation-1");
+    }
+
+    #[test]
+    fn control_operation_requires_attested_project_kind_and_operation() {
+        let bind = bind_identity("/caller/project", "conversation-1");
+        let accepted = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            Some(&serde_json::json!({
+                "agentProjectId": "pj-accepted",
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["browser.launch"],
+                "browserControlOperations": ["browser.launch"],
+            })),
+            None,
+            &tool_route(),
+        );
+        assert!(accepted.allows_control_operation("browser.launch"));
+        assert!(!accepted.allows_control_operation("browser.status"));
+
+        for facts in [
+            serde_json::json!({
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["browser.launch"],
+                "browserControlOperations": ["browser.launch"],
+            }),
+            serde_json::json!({
+                "agentProjectId": "pj-accepted",
+                "effectiveCapabilityScope": ["browser.launch"],
+                "browserControlOperations": ["browser.launch"],
+            }),
+        ] {
+            let accepted = AcceptedBindFacts::from_bind(
+                &bind,
+                Some(Principal::Direct),
+                Some(&facts),
+                None,
+                &tool_route(),
+            );
+            assert!(!accepted.allows_control_operation("browser.launch"));
+        }
     }
 
     #[test]
