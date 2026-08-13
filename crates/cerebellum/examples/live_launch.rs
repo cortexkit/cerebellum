@@ -1,18 +1,9 @@
-//! Launch a real browser through the production service, then close it.
+//! Drive the browser surface exactly as a caller does: bind routes, launch a
+//! real browser, mint authority through the consent relay, snapshot the page,
+//! click a ref from that snapshot, and snapshot the visible result.
 //!
-//! Every test of this path uses doubles: a fake launcher, a fake pipe, a fake
-//! clock. That is correct for a suite — a test that opens a browser cannot run
-//! on a machine without one, and would be skipped into meaninglessness on CI.
-//! But it leaves the whole production path proven only against stand-ins, and
-//! this module has now been bitten three times by the difference between what a
-//! double reports and what the system does: a handshake that worked headless and
-//! not headed, renderer subprocesses that appeared broken under our launcher,
-//! and a contended child whose exit code inverts between modes.
-//!
-//! So this drives the real service against the real browser and prints what a
-//! caller would see. A probe rather than a test, because it needs Chrome
-//! installed, a signed executable whose identity matches configuration, and a
-//! window server to talk to.
+//! This is a probe rather than a test because it needs Chrome, a window server,
+//! and a signed executable whose identity can be verified.
 //!
 //! Run it with:
 //!
@@ -26,31 +17,32 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use cerebellum::browser::navigation::BrowserSnapshotObservation;
-use cerebellum::browser::Tracker;
 use cerebellum::browser_config::BrowserConfig;
-use cerebellum::browser_launch_service::ProductionLaunchService;
-use cerebellum::browser_session::{NavigationWait, OwnedBrowserProcess};
-use cerebellum::snapshot_store::SnapshotKind;
-use cerebellum_core::identity::AcceptedBindFacts;
-use serde_json::json;
-use subc_protocol::{BindIdentity, Principal, RouteTarget};
+use cerebellum::management;
+use cerebellum::Planes;
+use cerebellum_core::health::HealthState;
+use serde_json::{json, Value};
+use subc_protocol::session::ModuleControlRequest;
+use subc_protocol::{
+    BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
+};
+use tokio::sync::mpsc;
 
 const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const TOOL_CHANNEL: u16 = 9;
+const TOOL_EPOCH: u32 = 3;
+const MANAGEMENT_CHANNEL: u16 = 4;
+const MANAGEMENT_EPOCH: u32 = 1;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let executable = PathBuf::from(CHROME);
     if !executable.is_file() {
         eprintln!("skipped: no browser at {}", executable.display());
         return;
     }
-
-    // Read the identity from the binary rather than hardcoding it, so the probe
-    // keeps working across Chrome updates. A configuration would name this
-    // explicitly; here the point is to exercise the verification, not to pin a
-    // particular build.
     let Some(identity) = signing_identifier(&executable) else {
         eprintln!("skipped: could not read a signing identifier from the browser");
         return;
@@ -67,53 +59,14 @@ fn main() {
         navigation_settle_deadline_ms: 10_000,
     };
 
-    // Daemon-attested facts, because an unattested identity is refused before
-    // any profile effect — which is the property this probe would otherwise
-    // silently skip past.
-    let facts = json!({
-        "agentProjectId": std::env::var("CK_PROBE_PROJECT_ID")
-            .unwrap_or_else(|_| "pj-live-launch-probe".to_string()),
-        "sessionKind": "primary",
-        "controlOperations": ["browser.launch", "browser.status", "browser.close"],
-    });
-    let accepted = AcceptedBindFacts::from_bind(
-        &BindIdentity {
-            project_root: std::env::temp_dir().join("ck-live-launch"),
-            harness: "probe".to_string(),
-            session: "live-launch-probe".to_string(),
-        },
-        // A principal, because an accepted bind always has one: the default-deny
-        // backstop refuses an absent principal before any capability runs, so a
-        // probe without one exercises a state production cannot reach.
-        Some(Principal::Direct),
-        Some(&facts),
-        None,
-        &RouteTarget::ToolProvider {
-            module_id: "cerebellum".to_string(),
-        },
-    );
-
-    println!(
-        "attested: project_id={} session_kind={} disposition={}",
-        accepted.agent_project_id_attested,
-        accepted.session_kind_attested,
-        accepted.identity.profile_disposition.as_str()
-    );
-
-    let service = ProductionLaunchService::open(config);
-
-    // Two launches for the SAME identity. The per-agent profile is only worth
-    // anything if the second one lands in the directory the first one used: a
-    // fresh directory each time satisfies every "a profile directory exists"
-    // assertion while defeating the entire purpose.
-    let first = launch_once(&service, &accepted, "live-launch-probe-first");
+    let first = run_wire_probe(config.clone(), "first").await;
     let after_first = profile_directories();
     println!(
         "profile directories after first launch: {} {after_first:?}",
         after_first.len()
     );
 
-    let second = launch_once(&service, &accepted, "live-launch-probe-second");
+    let second = run_wire_probe(config, "second").await;
     let after_second = profile_directories();
     println!(
         "profile directories after second launch: {} {after_second:?}",
@@ -132,17 +85,319 @@ fn main() {
             );
         }
     } else {
-        println!("VERDICT: a launch failed, so reuse was not tested");
+        eprintln!("VERDICT: a wire probe failed");
+        std::process::exit(1);
     }
 }
 
-/// The per-agent profile directories on disk, read from the filesystem rather
-/// than from anything the module reports about itself.
-///
-/// Reads the `profiles` subdirectory specifically. Listing the ROOT instead
-/// names only its fixed children and would compare equal across two launches
-/// however many profiles were minted underneath — an observation that cannot
-/// fail, which is worse than no observation at all.
+async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
+    let page = match ProbePage::start() {
+        Ok(page) => page,
+        Err(error) => {
+            eprintln!("[{label}] probe page failed to start: {error}");
+            return false;
+        }
+    };
+    let planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config));
+    bind_route(
+        &planes,
+        TOOL_CHANNEL,
+        TOOL_EPOCH,
+        RouteTarget::ToolProvider {
+            module_id: "cerebellum".to_string(),
+        },
+        false,
+    )
+    .await;
+    bind_route(
+        &planes,
+        MANAGEMENT_CHANNEL,
+        MANAGEMENT_EPOCH,
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".to_string(),
+        },
+        true,
+    )
+    .await;
+
+    let launched = invoke_tool(&planes, 1, "browser.launch", json!({})).await;
+    if launched["outcome"] != "launched" {
+        eprintln!("[{label}] launch refused: {launched}");
+        return false;
+    }
+    let browser_session_id = launched["browser_session_id"]
+        .as_str()
+        .expect("a launch names its browser session")
+        .to_string();
+    println!("[{label}] launch: {launched}");
+
+    mint_browser_grant(&planes, page.origin()).await;
+
+    let navigated = invoke_tool(
+        &planes,
+        2,
+        "browser.navigate",
+        json!({
+            "url": page.url(),
+            "intent": "open the visible click probe",
+            "wait": "settle",
+            "severity": {"tier": 1, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    if navigated["outcome"] != "ok" {
+        eprintln!("[{label}] navigation failed: {navigated}");
+        close_browser(&planes, label, &browser_session_id, 90).await;
+        return false;
+    }
+
+    let before = invoke_tool(
+        &planes,
+        3,
+        "browser.snapshot",
+        json!({"mode": "ax", "max_bytes": 65_536}),
+    )
+    .await;
+    print_wire_snapshot(label, "BEFORE", &before);
+    if before["outcome"] != "ok" {
+        eprintln!("[{label}] snapshot before click failed: {before}");
+        close_browser(&planes, label, &browser_session_id, 91).await;
+        return false;
+    }
+    let Some(reference) = before["refs"]
+        .as_array()
+        .and_then(|refs| refs.iter().find(|reference| reference["name"] == "Sign in"))
+        .and_then(|reference| reference["ref"].as_str())
+        .map(str::to_string)
+    else {
+        eprintln!("[{label}] snapshot before click exposed no named button ref");
+        close_browser(&planes, label, &browser_session_id, 92).await;
+        return false;
+    };
+    let Some(snapshot_id) = before["snapshot_id"].as_str().map(str::to_string) else {
+        eprintln!("[{label}] snapshot before click exposed no snapshot_id");
+        close_browser(&planes, label, &browser_session_id, 93).await;
+        return false;
+    };
+
+    let clicked = invoke_tool(
+        &planes,
+        4,
+        "browser.click",
+        json!({
+            "ref": reference,
+            "snapshot_id": snapshot_id,
+            "intent": "change the visible probe heading",
+            "severity": {"tier": 4, "credential": true, "financial": false}
+        }),
+    )
+    .await;
+    if clicked["outcome"] != "ok" {
+        eprintln!("[{label}] click failed: {clicked}");
+        close_browser(&planes, label, &browser_session_id, 94).await;
+        return false;
+    }
+    println!("[{label}] click: {clicked}");
+
+    let after = invoke_tool(
+        &planes,
+        5,
+        "browser.snapshot",
+        json!({"mode": "ax", "max_bytes": 65_536}),
+    )
+    .await;
+    print_wire_snapshot(label, "AFTER", &after);
+    let before_content = before["content"].as_str().unwrap_or_default();
+    let after_content = after["content"].as_str().unwrap_or_default();
+    let page_changed = before_content.contains("Click probe before")
+        && after_content.contains("Click probe after")
+        && before_content != after_content;
+
+    let closed = close_browser(&planes, label, &browser_session_id, 6).await;
+    if page_changed {
+        println!(
+            "[{label}] CLICK VERDICT: the AFTER snapshot differs and exposes 'Click probe after'"
+        );
+    } else {
+        eprintln!(
+            "[{label}] CLICK VERDICT: the two printed snapshots do not prove the page changed"
+        );
+    }
+    page_changed && closed["outcome"] == "closed"
+}
+
+async fn bind_route(
+    planes: &Planes,
+    route_channel: u16,
+    epoch: u32,
+    target: RouteTarget,
+    declares_elicitation: bool,
+) {
+    let request = ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity: probe_identity(),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: declares_elicitation.then(|| vec!["elicitation".to_string()]),
+        admission_facts: Some(json!({
+            "agentProjectId": std::env::var("CK_PROBE_PROJECT_ID")
+                .unwrap_or_else(|_| "pj-live-launch-probe".to_string()),
+            "sessionKind": "primary",
+            "effectiveCapabilityScope": ["*"],
+            "browserControlOperations": [
+                "browser.launch",
+                "browser.status",
+                "browser.close"
+            ]
+        })),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        route_channel as u64,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(2);
+    cerebellum::handle_control_request_for_test_with_bindings(
+        frame,
+        &writer,
+        &planes.health,
+        &planes.routes,
+    )
+    .await
+    .unwrap();
+    let reply = replies.recv().await.expect("route.bind receives a reply");
+    assert_eq!(reply.header.ty, FrameType::Response);
+}
+
+async fn mint_browser_grant(planes: &Planes, origin: &str) {
+    let (writer, mut frames) = mpsc::channel(8);
+    let opening = route_request(
+        MANAGEMENT_CHANNEL,
+        MANAGEMENT_EPOCH,
+        10,
+        json!({
+            "method": management::OPEN_GRANT,
+            "params": {
+                "origins": [origin],
+                "hazards": [
+                    "credential_form_submit",
+                    "unverified_form_contents"
+                ]
+            }
+        }),
+    );
+    cerebellum::handle_frame_for_test(opening, &writer, planes)
+        .await
+        .unwrap();
+
+    let mut pending = None;
+    let mut question = None;
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("the grant reply and consent question are prompt")
+            .expect("the consent relay remains open");
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        if frame.header.ty == FrameType::Request {
+            question = Some((frame, body));
+        } else {
+            pending = Some(body);
+        }
+    }
+    let pending = pending.expect("browser.open_grant returns consent_pending");
+    assert_eq!(pending["outcome"], "consent_pending", "{pending}");
+    let (question_frame, question) = question.expect("the relay receives a consent question");
+    println!("consent question: {question}");
+
+    let answer = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        question_frame.header.channel,
+        question_frame.header.epoch,
+        question_frame.header.corr,
+        serde_json::to_vec(&json!({"decision": "allow"})).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(answer, &writer, planes)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while planes.management.browser_grant_count().await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the affirmative relay answer mints a browser grant");
+}
+
+async fn close_browser(planes: &Planes, label: &str, browser_session_id: &str, corr: u64) -> Value {
+    let closed = invoke_tool(
+        planes,
+        corr,
+        "browser.close",
+        json!({"browser_session_id": browser_session_id}),
+    )
+    .await;
+    println!("[{label}] close: {closed}");
+    closed
+}
+
+async fn invoke_tool(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Value {
+    let (writer, mut replies) = mpsc::channel(2);
+    cerebellum::handle_tool_request_for_test_with_existing_planes(
+        route_request(
+            TOOL_CHANNEL,
+            TOOL_EPOCH,
+            corr,
+            json!({"name": name, "arguments": arguments}),
+        ),
+        &writer,
+        planes,
+    )
+    .await
+    .unwrap();
+    let response = replies.recv().await.expect("tool request receives a reply");
+    serde_json::from_slice(&response.body).unwrap()
+}
+
+fn route_request(channel: u16, epoch: u32, corr: u64, body: Value) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap()
+}
+
+fn print_wire_snapshot(label: &str, phase: &str, snapshot: &Value) {
+    println!("[{label}] SNAPSHOT {phase} RESPONSE: {snapshot}");
+    println!(
+        "[{label}] SNAPSHOT {phase} CONTENT:\n{}",
+        snapshot["content"].as_str().unwrap_or("<missing content>")
+    );
+}
+
+fn probe_identity() -> BindIdentity {
+    BindIdentity {
+        project_root: std::env::temp_dir().join("ck-live-launch"),
+        harness: "probe".to_string(),
+        session: "live-launch-probe".to_string(),
+    }
+}
+
+/// Read the profile directories themselves. Listing only their parent would
+/// compare equal no matter how many per-agent profiles were minted below it.
 fn profile_directories() -> Vec<String> {
     let Ok(home) = std::env::var("HOME") else {
         return Vec::new();
@@ -212,6 +467,10 @@ impl ProbePage {
     fn url(&self) -> &str {
         &self.url
     }
+
+    fn origin(&self) -> &str {
+        self.url.trim_end_matches('/')
+    }
 }
 
 impl Drop for ProbePage {
@@ -224,213 +483,14 @@ impl Drop for ProbePage {
     }
 }
 
-fn print_snapshot(label: &str, snapshot: &BrowserSnapshotObservation) {
-    println!(
-        "snapshot {label}: records={} refs={} truncated={} refs_truncated={}",
-        snapshot.records.len(),
-        snapshot.refs.len(),
-        snapshot.ax_truncated,
-        snapshot.refs_truncated
-    );
-    for record in &snapshot.records {
-        println!(
-            "snapshot {label} AX: role={:?} name={:?}",
-            record.role, record.name
-        );
-    }
-}
-
-fn drive_click_probe(
-    process: &mut dyn OwnedBrowserProcess,
-    context_key: &str,
-    current_origin: &str,
-) -> Option<String> {
-    let before =
-        match process.snapshot_classified(context_key, SnapshotKind::Ax, 0, current_origin, 10_000)
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Some(format!("snapshot before click failed: {error:?}")),
-        };
-    print_snapshot("BEFORE", &before);
-    let Some(reference) = before.refs.iter().find(|reference| {
-        reference.captured.role == "button" && reference.captured.name == "Sign in"
-    }) else {
-        return Some("snapshot before click did not expose the named button ref".into());
-    };
-    let Some(backend_identity) = reference.backend_identity.as_ref() else {
-        return Some("named button ref had no backend DOM identity".into());
-    };
-    let Some(classification) = reference.classification.clone() else {
-        return Some(
-            "live login form classification was unavailable in the pinned snapshot".into(),
-        );
-    };
-    println!(
-        "classification: submit={} credential={} financial={} tier={}",
-        classification.activation_invokes_form_submit,
-        classification.credential,
-        classification.financial,
-        classification.required_tier,
-    );
-    if !classification.activation_invokes_form_submit || !classification.credential {
-        return Some(format!(
-            "live login form was not classified as credential_form_submit: {classification:?}"
-        ));
-    }
-
-    let mut input_events = Vec::new();
-    let position = match process.click_classified(
-        context_key,
-        backend_identity,
-        0,
-        current_origin,
-        Some(&classification),
-        10_000,
-        &mut |event| input_events.push(event),
-    ) {
-        Ok(position) => position,
-        Err(error) => {
-            return Some(format!(
-                "click {} failed: {error:?}",
-                reference.captured.reference
-            ))
-        }
-    };
-    println!(
-        "click ref={} resolved=({}, {}) input={input_events:?}",
-        reference.captured.reference, position.x_css, position.y_css
-    );
-
-    let after = match process.snapshot(context_key, SnapshotKind::Ax, 10_000) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return Some(format!("snapshot after click failed: {error:?}")),
-    };
-    print_snapshot("AFTER", &after);
-    let changed = before.records != after.records
-        && after
-            .records
-            .iter()
-            .any(|record| record.role == "heading" && record.name == "Click probe after");
-    if changed {
-        println!("CLICK VERDICT: second snapshot DIFFERS and exposes 'Click probe after'");
-        None
-    } else {
-        Some("second snapshot did not differ with the expected visible text change".into())
-    }
-}
-
-fn launch_once(
-    service: &ProductionLaunchService,
-    accepted: &AcceptedBindFacts,
-    session_id: &str,
-) -> bool {
-    let started = Instant::now();
-    let page = match ProbePage::start() {
-        Ok(page) => page,
-        Err(error) => {
-            println!("probe page failed to start: {error}");
-            return false;
-        }
-    };
-    match service.launch(accepted, session_id) {
-        Ok(ready) => {
-            println!("[{session_id}] LAUNCHED in {:?}", started.elapsed());
-            let (mut process, mut cleanup) = ready.into_parts();
-            println!("generation still matches: {}", process.generation_matches());
-
-            // Serve a normal HTTP page so both navigation and the click effect are
-            // observations of browser state, not values embedded in a data URL.
-            let requested_url = page.url();
-            let mut tracker = Tracker::default();
-            tracker.token("navigation_started");
-            let navigation_failure = match process.navigate(
-                &accepted.identity.conversation_key,
-                requested_url,
-                NavigationWait::Settle,
-                10_000,
-                &mut tracker,
-            ) {
-                Ok(()) => {
-                    println!(
-                        "navigation: requested={requested_url} url_final={:?} settled={} lifecycle={:?}",
-                        tracker.url_final, tracker.settled, tracker.lifecycle
-                    );
-                    None
-                }
-                Err(error) => {
-                    let failure = format!(
-                        "navigation failed: {error:?}; url_final={:?} lifecycle={:?}",
-                        tracker.url_final, tracker.lifecycle
-                    );
-                    println!("{failure}");
-                    Some(failure)
-                }
-            };
-
-            let click_probe_failure = if navigation_failure.is_none() {
-                let current_origin = format!("http://{}", page.address);
-                drive_click_probe(
-                    process.as_mut(),
-                    &accepted.identity.conversation_key,
-                    &current_origin,
-                )
-            } else {
-                navigation_failure
-            };
-
-            // The real ladder: ask, wait the grace period, force only if the
-            // same generation is still alive, then reap before any cleanup.
-            println!("requesting graceful termination");
-            if let Err(error) = process.request_graceful_termination() {
-                println!("graceful request failed: {error:?}");
-            }
-            let exited = process
-                .wait_for_exit(std::time::Duration::from_millis(5_000))
-                .unwrap_or(false);
-            println!("exited within the grace period: {exited}");
-            if !exited && process.generation_matches() {
-                println!("forcing termination");
-                if let Err(error) = process.force_terminate() {
-                    println!("force failed: {error:?}");
-                }
-            }
-            match process.wait_until_reaped() {
-                Ok(()) => println!("reaped"),
-                Err(error) => println!("reap failed: {error:?}"),
-            }
-            // Say how the session ended before cleaning up, exactly as the
-            // session layer does. A probe that skips this is not driving the
-            // production sequence, and the journal cannot record an outcome
-            // nobody supplied.
-            cleanup.set_terminal_outcome(
-                cerebellum::browser_session::BrowserSessionTerminalOutcome::Closed,
-            );
-            match cleanup.after_reap() {
-                Ok(()) => println!("[{session_id}] reaped and cleaned up after reap"),
-                Err(stage) => println!("[{session_id}] cleanup failed at {stage:?}"),
-            }
-            if let Some(failure) = click_probe_failure {
-                panic!("{failure}");
-            }
-            true
-        }
-        Err(refusal) => {
-            println!(
-                "[{session_id}] REFUSED after {:?}: {refusal}",
-                started.elapsed()
-            );
-            false
-        }
-    }
-}
-
 fn signing_identifier(path: &PathBuf) -> Option<String> {
     let output = std::process::Command::new("/usr/bin/codesign")
         .args(["-d", "--verbose=4"])
         .arg(path)
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .find_map(|line| line.strip_prefix("Identifier=").map(ToOwned::to_owned))
+    let text = String::from_utf8_lossy(&output.stderr);
+    text.lines()
+        .find_map(|line| line.strip_prefix("Identifier="))
+        .map(str::to_string)
 }

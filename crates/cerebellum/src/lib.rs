@@ -602,7 +602,7 @@ fn serialize_manifest_with_computer_plane_configured(
         tools.extend(
             manifest::browser_control_tools()
                 .into_iter()
-                .chain(std::iter::once(manifest::browser_navigation_tool()))
+                .chain(manifest::browser_wire_tools())
                 .filter(|tool| dispatchable_tool_with_browser(&tool.name, true).is_some()),
         );
     }
@@ -631,7 +631,8 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
     if browser_configured
-        && (browser_session::CONTROL_TOOLS.contains(&name) || name == browser::NAVIGATE)
+        && (browser_session::CONTROL_TOOLS.contains(&name)
+            || matches!(name, browser::NAVIGATE | browser::SNAPSHOT | browser::CLICK))
     {
         Some(name)
     } else if computer_capability::servable(name).is_some() {
@@ -2592,6 +2593,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn configured_browser_advertisement_and_dispatch_match_in_both_directions() {
+        let manifest = serialize_manifest_with_browser_configuration("cerebellum", true);
+        let advertised: std::collections::BTreeSet<&str> = manifest["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["role"] == "tool_provider")
+            .unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| name.starts_with("browser."))
+            .collect();
+        let candidates = browser_session::CONTROL_TOOLS
+            .into_iter()
+            .chain(browser::ALL_TOOLS)
+            .chain(["browser.type"]);
+        let dispatchable: std::collections::BTreeSet<&str> = candidates
+            .filter(|name| dispatchable_tool_with_browser(name, true).is_some())
+            .collect();
+
+        for name in &advertised {
+            assert!(
+                dispatchable.contains(name),
+                "{name} is advertised but undispatchable"
+            );
+        }
+        for name in &dispatchable {
+            assert!(
+                advertised.contains(name),
+                "{name} is dispatchable but unadvertised"
+            );
+        }
+        assert!(!dispatchable.contains(browser::CLICK_POINT));
+        assert!(!dispatchable.contains("browser.type"));
+    }
+
     use super::*;
     use cerebellum_computer::platform::TargetResolution;
     use subc_protocol::Principal;
