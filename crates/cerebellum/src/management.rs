@@ -173,6 +173,22 @@ impl ManagementPlane {
                     None,
                 );
             }
+            // Separate from `not_running` because that answer is a claim about
+            // the world and this one is only about our own sight. Telling
+            // someone their running application is not running sends them to
+            // start a second copy.
+            TargetResolution::Unreadable => {
+                return (
+                    json!({
+                        "outcome": "targets_unreadable",
+                        "bundle_identity": bundle_identity,
+                        "remedy": "the window list could not be read, so nothing \
+                    is known about this application; retry, and if it persists check that screen \
+                    recording is still granted to the process that launched this module",
+                    }),
+                    None,
+                );
+            }
         };
 
         let key = LeaseKey {
@@ -355,6 +371,18 @@ impl ManagementPlane {
                 "bundle_identity": key.bundle_identity,
                 "instances": describe(&candidates),
                 "remedy": "quit all but one instance, then retry",
+            })),
+            // Refused rather than admitted, because an action needs a target
+            // this process can currently see: the grant identifies a process by
+            // its generation, and that cannot be re-established from a window
+            // list that did not answer. Distinct from `target_not_running` so a
+            // caller is not sent to start an application that is already there.
+            TargetResolution::Unreadable => ActionAuthority::Refused(json!({
+                "outcome": "targets_unreadable",
+                "bundle_identity": key.bundle_identity,
+                "remedy": "the window list could not be read, so the target could \
+            not be confirmed; retry, and if it persists check that screen recording is still \
+            granted to the process that launched this module",
             })),
         }
     }

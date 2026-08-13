@@ -1,0 +1,91 @@
+//! Does the launch barrier survive being used from a heavily threaded process?
+//!
+//! The module runs a multithreaded async runtime, and `spawn_barred` forks.
+//! `fork()` clones only the calling thread, so any lock another thread held at
+//! that instant stays locked forever in the child — and the child then calls
+//! `posix_spawn`, which is not guaranteed safe in that state. A test binary is
+//! threaded too, which is why this shows up as a load-dependent flake rather
+//! than a clean failure.
+
+use std::ffi::OsString;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+fn main() {
+    let threads: usize = std::env::args()
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64);
+    let attempts: usize = std::env::args()
+        .nth(2)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn = Arc::new(AtomicU64::new(0));
+    let mut workers = Vec::new();
+    for _ in 0..threads {
+        let stop = Arc::clone(&stop);
+        let churn = Arc::clone(&churn);
+        workers.push(std::thread::spawn(move || {
+            // Hold and release allocator locks continuously, which is what a
+            // busy runtime does and what makes a fork child's first allocation
+            // land on a lock nobody will ever unlock.
+            while !stop.load(Ordering::Relaxed) {
+                let mut v: Vec<String> = Vec::with_capacity(64);
+                for i in 0..64 {
+                    v.push(format!("allocation-{i}"));
+                }
+                churn.fetch_add(v.len() as u64, Ordering::Relaxed);
+                drop(v);
+            }
+        }));
+    }
+
+    let shell = PathBuf::from("/bin/sh");
+    let args: Vec<OsString> = vec![OsString::from("-c"), OsString::from("exit 0")];
+    let mut failures = 0usize;
+    let mut kinds: Vec<String> = Vec::new();
+    for attempt in 0..attempts {
+        let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
+        let (_response_parent, response_child) = UnixStream::pair().expect("response pair");
+        match cerebellum_macos::spawn_barred(
+            &shell,
+            &args,
+            &[],
+            command_child.as_raw_fd(),
+            response_child.as_raw_fd(),
+        ) {
+            Ok(child) => {
+                let _ = child.terminate_and_reap();
+            }
+            Err(error) => {
+                failures += 1;
+                let text = format!("{error:?}");
+                if !kinds.contains(&text) {
+                    kinds.push(text.clone());
+                }
+                if failures <= 3 {
+                    eprintln!("attempt {attempt}: {text}");
+                }
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for worker in workers {
+        let _ = worker.join();
+    }
+    println!("threads={threads} attempts={attempts} failures={failures}");
+    println!("distinct failure kinds: {kinds:?}");
+    println!(
+        "VERDICT: {}",
+        if failures == 0 {
+            "no failure under thread pressure"
+        } else {
+            "FORK-UNDER-THREADS REPRODUCES THE FAILURE"
+        }
+    );
+}
