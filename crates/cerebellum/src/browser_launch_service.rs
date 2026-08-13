@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::browser::navigation::CdpNavigationDriver;
+use crate::browser::navigation::{BrowserSnapshotObservation, CdpNavigationDriver};
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
 use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
@@ -40,6 +40,7 @@ use crate::profile_custody::{
     ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
     ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
 };
+use crate::snapshot_store::SnapshotKind;
 
 type ProductionLaunchJournal =
     DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage>;
@@ -530,6 +531,18 @@ impl OwnedBrowserProcess for ProductionProcess {
             .as_mut()
             .ok_or(NavigationDriveError::Unavailable)?
             .navigate(context_key, url, wait, deadline_ms, tracker)
+    }
+
+    fn snapshot(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .snapshot(context_key, mode, deadline_ms)
     }
 
     fn generation_matches(&self) -> bool {

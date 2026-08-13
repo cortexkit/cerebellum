@@ -758,7 +758,10 @@ impl BrowserPlane {
                     return Err(BrowserError::NoSession)
                 }
             }
-        } else if capability == BrowserCapability::Navigate {
+        } else if matches!(
+            capability,
+            BrowserCapability::Navigate | BrowserCapability::Snapshot
+        ) {
             return Err(BrowserError::NoSession);
         } else {
             None
@@ -1024,9 +1027,10 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, BrowserError> {
         let object = self.validate_request(args, &["mode", "max_bytes"]).await?;
-        let mode = match object.get("mode") {
-            None => "ax",
-            Some(Value::String(value)) if value == "ax" || value == "dom_full" => value.as_str(),
+        let kind = match object.get("mode") {
+            None => SnapshotKind::Ax,
+            Some(Value::String(value)) if value == "ax" => SnapshotKind::Ax,
+            Some(Value::String(value)) if value == "dom_full" => SnapshotKind::DomFull,
             Some(Value::String(_)) => {
                 return Err(BrowserError::InvalidRequest {
                     field: "mode".into(),
@@ -1040,53 +1044,77 @@ impl BrowserPlane {
                 })
             }
         };
-        let _max_bytes =
+        let max_bytes =
             optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
-        let _session_operation = self.reserve(identity, BrowserCapability::Snapshot).await?;
-        let mut state = self.state.lock().await;
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpObserve,
-        );
-        let kind = if mode == "ax" {
-            SnapshotKind::Ax
-        } else {
-            SnapshotKind::DomFull
+        let Some(mut session_operation) =
+            self.reserve(identity, BrowserCapability::Snapshot).await?
+        else {
+            return Err(BrowserError::NoSession);
         };
-        let snapshot = {
-            let context = state
-                .contexts
-                .get_mut(&identity.conversation_key)
-                .ok_or(BrowserError::NoSession)?;
-            if context.ended {
-                return Err(BrowserError::NoSession);
-            }
-            let id = context.snapshot_id(kind);
-            let snapshot = TextSnapshot {
-                snapshot_id: id.clone(),
+        self.commit(identity, BrowserCapability::Snapshot).await?;
+        {
+            let mut state = self.state.lock().await;
+            Self::op(
+                &mut state,
+                &identity.conversation_key,
+                Operation::CdpObserve,
+            );
+        }
+
+        let deadline_ms = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+            .ok_or(BrowserError::NoSession)?;
+        let route_key = identity.conversation_key.clone();
+        let driven = tokio::task::spawn_blocking(move || {
+            let result = session_operation.snapshot(&route_key, kind, deadline_ms);
+            (session_operation, result)
+        })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        let (session_operation, drive_result) = driven;
+        session_operation.finish();
+        let observation = drive_result.map_err(map_navigation_drive_error)?;
+        let result = self
+            .retain_text_snapshot_inner(
+                identity,
                 kind,
-                document_epoch: context.epoch.value(),
-                source_origin: context
-                    .tracker
-                    .url_final
-                    .clone()
-                    .unwrap_or_else(|| "null".into()),
-                content_schema: if mode == "ax" { AX_SCHEMA } else { DOM_SCHEMA },
-                content: String::new(),
-                truncated: false,
-                refs_truncated: false,
-                refs: Vec::new(),
-            };
-            context
-                .snapshots
-                .retain_text(snapshot.clone())
-                .map_err(map_snapshot_error)?;
-            snapshot
-        };
-        Ok(
-            json!({"outcome":"ok","snapshot_id":snapshot.snapshot_id,"document_epoch":snapshot.document_epoch,"source_origin":snapshot.source_origin,"content_schema":snapshot.content_schema,"truncated":false,"refs_truncated":false,"content":"","refs":[]}),
+                &observation.records,
+                observation.dom_text.as_deref(),
+                observation.refs,
+                max_bytes,
+                kind == SnapshotKind::Ax && observation.ax_truncated,
+                observation.refs_truncated,
+            )
+            .await?;
+        let content_bytes = result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or_default();
+        let ref_count = result
+            .get("refs")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        self.finalize(
+            identity,
+            BrowserCapability::Snapshot,
+            Outcome::Success,
+            json!({
+                "outcome": "ok",
+                "snapshot_id": result["snapshot_id"],
+                "content_bytes": content_bytes,
+                "ref_count": ref_count,
+                "truncated": result["truncated"],
+                "refs_truncated": result["refs_truncated"],
+            }),
         )
+        .await?;
+        Ok(result)
     }
 
     /// Retain a completed extraction observation supplied by the CDP adapter.
@@ -1102,6 +1130,24 @@ impl BrowserPlane {
         max_bytes: usize,
     ) -> Result<Value, BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
+        self.retain_text_snapshot_inner(
+            identity, mode, records, dom_text, refs, max_bytes, false, false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_text_snapshot_inner(
+        &self,
+        identity: &RouteIdentity,
+        mode: SnapshotKind,
+        records: &[AxRecord],
+        dom_text: Option<&str>,
+        refs: Vec<crate::snapshot_store::RefRecord>,
+        max_bytes: usize,
+        content_incomplete: bool,
+        refs_incomplete: bool,
+    ) -> Result<Value, BrowserError> {
         let mut state = self.state.lock().await;
         let context = state
             .contexts
@@ -1110,7 +1156,7 @@ impl BrowserPlane {
         if context.ended {
             return Err(BrowserError::NoSession);
         }
-        let (content, truncated, schema) = match mode {
+        let (content, encoded_truncated, schema) = match mode {
             SnapshotKind::Ax => {
                 let (content, truncated) = snapshot_store::encode_ax_jsonl(records, max_bytes)
                     .map_err(map_snapshot_error)?;
@@ -1128,7 +1174,8 @@ impl BrowserPlane {
                 })
             }
         };
-        let refs_truncated = refs.len() > MAX_REFS;
+        let truncated = encoded_truncated || content_incomplete;
+        let refs_truncated = refs.len() > MAX_REFS || refs_incomplete;
         let refs = refs.into_iter().take(MAX_REFS).collect::<Vec<_>>();
         let id = context.snapshot_id(mode);
         let snapshot = TextSnapshot {

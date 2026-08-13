@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::browser::navigation::BrowserSnapshotObservation;
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
+use crate::snapshot_store::SnapshotKind;
 use cerebellum_core::clock::{MonoInstant, MonotonicClock};
 use serde_json::{json, Value};
 
@@ -174,6 +176,19 @@ pub trait OwnedBrowserProcess: Send {
         Err(NavigationDriveError::Unavailable)
     }
 
+    /// Read page structure through the process-owned CDP driver.
+    ///
+    /// This capability-specific method avoids exposing an unrestricted CDP command
+    /// surface while still preserving the pipe's single-writer ownership.
+    fn snapshot(
+        &mut self,
+        _context_key: &str,
+        _mode: SnapshotKind,
+        _deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     fn generation_matches(&self) -> bool;
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure>;
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure>;
@@ -287,6 +302,28 @@ impl OperationGuard {
             .and_then(|session| session.process.as_mut())
             .ok_or(NavigationDriveError::Unavailable)?;
         process.navigate(context_key, url, wait, deadline_ms, tracker)
+    }
+
+    pub(crate) fn snapshot(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        let mut state = self
+            .sessions
+            .inner
+            .0
+            .lock()
+            .map_err(|_| NavigationDriveError::Unavailable)?;
+        let process = state
+            .routes
+            .get_mut(&self.route_key)
+            .and_then(|route| route.active.as_mut())
+            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
+            .and_then(|session| session.process.as_mut())
+            .ok_or(NavigationDriveError::Unavailable)?;
+        process.snapshot(context_key, mode, deadline_ms)
     }
 
     fn release(&mut self) {
