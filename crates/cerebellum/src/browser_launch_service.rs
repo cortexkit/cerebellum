@@ -374,22 +374,23 @@ impl OrphanBrowserProcessControl for MacOsOrphanProcessControl {
         &mut self,
         generation: BrowserProcessGeneration,
     ) -> Result<(), OrphanProcessControlFailure> {
-        // Repeat the generation check immediately before invoking `kill`. The
-        // journal check authorizes this call, while this second read closes the
-        // interval in which the old process could exit and its PID be recycled.
-        if !Self::generation_still_matches(generation).map_err(|_| OrphanProcessControlFailure)? {
-            return Ok(());
-        }
-        let status = std::process::Command::new("/bin/kill")
-            .arg("-KILL")
-            .arg(generation.pid.to_string())
-            .status()
-            .map_err(|_| OrphanProcessControlFailure)?;
-        if !status.success()
-            && Self::generation_still_matches(generation)
-                .map_err(|_| OrphanProcessControlFailure)?
-        {
-            return Err(OrphanProcessControlFailure);
+        // The seam owns the signal, because it owns every raw system call in
+        // this workspace. Spawning `/bin/kill` from here would reach the same
+        // process while stepping outside the boundary that makes such calls
+        // auditable in one place — and it would re-implement the generation
+        // check that decides whether signalling is safe at all.
+        //
+        // The check is repeated inside that call, immediately before the
+        // signal: the journal read authorizes this attempt, and the second read
+        // closes the interval in which the recorded process could exit and its
+        // pid be taken by something else.
+        match cerebellum_macos::terminate_exact_generation(cerebellum_macos::ProcessGeneration {
+            pid: generation.pid,
+            start_time_micros: generation.start_time_micros,
+        }) {
+            Ok(cerebellum_macos::TerminationOutcome::Signalled) => {}
+            Ok(cerebellum_macos::TerminationOutcome::AlreadyGoneOrReplaced) => return Ok(()),
+            Err(_) => return Err(OrphanProcessControlFailure),
         }
 
         let deadline = Instant::now() + self.reap_deadline;

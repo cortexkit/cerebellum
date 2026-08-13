@@ -38,8 +38,9 @@ pub use accessibility::{
 };
 #[cfg(target_os = "macos")]
 pub use launch::{
-    executed_image_identity, process_descriptors, spawn_barred, BarredChild, ExecutedImageIdentity,
-    ImageIdentityError, ProcessControlError, ProcessGeneration, ReleasedChild, SpawnError,
+    executed_image_identity, process_descriptors, spawn_barred, terminate_exact_generation,
+    BarredChild, ExecutedImageIdentity, ImageIdentityError, ProcessControlError, ProcessGeneration,
+    ReleasedChild, SpawnError, TerminationOutcome,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
