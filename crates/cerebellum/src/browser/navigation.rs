@@ -4,9 +4,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
+use crate::browser::geometry::{self, Quad};
 use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
-use crate::browser_session::{NavigationDriveError, NavigationWait};
+use crate::browser_session::{
+    BrowserClickPosition, BrowserInputEvent, ClickDriveError, NavigationDriveError, NavigationWait,
+};
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
 use crate::snapshot_store::{
     truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
@@ -121,6 +124,35 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         self.snapshot_with_clock(context_key, mode, deadline_ms, &mut clock)
     }
 
+    pub(crate) fn click(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.click_with_clock(
+            context_key,
+            identity,
+            deadline_ms,
+            input_dispatched,
+            &mut clock,
+        )
+    }
+
+    #[cfg(test)]
+    fn click_for_test<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+        clock: &mut C,
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        self.click_with_clock(context_key, identity, deadline_ms, input_dispatched, clock)
+    }
+
     #[cfg(test)]
     fn snapshot_for_test<C: NavigationClock>(
         &mut self,
@@ -130,6 +162,176 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.snapshot_with_clock(context_key, mode, deadline_ms, clock)
+    }
+
+    fn click_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+        clock: &mut C,
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ))?;
+        self.ensure_attached(context_key, deadline, clock)
+            .map_err(ClickDriveError::Navigation)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .filter(|attachment| {
+                attachment.context_key == context_key && attachment.target_id == identity.target_id
+            })
+            .ok_or(ClickDriveError::NoPosition)?;
+
+        let mut params = Map::new();
+        params.insert(
+            "backendNodeId".into(),
+            Value::Number(identity.backend_node_id.into()),
+        );
+        let quads_response = self
+            .command_response(
+                "DOM.getContentQuads",
+                Some(params),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                None,
+                clock,
+            )
+            .map_err(ClickDriveError::Navigation)?;
+        if quads_response.error.is_some() {
+            return Err(ClickDriveError::NoPosition);
+        }
+        let quads = required_content_quads(&quads_response.result.ok_or(
+            ClickDriveError::Navigation(NavigationDriveError::CdpFailure),
+        )?)
+        .map_err(ClickDriveError::Navigation)?;
+        let projection =
+            geometry::select_first_eligible(&quads).map_err(|_| ClickDriveError::NoPosition)?;
+        let position = BrowserClickPosition {
+            x_css: projection.x_css,
+            y_css: projection.y_css,
+        };
+
+        let hit_x = hit_test_coordinate(position.x_css)?;
+        let hit_y = hit_test_coordinate(position.y_css)?;
+        let mut hit_params = Map::new();
+        hit_params.insert("x".into(), Value::Number(hit_x.into()));
+        hit_params.insert("y".into(), Value::Number(hit_y.into()));
+        hit_params.insert("includeUserAgentShadowDOM".into(), Value::Bool(true));
+        let hit_response = self
+            .command_response(
+                "DOM.getNodeForLocation",
+                Some(hit_params),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                None,
+                clock,
+            )
+            .map_err(ClickDriveError::Navigation)?;
+        if hit_response.error.is_some() {
+            return Err(ClickDriveError::NoPosition);
+        }
+        let hit_result = hit_response.result.ok_or(ClickDriveError::Navigation(
+            NavigationDriveError::CdpFailure,
+        ))?;
+        let hit_backend_node_id = hit_result
+            .get("backendNodeId")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ))?;
+        let hit_frame_id = hit_result
+            .get("frameId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ))?;
+        if hit_frame_id != identity.frame_id {
+            return Err(ClickDriveError::NoPosition);
+        }
+        if hit_backend_node_id != identity.backend_node_id {
+            let mut describe_params = Map::new();
+            describe_params.insert(
+                "backendNodeId".into(),
+                Value::Number(identity.backend_node_id.into()),
+            );
+            describe_params.insert("depth".into(), Value::Number((-1).into()));
+            describe_params.insert("pierce".into(), Value::Bool(true));
+            let describe_response = self
+                .command_response(
+                    "DOM.describeNode",
+                    Some(describe_params),
+                    Some(attachment.session_id.clone()),
+                    deadline,
+                    None,
+                    None,
+                    clock,
+                )
+                .map_err(ClickDriveError::Navigation)?;
+            if describe_response.error.is_some() {
+                return Err(ClickDriveError::NoPosition);
+            }
+            let described = describe_response.result.ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ))?;
+            if !described_node_contains(&described, hit_backend_node_id)
+                .map_err(ClickDriveError::Navigation)?
+            {
+                return Err(ClickDriveError::NoPosition);
+            }
+        }
+
+        let mut press_params = mouse_event_params("mousePressed", position);
+        press_params.insert("button".into(), Value::String("left".into()));
+        press_params.insert("clickCount".into(), Value::Number(1.into()));
+        let mut press_dispatched = || input_dispatched(BrowserInputEvent::Press(position));
+        let press = self
+            .command_response(
+                "Input.dispatchMouseEvent",
+                Some(press_params),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                Some(&mut press_dispatched),
+                clock,
+            )
+            .map_err(ClickDriveError::Navigation)?;
+        if press.error.is_some() {
+            return Err(ClickDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ));
+        }
+
+        let mut release_params = mouse_event_params("mouseReleased", position);
+        release_params.insert("button".into(), Value::String("left".into()));
+        release_params.insert("clickCount".into(), Value::Number(1.into()));
+        let mut release_dispatched = || input_dispatched(BrowserInputEvent::Release(position));
+        let release = self
+            .command_response(
+                "Input.dispatchMouseEvent",
+                Some(release_params),
+                Some(attachment.session_id),
+                deadline,
+                None,
+                Some(&mut release_dispatched),
+                clock,
+            )
+            .map_err(ClickDriveError::Navigation)?;
+        if release.error.is_some() {
+            return Err(ClickDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ));
+        }
+        Ok(position)
     }
 
     fn snapshot_with_clock<C: NavigationClock>(
@@ -373,9 +575,28 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         params: Option<Map<String, Value>>,
         session_id: Option<String>,
         deadline: Instant,
-        mut tracking: Option<(&str, &mut Tracker)>,
+        tracking: Option<(&str, &mut Tracker)>,
         clock: &mut C,
     ) -> Result<Map<String, Value>, NavigationDriveError> {
+        let response =
+            self.command_response(method, params, session_id, deadline, tracking, None, clock)?;
+        if response.error.is_some() {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        response.result.ok_or(NavigationDriveError::CdpFailure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn command_response<C: NavigationClock>(
+        &mut self,
+        method: &str,
+        params: Option<Map<String, Value>>,
+        session_id: Option<String>,
+        deadline: Instant,
+        mut tracking: Option<(&str, &mut Tracker)>,
+        mut dispatched: Option<&mut dyn FnMut()>,
+        clock: &mut C,
+    ) -> Result<CdpResponse, NavigationDriveError> {
         let command = self
             .transport
             .issue_command(method, params, session_id, clock.now())
@@ -388,6 +609,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         self.pipe
             .write_frame(&bytes)
             .map_err(|_| NavigationDriveError::ConnectorFailure)?;
+        if let Some(callback) = dispatched.as_mut() {
+            callback();
+        }
 
         loop {
             if clock.now() >= deadline {
@@ -402,10 +626,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 None => self.read_turn(Some(command_id), None, clock.now())?,
             };
             if let Some(response) = response {
-                if response.error.is_some() {
-                    return Err(NavigationDriveError::CdpFailure);
-                }
-                return response.result.ok_or(NavigationDriveError::CdpFailure);
+                return Ok(response);
             }
             let remaining = deadline.saturating_duration_since(clock.now());
             clock.sleep(cmp::min(POLL_INTERVAL, remaining));
@@ -530,6 +751,91 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             _ => {}
         }
     }
+}
+
+fn hit_test_coordinate(value: f64) -> Result<i64, ClickDriveError> {
+    let rounded = value.round();
+    if !(0.0..=f64::from(i32::MAX)).contains(&rounded) {
+        return Err(ClickDriveError::NoPosition);
+    }
+    Ok(rounded as i64)
+}
+
+fn mouse_event_params(event_type: &str, position: BrowserClickPosition) -> Map<String, Value> {
+    let mut params = Map::new();
+    params.insert("type".into(), Value::String(event_type.to_string()));
+    params.insert(
+        "x".into(),
+        Value::Number(
+            serde_json::Number::from_f64(position.x_css)
+                .expect("eligible click x-coordinate is finite"),
+        ),
+    );
+    params.insert(
+        "y".into(),
+        Value::Number(
+            serde_json::Number::from_f64(position.y_css)
+                .expect("eligible click y-coordinate is finite"),
+        ),
+    );
+    params
+}
+
+fn required_content_quads(result: &Map<String, Value>) -> Result<Vec<Quad>, NavigationDriveError> {
+    let values = result
+        .get("quads")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() <= 4_096)
+        .ok_or(NavigationDriveError::CdpFailure)?;
+    values
+        .iter()
+        .map(|value| {
+            let coordinates = value
+                .as_array()
+                .filter(|coordinates| coordinates.len() == 8)
+                .ok_or(NavigationDriveError::CdpFailure)?;
+            let mut points = [(0.0, 0.0); 4];
+            for (index, point) in points.iter_mut().enumerate() {
+                point.0 = coordinates[index * 2]
+                    .as_f64()
+                    .ok_or(NavigationDriveError::CdpFailure)?;
+                point.1 = coordinates[index * 2 + 1]
+                    .as_f64()
+                    .ok_or(NavigationDriveError::CdpFailure)?;
+            }
+            Ok(Quad::new(points))
+        })
+        .collect()
+}
+
+fn described_node_contains(
+    result: &Map<String, Value>,
+    backend_node_id: u64,
+) -> Result<bool, NavigationDriveError> {
+    let root = result
+        .get("node")
+        .and_then(Value::as_object)
+        .ok_or(NavigationDriveError::CdpFailure)?;
+    let mut pending = vec![root];
+    let mut visited = 0usize;
+    while let Some(node) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 4_096 {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        if node.get("backendNodeId").and_then(Value::as_u64) == Some(backend_node_id) {
+            return Ok(true);
+        }
+        if let Some(children) = node.get("children") {
+            let children = children
+                .as_array()
+                .ok_or(NavigationDriveError::CdpFailure)?;
+            for child in children {
+                pending.push(child.as_object().ok_or(NavigationDriveError::CdpFailure)?);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn required_ax_node(
@@ -1015,6 +1321,153 @@ mod tests {
             frame_id,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn click_dispatches_mouse_input_at_the_resolved_content_quad_center() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
+            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut input_events = Vec::new();
+        let mut clock = FakeClock::new();
+
+        let position = driver
+            .click_for_test(
+                "route-own",
+                &identity,
+                1_000,
+                &mut |event| input_events.push(event),
+                &mut clock,
+            )
+            .unwrap();
+
+        assert_eq!(
+            position,
+            BrowserClickPosition {
+                x_css: 22.0,
+                y_css: 36.0,
+            }
+        );
+        assert_eq!(
+            input_events,
+            vec![
+                BrowserInputEvent::Press(position),
+                BrowserInputEvent::Release(position),
+            ]
+        );
+        let writes = &driver.pipe.writes;
+        assert_eq!(writes.len(), 4);
+        assert_eq!(writes[0]["method"], "DOM.getContentQuads");
+        assert_eq!(writes[0]["params"]["backendNodeId"], 42);
+        assert_eq!(writes[1]["method"], "DOM.getNodeForLocation");
+        assert_eq!(writes[1]["params"]["x"], 22);
+        assert_eq!(writes[1]["params"]["y"], 36);
+        assert_eq!(writes[2]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(writes[2]["params"]["type"], "mousePressed");
+        assert_eq!(writes[2]["params"]["x"], 22.0);
+        assert_eq!(writes[2]["params"]["y"], 36.0);
+        assert_eq!(writes[3]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(writes[3]["params"]["type"], "mouseReleased");
+        assert_eq!(writes[3]["params"]["x"], 22.0);
+        assert_eq!(writes[3]["params"]["y"], 36.0);
+    }
+
+    #[test]
+    fn click_without_an_eligible_content_quad_refuses_without_input_dispatch() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{"quads":[[8.0,13.0,8.0,13.0,8.0,13.0,8.0,13.0]]}}),
+            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut input_events = Vec::new();
+        let mut clock = FakeClock::new();
+
+        let result = driver.click_for_test(
+            "route-own",
+            &identity,
+            1_000,
+            &mut |event| input_events.push(event),
+            &mut clock,
+        );
+
+        assert_eq!(result, Err(ClickDriveError::NoPosition));
+        assert!(input_events.is_empty());
+        assert_eq!(driver.pipe.writes.len(), 1);
+        assert_eq!(driver.pipe.writes[0]["method"], "DOM.getContentQuads");
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .all(|write| write["method"] != "Input.dispatchMouseEvent"));
+    }
+
+    #[test]
+    fn click_with_an_offscreen_content_quad_refuses_without_input_dispatch() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{"quads":[[-30.0,20.0,-10.0,20.0,-10.0,40.0,-30.0,40.0]]}}),
+            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut input_events = Vec::new();
+        let mut clock = FakeClock::new();
+
+        let result = driver.click_for_test(
+            "route-own",
+            &identity,
+            1_000,
+            &mut |event| input_events.push(event),
+            &mut clock,
+        );
+
+        assert_eq!(result, Err(ClickDriveError::NoPosition));
+        assert!(input_events.is_empty());
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .all(|write| write["method"] != "Input.dispatchMouseEvent"));
+    }
+
+    #[test]
+    fn click_with_an_occluded_center_refuses_without_input_dispatch() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
+            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":99,"frameId":"frame-main"}}),
+            json!({"id":3,"sessionId":"session-own","result":{"node":{"backendNodeId":42}}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut input_events = Vec::new();
+        let mut clock = FakeClock::new();
+
+        let result = driver.click_for_test(
+            "route-own",
+            &identity,
+            1_000,
+            &mut |event| input_events.push(event),
+            &mut clock,
+        );
+
+        assert_eq!(result, Err(ClickDriveError::NoPosition));
+        assert!(input_events.is_empty());
+        assert_eq!(driver.pipe.writes[2]["method"], "DOM.describeNode");
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .all(|write| write["method"] != "Input.dispatchMouseEvent"));
     }
 
     #[test]

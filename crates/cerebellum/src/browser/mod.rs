@@ -1203,19 +1203,10 @@ impl BrowserPlane {
         )
     }
 
-    /// Record the post-commitment input sequence for a click and release the
-    /// snapshot it was aimed at.
-    ///
-    /// Shared by the structured and coordinate click paths so the actuation
-    /// ordering cannot be changed for one and left alone for the other. The two
-    /// paths are required to reach the same target classification, and a change
-    /// that landed on only one of them would be a difference in what actually
-    /// gets pressed rather than in how it was authorized.
-    ///
-    /// The adapter supplies geometry and hit-test observations, and commitment
-    /// is recorded before they are read because those reads are part of the
-    /// click's verification sequence.
-    async fn actuate_click(&self, identity: &RouteIdentity, snapshot_id: &str) {
+    /// Keep the coordinate click's existing operation record and pin cleanup.
+    /// Structured clicks use the session driver because their DOM identity can be
+    /// resolved by the browser; coordinate clicks require a separate input-space pass.
+    async fn actuate_click_point(&self, identity: &RouteIdentity, snapshot_id: &str) {
         let mut state = self.state.lock().await;
         Self::op(
             &mut state,
@@ -1235,6 +1226,27 @@ impl BrowserPlane {
         if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
             context.snapshots.unpin(snapshot_id);
         }
+    }
+
+    async fn unpin_text_snapshot(&self, identity: &RouteIdentity, snapshot_id: &str) {
+        let mut state = self.state.lock().await;
+        if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
+            context.snapshots.unpin(snapshot_id);
+        }
+    }
+
+    pub async fn text_snapshot_pin_count_for_test(
+        &self,
+        identity: &RouteIdentity,
+        snapshot_id: &str,
+    ) -> usize {
+        self.state
+            .lock()
+            .await
+            .contexts
+            .get(&identity.conversation_key)
+            .map(|context| context.snapshots.pin_count(snapshot_id))
+            .unwrap_or_default()
     }
 
     async fn click(&self, identity: &RouteIdentity, args: &Value) -> Result<Value, BrowserError> {
@@ -1263,7 +1275,7 @@ impl BrowserPlane {
                 reason_code: "severity_below_floor",
             });
         }
-        {
+        let backend_identity = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
@@ -1276,26 +1288,108 @@ impl BrowserPlane {
                 .snapshots
                 .pin_text(snapshot_id, context.epoch.value())
                 .map_err(map_snapshot_error)?;
-            let refs = snapshot.refs;
-            if !refs
+            let Some(record) = snapshot
+                .refs
                 .iter()
-                .any(|record| record.captured.reference == reference)
-            {
+                .find(|record| record.captured.reference == reference)
+            else {
+                context.snapshots.unpin(snapshot_id);
                 return Err(BrowserError::RefNotFound {
                     reference: reference.to_string(),
                 });
+            };
+            let Some(backend_identity) = record.backend_identity.clone() else {
+                context.snapshots.unpin(snapshot_id);
+                return Err(BrowserError::ElementIntercepted);
+            };
+            backend_identity
+        };
+
+        let reservation = self.reserve(identity, BrowserCapability::Click).await;
+        let mut session_operation = match reservation {
+            Ok(Some(operation)) => operation,
+            Ok(None) => {
+                self.unpin_text_snapshot(identity, snapshot_id).await;
+                return Err(BrowserError::NoSession);
+            }
+            Err(error) => {
+                self.unpin_text_snapshot(identity, snapshot_id).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.commit(identity, BrowserCapability::Click).await {
+            session_operation.finish();
+            self.unpin_text_snapshot(identity, snapshot_id).await;
+            return Err(error);
+        }
+        {
+            let mut state = self.state.lock().await;
+            Self::op(
+                &mut state,
+                &identity.conversation_key,
+                Operation::CdpObserve,
+            );
+        }
+
+        let Some(deadline_ms) = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+        else {
+            session_operation.finish();
+            self.unpin_text_snapshot(identity, snapshot_id).await;
+            return Err(BrowserError::NoSession);
+        };
+        let state = Arc::clone(&self.state);
+        let route_key = identity.conversation_key.clone();
+        let driven = tokio::task::spawn_blocking(move || {
+            let mut input_dispatched = |event| {
+                let operation = match event {
+                    crate::browser_session::BrowserInputEvent::Press(_) => Operation::CdpInputPress,
+                    crate::browser_session::BrowserInputEvent::Release(_) => {
+                        Operation::CdpInputRelease
+                    }
+                };
+                let mut state = state.blocking_lock();
+                Self::op(&mut state, &route_key, operation);
+            };
+            let result = session_operation.click(
+                &route_key,
+                &backend_identity,
+                deadline_ms,
+                &mut input_dispatched,
+            );
+            (session_operation, result)
+        })
+        .await;
+        let (session_operation, drive_result) = match driven {
+            Ok(result) => result,
+            Err(_) => {
+                self.unpin_text_snapshot(identity, snapshot_id).await;
+                return Err(BrowserError::Internal {
+                    reason_code: JournalReasonCode::InternalFailure,
+                });
+            }
+        };
+        session_operation.finish();
+        self.unpin_text_snapshot(identity, snapshot_id).await;
+
+        match drive_result {
+            Ok(_) => {}
+            Err(crate::browser_session::ClickDriveError::NoPosition) => {
+                self.finalize(
+                    identity,
+                    BrowserCapability::Click,
+                    Outcome::StaleSnapshot,
+                    json!({}),
+                )
+                .await?;
+                return Err(BrowserError::ElementIntercepted);
+            }
+            Err(crate::browser_session::ClickDriveError::Navigation(error)) => {
+                return Err(map_navigation_drive_error(error));
             }
         }
-        let _session_operation = self.reserve(identity, BrowserCapability::Click).await?;
-        let mut state = self.state.lock().await;
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpObserve,
-        );
-        drop(state);
-        self.commit(identity, BrowserCapability::Click).await?;
-        self.actuate_click(identity, snapshot_id).await;
         self.finalize(
             identity,
             BrowserCapability::Click,
@@ -1438,7 +1532,7 @@ impl BrowserPlane {
         );
         drop(state);
         self.commit(identity, BrowserCapability::ClickPoint).await?;
-        self.actuate_click(identity, snapshot_id).await;
+        self.actuate_click_point(identity, snapshot_id).await;
         self.finalize(
             identity,
             BrowserCapability::ClickPoint,

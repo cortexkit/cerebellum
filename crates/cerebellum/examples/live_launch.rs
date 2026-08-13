@@ -20,13 +20,19 @@
 //! cargo run -p cerebellum --example live_launch
 //! ```
 
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
+use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::Tracker;
 use cerebellum::browser_config::BrowserConfig;
 use cerebellum::browser_launch_service::ProductionLaunchService;
-use cerebellum::browser_session::NavigationWait;
+use cerebellum::browser_session::{NavigationWait, OwnedBrowserProcess};
 use cerebellum::snapshot_store::SnapshotKind;
 use cerebellum_core::identity::AcceptedBindFacts;
 use serde_json::json;
@@ -156,100 +162,184 @@ fn profile_directories() -> Vec<String> {
     found
 }
 
+struct ProbePage {
+    address: SocketAddr,
+    url: String,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ProbePage {
+    fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let body = concat!(
+                            "<!doctype html><html><head><title>Cerebellum Click Probe</title></head>",
+                            "<body><main><h1 id='status'>Click probe before</h1>",
+                            "<button type='button' onclick=\"document.getElementById('status').textContent='Click probe after'\">",
+                            "Change probe text</button></main></body></html>"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            url: format!("http://{address}/"),
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl Drop for ProbePage {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn print_snapshot(label: &str, snapshot: &BrowserSnapshotObservation) {
+    println!(
+        "snapshot {label}: records={} refs={} truncated={} refs_truncated={}",
+        snapshot.records.len(),
+        snapshot.refs.len(),
+        snapshot.ax_truncated,
+        snapshot.refs_truncated
+    );
+    for record in &snapshot.records {
+        println!(
+            "snapshot {label} AX: role={:?} name={:?}",
+            record.role, record.name
+        );
+    }
+}
+
+fn drive_click_probe(process: &mut dyn OwnedBrowserProcess, context_key: &str) -> Option<String> {
+    let before = match process.snapshot(context_key, SnapshotKind::Ax, 10_000) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Some(format!("snapshot before click failed: {error:?}")),
+    };
+    print_snapshot("BEFORE", &before);
+    let Some(reference) = before.refs.iter().find(|reference| {
+        reference.captured.role == "button" && reference.captured.name == "Change probe text"
+    }) else {
+        return Some("snapshot before click did not expose the named button ref".into());
+    };
+    let Some(backend_identity) = reference.backend_identity.as_ref() else {
+        return Some("named button ref had no backend DOM identity".into());
+    };
+    let mut input_events = Vec::new();
+    let position = match process.click(context_key, backend_identity, 10_000, &mut |event| {
+        input_events.push(event)
+    }) {
+        Ok(position) => position,
+        Err(error) => {
+            return Some(format!(
+                "click {} failed: {error:?}",
+                reference.captured.reference
+            ))
+        }
+    };
+    println!(
+        "click ref={} resolved=({}, {}) input={input_events:?}",
+        reference.captured.reference, position.x_css, position.y_css
+    );
+
+    let after = match process.snapshot(context_key, SnapshotKind::Ax, 10_000) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Some(format!("snapshot after click failed: {error:?}")),
+    };
+    print_snapshot("AFTER", &after);
+    let changed = before.records != after.records
+        && after
+            .records
+            .iter()
+            .any(|record| record.role == "heading" && record.name == "Click probe after");
+    if changed {
+        println!("CLICK VERDICT: second snapshot DIFFERS and exposes 'Click probe after'");
+        None
+    } else {
+        Some("second snapshot did not differ with the expected visible text change".into())
+    }
+}
+
 fn launch_once(
     service: &ProductionLaunchService,
     accepted: &AcceptedBindFacts,
     session_id: &str,
 ) -> bool {
     let started = Instant::now();
+    let page = match ProbePage::start() {
+        Ok(page) => page,
+        Err(error) => {
+            println!("probe page failed to start: {error}");
+            return false;
+        }
+    };
     match service.launch(accepted, session_id) {
         Ok(ready) => {
             println!("[{session_id}] LAUNCHED in {:?}", started.elapsed());
             let (mut process, mut cleanup) = ready.into_parts();
             println!("generation still matches: {}", process.generation_matches());
 
-            // The default document has enough distinct semantics that a nearly-empty
-            // adapter cannot appear healthy merely because it found the page root.
-            // A caller can still override it to exercise redirects or a deployed page.
-            let override_url = std::env::var("CK_PROBE_URL").ok();
-            let requested_url = override_url.clone().unwrap_or_else(|| {
-                concat!(
-                    "data:text/html,",
-                    "%3Cheader%3E%3Ch1%3ECerebellum%20Snapshot%20Probe%3C/h1%3E%3C/header%3E",
-                    "%3Cnav%20aria-label='Probe%20navigation'%3E%3Ca%20href='%23details'%3ERead%20details%3C/a%3E%3C/nav%3E",
-                    "%3Cmain%3E%3Csection%3E%3Ch2%20id='details'%3EAccount%20details%3C/h2%3E",
-                    "%3Cform%20aria-label='Probe%20form'%3E%3Clabel%20for='email'%3EEmail%20address%3C/label%3E",
-                    "%3Cinput%20id='email'%20type='email'%3E%3Cbutton%20type='button'%3ESave%20profile%3C/button%3E",
-                    "%3C/form%3E%3C/section%3E%3C/main%3E%3Cfooter%3EProbe%20footer%3C/footer%3E"
-                )
-                .to_string()
-            });
-            let requested_url = requested_url.as_str();
+            // Serve a normal HTTP page so both navigation and the click effect are
+            // observations of browser state, not values embedded in a data URL.
+            let requested_url = page.url();
             let mut tracker = Tracker::default();
             tracker.token("navigation_started");
-            match process.navigate(
+            let navigation_failure = match process.navigate(
                 &accepted.identity.conversation_key,
                 requested_url,
                 NavigationWait::Settle,
                 10_000,
                 &mut tracker,
             ) {
-                Ok(()) => println!(
-                    "navigation: requested={requested_url} url_final={:?} settled={} lifecycle={:?}",
-                    tracker.url_final, tracker.settled, tracker.lifecycle
-                ),
-                Err(error) => println!(
-                    "navigation failed: {error:?}; url_final={:?} lifecycle={:?}",
-                    tracker.url_final, tracker.lifecycle
-                ),
-            }
-
-            let snapshot_failure = match process.snapshot(
-                &accepted.identity.conversation_key,
-                SnapshotKind::Ax,
-                10_000,
-            ) {
-                Ok(snapshot) => {
+                Ok(()) => {
                     println!(
-                        "snapshot: records={} refs={} truncated={} refs_truncated={}",
-                        snapshot.records.len(),
-                        snapshot.refs.len(),
-                        snapshot.ax_truncated,
-                        snapshot.refs_truncated
+                        "navigation: requested={requested_url} url_final={:?} settled={} lifecycle={:?}",
+                        tracker.url_final, tracker.settled, tracker.lifecycle
                     );
-                    for record in &snapshot.records {
-                        println!("snapshot AX: role={:?} name={:?}", record.role, record.name);
-                    }
-                    if override_url.is_some() {
-                        None
-                    } else {
-                        let expected = [
-                            ("banner", ""),
-                            ("heading", "Cerebellum Snapshot Probe"),
-                            ("navigation", "Probe navigation"),
-                            ("link", "Read details"),
-                            ("main", ""),
-                            ("heading", "Account details"),
-                            ("form", "Probe form"),
-                            ("textbox", "Email address"),
-                            ("button", "Save profile"),
-                            ("contentinfo", ""),
-                        ];
-                        let missing = expected
-                            .into_iter()
-                            .filter(|(role, name)| {
-                                !snapshot.records.iter().any(|record| {
-                                    record.role == *role
-                                        && (name.is_empty() || record.name == *name)
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        (!missing.is_empty()).then(|| {
-                            format!("snapshot missed expected role/name pairs: {missing:?}")
-                        })
-                    }
+                    None
                 }
-                Err(error) => Some(format!("snapshot failed: {error:?}")),
+                Err(error) => {
+                    let failure = format!(
+                        "navigation failed: {error:?}; url_final={:?} lifecycle={:?}",
+                        tracker.url_final, tracker.lifecycle
+                    );
+                    println!("{failure}");
+                    Some(failure)
+                }
+            };
+
+            let click_probe_failure = if navigation_failure.is_none() {
+                drive_click_probe(process.as_mut(), &accepted.identity.conversation_key)
+            } else {
+                navigation_failure
             };
 
             // The real ladder: ask, wait the grace period, force only if the
@@ -283,7 +373,7 @@ fn launch_once(
                 Ok(()) => println!("[{session_id}] reaped and cleaned up after reap"),
                 Err(stage) => println!("[{session_id}] cleanup failed at {stage:?}"),
             }
-            if let Some(failure) = snapshot_failure {
+            if let Some(failure) = click_probe_failure {
                 panic!("{failure}");
             }
             true
