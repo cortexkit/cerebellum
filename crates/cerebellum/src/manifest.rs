@@ -42,6 +42,30 @@ use subc_protocol::PROTOCOL_VERSION;
 /// The single application capability this module advertises.
 pub const BROWSER_STATUS: &str = "browser.status";
 
+pub fn browser_control_tools() -> Vec<Tool> {
+    use crate::browser_session::{BROWSER_CLOSE, BROWSER_LAUNCH};
+    vec![
+        Tool {
+            name: BROWSER_LAUNCH.to_string(),
+            description: Some("Launch the route-owned browser session.".to_string()),
+            execution_mode: ExecutionMode::Unfenceable,
+            schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+        },
+        Tool {
+            name: BROWSER_STATUS.to_string(),
+            description: Some("Report the route-owned browser session state.".to_string()),
+            execution_mode: ExecutionMode::Pure,
+            schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+        },
+        Tool {
+            name: BROWSER_CLOSE.to_string(),
+            description: Some("Close and reap the route-owned browser session.".to_string()),
+            execution_mode: ExecutionMode::Unfenceable,
+            schema: json!({"type":"object","properties":{"browser_session_id":{"type":"string","minLength":1}},"required":["browser_session_id"],"additionalProperties":false}),
+        },
+    ]
+}
+
 /// Build the browser-free cerebellum capability manifest.
 ///
 /// The default manifest declares exactly one `ToolProvider` role with the
@@ -79,6 +103,10 @@ fn management_surface() -> ProviderRole {
 }
 
 pub fn build(module_id: &str) -> ModuleManifest {
+    build_with_browser_config(module_id, false)
+}
+
+pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -86,23 +114,11 @@ pub fn build(module_id: &str) -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: vec![
             ProviderRole::ToolProvider {
-                tools: vec![Tool {
-                    name: BROWSER_STATUS.to_string(),
-                    description: Some(
-                        "Report the browser-plane session status and profile disposition \
-                     without opening a browser."
-                            .to_string(),
-                    ),
-                    execution_mode: ExecutionMode::Pure,
-                    // Closed schema: the request is `{}` (empty); unknown fields are
-                    // rejected at the application level. The schema declares no
-                    // properties and forbids additional properties.
-                    schema: json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false,
-                    }),
-                }],
+                tools: if browser_configured {
+                    browser_control_tools()
+                } else {
+                    Vec::new()
+                },
                 identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
                 concurrency: Concurrency::ModuleManaged,
                 emits_push: false,
@@ -141,7 +157,7 @@ pub fn build_with_browser_plane_pins(
     common_artifacts_eligible: bool,
     extraction_evidence_eligible: bool,
 ) -> ModuleManifest {
-    let mut manifest = build(module_id);
+    let mut manifest = build_with_browser_config(module_id, true);
     let Some(pins) = pins else {
         return manifest;
     };
@@ -446,13 +462,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_advertises_exactly_one_capability() {
-        let manifest = build("cerebellum");
-        let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+    fn browser_controls_follow_configuration_presence() {
+        let absent = build("cerebellum");
+        let ProviderRole::ToolProvider { tools, .. } = &absent.provides[0] else {
             panic!("expected a ToolProvider role");
         };
-        assert_eq!(tools.len(), 1, "exactly one application capability");
-        assert_eq!(tools[0].name, BROWSER_STATUS);
+        assert!(tools.is_empty());
+
+        let configured = build_with_browser_config("cerebellum", true);
+        let ProviderRole::ToolProvider { tools, .. } = &configured.provides[0] else {
+            panic!("expected a ToolProvider role");
+        };
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["browser.launch", "browser.status", "browser.close"]
+        );
     }
 
     /// The management surface advertises only what the dispatcher will serve.
@@ -503,20 +530,28 @@ mod tests {
 
     #[test]
     fn browser_status_is_pure() {
-        let manifest = build("cerebellum");
+        let manifest = build_with_browser_config("cerebellum", true);
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
         };
-        assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
+        let status = tools
+            .iter()
+            .find(|tool| tool.name == BROWSER_STATUS)
+            .unwrap();
+        assert_eq!(status.execution_mode, ExecutionMode::Pure);
     }
 
     #[test]
     fn browser_status_schema_is_closed() {
-        let manifest = build("cerebellum");
+        let manifest = build_with_browser_config("cerebellum", true);
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
         };
-        let schema = &tools[0].schema;
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == BROWSER_STATUS)
+            .unwrap()
+            .schema;
         assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("object"));
         assert_eq!(
             schema.get("additionalProperties").and_then(|v| v.as_bool()),
@@ -538,14 +573,14 @@ mod tests {
 
     #[test]
     fn manifest_tool_schema_has_no_evidence_approval_member() {
-        let manifest = build("cerebellum");
+        let manifest = build_with_browser_config("cerebellum", true);
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("expected a ToolProvider role");
         };
-        assert!(tools[0]
+        assert!(tools.iter().all(|tool| tool
             .schema
             .get("browser_evidence_eligibility_sha256")
-            .is_none());
+            .is_none()));
     }
 
     fn valid_evidence() -> EvidenceEligibilityInput {
@@ -604,8 +639,8 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            5,
-            "status plus navigate, screenshot, point-click, and wait"
+            7,
+            "three controls plus navigate, screenshot, point-click, and wait"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
 
@@ -618,7 +653,11 @@ mod tests {
         let ProviderRole::ToolProvider { tools, .. } = &all.provides[0] else {
             panic!("expected tool provider");
         };
-        assert_eq!(tools.len(), 7, "status plus six minted browser routes");
+        assert_eq!(
+            tools.len(),
+            9,
+            "three controls plus six minted browser routes"
+        );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
         let serialized = serialize_with_browser_plane_pins(
             "cerebellum",
