@@ -19,6 +19,7 @@ const F_SETFD: c_int = 2;
 const FD_CLOEXEC: c_int = 1;
 const SIGCONT: c_int = 19;
 const SIGKILL: c_int = 9;
+#[cfg(test)]
 const WNOHANG: c_int = 1;
 const PROC_PIDLISTFDS: c_int = 1;
 const CF_NUMBER_SINT32_TYPE: c_int = 3;
@@ -184,7 +185,6 @@ pub enum SpawnError {
     DuplicateDescriptor(io::ErrorKind),
     Fork(io::ErrorKind),
     Spawn(c_int),
-    GuardianProtocol,
     ProcessMissing,
     ProcessInspectionDenied,
     ProcessLayoutMismatch,
@@ -277,15 +277,14 @@ pub enum TerminationOutcome {
 /// `POSIX_SPAWN_START_SUSPENDED` stops the target after the kernel has installed
 /// its executable image but before its first user-space instruction. That makes
 /// the actual mapped image available to Security.framework without allowing the
-/// browser to touch its profile. A separate guardian owns the target and blocks
-/// on a pipe whose write end exists only in the launcher. EOF makes the guardian
-/// kill and reap the still-suspended target, so launcher death cannot accidentally
-/// turn the gate into release.
+/// browser to touch its profile. The launcher remains the target's parent so it
+/// can reap every normal terminal path. A separate guardian blocks on a pipe
+/// whose write end exists only in the launcher; EOF makes the guardian kill the
+/// still-suspended target if the launcher dies before release.
 pub struct BarredChild {
     generation: ProcessGeneration,
     guardian_pid: c_int,
     command: Option<OwnedFd>,
-    terminal_report: Option<OwnedFd>,
 }
 
 impl BarredChild {
@@ -302,23 +301,20 @@ impl BarredChild {
             .command
             .take()
             .ok_or(ProcessControlError::AlreadyReleased)?;
-        write_byte(command.as_raw_fd(), b'R').map_err(ProcessControlError::Signal)?;
-        let released = ReleasedChild {
-            generation: self.generation,
-            guardian_pid: self.guardian_pid,
-            guardian_release: Some(command),
-            terminal_report: self.terminal_report.take(),
-            reaped: false,
-        };
+        let generation = self.generation;
+        let result = release_guarded_target(self.guardian_pid, generation.pid as c_int, command);
         std::mem::forget(self);
-        Ok(released)
+        result.map(|_| ReleasedChild {
+            generation,
+            reaped: false,
+        })
     }
 
-    /// Kill the barred target and wait for its guardian to reap it.
+    /// Kill the barred target, then reap both processes owned by the launcher.
     pub fn terminate_and_reap(mut self) -> Result<(), ProcessControlError> {
-        self.terminate_inner()?;
+        let result = self.terminate_inner();
         std::mem::forget(self);
-        Ok(())
+        result
     }
 
     fn terminate_inner(&mut self) -> Result<(), ProcessControlError> {
@@ -326,15 +322,7 @@ impl BarredChild {
             .command
             .take()
             .ok_or(ProcessControlError::AlreadyReleased)?;
-        let _ = write_byte(command.as_raw_fd(), b'T');
-        wait_for_guardian(
-            self.guardian_pid,
-            self.generation,
-            self.terminal_report
-                .take()
-                .ok_or(ProcessControlError::GuardianProtocol)?,
-            command,
-        )
+        terminate_guarded_target(self.guardian_pid, self.generation.pid as c_int, command)
     }
 }
 
@@ -347,9 +335,6 @@ impl Drop for BarredChild {
 /// Ownership of a released target remains represented by this handle.
 pub struct ReleasedChild {
     generation: ProcessGeneration,
-    guardian_pid: c_int,
-    guardian_release: Option<OwnedFd>,
-    terminal_report: Option<OwnedFd>,
     reaped: bool,
 }
 
@@ -358,45 +343,34 @@ impl ReleasedChild {
         self.generation
     }
 
-    /// Wait until the target exits and its guardian has reaped it.
+    /// Wait until the target exits and reap it in the launcher.
     pub fn wait(mut self) -> Result<(), ProcessControlError> {
-        wait_for_guardian(
-            self.guardian_pid,
-            self.generation,
-            self.terminal_report
-                .take()
-                .ok_or(ProcessControlError::GuardianProtocol)?,
-            self.guardian_release
-                .take()
-                .ok_or(ProcessControlError::GuardianProtocol)?,
-        )?;
-        self.reaped = true;
-        Ok(())
+        let result = wait_for_pid(self.generation.pid as c_int);
+        if result.is_ok() {
+            self.reaped = true;
+        }
+        result
     }
 
-    /// Terminate only if the PID still names the released generation, then wait
-    /// for the guardian that owns `waitpid` authority to reap it.
+    /// Terminate only if the PID still names the released generation, then reap
+    /// the launcher's direct child.
     pub fn terminate_and_reap(mut self) -> Result<(), ProcessControlError> {
         verify_generation(self.generation)?;
         // SAFETY: a plain pid and signal are passed by value. The generation was
         // checked immediately above; a mismatch is refused rather than signaled.
-        if unsafe { kill(self.generation.pid as c_int, SIGKILL) } != 0 {
-            return Err(ProcessControlError::Signal(
+        let signal_result = if unsafe { kill(self.generation.pid as c_int, SIGKILL) } == 0 {
+            Ok(())
+        } else {
+            Err(ProcessControlError::Signal(
                 io::Error::last_os_error().kind(),
-            ));
+            ))
+        };
+        let reap_result = wait_for_pid(self.generation.pid as c_int);
+        if reap_result.is_ok() {
+            self.reaped = true;
         }
-        wait_for_guardian(
-            self.guardian_pid,
-            self.generation,
-            self.terminal_report
-                .take()
-                .ok_or(ProcessControlError::GuardianProtocol)?,
-            self.guardian_release
-                .take()
-                .ok_or(ProcessControlError::GuardianProtocol)?,
-        )?;
-        self.reaped = true;
-        Ok(())
+        signal_result?;
+        reap_result
     }
 }
 
@@ -410,14 +384,9 @@ impl Drop for ReleasedChild {
             // best-effort ownership cleanup.
             let _ = unsafe { kill(self.generation.pid as c_int, SIGKILL) };
         }
-        if let (Some(report), Some(release)) =
-            (self.terminal_report.take(), self.guardian_release.take())
-        {
-            let _ = wait_for_guardian(self.guardian_pid, self.generation, report, release);
-        } else {
-            let _ = wait_for_pid(self.guardian_pid);
+        if wait_for_pid(self.generation.pid as c_int).is_ok() {
+            self.reaped = true;
         }
-        self.reaped = true;
     }
 }
 
@@ -475,78 +444,63 @@ pub fn spawn_barred(
     let command_source = duplicate_descriptor(cdp_command_read_fd)?;
     let response_source = duplicate_descriptor(cdp_response_write_fd)?;
     let (death_read, death_write) = create_pipe()?;
-    let (report_read, report_write) = create_pipe()?;
-    // Build the allocation-backed spawn descriptions before fork. The guardian
-    // then uses only process syscalls and prebuilt memory; it never enters the
-    // allocator state copied from another thread at fork time.
     let (mut actions, mut attributes) =
         prepare_spawn(command_source.as_raw_fd(), response_source.as_raw_fd())?;
 
-    // SAFETY: fork has no pointer arguments. The guardian branch below limits
-    // itself to C process APIs and prebuilt C strings before calling `_exit`.
-    let guardian_pid = unsafe { fork() };
-    if guardian_pid < 0 {
-        let _ = unsafe { posix_spawn_file_actions_destroy(&mut actions) };
-        let _ = unsafe { posix_spawnattr_destroy(&mut attributes) };
-        return Err(SpawnError::Fork(io::Error::last_os_error().kind()));
-    }
-    if guardian_pid == 0 {
-        drop(death_write);
-        drop(report_read);
-        guardian_main(GuardianSpawn {
-            death_read: death_read.as_raw_fd(),
-            report_write: report_write.as_raw_fd(),
-            command_source: command_source.as_raw_fd(),
-            response_source: response_source.as_raw_fd(),
-            executable: executable.as_ptr(),
-            argv: argv.as_ptr(),
-            envp: envp.as_ptr(),
-            actions,
-            attributes,
-        });
-    }
-
+    // `posix_spawn` may enter framework and libc initialization, so it must run
+    // in the ordinary multithreaded process rather than in a child of `fork`.
+    let mut target_pid = 0;
+    let spawn_status = unsafe {
+        posix_spawn(
+            &mut target_pid,
+            executable.as_ptr(),
+            &actions,
+            &attributes,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        )
+    };
     let _ = unsafe { posix_spawn_file_actions_destroy(&mut actions) };
     let _ = unsafe { posix_spawnattr_destroy(&mut attributes) };
-    drop(death_read);
-    drop(report_write);
     drop(command_source);
     drop(response_source);
-
-    let mut report = [0u8; 8];
-    if read_exact_raw(report_read.as_raw_fd(), &mut report).is_err() {
-        drop(death_write);
-        let _ = wait_for_pid(guardian_pid);
-        return Err(SpawnError::GuardianProtocol);
-    }
-    let spawn_status = c_int::from_ne_bytes(report[..4].try_into().expect("four status bytes"));
-    let target_pid = c_int::from_ne_bytes(report[4..].try_into().expect("four pid bytes"));
     if spawn_status != 0 || target_pid <= 0 {
-        drop(death_write);
-        let _ = wait_for_pid(guardian_pid);
         return Err(SpawnError::Spawn(spawn_status));
     }
+
+    // Read the table limit before fork so the guardian can close inherited
+    // descriptors using only the async-signal-safe `close` syscall.
+    let descriptor_limit = unsafe { getdtablesize() };
+    // SAFETY: fork has no pointer arguments. The child branch calls only
+    // async-signal-safe process functions before `_exit`.
+    let guardian_pid = unsafe { fork() };
+    if guardian_pid < 0 {
+        let error = io::Error::last_os_error().kind();
+        let _ = unsafe { kill(target_pid, SIGKILL) };
+        let _ = waitpid_retry(target_pid);
+        return Err(SpawnError::Fork(error));
+    }
+    if guardian_pid == 0 {
+        guardian_main(death_read.as_raw_fd(), target_pid, descriptor_limit);
+    }
+    drop(death_read);
 
     let start_time_micros = match process_start_time(target_pid as u32) {
         ProcessStartTime::Started(value) => value,
         ProcessStartTime::NoSuchProcess => {
-            drop(death_write);
-            let _ = wait_for_pid(guardian_pid);
+            let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
             return Err(SpawnError::ProcessMissing);
         }
         ProcessStartTime::NotPermitted => {
-            drop(death_write);
-            let _ = wait_for_pid(guardian_pid);
+            let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
             return Err(SpawnError::ProcessInspectionDenied);
         }
         ProcessStartTime::LayoutMismatch => {
-            drop(death_write);
-            let _ = wait_for_pid(guardian_pid);
+            let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
             return Err(SpawnError::ProcessLayoutMismatch);
         }
         ProcessStartTime::NoStartTime => {
-            drop(death_write);
-            let _ = wait_for_pid(guardian_pid);
+            let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
             return Err(SpawnError::ProcessStartTimeMissing);
         }
     };
@@ -558,7 +512,6 @@ pub fn spawn_barred(
         },
         guardian_pid,
         command: Some(death_write),
-        terminal_report: Some(report_read),
     })
 }
 
@@ -757,93 +710,32 @@ fn prepare_spawn(
     Ok((actions, attributes))
 }
 
-struct GuardianSpawn {
-    death_read: RawFd,
-    report_write: RawFd,
-    command_source: RawFd,
-    response_source: RawFd,
-    executable: *const c_char,
-    argv: *const *mut c_char,
-    envp: *const *mut c_char,
-    actions: PosixSpawnFileActions,
-    attributes: PosixSpawnAttr,
-}
-
-fn guardian_main(spawn: GuardianSpawn) -> ! {
-    let GuardianSpawn {
-        death_read,
-        report_write,
-        command_source,
-        response_source,
-        executable,
-        argv,
-        envp,
-        actions,
-        attributes,
-    } = spawn;
-    // The guardian exists only to convert death-pipe EOF into kill-and-reap. It
-    // must not keep unrelated module descriptors alive while doing so, because
-    // merely retaining a pipe or socket end changes who has authority over its
-    // lifetime even when the guardian never reads it.
-    let descriptor_limit = unsafe { getdtablesize() };
-    for descriptor in 3..descriptor_limit {
-        if ![death_read, report_write, command_source, response_source].contains(&descriptor) {
+fn guardian_main(death_read: RawFd, target_pid: c_int, descriptor_limit: c_int) -> ! {
+    // Only async-signal-safe calls are allowed here: another thread may have held
+    // any userspace lock when `fork` copied the process. Closing every inherited
+    // descriptor except the death pipe also prevents this helper from extending
+    // unrelated pipe, socket, or file authority.
+    for descriptor in 0..descriptor_limit {
+        if descriptor != death_read {
             let _ = unsafe { close(descriptor) };
         }
     }
 
-    let mut target_pid = 0;
-    let status = unsafe {
-        posix_spawn(
-            &mut target_pid,
-            executable,
-            &actions,
-            &attributes,
-            argv,
-            envp,
-        )
-    };
-    let _ = unsafe { close(command_source) };
-    let _ = unsafe { close(response_source) };
-
-    let mut report = [0u8; 8];
-    report[..4].copy_from_slice(&status.to_ne_bytes());
-    report[4..].copy_from_slice(&target_pid.to_ne_bytes());
-    let _ = write_all_raw(report_write, &report);
-    if status != 0 || target_pid <= 0 {
-        let _ = unsafe { close(report_write) };
-        unsafe { _exit(111) };
-    }
-
-    let mut command = [0u8; 1];
-    let received = read_exact_raw(death_read, &mut command).is_ok();
-    let reaped = if received && command[0] == b'R' {
-        let mut child_status = 0;
-        // A suspended direct child cannot legitimately disappear before release.
-        // Checking waitpid first avoids signaling a PID already known to have
-        // exited if an external actor terminated it.
-        let observed = unsafe { waitpid(target_pid, &mut child_status, WNOHANG) };
-        if observed == target_pid {
-            true
-        } else if observed == 0 {
-            let _ = unsafe { kill(target_pid, SIGCONT) };
-            waitpid_retry(target_pid).is_ok()
-        } else {
-            false
-        }
+    let mut command = 0u8;
+    let received = unsafe { read(death_read, (&mut command as *mut u8).cast(), 1) };
+    let signal = if received == 1 && command == b'R' {
+        SIGCONT
     } else {
-        let _ = unsafe { kill(target_pid, SIGKILL) };
-        waitpid_retry(target_pid).is_ok()
+        SIGKILL
     };
-    let _ = write_byte(report_write, if reaped { b'R' } else { b'F' });
-    let _ = unsafe { close(report_write) };
-    // Keep the guardian alive after reporting so the launcher can verify that
-    // the target disappeared while still parented here. Closing the launcher's
-    // write end is the acknowledgement that this observation is complete.
-    let mut acknowledgement = [0u8; 1];
-    let _ = read_exact_raw(death_read, &mut acknowledgement);
+    // Before release the launcher is still the target's parent, so an exited
+    // target retains its PID until that parent reaps it. After launcher death,
+    // the guardian cannot read a start time without violating fork safety; PID
+    // reuse would require an independent target death, launchd reaping it, and a
+    // reuse in the interval between death-pipe wakeup and this signal.
+    let signalled = unsafe { kill(target_pid, signal) } == 0;
     let _ = unsafe { close(death_read) };
-    unsafe { _exit(if reaped { 0 } else { 112 }) }
+    unsafe { _exit(if signalled { 0 } else { 112 }) }
 }
 
 fn verify_generation(generation: ProcessGeneration) -> Result<(), ProcessControlError> {
@@ -853,37 +745,67 @@ fn verify_generation(generation: ProcessGeneration) -> Result<(), ProcessControl
     }
 }
 
-fn wait_for_guardian(
+fn release_guarded_target(
     guardian_pid: c_int,
-    generation: ProcessGeneration,
-    terminal_report: OwnedFd,
-    guardian_release: OwnedFd,
+    target_pid: c_int,
+    command: OwnedFd,
 ) -> Result<(), ProcessControlError> {
-    let mut report = [0u8; 1];
-    let report_result = read_exact_raw(terminal_report.as_raw_fd(), &mut report);
-    // Read this while the guardian is still our direct child. If the guardian
-    // exited without waiting, the target could be reparented and disappear for a
-    // different reason; checking before guardian reap proves its own waitpid won.
-    let target_is_gone = process_start_time(generation.pid) == ProcessStartTime::NoSuchProcess;
-    drop(terminal_report);
-    drop(guardian_release);
-    wait_for_pid(guardian_pid)?;
-    if report_result.is_err() || report[0] != b'R' || !target_is_gone {
+    let write_result = write_byte(command.as_raw_fd(), b'R').map_err(ProcessControlError::Signal);
+    drop(command);
+    let guardian_result = wait_for_guardian(guardian_pid);
+    if write_result.is_err() || guardian_result.is_err() {
+        // The target is our unreaped direct child, so its PID cannot have been
+        // reused. A failed guardian command is therefore safe to contain here.
+        let _ = unsafe { kill(target_pid, SIGKILL) };
+        let _ = wait_for_pid(target_pid);
+    }
+    write_result?;
+    guardian_result
+}
+
+fn terminate_guarded_target(
+    guardian_pid: c_int,
+    target_pid: c_int,
+    command: OwnedFd,
+) -> Result<(), ProcessControlError> {
+    let write_result = write_byte(command.as_raw_fd(), b'T').map_err(ProcessControlError::Signal);
+    drop(command);
+    // Wait for the guardian before reaping the target. Until the launcher reaps
+    // its direct child, the target PID cannot be reused under the guardian.
+    let guardian_result = wait_for_guardian(guardian_pid);
+    if write_result.is_err() || guardian_result.is_err() {
+        let _ = unsafe { kill(target_pid, SIGKILL) };
+    }
+    let target_result = wait_for_pid(target_pid);
+    write_result?;
+    guardian_result?;
+    target_result
+}
+
+fn wait_for_guardian(guardian_pid: c_int) -> Result<(), ProcessControlError> {
+    let status = waitpid_status_retry(guardian_pid).map_err(ProcessControlError::Reap)?;
+    if status != 0 {
         return Err(ProcessControlError::GuardianProtocol);
     }
     Ok(())
 }
 
 fn wait_for_pid(pid: c_int) -> Result<(), ProcessControlError> {
-    waitpid_retry(pid).map_err(ProcessControlError::Reap)
+    waitpid_status_retry(pid)
+        .map(|_| ())
+        .map_err(ProcessControlError::Reap)
 }
 
 fn waitpid_retry(pid: c_int) -> Result<(), io::ErrorKind> {
+    waitpid_status_retry(pid).map(|_| ())
+}
+
+fn waitpid_status_retry(pid: c_int) -> Result<c_int, io::ErrorKind> {
     loop {
         let mut status = 0;
         let result = unsafe { waitpid(pid, &mut status, 0) };
         if result == pid {
-            return Ok(());
+            return Ok(status);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -939,25 +861,6 @@ fn write_all_raw(fd: RawFd, mut bytes: &[u8]) -> Result<(), io::ErrorKind> {
         if written > 0 {
             bytes = &bytes[written as usize..];
             continue;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error.kind());
-        }
-    }
-    Ok(())
-}
-
-fn read_exact_raw(fd: RawFd, mut bytes: &mut [u8]) -> Result<(), io::ErrorKind> {
-    while !bytes.is_empty() {
-        let read_count = unsafe { read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-        if read_count > 0 {
-            let (_, rest) = bytes.split_at_mut(read_count as usize);
-            bytes = rest;
-            continue;
-        }
-        if read_count == 0 {
-            return Err(io::ErrorKind::UnexpectedEof);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -1043,6 +946,22 @@ mod tests {
         (command_read, command_write, response_read, response_write)
     }
 
+    fn assert_reaped_by_launcher(pid: u32) {
+        let mut status = 0;
+        // A successful wait here would consume a zombie and prove the production
+        // path returned before fulfilling its own reaping responsibility.
+        let observed = unsafe { waitpid(pid as c_int, &mut status, WNOHANG) };
+        assert_eq!(
+            observed, -1,
+            "target {pid} remained waitable by its launcher"
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(10),
+            "waitpid refused for a reason other than ECHILD"
+        );
+    }
+
     fn spawn_shell(script: &str) -> BarredChild {
         let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
         spawn_barred(
@@ -1093,6 +1012,7 @@ mod tests {
             ProcessStartTime::NoSuchProcess,
             "the target was not reaped after its effect"
         );
+        assert_reaped_by_launcher(generation.pid);
     }
 
     #[test]
@@ -1137,6 +1057,26 @@ mod tests {
             process_start_time(generation.pid),
             ProcessStartTime::NoSuchProcess
         );
+        assert_reaped_by_launcher(generation.pid);
+    }
+
+    #[test]
+    fn released_termination_reaps_the_target_in_the_launcher() {
+        let _serial = serialize_launch_fixtures();
+        let released = spawn_shell("sleep 30")
+            .release()
+            .expect("release exact generation");
+        let generation = released.generation();
+
+        released
+            .terminate_and_reap()
+            .expect("terminate and reap released target");
+
+        assert_eq!(
+            process_start_time(generation.pid),
+            ProcessStartTime::NoSuchProcess
+        );
+        assert_reaped_by_launcher(generation.pid);
     }
 
     #[test]
@@ -1150,6 +1090,10 @@ mod tests {
             .create_new(true)
             .open(&authority_path)
             .expect("open unintended descriptor");
+        // Rust opens files close-on-exec by default. Clear that flag so this test
+        // proves the spawn policy closes unspecified descriptors rather than
+        // accidentally relying on the caller's descriptor hygiene.
+        assert_eq!(unsafe { fcntl(unintended.as_raw_fd(), F_SETFD, 0) }, 0);
         // SAFETY: flock takes a live descriptor and an operation by value.
         assert_eq!(unsafe { flock(unintended.as_raw_fd(), 2) }, 0);
         let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
@@ -1162,22 +1106,28 @@ mod tests {
         )
         .expect("spawn suspended sleep");
 
-        let descriptors =
+        let mut descriptors =
             process_descriptors(child.generation().pid).expect("enumerate descriptors");
-        assert!(descriptors.contains(&0));
-        assert!(descriptors.contains(&1));
-        assert!(descriptors.contains(&2));
-        assert!(descriptors.contains(&3));
-        assert!(descriptors.contains(&4));
+        descriptors.sort_unstable();
+        assert_eq!(descriptors, vec![0, 1, 2, 3, 4]);
         // Descriptor numbers can be reused for intended pipes, so comparing the
         // parent's number would confuse a remapping with inheritance. Drop the
         // parent's lock-bearing descriptor and ask the kernel whether any other
         // process still carries that exact open-file authority.
         drop(unintended);
         let contender = File::open(&authority_path).expect("reopen authority file");
-        // LOCK_EX | LOCK_NB succeeds only when neither target nor guardian kept
-        // the parent's open file description alive.
-        assert_eq!(unsafe { flock(contender.as_raw_fd(), 2 | 4) }, 0);
+        // The parent can resume before the newly forked guardian is scheduled to
+        // close its inherited descriptors. Wait only for that finite setup step;
+        // LOCK_EX | LOCK_NB then proves neither process retains the authority.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let lock_result = loop {
+            let result = unsafe { flock(contender.as_raw_fd(), 2 | 4) };
+            if result == 0 || Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(lock_result, 0);
         child.terminate_and_reap().expect("reap descriptor fixture");
     }
 
@@ -1244,7 +1194,7 @@ mod tests {
             .env("CEREBELLUM_BARRIER_HELPER_REPORT", &report)
             .status()
             .expect("run owner helper");
-        assert!(status.success(), "owner helper failed: {status}");
+        assert_eq!(status.code(), Some(0), "owner helper failed: {status}");
         let pid: u32 = fs::read_to_string(&report)
             .expect("helper wrote target pid")
             .parse()

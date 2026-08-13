@@ -1,11 +1,9 @@
-//! Does the launch barrier survive being used from a heavily threaded process?
+//! Does the launch barrier remain fork-safe in a heavily threaded process?
 //!
-//! The module runs a multithreaded async runtime, and `spawn_barred` forks.
-//! `fork()` clones only the calling thread, so any lock another thread held at
-//! that instant stays locked forever in the child — and the child then calls
-//! `posix_spawn`, which is not guaranteed safe in that state. A test binary is
-//! threaded too, which is why this shows up as a load-dependent flake rather
-//! than a clean failure.
+//! The module runs a multithreaded async runtime. The target must be spawned by
+//! that ordinary process before it forks the guardian; the guardian's child-side
+//! body may use only async-signal-safe calls. Framework churn and concurrent
+//! launch attempts keep the unsafe pre-exec window under pressure.
 
 use std::ffi::OsString;
 use std::os::fd::AsRawFd;
@@ -76,13 +74,12 @@ fn main() {
 
     let shell = PathBuf::from("/bin/sh");
     let args: Vec<OsString> = vec![OsString::from("-c"), OsString::from("exit 0")];
-    // Fork from SEVERAL threads at once when asked. The suite does this and the
-    // earlier runs of this probe did not: libtest runs tests on parallel
-    // threads, and more than one launch test spawns a process, so the real
+    // Launch from SEVERAL threads at once when asked. The suite does this and
+    // the earlier runs of this probe did not: libtest runs tests on parallel
+    // threads, and more than one launch test creates a guardian, so the real
     // condition is concurrent forks from one process rather than a loop on a
-    // single thread. `fork()` clones only the calling thread, so two threads
-    // forking while a third holds a lock is a different situation from one
-    // thread forking while others merely work.
+    // single thread. `fork()` clones only the calling thread, so every guardian
+    // child must remain safe even while another thread holds a framework lock.
     let concurrent_forkers: usize = std::env::args()
         .position(|argument| argument == "--forkers")
         .and_then(|at| std::env::args().nth(at + 1))
