@@ -488,7 +488,6 @@ pub struct BrowserPlane {
     grants: Arc<Mutex<GrantStore>>,
     journal_config: Option<journal::JournalConfig>,
     journals: Arc<Mutex<HashMap<String, JournalInvocation>>>,
-    authorization_enabled: bool,
     session_gate: Option<(
         crate::browser_session::BrowserSessions,
         Arc<cerebellum_core::clock::SystemClock>,
@@ -507,7 +506,6 @@ impl BrowserPlane {
             grants: Arc::new(Mutex::new(grants)),
             journal_config: None,
             journals: Arc::new(Mutex::new(HashMap::new())),
-            authorization_enabled: true,
             session_gate: None,
         }
     }
@@ -520,6 +518,17 @@ impl BrowserPlane {
             session_gate: Some((sessions, clock, navigation_settle_deadline_ms)),
             ..Self::default()
         }
+    }
+
+    /// Install grants on a plane that already has a session gate.
+    ///
+    /// Separate from [`Self::with_grants`] because a driving capability needs
+    /// both, and the two constructors each reach `Self::default()` for the
+    /// half they do not set -- so calling one after the other would discard
+    /// whichever was applied first.
+    pub fn with_grants_installed(mut self, grants: GrantStore) -> Self {
+        self.grants = Arc::new(Mutex::new(grants));
+        self
     }
 
     pub fn with_journal(config: journal::JournalConfig) -> Self {
@@ -921,7 +930,7 @@ impl BrowserPlane {
                 reason_code: "unsupported_value",
             });
         }
-        if self.authorization_enabled {
+        {
             let decision = self
                 .grants
                 .lock()
@@ -2097,6 +2106,25 @@ mod tests {
         json!({"tier":1,"credential":false,"financial":false})
     }
 
+    /// A grant covering this module's test conversation and origin.
+    ///
+    /// The authorization gate always runs and an empty store covers nothing, so
+    /// a test about anything downstream of it must arrive holding the authority
+    /// a real caller would hold.
+    fn test_grants() -> GrantStore {
+        GrantStore::new([crate::authorization::ActionGrant::new(
+            "browser-mod-test-grant",
+            1,
+            identity().conversation_key.clone(),
+            crate::authorization::Severity {
+                tier: 4,
+                credential: false,
+                financial: false,
+            },
+            ["https://example.test"],
+        )])
+    }
+
     #[tokio::test]
     async fn six_tools_have_closed_descriptors_and_browser_type_is_absent() {
         let tools = tool_definitions();
@@ -2159,7 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn navigation_without_a_session_never_opens_an_operation_bracket() {
-        let plane = BrowserPlane::new();
+        let plane = BrowserPlane::new().with_grants_installed(test_grants());
         let identity = identity();
         plane.open_context(identity.clone()).await.unwrap();
         let request = json!({"url":"https://example.test/","intent":"go","severity":severity(),"wait":"none"});

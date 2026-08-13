@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cerebellum::authorization::{ActionGrant, GrantStore, Severity};
 use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
 use cerebellum::browser_session::{
@@ -222,6 +223,27 @@ fn plane_with_process(
     assert_eq!(browser_session_id, acquired_id);
     assert!(!cancelled);
     BrowserPlane::with_session_gate(sessions, clock, navigation_settle_deadline_ms)
+        .with_grants_installed(navigation_grants())
+}
+
+/// A grant covering this file's navigation conversation and origin.
+///
+/// The authorization gate always runs and an empty store covers nothing, so a
+/// test about navigation behaviour must arrive holding the authority a real
+/// caller would hold. Turning the gate off instead would make every one of
+/// these tests pass over a plane that no longer resembles the shipped one.
+fn navigation_grants() -> GrantStore {
+    GrantStore::new([ActionGrant::new(
+        "b1-s3-navigation-grant",
+        1,
+        identity().conversation_key.clone(),
+        Severity {
+            tier: 4,
+            credential: false,
+            financial: false,
+        },
+        ["https://requested.example"],
+    )])
 }
 
 #[derive(Clone)]
@@ -566,7 +588,7 @@ impl OwnedBrowserProcess for UnsettledNavigationProcess {
 
 #[tokio::test]
 async fn navigation_without_a_ready_session_refuses_before_commit_or_transport() {
-    let plane = BrowserPlane::new();
+    let plane = BrowserPlane::new().with_grants_installed(navigation_grants());
     let route = identity();
     plane.open_context(route.clone()).await.unwrap();
 
@@ -599,7 +621,8 @@ async fn navigation_while_launch_is_pending_still_names_no_open_session() {
             panic!("unexpected occupied launch slot {browser_session_id}")
         }
     }
-    let plane = BrowserPlane::with_session_gate(sessions, Arc::new(SystemClock::new()), 100);
+    let plane = BrowserPlane::with_session_gate(sessions, Arc::new(SystemClock::new()), 100)
+        .with_grants_installed(navigation_grants());
     plane.open_context(route.clone()).await.unwrap();
 
     let result = plane
@@ -958,5 +981,61 @@ async fn a_stale_text_snapshot_refuses_before_any_input_is_dispatched() {
             .text_snapshot_pin_count_for_test(&route, &snapshot_id)
             .await,
         0
+    );
+}
+
+/// The plane production builds runs its authorization gate.
+///
+/// `BrowserPlane` derives `Default`, so a `bool` field the derive is left to
+/// fill is `false`. Both production constructors reach that default -- `new()`
+/// directly, and `with_session_gate` through `..Self::default()` -- while only
+/// `with_grants` sets the flag, and nothing outside tests calls it.
+///
+/// That is not a dormant fixture setting. `browser.navigate` becomes
+/// wire-dispatchable as soon as a browser is configured, so a flag reading
+/// `false` means navigation is served with its grant check skipped rather than
+/// refused for want of a grant -- the opposite of the fail-closed posture the
+/// empty grant store is there to provide.
+///
+/// Asserted behaviourally rather than by reading the field, because the field
+/// is private and what matters is what a request receives. An empty grant store
+/// can cover nothing, so a plane whose gate runs must refuse this request; a
+/// plane whose gate is skipped proceeds past it.
+#[tokio::test]
+async fn the_plane_production_builds_runs_its_authorization_gate() {
+    let plane = BrowserPlane::new();
+    let route = identity();
+    plane.open_context(route.clone()).await.unwrap();
+
+    let outcome = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://example.test/",
+                "intent": "probe whether the grant gate runs",
+                "wait": "none",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    let body = outcome.to_string();
+    // A request that never reached the gate proves nothing about it.
+    assert!(
+        !body.contains("missing_field") && !body.contains("unsupported_value"),
+        "the request was refused at validation before reaching the \
+         authorization gate, so this run did not test the gate: {body}"
+    );
+    assert!(
+        body.contains("authorization") || body.contains("grant"),
+        "A navigate through the PRODUCTION constructor was not refused by the \
+         authorization gate, so the gate did not run.\n\n\
+         BrowserPlane derives Default and `authorization_enabled` is a bool the \
+         derive sets to FALSE. `new()` and `with_session_gate` both reach that \
+         default; only `with_grants`, which nothing outside tests calls, sets it \
+         true. browser.navigate IS wire-dispatchable once a browser is \
+         configured, so this serves navigation with no grant check at all.\n\n\
+         Outcome was: {body}"
     );
 }
