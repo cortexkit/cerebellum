@@ -107,7 +107,16 @@ impl ProductionLaunchService {
                 &accepted.identity.conversation_key,
                 browser_session_id,
             ),
-            ProfileDisposition::None => unreachable!("none returned before profile preparation"),
+            // Refused rather than asserted impossible. It is unreachable only
+            // because the check above reads a disposition that this same field
+            // produced, so the two agree by construction — an invariant held in
+            // another module's validator rather than here. A panic on a wire
+            // path takes the module loop down and every unrelated capability
+            // with it, which is a heavy price for a condition whose honest
+            // answer already exists one branch up.
+            ProfileDisposition::None => {
+                return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}))
+            }
         };
 
         let mut lifecycle_guard = lifecycle
