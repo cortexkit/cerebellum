@@ -833,7 +833,19 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let health_state = Arc::new(HealthState::with_config(config.health));
-    let planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
+    let mut planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
+    #[cfg(target_os = "macos")]
+    if planes.launch_service.is_none() {
+        if let Some(browser) = config.browser.clone() {
+            // Startup recovery belongs before `module_loop`: once that loop owns
+            // the transport it can serve launch requests, so publishing the
+            // production service any later would let a fresh spawn race an
+            // attested orphan from the previous module process.
+            planes.launch_service = Some(Arc::new(
+                browser_launch_service::ProductionLaunchService::open(browser),
+            ));
+        }
+    }
     let idle_enforcer = config.browser.clone().map(|browser| {
         let sessions = planes.sessions.clone();
         let clock = Arc::clone(&planes.lease_clock);

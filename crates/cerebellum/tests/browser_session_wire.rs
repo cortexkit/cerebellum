@@ -84,6 +84,21 @@ impl BrowserSessionLauncher for RecordingLauncher {
     }
 }
 
+struct RecoveryFailedLauncher;
+
+impl BrowserSessionLauncher for RecoveryFailedLauncher {
+    fn launch(
+        &self,
+        _: &cerebellum_core::identity::AcceptedBindFacts,
+        _: &str,
+    ) -> Result<(Box<dyn OwnedBrowserProcess>, Box<dyn SessionCleanup>), Value> {
+        Err(json!({
+            "outcome": "internal_failure",
+            "reason_code": "browser_launch_recovery_failed",
+        }))
+    }
+}
+
 struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -242,6 +257,27 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         "browser_session_not_found"
     );
     assert_eq!(launcher.effects.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() {
+    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    planes.launch_service = Some(Arc::new(RecoveryFailedLauncher));
+
+    let response = invoke(&planes, 1, "browser.launch", json!({})).await;
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+    assert_eq!(
+        body,
+        json!({
+            "outcome": "internal_failure",
+            "reason_code": "browser_launch_recovery_failed",
+        })
+    );
+    assert!(matches!(
+        planes.health.report(),
+        subc_protocol::session::ModuleControlResponse::HealthCheck { .. }
+    ));
 }
 
 #[tokio::test]
