@@ -167,8 +167,14 @@ fn launch_once(
             let (mut process, mut cleanup) = ready.into_parts();
             println!("generation still matches: {}", process.generation_matches());
 
-            let requested_url =
-                "data:text/html,<title>Cerebellum%20navigation%20probe</title>ready";
+            // A data URL always reports itself as the final URL, so `url_final`
+            // looks identical whether the browser supplied it or the request was
+            // echoed back. Override this with a redirecting origin to tell those
+            // two apart.
+            let requested_url = std::env::var("CK_PROBE_URL").unwrap_or_else(|_| {
+                "data:text/html,<title>Cerebellum%20navigation%20probe</title>ready".to_string()
+            });
+            let requested_url = requested_url.as_str();
             let mut tracker = Tracker::default();
             tracker.token("navigation_started");
             match process.navigate(

@@ -332,7 +332,28 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
         match event.method.as_str() {
             "Page.loadEventFired" => tracker.load(observed_at),
-            "Network.requestWillBeSent" => tracker.request_started(),
+            "Network.requestWillBeSent" => {
+                // A redirect re-emits this event for the SAME request, carrying
+                // the response that caused the redirect. The original request
+                // never gets its own `loadingFinished`, so counting the
+                // continuation as a new request leaks one in-flight forever and
+                // the navigation can never reach network quiet.
+                //
+                // Measured against Chrome 151: `http://example.com` redirects to
+                // https and never settled, while `https://example.com/` settled
+                // immediately. On today's web nearly every bare-domain URL
+                // redirects, so this made `wait: "settle"` unusable for real
+                // navigation while looking correct on a page that happens not to
+                // redirect.
+                let is_redirect_continuation = event
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("redirectResponse"))
+                    .is_some();
+                if !is_redirect_continuation {
+                    tracker.request_started();
+                }
+            }
             "Network.loadingFinished" | "Network.loadingFailed" => {
                 tracker.request_finished(observed_at)
             }
@@ -534,6 +555,101 @@ mod tests {
 
         assert!(!tracker.load_observed);
         assert!(tracker.lifecycle.is_empty());
+    }
+
+    /// A redirect continuation is not a new request.
+    ///
+    /// Chrome re-emits `requestWillBeSent` for the SAME request when it
+    /// redirects, carrying the response that caused it, and the original never
+    /// receives its own `loadingFinished`. Counting the continuation leaves one
+    /// request in flight forever, so the navigation never reaches network quiet.
+    ///
+    /// Measured against Chrome 151 before the fix: `http://example.com` never
+    /// settled while `https://example.com/` settled at once. Nearly every
+    /// bare-domain URL redirects to https, so this made `wait: "settle"`
+    /// unusable for real navigation while passing on pages that do not redirect.
+    #[test]
+    fn a_redirect_continuation_is_not_counted_as_a_new_request() {
+        let driver = attached_driver([]);
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+
+        // The original request, then the redirect continuation, then the single
+        // completion the browser sends for the whole chain.
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Network.requestWillBeSent", json!({})),
+            now,
+        );
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"redirectResponse": {"status": 301, "url": "http://example.com/"}}),
+            ),
+            now,
+        );
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Network.loadingFinished", json!({})),
+            now,
+        );
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Page.loadEventFired", json!({})),
+            now,
+        );
+
+        assert!(
+            tracker.poll_settlement(now + Duration::from_millis(QUIET_MS + 1)),
+            "a redirected navigation never settled: {:?} in flight",
+            tracker.inflight_count
+        );
+    }
+
+    /// The companion: an ordinary second request IS counted.
+    ///
+    /// Without this, ignoring every `requestWillBeSent` would satisfy the test
+    /// above while destroying the in-flight count the settlement rule rests on.
+    #[test]
+    fn an_ordinary_concurrent_request_is_still_counted() {
+        let driver = attached_driver([]);
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Network.requestWillBeSent", json!({})),
+            now,
+        );
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Network.requestWillBeSent", json!({})),
+            now,
+        );
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Network.loadingFinished", json!({})),
+            now,
+        );
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Page.loadEventFired", json!({})),
+            now,
+        );
+
+        assert!(
+            !tracker.poll_settlement(now + Duration::from_millis(QUIET_MS + 1)),
+            "settled while a request was still in flight"
+        );
     }
 
     #[test]
