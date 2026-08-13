@@ -933,6 +933,26 @@ mod tests {
     // descriptors from the others, obscuring the whitelist property under test.
     static LAUNCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Take the serialization lock without letting one failure rename the rest.
+    ///
+    /// A panicking test poisons this mutex, so every later test that unwraps the
+    /// lock fails with `PoisonError` instead of running. One real failure then
+    /// arrives as six or seven, all naming tests that were never executed, and
+    /// the one that actually broke is indistinguishable from the ones that did
+    /// not. That happened here: a single spawn failure was read as a broad
+    /// failure of the launch layer, and diagnosing it meant separating the
+    /// original from its victims before anything could be investigated.
+    ///
+    /// Recovering the guard is safe because the data is `()` — there is no
+    /// invariant a panicking holder could have left half-established. What the
+    /// lock protects is the ordering between fixtures, and the next test wants
+    /// that ordering whether or not its predecessor panicked.
+    fn serialize_launch_fixtures() -> std::sync::MutexGuard<'static, ()> {
+        LAUNCH_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -977,7 +997,7 @@ mod tests {
 
     #[test]
     fn barrier_holds_before_release_and_release_executes_once() {
-        let _serial = LAUNCH_TESTS.lock().expect("serialize launch fixtures");
+        let _serial = serialize_launch_fixtures();
         let directory = TestDirectory::new("release");
         let effect = directory.join("effect");
         let script = format!("printf executed >> '{}'; exit 0", effect.display());
@@ -1017,7 +1037,7 @@ mod tests {
 
     #[test]
     fn release_refuses_a_process_generation_that_no_longer_matches() {
-        let _serial = LAUNCH_TESTS.lock().expect("serialize launch fixtures");
+        let _serial = serialize_launch_fixtures();
         let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
         let mut child = spawn_barred(
             Path::new("/bin/sleep"),
@@ -1039,7 +1059,7 @@ mod tests {
 
     #[test]
     fn termination_reaps_a_barred_target_without_running_it() {
-        let _serial = LAUNCH_TESTS.lock().expect("serialize launch fixtures");
+        let _serial = serialize_launch_fixtures();
         let directory = TestDirectory::new("terminate");
         let effect = directory.join("effect");
         let child = spawn_shell(&format!("printf ran > '{}'; sleep 30", effect.display()));
@@ -1061,7 +1081,7 @@ mod tests {
 
     #[test]
     fn the_target_does_not_inherit_an_unintended_parent_descriptor() {
-        let _serial = LAUNCH_TESTS.lock().expect("serialize launch fixtures");
+        let _serial = serialize_launch_fixtures();
         let directory = TestDirectory::new("descriptor-authority");
         let authority_path = directory.join("unintended.lock");
         let unintended = OpenOptions::new()
@@ -1132,7 +1152,7 @@ mod tests {
 
     #[test]
     fn security_framework_reads_the_actual_suspended_image() {
-        let _serial = LAUNCH_TESTS.lock().expect("serialize launch fixtures");
+        let _serial = serialize_launch_fixtures();
         let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
         let child = spawn_barred(
             Path::new("/bin/sleep"),
@@ -1153,7 +1173,7 @@ mod tests {
 
     #[test]
     fn parent_death_before_release_kills_the_suspended_target() {
-        let _serial = LAUNCH_TESTS.lock().expect("serialize launch fixtures");
+        let _serial = serialize_launch_fixtures();
         let directory = TestDirectory::new("parent-death");
         let report = directory.join("pid");
         let helper = std::env::current_exe().expect("test executable");
