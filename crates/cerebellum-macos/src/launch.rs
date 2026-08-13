@@ -212,6 +212,66 @@ pub enum ProcessControlError {
     Reap(io::ErrorKind),
 }
 
+/// Terminate a process only if it is still the exact generation named.
+///
+/// The caller supplies the generation it recorded when the process was trusted,
+/// and this re-reads the kernel's start time immediately before signalling. A
+/// pid alone is not identity: pids are reused, so signalling on a pid match
+/// after a crash can kill an unrelated program that happens to hold that number
+/// now — on a machine this module does not own.
+///
+/// Reports whether a signal was sent, so a caller can tell "the process was
+/// gone" from "the process was replaced" from "it was terminated". An
+/// unreadable start time is refused rather than treated as a mismatch, since
+/// not knowing is not the same as knowing it differs.
+///
+/// Lives here because this crate is the only one permitted raw system calls,
+/// and a caller that instead spawned `/bin/kill` would achieve the same effect
+/// while stepping outside the boundary that makes such calls auditable.
+pub fn terminate_exact_generation(
+    generation: ProcessGeneration,
+) -> Result<TerminationOutcome, ProcessControlError> {
+    // Read the start time directly rather than through `verify_generation`,
+    // which folds an unreadable reading into "changed". Here the difference
+    // decides whether a signal is sent, and NOT KNOWING WHETHER THIS IS THE
+    // SAME PROCESS MUST NOT READ AS KNOWING IT IS NOT: the first is a refusal,
+    // the second would let a caller conclude the orphan is already gone.
+    match process_start_time(generation.pid) {
+        ProcessStartTime::Started(start) if start == generation.start_time_micros => {}
+        ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
+            return Ok(TerminationOutcome::AlreadyGoneOrReplaced)
+        }
+        ProcessStartTime::NotPermitted
+        | ProcessStartTime::LayoutMismatch
+        | ProcessStartTime::NoStartTime => return Err(ProcessControlError::GenerationChanged),
+    }
+
+    if unsafe { kill(generation.pid as c_int, SIGKILL) } != 0 {
+        // A signal that fails because the process left in the meantime is the
+        // outcome we wanted, not a failure.
+        return match process_start_time(generation.pid) {
+            ProcessStartTime::Started(start) if start == generation.start_time_micros => {
+                Err(ProcessControlError::Signal(io::ErrorKind::Other))
+            }
+            ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
+                Ok(TerminationOutcome::AlreadyGoneOrReplaced)
+            }
+            _ => Err(ProcessControlError::Signal(io::ErrorKind::Other)),
+        };
+    }
+    Ok(TerminationOutcome::Signalled)
+}
+
+/// What a generation-checked termination did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationOutcome {
+    /// The exact generation was signalled.
+    Signalled,
+    /// Nothing was signalled: that generation had already exited, or the pid
+    /// now belongs to a different process.
+    AlreadyGoneOrReplaced,
+}
+
 /// A target created in the suspended state with a death-pipe guardian.
 ///
 /// `POSIX_SPAWN_START_SUSPENDED` stops the target after the kernel has installed
@@ -1213,5 +1273,79 @@ mod tests {
         fs::write(report, child.generation().pid.to_string()).expect("write target pid");
         std::mem::forget(child);
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A pid alone never authorizes a signal.
+    ///
+    /// Pids are reused. After a crash the recorded pid may belong to an
+    /// unrelated program — a shell, an editor, anything the user started since
+    /// — so signalling on a pid match would let this module kill a stranger's
+    /// process on a machine it does not own. Only the recorded start time
+    /// distinguishes the two, and it is the single reason the generation is
+    /// captured at launch.
+    #[test]
+    fn a_pid_whose_start_time_differs_is_never_signalled() {
+        // A live process this test owns, standing in for whatever now holds a
+        // recycled pid. Killing it would be the defect.
+        let mut victim = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a process to protect");
+        let pid = victim.id();
+        let real_start = match process_start_time(pid) {
+            ProcessStartTime::Started(start) => start,
+            other => panic!("could not read a start time: {other:?}"),
+        };
+
+        // The same pid, recorded with a generation that is not this process.
+        let stale = ProcessGeneration {
+            pid,
+            start_time_micros: real_start - 1,
+        };
+
+        let outcome = terminate_exact_generation(stale).expect("a mismatch is not a failure");
+
+        assert_eq!(
+            outcome,
+            TerminationOutcome::AlreadyGoneOrReplaced,
+            "a mismatched generation must report nothing was signalled"
+        );
+        assert!(
+            matches!(process_start_time(pid), ProcessStartTime::Started(start) if start == real_start),
+            "an unrelated process holding the recorded pid was killed"
+        );
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    /// The matching generation is signalled, so the refusal above is not simply
+    /// a function that never signals anything.
+    #[test]
+    fn the_exact_generation_is_signalled() {
+        let mut target = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a target");
+        let pid = target.id();
+        let start = match process_start_time(pid) {
+            ProcessStartTime::Started(start) => start,
+            other => panic!("could not read a start time: {other:?}"),
+        };
+
+        let outcome = terminate_exact_generation(ProcessGeneration {
+            pid,
+            start_time_micros: start,
+        })
+        .expect("terminating the exact generation");
+
+        assert_eq!(outcome, TerminationOutcome::Signalled);
+        let _ = target.wait();
     }
 }
