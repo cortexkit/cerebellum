@@ -275,3 +275,84 @@ fn pinned_implementation_digest_matches_the_module_source() {
          ck-browser-profile-registry-v1.json to:\n  {computed}\n"
     );
 }
+
+/// A second agent identity gets its own durable profile.
+///
+/// Per-agent profiles exist so one agent's logins are its own. If the second
+/// identity to ask cannot get a profile at all, the feature is one browser per
+/// machine wearing a per-agent name.
+///
+/// This failed against a real machine while every test passed, because both
+/// guards it exercises only misfire once a `profiles` directory exists: the
+/// uuid collision check treated a resolvable path as an occupied one, and the
+/// foreign-directory check treated another agent's own profile as a stranger's.
+/// A suite whose fixtures each start from an empty root never reaches either.
+#[test]
+fn a_second_agent_identity_gets_its_own_durable_profile() {
+    let root = std::env::temp_dir().join(format!(
+        "ck-two-agents-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+
+    let config = cerebellum::profile::RegistryConfig {
+        uuid_protocol_compatible: true,
+        grant_verifier_available: true,
+        grant_accepted: true,
+        sealing_available: true,
+        ..Default::default()
+    };
+
+    let mut targets = Vec::new();
+    for project in ["pj-agent-one", "pj-agent-two"] {
+        let mut lifecycle =
+            cerebellum::profile::ProfileLifecycle::open_with_config(&root, config.clone())
+                .expect("lifecycle opens");
+        let context = stamped_bind_context(BindFacts {
+            agent_project_id: project.to_string(),
+            conversation_key: format!("conversation-{project}"),
+            ..valid_facts()
+        })
+        .expect("strict bind facts");
+        let invocation = cerebellum::profile::InvocationToken::for_test(project);
+        let reservation = cerebellum::profile::JournalReservationHandle::for_test(
+            &invocation,
+            format!("reservation-{project}"),
+        );
+
+        match lifecycle.prepare_context_open(&invocation, &reservation, &context) {
+            cerebellum::profile::PrepareResult::Prepared(_) => {
+                // Observed on disk rather than from the prepared handle, which
+                // is opaque: the property is that two directories exist, and a
+                // handle reporting two distinct ids would satisfy the assertion
+                // with one directory underneath.
+                let mut minted: Vec<String> = std::fs::read_dir(root.join("profiles"))
+                    .expect("profiles directory")
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                minted.sort();
+                targets = minted;
+            }
+            cerebellum::profile::PrepareResult::Closed(outcome) => {
+                panic!("{project} could not get a durable profile: {outcome:?}")
+            }
+        }
+    }
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "two agents should own two profile directories, found: {targets:?}"
+    );
+    assert_ne!(
+        targets[0], targets[1],
+        "two agents were given the same profile directory: {targets:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -17,105 +17,359 @@
     "algorithm": "sha256",
     "bundle": "ck-browser-profile-registry-implementation-bundle/v1",
     "member_order": "unsigned_utf8_identifier",
-    "value": "9b94a3908af70ac7e237ccf6e9ed42f04ea8163541103f8dc661da8db5f44a53"
+    "value": "70a5e887db688c4f76b636899fd17cb2aa1322bd6009ee5beb7092649518681c"
   },
   "schemas": {
     "registry": {
-      "required": ["schema", "managed_root_identity", "generation", "records", "integrity"],
+      "required": [
+        "schema",
+        "managed_root_identity",
+        "generation",
+        "records",
+        "integrity"
+      ],
       "additional_properties": false,
       "integrity": "sha256-canonical-json-with-integrity-omitted"
     },
     "entry": {
-      "required": ["project_id", "kind", "target", "transaction_id", "state", "owner_instance", "profile_uuid", "profile_name", "session_id", "attachment_id", "process", "seal_state", "quarantine", "generation", "deletion_pending", "integrity"],
+      "required": [
+        "project_id",
+        "kind",
+        "target",
+        "transaction_id",
+        "state",
+        "owner_instance",
+        "profile_uuid",
+        "profile_name",
+        "session_id",
+        "attachment_id",
+        "process",
+        "seal_state",
+        "quarantine",
+        "generation",
+        "deletion_pending",
+        "integrity"
+      ],
       "additional_properties": false,
       "profile_uuid": "immutable-nonempty-uuid",
       "profile_name": "default-for-durable-null-for-disposable",
       "target": "canonical-contained-single-component",
-      "state": ["provisional", "available", "attached", "sealing_transition", "locked", "quarantined", "incomplete", "unavailable", "released", "deletion_failed"],
-      "durable_forbidden_states": ["deletion_failed"],
+      "state": [
+        "provisional",
+        "available",
+        "attached",
+        "sealing_transition",
+        "locked",
+        "quarantined",
+        "incomplete",
+        "unavailable",
+        "released",
+        "deletion_failed"
+      ],
+      "durable_forbidden_states": [
+        "deletion_failed"
+      ],
       "disposable_deletion_pending_only_after_destructive_start": true
     },
     "transaction": {
-      "required": ["transaction_id", "project_id", "kind", "state", "generation", "integrity"],
+      "required": [
+        "transaction_id",
+        "project_id",
+        "kind",
+        "state",
+        "generation",
+        "integrity"
+      ],
       "additional_properties": false
     },
     "lock": {
-      "required": ["lock_id", "slot", "owner_instance", "generation"],
+      "required": [
+        "lock_id",
+        "slot",
+        "owner_instance",
+        "generation"
+      ],
       "additional_properties": false,
-      "held_until": ["terminal_commit", "deletion_failed_with_pending_exclusion"]
+      "held_until": [
+        "terminal_commit",
+        "deletion_failed_with_pending_exclusion"
+      ]
     },
     "attachment": {
-      "required": ["attachment_id", "session_id", "profile_uuid", "generation"],
+      "required": [
+        "attachment_id",
+        "session_id",
+        "profile_uuid",
+        "generation"
+      ],
       "additional_properties": false
     },
     "quarantine": {
-      "required": ["reason", "generation"],
+      "required": [
+        "reason",
+        "generation"
+      ],
       "additional_properties": false,
-      "reason": ["unregistered_profile_directory", "malformed_profile_metadata", "conflicting_registry_identity", "ambiguous_ownership", "ambiguous_seal_state", "managed_root_escape", "liveness_unavailable", "deletion_failed"]
+      "reason": [
+        "unregistered_profile_directory",
+        "malformed_profile_metadata",
+        "conflicting_registry_identity",
+        "ambiguous_ownership",
+        "ambiguous_seal_state",
+        "managed_root_escape",
+        "liveness_unavailable",
+        "deletion_failed"
+      ]
     },
     "deletion_failure": {
-      "required": ["transaction_id", "profile_uuid", "deletion_pending", "generation", "integrity"],
+      "required": [
+        "transaction_id",
+        "profile_uuid",
+        "deletion_pending",
+        "generation",
+        "integrity"
+      ],
       "additional_properties": false,
       "kind": "disposable_only"
     }
   },
   "providers": {
-    "complete_source_set": ["instance", "session", "attachment", "lock_owner", "supervised_process"],
+    "complete_source_set": [
+      "instance",
+      "session",
+      "attachment",
+      "lock_owner",
+      "supervised_process"
+    ],
     "required": [
-      {"id": "instance", "freshness": "generation", "absence": "authoritative", "inconsistent": "unavailable"},
-      {"id": "session", "freshness": "generation", "absence": "authoritative", "inconsistent": "unavailable"},
-      {"id": "attachment", "freshness": "generation", "absence": "authoritative", "inconsistent": "unavailable"},
-      {"id": "lock_owner", "freshness": "generation", "absence": "authoritative", "inconsistent": "unavailable"},
-      {"id": "supervised_process", "freshness": "generation_and_start_token", "pid_only": false, "absence": "authoritative", "inconsistent": "unavailable"}
+      {
+        "id": "instance",
+        "freshness": "generation",
+        "absence": "authoritative",
+        "inconsistent": "unavailable"
+      },
+      {
+        "id": "session",
+        "freshness": "generation",
+        "absence": "authoritative",
+        "inconsistent": "unavailable"
+      },
+      {
+        "id": "attachment",
+        "freshness": "generation",
+        "absence": "authoritative",
+        "inconsistent": "unavailable"
+      },
+      {
+        "id": "lock_owner",
+        "freshness": "generation",
+        "absence": "authoritative",
+        "inconsistent": "unavailable"
+      },
+      {
+        "id": "supervised_process",
+        "freshness": "generation_and_start_token",
+        "pid_only": false,
+        "absence": "authoritative",
+        "inconsistent": "unavailable"
+      }
     ],
     "combined_provider": {
       "id": "combined-ownership",
-      "covers": ["instance", "session", "attachment", "lock_owner", "supervised_process"],
+      "covers": [
+        "instance",
+        "session",
+        "attachment",
+        "lock_owner",
+        "supervised_process"
+      ],
       "result": "complete_absence_or_present_or_unavailable",
       "requires_generation_or_fence": true
     }
   },
   "transitions": [
-    {"id": "durable_create", "kind": "durable", "from": "affirmative_absence", "to": "provisional", "lock": "durable_slot_exclusive", "uncertain": "unavailable_without_replacement"},
-    {"id": "durable_commit", "kind": "durable", "from": "provisional", "to": "available", "lock": "held", "uncertain": "recovery_owned_unavailable"},
-    {"id": "attach", "kind": "durable_or_disposable", "from": "available", "to": "attached", "lock": "held", "uncertain": "recovery_owned_unavailable"},
-    {"id": "reuse", "kind": "durable_or_disposable", "from": "attached", "to": "attached", "lock": "unchanged", "uncertain": "internal_failure"},
-    {"id": "abort", "kind": "durable_or_disposable", "from": "provisional", "to": "aborted", "lock": "held_until_restored", "uncertain": "recovery_owned_unavailable"},
-    {"id": "release_durable", "kind": "durable", "from": "attached", "to": "released", "lock": "release_after_sealed", "uncertain": "release_failed_recovery_owned"},
-    {"id": "release_disposable", "kind": "disposable", "from": "attached", "to": "released", "lock": "held_until_deleted", "uncertain": "deletion_failed"},
-    {"id": "deletion_failed", "kind": "disposable", "from": "attached", "to": "deletion_failed", "lock": "pending_exclusion", "uncertain": "recovery_owned"}
+    {
+      "id": "durable_create",
+      "kind": "durable",
+      "from": "affirmative_absence",
+      "to": "provisional",
+      "lock": "durable_slot_exclusive",
+      "uncertain": "unavailable_without_replacement"
+    },
+    {
+      "id": "durable_commit",
+      "kind": "durable",
+      "from": "provisional",
+      "to": "available",
+      "lock": "held",
+      "uncertain": "recovery_owned_unavailable"
+    },
+    {
+      "id": "attach",
+      "kind": "durable_or_disposable",
+      "from": "available",
+      "to": "attached",
+      "lock": "held",
+      "uncertain": "recovery_owned_unavailable"
+    },
+    {
+      "id": "reuse",
+      "kind": "durable_or_disposable",
+      "from": "attached",
+      "to": "attached",
+      "lock": "unchanged",
+      "uncertain": "internal_failure"
+    },
+    {
+      "id": "abort",
+      "kind": "durable_or_disposable",
+      "from": "provisional",
+      "to": "aborted",
+      "lock": "held_until_restored",
+      "uncertain": "recovery_owned_unavailable"
+    },
+    {
+      "id": "release_durable",
+      "kind": "durable",
+      "from": "attached",
+      "to": "released",
+      "lock": "release_after_sealed",
+      "uncertain": "release_failed_recovery_owned"
+    },
+    {
+      "id": "release_disposable",
+      "kind": "disposable",
+      "from": "attached",
+      "to": "released",
+      "lock": "held_until_deleted",
+      "uncertain": "deletion_failed"
+    },
+    {
+      "id": "deletion_failed",
+      "kind": "disposable",
+      "from": "attached",
+      "to": "deletion_failed",
+      "lock": "pending_exclusion",
+      "uncertain": "recovery_owned"
+    }
   ],
   "recovery": {
     "artifact_absent": "no_scan_no_mutation_no_existing_path_inspection",
     "durable_policy": "never_delete_never_replace_never_adopt",
     "stale_lock": "instance_not_live_and_no_associated_supervised_process",
     "uncertainty": "preserve_and_exclude",
-    "terminal_states": ["aborted", "abort_failed_recovery_owned", "released", "release_failed_recovery_owned", "deletion_failed"]
+    "terminal_states": [
+      "aborted",
+      "abort_failed_recovery_owned",
+      "released",
+      "release_failed_recovery_owned",
+      "deletion_failed"
+    ]
   },
   "fixtures": {
     "fixture_set_id": "ck-browser-profile-registry-fixtures-v1",
     "expected_result_bytes_are_immutable": true,
     "expected_results": [
-      {"id": "unknown-field", "input": "{\"state\":\"available\",\"extra\":1}", "expected": "reject_unknown_field"},
-      {"id": "unknown-state", "input": "{\"state\":\"invented\"}", "expected": "reject_unknown_state"},
-      {"id": "integrity-failure", "input": "integrity-mismatch", "expected": "untrustworthy_or_unavailable"},
-      {"id": "invalid-root", "input": "root-not-directory", "expected": "profile_storage_unavailable"},
-      {"id": "outside-root", "input": "target-outside-root", "expected": "managed_root_escape_preserve_bytes"},
-      {"id": "non-canonical", "input": "target-not-canonical", "expected": "untrustworthy_or_unavailable"},
-      {"id": "generation-conflict", "input": "stale-generation", "expected": "internal_failure"},
-      {"id": "provider-unavailable", "input": "liveness-unavailable", "expected": "liveness_unavailable_preserve_bytes"},
-      {"id": "pid-reuse", "input": "same-pid-new-start-token", "expected": "ambiguous_ownership_preserve_bytes"},
-      {"id": "attachment-race", "input": "attachment-appeared", "expected": "ambiguous_ownership_preserve_bytes"},
-      {"id": "fence-before-delete", "input": "fence-lost", "expected": "liveness_unavailable_preserve_bytes"},
-      {"id": "fence-after-delete", "input": "fence-lost-after-start", "expected": "deletion_failed_pending_exclusion"},
-      {"id": "durable-deletion-state", "input": "durable-deletion_failed", "expected": "reject_preserve_existing_record"},
-      {"id": "uncertain-absence", "input": "ambiguous-registry", "expected": "untrustworthy_or_unavailable_no_replacement"},
-      {"id": "cross-pair-primary-disposable", "input": "primary/disposable", "expected": "reject_before_storage"},
-      {"id": "cross-pair-primary-none", "input": "primary/none", "expected": "reject_before_storage"},
-      {"id": "cross-pair-subagent-durable", "input": "subagent/durable", "expected": "reject_before_storage"},
-      {"id": "cross-pair-subagent-none", "input": "subagent/none", "expected": "reject_before_storage"},
-      {"id": "cross-pair-ephemeral-durable", "input": "ephemeral/durable", "expected": "reject_before_storage"},
-      {"id": "cross-pair-ephemeral-disposable", "input": "ephemeral/disposable", "expected": "reject_before_storage"}
+      {
+        "id": "unknown-field",
+        "input": "{\"state\":\"available\",\"extra\":1}",
+        "expected": "reject_unknown_field"
+      },
+      {
+        "id": "unknown-state",
+        "input": "{\"state\":\"invented\"}",
+        "expected": "reject_unknown_state"
+      },
+      {
+        "id": "integrity-failure",
+        "input": "integrity-mismatch",
+        "expected": "untrustworthy_or_unavailable"
+      },
+      {
+        "id": "invalid-root",
+        "input": "root-not-directory",
+        "expected": "profile_storage_unavailable"
+      },
+      {
+        "id": "outside-root",
+        "input": "target-outside-root",
+        "expected": "managed_root_escape_preserve_bytes"
+      },
+      {
+        "id": "non-canonical",
+        "input": "target-not-canonical",
+        "expected": "untrustworthy_or_unavailable"
+      },
+      {
+        "id": "generation-conflict",
+        "input": "stale-generation",
+        "expected": "internal_failure"
+      },
+      {
+        "id": "provider-unavailable",
+        "input": "liveness-unavailable",
+        "expected": "liveness_unavailable_preserve_bytes"
+      },
+      {
+        "id": "pid-reuse",
+        "input": "same-pid-new-start-token",
+        "expected": "ambiguous_ownership_preserve_bytes"
+      },
+      {
+        "id": "attachment-race",
+        "input": "attachment-appeared",
+        "expected": "ambiguous_ownership_preserve_bytes"
+      },
+      {
+        "id": "fence-before-delete",
+        "input": "fence-lost",
+        "expected": "liveness_unavailable_preserve_bytes"
+      },
+      {
+        "id": "fence-after-delete",
+        "input": "fence-lost-after-start",
+        "expected": "deletion_failed_pending_exclusion"
+      },
+      {
+        "id": "durable-deletion-state",
+        "input": "durable-deletion_failed",
+        "expected": "reject_preserve_existing_record"
+      },
+      {
+        "id": "uncertain-absence",
+        "input": "ambiguous-registry",
+        "expected": "untrustworthy_or_unavailable_no_replacement"
+      },
+      {
+        "id": "cross-pair-primary-disposable",
+        "input": "primary/disposable",
+        "expected": "reject_before_storage"
+      },
+      {
+        "id": "cross-pair-primary-none",
+        "input": "primary/none",
+        "expected": "reject_before_storage"
+      },
+      {
+        "id": "cross-pair-subagent-durable",
+        "input": "subagent/durable",
+        "expected": "reject_before_storage"
+      },
+      {
+        "id": "cross-pair-subagent-none",
+        "input": "subagent/none",
+        "expected": "reject_before_storage"
+      },
+      {
+        "id": "cross-pair-ephemeral-durable",
+        "input": "ephemeral/durable",
+        "expected": "reject_before_storage"
+      },
+      {
+        "id": "cross-pair-ephemeral-disposable",
+        "input": "ephemeral/disposable",
+        "expected": "reject_before_storage"
+      }
     ]
   },
   "conformance": {
