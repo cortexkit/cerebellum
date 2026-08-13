@@ -183,8 +183,9 @@ impl ProbePage {
                         let body = concat!(
                             "<!doctype html><html><head><title>Cerebellum Click Probe</title></head>",
                             "<body><main><h1 id='status'>Click probe before</h1>",
-                            "<button type='button' onclick=\"document.getElementById('status').textContent='Click probe after'\">",
-                            "Change probe text</button></main></body></html>"
+                            "<form><input type='password' autocomplete='current-password'>",
+                            "<button type='submit' onclick=\"event.preventDefault();document.getElementById('status').textContent='Click probe after'\">",
+                            "Sign in</button></form></main></body></html>"
                         );
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -239,24 +240,54 @@ fn print_snapshot(label: &str, snapshot: &BrowserSnapshotObservation) {
     }
 }
 
-fn drive_click_probe(process: &mut dyn OwnedBrowserProcess, context_key: &str) -> Option<String> {
-    let before = match process.snapshot(context_key, SnapshotKind::Ax, 10_000) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return Some(format!("snapshot before click failed: {error:?}")),
-    };
+fn drive_click_probe(
+    process: &mut dyn OwnedBrowserProcess,
+    context_key: &str,
+    current_origin: &str,
+) -> Option<String> {
+    let before =
+        match process.snapshot_classified(context_key, SnapshotKind::Ax, 0, current_origin, 10_000)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Some(format!("snapshot before click failed: {error:?}")),
+        };
     print_snapshot("BEFORE", &before);
     let Some(reference) = before.refs.iter().find(|reference| {
-        reference.captured.role == "button" && reference.captured.name == "Change probe text"
+        reference.captured.role == "button" && reference.captured.name == "Sign in"
     }) else {
         return Some("snapshot before click did not expose the named button ref".into());
     };
     let Some(backend_identity) = reference.backend_identity.as_ref() else {
         return Some("named button ref had no backend DOM identity".into());
     };
+    let Some(classification) = reference.classification.clone() else {
+        return Some(
+            "live login form classification was unavailable in the pinned snapshot".into(),
+        );
+    };
+    println!(
+        "classification: submit={} credential={} financial={} tier={}",
+        classification.activation_invokes_form_submit,
+        classification.credential,
+        classification.financial,
+        classification.required_tier,
+    );
+    if !classification.activation_invokes_form_submit || !classification.credential {
+        return Some(format!(
+            "live login form was not classified as credential_form_submit: {classification:?}"
+        ));
+    }
+
     let mut input_events = Vec::new();
-    let position = match process.click(context_key, backend_identity, 10_000, &mut |event| {
-        input_events.push(event)
-    }) {
+    let position = match process.click_classified(
+        context_key,
+        backend_identity,
+        0,
+        current_origin,
+        Some(&classification),
+        10_000,
+        &mut |event| input_events.push(event),
+    ) {
         Ok(position) => position,
         Err(error) => {
             return Some(format!(
@@ -337,7 +368,12 @@ fn launch_once(
             };
 
             let click_probe_failure = if navigation_failure.is_none() {
-                drive_click_probe(process.as_mut(), &accepted.identity.conversation_key)
+                let current_origin = format!("http://{}", page.address);
+                drive_click_probe(
+                    process.as_mut(),
+                    &accepted.identity.conversation_key,
+                    &current_origin,
+                )
             } else {
                 navigation_failure
             };

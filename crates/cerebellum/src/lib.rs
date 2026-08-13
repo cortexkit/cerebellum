@@ -1202,14 +1202,21 @@ impl Planes {
         let launch_service = None;
         let sessions = browser_session::BrowserSessions::default();
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
+        let management = Arc::new(ManagementPlane::new(Arc::new(
+            management::PlatformResolver::new(),
+        )));
+        let browser_grants = management.browser_grants();
         let browser = if let Some(config) = browser_config.as_ref() {
-            Arc::new(BrowserPlane::with_session_gate(
-                sessions.clone(),
-                Arc::clone(&lease_clock),
-                config.navigation_settle_deadline_ms,
-            ))
+            Arc::new(
+                BrowserPlane::with_session_gate(
+                    sessions.clone(),
+                    Arc::clone(&lease_clock),
+                    config.navigation_settle_deadline_ms,
+                )
+                .with_shared_grants(browser_grants),
+            )
         } else {
-            Arc::new(BrowserPlane::new())
+            Arc::new(BrowserPlane::new().with_shared_grants(browser_grants))
         };
         Self {
             health,
@@ -1219,9 +1226,7 @@ impl Planes {
             sessions,
             lease_clock,
             launch_service,
-            management: Arc::new(ManagementPlane::new(Arc::new(
-                management::PlatformResolver::new(),
-            ))),
+            management,
             #[cfg(target_os = "macos")]
             computer: computer_capability::production_audit()
                 .map(|audit| Arc::new(computer_capability::ComputerPlane::new(audit))),
@@ -1398,7 +1403,6 @@ async fn handle_route_request(
     }
 }
 
-/// Serve one management operation.
 async fn handle_management_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -1426,10 +1430,6 @@ async fn handle_management_request(
         return send_invalid_request_response(writer, ver, channel, epoch, corr, "$", "wrong_type")
             .await;
     };
-
-    // Closed envelope, as on the tool surface: an unknown member is a caller
-    // meaning something this module will not do, and accepting it silently would
-    // serve a request different from the one sent.
     if let Some(field) = object
         .keys()
         .filter(|field| !matches!(field.as_str(), "method" | "params"))
@@ -1459,7 +1459,7 @@ async fn handle_management_request(
         )
         .await;
     };
-    if method != management::OPEN_TARGET {
+    if !matches!(method, management::OPEN_TARGET | management::OPEN_GRANT) {
         return send_route_error(
             writer,
             ver,
@@ -1471,60 +1471,192 @@ async fn handle_management_request(
         )
         .await;
     }
-
     let params = object
         .get("params")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let Some(bundle_identity) = params
-        .get("bundle_identity")
-        .and_then(serde_json::Value::as_str)
-    else {
+    let Some(params_object) = params.as_object() else {
         return send_invalid_request_response(
             writer,
             ver,
             channel,
             epoch,
             corr,
-            "bundle_identity",
-            "missing_field",
+            "params",
+            "wrong_type",
         )
         .await;
     };
 
-    let Some(action_kind) = params
-        .get("action_kind")
-        .and_then(serde_json::Value::as_str)
-        .and_then(management::action_kind_from_wire)
-    else {
-        return send_invalid_request_response(
-            writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "action_kind",
-            "missing_field",
-        )
-        .await;
+    enum Settlement {
+        ComputerTarget,
+        BrowserGrant,
+    }
+
+    let (reply, question, settlement) = if method == management::OPEN_TARGET {
+        let Some(bundle_identity) = params_object
+            .get("bundle_identity")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "bundle_identity",
+                "missing_field",
+            )
+            .await;
+        };
+        let Some(action_kind) = params_object
+            .get("action_kind")
+            .and_then(serde_json::Value::as_str)
+            .and_then(management::action_kind_from_wire)
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "action_kind",
+                "missing_field",
+            )
+            .await;
+        };
+        let grantee = facts.identity.agent_project_id.clone();
+        let clock = SystemClock::default();
+        let (reply, question) = planes
+            .management
+            .open_target(
+                &grantee,
+                bundle_identity,
+                action_kind,
+                facts.declares_elicitation(),
+                &clock,
+            )
+            .await;
+        (reply, question, Settlement::ComputerTarget)
+    } else {
+        if let Some(field) = params_object
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "origins" | "hazards"))
+            .min()
+        {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
+        let Some(origin_values) = params_object
+            .get("origins")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "origins",
+                "missing_field",
+            )
+            .await;
+        };
+        let Some(origins) = origin_values
+            .iter()
+            .map(serde_json::Value::as_str)
+            .map(|origin| origin.map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "origins",
+                "wrong_type",
+            )
+            .await;
+        };
+        let Some(hazard_values) = params_object
+            .get("hazards")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "hazards",
+                "missing_field",
+            )
+            .await;
+        };
+        let Some(hazards) = hazard_values
+            .iter()
+            .map(serde_json::Value::as_str)
+            .map(|hazard| hazard.and_then(crate::authorization::HazardClass::from_wire))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "hazards",
+                "unsupported_value",
+            )
+            .await;
+        };
+        let opened = planes
+            .management
+            .open_browser_grant(
+                &facts.identity.conversation_key,
+                origins,
+                hazards,
+                facts.declares_elicitation(),
+            )
+            .await;
+        let (reply, question) = match opened {
+            Ok(opened) => opened,
+            Err(management::BrowserGrantRequestError::InvalidOrigins) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "origins",
+                    "unsupported_value",
+                )
+                .await
+            }
+            Err(management::BrowserGrantRequestError::InvalidHazards) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "hazards",
+                    "unsupported_value",
+                )
+                .await
+            }
+        };
+        (reply, question, Settlement::BrowserGrant)
     };
-
-    // The grantee is the identity the daemon stamped, never anything the request
-    // carries: a permission written against a caller-chosen identity is a
-    // permission granted to whoever asked for it.
-    let grantee = facts.identity.agent_project_id.clone();
-
-    let clock = SystemClock::default();
-    let (reply, question) = planes
-        .management
-        .open_target(
-            &grantee,
-            bundle_identity,
-            action_kind,
-            facts.declares_elicitation(),
-            &clock,
-        )
-        .await;
 
     if let Some(question) = question {
         // Asked on its own task: the answer may be minutes away while this
@@ -1539,14 +1671,20 @@ async fn handle_management_request(
                 .await;
             let answer = match outcome {
                 elicit::AskOutcome::Answered(body) => Some(body),
-                // Silence and an undeliverable question are both not-granted
-                // here. They are distinguished where they happen, and by the
-                // time an answer is being applied only the decision matters.
                 elicit::AskOutcome::NoAnswer | elicit::AskOutcome::Undeliverable => None,
             };
-            management_plane
-                .settle(&question.ask_id, answer.as_ref(), &SystemClock::default())
-                .await;
+            match settlement {
+                Settlement::ComputerTarget => {
+                    management_plane
+                        .settle(&question.ask_id, answer.as_ref(), &SystemClock::default())
+                        .await;
+                }
+                Settlement::BrowserGrant => {
+                    management_plane
+                        .settle_browser_grant(&question.ask_id, answer.as_ref())
+                        .await;
+                }
+            }
         });
     }
 
@@ -2324,6 +2462,13 @@ pub fn install_browser_compatibility_test_bind(
     );
 }
 
+#[cfg(test)]
+pub fn browser_plane_with_shared_grants_for_test(
+    grants: Arc<tokio::sync::Mutex<crate::authorization::GrantStore>>,
+) -> BrowserPlane {
+    BrowserPlane::new().with_shared_grants(grants)
+}
+
 pub async fn handle_frame_for_test(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -2469,6 +2614,297 @@ mod tests {
     /// A management plane for frame-level tests, resolving nothing.
     fn test_management_plane() -> Arc<ManagementPlane> {
         Arc::new(ManagementPlane::new(Arc::new(NothingRunning)))
+    }
+
+    /// Minting through the management wire creates authority on the browser
+    /// plane built by the production constructor.
+    ///
+    /// This is intentionally not a configured-grant fixture: the only authority
+    /// the navigation may use is the answer delivered to the elicitation request.
+    #[tokio::test]
+    async fn an_elicited_browser_grant_admits_wire_navigation() {
+        let planes = Planes::with_browser_config(
+            Arc::new(HealthState::default()),
+            Some(BrowserConfig {
+                executable_path: None,
+                expected_identity: None,
+                launch_handshake_deadline_ms: 100,
+                termination_grace_period_ms: 100,
+                browser_idle_timeout_ms: 30_000,
+                browser_exit_observation_deadline_ms: 100,
+                navigation_settle_deadline_ms: 100,
+            }),
+        );
+        let identity = bind_identity_for_test();
+        let admission = json!({
+            "agentProjectId": "test-project",
+            "sessionKind": "primary",
+            "effectiveCapabilityScope": ["*"],
+        });
+        planes.routes.insert(
+            4,
+            1,
+            AcceptedBindFacts::from_bind(
+                &identity,
+                Some(Principal::Direct),
+                Some(&admission),
+                Some(&["elicitation".to_string()]),
+                &subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+        planes.routes.insert(
+            9,
+            3,
+            AcceptedBindFacts::from_bind(
+                &identity,
+                Some(Principal::Direct),
+                Some(&admission),
+                None,
+                &subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let opening = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            71,
+            serde_json::to_vec(&json!({
+                "method": management::OPEN_GRANT,
+                "params": {
+                    "origins": ["https://requested.example"],
+                    "hazards": [
+                        "credential_form_submit",
+                        "unverified_form_contents"
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        handle_frame(opening, &writer_tx, &planes)
+            .await
+            .expect("the grant request enters the production frame dispatcher");
+
+        let mut pending = None;
+        let mut question = None;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
+                .await
+                .expect("the management reply and question are prompt")
+                .expect("the writer remains open");
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            if frame.header.ty == FrameType::Request {
+                question = Some((frame, body));
+            } else {
+                pending = Some(body);
+            }
+        }
+        let pending = pending.expect("the caller receives a pending reply");
+        assert_eq!(pending["outcome"], "consent_pending", "{pending}");
+        let (question_frame, question) = question.expect("the consumer receives a question");
+        assert_eq!(
+            question["params"]["origins"],
+            json!(["https://requested.example"])
+        );
+        assert_eq!(
+            question["params"]["hazards"],
+            json!(["credential_form_submit", "unverified_form_contents"])
+        );
+        let message = question["params"]["message"].as_str().unwrap();
+        for disclosed in [
+            "https://requested.example",
+            "credential_form_submit",
+            "unverified_form_contents",
+        ] {
+            assert!(
+                message.contains(disclosed),
+                "question omitted {disclosed}: {question}"
+            );
+        }
+
+        let answer = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            question_frame.header.channel,
+            question_frame.header.epoch,
+            question_frame.header.corr,
+            serde_json::to_vec(&json!({"decision": "allow"})).unwrap(),
+        )
+        .unwrap();
+        handle_frame(answer, &writer_tx, &planes)
+            .await
+            .expect("the affirmative answer reaches the elicitor");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while planes.browser.grant_count_for_test().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the answer mints a grant without blocking the original request");
+
+        let navigation = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            9,
+            3,
+            72,
+            serde_json::to_vec(&json!({
+                "name": "browser.navigate",
+                "arguments": {
+                    "url": "https://requested.example/path",
+                    "intent": "confirm the elicited authority reaches dispatch",
+                    "wait": "none",
+                    "severity": {"tier": 1, "credential": false, "financial": false}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        handle_route_request(navigation, &writer_tx, &planes)
+            .await
+            .expect("the navigation reaches the browser wire handler");
+        let navigated: Value =
+            serde_json::from_slice(&writer_rx.recv().await.expect("navigation response").body)
+                .unwrap();
+        assert_ne!(navigated["outcome"], "authorization_denied", "{navigated}");
+        assert_eq!(navigated["outcome"], "no_session", "{navigated}");
+    }
+
+    /// The refusal names the exact target fact absent from the human disclosure.
+    #[tokio::test]
+    async fn a_wire_built_plane_names_the_undisclosed_target_hazard() {
+        let management = ManagementPlane::new(Arc::new(NothingRunning));
+        let question = management
+            .browser_grant_question_for_test(
+                "conversation",
+                vec!["https://login.example".to_string()],
+                vec![crate::authorization::HazardClass::FinancialFormSubmit],
+            )
+            .await;
+        management
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+            .await;
+        let browser = browser_plane_with_shared_grants_for_test(management.browser_grants());
+        let route = RouteIdentity {
+            conversation_key: "conversation".to_string(),
+            ..RouteIdentity::from_bind(&bind_identity_for_test(), &Some(Principal::Direct))
+        };
+        browser.open_context(route.clone()).await.unwrap();
+        let submit = crate::classification::ElementClassificationInput::new(
+            crate::classification::NodeIdentityInput::new("target", "frame", 42),
+            crate::classification::TargetKind::Button,
+        )
+        .form_owner(crate::classification::NodeIdentityInput::new(
+            "target", "frame", 7,
+        ))
+        .associated_control(
+            crate::classification::AssociatedFormControlInput::new(
+                crate::classification::NodeIdentityInput::new("target", "frame", 8),
+            )
+            .with_tokens(["current-password"]),
+        );
+        let classification = crate::classification::classify_click(
+            &crate::classification::NonTypeClassificationInput::new(
+                0,
+                submit,
+                "https://login.example",
+            ),
+        )
+        .unwrap();
+        browser
+            .same_document_url(
+                &route,
+                "https://login.example/page",
+                crate::snapshot_store::SameDocumentChange::ReplaceState,
+            )
+            .await
+            .unwrap();
+        let retained = browser
+            .retain_text_snapshot(
+                &route,
+                crate::snapshot_store::SnapshotKind::Ax,
+                &[],
+                None,
+                vec![
+                    crate::snapshot_store::RefRecord {
+                        captured: crate::snapshot_store::SnapshotRef::new(
+                            "e1", "button", "Sign in", 0,
+                        )
+                        .unwrap(),
+                        frame_path: vec!["frame".to_string()],
+                        backend_identity: Some(
+                            crate::snapshot_store::BackendNodeIdentity::new("target", "frame", 42)
+                                .unwrap(),
+                        ),
+                        raw_role: Some("button".to_string()),
+                        raw_name: Some("Sign in".to_string()),
+                        classification: Some(Box::new(classification)),
+                    },
+                    crate::snapshot_store::RefRecord {
+                        captured: crate::snapshot_store::SnapshotRef::new(
+                            "e2", "button", "Continue", 0,
+                        )
+                        .unwrap(),
+                        frame_path: vec!["frame".to_string()],
+                        backend_identity: Some(
+                            crate::snapshot_store::BackendNodeIdentity::new("target", "frame", 43)
+                                .unwrap(),
+                        ),
+                        raw_role: Some("button".to_string()),
+                        raw_name: Some("Continue".to_string()),
+                        classification: None,
+                    },
+                ],
+                4096,
+            )
+            .await
+            .unwrap();
+        let result = browser
+            .dispatch(
+                &route,
+                crate::browser::BrowserCapability::Click,
+                &json!({
+                    "ref": "e1",
+                    "snapshot_id": retained["snapshot_id"],
+                    "intent": "sign in",
+                    "severity": {"tier": 4, "credential": true, "financial": false}
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "authorization_denied", "{result}");
+        assert_eq!(
+            result["detail"]["missing_hazard"], "credential_form_submit",
+            "{result}"
+        );
+
+        let unknown = browser
+            .dispatch(
+                &route,
+                crate::browser::BrowserCapability::Click,
+                &json!({
+                    "ref": "e2",
+                    "snapshot_id": retained["snapshot_id"],
+                    "intent": "continue",
+                    "severity": {"tier": 4, "credential": true, "financial": false}
+                }),
+            )
+            .await;
+        assert_eq!(unknown["outcome"], "authorization_denied", "{unknown}");
+        assert_eq!(
+            unknown["detail"]["missing_hazard"], "unverified_form_contents",
+            "{unknown}"
+        );
     }
 
     /// An answer arriving on a route reaches the question that asked it.
@@ -2630,6 +3066,43 @@ mod tests {
         assert_eq!(
             body["outcome"], "not_running",
             "a management request was not served by the management surface: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_management_route_without_elicitation_gets_no_browser_grant_question() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let planes = management_bound_planes(4, 1);
+        let request = serde_json::json!({
+            "method": management::OPEN_GRANT,
+            "params": {
+                "origins": ["https://example.test"],
+                "hazards": ["unverified_form_contents"],
+            },
+        });
+        let frame = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            79,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+
+        handle_route_request(frame, &writer_tx, &planes)
+            .await
+            .expect("the grant operation is served");
+        let response = writer_rx.recv().await.expect("an immediate response");
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["outcome"], "consent_unavailable", "{body}");
+        assert_eq!(planes.management.browser_grant_count().await, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), writer_rx.recv())
+                .await
+                .is_err(),
+            "a consumer that did not declare elicitation received a question"
         );
     }
 

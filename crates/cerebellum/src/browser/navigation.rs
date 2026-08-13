@@ -11,6 +11,10 @@ use crate::browser_session::{
     BrowserClickPosition, BrowserInputEvent, ClickDriveError, NavigationDriveError, NavigationWait,
 };
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
+use crate::classification::{
+    self, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
+    NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
+};
 use crate::snapshot_store::{
     truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
     MAX_NAME_BYTES, MAX_REFS, MAX_ROLE_BYTES, MAX_VALUE_BYTES,
@@ -44,6 +48,16 @@ struct RawAxNode {
     child_ids: Vec<String>,
     backend_node_id: Option<u64>,
     frame_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawDomNode {
+    node_id: u64,
+    parent_id: Option<u64>,
+    backend_node_id: u64,
+    local_name: String,
+    attributes: HashMap<String, String>,
+    assigned_slot_backend_node_id: Option<u64>,
 }
 
 struct PendingAxNode {
@@ -121,13 +135,35 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
-        self.snapshot_with_clock(context_key, mode, deadline_ms, &mut clock)
+        self.snapshot_with_clock(context_key, mode, deadline_ms, None, &mut clock)
     }
 
-    pub(crate) fn click(
+    pub(crate) fn snapshot_classified(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.snapshot_with_clock(
+            context_key,
+            mode,
+            deadline_ms,
+            Some((document_epoch, current_origin)),
+            &mut clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn click_classified(
         &mut self,
         context_key: &str,
         identity: &BackendNodeIdentity,
+        document_epoch: u64,
+        current_origin: &str,
+        expected: Option<&NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickPosition, ClickDriveError> {
@@ -137,6 +173,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             identity,
             deadline_ms,
             input_dispatched,
+            Some((document_epoch, current_origin, expected)),
             &mut clock,
         )
     }
@@ -150,7 +187,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
     ) -> Result<BrowserClickPosition, ClickDriveError> {
-        self.click_with_clock(context_key, identity, deadline_ms, input_dispatched, clock)
+        self.click_with_clock(
+            context_key,
+            identity,
+            deadline_ms,
+            input_dispatched,
+            None,
+            clock,
+        )
     }
 
     #[cfg(test)]
@@ -161,7 +205,98 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-        self.snapshot_with_clock(context_key, mode, deadline_ms, clock)
+        self.snapshot_with_clock(context_key, mode, deadline_ms, None, clock)
+    }
+
+    #[cfg(test)]
+    fn classify_click_for_test<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<Option<NonTypeClassificationRecord>, NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, clock)?;
+        self.classify_click_before(
+            context_key,
+            identity,
+            document_epoch,
+            current_origin,
+            deadline,
+            clock,
+        )
+    }
+
+    fn classify_click_before<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<Option<NonTypeClassificationRecord>, NavigationDriveError> {
+        let attachment = self
+            .attachment
+            .clone()
+            .filter(|attachment| {
+                attachment.context_key == context_key && attachment.target_id == identity.target_id
+            })
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        if identity.frame_id.is_empty() || current_origin.is_empty() {
+            return Ok(None);
+        }
+        let Some(nodes) = self.flattened_dom_nodes_before(&attachment, deadline, clock)? else {
+            return Ok(None);
+        };
+        Ok(build_non_type_classification(
+            &nodes,
+            identity,
+            document_epoch,
+            current_origin,
+        ))
+    }
+
+    fn flattened_dom_nodes_before<C: NavigationClock>(
+        &mut self,
+        attachment: &AttachedTarget,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<Option<Vec<RawDomNode>>, NavigationDriveError> {
+        let enabled = self.command_response(
+            "DOM.enable",
+            None,
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            None,
+            clock,
+        )?;
+        if enabled.error.is_some() || enabled.result.is_none() {
+            return Ok(None);
+        }
+        let mut params = Map::new();
+        params.insert("depth".into(), Value::Number((-1).into()));
+        params.insert("pierce".into(), Value::Bool(true));
+        let response = self.command_response(
+            "DOM.getFlattenedDocument",
+            Some(params),
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            None,
+            clock,
+        )?;
+        if response.error.is_some() {
+            return Ok(None);
+        }
+        Ok(response.result.as_ref().and_then(parse_flattened_dom_nodes))
     }
 
     fn click_with_clock<C: NavigationClock>(
@@ -170,6 +305,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         identity: &BackendNodeIdentity,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+        revalidation: Option<(u64, &str, Option<&NonTypeClassificationRecord>)>,
         clock: &mut C,
     ) -> Result<BrowserClickPosition, ClickDriveError> {
         let deadline = clock
@@ -290,6 +426,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
+        if let Some((document_epoch, current_origin, expected)) = revalidation {
+            let actual = self
+                .classify_click_before(
+                    context_key,
+                    identity,
+                    document_epoch,
+                    current_origin,
+                    deadline,
+                    clock,
+                )
+                .map_err(ClickDriveError::Navigation)?;
+            if actual.as_ref() != expected {
+                return Err(ClickDriveError::ClassificationChanged);
+            }
+        }
+
         let mut press_params = mouse_event_params("mousePressed", position);
         press_params.insert("button".into(), Value::String("left".into()));
         press_params.insert("clickCount".into(), Value::Number(1.into()));
@@ -339,6 +491,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         context_key: &str,
         mode: SnapshotKind,
         deadline_ms: u64,
+        classification_context: Option<(u64, &str)>,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         if mode == SnapshotKind::Screenshot {
@@ -395,6 +548,27 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 required_ax_nodes(&result)
             },
         )?;
+
+        if let Some((document_epoch, current_origin)) = classification_context {
+            if let Some(nodes) = self
+                .flattened_dom_nodes_before(&attachment, deadline, clock)
+                .ok()
+                .flatten()
+            {
+                for reference in &mut observation.refs {
+                    reference.classification =
+                        reference.backend_identity.as_ref().and_then(|identity| {
+                            build_non_type_classification(
+                                &nodes,
+                                identity,
+                                document_epoch,
+                                current_origin,
+                            )
+                            .map(Box::new)
+                        });
+                }
+            }
+        }
 
         if mode == SnapshotKind::DomFull {
             let mut params = Map::new();
@@ -753,6 +927,295 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     }
 }
 
+fn parse_flattened_dom_nodes(result: &Map<String, Value>) -> Option<Vec<RawDomNode>> {
+    let values = result.get("nodes")?.as_array()?;
+    let mut nodes = Vec::with_capacity(values.len());
+    for value in values {
+        let object = value.as_object()?;
+        if object.get("nodeType")?.as_u64()? != 1 {
+            continue;
+        }
+        let node_id = object.get("nodeId")?.as_u64().filter(|id| *id > 0)?;
+        let backend_node_id = object.get("backendNodeId")?.as_u64().filter(|id| *id > 0)?;
+        let local_name = object
+            .get("localName")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("nodeName").and_then(Value::as_str))?
+            .to_ascii_lowercase();
+        // DOM.getFlattenedDocument supplies the complete attribute array for
+        // element nodes. Missing it makes security-relevant facts unavailable,
+        // so the entire projection becomes an unknown classification.
+        let attribute_values = object.get("attributes")?.as_array()?.clone();
+        if attribute_values.len() % 2 != 0 {
+            return None;
+        }
+        let mut attributes = HashMap::new();
+        for pair in attribute_values.chunks_exact(2) {
+            let name = pair[0].as_str()?.to_ascii_lowercase();
+            let value = pair[1].as_str()?.to_string();
+            if attributes.insert(name, value).is_some() {
+                return None;
+            }
+        }
+        let assigned_slot_backend_node_id = object
+            .get("assignedSlot")
+            .and_then(Value::as_object)
+            .and_then(|slot| slot.get("backendNodeId"))
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0);
+        nodes.push(RawDomNode {
+            node_id,
+            parent_id: object
+                .get("parentId")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0),
+            backend_node_id,
+            local_name,
+            attributes,
+            assigned_slot_backend_node_id,
+        });
+    }
+    Some(nodes)
+}
+
+fn build_non_type_classification(
+    nodes: &[RawDomNode],
+    target_identity: &BackendNodeIdentity,
+    document_epoch: u64,
+    current_origin: &str,
+) -> Option<NonTypeClassificationRecord> {
+    let by_node_id = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.node_id, index))
+        .collect::<HashMap<_, _>>();
+    let by_backend_id = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.backend_node_id, index))
+        .collect::<HashMap<_, _>>();
+    if by_node_id.len() != nodes.len() || by_backend_id.len() != nodes.len() {
+        return None;
+    }
+    let target_index = *by_backend_id.get(&target_identity.backend_node_id)?;
+    let context = DomClassificationContext {
+        nodes,
+        by_node_id: &by_node_id,
+        by_backend_id: &by_backend_id,
+        target_id: &target_identity.target_id,
+        frame_id: &target_identity.frame_id,
+        current_origin,
+    };
+    let target = context.element(target_index, true)?;
+    let mut input = NonTypeClassificationInput::new(document_epoch, target, current_origin);
+    let mut current = target_index;
+    let mut visited = HashSet::from([current]);
+    while let Some(parent) = context.composed_parent(current) {
+        if !visited.insert(parent) {
+            return None;
+        }
+        input
+            .composed_ancestors
+            .push(context.element(parent, true)?);
+        current = parent;
+    }
+    classification::classify_click(&input).ok()
+}
+
+struct DomClassificationContext<'a> {
+    nodes: &'a [RawDomNode],
+    by_node_id: &'a HashMap<u64, usize>,
+    by_backend_id: &'a HashMap<u64, usize>,
+    target_id: &'a str,
+    frame_id: &'a str,
+    current_origin: &'a str,
+}
+
+impl DomClassificationContext<'_> {
+    fn identity(&self, index: usize) -> NodeIdentityInput {
+        NodeIdentityInput::new(
+            self.target_id,
+            self.frame_id,
+            self.nodes[index].backend_node_id,
+        )
+    }
+
+    fn composed_parent(&self, index: usize) -> Option<usize> {
+        let node = self.nodes.get(index)?;
+        node.assigned_slot_backend_node_id
+            .and_then(|backend| self.by_backend_id.get(&backend).copied())
+            .or_else(|| {
+                node.parent_id
+                    .and_then(|parent| self.by_node_id.get(&parent).copied())
+            })
+    }
+
+    fn dom_parent(&self, index: usize) -> Option<usize> {
+        self.nodes
+            .get(index)?
+            .parent_id
+            .and_then(|parent| self.by_node_id.get(&parent).copied())
+    }
+
+    fn form_owner(&self, index: usize) -> Option<usize> {
+        if let Some(form_id) = self.nodes[index].attributes.get("form") {
+            return self.nodes.iter().position(|node| {
+                node.local_name == "form"
+                    && node.attributes.get("id").is_some_and(|id| id == form_id)
+            });
+        }
+        let mut current = self.dom_parent(index);
+        let mut visited = HashSet::new();
+        while let Some(parent) = current {
+            if !visited.insert(parent) {
+                return None;
+            }
+            if self.nodes[parent].local_name == "form" {
+                return Some(parent);
+            }
+            current = self.dom_parent(parent);
+        }
+        None
+    }
+
+    fn label_control(&self, label_index: usize) -> Option<usize> {
+        if let Some(control_id) = self.nodes[label_index].attributes.get("for") {
+            return self.nodes.iter().position(|node| {
+                is_labelable(&node.local_name)
+                    && node.attributes.get("id").is_some_and(|id| id == control_id)
+            });
+        }
+        self.nodes.iter().enumerate().find_map(|(index, node)| {
+            (is_labelable(&node.local_name) && self.is_dom_descendant(index, label_index))
+                .then_some(index)
+        })
+    }
+
+    fn is_dom_descendant(&self, candidate: usize, ancestor: usize) -> bool {
+        let mut current = self.dom_parent(candidate);
+        let mut visited = HashSet::new();
+        while let Some(parent) = current {
+            if parent == ancestor {
+                return true;
+            }
+            if !visited.insert(parent) {
+                return false;
+            }
+            current = self.dom_parent(parent);
+        }
+        false
+    }
+
+    fn element(
+        &self,
+        index: usize,
+        include_label_control: bool,
+    ) -> Option<ElementClassificationInput> {
+        let node = self.nodes.get(index)?;
+        let kind = target_kind(&node.local_name);
+        let mut element = ElementClassificationInput::new(self.identity(index), kind)
+            .disabled(node.attributes.contains_key("disabled"));
+        if matches!(kind, TargetKind::Input | TargetKind::Button) {
+            if let Some(input_type) = node.attributes.get("type") {
+                element = element.input_type(input_type.to_ascii_lowercase());
+            }
+        }
+        let tokens = autocomplete_tokens(node.attributes.get("autocomplete"));
+        if !tokens.is_empty() {
+            element = element.autocomplete(tokens);
+        }
+        if node.local_name == "input"
+            && node
+                .attributes
+                .get("type")
+                .is_some_and(|input_type| input_type.eq_ignore_ascii_case("password"))
+        {
+            element = element.password(true);
+        }
+        if let Some(owner) = self.form_owner(index) {
+            element = element.form_owner(self.identity(owner));
+            for (control_index, control) in self.nodes.iter().enumerate() {
+                if !is_form_control(&control.local_name)
+                    || self.form_owner(control_index) != Some(owner)
+                {
+                    continue;
+                }
+                let mut associated = AssociatedFormControlInput::new(self.identity(control_index));
+                let tokens = autocomplete_tokens(control.attributes.get("autocomplete"));
+                if !tokens.is_empty() {
+                    associated = associated.with_tokens(tokens);
+                }
+                let password = control.local_name == "input"
+                    && control
+                        .attributes
+                        .get("type")
+                        .is_some_and(|input_type| input_type.eq_ignore_ascii_case("password"));
+                element = element.associated_control(associated.with_password(password));
+            }
+        }
+        if let Some(destination) = self.activation_destination(index) {
+            element = element.destination(destination);
+        }
+        if node.local_name == "label" && include_label_control {
+            if let Some(control) = self.label_control(index) {
+                element = element.label_for(self.element(control, false)?);
+            } else {
+                element.is_label = true;
+            }
+        }
+        Some(element)
+    }
+
+    fn activation_destination(&self, index: usize) -> Option<String> {
+        let node = &self.nodes[index];
+        let declared = match node.local_name.as_str() {
+            "a" | "area" => node.attributes.get("href"),
+            "button" | "input" => node.attributes.get("formaction").or_else(|| {
+                self.form_owner(index)
+                    .and_then(|owner| self.nodes[owner].attributes.get("action"))
+            }),
+            _ => None,
+        }?;
+        if declared.contains("://") {
+            return Some(declared.clone());
+        }
+        if declared.starts_with('/') {
+            return classification::canonical_origin(self.current_origin)
+                .map(|origin| format!("{origin}{declared}"));
+        }
+        None
+    }
+}
+
+fn target_kind(local_name: &str) -> TargetKind {
+    match local_name {
+        "button" => TargetKind::Button,
+        "input" => TargetKind::Input,
+        "a" => TargetKind::Anchor,
+        "area" => TargetKind::Area,
+        _ => TargetKind::Other,
+    }
+}
+
+fn is_labelable(local_name: &str) -> bool {
+    matches!(local_name, "button" | "input" | "select" | "textarea")
+}
+
+fn is_form_control(local_name: &str) -> bool {
+    matches!(
+        local_name,
+        "button" | "input" | "select" | "textarea" | "output"
+    )
+}
+
+fn autocomplete_tokens(value: Option<&String>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split_ascii_whitespace())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 fn hit_test_coordinate(value: f64) -> Result<i64, ClickDriveError> {
     let rounded = value.round();
     if !(0.0..=f64::from(i32::MAX)).contains(&rounded) {
@@ -1017,6 +1480,7 @@ where
                         backend_identity: Some(backend_identity),
                         raw_role: Some(role.clone()),
                         raw_name: Some(name.clone()),
+                        classification: None,
                     });
                     *nth = nth.saturating_add(1);
                     reference = Some(ref_name);
@@ -1323,6 +1787,197 @@ mod tests {
         .unwrap()
     }
 
+    fn flattened_dom_node(
+        node_id: u64,
+        parent_id: Option<u64>,
+        backend_node_id: u64,
+        local_name: &str,
+        attributes: &[&str],
+    ) -> Value {
+        let mut node = json!({
+            "nodeId": node_id,
+            "nodeType": 1,
+            "backendNodeId": backend_node_id,
+            "nodeName": local_name.to_ascii_uppercase(),
+            "localName": local_name,
+            "attributes": attributes,
+        });
+        if let Some(parent_id) = parent_id {
+            node["parentId"] = json!(parent_id);
+        }
+        node
+    }
+
+    #[test]
+    fn missing_element_attributes_make_the_dom_projection_unknown() {
+        let result = json!({"nodes":[{
+            "nodeId": 1,
+            "nodeType": 1,
+            "backendNodeId": 10,
+            "nodeName": "BUTTON",
+            "localName": "button"
+        }]});
+        assert!(parse_flattened_dom_nodes(result.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn classified_snapshot_pins_form_hazards_beside_the_target_ref() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Login", &["button"], 10, Some("frame-main"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
+                ax_node("button","button","Sign in", &[], 60, None),
+            ]}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{"nodes":[
+                flattened_dom_node(1, None, 10, "html", &[]),
+                flattened_dom_node(2, Some(1), 30, "form", &[]),
+                flattened_dom_node(3, Some(2), 40, "input", &["type", "password"]),
+                flattened_dom_node(4, Some(2), 60, "button", &["type", "submit"]),
+            ]}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let observation = driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Ax,
+                1_000,
+                Some((7, "https://login.example")),
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+        let record = observation.refs[1]
+            .classification
+            .as_ref()
+            .expect("the button ref carries the same-epoch classification");
+
+        assert!(record.activation_invokes_form_submit);
+        assert!(record.credential);
+        assert!(!record.financial);
+        assert_eq!(record.document_epoch, 7);
+    }
+
+    #[test]
+    fn real_dom_projection_feeds_the_frozen_classifier_for_login_and_payment_forms() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"nodes":[
+                flattened_dom_node(1, None, 10, "html", &[]),
+                flattened_dom_node(2, Some(1), 20, "body", &[]),
+                flattened_dom_node(3, Some(2), 30, "form", &["id", "checkout", "action", "/pay"]),
+                flattened_dom_node(4, Some(3), 40, "input", &["type", "password", "autocomplete", "current-password"]),
+                flattened_dom_node(5, Some(3), 50, "input", &["autocomplete", "cc-number"]),
+                flattened_dom_node(6, Some(3), 60, "button", &["type", "submit"]),
+            ]}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 60).unwrap();
+        let record = driver
+            .classify_click_for_test(
+                "route-own",
+                &identity,
+                7,
+                "https://shop.example",
+                1_000,
+                &mut FakeClock::new(),
+            )
+            .unwrap()
+            .expect("the complete DOM projection classifies");
+
+        assert!(record.activation_invokes_form_submit);
+        assert!(record.credential);
+        assert!(record.financial);
+        assert_eq!(record.required_tier, crate::authorization::MUTATE_DURABLE);
+        assert_eq!(
+            driver
+                .pipe
+                .writes
+                .iter()
+                .map(|write| write["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["DOM.enable", "DOM.getFlattenedDocument"]
+        );
+    }
+
+    #[test]
+    fn an_unavailable_dom_classification_is_explicitly_unknown() {
+        let frames = [json!({
+            "id":1,
+            "sessionId":"session-own",
+            "error":{"code":-32601,"message":"unsupported"}
+        })];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 60).unwrap();
+        assert_eq!(
+            driver
+                .classify_click_for_test(
+                    "route-own",
+                    &identity,
+                    7,
+                    "https://shop.example",
+                    1_000,
+                    &mut FakeClock::new(),
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn final_classification_revalidation_refuses_before_input() {
+        let initial_nodes = json!({"nodes":[
+            flattened_dom_node(1, None, 10, "html", &[]),
+            flattened_dom_node(2, Some(1), 20, "form", &[]),
+            flattened_dom_node(3, Some(2), 30, "input", &["type", "password"]),
+            flattened_dom_node(4, Some(2), 42, "button", &["type", "submit"]),
+        ]});
+        let revalidated_nodes = json!({"nodes":[
+            flattened_dom_node(1, None, 10, "html", &[]),
+            flattened_dom_node(2, Some(1), 20, "form", &[]),
+            flattened_dom_node(3, Some(2), 30, "input", &["type", "text"]),
+            flattened_dom_node(4, Some(2), 42, "button", &["type", "submit"]),
+        ]});
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":initial_nodes}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
+            json!({"id":4,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":revalidated_nodes}),
+        ]);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut clock = FakeClock::new();
+        let initial = driver
+            .classify_click_for_test(
+                "route-own",
+                &identity,
+                7,
+                "https://login.example",
+                1_000,
+                &mut clock,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(initial.credential);
+        let mut input_events = Vec::new();
+        let result = driver.click_with_clock(
+            "route-own",
+            &identity,
+            1_000,
+            &mut |event| input_events.push(event),
+            Some((7, "https://login.example", Some(&initial))),
+            &mut clock,
+        );
+
+        assert_eq!(result, Err(ClickDriveError::ClassificationChanged));
+        assert!(input_events.is_empty());
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .all(|write| write["method"] != "Input.dispatchMouseEvent"));
+    }
+
     #[test]
     fn click_dispatches_mouse_input_at_the_resolved_content_quad_center() {
         let frames = [
@@ -1552,7 +2207,7 @@ mod tests {
             store
                 .resolve_ref(&snapshot_id, "e3", 7, &candidates)
                 .unwrap(),
-            RefResolution::Resolved(captured)
+            RefResolution::Resolved(Box::new(captured))
         );
     }
 

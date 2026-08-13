@@ -6,7 +6,7 @@
 //! state again after dispatch commitment.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -23,6 +23,46 @@ pub const MUTATE_REVERSIBLE: u8 = 3;
 pub const MUTATE_DURABLE: u8 = 4;
 pub const ACTUATE: u8 = 5;
 pub const MAX_ORIGINS: usize = 256;
+
+/// Target facts a person must be told before a grant can cover the action.
+///
+/// This vocabulary is closed so the mint and dispatch cannot each invent a
+/// spelling that the other side never understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HazardClass {
+    CredentialFormSubmit,
+    FinancialFormSubmit,
+    UnverifiedFormContents,
+}
+
+impl HazardClass {
+    pub const ALL: [Self; 3] = [
+        Self::CredentialFormSubmit,
+        Self::FinancialFormSubmit,
+        Self::UnverifiedFormContents,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialFormSubmit => "credential_form_submit",
+            Self::FinancialFormSubmit => "financial_form_submit",
+            Self::UnverifiedFormContents => "unverified_form_contents",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|hazard| hazard.as_str() == value)
+    }
+}
+
+impl fmt::Display for HazardClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Names for the closed `ck-action-severity/v1` tier vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -122,7 +162,8 @@ impl Action {
 }
 
 /// A grant scoped to one conversation. Each grant has an identifier, revision,
-/// severity requirement, and list of authorized origins.
+/// severity requirement, authorized origins, and the target hazards disclosed to
+/// the person who issued it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionGrant {
     pub id: String,
@@ -130,6 +171,7 @@ pub struct ActionGrant {
     pub conversation_key: String,
     pub severity: Severity,
     pub authorized_origins: Vec<String>,
+    pub disclosed_hazards: BTreeSet<HazardClass>,
 }
 
 impl ActionGrant {
@@ -146,7 +188,19 @@ impl ActionGrant {
             conversation_key: conversation_key.into(),
             severity,
             authorized_origins: authorized_origins.into_iter().map(Into::into).collect(),
+            // Empty is the safe compatibility default for direct test grants: it
+            // covers targets with no classified hazards and never silently grants
+            // consent for a form hazard nobody disclosed.
+            disclosed_hazards: BTreeSet::new(),
         }
+    }
+
+    pub fn with_disclosed_hazards(
+        mut self,
+        hazards: impl IntoIterator<Item = HazardClass>,
+    ) -> Self {
+        self.disclosed_hazards = hazards.into_iter().collect();
+        self
     }
 
     pub fn for_conversation(
@@ -229,6 +283,22 @@ impl<'a> AuthorizationRequest<'a> {
         }
     }
 
+    pub fn click_unverified(
+        conversation_key: &'a str,
+        requested_severity: Severity,
+        invocation_id: &'a str,
+        bind_identity: &'a str,
+    ) -> Self {
+        Self {
+            conversation_key,
+            action: Action::Click,
+            requested_severity,
+            invocation_id,
+            bind_identity,
+            classification: None,
+        }
+    }
+
     pub fn click_point(
         conversation_key: &'a str,
         requested_severity: Severity,
@@ -262,6 +332,7 @@ pub struct AuthorizationDecision {
     selected_grant_severity: Severity,
     grant_conversation_key: String,
     authorized_origins: Vec<String>,
+    disclosed_hazards: BTreeSet<HazardClass>,
     classification_fingerprint: Option<NonTypeClassificationFingerprint>,
     action: Action,
 }
@@ -299,6 +370,10 @@ impl AuthorizationDecision {
 
     pub fn authorized_origins(&self) -> &[String] {
         &self.authorized_origins
+    }
+
+    pub fn disclosed_hazards(&self) -> &BTreeSet<HazardClass> {
+        &self.disclosed_hazards
     }
 
     pub fn classification_fingerprint(&self) -> Option<NonTypeClassificationFingerprint> {
@@ -430,19 +505,53 @@ impl GrantStore {
         conversation_key: &str,
         required: Severity,
     ) -> Result<ActionGrant, AuthorizationError> {
+        self.select_covering_grant_for_hazards(conversation_key, required, &BTreeSet::new())
+    }
+
+    fn select_covering_grant_for_hazards(
+        &self,
+        conversation_key: &str,
+        required: Severity,
+        required_hazards: &BTreeSet<HazardClass>,
+    ) -> Result<ActionGrant, AuthorizationError> {
         self.ensure_valid()?;
         required.validate()?;
-        let candidates = self
+        let mut candidates = self
             .current
             .values()
             .filter(|grant| {
                 grant.conversation_key == conversation_key && grant.severity.covers(required)
             })
-            .cloned()
             .collect::<Vec<_>>();
-        select_deterministic_covering_grant(&candidates, required)?
-            .cloned()
-            .ok_or(AuthorizationError::NoGrant)
+        candidates.sort_by(compare_grants);
+        if let Some(grant) = candidates
+            .iter()
+            .find(|grant| required_hazards.is_subset(&grant.disclosed_hazards))
+        {
+            return Ok((**grant).clone());
+        }
+
+        if !candidates.is_empty() {
+            let missing = required_hazards.iter().copied().find(|hazard| {
+                candidates
+                    .iter()
+                    .all(|grant| !grant.disclosed_hazards.contains(hazard))
+            });
+            if let Some(missing) = missing.or_else(|| {
+                required_hazards
+                    .difference(&candidates[0].disclosed_hazards)
+                    .next()
+                    .copied()
+            }) {
+                return Err(AuthorizationError::HazardNotDisclosed(missing));
+            }
+        }
+        // An empty store still names a target hazard when one is known. This is
+        // the actionable fact the caller needs in order to re-ask a person.
+        if let Some(missing) = required_hazards.iter().next().copied() {
+            return Err(AuthorizationError::HazardNotDisclosed(missing));
+        }
+        Err(AuthorizationError::NoGrant)
     }
 
     /// Build a decision and perform no browser or connector work.
@@ -453,13 +562,18 @@ impl GrantStore {
         self.ensure_valid()?;
         let (computed, fingerprint) =
             computed_required_severity(request.action, request.classification)?;
+        let required_hazards = target_hazards(request.action, request.classification)?;
         let floor = request.action.floor();
         request.requested_severity.validate()?;
         if request.requested_severity.tier < floor.tier {
             return Err(AuthorizationError::SeverityBelowFloor);
         }
         let effective = request.requested_severity.maximum(computed);
-        let grant = self.select_covering_grant(request.conversation_key, effective)?;
+        let grant = self.select_covering_grant_for_hazards(
+            request.conversation_key,
+            effective,
+            &required_hazards,
+        )?;
         make_decision(&grant, request, effective, fingerprint)
     }
 
@@ -478,6 +592,7 @@ impl GrantStore {
             || current.conversation_key != decision.grant_conversation_key
             || current.severity != decision.selected_grant_severity
             || current.authorized_origins != decision.authorized_origins
+            || current.disclosed_hazards != decision.disclosed_hazards
         {
             return Err(AuthorizationCommitError::GrantReplaced);
         }
@@ -543,6 +658,9 @@ pub fn computed_required_severity(
 ) -> Result<(Severity, Option<NonTypeClassificationFingerprint>), AuthorizationError> {
     match action {
         Action::Navigate => Ok((Action::Navigate.floor(), None)),
+        Action::Click if classification.is_none() => {
+            Ok((Severity::new(MUTATE_DURABLE, true, true), None))
+        }
         Action::Click | Action::ClickPoint => {
             let record = classification.ok_or(AuthorizationError::SeverityUnclassifiable)?;
             record
@@ -556,6 +674,32 @@ pub fn computed_required_severity(
                         .map_err(|_| AuthorizationError::SeverityUnclassifiable)?,
                 ),
             ))
+        }
+    }
+}
+
+/// Derive the exact disclosure requirements from the same closed record used
+/// for severity. A form submit can independently carry credential and financial
+/// fields; an unavailable record is not equivalent to either flag being false.
+pub fn target_hazards(
+    action: Action,
+    classification: Option<&NonTypeClassificationRecord>,
+) -> Result<BTreeSet<HazardClass>, AuthorizationError> {
+    match (action, classification) {
+        (Action::Navigate, _) | (Action::ClickPoint, _) => Ok(BTreeSet::new()),
+        (Action::Click, None) => Ok(BTreeSet::from([HazardClass::UnverifiedFormContents])),
+        (Action::Click, Some(record)) => {
+            record
+                .validate()
+                .map_err(|_| AuthorizationError::SeverityUnclassifiable)?;
+            let mut hazards = BTreeSet::new();
+            if record.activation_invokes_form_submit && record.credential {
+                hazards.insert(HazardClass::CredentialFormSubmit);
+            }
+            if record.activation_invokes_form_submit && record.financial {
+                hazards.insert(HazardClass::FinancialFormSubmit);
+            }
+            Ok(hazards)
         }
     }
 }
@@ -595,6 +739,7 @@ fn make_decision(
         selected_grant_severity: grant.severity,
         grant_conversation_key: grant.conversation_key.clone(),
         authorized_origins: grant.authorized_origins.clone(),
+        disclosed_hazards: grant.disclosed_hazards.clone(),
         classification_fingerprint: fingerprint,
         action: request.action,
     })
@@ -609,6 +754,7 @@ fn compare_grants(left: &&ActionGrant, right: &&ActionGrant) -> Ordering {
         .then_with(|| left.severity.credential.cmp(&right.severity.credential))
         .then_with(|| left.severity.financial.cmp(&right.severity.financial))
         .then_with(|| left.authorized_origins.cmp(&right.authorized_origins))
+        .then_with(|| left.disclosed_hazards.cmp(&right.disclosed_hazards))
 }
 
 static NEXT_DECISION_ID: AtomicU64 = AtomicU64::new(1);
@@ -715,6 +861,7 @@ pub enum AuthorizationError {
     InvalidSeverityTier,
     SeverityBelowFloor,
     NoGrant,
+    HazardNotDisclosed(HazardClass),
     SeverityUnclassifiable,
     InvalidGrant,
     DuplicateGrantIdentity,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cerebellum::authorization::{ActionGrant, GrantStore, Severity};
+use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity};
 use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
 use cerebellum::browser_session::{
@@ -142,6 +142,7 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
                 backend_identity: None,
                 raw_role: None,
                 raw_name: None,
+                classification: None,
             }],
             4096,
         )
@@ -239,11 +240,12 @@ fn navigation_grants() -> GrantStore {
         identity().conversation_key.clone(),
         Severity {
             tier: 4,
-            credential: false,
-            financial: false,
+            credential: true,
+            financial: true,
         },
         ["https://requested.example"],
-    )])
+    )
+    .with_disclosed_hazards([HazardClass::UnverifiedFormContents])])
 }
 
 #[derive(Clone)]
@@ -307,6 +309,23 @@ impl OwnedBrowserProcess for ClickProcess {
         Ok(position)
     }
 
+    fn click_classified(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        _: u64,
+        _: &str,
+        expected: Option<&cerebellum::classification::NonTypeClassificationRecord>,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        assert!(
+            expected.is_none(),
+            "this fixture represents an unverified target"
+        );
+        self.click(context_key, identity, deadline_ms, input_dispatched)
+    }
+
     fn generation_matches(&self) -> bool {
         true
     }
@@ -347,6 +366,7 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
                 ),
                 raw_role: Some(record.role.clone()),
                 raw_name: Some(record.name.clone()),
+                classification: None,
             })
         })
         .collect();
@@ -791,6 +811,14 @@ async fn same_context_dispatches_serialize_and_different_contexts_do_not() {
 }
 
 async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> String {
+    plane
+        .same_document_url(
+            route,
+            "https://requested.example/page",
+            cerebellum::snapshot_store::SameDocumentChange::ReplaceState,
+        )
+        .await
+        .unwrap();
     let reference = SnapshotRef::new("e1", "button", "Save", 0).unwrap();
     plane
         .retain_text_snapshot(
@@ -812,6 +840,7 @@ async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> S
                 ),
                 raw_role: Some("button".into()),
                 raw_name: Some("Save".into()),
+                classification: None,
             }],
             4096,
         )
