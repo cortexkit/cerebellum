@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cerebellum::browser::Tracker;
 use cerebellum::browser_session::{
-    BrowserSessionLauncher, CleanupStage, OwnedBrowserProcess, ProcessControlFailure,
-    SessionCleanup,
+    BrowserSessionLauncher, CleanupStage, NavigationDriveError, NavigationWait,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
 };
 use cerebellum::{BrowserConfig, Planes};
 use cerebellum_core::health::HealthState;
@@ -104,6 +105,22 @@ struct RecordingProcess {
 }
 
 impl OwnedBrowserProcess for RecordingProcess {
+    fn navigate(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: NavigationWait,
+        _: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.effects.lock().unwrap().push("navigate");
+        let now = std::time::Instant::now();
+        tracker.url_final = Some("https://landed.example/final".into());
+        tracker.load(now);
+        tracker.poll_settlement(now + Duration::from_millis(cerebellum::browser::QUIET_MS));
+        Ok(())
+    }
+
     fn generation_matches(&self) -> bool {
         true
     }
@@ -141,7 +158,7 @@ impl SessionCleanup for RecordingCleanup {
 }
 
 #[test]
-fn real_manifest_path_advertises_session_controls_only_when_configured() {
+fn real_manifest_path_advertises_session_controls_and_navigation_only_when_configured() {
     fn names(configured: bool) -> Vec<String> {
         let manifest =
             cerebellum::serialize_manifest_with_browser_configuration("cerebellum", configured);
@@ -159,12 +176,27 @@ fn real_manifest_path_advertises_session_controls_only_when_configured() {
     }
 
     let configured = names(true);
-    for control in ["browser.launch", "browser.status", "browser.close"] {
-        assert!(configured.iter().any(|name| name == control));
+    for dispatchable in [
+        "browser.launch",
+        "browser.status",
+        "browser.close",
+        "browser.navigate",
+    ] {
+        assert!(configured.iter().any(|name| name == dispatchable));
+    }
+    for unavailable in [
+        "browser.click",
+        "browser.click_point",
+        "browser.snapshot",
+        "browser.screenshot",
+        "browser.wait_for",
+        "browser.type",
+    ] {
+        assert!(!configured.iter().any(|name| name == unavailable));
     }
     let absent = names(false);
-    for control in ["browser.launch", "browser.status", "browser.close"] {
-        assert!(!absent.iter().any(|name| name == control));
+    for configured_only in ["browser.launch", "browser.close", "browser.navigate"] {
+        assert!(!absent.iter().any(|name| name == configured_only));
     }
 }
 
@@ -186,6 +218,36 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     assert!(launched["lease"]["idle_expires_at"]
         .as_str()
         .is_some_and(|value| value.ends_with('Z') && value.contains('.')));
+
+    let navigated = invoke(
+        &planes,
+        11,
+        "browser.navigate",
+        json!({
+            "url": "https://requested.example/",
+            "intent": "follow the redirect",
+            "wait": "settle",
+            "severity": {"tier": 2, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    let navigated: Value = serde_json::from_slice(&navigated.body).unwrap();
+    assert_eq!(navigated["outcome"], "ok", "{navigated}");
+    assert_eq!(navigated["url_final"], "https://landed.example/final");
+
+    for (corr, unavailable) in [
+        (12, "browser.click"),
+        (13, "browser.click_point"),
+        (14, "browser.snapshot"),
+        (15, "browser.screenshot"),
+        (16, "browser.wait_for"),
+        (17, "browser.type"),
+    ] {
+        let refused = invoke(&planes, corr, unavailable, json!({})).await;
+        let refused: Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(refused["code"], "unknown_method", "{refused}");
+    }
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
 
     let duplicate = invoke(&planes, 2, "browser.launch", json!({})).await;
     let duplicate: Value = serde_json::from_slice(&duplicate.body).unwrap();
@@ -232,7 +294,14 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     }
     assert_eq!(
         launcher.effects.lock().unwrap().as_slice(),
-        ["graceful", "grace_wait", "force", "reap", "cleanup"]
+        [
+            "navigate",
+            "graceful",
+            "grace_wait",
+            "force",
+            "reap",
+            "cleanup"
+        ]
     );
     let repeated = invoke(
         &planes,
@@ -256,7 +325,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         serde_json::from_slice::<Value>(&unknown.body).unwrap()["outcome"],
         "browser_session_not_found"
     );
-    assert_eq!(launcher.effects.lock().unwrap().len(), 5);
+    assert_eq!(launcher.effects.lock().unwrap().len(), 6);
 }
 
 #[tokio::test]

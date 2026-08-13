@@ -23,8 +23,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use cerebellum::browser::Tracker;
 use cerebellum::browser_config::BrowserConfig;
 use cerebellum::browser_launch_service::ProductionLaunchService;
+use cerebellum::browser_session::NavigationWait;
 use cerebellum_core::identity::AcceptedBindFacts;
 use serde_json::json;
 use subc_protocol::{BindIdentity, Principal, RouteTarget};
@@ -164,6 +166,27 @@ fn launch_once(
             println!("[{session_id}] LAUNCHED in {:?}", started.elapsed());
             let (mut process, mut cleanup) = ready.into_parts();
             println!("generation still matches: {}", process.generation_matches());
+
+            let requested_url =
+                "data:text/html,<title>Cerebellum%20navigation%20probe</title>ready";
+            let mut tracker = Tracker::default();
+            tracker.token("navigation_started");
+            match process.navigate(
+                &accepted.identity.conversation_key,
+                requested_url,
+                NavigationWait::Settle,
+                10_000,
+                &mut tracker,
+            ) {
+                Ok(()) => println!(
+                    "navigation: requested={requested_url} url_final={:?} settled={} lifecycle={:?}",
+                    tracker.url_final, tracker.settled, tracker.lifecycle
+                ),
+                Err(error) => println!(
+                    "navigation failed: {error:?}; url_final={:?} lifecycle={:?}",
+                    tracker.url_final, tracker.lifecycle
+                ),
+            }
 
             // The real ladder: ask, wait the grace period, force only if the
             // same generation is still alive, then reap before any cleanup.

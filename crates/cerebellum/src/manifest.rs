@@ -42,6 +42,19 @@ use subc_protocol::PROTOCOL_VERSION;
 /// The single application capability this module advertises.
 pub const BROWSER_STATUS: &str = "browser.status";
 
+pub fn browser_navigation_tool() -> Tool {
+    let (name, description, schema) = crate::browser::tool_definitions()
+        .into_iter()
+        .find(|(name, _, _)| *name == crate::browser::NAVIGATE)
+        .expect("browser.navigate has a frozen descriptor");
+    Tool {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        execution_mode: ExecutionMode::Unfenceable,
+        schema,
+    }
+}
+
 pub fn browser_control_tools() -> Vec<Tool> {
     use crate::browser_session::{BROWSER_CLOSE, BROWSER_LAUNCH};
     vec![
