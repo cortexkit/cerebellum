@@ -688,3 +688,42 @@ async fn a_target_with_no_capturable_window_says_so() {
         "the refusal named no way forward"
     );
 }
+
+/// An unreadable window list is never reported as the application being absent.
+///
+/// The two answers send a person in opposite directions: `not_running` says to
+/// start the application, while an unreadable list says nothing about whether it
+/// is running at all.
+///
+/// Not hypothetical. Under concurrent load on a real machine the permission
+/// query reported capture as permitted while enumeration failed in the same
+/// instant with a declined-permission error, so a transient window-server
+/// failure arrives wearing a denial's clothes. Reporting that as "not running"
+/// tells someone to start a second copy of an application already in front of
+/// them, and the second copy then makes the target ambiguous.
+#[tokio::test]
+async fn an_unreadable_window_list_is_not_reported_as_the_application_being_absent() {
+    let plane = Arc::new(ManagementPlane::new(Arc::new(Fixed(
+        TargetResolution::Unreadable,
+    ))));
+    let clock = FakeClock::new();
+
+    let (body, question) = plane
+        .open_target(
+            "agent-under-test",
+            "com.example.App",
+            cerebellum_core::consent::ActionKind::Observe,
+            true,
+            &clock,
+        )
+        .await;
+
+    assert_eq!(
+        body["outcome"], "targets_unreadable",
+        "an unreadable window list produced: {body}"
+    );
+    assert!(
+        question.is_none(),
+        "a person was asked to approve a target nothing could see: {body}"
+    );
+}

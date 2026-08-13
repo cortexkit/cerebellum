@@ -224,6 +224,19 @@ pub enum TargetResolution {
     /// "ambiguous" makes them reconstruct which instances exist before they can
     /// do anything about it.
     Ambiguous(Vec<TargetCandidate>),
+    /// The window list could not be read, so nothing is known about the target.
+    ///
+    /// Distinct from `NotRunning`, which is a claim about the world. This says
+    /// only that this process could not see, and the two have opposite remedies:
+    /// one is answered by starting the application, and this one by finding out
+    /// why the window server did not answer.
+    ///
+    /// The distinction is not theoretical. Under load the permission query can
+    /// report capture as permitted while enumeration fails with a declined-TCC
+    /// error in the same instant, so a transient window-server failure arrives
+    /// wearing a permission denial's clothes. Reporting that as `NotRunning`
+    /// tells someone their running application is not running.
+    Unreadable,
 }
 
 impl TargetResolution {
