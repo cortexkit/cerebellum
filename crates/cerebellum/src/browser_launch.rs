@@ -3,7 +3,7 @@
 //! This module owns ordering and policy. Platform code returns process and
 //! code-signing facts; the journal decides whether release may be reached.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -151,6 +151,74 @@ impl LaunchSessionCompletion {
             terminal_outcome,
         }
     }
+}
+
+/// What startup learned about the process named by one active launch record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveredBrowserProcess {
+    TerminatedAndReaped,
+    StartTimeMismatch,
+    NotRunning,
+    Unattested,
+}
+
+/// Exact successful result for one record consumed by startup recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserLaunchRecoveryOutcome {
+    pub sequence: u64,
+    pub process: RecoveredBrowserProcess,
+    pub journal_action: cerebellum_core::journal::RecoveryAction,
+}
+
+/// The first failed obligation from a pass that still attempts every independent
+/// cleanup resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserLaunchRecoveryFailure {
+    JournalOpen,
+    JournalRead { sequence: u64 },
+    ProcessObservation { sequence: u64 },
+    ProcessTermination { sequence: u64 },
+    JournalTerminalization,
+    ProfileCustodyRelease { sequence: u64 },
+    InvalidIntent { sequence: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanProcessControlFailure;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanProfileCustodyFailure;
+
+/// Kernel observation and process control used by startup recovery.
+///
+/// The orchestrator calls `terminate_and_reap` only after this observer returns
+/// the recorded start time. Implementations should repeat that comparison as
+/// close to signaling as the platform allows, so a PID reuse between the two
+/// calls is refused too.
+pub trait OrphanBrowserProcessControl {
+    fn observed_start_time_micros(
+        &mut self,
+        pid: u32,
+    ) -> Result<Option<u64>, OrphanProcessControlFailure>;
+    fn terminate_and_reap(
+        &mut self,
+        generation: BrowserProcessGeneration,
+    ) -> Result<(), OrphanProcessControlFailure>;
+}
+
+/// Release the exact profile claim identified by durable launch intent.
+pub trait OrphanProfileCustody {
+    fn release(
+        &mut self,
+        intent: &AuthorizedLaunchIntent,
+    ) -> Result<(), OrphanProfileCustodyFailure>;
+}
+
+#[derive(Debug, Clone)]
+struct ActiveLaunchAttempt {
+    sequence: u64,
+    intent: Option<AuthorizedLaunchIntent>,
+    attested_generation: Option<BrowserProcessGeneration>,
 }
 
 /// Terminal mismatch record. The process is still barred when this is written.
@@ -531,6 +599,155 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
     ) -> Result<cerebellum_core::journal::ObligationAuditRecord, CoreJournalError> {
         self.core.read_obligation_audit(sequence)
     }
+
+    fn active_launch_attempts(
+        &self,
+    ) -> Result<Vec<ActiveLaunchAttempt>, BrowserLaunchRecoveryFailure> {
+        let mut attempts = Vec::new();
+        for sequence in 1..self.core.next_sequence() {
+            let Some(classification) = self.core.classify(sequence) else {
+                continue;
+            };
+            let audit = self
+                .core
+                .read_obligation_audit(sequence)
+                .map_err(|_| BrowserLaunchRecoveryFailure::JournalRead { sequence })?;
+            let intent = serde_json::from_slice::<AuthorizedLaunchIntent>(&audit.descriptor_bytes)
+                .ok()
+                .filter(|intent| intent.format_version == LAUNCH_CODEC_VERSION);
+            let attested_generation = if classification
+                == cerebellum_core::journal::RecoveryClassification::ProvisionalDispatched
+            {
+                intent.as_ref().and_then(|intent| {
+                    audit
+                        .attachment_slots
+                        .iter()
+                        .find(|attachment| attachment.slot == ATTESTATION_SLOT)
+                        .and_then(|attachment| {
+                            serde_json::from_slice::<LaunchAttestationRecord>(
+                                &attachment.opaque_bytes,
+                            )
+                            .ok()
+                        })
+                        .filter(|attestation| {
+                            attestation.generation.intent == *intent
+                                && attestation.observed_executable_identity
+                                    == intent.verified_executable_identity
+                        })
+                        .map(|attestation| attestation.generation.process_generation)
+                })
+            } else {
+                None
+            };
+            attempts.push(ActiveLaunchAttempt {
+                sequence,
+                intent,
+                attested_generation,
+            });
+        }
+        Ok(attempts)
+    }
+}
+
+/// Reclaim every launch record left active by an earlier module process.
+///
+/// Process decisions are completed before the neutral journal consumes active
+/// records, preserving the attestation until it has served its only authority:
+/// proving whether a signal is safe. Journal and custody cleanup then both run
+/// even when process control failed, because they are independent obligations
+/// and one resource's failure must not silently skip another's cleanup.
+pub fn recover_browser_launches<S, P, C>(
+    journal: &mut DurableLaunchJournal<S>,
+    process: &mut P,
+    custody: &mut C,
+) -> Result<Vec<BrowserLaunchRecoveryOutcome>, BrowserLaunchRecoveryFailure>
+where
+    S: JournalStorage,
+    P: OrphanBrowserProcessControl,
+    C: OrphanProfileCustody,
+{
+    let attempts = journal.active_launch_attempts()?;
+    let mut first_failure = None;
+    let mut process_outcomes = BTreeMap::new();
+
+    for attempt in &attempts {
+        let outcome = match attempt.attested_generation {
+            None => RecoveredBrowserProcess::Unattested,
+            Some(generation) => match process.observed_start_time_micros(generation.pid) {
+                Ok(Some(observed)) if observed == generation.start_time_micros => {
+                    match process.terminate_and_reap(generation) {
+                        Ok(()) => RecoveredBrowserProcess::TerminatedAndReaped,
+                        Err(OrphanProcessControlFailure) => {
+                            first_failure.get_or_insert(
+                                BrowserLaunchRecoveryFailure::ProcessTermination {
+                                    sequence: attempt.sequence,
+                                },
+                            );
+                            RecoveredBrowserProcess::Unattested
+                        }
+                    }
+                }
+                Ok(Some(_)) => RecoveredBrowserProcess::StartTimeMismatch,
+                Ok(None) => RecoveredBrowserProcess::NotRunning,
+                Err(OrphanProcessControlFailure) => {
+                    first_failure.get_or_insert(BrowserLaunchRecoveryFailure::ProcessObservation {
+                        sequence: attempt.sequence,
+                    });
+                    RecoveredBrowserProcess::Unattested
+                }
+            },
+        };
+        process_outcomes.insert(attempt.sequence, outcome);
+    }
+
+    let expected_sequences = attempts
+        .iter()
+        .map(|attempt| attempt.sequence)
+        .collect::<BTreeSet<_>>();
+    let recovered = journal.core.recover_active();
+    let recovered_sequences = recovered
+        .iter()
+        .map(|outcome| outcome.action_obligation_id)
+        .collect::<BTreeSet<_>>();
+    if recovered_sequences != expected_sequences {
+        first_failure.get_or_insert(BrowserLaunchRecoveryFailure::JournalTerminalization);
+    }
+    let journal_actions = recovered
+        .into_iter()
+        .map(|outcome| (outcome.action_obligation_id, outcome.recovery_action))
+        .collect::<BTreeMap<_, _>>();
+
+    for attempt in &attempts {
+        match attempt.intent.as_ref() {
+            Some(intent) => {
+                if custody.release(intent).is_err() {
+                    first_failure.get_or_insert(
+                        BrowserLaunchRecoveryFailure::ProfileCustodyRelease {
+                            sequence: attempt.sequence,
+                        },
+                    );
+                }
+            }
+            None => {
+                first_failure.get_or_insert(BrowserLaunchRecoveryFailure::InvalidIntent {
+                    sequence: attempt.sequence,
+                });
+            }
+        }
+    }
+
+    if let Some(failure) = first_failure {
+        return Err(failure);
+    }
+
+    Ok(attempts
+        .into_iter()
+        .map(|attempt| BrowserLaunchRecoveryOutcome {
+            sequence: attempt.sequence,
+            process: process_outcomes[&attempt.sequence],
+            journal_action: journal_actions[&attempt.sequence],
+        })
+        .collect())
 }
 
 impl DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage> {
@@ -770,6 +987,81 @@ mod tests {
 
         fn snapshot(&self) -> Vec<&'static str> {
             self.0.lock().expect("event log").clone()
+        }
+    }
+
+    struct RecordingOrphanProcess {
+        observed: Result<Option<u64>, OrphanProcessControlFailure>,
+        observation_calls: usize,
+        termination_calls: usize,
+        fail_termination: bool,
+        events: Events,
+    }
+
+    impl RecordingOrphanProcess {
+        fn new(observed: Result<Option<u64>, OrphanProcessControlFailure>, events: Events) -> Self {
+            Self {
+                observed,
+                observation_calls: 0,
+                termination_calls: 0,
+                fail_termination: false,
+                events,
+            }
+        }
+    }
+
+    impl OrphanBrowserProcessControl for RecordingOrphanProcess {
+        fn observed_start_time_micros(
+            &mut self,
+            _pid: u32,
+        ) -> Result<Option<u64>, OrphanProcessControlFailure> {
+            self.observation_calls += 1;
+            self.events.push("generation_observed");
+            self.observed
+        }
+
+        fn terminate_and_reap(
+            &mut self,
+            _generation: BrowserProcessGeneration,
+        ) -> Result<(), OrphanProcessControlFailure> {
+            self.termination_calls += 1;
+            self.events.push("orphan_terminated_and_reaped");
+            if self.fail_termination {
+                Err(OrphanProcessControlFailure)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct RecordingOrphanCustody {
+        releases: Vec<String>,
+        fail: bool,
+        events: Events,
+    }
+
+    impl RecordingOrphanCustody {
+        fn new(events: Events) -> Self {
+            Self {
+                releases: Vec::new(),
+                fail: false,
+                events,
+            }
+        }
+    }
+
+    impl OrphanProfileCustody for RecordingOrphanCustody {
+        fn release(
+            &mut self,
+            intent: &AuthorizedLaunchIntent,
+        ) -> Result<(), OrphanProfileCustodyFailure> {
+            self.releases.push(intent.holder_id.clone());
+            self.events.push("profile_lock_released");
+            if self.fail {
+                Err(OrphanProfileCustodyFailure)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1173,6 +1465,220 @@ mod tests {
         let decoded: LaunchAttestationRecord =
             serde_json::from_slice(&stored.opaque_bytes).expect("decode attestation");
         assert_eq!(decoded, attestation);
+    }
+
+    fn reopened_dispatched_journal(
+        storage: InMemoryJournalStorage,
+    ) -> DurableLaunchJournal<InMemoryJournalStorage> {
+        DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            storage,
+        )
+        .expect("reopen launch journal")
+    }
+
+    #[test]
+    fn startup_recovery_terminates_exact_attested_generation_before_fresh_spawn() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, _) = dispatch_attempt(&mut original, &request());
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(Some(sequence)), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events.clone());
+
+        let outcomes = recover_browser_launches(&mut journal, &mut process, &mut custody)
+            .expect("recover exact attested orphan");
+        events.push("fresh_spawn");
+
+        assert_eq!(
+            outcomes,
+            vec![BrowserLaunchRecoveryOutcome {
+                sequence,
+                process: RecoveredBrowserProcess::TerminatedAndReaped,
+                journal_action: cerebellum_core::journal::RecoveryAction::DispatchFinalized,
+            }]
+        );
+        assert_eq!(process.observation_calls, 1);
+        assert_eq!(process.termination_calls, 1);
+        assert_eq!(custody.releases, vec!["holder-1"]);
+        assert_eq!(
+            events.snapshot(),
+            vec![
+                "generation_observed",
+                "orphan_terminated_and_reaped",
+                "profile_lock_released",
+                "fresh_spawn",
+            ]
+        );
+        let audit = journal
+            .read_attempt(sequence)
+            .expect("read recovered attempt");
+        assert_eq!(
+            audit.lifecycle,
+            cerebellum_core::journal::LifecycleState::Finalized
+        );
+        assert_eq!(
+            audit.terminal_kind,
+            Some(cerebellum_core::journal::TerminalKind::RecoveryDispatchFinalized)
+        );
+        assert_eq!(
+            audit.reason,
+            Some(cerebellum_core::journal::JournalReason::InterruptedAfterDispatch)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_never_signals_a_pid_whose_start_time_differs() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, _) = dispatch_attempt(&mut original, &request());
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(Some(sequence + 100)), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+
+        let outcomes = recover_browser_launches(&mut journal, &mut process, &mut custody)
+            .expect("finalize recycled pid record");
+
+        assert_eq!(
+            outcomes[0].process,
+            RecoveredBrowserProcess::StartTimeMismatch
+        );
+        assert_eq!(process.observation_calls, 1);
+        assert_eq!(
+            process.termination_calls, 0,
+            "a PID match without the recorded start time has no signal authority"
+        );
+        assert_eq!(custody.releases, vec!["holder-1"]);
+        assert_eq!(
+            journal
+                .read_attempt(sequence)
+                .expect("read attempt")
+                .terminal_kind,
+            Some(cerebellum_core::journal::TerminalKind::RecoveryDispatchFinalized)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_finalizes_a_gone_process_without_signalling() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, _) = dispatch_attempt(&mut original, &request());
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(None), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+
+        let outcomes = recover_browser_launches(&mut journal, &mut process, &mut custody)
+            .expect("finalize absent process record");
+
+        assert_eq!(outcomes[0].process, RecoveredBrowserProcess::NotRunning);
+        assert_eq!(process.termination_calls, 0);
+        assert_eq!(custody.releases, vec!["holder-1"]);
+        assert_eq!(
+            journal
+                .read_attempt(sequence)
+                .expect("read attempt")
+                .terminal_kind,
+            Some(cerebellum_core::journal::TerminalKind::RecoveryDispatchFinalized)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_never_observes_or_signals_an_unattested_record() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let intent = request().durable_intent();
+        let handle = original.record_intent(&intent).expect("record intent");
+        let sequence = handle.sequence();
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(Some(1)), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+
+        let outcomes = recover_browser_launches(&mut journal, &mut process, &mut custody)
+            .expect("cancel unattested record");
+
+        assert_eq!(
+            outcomes,
+            vec![BrowserLaunchRecoveryOutcome {
+                sequence,
+                process: RecoveredBrowserProcess::Unattested,
+                journal_action: cerebellum_core::journal::RecoveryAction::Cancelled,
+            }]
+        );
+        assert_eq!(process.observation_calls, 0);
+        assert_eq!(process.termination_calls, 0);
+        assert_eq!(custody.releases, vec!["holder-1"]);
+        assert_eq!(
+            journal.read_attempt(sequence),
+            Err(CoreJournalError::ObligationUnknown)
+        );
+        assert_eq!(journal.core.classify(sequence), None);
+        assert_eq!(journal.core.status().active_reservation_count, 0);
+    }
+
+    #[test]
+    fn failed_process_recovery_still_terminalizes_journal_and_releases_custody() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, _) = dispatch_attempt(&mut original, &request());
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(Some(sequence)), events.clone());
+        process.fail_termination = true;
+        let mut custody = RecordingOrphanCustody::new(events);
+
+        let outcome = recover_browser_launches(&mut journal, &mut process, &mut custody);
+
+        assert_eq!(
+            outcome,
+            Err(BrowserLaunchRecoveryFailure::ProcessTermination { sequence })
+        );
+        assert_eq!(custody.releases, vec!["holder-1"]);
+        assert_eq!(
+            journal
+                .read_attempt(sequence)
+                .expect("read attempt")
+                .terminal_kind,
+            Some(cerebellum_core::journal::TerminalKind::RecoveryDispatchFinalized)
+        );
+    }
+
+    #[test]
+    fn failed_custody_release_does_not_skip_journal_terminalization() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, _) = dispatch_attempt(&mut original, &request());
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(None), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+        custody.fail = true;
+
+        let outcome = recover_browser_launches(&mut journal, &mut process, &mut custody);
+
+        assert_eq!(
+            outcome,
+            Err(BrowserLaunchRecoveryFailure::ProfileCustodyRelease { sequence })
+        );
+        assert_eq!(
+            journal
+                .read_attempt(sequence)
+                .expect("read attempt")
+                .terminal_kind,
+            Some(cerebellum_core::journal::TerminalKind::RecoveryDispatchFinalized)
+        );
     }
 
     #[test]
