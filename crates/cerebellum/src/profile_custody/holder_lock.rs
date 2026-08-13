@@ -53,9 +53,12 @@ impl ProfileCustodyKey {
     /// Disposable launches mint a new directory even when their route selector
     /// agrees, so their claim key includes the already-minted attempt holder.
     pub fn disposable(project_id: &str, conversation_key: &str, holder: &HolderId) -> Self {
+        Self::disposable_route(project_id, conversation_key, holder.as_str())
+    }
+
+    pub fn disposable_route(project_id: &str, conversation_key: &str, attempt_id: &str) -> Self {
         Self(format!(
-            "disposable\0{project_id}\0{conversation_key}\0{}",
-            holder.as_str()
+            "disposable\0{project_id}\0{conversation_key}\0{attempt_id}"
         ))
     }
 
