@@ -602,6 +602,7 @@ fn serialize_manifest_with_computer_plane_configured(
         tools.extend(
             manifest::browser_control_tools()
                 .into_iter()
+                .chain(std::iter::once(manifest::browser_navigation_tool()))
                 .filter(|tool| dispatchable_tool_with_browser(&tool.name, true).is_some()),
         );
     }
@@ -629,7 +630,9 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 }
 
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
-    if browser_configured && browser_session::CONTROL_TOOLS.contains(&name) {
+    if browser_configured
+        && (browser_session::CONTROL_TOOLS.contains(&name) || name == browser::NAVIGATE)
+    {
         Some(name)
     } else if computer_capability::servable(name).is_some() {
         // A computer capability is dispatchable when this module can serve it,
@@ -1199,10 +1202,11 @@ impl Planes {
         let launch_service = None;
         let sessions = browser_session::BrowserSessions::default();
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
-        let browser = if browser_config.is_some() {
+        let browser = if let Some(config) = browser_config.as_ref() {
             Arc::new(BrowserPlane::with_session_gate(
                 sessions.clone(),
                 Arc::clone(&lease_clock),
+                config.navigation_settle_deadline_ms,
             ))
         } else {
             Arc::new(BrowserPlane::new())

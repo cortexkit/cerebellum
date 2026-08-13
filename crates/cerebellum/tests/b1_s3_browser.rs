@@ -1,11 +1,17 @@
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use cerebellum::browser::{self, BrowserCapability, BrowserPlane};
+use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
+use cerebellum::browser_session::{
+    BrowserSessions, CleanupStage, LaunchSlot, NavigationDriveError, NavigationWait,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+};
 use cerebellum::cdp::{Attachment, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
 use cerebellum::snapshot_store::{AxRecord, RefRecord, SnapshotKind, SnapshotRef};
-use cerebellum::RouteIdentity;
-use serde_json::json;
+use cerebellum::{BrowserConfig, RouteIdentity};
+use cerebellum_core::clock::SystemClock;
+use serde_json::{json, Value};
 
 fn identity() -> RouteIdentity {
     RouteIdentity::from_bind(
@@ -169,8 +175,128 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
         .all(|(_, operation)| *operation != browser::Operation::CdpInputPress));
 }
 
+struct NoopCleanup;
+
+impl SessionCleanup for NoopCleanup {
+    fn after_reap(&mut self) -> Result<(), CleanupStage> {
+        Ok(())
+    }
+}
+
+fn plane_with_process(
+    route: &RouteIdentity,
+    process: Box<dyn OwnedBrowserProcess>,
+    navigation_settle_deadline_ms: u64,
+) -> BrowserPlane {
+    let sessions = BrowserSessions::default();
+    let acquired_id = match sessions.acquire_launch_slot(&route.conversation_key) {
+        LaunchSlot::Acquired { browser_session_id } => browser_session_id,
+        LaunchSlot::Occupied { browser_session_id } => {
+            panic!("unexpected occupied launch slot {browser_session_id}")
+        }
+    };
+    let clock = Arc::new(SystemClock::new());
+    let config = BrowserConfig {
+        executable_path: None,
+        expected_identity: None,
+        launch_handshake_deadline_ms: 100,
+        termination_grace_period_ms: 100,
+        browser_idle_timeout_ms: 30_000,
+        browser_exit_observation_deadline_ms: 100,
+        navigation_settle_deadline_ms,
+    };
+    let Some((browser_session_id, _, cancelled)) = sessions.establish_ready(
+        &route.conversation_key,
+        route.profile_disposition,
+        &config,
+        clock.as_ref(),
+        process,
+        Box::new(NoopCleanup),
+    ) else {
+        panic!("the acquired launch slot did not accept a ready process");
+    };
+    assert_eq!(browser_session_id, acquired_id);
+    assert!(!cancelled);
+    BrowserPlane::with_session_gate(sessions, clock, navigation_settle_deadline_ms)
+}
+
+struct RedirectingNavigationProcess;
+
+impl OwnedBrowserProcess for RedirectingNavigationProcess {
+    fn navigate(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: NavigationWait,
+        _: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        let now = Instant::now();
+        tracker.url_final = Some("https://landed.example/final".into());
+        tracker.load(now);
+        tracker.poll_settlement(now + Duration::from_millis(browser::QUIET_MS));
+        Ok(())
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+struct UnsettledNavigationProcess;
+
+impl OwnedBrowserProcess for UnsettledNavigationProcess {
+    fn navigate(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: NavigationWait,
+        _: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        tracker.load(Instant::now());
+        Ok(())
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
-async fn navigation_reports_unsettled_result_after_recording_non_success() {
+async fn navigation_without_a_ready_session_refuses_before_commit_or_transport() {
     let plane = BrowserPlane::new();
     let route = identity();
     plane.open_context(route.clone()).await.unwrap();
@@ -180,8 +306,101 @@ async fn navigation_reports_unsettled_result_after_recording_non_success() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://example.com",
-                "intent": "open the example page",
+                "url": "https://requested.example/",
+                "intent": "open a page",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "no_session");
+    assert_eq!(result["detail"]["reason_code"], "no_session");
+    assert_eq!(result["detail"]["reason"], "no browser session is open");
+    assert!(plane.operation_log().await.is_empty());
+}
+
+#[tokio::test]
+async fn navigation_while_launch_is_pending_still_names_no_open_session() {
+    let route = identity();
+    let sessions = BrowserSessions::default();
+    match sessions.acquire_launch_slot(&route.conversation_key) {
+        LaunchSlot::Acquired { .. } => {}
+        LaunchSlot::Occupied { browser_session_id } => {
+            panic!("unexpected occupied launch slot {browser_session_id}")
+        }
+    }
+    let plane = BrowserPlane::with_session_gate(sessions, Arc::new(SystemClock::new()), 100);
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "open a page",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "no_session");
+    assert_eq!(result["detail"]["reason"], "no browser session is open");
+    assert!(plane.operation_log().await.is_empty());
+}
+
+#[tokio::test]
+async fn navigation_reports_the_browser_landing_url_instead_of_the_request() {
+    let route = identity();
+    let plane = plane_with_process(&route, Box::new(RedirectingNavigationProcess), 100);
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "follow the redirect",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "ok");
+    assert_eq!(result["url_final"], "https://landed.example/final");
+    assert_eq!(
+        result["lifecycle"],
+        json!(["navigation_started", "load", "network_quiet"])
+    );
+    let operations = plane.operation_log().await;
+    let committed = operations
+        .iter()
+        .position(|(_, operation)| *operation == browser::Operation::CommitDispatched)
+        .expect("navigation records a dispatch commitment");
+    let navigated = operations
+        .iter()
+        .position(|(_, operation)| *operation == browser::Operation::CdpNavigate)
+        .expect("navigation reaches the driver");
+    assert!(committed < navigated, "{operations:?}");
+}
+
+#[tokio::test]
+async fn unsettled_navigation_returns_the_observed_tokens() {
+    let route = identity();
+    let plane = plane_with_process(&route, Box::new(UnsettledNavigationProcess), 10);
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "open a page that stays busy",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
             }),
@@ -189,8 +408,8 @@ async fn navigation_reports_unsettled_result_after_recording_non_success() {
         .await;
 
     assert_eq!(result["outcome"], "not_settled");
-    assert_eq!(result["url_final"], "https://example.com");
-    assert!(result["lifecycle"].is_array());
+    assert_eq!(result["url_final"], Value::Null);
+    assert_eq!(result["lifecycle"], json!(["navigation_started", "load"]));
 }
 
 #[test]

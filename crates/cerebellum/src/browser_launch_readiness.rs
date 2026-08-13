@@ -12,7 +12,7 @@ use crate::browser_launch::{
     AttestedLaunchError, AttestedLaunchRequest, BarredLaunchProcess, BarredProcessLauncher,
     LaunchAttestationRecord, LaunchJournalPort, PlatformLaunchError, ReleasedAttestedBrowser,
 };
-use crate::cdp::{parse_json_message, CdpError, CdpTransport, MAX_MESSAGE_BYTES};
+use crate::cdp::{parse_json_message, CdpError, CdpFrameDecoder, CdpTransport};
 
 const HANDSHAKE_METHOD: &str = "Browser.getVersion";
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -107,39 +107,6 @@ enum HandshakeTerminal {
     Failed(ProfileStartupIndeterminate),
 }
 
-#[derive(Debug, Default)]
-struct PipeFrameDecoder {
-    frame: Vec<u8>,
-    discarding_oversized_frame: bool,
-}
-
-impl PipeFrameDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut frames = Vec::new();
-        for &byte in bytes {
-            if byte == 0 {
-                if self.discarding_oversized_frame {
-                    self.discarding_oversized_frame = false;
-                    self.frame.clear();
-                } else {
-                    frames.push(std::mem::take(&mut self.frame));
-                }
-                continue;
-            }
-            if self.discarding_oversized_frame {
-                continue;
-            }
-            if self.frame.len() == MAX_MESSAGE_BYTES {
-                self.frame.clear();
-                self.discarding_oversized_frame = true;
-                continue;
-            }
-            self.frame.push(byte);
-        }
-        frames
-    }
-}
-
 /// Stateful handshake policy around the transport-agnostic CDP correlator.
 /// Bytes enter only through the NUL decoder; `CdpTransport` remains the sole
 /// owner of request identifiers, pending state, and response correlation.
@@ -149,7 +116,7 @@ pub struct PipeHandshake {
     request_id: u64,
     request_bytes: Vec<u8>,
     deadline: Instant,
-    decoder: PipeFrameDecoder,
+    decoder: CdpFrameDecoder,
     terminal: Option<HandshakeTerminal>,
 }
 
@@ -171,7 +138,7 @@ impl PipeHandshake {
             request_id: command.id,
             request_bytes,
             deadline,
-            decoder: PipeFrameDecoder::default(),
+            decoder: CdpFrameDecoder::default(),
             terminal: None,
         })
     }
@@ -220,8 +187,8 @@ impl PipeHandshake {
         PipeHandshakeState::Pending
     }
 
-    pub fn into_transport(self) -> CdpTransport {
-        self.transport
+    pub fn into_transport_parts(self) -> (CdpTransport, CdpFrameDecoder) {
+        (self.transport, self.decoder)
     }
 
     fn fail(&mut self, cause: ProfileStartupCause) -> PipeHandshakeState {
@@ -355,6 +322,7 @@ pub struct ReadyAttestedBrowser<P, IO> {
     pub process: P,
     pub pipe: IO,
     pub transport: CdpTransport,
+    pub decoder: CdpFrameDecoder,
     pub browser_version: BrowserVersion,
 }
 
@@ -420,11 +388,13 @@ where
                 clock.sleep(cmp::min(POLL_INTERVAL, remaining));
             }
             PipeHandshakeState::Ready(browser_version) => {
+                let (transport, decoder) = handshake.into_transport_parts();
                 return Ok(ReadyAttestedBrowser {
                     attestation,
                     process,
                     pipe,
-                    transport: handshake.into_transport(),
+                    transport,
+                    decoder,
                     browser_version,
                 });
             }
