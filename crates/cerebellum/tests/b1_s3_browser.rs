@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
 use cerebellum::browser_session::{
     BrowserSessions, CleanupStage, LaunchSlot, NavigationDriveError, NavigationWait,
@@ -8,7 +9,9 @@ use cerebellum::browser_session::{
 };
 use cerebellum::cdp::{Attachment, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
-use cerebellum::snapshot_store::{AxRecord, RefRecord, SnapshotKind, SnapshotRef};
+use cerebellum::snapshot_store::{
+    AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
+};
 use cerebellum::{BrowserConfig, RouteIdentity};
 use cerebellum_core::clock::SystemClock;
 use serde_json::{json, Value};
@@ -218,6 +221,225 @@ fn plane_with_process(
     assert_eq!(browser_session_id, acquired_id);
     assert!(!cancelled);
     BrowserPlane::with_session_gate(sessions, clock, navigation_settle_deadline_ms)
+}
+
+#[derive(Clone)]
+struct SnapshotProcess {
+    observation: BrowserSnapshotObservation,
+}
+
+impl OwnedBrowserProcess for SnapshotProcess {
+    fn snapshot(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        Ok(self.observation.clone())
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
+    let refs = records
+        .iter()
+        .filter_map(|record| {
+            let reference = record.reference.as_ref()?;
+            Some(RefRecord {
+                captured: SnapshotRef::new(reference, record.role.clone(), record.name.clone(), 0)
+                    .unwrap(),
+                frame_path: vec!["frame-main".into()],
+                backend_identity: Some(
+                    BackendNodeIdentity::new(
+                        "target-own",
+                        "frame-main",
+                        reference.trim_start_matches('e').parse::<u64>().unwrap() + 10,
+                    )
+                    .unwrap(),
+                ),
+                raw_role: Some(record.role.clone()),
+                raw_name: Some(record.name.clone()),
+            })
+        })
+        .collect();
+    BrowserSnapshotObservation {
+        records,
+        dom_text: None,
+        refs,
+        ax_truncated: false,
+        refs_truncated: false,
+    }
+}
+
+#[tokio::test]
+async fn snapshot_without_a_ready_session_refuses_before_transport_observation() {
+    let plane = BrowserPlane::new();
+    let route = identity();
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"mode": "ax", "max_bytes": 4096}),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "no_session");
+    assert_eq!(result["detail"]["reason_code"], "no_session");
+    assert_eq!(result["detail"]["reason"], "no browser session is open");
+    assert!(plane.operation_log().await.is_empty());
+}
+
+#[tokio::test]
+async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
+    let route = identity();
+    let observation = snapshot_observation(vec![
+        AxRecord {
+            depth: 0,
+            role: "RootWebArea".into(),
+            name: "Structured fixture".into(),
+            value: None,
+            reference: Some("e1".into()),
+        },
+        AxRecord {
+            depth: 1,
+            role: "heading".into(),
+            name: "Account details".into(),
+            value: None,
+            reference: Some("e2".into()),
+        },
+        AxRecord {
+            depth: 1,
+            role: "button".into(),
+            name: "Save profile".into(),
+            value: None,
+            reference: Some("e3".into()),
+        },
+    ]);
+    let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"mode": "ax", "max_bytes": 4096}),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "ok");
+    let records = result["content"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records[1]["role"], "heading");
+    assert_eq!(records[1]["name"], "Account details");
+    assert_eq!(records[2]["role"], "button");
+    assert_eq!(records[2]["name"], "Save profile");
+    assert_eq!(result["refs"][2]["ref"], "e3");
+    assert_eq!(result["refs"][2]["name"], "Save profile");
+    assert_eq!(result["truncated"], false);
+    assert_eq!(result["refs_truncated"], false);
+
+    let operations = plane.operation_log().await;
+    let committed = operations
+        .iter()
+        .position(|(_, operation)| *operation == browser::Operation::CommitDispatched)
+        .unwrap();
+    let observed = operations
+        .iter()
+        .position(|(_, operation)| *operation == browser::Operation::CdpObserve)
+        .unwrap();
+    assert!(committed < observed, "{operations:?}");
+}
+
+#[tokio::test]
+async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
+    let route = identity();
+    let records = vec![
+        AxRecord {
+            depth: 0,
+            role: "RootWebArea".into(),
+            name: "Large fixture".into(),
+            value: None,
+            reference: Some("e1".into()),
+        },
+        AxRecord {
+            depth: 1,
+            role: "heading".into(),
+            name: "This record exceeds the remaining output budget".into(),
+            value: None,
+            reference: Some("e2".into()),
+        },
+    ];
+    let first_line = records[0].canonical_line().unwrap();
+    let plane = plane_with_process(
+        &route,
+        Box::new(SnapshotProcess {
+            observation: snapshot_observation(records),
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"mode": "ax", "max_bytes": first_line.len()}),
+        )
+        .await;
+
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["content"], first_line);
+    for line in result["content"].as_str().unwrap().lines() {
+        let parsed: Value = serde_json::from_str(line).unwrap();
+        assert!(parsed.get("role").is_some());
+        assert!(parsed.get("name").is_some());
+    }
+
+    let route = identity();
+    let mut observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "RootWebArea".into(),
+        name: "Traversal stopped".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    observation.ax_truncated = true;
+    observation.refs_truncated = true;
+    let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
+    plane.open_context(route.clone()).await.unwrap();
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"mode": "ax", "max_bytes": 4096}),
+        )
+        .await;
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["refs_truncated"], true);
 }
 
 struct RedirectingNavigationProcess;
