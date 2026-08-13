@@ -15,7 +15,8 @@ pub const BROWSER_STATUS: &str = "browser.status";
 pub const BROWSER_CLOSE: &str = "browser.close";
 pub const CONTROL_TOOLS: [&str; 3] = [BROWSER_LAUNCH, BROWSER_STATUS, BROWSER_CLOSE];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BrowserSessionTerminalOutcome {
     Closed,
     BrowserCrashed,
@@ -154,6 +155,10 @@ pub trait OwnedBrowserProcess: Send {
 }
 
 pub trait SessionCleanup: Send {
+    fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
+        let _ = outcome;
+    }
+
     fn after_reap(&mut self) -> Result<(), CleanupStage>;
 }
 
@@ -600,7 +605,7 @@ impl BrowserSessions {
         config: &BrowserConfig,
     ) {
         let (lock, wake) = &*self.inner;
-        let (browser_session_id, mut process, mut cleanup) = {
+        let (browser_session_id, terminal_outcome, mut process, mut cleanup) = {
             let mut state = lock.lock().expect("browser session lock poisoned");
             while state
                 .routes
@@ -617,7 +622,7 @@ impl BrowserSessions {
             else {
                 return;
             };
-            session.terminal.get_or_insert(reason);
+            let terminal_outcome = *session.terminal.get_or_insert(reason);
             while state
                 .routes
                 .get(route_key)
@@ -648,16 +653,16 @@ impl BrowserSessions {
             };
             (
                 session.browser_session_id.clone(),
+                terminal_outcome,
                 process,
                 session.cleanup.take(),
             )
         };
 
         let outcome = teardown_process(process.as_mut(), config).and_then(|()| {
-            cleanup
-                .as_mut()
-                .ok_or(CleanupStage::CustodyRelease)?
-                .after_reap()
+            let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
+            cleanup.set_terminal_outcome(terminal_outcome);
+            cleanup.after_reap()
         });
 
         let mut state = lock.lock().expect("browser session lock poisoned");
@@ -866,6 +871,18 @@ mod tests {
         }
     }
 
+    struct RecordingFinalizer(Arc<Mutex<Vec<BrowserSessionTerminalOutcome>>>);
+
+    impl SessionCleanup for RecordingFinalizer {
+        fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
+            self.0.lock().unwrap().push(outcome);
+        }
+
+        fn after_reap(&mut self) -> Result<(), CleanupStage> {
+            Ok(())
+        }
+    }
+
     type TestReadySession = (
         String,
         Arc<Mutex<Vec<&'static str>>>,
@@ -906,6 +923,138 @@ mod tests {
         second_generation_match: bool,
     ) -> TestReadySession {
         ready_session_on(sessions, "route", clock, second_generation_match)
+    }
+
+    fn finalizing_session_on(
+        sessions: &BrowserSessions,
+        route: &str,
+        clock: &FakeClock,
+        first_generation_match: bool,
+    ) -> (String, Arc<Mutex<Vec<BrowserSessionTerminalOutcome>>>) {
+        let _ = sessions.acquire_launch_slot(route);
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let (id, _, cancelled) = sessions
+            .establish_ready(
+                route,
+                ProfileDisposition::Durable,
+                &config(),
+                clock,
+                Box::new(RecordingProcess {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    checks: 0,
+                    first_generation_match,
+                    second_generation_match: first_generation_match,
+                }),
+                Box::new(RecordingFinalizer(Arc::clone(&outcomes))),
+            )
+            .unwrap();
+        assert!(!cancelled);
+        (id, outcomes)
+    }
+
+    #[test]
+    fn explicit_close_finalizes_once_with_closed_outcome() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (id, outcomes) = finalizing_session_on(&sessions, "route", &clock, true);
+
+        assert_eq!(
+            sessions.close("route", &id, &config()),
+            json!({"outcome": "closed", "browser_session_id": id})
+        );
+        assert_eq!(
+            sessions.close("route", &id, &config()),
+            json!({"outcome": "closed", "browser_session_id": id})
+        );
+        assert_eq!(
+            outcomes.lock().unwrap().as_slice(),
+            [BrowserSessionTerminalOutcome::Closed]
+        );
+    }
+
+    #[test]
+    fn every_automatic_terminal_path_finalizes_once_with_its_exact_outcome() {
+        let mut clock = FakeClock::new();
+
+        let sessions = BrowserSessions::default();
+        let (_, idle_outcomes) = finalizing_session_on(&sessions, "idle", &clock, true);
+        clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
+        assert!(sessions.expire_idle("idle", &clock, &config()));
+        assert!(!sessions.expire_idle("idle", &clock, &config()));
+        assert_eq!(
+            idle_outcomes.lock().unwrap().as_slice(),
+            [BrowserSessionTerminalOutcome::IdleExpired]
+        );
+
+        let sessions = BrowserSessions::default();
+        let (_, crash_outcomes) = finalizing_session_on(&sessions, "crash", &clock, false);
+        sessions.observe_exits_all(&config());
+        sessions.observe_exits_all(&config());
+        assert_eq!(
+            crash_outcomes.lock().unwrap().as_slice(),
+            [BrowserSessionTerminalOutcome::BrowserCrashed]
+        );
+
+        for (route, reason) in [
+            ("connector", BrowserSessionTerminalOutcome::ConnectorFailure),
+            ("cdp", BrowserSessionTerminalOutcome::CdpFailure),
+            ("unbind", BrowserSessionTerminalOutcome::RouteUnbound),
+        ] {
+            let sessions = BrowserSessions::default();
+            let (_, outcomes) = finalizing_session_on(&sessions, route, &clock, true);
+            sessions.teardown_route(route, reason, &config());
+            sessions.teardown_route(route, reason, &config());
+            assert_eq!(outcomes.lock().unwrap().as_slice(), [reason]);
+        }
+
+        let sessions = BrowserSessions::default();
+        let (_, shutdown_outcomes) = finalizing_session_on(&sessions, "shutdown", &clock, true);
+        sessions.teardown_all(&config());
+        sessions.teardown_all(&config());
+        assert_eq!(
+            shutdown_outcomes.lock().unwrap().as_slice(),
+            [BrowserSessionTerminalOutcome::ModuleShutdown]
+        );
+    }
+
+    #[test]
+    fn failed_journal_finalization_is_cleanup_failure_never_closed() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let _ = sessions.acquire_launch_slot("journal-failure");
+        let (id, _, _) = sessions
+            .establish_ready(
+                "journal-failure",
+                ProfileDisposition::Durable,
+                &config(),
+                &clock,
+                Box::new(RecordingProcess {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    checks: 0,
+                    first_generation_match: true,
+                    second_generation_match: true,
+                }),
+                Box::new(FailingCleanup(CleanupStage::RecordTerminalization)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            sessions.close("journal-failure", &id, &config()),
+            json!({
+                "outcome": "cleanup_failure",
+                "browser_session_id": id,
+                "stage": "record_terminalization",
+            })
+        );
+        assert_eq!(
+            sessions.status("journal-failure", &clock, UNIX_EPOCH),
+            json!({
+                "outcome": "cleanup_failure",
+                "browser_session_id": id,
+                "profile_disposition": "durable",
+                "stage": "record_terminalization",
+            })
+        );
     }
 
     #[test]
