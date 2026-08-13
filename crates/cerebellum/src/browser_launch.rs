@@ -1184,3 +1184,438 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove mismatch directory");
     }
 }
+
+use serde_json::{json, Value};
+
+use crate::profile::{
+    AbortCause, AbortResult, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
+    LaunchResult, OpenedContext, PrepareResult, PreparedOpen, PreparedProfileAttempt,
+    ProfileDisposition, ProfileLifecycle, ProfileOutcome, ReleaseCause, ReleaseResult,
+    StampedBindContext,
+};
+use crate::profile_custody::{
+    HolderId, ProfileCustodyAcquisition, ProfileCustodyClaim, ProfileCustodyJournal,
+    ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease, SupervisorLivenessProbe,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchCleanupStage {
+    RecordTerminalization,
+    CustodyRelease,
+    DisposableDelete,
+}
+
+impl LaunchCleanupStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordTerminalization => "record_terminalization",
+            Self::CustodyRelease => "custody_release",
+            Self::DisposableDelete => "disposable_delete",
+        }
+    }
+}
+
+/// Wire launch outcomes do not contain a profile UUID by construction. The only
+/// profile contention identity this type can carry is a custody holder id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserLaunchOutcome {
+    ProfileBusy { holder_id: HolderId },
+    ProfileGrantRequired,
+    ProfileStorageUnavailable,
+    InternalFailure,
+    CleanupFailure { stage: LaunchCleanupStage },
+}
+
+impl BrowserLaunchOutcome {
+    pub fn as_json(&self) -> Value {
+        match self {
+            Self::ProfileBusy { holder_id } => {
+                json!({"outcome": "profile_busy", "holder_id": holder_id.as_str()})
+            }
+            Self::ProfileGrantRequired => json!({"outcome": "profile_grant_required"}),
+            Self::ProfileStorageUnavailable => {
+                json!({"outcome": "profile_storage_unavailable"})
+            }
+            Self::InternalFailure => json!({"outcome": "internal_failure"}),
+            Self::CleanupFailure { stage } => {
+                json!({"outcome": "cleanup_failure", "stage": stage.as_str()})
+            }
+        }
+    }
+}
+
+/// Exhaustive mapping for the profile API's closed outcome. In particular,
+/// registry `ProfileBusy` is disagreement with an already-held custody claim and
+/// cannot be reported as contention.
+pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
+    match outcome {
+        ProfileOutcome::ProfileBusy { profile_uuid: _ } => BrowserLaunchOutcome::InternalFailure,
+        ProfileOutcome::ProfileGrantRequired { reason_code: _ } => {
+            BrowserLaunchOutcome::ProfileGrantRequired
+        }
+        ProfileOutcome::NoSession { reason_code: _ } => BrowserLaunchOutcome::InternalFailure,
+        ProfileOutcome::StorageUnavailable {
+            reason_code: _,
+            origin: _,
+        } => BrowserLaunchOutcome::ProfileStorageUnavailable,
+        ProfileOutcome::InternalFailure { reason_code: _ } => BrowserLaunchOutcome::InternalFailure,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPreparedProfile {
+    prepared: PreparedOpen,
+    attempt: PreparedProfileAttempt,
+    claim: ProfileCustodyClaim,
+}
+
+impl HeldPreparedProfile {
+    pub fn holder_id(&self) -> &HolderId {
+        self.claim.holder_id()
+    }
+
+    pub fn attempt(&self) -> &PreparedProfileAttempt {
+        &self.attempt
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldOpenedProfile {
+    opened: OpenedContext,
+    attempt: PreparedProfileAttempt,
+    claim: ProfileCustodyClaim,
+}
+
+impl HeldOpenedProfile {
+    pub fn holder_id(&self) -> &HolderId {
+        self.claim.holder_id()
+    }
+
+    pub fn opened(&self) -> &OpenedContext {
+        &self.opened
+    }
+}
+
+pub struct ProfileBoundLaunch<'a, J, P>
+where
+    J: ProfileCustodyJournal,
+    P: SupervisorLivenessProbe,
+{
+    lifecycle: &'a mut ProfileLifecycle,
+    locks: &'a mut ProfileCustodyLocks<J, P>,
+}
+
+impl<'a, J, P> ProfileBoundLaunch<'a, J, P>
+where
+    J: ProfileCustodyJournal,
+    P: SupervisorLivenessProbe,
+{
+    pub fn new(
+        lifecycle: &'a mut ProfileLifecycle,
+        locks: &'a mut ProfileCustodyLocks<J, P>,
+    ) -> Self {
+        Self { lifecycle, locks }
+    }
+
+    /// Acquire the logical profile before the existing prepare API performs any
+    /// profile mutation. Failure after acquisition enters the same rollback path
+    /// even when preparation itself did not finish.
+    pub fn acquire_and_prepare(
+        &mut self,
+        key: ProfileCustodyKey,
+        invocation: &InvocationToken,
+        reservation: &JournalReservationHandle,
+        context: &StampedBindContext,
+    ) -> Result<HeldPreparedProfile, BrowserLaunchOutcome> {
+        let holder_id = self
+            .locks
+            .mint_holder()
+            .map_err(|_| BrowserLaunchOutcome::InternalFailure)?;
+        let mut claim = match self.locks.acquire(key, holder_id) {
+            Ok(ProfileCustodyAcquisition::Acquired(claim)) => claim,
+            Ok(ProfileCustodyAcquisition::ProfileBusy { holder_id }) => {
+                return Err(BrowserLaunchOutcome::ProfileBusy { holder_id })
+            }
+            Err(_) => return Err(BrowserLaunchOutcome::InternalFailure),
+        };
+
+        let prepared = match self
+            .lifecycle
+            .prepare_context_open(invocation, reservation, context)
+        {
+            PrepareResult::Prepared(prepared) => prepared,
+            PrepareResult::Closed(outcome) => {
+                let primary = map_profile_outcome(outcome);
+                return match self.release_unprepared(&claim) {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+        };
+        let attempt = match self.lifecycle.prepared_profile_attempt(&prepared) {
+            Ok(attempt) => attempt,
+            Err(outcome) => {
+                let primary = map_profile_outcome(outcome);
+                return match self.rollback_prepared_parts(prepared, None, claim) {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+        };
+        if self
+            .locks
+            .bind_profile_directory(&mut claim, attempt.directory())
+            .is_err()
+        {
+            return match self.rollback_prepared_parts(prepared, Some(attempt), claim) {
+                Ok(()) => Err(BrowserLaunchOutcome::InternalFailure),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+        Ok(HeldPreparedProfile {
+            prepared,
+            attempt,
+            claim,
+        })
+    }
+
+    pub fn launch_prepared(
+        &mut self,
+        held: HeldPreparedProfile,
+        token: &DispatchCommitmentToken,
+    ) -> Result<HeldOpenedProfile, BrowserLaunchOutcome> {
+        if self.locks.verify_exact_holder(&held.claim).is_err() {
+            return Err(BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            });
+        }
+        match self
+            .lifecycle
+            .launch_prepared_context(held.prepared.clone(), token)
+        {
+            LaunchResult::Opened(opened) => Ok(HeldOpenedProfile {
+                opened,
+                attempt: held.attempt,
+                claim: held.claim,
+            }),
+            LaunchResult::Closed(outcome) => {
+                let primary = map_profile_outcome(outcome);
+                match self.rollback_prepared(held) {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(cleanup),
+                }
+            }
+        }
+    }
+
+    pub fn into_opened_rollback(self, held: HeldOpenedProfile) -> OpenedProfileRollback<'a, J, P> {
+        OpenedProfileRollback {
+            lifecycle: self.lifecycle,
+            locks: self.locks,
+            held: Some(held),
+            cleanup_failure: None,
+        }
+    }
+
+    /// Roll back a failure that happened before the profile API transferred the
+    /// prepared handle into an opened context.
+    pub fn rollback_prepared(
+        &mut self,
+        held: HeldPreparedProfile,
+    ) -> Result<(), BrowserLaunchOutcome> {
+        self.rollback_prepared_parts(held.prepared, Some(held.attempt), held.claim)
+    }
+
+    /// Roll back a failure after profile launch but before a ready session owns
+    /// the profile. Callers invoke this only after any child has been reaped.
+    pub fn rollback_opened(&mut self, held: HeldOpenedProfile) -> Result<(), BrowserLaunchOutcome> {
+        self.locks.verify_exact_holder(&held.claim).map_err(|_| {
+            BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            }
+        })?;
+        self.locks
+            .record_rollback_terminalization(&held.claim)
+            .map_err(|_| BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::RecordTerminalization,
+            })?;
+        let rollback = self
+            .lifecycle
+            .terminalize_opened_rollback(&held.opened, ReleaseCause::SessionEnd)
+            .map_err(|_| BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::RecordTerminalization,
+            })?;
+        self.release_and_delete(&held.claim, &held.attempt)?;
+        match self
+            .lifecycle
+            .complete_opened_rollback(rollback, &held.attempt)
+        {
+            ReleaseResult::Released => Ok(()),
+            ReleaseResult::Closed(_) => Err(BrowserLaunchOutcome::CleanupFailure {
+                stage: cleanup_stage_after_profile_completion(&held.attempt),
+            }),
+        }
+    }
+
+    fn rollback_prepared_parts(
+        &mut self,
+        prepared: PreparedOpen,
+        attempt: Option<PreparedProfileAttempt>,
+        claim: ProfileCustodyClaim,
+    ) -> Result<(), BrowserLaunchOutcome> {
+        self.locks.verify_exact_holder(&claim).map_err(|_| {
+            BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            }
+        })?;
+        self.locks
+            .record_rollback_terminalization(&claim)
+            .map_err(|_| BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::RecordTerminalization,
+            })?;
+        let rollback = self
+            .lifecycle
+            .terminalize_prepared_rollback(&prepared, AbortCause::Teardown)
+            .map_err(|_| BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::RecordTerminalization,
+            })?;
+        let attempt = attempt.ok_or(BrowserLaunchOutcome::CleanupFailure {
+            stage: LaunchCleanupStage::RecordTerminalization,
+        })?;
+        self.release_and_delete(&claim, &attempt)?;
+        match self
+            .lifecycle
+            .complete_prepared_rollback(rollback, &attempt)
+        {
+            AbortResult::Aborted(_) => Ok(()),
+            AbortResult::Closed(_) => Err(BrowserLaunchOutcome::CleanupFailure {
+                stage: cleanup_stage_after_profile_completion(&attempt),
+            }),
+        }
+    }
+
+    fn release_unprepared(
+        &mut self,
+        claim: &ProfileCustodyClaim,
+    ) -> Result<(), BrowserLaunchOutcome> {
+        self.locks
+            .record_rollback_terminalization(claim)
+            .map_err(|_| BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::RecordTerminalization,
+            })?;
+        match self.locks.release_exact(claim) {
+            Ok(ProfileCustodyRelease::Released) => Ok(()),
+            Ok(ProfileCustodyRelease::HolderMismatch { .. } | ProfileCustodyRelease::Missing)
+            | Err(_) => Err(BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            }),
+        }
+    }
+
+    fn release_and_delete(
+        &mut self,
+        claim: &ProfileCustodyClaim,
+        attempt: &PreparedProfileAttempt,
+    ) -> Result<(), BrowserLaunchOutcome> {
+        if claim.profile_directory() != Some(attempt.directory()) {
+            return Err(BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            });
+        }
+        if attempt.disposition() == ProfileDisposition::Disposable {
+            self.locks.record_disposable_delete(claim).map_err(|_| {
+                BrowserLaunchOutcome::CleanupFailure {
+                    stage: LaunchCleanupStage::DisposableDelete,
+                }
+            })?;
+        }
+        match self.locks.release_exact(claim) {
+            Ok(ProfileCustodyRelease::Released) => {}
+            Ok(ProfileCustodyRelease::HolderMismatch { .. } | ProfileCustodyRelease::Missing)
+            | Err(_) => {
+                return Err(BrowserLaunchOutcome::CleanupFailure {
+                    stage: LaunchCleanupStage::CustodyRelease,
+                })
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Readiness invokes this adapter only after it has confirmed the child is gone
+/// and reaped. The held profile is consumed once, so a second callback cannot
+/// repeat terminalization, release, or deletion.
+pub struct OpenedProfileRollback<'a, J, P>
+where
+    J: ProfileCustodyJournal,
+    P: SupervisorLivenessProbe,
+{
+    lifecycle: &'a mut ProfileLifecycle,
+    locks: &'a mut ProfileCustodyLocks<J, P>,
+    held: Option<HeldOpenedProfile>,
+    cleanup_failure: Option<BrowserLaunchOutcome>,
+}
+
+impl<J, P> OpenedProfileRollback<'_, J, P>
+where
+    J: ProfileCustodyJournal,
+    P: SupervisorLivenessProbe,
+{
+    pub fn cleanup_failure(&self) -> Option<&BrowserLaunchOutcome> {
+        self.cleanup_failure.as_ref()
+    }
+
+    pub fn rollback_now(&mut self) -> Result<(), BrowserLaunchOutcome> {
+        let held = self
+            .held
+            .take()
+            .ok_or(BrowserLaunchOutcome::InternalFailure)?;
+        match ProfileBoundLaunch::new(self.lifecycle, self.locks).rollback_opened(held) {
+            Ok(()) => Ok(()),
+            Err(outcome) => {
+                self.cleanup_failure = Some(outcome.clone());
+                Err(outcome)
+            }
+        }
+    }
+}
+
+impl<J, P> FailedLaunchRollback for OpenedProfileRollback<'_, J, P>
+where
+    J: ProfileCustodyJournal,
+    P: SupervisorLivenessProbe,
+{
+    fn rollback(
+        &mut self,
+        _failure: &ProfileStartupIndeterminate,
+    ) -> Result<(), PlatformLaunchError> {
+        self.rollback_now()
+            .map_err(|_| PlatformLaunchError::ProcessControl)
+    }
+
+    fn rollback_attested(
+        &mut self,
+        _failure: &AttestedLaunchError,
+    ) -> Result<(), PlatformLaunchError> {
+        self.rollback_now()
+            .map_err(|_| PlatformLaunchError::ProcessControl)
+    }
+}
+
+fn cleanup_stage_after_profile_completion(attempt: &PreparedProfileAttempt) -> LaunchCleanupStage {
+    if attempt.disposition() == ProfileDisposition::Disposable {
+        LaunchCleanupStage::DisposableDelete
+    } else {
+        LaunchCleanupStage::RecordTerminalization
+    }
+}
+
+/// This compile-time shape assertion fails if a future wire-facing outcome can
+/// carry a profile UUID or profile path without updating the structural fence.
+const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
+    BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
+    | BrowserLaunchOutcome::ProfileGrantRequired
+    | BrowserLaunchOutcome::ProfileStorageUnavailable
+    | BrowserLaunchOutcome::InternalFailure
+    | BrowserLaunchOutcome::CleanupFailure { stage: _ } => {}
+};

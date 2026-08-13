@@ -318,35 +318,11 @@ impl ProfileOutcome {
             | Self::InternalFailure { reason_code } => reason_code,
         }
     }
-
-    pub fn as_json(&self) -> Value {
-        match self {
-            Self::ProfileBusy { profile_uuid } => serde_json::json!({
-                "outcome":"profile_busy", "profile_uuid":profile_uuid
-            }),
-            Self::ProfileGrantRequired { reason_code } => serde_json::json!({
-                "outcome":"profile_grant_required", "reason_code":reason_code
-            }),
-            Self::NoSession { reason_code } => serde_json::json!({
-                "outcome":"no_session", "reason_code":reason_code
-            }),
-            Self::StorageUnavailable {
-                reason_code,
-                origin,
-            } => serde_json::json!({
-                "outcome":"internal_error", "reason_code":reason_code,
-                "profile_storage_failure_origin":origin.as_str()
-            }),
-            Self::InternalFailure { reason_code } => serde_json::json!({
-                "outcome":"internal_error", "reason_code":reason_code
-            }),
-        }
-    }
 }
 
 impl fmt::Display for ProfileOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_json())
+        write!(f, "{}", self.reason_code())
     }
 }
 
@@ -1768,6 +1744,25 @@ pub enum PreparedKind {
     Creating(ProfileKind),
     Reuse,
 }
+
+/// The exact profile directory selected by preparation. The registry UUID stays
+/// private; launch custody needs only the disposition and canonical delete target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedProfileAttempt {
+    disposition: ProfileDisposition,
+    directory: PathBuf,
+}
+
+impl PreparedProfileAttempt {
+    pub const fn disposition(&self) -> ProfileDisposition {
+        self.disposition
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedState {
     id: u64,
@@ -1799,12 +1794,30 @@ struct OpenedState {
     profile_uuid: String,
     profile_name: Option<String>,
     release: Option<(ReleaseCause, Result<(), ProfileOutcome>)>,
+    rollback_terminalized: Option<ReleaseCause>,
 }
 /// Opaque session-owned opened context handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenedContext {
     namespace: u64,
     id: u64,
+}
+
+/// Opaque proof that the prepared profile record reached a terminal rollback
+/// state. Custody release may occur only between this phase and completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRollback {
+    namespace: u64,
+    id: u64,
+    cause: AbortCause,
+}
+
+/// Opaque proof that an opened profile record reached a terminal rollback state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedRollback {
+    namespace: u64,
+    id: u64,
+    cause: ReleaseCause,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1907,6 +1920,15 @@ impl ProfileLifecycle {
     pub fn abort_signals(&self) -> &[AbortSignal] {
         &self.abort_signals
     }
+
+    /// Report pending preparation ownership without exposing any profile
+    /// identity or filesystem path.
+    pub fn pending_preparation_count(&self) -> usize {
+        self.prepared
+            .values()
+            .filter(|state| state.terminal.is_none())
+            .count()
+    }
     pub fn is_effectively_excluded(&self, profile_uuid: &str) -> bool {
         self.deletion_excluded.contains(profile_uuid)
     }
@@ -2005,93 +2027,101 @@ impl ProfileLifecycle {
                 })
             }
             ProfileDisposition::Durable => {
-                if !self.registry.config.grant_verifier_available
-                    || !self.registry.config.sealing_available
-                {
-                    return self.closed_storage(FailureOrigin::CkcredDependency);
+                self.prepare_durable(invocation, reservation, context, conversation)
+            }
+        }
+    }
+
+    fn prepare_durable(
+        &mut self,
+        invocation: &InvocationToken,
+        reservation: &JournalReservationHandle,
+        context: &StampedBindContext,
+        conversation: String,
+    ) -> PrepareResult {
+        if !self.registry.config.grant_verifier_available || !self.registry.config.sealing_available
+        {
+            return self.closed_storage(FailureOrigin::CkcredDependency);
+        }
+        let resolution = match self.registry.resolve_durable(context.agent_project_id()) {
+            Ok(resolution) => resolution,
+            Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
+        };
+        let record = match resolution {
+            DurableResolution::UntrustworthyOrUnavailable { .. } => {
+                return self.closed_storage(FailureOrigin::RegistryOrStorage)
+            }
+            DurableResolution::AffirmativeAbsence => {
+                if !self.registry.config.uuid_protocol_compatible {
+                    return PrepareResult::Closed(ProfileOutcome::NoSession {
+                        reason_code: "no_session",
+                    });
                 }
-                let resolution = match self.registry.resolve_durable(context.agent_project_id()) {
-                    Ok(resolution) => resolution,
-                    Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
-                };
-                let record = match resolution {
-                    DurableResolution::UntrustworthyOrUnavailable { .. } => {
-                        return self.closed_storage(FailureOrigin::RegistryOrStorage)
-                    }
-                    DurableResolution::AffirmativeAbsence => {
-                        if !self.registry.config.uuid_protocol_compatible {
-                            return PrepareResult::Closed(ProfileOutcome::NoSession {
-                                reason_code: "no_session",
-                            });
-                        }
-                        if !self.registry.config.grant_accepted
-                            || self.registry.config.grant_authority.is_some()
-                        {
-                            return PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
-                                reason_code: "durable_profile_grant_unavailable",
-                            });
-                        }
-                        match self.registry.create_durable_record(context) {
-                            Ok(record) => record,
-                            Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
-                        }
-                    }
-                    DurableResolution::TrustworthyExisting(record) => record,
-                };
-                // Grant verification must succeed before the profile's
-                // owner-specific authority data is exposed. The adapter is
-                // modeled here by its availability and grant-decision flags;
-                // an unavailable adapter has already caused rejection.
-                let authority = self
-                    .registry
-                    .authority_projection(context, &record.profile_uuid);
                 if !self.registry.config.grant_accepted
-                    || self
-                        .registry
-                        .config
-                        .grant_authority
-                        .as_ref()
-                        .is_some_and(|grant| grant != &authority)
+                    || self.registry.config.grant_authority.is_some()
                 {
                     return PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
                         reason_code: "durable_profile_grant_unavailable",
                     });
                 }
-                if record.state == ProfileState::Attached || record.state == ProfileState::Locked {
-                    return PrepareResult::Closed(ProfileOutcome::ProfileBusy {
-                        profile_uuid: record.profile_uuid,
-                    });
+                match self.registry.create_durable_record(context) {
+                    Ok(record) => record,
+                    Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
                 }
-                if !matches!(
-                    record.state,
-                    ProfileState::Available | ProfileState::Released
-                ) || !record.state.legal_for(ProfileKind::Durable)
-                    || record.seal_state == SealState::Ambiguous
-                {
-                    return self.closed_storage(FailureOrigin::RegistryOrStorage);
-                }
-                let id = self.next();
-                self.prepared.insert(
-                    id,
-                    PreparedState {
-                        id,
-                        invocation_id: invocation.id.clone(),
-                        reservation_id: reservation.id.clone(),
-                        context_fingerprint: context.fingerprint(),
-                        conversation_key: conversation,
-                        project_id: context.agent_project_id().to_string(),
-                        kind: PreparedKind::Creating(ProfileKind::Durable),
-                        profile_uuid: Some(record.profile_uuid),
-                        profile_name: Some("default".to_string()),
-                        terminal: None,
-                    },
-                );
-                PrepareResult::Prepared(PreparedOpen {
-                    namespace: self.namespace,
-                    id,
-                })
             }
+            DurableResolution::TrustworthyExisting(record) => record,
+        };
+        // Grant verification must succeed before the profile's owner-specific
+        // authority data is exposed. An unavailable adapter has already caused
+        // rejection above, so only affirmative authority reaches preparation.
+        let authority = self
+            .registry
+            .authority_projection(context, &record.profile_uuid);
+        if !self.registry.config.grant_accepted
+            || self
+                .registry
+                .config
+                .grant_authority
+                .as_ref()
+                .is_some_and(|grant| grant != &authority)
+        {
+            return PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
+                reason_code: "durable_profile_grant_unavailable",
+            });
         }
+        if record.state == ProfileState::Attached || record.state == ProfileState::Locked {
+            return PrepareResult::Closed(ProfileOutcome::ProfileBusy {
+                profile_uuid: record.profile_uuid,
+            });
+        }
+        if !matches!(
+            record.state,
+            ProfileState::Available | ProfileState::Released
+        ) || !record.state.legal_for(ProfileKind::Durable)
+            || record.seal_state == SealState::Ambiguous
+        {
+            return self.closed_storage(FailureOrigin::RegistryOrStorage);
+        }
+        let id = self.next();
+        self.prepared.insert(
+            id,
+            PreparedState {
+                id,
+                invocation_id: invocation.id.clone(),
+                reservation_id: reservation.id.clone(),
+                context_fingerprint: context.fingerprint(),
+                conversation_key: conversation,
+                project_id: context.agent_project_id().to_string(),
+                kind: PreparedKind::Creating(ProfileKind::Durable),
+                profile_uuid: Some(record.profile_uuid),
+                profile_name: Some("default".to_string()),
+                terminal: None,
+            },
+        );
+        PrepareResult::Prepared(PreparedOpen {
+            namespace: self.namespace,
+            id,
+        })
     }
 
     fn create_disposable(&self, context: &StampedBindContext) -> Result<String, RegistryError> {
@@ -2147,6 +2177,162 @@ impl ProfileLifecycle {
         document.generation = document.generation.saturating_add(1);
         self.registry.write_document(document)?;
         Ok(uuid)
+    }
+
+    /// Return the disposition and canonical directory selected for this opaque
+    /// preparation without exposing the registry's profile UUID.
+    pub fn prepared_profile_attempt(
+        &self,
+        prepared: &PreparedOpen,
+    ) -> Result<PreparedProfileAttempt, ProfileOutcome> {
+        if prepared.namespace != self.namespace {
+            return Err(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let state = self
+            .prepared
+            .get(&prepared.id)
+            .ok_or(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            })?;
+        let uuid = state
+            .profile_uuid
+            .as_deref()
+            .ok_or(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            })?;
+        let record = self.registry.record_for_by_uuid(uuid).map_err(|_| {
+            ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            }
+        })?;
+        let directory = self
+            .registry
+            .profile_target(&record.target, false)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        Ok(PreparedProfileAttempt {
+            disposition: match record.kind {
+                ProfileKind::Durable => ProfileDisposition::Durable,
+                ProfileKind::Disposable => ProfileDisposition::Disposable,
+            },
+            directory,
+        })
+    }
+
+    /// Terminalize a prepared profile without releasing it or deleting its
+    /// directory. The separate completion step lets the lock owner enforce
+    /// terminalize-before-release and release-before-delete ordering.
+    pub fn terminalize_prepared_rollback(
+        &mut self,
+        prepared: &PreparedOpen,
+        cause: AbortCause,
+    ) -> Result<PreparedRollback, ProfileOutcome> {
+        if prepared.namespace != self.namespace {
+            return Err(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let Some(state) = self.prepared.get(&prepared.id).cloned() else {
+            return Err(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if let Some(signal) = state.terminal.as_ref() {
+            if signal.cause != cause {
+                return Err(ProfileOutcome::InternalFailure {
+                    reason_code: "internal_failure",
+                });
+            }
+        } else {
+            if self.registry.config.abort_failure {
+                return Err(ProfileOutcome::StorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                    origin: FailureOrigin::RegistryOrStorage,
+                });
+            }
+            if let PreparedKind::Creating(kind) = state.kind {
+                let uuid =
+                    state
+                        .profile_uuid
+                        .as_deref()
+                        .ok_or(ProfileOutcome::InternalFailure {
+                            reason_code: "internal_failure",
+                        })?;
+                self.terminalize_profile_record(uuid, kind)?;
+            }
+            let signal = AbortSignal {
+                invocation_id: state.invocation_id,
+                reservation_id: state.reservation_id,
+                cause,
+                state: AbortTerminalState::Aborted,
+            };
+            self.abort_signals.push(signal.clone());
+            self.prepared
+                .get_mut(&prepared.id)
+                .expect("prepared state exists")
+                .terminal = Some(signal);
+        }
+        Ok(PreparedRollback {
+            namespace: prepared.namespace,
+            id: prepared.id,
+            cause,
+        })
+    }
+
+    /// Complete a terminalized rollback after custody release. Disposable
+    /// cleanup removes only the directory recorded in the supplied attempt.
+    pub fn complete_prepared_rollback(
+        &mut self,
+        rollback: PreparedRollback,
+        attempt: &PreparedProfileAttempt,
+    ) -> AbortResult {
+        if rollback.namespace != self.namespace {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let Some(state) = self.prepared.get(&rollback.id).cloned() else {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        let Some(signal) = state.terminal.clone() else {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if signal.cause != rollback.cause {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let actual_attempt = match self.prepared_profile_attempt(&PreparedOpen {
+            namespace: rollback.namespace,
+            id: rollback.id,
+        }) {
+            Ok(value) => value,
+            Err(error) => return AbortResult::Closed(error),
+        };
+        if &actual_attempt != attempt {
+            return AbortResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let result = match state.kind {
+            PreparedKind::Creating(ProfileKind::Disposable) => {
+                self.remove_prepared_disposable(&state)
+            }
+            PreparedKind::Reuse | PreparedKind::Creating(ProfileKind::Durable) => Ok(()),
+        };
+        match result {
+            Ok(()) => AbortResult::Aborted(signal),
+            Err(error) => AbortResult::Closed(error),
+        }
     }
 
     pub fn abort_prepared_context(
@@ -2286,6 +2472,35 @@ impl ProfileLifecycle {
             })
     }
 
+    fn terminalize_profile_record(
+        &self,
+        uuid: &str,
+        kind: ProfileKind,
+    ) -> Result<(), ProfileOutcome> {
+        self.registry
+            .update_record_by_uuid(uuid, |record| {
+                if record.profile_uuid != uuid || record.kind != kind {
+                    return Err(RegistryError::Conflict);
+                }
+                record.state = ProfileState::Released;
+                record.session_id = None;
+                record.attachment_id = None;
+                record.process = None;
+                record.seal_state = if kind == ProfileKind::Durable {
+                    SealState::Sealed
+                } else {
+                    SealState::Available
+                };
+                record.deletion_pending = kind == ProfileKind::Disposable;
+                Ok(())
+            })
+            .map(|_| ())
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })
+    }
+
     pub fn launch_prepared_context(
         &mut self,
         prepared: PreparedOpen,
@@ -2296,7 +2511,7 @@ impl ProfileLifecycle {
                 reason_code: "internal_failure",
             });
         }
-        let Some(state) = self.prepared.remove(&prepared.id) else {
+        let Some(state) = self.prepared.get(&prepared.id).cloned() else {
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
                 reason_code: "internal_failure",
             });
@@ -2304,7 +2519,6 @@ impl ProfileLifecycle {
         if state.invocation_id != token.invocation_id
             || state.reservation_id != token.reservation_id
         {
-            self.prepared.insert(state.id, state);
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
                 reason_code: "internal_failure",
             });
@@ -2347,6 +2561,7 @@ impl ProfileLifecycle {
                     namespace: self.namespace,
                     id: existing.id,
                 };
+                self.prepared.remove(&state.id);
                 self.final_contexts.insert(
                     token.id.clone(),
                     FinalContextAssociation {
@@ -2406,9 +2621,11 @@ impl ProfileLifecycle {
                     profile_uuid: uuid.clone(),
                     profile_name: state.profile_name.clone(),
                     release: None,
+                    rollback_terminalized: None,
                 };
                 self.sessions.insert(state.conversation_key.clone(), id);
                 self.opened.insert(id, opened);
+                self.prepared.remove(&state.id);
                 self.set_open_snapshot(
                     &state.conversation_key,
                     Some(uuid.clone()),
@@ -2458,6 +2675,140 @@ impl ProfileLifecycle {
             || previous.profile_name != next.profile_name
         {
             self.current.insert(conversation.to_string(), next);
+        }
+    }
+
+    pub fn opened_profile_attempt(
+        &self,
+        opened: &OpenedContext,
+    ) -> Result<PreparedProfileAttempt, ProfileOutcome> {
+        if opened.namespace != self.namespace {
+            return Err(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let state = self
+            .opened
+            .get(&opened.id)
+            .ok_or(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            })?;
+        let record = self
+            .registry
+            .record_for_by_uuid(&state.profile_uuid)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        let directory = self
+            .registry
+            .profile_target(&record.target, false)
+            .map_err(|_| ProfileOutcome::StorageUnavailable {
+                reason_code: "profile_storage_unavailable",
+                origin: FailureOrigin::RegistryOrStorage,
+            })?;
+        Ok(PreparedProfileAttempt {
+            disposition: match state.kind {
+                ProfileKind::Durable => ProfileDisposition::Durable,
+                ProfileKind::Disposable => ProfileDisposition::Disposable,
+            },
+            directory,
+        })
+    }
+
+    pub fn terminalize_opened_rollback(
+        &mut self,
+        opened: &OpenedContext,
+        cause: ReleaseCause,
+    ) -> Result<OpenedRollback, ProfileOutcome> {
+        if opened.namespace != self.namespace {
+            return Err(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let state =
+            self.opened
+                .get(&opened.id)
+                .cloned()
+                .ok_or(ProfileOutcome::InternalFailure {
+                    reason_code: "internal_failure",
+                })?;
+        if state
+            .rollback_terminalized
+            .is_some_and(|prior| prior != cause)
+        {
+            return Err(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        if state.rollback_terminalized.is_none() {
+            if self.registry.config.release_failure {
+                return Err(ProfileOutcome::StorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                    origin: FailureOrigin::RegistryOrStorage,
+                });
+            }
+            self.terminalize_profile_record(&state.profile_uuid, state.kind)?;
+            self.opened
+                .get_mut(&opened.id)
+                .expect("opened state exists")
+                .rollback_terminalized = Some(cause);
+        }
+        Ok(OpenedRollback {
+            namespace: opened.namespace,
+            id: opened.id,
+            cause,
+        })
+    }
+
+    pub fn complete_opened_rollback(
+        &mut self,
+        rollback: OpenedRollback,
+        attempt: &PreparedProfileAttempt,
+    ) -> ReleaseResult {
+        if rollback.namespace != self.namespace {
+            return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let opened = OpenedContext {
+            namespace: rollback.namespace,
+            id: rollback.id,
+        };
+        let actual_attempt = match self.opened_profile_attempt(&opened) {
+            Ok(value) => value,
+            Err(error) => return ReleaseResult::Closed(error),
+        };
+        if &actual_attempt != attempt {
+            return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let Some(state) = self.opened.get(&rollback.id).cloned() else {
+            return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        };
+        if state.rollback_terminalized != Some(rollback.cause) {
+            return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
+                reason_code: "internal_failure",
+            });
+        }
+        let outcome = match state.kind {
+            ProfileKind::Disposable => self.release_disposable(&state),
+            ProfileKind::Durable => Ok(()),
+        };
+        match outcome {
+            Ok(()) => {
+                self.sessions.remove(&state.conversation_key);
+                self.set_open_snapshot(&state.conversation_key, None, None);
+                self.opened
+                    .get_mut(&rollback.id)
+                    .expect("opened state exists")
+                    .release = Some((rollback.cause, Ok(())));
+                ReleaseResult::Released
+            }
+            Err(error) => ReleaseResult::Closed(error),
         }
     }
 
