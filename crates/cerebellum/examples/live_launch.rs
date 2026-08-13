@@ -27,6 +27,7 @@ use cerebellum::browser::Tracker;
 use cerebellum::browser_config::BrowserConfig;
 use cerebellum::browser_launch_service::ProductionLaunchService;
 use cerebellum::browser_session::NavigationWait;
+use cerebellum::snapshot_store::SnapshotKind;
 use cerebellum_core::identity::AcceptedBindFacts;
 use serde_json::json;
 use subc_protocol::{BindIdentity, Principal, RouteTarget};
@@ -167,12 +168,21 @@ fn launch_once(
             let (mut process, mut cleanup) = ready.into_parts();
             println!("generation still matches: {}", process.generation_matches());
 
-            // A data URL always reports itself as the final URL, so `url_final`
-            // looks identical whether the browser supplied it or the request was
-            // echoed back. Override this with a redirecting origin to tell those
-            // two apart.
-            let requested_url = std::env::var("CK_PROBE_URL").unwrap_or_else(|_| {
-                "data:text/html,<title>Cerebellum%20navigation%20probe</title>ready".to_string()
+            // The default document has enough distinct semantics that a nearly-empty
+            // adapter cannot appear healthy merely because it found the page root.
+            // A caller can still override it to exercise redirects or a deployed page.
+            let override_url = std::env::var("CK_PROBE_URL").ok();
+            let requested_url = override_url.clone().unwrap_or_else(|| {
+                concat!(
+                    "data:text/html,",
+                    "%3Cheader%3E%3Ch1%3ECerebellum%20Snapshot%20Probe%3C/h1%3E%3C/header%3E",
+                    "%3Cnav%20aria-label='Probe%20navigation'%3E%3Ca%20href='%23details'%3ERead%20details%3C/a%3E%3C/nav%3E",
+                    "%3Cmain%3E%3Csection%3E%3Ch2%20id='details'%3EAccount%20details%3C/h2%3E",
+                    "%3Cform%20aria-label='Probe%20form'%3E%3Clabel%20for='email'%3EEmail%20address%3C/label%3E",
+                    "%3Cinput%20id='email'%20type='email'%3E%3Cbutton%20type='button'%3ESave%20profile%3C/button%3E",
+                    "%3C/form%3E%3C/section%3E%3C/main%3E%3Cfooter%3EProbe%20footer%3C/footer%3E"
+                )
+                .to_string()
             });
             let requested_url = requested_url.as_str();
             let mut tracker = Tracker::default();
@@ -193,6 +203,54 @@ fn launch_once(
                     tracker.url_final, tracker.lifecycle
                 ),
             }
+
+            let snapshot_failure = match process.snapshot(
+                &accepted.identity.conversation_key,
+                SnapshotKind::Ax,
+                10_000,
+            ) {
+                Ok(snapshot) => {
+                    println!(
+                        "snapshot: records={} refs={} truncated={} refs_truncated={}",
+                        snapshot.records.len(),
+                        snapshot.refs.len(),
+                        snapshot.ax_truncated,
+                        snapshot.refs_truncated
+                    );
+                    for record in &snapshot.records {
+                        println!("snapshot AX: role={:?} name={:?}", record.role, record.name);
+                    }
+                    if override_url.is_some() {
+                        None
+                    } else {
+                        let expected = [
+                            ("banner", ""),
+                            ("heading", "Cerebellum Snapshot Probe"),
+                            ("navigation", "Probe navigation"),
+                            ("link", "Read details"),
+                            ("main", ""),
+                            ("heading", "Account details"),
+                            ("form", "Probe form"),
+                            ("textbox", "Email address"),
+                            ("button", "Save profile"),
+                            ("contentinfo", ""),
+                        ];
+                        let missing = expected
+                            .into_iter()
+                            .filter(|(role, name)| {
+                                !snapshot.records.iter().any(|record| {
+                                    record.role == *role
+                                        && (name.is_empty() || record.name == *name)
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        (!missing.is_empty()).then(|| {
+                            format!("snapshot missed expected role/name pairs: {missing:?}")
+                        })
+                    }
+                }
+                Err(error) => Some(format!("snapshot failed: {error:?}")),
+            };
 
             // The real ladder: ask, wait the grace period, force only if the
             // same generation is still alive, then reap before any cleanup.
@@ -224,6 +282,9 @@ fn launch_once(
             match cleanup.after_reap() {
                 Ok(()) => println!("[{session_id}] reaped and cleaned up after reap"),
                 Err(stage) => println!("[{session_id}] cleanup failed at {stage:?}"),
+            }
+            if let Some(failure) = snapshot_failure {
+                panic!("{failure}");
             }
             true
         }

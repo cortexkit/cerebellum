@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -7,9 +8,48 @@ use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use crate::browser_session::{NavigationDriveError, NavigationWait};
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
+use crate::snapshot_store::{
+    truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
+    MAX_NAME_BYTES, MAX_REFS, MAX_ROLE_BYTES, MAX_VALUE_BYTES,
+};
 
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_AX_NODES: usize = MAX_REFS;
+const MAX_AX_DEPTH: usize = 64;
+
+/// Page data extracted by the session-owned CDP driver.
+///
+/// The caller retains this separately from the driver so the pipe and request
+/// correlator remain owned by the browser session rather than by snapshot state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSnapshotObservation {
+    pub records: Vec<AxRecord>,
+    pub dom_text: Option<String>,
+    pub refs: Vec<RefRecord>,
+    pub ax_truncated: bool,
+    pub refs_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawAxNode {
+    node_id: String,
+    ignored: bool,
+    role: String,
+    name: String,
+    value: Option<String>,
+    child_ids: Vec<String>,
+    backend_node_id: Option<u64>,
+    frame_id: Option<String>,
+}
+
+struct PendingAxNode {
+    node: Option<RawAxNode>,
+    node_id: String,
+    depth: usize,
+    frame_path: Vec<String>,
+    ancestors: HashSet<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachedTarget {
@@ -69,6 +109,124 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         clock: &mut C,
     ) -> Result<(), NavigationDriveError> {
         self.navigate_with_clock(context_key, url, wait, deadline_ms, tracker, clock)
+    }
+
+    pub(crate) fn snapshot(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.snapshot_with_clock(context_key, mode, deadline_ms, &mut clock)
+    }
+
+    #[cfg(test)]
+    fn snapshot_for_test<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.snapshot_with_clock(context_key, mode, deadline_ms, clock)
+    }
+
+    fn snapshot_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        if mode == SnapshotKind::Screenshot {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .filter(|attachment| attachment.context_key == context_key)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+
+        self.command(
+            "Accessibility.enable",
+            None,
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let root_result = self.command(
+            "Accessibility.getRootAXNode",
+            None,
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let root = required_ax_node(&root_result, "node")?;
+        let session_id = attachment.session_id.clone();
+        let mut observation = traverse_ax_tree(
+            root,
+            &attachment.target_id,
+            MAX_AX_NODES,
+            MAX_AX_DEPTH,
+            |node_id, frame_id| {
+                let mut params = Map::new();
+                params.insert("id".into(), Value::String(node_id.to_string()));
+                if let Some(frame_id) = frame_id {
+                    params.insert("frameId".into(), Value::String(frame_id.to_string()));
+                }
+                let result = self.command(
+                    "Accessibility.getChildAXNodes",
+                    Some(params),
+                    Some(session_id.clone()),
+                    deadline,
+                    None,
+                    clock,
+                )?;
+                required_ax_nodes(&result)
+            },
+        )?;
+
+        if mode == SnapshotKind::DomFull {
+            let mut params = Map::new();
+            params.insert("depth".into(), Value::Number(0.into()));
+            params.insert("pierce".into(), Value::Bool(true));
+            let document = self.command(
+                "DOM.getDocument",
+                Some(params),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            let node_id = document
+                .get("root")
+                .and_then(Value::as_object)
+                .and_then(|root| root.get("nodeId"))
+                .and_then(Value::as_u64)
+                .filter(|node_id| *node_id > 0)
+                .ok_or(NavigationDriveError::CdpFailure)?;
+            let mut params = Map::new();
+            params.insert("nodeId".into(), Value::Number(node_id.into()));
+            let outer_html = self.command(
+                "DOM.getOuterHTML",
+                Some(params),
+                Some(attachment.session_id),
+                deadline,
+                None,
+                clock,
+            )?;
+            observation.dom_text = Some(required_result_string(&outer_html, "outerHTML")?);
+        }
+
+        Ok(observation)
     }
 
     fn navigate_with_clock<C: NavigationClock>(
@@ -374,6 +532,306 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     }
 }
 
+fn required_ax_node(
+    result: &Map<String, Value>,
+    field: &str,
+) -> Result<RawAxNode, NavigationDriveError> {
+    result
+        .get(field)
+        .ok_or(NavigationDriveError::CdpFailure)
+        .and_then(RawAxNode::from_value)
+}
+
+fn required_ax_nodes(result: &Map<String, Value>) -> Result<Vec<RawAxNode>, NavigationDriveError> {
+    result
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or(NavigationDriveError::CdpFailure)?
+        .iter()
+        .map(RawAxNode::from_value)
+        .collect()
+}
+
+impl RawAxNode {
+    fn from_value(value: &Value) -> Result<Self, NavigationDriveError> {
+        let object = value.as_object().ok_or(NavigationDriveError::CdpFailure)?;
+        let node_id = object
+            .get("nodeId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or(NavigationDriveError::CdpFailure)?
+            .to_string();
+        let ignored = object
+            .get("ignored")
+            .and_then(Value::as_bool)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let child_ids = match object.get("childIds") {
+            None => Vec::new(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|value| !value.is_empty() && value.len() <= 4_096)
+                        .map(str::to_string)
+                        .ok_or(NavigationDriveError::CdpFailure)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(NavigationDriveError::CdpFailure),
+        };
+        let backend_node_id = match object.get("backendDOMNodeId") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|value| *value > 0)
+                    .ok_or(NavigationDriveError::CdpFailure)?,
+            ),
+        };
+        let frame_id = match object.get("frameId") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty() && value.len() <= 4_096)
+                    .ok_or(NavigationDriveError::CdpFailure)?
+                    .to_string(),
+            ),
+        };
+        Ok(Self {
+            node_id,
+            ignored,
+            role: ax_value_text(object.get("role")).unwrap_or_default(),
+            name: ax_value_text(object.get("name")).unwrap_or_default(),
+            value: ax_value_text(object.get("value")),
+            child_ids,
+            backend_node_id,
+            frame_id,
+        })
+    }
+}
+
+fn ax_value_text(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_object()?.get("value")?;
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn bounded_ax_field(value: &str, max_bytes: usize) -> (String, bool) {
+    let bounded = truncate_ax_field(value, max_bytes);
+    let truncated = bounded.len() != value.len();
+    (bounded, truncated)
+}
+
+fn traverse_ax_tree<F>(
+    root: RawAxNode,
+    target_id: &str,
+    max_nodes: usize,
+    max_depth: usize,
+    mut fetch_children: F,
+) -> Result<BrowserSnapshotObservation, NavigationDriveError>
+where
+    F: FnMut(&str, Option<&str>) -> Result<Vec<RawAxNode>, NavigationDriveError>,
+{
+    if max_nodes == 0 || target_id.is_empty() {
+        return Err(NavigationDriveError::CdpFailure);
+    }
+    let root_id = root.node_id.clone();
+    let mut scheduled = HashSet::from([root_id.clone()]);
+    let mut stack = vec![PendingAxNode {
+        node: Some(root),
+        node_id: root_id,
+        depth: 0,
+        frame_path: Vec::new(),
+        ancestors: HashSet::new(),
+    }];
+    let mut records = Vec::new();
+    let mut refs = Vec::new();
+    let mut fallback_counts: HashMap<(Vec<String>, String, String), u64> = HashMap::new();
+    let mut node_cache = HashMap::<String, RawAxNode>::new();
+    let mut processed = 0usize;
+    let mut ax_truncated = false;
+    let mut refs_truncated = false;
+
+    while let Some(pending) = stack.pop() {
+        if processed == max_nodes {
+            ax_truncated = true;
+            refs_truncated = true;
+            break;
+        }
+        let node = pending.node.ok_or(NavigationDriveError::CdpFailure)?;
+        if node.node_id != pending.node_id {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        processed += 1;
+
+        let mut frame_path = pending.frame_path;
+        if let Some(frame_id) = &node.frame_id {
+            if frame_path.last() != Some(frame_id) {
+                frame_path.push(frame_id.clone());
+            }
+        }
+        let (role, role_truncated) = bounded_ax_field(&node.role, MAX_ROLE_BYTES);
+        let (name, name_truncated) = bounded_ax_field(&node.name, MAX_NAME_BYTES);
+        let (value, value_truncated) = match node.value.as_deref() {
+            Some(value) => {
+                let (value, truncated) = bounded_ax_field(value, MAX_VALUE_BYTES);
+                (Some(value), truncated)
+            }
+            None => (None, false),
+        };
+        if role_truncated || name_truncated || value_truncated {
+            ax_truncated = true;
+            refs_truncated = true;
+        }
+
+        let mut reference = None;
+        if !node.ignored {
+            if let (Some(backend_node_id), Some(frame_id)) =
+                (node.backend_node_id, frame_path.last())
+            {
+                if refs.len() == MAX_REFS {
+                    refs_truncated = true;
+                } else {
+                    let key = (frame_path.clone(), role.clone(), name.clone());
+                    let nth = fallback_counts.entry(key).or_insert(0);
+                    let ref_name = format!("e{}", refs.len() + 1);
+                    let captured = SnapshotRef::new(&ref_name, &role, &name, *nth)
+                        .map_err(|_| NavigationDriveError::CdpFailure)?;
+                    let backend_identity =
+                        BackendNodeIdentity::new(target_id, frame_id, backend_node_id)
+                            .map_err(|_| NavigationDriveError::CdpFailure)?;
+                    refs.push(RefRecord {
+                        captured,
+                        frame_path: frame_path.clone(),
+                        backend_identity: Some(backend_identity),
+                        raw_role: Some(role.clone()),
+                        raw_name: Some(name.clone()),
+                    });
+                    *nth = nth.saturating_add(1);
+                    reference = Some(ref_name);
+                }
+            }
+            records.push(AxRecord {
+                depth: pending.depth as i64,
+                role,
+                name,
+                value,
+                reference,
+            });
+        }
+
+        let mut ancestors = pending.ancestors;
+        ancestors.insert(node.node_id.clone());
+        let node_child_ids = node.child_ids;
+        let mut child_ids = Vec::new();
+        for child_id in node_child_ids {
+            // A back-edge names an element already represented on this path. Cutting
+            // it avoids infinite recursion without hiding any accessibility node.
+            if ancestors.contains(&child_id) {
+                continue;
+            }
+            // A repeated node identity elsewhere in the graph is already represented,
+            // so omitting its duplicate edge is lossless for the flattened snapshot.
+            if !scheduled.insert(child_id.clone()) {
+                continue;
+            }
+            child_ids.push(child_id);
+        }
+        if child_ids.is_empty() {
+            continue;
+        }
+        if pending.depth >= max_depth {
+            ax_truncated = true;
+            refs_truncated = true;
+            continue;
+        }
+
+        let available = max_nodes.saturating_sub(processed.saturating_add(stack.len()));
+        if child_ids.len() > available {
+            ax_truncated = true;
+            refs_truncated = true;
+            child_ids.truncate(available);
+        }
+        if child_ids.is_empty() {
+            continue;
+        }
+        if child_ids
+            .iter()
+            .any(|child_id| !node_cache.contains_key(child_id))
+        {
+            // Chromium can return the descendants it traversed while resolving an
+            // ignored child. Caching that bounded response avoids sending one command
+            // per intermediate node and still follows only declared child identities.
+            let selected_ids = child_ids.iter().cloned().collect::<HashSet<_>>();
+            // Cached descendants are an optimization only. Keeping the immediate
+            // children first ensures cache pressure can never make a declared edge
+            // disappear or turn a complete traversal into a protocol failure.
+            node_cache.retain(|node_id, _| selected_ids.contains(node_id));
+            let fetched = fetch_children(&node.node_id, frame_path.last().map(String::as_str))?;
+            let mut ordered = fetched
+                .iter()
+                .filter(|child| selected_ids.contains(&child.node_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            ordered.extend(
+                fetched
+                    .into_iter()
+                    .filter(|child| !selected_ids.contains(&child.node_id)),
+            );
+            for child in ordered {
+                if node_cache.len() == max_nodes && !selected_ids.contains(&child.node_id) {
+                    // Descendants omitted only from this command-local cache can be
+                    // fetched when their parent is visited, so this is not a lossy
+                    // traversal cut and does not change completeness flags.
+                    continue;
+                }
+                match node_cache.entry(child.node_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(child);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &child => {
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        return Err(NavigationDriveError::CdpFailure)
+                    }
+                }
+            }
+        }
+        let mut selected = child_ids
+            .into_iter()
+            .map(|child_id| {
+                node_cache
+                    .remove(&child_id)
+                    .map(|child| (child_id, child))
+                    .ok_or(NavigationDriveError::CdpFailure)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        selected.reverse();
+        for (child_id, child) in selected {
+            stack.push(PendingAxNode {
+                node: Some(child),
+                node_id: child_id,
+                depth: pending.depth + 1,
+                frame_path: frame_path.clone(),
+                ancestors: ancestors.clone(),
+            });
+        }
+    }
+
+    Ok(BrowserSnapshotObservation {
+        records,
+        dom_text: None,
+        refs,
+        ax_truncated,
+        refs_truncated,
+    })
+}
+
 fn required_result_string(
     result: &Map<String, Value>,
     field: &str,
@@ -412,6 +870,9 @@ mod tests {
 
     use super::*;
     use crate::browser::QUIET_MS;
+    use crate::snapshot_store::{
+        new_snapshot_id, BrowserSnapshotStore, RefCandidate, RefResolution, TextSnapshot, AX_SCHEMA,
+    };
 
     #[derive(Default)]
     struct FakePipe {
@@ -513,6 +974,255 @@ mod tests {
             session_id: Some("session-own".into()),
             raw,
         }
+    }
+
+    fn ax_node(
+        node_id: &str,
+        role: &str,
+        name: &str,
+        child_ids: &[&str],
+        backend_node_id: u64,
+        frame_id: Option<&str>,
+    ) -> Value {
+        let mut node = json!({
+            "nodeId": node_id,
+            "ignored": false,
+            "role": {"type": "role", "value": role},
+            "name": {"type": "computedString", "value": name},
+            "childIds": child_ids,
+            "backendDOMNodeId": backend_node_id,
+        });
+        if let Some(frame_id) = frame_id {
+            node["frameId"] = Value::String(frame_id.to_string());
+        }
+        node
+    }
+
+    fn raw_node(
+        node_id: &str,
+        role: &str,
+        name: &str,
+        child_ids: &[&str],
+        backend_node_id: u64,
+        frame_id: Option<&str>,
+    ) -> RawAxNode {
+        RawAxNode::from_value(&ax_node(
+            node_id,
+            role,
+            name,
+            child_ids,
+            backend_node_id,
+            frame_id,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_reads_named_structure_and_retains_a_resolvable_backend_identity() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Snapshot fixture", &["heading","link"], 10, Some("frame-main"))}}),
+            json!({
+                "method":"Accessibility.loadComplete",
+                "sessionId":"session-foreign",
+                "targetId":"target-foreign",
+                "params":{"root":ax_node("intruder","button","Foreign target", &[], 999, Some("frame-foreign"))}
+            }),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
+                ax_node("heading","heading","Account details", &[], 11, None),
+                ax_node("link","link","Read details", &[], 12, None)
+            ]}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let observation = driver
+            .snapshot_for_test("route-own", SnapshotKind::Ax, 1_000, &mut FakeClock::new())
+            .unwrap();
+
+        assert_eq!(
+            observation
+                .records
+                .iter()
+                .map(|record| (record.role.as_str(), record.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("RootWebArea", "Snapshot fixture"),
+                ("heading", "Account details"),
+                ("link", "Read details"),
+            ]
+        );
+        assert!(!observation
+            .records
+            .iter()
+            .any(|record| record.name == "Foreign target"));
+        assert_eq!(observation.refs[2].captured.reference, "e3");
+        assert_eq!(
+            observation.refs[2].backend_identity,
+            Some(BackendNodeIdentity::new("target-own", "frame-main", 12).unwrap())
+        );
+        assert!(driver.pipe.writes.iter().all(|command| {
+            command.get("sessionId").and_then(Value::as_str) == Some("session-own")
+        }));
+
+        let snapshot_id = new_snapshot_id("driver-ref-resolution");
+        let mut store = BrowserSnapshotStore::new(1).unwrap();
+        store
+            .retain_text(TextSnapshot {
+                snapshot_id: snapshot_id.clone(),
+                kind: SnapshotKind::Ax,
+                document_epoch: 7,
+                source_origin: "https://snapshot.example".into(),
+                content_schema: AX_SCHEMA,
+                content: String::new(),
+                truncated: false,
+                refs_truncated: false,
+                refs: observation.refs.clone(),
+            })
+            .unwrap();
+        let captured = observation.refs[2].clone();
+        let candidates = [
+            RefCandidate {
+                identity: captured.backend_identity.clone(),
+                frame_path: captured.frame_path.clone(),
+                role: "link".into(),
+                name: "Read details".into(),
+                traversal_index: 2,
+            },
+            RefCandidate {
+                identity: Some(BackendNodeIdentity::new("target-own", "frame-main", 77).unwrap()),
+                frame_path: captured.frame_path.clone(),
+                role: "button".into(),
+                name: "Unrelated action".into(),
+                traversal_index: 3,
+            },
+        ];
+        assert_eq!(
+            store
+                .resolve_ref(&snapshot_id, "e3", 7, &candidates)
+                .unwrap(),
+            RefResolution::Resolved(captured)
+        );
+    }
+
+    #[test]
+    fn dom_full_reads_outer_html_while_preserving_ax_refs() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","DOM fixture", &[], 10, Some("frame-main"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"root":{"nodeId":42}}}),
+            json!({"id":4,"sessionId":"session-own","result":{"outerHTML":"<main><h1>DOM fixture</h1></main>"}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let observation = driver
+            .snapshot_for_test(
+                "route-own",
+                SnapshotKind::DomFull,
+                1_000,
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            observation.dom_text.as_deref(),
+            Some("<main><h1>DOM fixture</h1></main>")
+        );
+        assert_eq!(observation.records[0].name, "DOM fixture");
+        assert_eq!(observation.refs[0].captured.reference, "e1");
+        assert_eq!(
+            driver
+                .pipe
+                .writes
+                .iter()
+                .map(|command| command["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Accessibility.enable",
+                "Accessibility.getRootAXNode",
+                "DOM.getDocument",
+                "DOM.getOuterHTML",
+            ]
+        );
+    }
+
+    #[test]
+    fn lossy_limits_mark_incomplete_but_an_ancestor_cycle_does_not() {
+        let mut nodes = Some(vec![
+            raw_node("a", "heading", "First", &[], 2, None),
+            raw_node("b", "button", "Second", &[], 3, None),
+        ]);
+        let bounded = traverse_ax_tree(
+            raw_node(
+                "root",
+                "RootWebArea",
+                "Bounded",
+                &["a", "b"],
+                1,
+                Some("frame-main"),
+            ),
+            "target-own",
+            2,
+            64,
+            |node_id, _| {
+                if node_id != "root" {
+                    return Err(NavigationDriveError::CdpFailure);
+                }
+                nodes.take().ok_or(NavigationDriveError::CdpFailure)
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded.records.len(), 2);
+        assert!(bounded.ax_truncated);
+        assert!(bounded.refs_truncated);
+
+        let depth_bounded = traverse_ax_tree(
+            raw_node(
+                "root",
+                "RootWebArea",
+                "Depth bounded",
+                &["child"],
+                1,
+                Some("frame-main"),
+            ),
+            "target-own",
+            10,
+            0,
+            |_, _| panic!("a depth cut must happen before fetching children"),
+        )
+        .unwrap();
+        assert_eq!(depth_bounded.records.len(), 1);
+        assert!(depth_bounded.ax_truncated);
+        assert!(depth_bounded.refs_truncated);
+
+        let mut cycle_nodes = Some(vec![raw_node(
+            "child",
+            "group",
+            "Cycle child",
+            &["root"],
+            2,
+            None,
+        )]);
+        let cycle = traverse_ax_tree(
+            raw_node(
+                "root",
+                "RootWebArea",
+                "Cycle root",
+                &["child"],
+                1,
+                Some("frame-main"),
+            ),
+            "target-own",
+            10,
+            64,
+            |node_id, _| {
+                if node_id != "root" {
+                    return Err(NavigationDriveError::CdpFailure);
+                }
+                cycle_nodes.take().ok_or(NavigationDriveError::CdpFailure)
+            },
+        )
+        .unwrap();
+        assert_eq!(cycle.records.len(), 2);
+        assert!(!cycle.ax_truncated);
+        assert!(!cycle.refs_truncated);
     }
 
     #[test]
