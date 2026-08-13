@@ -232,8 +232,22 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     )
     .await;
     let navigated: Value = serde_json::from_slice(&navigated.body).unwrap();
-    assert_eq!(navigated["outcome"], "ok", "{navigated}");
-    assert_eq!(navigated["url_final"], "https://landed.example/final");
+    // Refused for want of a grant, which is what a caller gets today: nothing in
+    // production mints an ActionGrant, so the store this plane is built with is
+    // empty and covers nothing. The capability is wired and unreachable until
+    // consent has a path, and that is the intended order rather than a gap.
+    //
+    // This assertion previously read "ok". It passed because the authorization
+    // gate was governed by a bool that `derive(Default)` set to false, so wire
+    // navigation was SERVED with no grant check at all -- the test was
+    // recording the bypass rather than the policy.
+    //
+    // The successful-navigation behaviour it used to cover is asserted in
+    // b1_s3_browser.rs, where a grant can be installed directly:
+    // navigation_reports_the_browser_landing_url_instead_of_the_request makes
+    // the same url_final assertion against a plane that holds authority.
+    assert_eq!(navigated["outcome"], "authorization_denied", "{navigated}");
+    assert_eq!(navigated["detail"]["reason"], "no_grant", "{navigated}");
 
     for (corr, unavailable) in [
         (12, "browser.click"),
@@ -247,7 +261,16 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         let refused: Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(refused["code"], "unknown_method", "{refused}");
     }
-    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
+    // EMPTY, and this is the load-bearing half of the refusal above: the
+    // authorization gate runs before anything reaches the browser, so a
+    // navigation refused for want of a grant leaves no effect behind. An
+    // assertion that the caller got an error would still pass if the page had
+    // been navigated and the error raised afterwards.
+    assert!(
+        launcher.effects.lock().unwrap().is_empty(),
+        "a navigation refused for want of a grant still reached the browser: {:?}",
+        launcher.effects.lock().unwrap()
+    );
 
     let duplicate = invoke(&planes, 2, "browser.launch", json!({})).await;
     let duplicate: Value = serde_json::from_slice(&duplicate.body).unwrap();
@@ -294,14 +317,10 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     }
     assert_eq!(
         launcher.effects.lock().unwrap().as_slice(),
-        [
-            "navigate",
-            "graceful",
-            "grace_wait",
-            "force",
-            "reap",
-            "cleanup"
-        ]
+        // No "navigate": the navigation above was refused for want of a grant
+        // before it reached the browser. This assertion is about the teardown
+        // ladder, which is unaffected.
+        ["graceful", "grace_wait", "force", "reap", "cleanup"]
     );
     let repeated = invoke(
         &planes,
@@ -325,7 +344,8 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         serde_json::from_slice::<Value>(&unknown.body).unwrap()["outcome"],
         "browser_session_not_found"
     );
-    assert_eq!(launcher.effects.lock().unwrap().len(), 6);
+    // Five, not six: the refused navigation contributed no effect.
+    assert_eq!(launcher.effects.lock().unwrap().len(), 5);
 }
 
 #[tokio::test]
