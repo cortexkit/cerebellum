@@ -994,25 +994,39 @@ mod tests {
         assert!(first.is_some());
     }
 
-    /// Enumeration agrees with the permission query.
+    /// A denied permission query means enumeration cannot succeed.
     ///
-    /// Asserted as an equivalence rather than as an outcome, because the answer
-    /// depends on whether this machine has granted capture and a test demanding
-    /// one would fail honestly on the other kind of machine. The equivalence
-    /// holds either way, and it is the property the advertisement gate rests
-    /// on: a capability advertised because the query said yes must not then
-    /// fail at use.
+    /// An IMPLICATION, not an equivalence. The converse is false and asserting
+    /// it made this test fail under load: the permission query is a settings
+    /// level read, while enumeration is a live window-server operation that can
+    /// fail transiently — measured on this machine, the query reported
+    /// PERMITTED while enumeration returned a declined-permission error in the
+    /// same instant, with four suites running.
+    ///
+    /// That is the same wrong model the production path held until
+    /// `TargetResolution::Unreadable` was introduced: an unreadable window list
+    /// is not evidence that permission was withdrawn, and treating the two as
+    /// interchangeable turns a transient failure into a claim about the world.
+    ///
+    /// Stated as an outcome rather than a value so it holds on a machine of
+    /// either kind, which is what the original equivalence was reaching for.
     #[test]
-    fn enumeration_agrees_with_the_permission_query() {
+    fn a_denied_permission_query_means_enumeration_cannot_succeed() {
         let _serialized = WINDOW_SERVER.lock();
         let permitted = screen_capture_is_permitted();
         let enumerated = enumerate_windows(Duration::from_secs(10));
 
-        assert_eq!(
-            permitted,
-            enumerated.is_ok(),
-            "permission query said {permitted} but enumeration returned {enumerated:?}"
-        );
+        if !permitted {
+            assert!(
+                enumerated.is_err(),
+                "enumeration succeeded while the permission query said it was denied: \
+                 {enumerated:?}"
+            );
+        }
+
+        // The other direction is deliberately unasserted, and the reason is the
+        // finding: a failed enumeration on a permitted machine is a transient
+        // window-server failure, not a permission change.
     }
 
     /// A granted machine reports windows that carry an owner.
