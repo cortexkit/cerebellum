@@ -185,6 +185,13 @@ fn launch_once(
                 Ok(()) => println!("reaped"),
                 Err(error) => println!("reap failed: {error:?}"),
             }
+            // Say how the session ended before cleaning up, exactly as the
+            // session layer does. A probe that skips this is not driving the
+            // production sequence, and the journal cannot record an outcome
+            // nobody supplied.
+            cleanup.set_terminal_outcome(
+                cerebellum::browser_session::BrowserSessionTerminalOutcome::Closed,
+            );
             match cleanup.after_reap() {
                 Ok(()) => println!("[{session_id}] reaped and cleaned up after reap"),
                 Err(stage) => println!("[{session_id}] cleanup failed at {stage:?}"),

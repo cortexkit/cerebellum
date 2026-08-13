@@ -465,12 +465,13 @@ struct ProductionSessionCleanup {
     profile: SharedRollback,
 }
 
-impl SessionCleanup for ProductionSessionCleanup {
-    fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
-        self.terminal_outcome = Some(outcome);
-    }
-
-    fn after_reap(&mut self) -> Result<(), CleanupStage> {
+impl ProductionSessionCleanup {
+    /// Record how this session ended, releasing the journal charge it reserved.
+    ///
+    /// Separate from profile cleanup so that neither can skip the other: they
+    /// are independent obligations over different resources, and a single `?`
+    /// chain between them silently makes the second conditional on the first.
+    fn finalize_journal(&mut self) -> Result<(), CleanupStage> {
         let outcome = self
             .terminal_outcome
             .take()
@@ -484,9 +485,27 @@ impl SessionCleanup for ProductionSessionCleanup {
             .ok_or(CleanupStage::RecordTerminalization)?;
         journal
             .finalize_session(&self.launch_attempt_id, outcome)
-            .map_err(|_| CleanupStage::RecordTerminalization)?;
-        drop(journal_guard);
-        self.profile.after_reap()
+            .map_err(|_| CleanupStage::RecordTerminalization)
+    }
+}
+
+impl SessionCleanup for ProductionSessionCleanup {
+    fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
+        self.terminal_outcome = Some(outcome);
+    }
+
+    fn after_reap(&mut self) -> Result<(), CleanupStage> {
+        // Both steps always run, and the journal's failure never skips the
+        // profile's. The custody lock released here is what lets this agent
+        // launch again: stranding it because a journal write failed would turn
+        // a lost audit record into an agent permanently locked out of its own
+        // browser, which is far the worse of the two.
+        //
+        // The journal failure is still reported, and reported in preference to
+        // a later profile failure, because it is the earlier fact.
+        let journal_result = self.finalize_journal();
+        let profile_result = self.profile.after_reap();
+        journal_result.and(profile_result)
     }
 }
 
@@ -677,4 +696,77 @@ fn pipe_pair() -> Result<
     Value,
 > {
     std::os::unix::net::UnixStream::pair().map_err(|_| json!({"outcome":"internal_failure"}))
+}
+
+#[cfg(test)]
+mod cleanup_ordering_tests {
+    use super::*;
+
+    /// A journal failure must not strand the profile custody lock.
+    ///
+    /// The two obligations cover different resources and neither may be skipped
+    /// by the other's failure. The lock released by profile cleanup is what
+    /// permits this agent's NEXT launch, so chaining the steps with `?`
+    /// converts a lost audit record into an agent locked out of its own browser
+    /// until someone deletes a file by hand — far worse than the failure that
+    /// caused it.
+    ///
+    /// Reproduced against a real browser before the fix: a launch whose journal
+    /// step failed left a `.lock` file behind, and the next launch was refused
+    /// `profile_busy` naming a holder that no longer existed.
+    #[test]
+    fn a_journal_failure_still_releases_the_profile_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "ck-cleanup-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+
+        let lifecycle = Arc::new(Mutex::new(
+            ProfileLifecycle::open_with_config(&root, RegistryConfig::default())
+                .expect("lifecycle"),
+        ));
+        let locks = Arc::new(Mutex::new(
+            ProfileCustodyLocks::open_filesystem(&root).expect("locks"),
+        ));
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&released);
+        let rollback = SharedRollback {
+            state: Arc::new(Mutex::new(Some(SharedRollbackState {
+                lifecycle,
+                locks,
+                rollback: Some(Box::new(move |_lifecycle, _locks| {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })),
+            }))),
+        };
+
+        let mut cleanup = ProductionSessionCleanup {
+            // No journal bound, so the finalize step cannot succeed.
+            journal: Arc::new(Mutex::new(None)),
+            launch_attempt_id: "attempt-under-test".to_string(),
+            terminal_outcome: Some(BrowserSessionTerminalOutcome::Closed),
+            profile: rollback,
+        };
+
+        let result = cleanup.after_reap();
+
+        assert_eq!(
+            result,
+            Err(CleanupStage::RecordTerminalization),
+            "the journal failure must still be reported"
+        );
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "the profile lock was stranded by a journal failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
