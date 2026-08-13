@@ -12,7 +12,7 @@ use cerebellum::browser_session::{
 use cerebellum::cdp::{Attachment, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
 use cerebellum::snapshot_store::{
-    AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
+    AxRecord, BackendNodeIdentity, RefRecord, SameDocumentChange, SnapshotKind, SnapshotRef,
 };
 use cerebellum::{BrowserConfig, RouteIdentity};
 use cerebellum_core::clock::SystemClock;
@@ -379,11 +379,23 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
     }
 }
 
+async fn position_on_authorized_snapshot_page(plane: &BrowserPlane, route: &RouteIdentity) {
+    plane
+        .same_document_url(
+            route,
+            "https://requested.example/page",
+            SameDocumentChange::ReplaceState,
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn snapshot_without_a_ready_session_refuses_before_transport_observation() {
-    let plane = BrowserPlane::new();
+    let plane = BrowserPlane::with_grants(navigation_grants());
     let route = identity();
     plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_snapshot_page(&plane, &route).await;
 
     let result = plane
         .dispatch(
@@ -427,6 +439,7 @@ async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
     ]);
     let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
     plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_snapshot_page(&plane, &route).await;
 
     let result = plane
         .dispatch(
@@ -492,6 +505,7 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
         1_000,
     );
     plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_snapshot_page(&plane, &route).await;
     let result = plane
         .dispatch(
             &route,
@@ -520,6 +534,7 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
     observation.refs_truncated = true;
     let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
     plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_snapshot_page(&plane, &route).await;
     let result = plane
         .dispatch(
             &route,

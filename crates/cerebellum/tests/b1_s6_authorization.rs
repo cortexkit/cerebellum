@@ -1,6 +1,7 @@
 use cerebellum::authorization::{
-    effective_severity, Action, ActionGrant, AuthorizationDeniedDetail, AuthorizationError,
-    AuthorizationRequest, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE, OBSERVE,
+    effective_severity, target_hazards, Action, ActionGrant, AuthorizationDeniedDetail,
+    AuthorizationError, AuthorizationRequest, GrantStore, HazardClass, Severity, COMPOSE,
+    MUTATE_DURABLE, OBSERVE,
 };
 use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
@@ -192,7 +193,7 @@ fn replacement_before_commit_is_rejected_by_the_commit_guard() {
 }
 
 #[test]
-fn missing_grant_is_opaque_and_navigation_has_observe_floor() {
+fn missing_grant_is_opaque_and_observations_have_an_empty_hazard_floor() {
     let store = GrantStore::new([]);
     let error = store
         .authorize(AuthorizationRequest::navigate(
@@ -206,10 +207,10 @@ fn missing_grant_is_opaque_and_navigation_has_observe_floor() {
         error,
         cerebellum::authorization::AuthorizationError::NoGrant
     );
-    assert_eq!(
-        Action::Navigate.floor(),
-        Severity::new(OBSERVE, false, false)
-    );
+    for action in [Action::Navigate, Action::Snapshot] {
+        assert_eq!(action.floor(), Severity::new(OBSERVE, false, false));
+    }
+    assert!(target_hazards(Action::Snapshot, None).unwrap().is_empty());
 
     let _ = effective_severity;
 }

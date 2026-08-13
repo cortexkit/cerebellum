@@ -1089,6 +1089,24 @@ impl BrowserPlane {
                     .unwrap_or_else(|| "null".into()),
             )
         };
+        {
+            let grants = self.grants.lock().await;
+            let decision = grants
+                .authorize(AuthorizationRequest::snapshot(
+                    &identity.conversation_key,
+                    &source_origin,
+                    &identity.agent_project_id,
+                ))
+                .map_err(map_authorization_error)?;
+            decision
+                .evaluate_origin_scope(&origin_from_url(&source_origin))
+                .map_err(|_| BrowserError::AuthorizationDenied {
+                    reason: "origin_scope",
+                })?;
+            grants
+                .commit(&decision)
+                .map_err(|_| BrowserError::AuthorizationDenied { reason: "no_grant" })?;
+        }
         let Some(mut session_operation) =
             self.reserve(identity, BrowserCapability::Snapshot).await?
         else {

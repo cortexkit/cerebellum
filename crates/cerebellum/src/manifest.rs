@@ -42,17 +42,26 @@ use subc_protocol::PROTOCOL_VERSION;
 /// The single application capability this module advertises.
 pub const BROWSER_STATUS: &str = "browser.status";
 
-pub fn browser_navigation_tool() -> Tool {
-    let (name, description, schema) = crate::browser::tool_definitions()
+pub fn browser_wire_tools() -> Vec<Tool> {
+    crate::browser::tool_definitions()
         .into_iter()
-        .find(|(name, _, _)| *name == crate::browser::NAVIGATE)
-        .expect("browser.navigate has a frozen descriptor");
-    Tool {
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        execution_mode: ExecutionMode::Unfenceable,
-        schema,
-    }
+        .filter(|(name, _, _)| {
+            matches!(
+                *name,
+                crate::browser::NAVIGATE | crate::browser::SNAPSHOT | crate::browser::CLICK
+            )
+        })
+        .map(|(name, description, schema)| Tool {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            execution_mode: if name == crate::browser::SNAPSHOT {
+                ExecutionMode::Pure
+            } else {
+                ExecutionMode::Unfenceable
+            },
+            schema,
+        })
+        .collect()
 }
 
 pub fn browser_control_tools() -> Vec<Tool> {
@@ -166,10 +175,10 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
     }
 }
 
-/// Compose the six browser routes independently from the existing type route.
+/// Compose only the browser routes the wire dispatcher admits.
 /// A common pin failure suppresses every minted route; an extraction failure
-/// suppresses only routes that consume accessibility or DOM data (snapshot and
-/// click).
+/// suppresses the routes that consume accessibility or DOM data (snapshot and
+/// click), leaving navigation available.
 pub fn build_with_browser_plane_pins(
     module_id: &str,
     pins: Option<&ManifestPinSet>,
@@ -186,7 +195,16 @@ pub fn build_with_browser_plane_pins(
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
         return manifest;
     };
-    for (name, description, schema) in crate::browser::tool_definitions() {
+    for (name, description, schema) in
+        crate::browser::tool_definitions()
+            .into_iter()
+            .filter(|(name, _, _)| {
+                matches!(
+                    *name,
+                    crate::browser::NAVIGATE | crate::browser::SNAPSHOT | crate::browser::CLICK
+                )
+            })
+    {
         let requires_extraction = matches!(name, crate::browser::SNAPSHOT | crate::browser::CLICK);
         if requires_extraction
             && (!pins.extraction_group_eligible() || !extraction_evidence_eligible)
@@ -662,11 +680,7 @@ mod tests {
         let ProviderRole::ToolProvider { tools, .. } = &common_only.provides[0] else {
             panic!("expected tool provider");
         };
-        assert_eq!(
-            tools.len(),
-            7,
-            "three controls plus navigate, screenshot, point-click, and wait"
-        );
+        assert_eq!(tools.len(), 4, "three controls plus navigate");
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
 
         let all = build_with_browser_plane_pins(
@@ -680,8 +694,8 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            9,
-            "three controls plus six minted browser routes"
+            6,
+            "three controls plus navigate, snapshot, and click"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
         let serialized = serialize_with_browser_plane_pins(

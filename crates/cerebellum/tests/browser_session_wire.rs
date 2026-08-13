@@ -1,15 +1,26 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cerebellum::browser::Tracker;
+use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity, OBSERVE};
+use cerebellum::browser::navigation::BrowserSnapshotObservation;
+use cerebellum::browser::{BrowserPlane, Tracker};
 use cerebellum::browser_session::{
-    BrowserSessionLauncher, CleanupStage, NavigationDriveError, NavigationWait,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+    BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher, CleanupStage, ClickDriveError,
+    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
+    SessionCleanup,
+};
+use cerebellum::classification::{
+    classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
+    NonTypeClassificationInput, TargetKind,
+};
+use cerebellum::snapshot_store::{
+    AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
 };
 use cerebellum::{BrowserConfig, Planes};
 use cerebellum_core::health::HealthState;
+use cerebellum_core::identity::RouteIdentity;
 use serde_json::{json, Value};
-use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
+use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Principal, Priority, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 
 fn config() -> BrowserConfig {
@@ -61,10 +72,100 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
     rx.recv().await.unwrap()
 }
 
+fn route_identity() -> RouteIdentity {
+    RouteIdentity::from_bind(
+        &BindIdentity {
+            project_root: "/test/project".into(),
+            harness: "test".to_string(),
+            session: "test-session".to_string(),
+        },
+        &Some(Principal::Direct),
+    )
+}
+
+async fn grant_browser(planes: &Planes, origin: &str, hazards: Vec<HazardClass>) {
+    let question = planes
+        .management
+        .browser_grant_question_for_test("test-session", vec![origin.to_string()], hazards)
+        .await;
+    assert!(
+        planes
+            .management
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+            .await
+    );
+}
+
+fn snapshot_observation(
+    clicked: bool,
+    hazardous: bool,
+    document_epoch: u64,
+    current_url: &str,
+) -> BrowserSnapshotObservation {
+    let (scheme, rest) = current_url
+        .split_once("://")
+        .expect("the wire test page URL has a scheme");
+    let authority = rest.split(['/', '?', '#']).next().unwrap();
+    let origin = format!("{scheme}://{authority}");
+    let mut target = ElementClassificationInput::new(
+        NodeIdentityInput::new("target", "frame-main", 42),
+        TargetKind::Button,
+    );
+    if hazardous {
+        target = target
+            .form_owner(NodeIdentityInput::new("target", "frame-main", 7))
+            .associated_control(
+                AssociatedFormControlInput::new(NodeIdentityInput::new("target", "frame-main", 8))
+                    .with_tokens(["current-password"]),
+            );
+    }
+    let classification = classify_click(&NonTypeClassificationInput::new(
+        document_epoch,
+        target,
+        origin,
+    ))
+    .unwrap();
+    let heading = if clicked {
+        "Click probe after"
+    } else {
+        "Click probe before"
+    };
+    BrowserSnapshotObservation {
+        records: vec![
+            AxRecord {
+                depth: 0,
+                role: "heading".into(),
+                name: heading.into(),
+                value: None,
+                reference: None,
+            },
+            AxRecord {
+                depth: 0,
+                role: "button".into(),
+                name: "Sign in".into(),
+                value: None,
+                reference: Some("e1".into()),
+            },
+        ],
+        dom_text: None,
+        refs: vec![RefRecord {
+            captured: SnapshotRef::new("e1", "button", "Sign in", 0).unwrap(),
+            frame_path: vec!["frame-main".into()],
+            backend_identity: Some(BackendNodeIdentity::new("target", "frame-main", 42).unwrap()),
+            raw_role: Some("button".into()),
+            raw_name: Some("Sign in".into()),
+            classification: Some(Box::new(classification)),
+        }],
+        ax_truncated: false,
+        refs_truncated: false,
+    }
+}
+
 #[derive(Default)]
 struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
+    hazardous_target: bool,
 }
 
 impl BrowserSessionLauncher for RecordingLauncher {
@@ -77,6 +178,8 @@ impl BrowserSessionLauncher for RecordingLauncher {
         Ok((
             Box::new(RecordingProcess {
                 effects: Arc::clone(&self.effects),
+                clicked: false,
+                hazardous_target: self.hazardous_target,
             }),
             Box::new(RecordingCleanup {
                 effects: Arc::clone(&self.effects),
@@ -102,6 +205,8 @@ impl BrowserSessionLauncher for RecoveryFailedLauncher {
 
 struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
+    clicked: bool,
+    hazardous_target: bool,
 }
 
 impl OwnedBrowserProcess for RecordingProcess {
@@ -119,6 +224,45 @@ impl OwnedBrowserProcess for RecordingProcess {
         tracker.load(now);
         tracker.poll_settlement(now + Duration::from_millis(cerebellum::browser::QUIET_MS));
         Ok(())
+    }
+
+    fn snapshot_classified(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        document_epoch: u64,
+        current_origin: &str,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.effects.lock().unwrap().push("snapshot");
+        Ok(snapshot_observation(
+            self.clicked,
+            self.hazardous_target,
+            document_epoch,
+            current_origin,
+        ))
+    }
+
+    fn click_classified(
+        &mut self,
+        _: &str,
+        _: &BackendNodeIdentity,
+        _: u64,
+        _: &str,
+        _: Option<&cerebellum::classification::NonTypeClassificationRecord>,
+        _: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let position = BrowserClickPosition {
+            x_css: 12.0,
+            y_css: 24.0,
+        };
+        self.effects.lock().unwrap().push("input_press");
+        input_dispatched(BrowserInputEvent::Press(position));
+        self.effects.lock().unwrap().push("input_release");
+        input_dispatched(BrowserInputEvent::Release(position));
+        self.clicked = true;
+        Ok(position)
     }
 
     fn generation_matches(&self) -> bool {
@@ -157,8 +301,23 @@ impl SessionCleanup for RecordingCleanup {
     }
 }
 
+async fn launch_at(planes: &Planes, origin: &str) {
+    let launched = invoke(planes, 1, "browser.launch", json!({})).await;
+    let launched: Value = serde_json::from_slice(&launched.body).unwrap();
+    assert_eq!(launched["outcome"], "launched", "{launched}");
+    planes
+        .browser
+        .same_document_url(
+            &route_identity(),
+            &format!("{origin}/page"),
+            cerebellum::snapshot_store::SameDocumentChange::ReplaceState,
+        )
+        .await
+        .unwrap();
+}
+
 #[test]
-fn real_manifest_path_advertises_session_controls_and_navigation_only_when_configured() {
+fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
     fn names(configured: bool) -> Vec<String> {
         let manifest =
             cerebellum::serialize_manifest_with_browser_configuration("cerebellum", configured);
@@ -172,32 +331,23 @@ fn real_manifest_path_advertises_session_controls_and_navigation_only_when_confi
             .unwrap()
             .iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .filter(|name| name.starts_with("browser."))
             .collect()
     }
 
-    let configured = names(true);
-    for dispatchable in [
-        "browser.launch",
-        "browser.status",
-        "browser.close",
-        "browser.navigate",
-    ] {
-        assert!(configured.iter().any(|name| name == dispatchable));
-    }
-    for unavailable in [
-        "browser.click",
-        "browser.click_point",
-        "browser.snapshot",
-        "browser.screenshot",
-        "browser.wait_for",
-        "browser.type",
-    ] {
-        assert!(!configured.iter().any(|name| name == unavailable));
-    }
-    let absent = names(false);
-    for configured_only in ["browser.launch", "browser.close", "browser.navigate"] {
-        assert!(!absent.iter().any(|name| name == configured_only));
-    }
+    assert_eq!(
+        names(true),
+        [
+            "browser.launch",
+            "browser.status",
+            "browser.close",
+            "browser.navigate",
+            "browser.snapshot",
+            "browser.click",
+        ]
+        .map(str::to_string)
+    );
+    assert!(names(false).is_empty());
 }
 
 #[tokio::test]
@@ -250,9 +400,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     assert_eq!(navigated["detail"]["reason"], "no_grant", "{navigated}");
 
     for (corr, unavailable) in [
-        (12, "browser.click"),
         (13, "browser.click_point"),
-        (14, "browser.snapshot"),
         (15, "browser.screenshot"),
         (16, "browser.wait_for"),
         (17, "browser.type"),
@@ -346,6 +494,190 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     );
     // Five, not six: the refused navigation contributed no effect.
     assert_eq!(launcher.effects.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, "https://page.example").await;
+
+    let no_grant = invoke(&planes, 20, "browser.snapshot", json!({"mode": "ax"})).await;
+    let no_grant: Value = serde_json::from_slice(&no_grant.body).unwrap();
+    assert_eq!(no_grant["outcome"], "authorization_denied", "{no_grant}");
+    assert_eq!(no_grant["detail"]["reason"], "no_grant", "{no_grant}");
+    assert!(launcher.effects.lock().unwrap().is_empty());
+
+    grant_browser(&planes, "https://other.example", Vec::new()).await;
+    let wrong_origin = invoke(&planes, 21, "browser.snapshot", json!({"mode": "ax"})).await;
+    let wrong_origin: Value = serde_json::from_slice(&wrong_origin.body).unwrap();
+    assert_eq!(
+        wrong_origin["outcome"], "authorization_denied",
+        "{wrong_origin}"
+    );
+    assert_eq!(
+        wrong_origin["detail"]["reason"], "origin_scope",
+        "{wrong_origin}"
+    );
+    assert!(
+        launcher.effects.lock().unwrap().is_empty(),
+        "a refused snapshot reached CDP: {:?}",
+        launcher.effects.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    planes.launch_service = Some(launcher.clone());
+    grant_browser(
+        &planes,
+        "https://page.example",
+        vec![HazardClass::CredentialFormSubmit],
+    )
+    .await;
+    launch_at(&planes, "https://page.example").await;
+
+    let before = invoke(&planes, 30, "browser.snapshot", json!({"mode": "ax"})).await;
+    let before: Value = serde_json::from_slice(&before.body).unwrap();
+    assert_eq!(before["outcome"], "ok", "{before}");
+    assert!(
+        before["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Click probe before")),
+        "{before}"
+    );
+    let snapshot_id = before["snapshot_id"].as_str().unwrap();
+    let reference = before["refs"][0]["ref"].as_str().unwrap();
+
+    let clicked = invoke(
+        &planes,
+        31,
+        "browser.click",
+        json!({
+            "ref": reference,
+            "snapshot_id": snapshot_id,
+            "intent": "exercise the snapshot ref",
+            "severity": {"tier": 2, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["snapshot", "input_press", "input_release"]
+    );
+
+    let after = invoke(&planes, 32, "browser.snapshot", json!({"mode": "ax"})).await;
+    let after: Value = serde_json::from_slice(&after.body).unwrap();
+    assert!(
+        after["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Click probe after")),
+        "{after}"
+    );
+}
+
+#[tokio::test]
+async fn wire_click_without_a_covering_grant_dispatches_no_input() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    planes.launch_service = Some(launcher.clone());
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(
+            planes.sessions.clone(),
+            Arc::clone(&planes.lease_clock),
+            config().navigation_settle_deadline_ms,
+        )
+        .with_grants_installed(GrantStore::new([ActionGrant::new(
+            "snapshot-only",
+            1,
+            "test-session",
+            Severity::new(OBSERVE, false, false),
+            ["https://page.example"],
+        )])),
+    );
+    launch_at(&planes, "https://page.example").await;
+
+    let snapshot = invoke(&planes, 40, "browser.snapshot", json!({})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let clicked = invoke(
+        &planes,
+        41,
+        "browser.click",
+        json!({
+            "ref": snapshot["refs"][0]["ref"],
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "must remain refused",
+            "severity": {"tier": 2, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
+    assert_eq!(clicked["detail"]["reason"], "no_grant", "{clicked}");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["snapshot"],
+        "a refused click dispatched input"
+    );
+}
+
+#[tokio::test]
+async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
+    let launcher = Arc::new(RecordingLauncher {
+        hazardous_target: true,
+        ..RecordingLauncher::default()
+    });
+    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    planes.launch_service = Some(launcher.clone());
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(
+            planes.sessions.clone(),
+            Arc::clone(&planes.lease_clock),
+            config().navigation_settle_deadline_ms,
+        )
+        .with_grants_installed(GrantStore::new([ActionGrant::new(
+            "hazard-incomplete",
+            1,
+            "test-session",
+            Severity::new(4, true, true),
+            ["https://page.example"],
+        )
+        .with_disclosed_hazards([HazardClass::FinancialFormSubmit])])),
+    );
+    launch_at(&planes, "https://page.example").await;
+
+    let snapshot = invoke(&planes, 50, "browser.snapshot", json!({})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let clicked = invoke(
+        &planes,
+        51,
+        "browser.click",
+        json!({
+            "ref": snapshot["refs"][0]["ref"],
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "must remain refused",
+            "severity": {"tier": 4, "credential": true, "financial": false}
+        }),
+    )
+    .await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
+    assert_eq!(
+        clicked["detail"]["missing_hazard"], "credential_form_submit",
+        "{clicked}"
+    );
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["snapshot"],
+        "hazard refusal dispatched input"
+    );
 }
 
 #[tokio::test]
