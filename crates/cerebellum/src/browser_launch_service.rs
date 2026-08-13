@@ -301,7 +301,19 @@ impl OwnedBrowserProcess for ProductionProcess {
         self.pipe
             .as_mut()
             .ok_or(ProcessControlFailure)?
-            .write_frame(b"{\"id\":18446744073709551614,\"method\":\"Browser.close\"}\0")
+            // A small request id, because Chrome does not act on this command
+            // when the id is near the top of the u64 range: measured against
+            // Chrome 151, an id of 2 exits in under a second while
+            // 18446744073709551614 leaves the browser running indefinitely.
+            // JSON numbers that large do not survive a double, which is what a
+            // JavaScript-derived protocol implementation parses them into.
+            //
+            // This is load-bearing rather than cosmetic. When the graceful
+            // request does nothing, every teardown falls through to force
+            // termination, and a force-killed browser loses the profile writes
+            // it had not yet flushed — on a durable profile, that is the logged
+            // in state this whole path exists to keep.
+            .write_frame(b"{\"id\":2,\"method\":\"Browser.close\"}\0")
             .map_err(|_| ProcessControlFailure)
     }
 
@@ -575,11 +587,23 @@ fn browser_data_root() -> Result<PathBuf, ()> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or(())?;
-    Ok(PathBuf::from(home)
+    let root = PathBuf::from(home)
         .join(".local")
         .join("share")
         .join("cortexkit")
-        .join("browser"))
+        .join("browser");
+    // Created here because the registry deliberately refuses to: it opens an
+    // existing directory and rejects a symlink or a non-directory, which is the
+    // right posture for something that will hold logged-in profiles. Nothing
+    // else creates it, so without this the FIRST launch on a machine fails and
+    // every later one fails identically — a permanent refusal that no test can
+    // see, because every fixture supplies a directory it made itself.
+    //
+    // Not created at boot: a module that never launches a browser has no reason
+    // to leave a directory behind, and the failure to create is reported at the
+    // moment a caller asked for something that needs it.
+    std::fs::create_dir_all(&root).map_err(|_| ())?;
+    Ok(root)
 }
 
 fn cleanup_before_spawn(mut cleanup: SharedRollback, primary: Value) -> Value {
