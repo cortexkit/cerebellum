@@ -1336,6 +1336,19 @@ impl ProfileRegistry {
         Ok(self.root.target_path(path, create)?)
     }
 
+    /// Whether the profiles directory holds anything this registry did not mint.
+    ///
+    /// The question is whether an UNACCOUNTED directory sits where profiles
+    /// belong, since that suggests a path someone else manages and minting into
+    /// it could adopt or overwrite their data. A directory this registry has a
+    /// record for is not such a thing.
+    ///
+    /// Asking only whether the directory is non-empty conflates those two, and
+    /// the consequence is not subtle: the first agent to launch leaves a profile
+    /// behind, so every LATER agent finds a non-empty directory, resolves to
+    /// unavailable rather than absent, and can never mint a profile of its own.
+    /// One agent per machine, with the second one refused by a check written to
+    /// keep strangers out.
     fn conflicting_profile_path(&self) -> Result<bool, RegistryError> {
         self.root.revalidate()?;
         let profiles = self.root.target_path(Path::new("profiles"), false);
@@ -1354,7 +1367,31 @@ impl ProfileRegistry {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Ok(true);
         }
-        Ok(fs::read_dir(profiles)?.next().transpose()?.is_some())
+
+        // Read the document directly rather than through a resolving helper,
+        // because every caller of this check is itself deciding what a record
+        // means and would otherwise recurse.
+        let accounted: BTreeSet<String> = match self.read_document()? {
+            Some(document) => document
+                .records
+                .values()
+                .filter_map(|record| {
+                    Path::new(&record.target)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .collect(),
+            None => BTreeSet::new(),
+        };
+
+        for entry in fs::read_dir(profiles)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !accounted.contains(&name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn resolve_durable(&self, project_id: &str) -> Result<DurableResolution, RegistryError> {
@@ -1524,11 +1561,21 @@ impl ProfileRegistry {
             &digest[16..20],
             &digest[20..32]
         );
-        if self
-            .profile_target(&format!("profiles/{uuid}"), false)
-            .is_ok()
-        {
-            return Err(RegistryError::Conflict);
+        // Whether a directory ALREADY OCCUPIES this uuid, not whether the path
+        // could be resolved. `profile_target` answers the second: it validates
+        // the shape and canonicalises the PARENT, checking existence only to
+        // refuse a symlink, so it succeeds for any unused uuid the moment the
+        // `profiles` directory exists at all.
+        //
+        // Reading it as a collision check made the FIRST agent on a machine
+        // succeed — nothing had created `profiles` yet, so resolution failed and
+        // the uuid was accepted — and every agent after it fail with a conflict
+        // against a directory that does not exist. One browser profile per
+        // machine, which is the opposite of what per-agent profiles are for.
+        match self.profile_target(&format!("profiles/{uuid}"), false) {
+            Ok(path) if path.exists() => return Err(RegistryError::Conflict),
+            // An unresolvable path is not a collision: nothing occupies it.
+            Ok(_) | Err(_) => {}
         }
         Ok(uuid)
     }

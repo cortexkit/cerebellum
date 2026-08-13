@@ -62,7 +62,8 @@ fn main() {
     // any profile effect — which is the property this probe would otherwise
     // silently skip past.
     let facts = json!({
-        "agentProjectId": "pj-live-launch-probe",
+        "agentProjectId": std::env::var("CK_PROBE_PROJECT_ID")
+            .unwrap_or_else(|_| "pj-live-launch-probe".to_string()),
         "sessionKind": "primary",
         "controlOperations": ["browser.launch", "browser.status", "browser.close"],
     });
@@ -91,10 +92,76 @@ fn main() {
     );
 
     let service = ProductionLaunchService::open(config);
+
+    // Two launches for the SAME identity. The per-agent profile is only worth
+    // anything if the second one lands in the directory the first one used: a
+    // fresh directory each time satisfies every "a profile directory exists"
+    // assertion while defeating the entire purpose.
+    let first = launch_once(&service, &accepted, "live-launch-probe-first");
+    let after_first = profile_directories();
+    println!(
+        "profile directories after first launch: {} {after_first:?}",
+        after_first.len()
+    );
+
+    let second = launch_once(&service, &accepted, "live-launch-probe-second");
+    let after_second = profile_directories();
+    println!(
+        "profile directories after second launch: {} {after_second:?}",
+        after_second.len()
+    );
+
+    if first && second {
+        if after_first == after_second && !after_first.is_empty() {
+            println!("VERDICT: the second launch REUSED the same profile directory");
+        } else if after_first.is_empty() {
+            println!("VERDICT: no profile directory was observed — reuse unproven");
+        } else {
+            println!(
+                "VERDICT: the second launch MINTED A NEW DIRECTORY, so nothing an agent \
+                 does in its browser survives its next launch"
+            );
+        }
+    } else {
+        println!("VERDICT: a launch failed, so reuse was not tested");
+    }
+}
+
+/// The per-agent profile directories on disk, read from the filesystem rather
+/// than from anything the module reports about itself.
+///
+/// Reads the `profiles` subdirectory specifically. Listing the ROOT instead
+/// names only its fixed children and would compare equal across two launches
+/// however many profiles were minted underneath — an observation that cannot
+/// fail, which is worse than no observation at all.
+fn profile_directories() -> Vec<String> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let profiles = PathBuf::from(home)
+        .join(".local/share/cortexkit/browser")
+        .join("profiles");
+    let Ok(entries) = std::fs::read_dir(&profiles) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found
+}
+
+fn launch_once(
+    service: &ProductionLaunchService,
+    accepted: &AcceptedBindFacts,
+    session_id: &str,
+) -> bool {
     let started = Instant::now();
-    match service.launch(&accepted, "live-launch-probe-session") {
+    match service.launch(accepted, session_id) {
         Ok(ready) => {
-            println!("LAUNCHED in {:?}", started.elapsed());
+            println!("[{session_id}] LAUNCHED in {:?}", started.elapsed());
             let (mut process, mut cleanup) = ready.into_parts();
             println!("generation still matches: {}", process.generation_matches());
 
@@ -119,13 +186,17 @@ fn main() {
                 Err(error) => println!("reap failed: {error:?}"),
             }
             match cleanup.after_reap() {
-                Ok(()) => println!("VERDICT: launched, reaped, and cleaned up after reap"),
-                Err(stage) => println!("VERDICT: launched and reaped, cleanup failed at {stage:?}"),
+                Ok(()) => println!("[{session_id}] reaped and cleaned up after reap"),
+                Err(stage) => println!("[{session_id}] cleanup failed at {stage:?}"),
             }
+            true
         }
         Err(refusal) => {
-            println!("REFUSED after {:?}: {refusal}", started.elapsed());
-            println!("VERDICT: no browser launched — the refusal above is what a caller receives");
+            println!(
+                "[{session_id}] REFUSED after {:?}: {refusal}",
+                started.elapsed()
+            );
+            false
         }
     }
 }
