@@ -22,8 +22,8 @@ use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
 };
 use crate::browser_session::{
-    BrowserSessionLauncher, CleanupStage, LaunchedBrowser, OwnedBrowserProcess,
-    ProcessControlFailure, SessionCleanup,
+    BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, LaunchedBrowser,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
 };
 use crate::profile::{
     BindFacts, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
@@ -34,13 +34,22 @@ use crate::profile_custody::{
     ProfileCustodyLocks,
 };
 
+type ProductionLaunchJournal =
+    DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage>;
+
+type SharedLaunchJournal = Arc<Mutex<Option<ProductionLaunchJournal>>>;
+
 pub struct ProductionLaunchService {
     config: BrowserConfig,
+    journal: SharedLaunchJournal,
 }
 
 impl ProductionLaunchService {
     pub fn open(config: BrowserConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            journal: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn launch(
@@ -216,23 +225,27 @@ impl ProductionLaunchService {
                 ))
             }
         };
-        let mut journal =
-            match DurableLaunchJournal::open_filesystem(cerebellum_core::journal::JournalConfig {
-                journal_retention_bytes: 16 * 1024 * 1024,
-                journal_max_entry_bytes: 1024 * 1024,
-            }) {
-                Ok(journal) => journal,
-                Err(_) => {
-                    return Err(cleanup_before_spawn(
-                        rollback.clone(),
-                        json!({"outcome": "internal_failure"}),
-                    ))
-                }
-            };
+        let mut journal_guard = self.journal.lock().map_err(|_| {
+            cleanup_before_spawn(rollback.clone(), json!({"outcome": "internal_failure"}))
+        })?;
+        if journal_guard.is_none() {
+            let opened =
+                DurableLaunchJournal::open_filesystem(cerebellum_core::journal::JournalConfig {
+                    journal_retention_bytes: 16 * 1024 * 1024,
+                    journal_max_entry_bytes: 1024 * 1024,
+                })
+                .map_err(|_| {
+                    cleanup_before_spawn(rollback.clone(), json!({"outcome": "internal_failure"}))
+                })?;
+            *journal_guard = Some(opened);
+        }
+        let journal = journal_guard
+            .as_mut()
+            .ok_or_else(|| json!({"outcome": "internal_failure"}))?;
         let mut clock = SystemLaunchClock;
         let mut readiness_rollback = rollback.clone();
         let ready = launch_attested_to_readiness_with(
-            &mut journal,
+            journal,
             &mut launcher,
             &request,
             pipe,
@@ -242,11 +255,17 @@ impl ProductionLaunchService {
             &mut readiness_rollback,
         )
         .map_err(map_readiness_error)?;
+        drop(journal_guard);
 
         Ok(ReadyProductionBrowser {
             process: Some(ready.process),
             pipe: Some(ready.pipe),
-            cleanup: Some(rollback),
+            cleanup: Some(ProductionSessionCleanup {
+                journal: Arc::clone(&self.journal),
+                launch_attempt_id: browser_session_id.to_string(),
+                terminal_outcome: None,
+                profile: rollback,
+            }),
         })
     }
 }
@@ -265,7 +284,7 @@ impl BrowserSessionLauncher for ProductionLaunchService {
 pub struct ReadyProductionBrowser {
     process: Option<cerebellum_macos::ReleasedChild>,
     pipe: Option<UnixCdpPipe>,
-    cleanup: Option<SharedRollback>,
+    cleanup: Option<ProductionSessionCleanup>,
 }
 
 impl ReadyProductionBrowser {
@@ -402,7 +421,7 @@ impl crate::browser_launch_readiness::FailedLaunchRollback for SharedRollback {
     }
 }
 
-impl SessionCleanup for SharedRollback {
+impl SharedRollback {
     fn after_reap(&mut self) -> Result<(), CleanupStage> {
         let mut guard = self
             .state
@@ -436,6 +455,38 @@ impl SessionCleanup for SharedRollback {
             },
             _ => CleanupStage::CustodyRelease,
         })
+    }
+}
+
+struct ProductionSessionCleanup {
+    journal: SharedLaunchJournal,
+    launch_attempt_id: String,
+    terminal_outcome: Option<BrowserSessionTerminalOutcome>,
+    profile: SharedRollback,
+}
+
+impl SessionCleanup for ProductionSessionCleanup {
+    fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
+        self.terminal_outcome = Some(outcome);
+    }
+
+    fn after_reap(&mut self) -> Result<(), CleanupStage> {
+        let outcome = self
+            .terminal_outcome
+            .take()
+            .ok_or(CleanupStage::RecordTerminalization)?;
+        let mut journal_guard = self
+            .journal
+            .lock()
+            .map_err(|_| CleanupStage::RecordTerminalization)?;
+        let journal = journal_guard
+            .as_mut()
+            .ok_or(CleanupStage::RecordTerminalization)?;
+        journal
+            .finalize_session(&self.launch_attempt_id, outcome)
+            .map_err(|_| CleanupStage::RecordTerminalization)?;
+        drop(journal_guard);
+        self.profile.after_reap()
     }
 }
 
