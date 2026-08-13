@@ -1198,20 +1198,14 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
     );
 }
 
-/// A browser capability with no connector behind it is refused at the wire.
+/// Navigation is routable when browser support is configured, but a request has
+/// no transport to drive until its route owns a ready browser session. The
+/// refusal is therefore a session state rather than an unknown method.
 ///
-/// The browser drive capabilities are a state machine with nothing underneath:
-/// no socket is opened anywhere in this crate, and the operation recorded for a
-/// navigation is pushed to a Vec rather than dispatched. Until a connector
-/// exists to carry them, naming one must not reach the handler.
-///
-/// This is the refusal a fabricated success would replace. Driven over the wire
-/// with a FULLY VALID request, because an invalid one is refused by schema
-/// validation and would pass this test while the defect remained: the earlier
-/// probe returned `outcome: "ok"` with a url_final and a lifecycle event for a
-/// navigation that never happened, and it took a well-formed request to see it.
+/// Driven with a fully valid request so schema validation cannot satisfy the
+/// assertion before session admission is reached.
 #[tokio::test]
-async fn a_browser_capability_with_no_connector_is_refused_at_the_wire() {
+async fn navigation_without_an_open_session_is_refused_at_the_wire() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let request = json!({
@@ -1241,17 +1235,13 @@ async fn a_browser_capability_with_no_connector_is_refused_at_the_wire() {
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
+    assert_eq!(body["outcome"], "no_session", "{body}");
+    assert_eq!(body["detail"]["reason_code"], "no_session", "{body}");
     assert_eq!(
-        body["code"], "unknown_method",
-        "a browser capability with no connector was served: {body}"
+        body["detail"]["reason"], "no browser session is open",
+        "{body}"
     );
-    // The specific claim that must never appear: a navigation reporting where it
-    // landed. Asserted separately from the refusal because a future change could
-    // return a different error while still having reached the state machine.
-    assert!(
-        body.get("url_final").is_none(),
-        "a navigation reported a final url without a browser: {body}"
-    );
+    assert!(body.get("url_final").is_none(), "{body}");
 }
 
 /// Advertisement and dispatch agree about the browser surface.

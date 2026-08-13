@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
 use cerebellum_core::clock::{MonoInstant, MonotonicClock};
 use serde_json::{json, Value};
@@ -146,7 +147,33 @@ pub trait BrowserSessionLauncher: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessControlFailure;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationDriveError {
+    Unavailable,
+    ConnectorFailure,
+    CdpFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationWait {
+    Settle,
+    None,
+}
+
 pub trait OwnedBrowserProcess: Send {
+    /// Drive through the process-owned CDP connection. The default keeps test
+    /// and non-production process adapters explicitly non-dispatchable.
+    fn navigate(
+        &mut self,
+        _context_key: &str,
+        _url: &str,
+        _wait: NavigationWait,
+        _deadline_ms: u64,
+        _tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     fn generation_matches(&self) -> bool;
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure>;
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure>;
@@ -236,6 +263,30 @@ pub struct OperationGuard {
 impl OperationGuard {
     pub fn finish(mut self) {
         self.release();
+    }
+
+    pub(crate) fn navigate(
+        &mut self,
+        context_key: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline_ms: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        let mut state = self
+            .sessions
+            .inner
+            .0
+            .lock()
+            .map_err(|_| NavigationDriveError::Unavailable)?;
+        let process = state
+            .routes
+            .get_mut(&self.route_key)
+            .and_then(|route| route.active.as_mut())
+            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
+            .and_then(|session| session.process.as_mut())
+            .ok_or(NavigationDriveError::Unavailable)?;
+        process.navigate(context_key, url, wait, deadline_ms, tracker)
     }
 
     fn release(&mut self) {

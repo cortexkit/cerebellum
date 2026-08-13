@@ -16,6 +16,43 @@ pub const MAX_QUEUED_EVENTS: usize = 65_536;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const COMMAND_TIMEOUT: Duration = Duration::from_millis(30_000);
 
+/// Incrementally decodes the NUL-delimited framing used by a CDP pipe.
+///
+/// The decoder moves with the pipe after launch readiness so bytes from one
+/// descriptor are never split across independent framing states.
+#[derive(Debug, Default)]
+pub struct CdpFrameDecoder {
+    frame: Vec<u8>,
+    discarding_oversized_frame: bool,
+}
+
+impl CdpFrameDecoder {
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if byte == 0 {
+                if self.discarding_oversized_frame {
+                    self.discarding_oversized_frame = false;
+                    self.frame.clear();
+                } else {
+                    frames.push(std::mem::take(&mut self.frame));
+                }
+                continue;
+            }
+            if self.discarding_oversized_frame {
+                continue;
+            }
+            if self.frame.len() == MAX_MESSAGE_BYTES {
+                self.frame.clear();
+                self.discarding_oversized_frame = true;
+                continue;
+            }
+            self.frame.push(byte);
+        }
+        frames
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CdpError {
     InvalidUtf8,
