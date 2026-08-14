@@ -132,6 +132,37 @@ pub enum RegistrationError {
 }
 
 /// Verify the selected executable and the fully expanded argument vector.
+///
+/// THE PROXY REFUSALS BELOW GUARD A PROXY THIS MODULE DOES NOT YET CONFIGURE,
+/// and they are listed here first because the list otherwise reads as evidence
+/// that browser traffic is routed through one. `browser_launch_service` builds
+/// its argument vector from `--remote-debugging-pipe`, `--user-data-dir`,
+/// `--no-first-run` and `--no-default-browser-check`. It passes no
+/// `--proxy-server`, so a launched browser reaches the network directly, and
+/// refusing the arguments that would DISABLE a proxy forbids turning off
+/// something nobody turned on.
+///
+/// WHAT DOES CONSTRAIN BROWSER EGRESS TODAY, so the true model arrives with the
+/// correction: a navigation must use http or https, and its origin must be
+/// covered by an action grant. Grants are minted only from an answered consent
+/// question (`browser.open_grant` -> a question relayed to a person -> their
+/// answer), never from configuration or from the caller's own request, so an
+/// origin nobody approved cannot be navigated to. That leaves what a LOADED
+/// PAGE's own scripts reach unconstrained by this module, which is the layer a
+/// proxy would add.
+///
+/// `src/network/` holds the policy half of that intended proxy -- address
+/// classification and admission accounting -- with no listener and no caller
+/// outside its own directory. It is a model of an egress gate rather than one
+/// that runs.
+///
+/// The refusals stay rather than being deleted, and the reason is the failure
+/// mode of deleting them: whoever builds the proxy would have to REMEMBER to
+/// restore them, and a proxy whose bypass arguments are admitted is worse than
+/// no proxy, because it certifies a containment that one launch argument
+/// defeats. Kept, they become load-bearing the moment a proxy exists.
+/// `custody_tests::the_launch_vector_configures_no_proxy` fails at that moment
+/// and names this pairing.
 fn forbidden_argument(argument: &str) -> bool {
     let lower = argument.to_ascii_lowercase();
     lower == "--no-proxy-server"
@@ -534,6 +565,61 @@ mod tests {
         assert_eq!(
             canonical_json_bytes(&ascii),
             crate::classification::canonical_json_bytes(&ascii)
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_pairing_tests {
+    /// A tripwire for the day someone configures a proxy or wires the connector.
+    ///
+    /// The refusals in `forbidden_argument` reject arguments that would DISABLE a
+    /// proxy, and this module configures none, so today they forbid turning off
+    /// something nobody turned on. That is a deliberate deferral rather than an
+    /// oversight -- but a deferral recorded only in prose is one a future reader
+    /// has to happen to read, and this particular gap is DISGUISED: a refusal
+    /// list naming proxy arguments reads as evidence that egress is proxied.
+    ///
+    /// So the deferral is asserted instead. This test passes trivially now and
+    /// FAILS the moment either half is built, naming what must be checked at
+    /// exactly the point it stops being true.
+    ///
+    /// It asserts over SOURCE rather than behaviour deliberately: the property is
+    /// "these two subsystems are not yet paired", which no runtime state exposes.
+    #[test]
+    fn the_launch_vector_configures_no_proxy() {
+        let launch_service = include_str!("browser_launch_service.rs");
+        // The vector is built from OsString literals, so the flag would appear
+        // verbatim. Matching the flag rather than a value catches every form:
+        // --proxy-server=..., --proxy-pac-url=..., --proxy-bypass-list=...
+        let configures_proxy = launch_service
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("--proxy"));
+        assert!(
+            !configures_proxy,
+            "the launch vector now configures a proxy: the bypass refusals in \
+             forbidden_argument have become load-bearing. Verify the pairing -- \
+             every argument that could disable or bypass the proxy must be \
+             refused, and the address policy in src/network/ must be the thing \
+             deciding admission rather than a model beside it. See the comment \
+             on forbidden_argument."
+        );
+
+        // The companion half. A proxy could equally arrive by wiring the
+        // connector to a listener rather than by adding a launch argument, and
+        // that path would leave the assertion above green.
+        let module = include_str!("network/mod.rs");
+        let connector = include_str!("network/connector.rs");
+        let has_listener = [module, connector]
+            .iter()
+            .any(|source| source.contains("TcpListener") || source.contains("UnixListener"));
+        assert!(
+            !has_listener,
+            "src/network/ now binds a listener: the connector is becoming a real \
+             egress gate rather than a policy model. The launch vector must point \
+             the browser at it, or a browser that reaches the network directly \
+             will run beside a gate that believes it is enforcing."
         );
     }
 }
