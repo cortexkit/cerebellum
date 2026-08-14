@@ -18,6 +18,7 @@ fn valid_inputs() -> ComputerReleaseInputs {
         attendance_contract_revision: Some("fixture-attendance-contract-v1".into()),
         input_review_revision: Some("fixture-input-review-v1".into()),
         capture_review_revision: Some("fixture-capture-review-v1".into()),
+        semantic_actuation_review_revision: Some("fixture-semantic-actuation-review-v1".into()),
         release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
         vocabulary_digests: VocabularyDigestInputs {
             manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
@@ -89,8 +90,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
 
-    // Complete release identifiers admit exactly the two read-only rows. This
-    // was originally asserted against the manifest, on the assumption that
+    // Complete release identifiers admit semantic click and the two read-only
+    // rows. This was originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
     // Advertisement is now the conjunction of gate admission and
@@ -98,7 +99,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // half below.
     assert_eq!(
         evidence.gate_admitted_capabilities,
-        vec!["computer.screenshot", "computer.wait"]
+        vec!["computer.click", "computer.screenshot", "computer.wait"]
     );
 
     // Everything advertised can be dispatched. The advertised set is DERIVED
@@ -118,8 +119,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. It is PARTIAL: the two observing capabilities are served, and the
-    // six that actuate are not, because no input path exists to serve them.
+    // admit. It is PARTIAL: semantic click and the two observing capabilities
+    // are served, while the other five actuating rows remain unavailable.
     //
     // PARTIAL rather than EMPTY is a release-visible claim: it says a caller can
     // act on the computer plane rather than only read its declarations. Changing
@@ -131,8 +132,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     );
     assert_eq!(
         computer_tools,
-        vec!["computer.screenshot", "computer.wait"],
-        "the advertised set is no longer exactly the two observing capabilities"
+        vec!["computer.click", "computer.screenshot", "computer.wait"],
+        "the advertised set is no longer exactly semantic click plus the two observing capabilities"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -162,6 +163,31 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         }),
     };
     assert!(!computer_release_evidence_with_exercised_rows(&empty, 1).functional_computer_plane);
+}
+
+/// The manifest consumes the semantic review rather than the synthetic review.
+#[test]
+fn caller_manifest_requires_the_semantic_review_to_advertise_computer_click() {
+    let advertised = |context: &ComputerCapabilityAdvertisementContext| {
+        tools(&build_manifest_with_computer_plane("cerebellum", context))
+            .into_iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>()
+    };
+
+    let bound = valid_context();
+    assert!(advertised(&bound).contains("computer.click"));
+
+    let mut unreviewed = bound;
+    unreviewed.inputs.semantic_actuation_review_revision = None;
+    assert!(
+        unreviewed.inputs.input_review_revision.is_some(),
+        "the unrelated synthetic-input review must stay bound in this tripwire"
+    );
+    assert!(
+        !advertised(&unreviewed).contains("computer.click"),
+        "the caller manifest offered semantic click without its review"
+    );
 }
 
 /// A suppressed capability says which condition suppressed it.
@@ -320,7 +346,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 8],
+        vec![ComputerGateOutcome::Pass; 9],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -329,6 +355,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "attendance_contract_revision",
         "input_review_revision",
         "capture_review_revision",
+        "semantic_actuation_review_revision",
         "release_signing_topology_revision",
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
@@ -341,6 +368,9 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "attendance_contract_revision" => inputs.attendance_contract_revision = None,
             "input_review_revision" => inputs.input_review_revision = None,
             "capture_review_revision" => inputs.capture_review_revision = None,
+            "semantic_actuation_review_revision" => {
+                inputs.semantic_actuation_review_revision = None
+            }
             "release_signing_topology_revision" => inputs.release_signing_topology_revision = None,
             "vocabulary_manifest_digest" => inputs.vocabulary_digests.manifest_digest = None,
             "vocabulary_source_lock_digest" => inputs.vocabulary_digests.source_lock_digest = None,
@@ -368,32 +398,34 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             }),
             "missing pin {gate} must remain externally unresolved"
         );
-        // Gate behaviour is asserted against the capabilities the GATES admit,
-        // which is what this test is about. Advertisement additionally requires
-        // that dispatch can serve the capability, so reading the advertised set
-        // here would conflate a closed gate with an unserved capability and
-        // prove nothing about which gate closed.
         let admitted = evidence.gate_admitted_capabilities;
-        if matches!(
-            gate,
-            "attendance_contract_owner" | "attendance_contract_revision" | "input_review_revision"
-        ) {
-            // These pins apply to the currently unadvertised input declarations;
-            // the read-only rows remain available, while the affected input
-            // capability is absent from the manifest.
-            assert!(!admitted.iter().any(|id| id == "computer.click"));
-            assert!(admitted.iter().any(|id| id == "computer.wait"));
-        } else if matches!(
-            gate,
-            "capture_review_revision" | "release_signing_topology_revision"
-        ) {
-            assert!(!admitted.iter().any(|id| id == "computer.screenshot"));
-            assert!(admitted.iter().any(|id| id == "computer.wait"));
-        } else {
-            assert!(
+        match gate {
+            "attendance_contract_owner"
+            | "attendance_contract_revision"
+            | "input_review_revision" => assert_eq!(
+                admitted,
+                vec!["computer.click", "computer.screenshot", "computer.wait"],
+                "the synthetic-input gates must not govern reviewed semantic click"
+            ),
+            "capture_review_revision" => {
+                assert!(admitted.iter().any(|id| id == "computer.click"));
+                assert!(!admitted.iter().any(|id| id == "computer.screenshot"));
+                assert!(admitted.iter().any(|id| id == "computer.wait"));
+            }
+            "semantic_actuation_review_revision" => {
+                assert!(!admitted.iter().any(|id| id == "computer.click"));
+                assert!(admitted.iter().any(|id| id == "computer.screenshot"));
+                assert!(admitted.iter().any(|id| id == "computer.wait"));
+            }
+            "release_signing_topology_revision" => {
+                assert!(!admitted.iter().any(|id| id == "computer.click"));
+                assert!(!admitted.iter().any(|id| id == "computer.screenshot"));
+                assert!(admitted.iter().any(|id| id == "computer.wait"));
+            }
+            _ => assert!(
                 admitted.is_empty(),
                 "common missing pin {gate} must suppress rows"
-            );
+            ),
         }
     }
 }

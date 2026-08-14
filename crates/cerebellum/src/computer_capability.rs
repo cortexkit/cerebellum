@@ -20,6 +20,19 @@ use cerebellum_computer::audit::{
 use cerebellum_computer::capture::{CaptureArtifact, CaptureBackend, ScopedCaptureController};
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
 use cerebellum_computer::grounding::ContainmentRung;
+#[cfg(target_os = "macos")]
+use cerebellum_computer::{
+    dispatch::{
+        post_condition::PostCondition, AttendanceContext, AttendanceLease, DispatchError,
+        DispatchRequest, Dispatcher, ExpectedPostCondition, FrozenDispatchRow,
+    },
+    platform::{
+        containment::ContainmentRung as DispatchContainmentRung, AccessibilityElementName,
+        AccessibilityKeyForm, AccessibilityReadFailure, AccessibilityTreeRequest, DispatchMode,
+        DriverError, ElementResolutionRequest, MacOs26PlatformDriver, PlatformDriver,
+        SemanticDriverError, TargetDisposition,
+    },
+};
 use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::consent::ActionKind;
 use cerebellum_core::journal::JournalIdentity;
@@ -199,17 +212,16 @@ impl Servable {
 /// facility that does not exist, and it discovers otherwise only by using it.
 pub fn servable(name: &str) -> Option<Servable> {
     match ComputerCapability::parse(name) {
-        // Serving these two needs no input path: one reads pixels and the other
-        // reads a clock.
-        Some(capability @ (ComputerCapability::Screenshot | ComputerCapability::Wait)) => {
-            Some(Servable(capability))
-        }
-        // Everything else actuates, and no input path exists yet. Listed by
-        // name rather than caught by a wildcard so adding a capability to the
+        Some(
+            capability @ (ComputerCapability::Click
+            | ComputerCapability::Screenshot
+            | ComputerCapability::Wait),
+        ) => Some(Servable(capability)),
+        // These rows still have no reviewed wire input path. Listed by name
+        // rather than caught by a wildcard so adding a capability to the
         // vocabulary does not silently make it servable here.
         Some(
-            ComputerCapability::Click
-            | ComputerCapability::Type
+            ComputerCapability::Type
             | ComputerCapability::Keys
             | ComputerCapability::Scroll
             | ComputerCapability::Move
@@ -287,6 +299,8 @@ where
                 self.serve_screenshot(arguments, context, make_backend)
                     .await
             }
+            #[cfg(target_os = "macos")]
+            ComputerCapability::Click => self.serve_click(arguments, context).await,
             // Unreachable through `servable`, which is the only way a capability
             // arrives here. Answered rather than panicked: a dispatch table and
             // this match disagreeing is a bug to report, not a reason to take
@@ -312,6 +326,157 @@ where
             });
         };
         json!({ "outcome": "completed", "waited_ms": duration_ms })
+    }
+
+    /// Invoke the accessibility press action on one identifier-addressed element.
+    #[cfg(target_os = "macos")]
+    async fn serve_click<C: MonotonicClock>(
+        &self,
+        arguments: &Value,
+        context: ServeContext<'_, C>,
+    ) -> Value {
+        let Some(object) = arguments.as_object() else {
+            return invalid_click_request("$", "wrong_type");
+        };
+        if let Some(field) = object
+            .keys()
+            .filter(|field| {
+                !matches!(
+                    field.as_str(),
+                    "target" | "button" | "click_count" | "modifiers"
+                )
+            })
+            .min()
+        {
+            return invalid_click_request(field, "unknown_field");
+        }
+        let Some(target_identifier) = object.get("target").and_then(Value::as_str) else {
+            return invalid_click_request("target", field_reason(object.get("target")));
+        };
+        if target_identifier.is_empty() {
+            return invalid_click_request("target", "empty_value");
+        }
+        match object.get("button").and_then(Value::as_str) {
+            Some("left") => {}
+            Some(_) => return invalid_click_request("button", "semantic_path_requires_left"),
+            None => return invalid_click_request("button", field_reason(object.get("button"))),
+        }
+        match object.get("click_count").and_then(Value::as_u64) {
+            Some(1) => {}
+            Some(_) => return invalid_click_request("click_count", "semantic_path_requires_one"),
+            None => {
+                return invalid_click_request(
+                    "click_count",
+                    field_reason(object.get("click_count")),
+                )
+            }
+        }
+        let Some(modifiers) = object.get("modifiers").and_then(Value::as_array) else {
+            return invalid_click_request("modifiers", field_reason(object.get("modifiers")));
+        };
+        if modifiers.len() > 8 || modifiers.iter().any(|modifier| !modifier.is_string()) {
+            return invalid_click_request("modifiers", "invalid_value");
+        }
+        if !modifiers.is_empty() {
+            return invalid_click_request("modifiers", "semantic_path_requires_empty");
+        }
+
+        let ServeContext {
+            grantee,
+            identity,
+            management,
+            clock,
+            now_ms: _,
+        } = context;
+        let grant = match management
+            .authority_for(grantee, ActionKind::Compose, clock)
+            .await
+        {
+            ActionAuthority::Admitted(grant) => grant,
+            ActionAuthority::Refused(refusal) => return refusal,
+        };
+
+        let mut driver = MacOs26PlatformDriver::default().without_expected_post_condition();
+        let tree = match driver.read_accessibility_tree(AccessibilityTreeRequest {
+            target: grant.clone(),
+            settle_interval_ms: 500,
+        }) {
+            Ok(tree) => tree,
+            Err(error) => return click_driver_refusal(error, AccessibilityKeyForm::Identifier),
+        };
+        let Some(root_identifier) = tree.root_identifier else {
+            return dispatch_refusal(DispatchError::SemanticPathUnavailable);
+        };
+        let element = match driver.resolve_element(ElementResolutionRequest {
+            root_identifier,
+            element_name: AccessibilityElementName::Identifier(target_identifier.to_string()),
+        }) {
+            Ok(element) => element,
+            Err(error) => return click_driver_refusal(error, AccessibilityKeyForm::Identifier),
+        };
+
+        let row = FrozenDispatchRow::for_capability("computer.click")
+            .expect("the frozen vocabulary contains computer.click");
+        let dispatch_at_ms = clock.now().as_nanos() / 1_000_000;
+        let expires_at_ms = dispatch_at_ms.saturating_add(row.maximum_attendance_lease_age_ms);
+        let lease = match AttendanceLease::new(
+            identity.conversation_key.clone(),
+            grant.clone(),
+            grantee,
+            dispatch_at_ms,
+            expires_at_ms,
+            grant.process_generation_evidence.clone(),
+            "cerebellum-serve-context-v1",
+        ) {
+            Ok(lease) => lease,
+            Err(_) => return dispatch_refusal(DispatchError::AttendanceUnavailable),
+        };
+        let attendance = AttendanceContext::background(
+            identity.conversation_key.clone(),
+            grant.clone(),
+            grantee,
+            lease,
+            dispatch_at_ms,
+            dispatch_at_ms,
+            row.maximum_attendance_lease_age_ms,
+            row.maximum_attendance_check_to_dispatch_interval_ms,
+            true,
+        );
+
+        // The frozen wire schema cannot carry an expected post-condition. The
+        // driver is marked accordingly and performs no effect observation; this
+        // placeholder only satisfies the dispatch envelope's closed type and is
+        // never evaluated or reported as the caller's claim.
+        let request = DispatchRequest::new(
+            row,
+            DispatchMode::Background,
+            grant,
+            ExpectedPostCondition::new(
+                "computer-click-wire-no-effect-claim-v1",
+                PostCondition::ElementPresent {
+                    element_identifier: target_identifier.to_string(),
+                },
+            ),
+            attendance,
+            dispatch_at_ms,
+        )
+        .with_semantic(element, "press");
+
+        let mut audit = self.audit.lock().await;
+        match Dispatcher::new(driver).dispatch(&mut audit, identity, request) {
+            Ok(report) => json!({
+                "outcome": "handler_returned_no_effect_claim",
+                "containment_rung": report
+                    .containment
+                    .rung()
+                    .map(DispatchContainmentRung::as_str)
+                    .unwrap_or("global_none"),
+                // The frozen result vocabulary has no distinct status for an
+                // absent effect claim, so this is the honest coarser value.
+                "effect_status": "effect_indeterminate",
+            }),
+            Err(refusal) => dispatch_refusal(refusal),
+        }
     }
 
     /// Photograph the windows of the application this conversation may observe.
@@ -583,6 +748,169 @@ where
             "outcome": "captured",
             "windows": windows,
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn field_reason(value: Option<&Value>) -> &'static str {
+    if value.is_some() {
+        "wrong_type"
+    } else {
+        "missing_field"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn invalid_click_request(field: &str, reason: &str) -> Value {
+    json!({
+        "outcome": "invalid_request",
+        "field": field,
+        "reason": reason,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_refusal(refusal: DispatchError) -> Value {
+    serde_json::to_value(refusal).expect("the closed dispatch refusal taxonomy serializes")
+}
+
+#[cfg(target_os = "macos")]
+fn click_driver_refusal(error: DriverError, key_form: AccessibilityKeyForm) -> Value {
+    let refusal = match error {
+        DriverError::Semantic(failure) => match failure {
+            SemanticDriverError::ElementNameAmbiguous {
+                key_form,
+                match_count,
+            } => DispatchError::ElementNameAmbiguous {
+                key_form,
+                match_count,
+            },
+            SemanticDriverError::ElementNotFound { key_form } => {
+                DispatchError::ElementNotFound { key_form }
+            }
+            SemanticDriverError::ActionNotAdvertised { action, advertised } => {
+                DispatchError::ActionNotAdvertised { action, advertised }
+            }
+            SemanticDriverError::ApplicationRefused { ax_error } => {
+                DispatchError::ApplicationRefused { ax_error }
+            }
+            SemanticDriverError::AccessibilityPermissionUnavailable => {
+                DispatchError::AccessibilityPermissionUnavailable
+            }
+            SemanticDriverError::TargetNoLongerCurrent { disposition } => {
+                DispatchError::TargetNoLongerCurrent { disposition }
+            }
+            SemanticDriverError::Transient { deadline_ms } => {
+                DispatchError::SemanticDispatchTransient { deadline_ms }
+            }
+            SemanticDriverError::PathUnavailable => DispatchError::SemanticPathUnavailable,
+        },
+        DriverError::AccessibilityUnreadable(failure) => match failure {
+            AccessibilityReadFailure::PermissionRequired => {
+                DispatchError::AccessibilityPermissionUnavailable
+            }
+            AccessibilityReadFailure::TargetGone => DispatchError::TargetNoLongerCurrent {
+                disposition: TargetDisposition::Gone,
+            },
+            AccessibilityReadFailure::TargetReplaced => DispatchError::TargetNoLongerCurrent {
+                disposition: TargetDisposition::Replaced,
+            },
+            AccessibilityReadFailure::RetryableDeadlineExceeded => {
+                DispatchError::SemanticDispatchTransient { deadline_ms: 3_000 }
+            }
+            AccessibilityReadFailure::TargetNotInspectable
+            | AccessibilityReadFailure::TreeExceedsBound
+            | AccessibilityReadFailure::IncompatiblePlatformValue
+            | AccessibilityReadFailure::PlatformReadFailed => {
+                DispatchError::SemanticPathUnavailable
+            }
+        },
+        DriverError::ElementNotFound => DispatchError::ElementNotFound { key_form },
+        DriverError::Unsupported(_)
+        | DriverError::InvalidRequest(_)
+        | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
+    };
+    dispatch_refusal(refusal)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod click_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn wire_refusal_serialization_keeps_every_semantic_remedy_payload() {
+        let cases = [
+            (
+                DispatchError::ElementNameAmbiguous {
+                    key_form: AccessibilityKeyForm::Identifier,
+                    match_count: 2,
+                },
+                json!({
+                    "reason": "element_name_ambiguous",
+                    "key_form": "identifier",
+                    "match_count": 2,
+                }),
+            ),
+            (
+                DispatchError::ElementNotFound {
+                    key_form: AccessibilityKeyForm::Identifier,
+                },
+                json!({
+                    "reason": "element_not_found",
+                    "key_form": "identifier",
+                }),
+            ),
+            (
+                DispatchError::ActionNotAdvertised {
+                    action: "press".to_string(),
+                    advertised: vec!["show_menu".to_string()],
+                },
+                json!({
+                    "reason": "action_not_advertised",
+                    "action": "press",
+                    "advertised": ["show_menu"],
+                }),
+            ),
+            (
+                DispatchError::ApplicationRefused { ax_error: -25205 },
+                json!({
+                    "reason": "application_refused",
+                    "ax_error": -25205,
+                }),
+            ),
+            (
+                DispatchError::AccessibilityPermissionUnavailable,
+                json!({"reason": "accessibility_permission_unavailable"}),
+            ),
+            (
+                DispatchError::TargetNoLongerCurrent {
+                    disposition: TargetDisposition::Replaced,
+                },
+                json!({
+                    "reason": "target_no_longer_current",
+                    "disposition": "replaced",
+                }),
+            ),
+            (
+                DispatchError::SemanticDispatchTransient { deadline_ms: 3_000 },
+                json!({
+                    "reason": "semantic_dispatch_transient",
+                    "deadline_ms": 3_000,
+                }),
+            ),
+            (
+                DispatchError::SemanticPathUnavailable,
+                json!({"reason": "semantic_path_unavailable"}),
+            ),
+        ];
+
+        for (refusal, expected) in cases {
+            assert_eq!(
+                dispatch_refusal(refusal),
+                expected,
+                "a semantic remedy was changed at the wire boundary"
+            );
+        }
     }
 }
 

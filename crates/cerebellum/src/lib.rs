@@ -179,7 +179,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 16] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 17] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -206,6 +206,10 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 16] = [
     },
     ComputerReleaseGate {
         name: "capture_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "semantic_actuation_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     ComputerReleaseGate {
@@ -336,6 +340,9 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         "attendance_contract_revision" => inputs.attendance_contract_revision.as_deref(),
         "input_review_revision" => inputs.input_review_revision.as_deref(),
         "capture_review_revision" => inputs.capture_review_revision.as_deref(),
+        "semantic_actuation_review_revision" => {
+            inputs.semantic_actuation_review_revision.as_deref()
+        }
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
         _ => unreachable!("every external release gate has a bound input"),
     }
@@ -371,14 +378,16 @@ fn declaration_gate_passes(
             ]
             .iter()
             .all(|gate| gate_passes(outcomes, gate))
+    } else if id == "computer.click" {
+        [
+            "semantic_actuation_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
     } else if matches!(
         id,
-        "computer.click"
-            | "computer.type"
-            | "computer.keys"
-            | "computer.scroll"
-            | "computer.move"
-            | "computer.drag"
+        "computer.type" | "computer.keys" | "computer.scroll" | "computer.move" | "computer.drag"
     ) {
         [
             "attendance_contract_owner",
@@ -719,7 +728,7 @@ fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>
 /// Collect the release attestations supplied to the compiler and derive the
 /// vocabulary mirrors from their independent checked-in sources.
 ///
-/// The five external identifiers use `option_env!` so a release invocation must
+/// The six external identifiers use `option_env!` so a release invocation must
 /// supply each attestation before compilation. Starting a binary with a new
 /// environment value cannot manufacture a review after the binary was built.
 fn compiled_release_inputs() -> ComputerReleaseInputs {
@@ -728,6 +737,7 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_REVISION"),
         option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
         option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
+        option_env!("CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION"),
         option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION"),
     )
 }
@@ -737,6 +747,7 @@ fn release_inputs_from_build_bindings(
     attendance_contract_revision: Option<&str>,
     input_review_revision: Option<&str>,
     capture_review_revision: Option<&str>,
+    semantic_actuation_review_revision: Option<&str>,
     release_signing_topology_revision: Option<&str>,
 ) -> ComputerReleaseInputs {
     let computed_vocabulary_digest = computer::platform::computed_vocabulary_sha256();
@@ -745,6 +756,7 @@ fn release_inputs_from_build_bindings(
         attendance_contract_revision: attendance_contract_revision.map(str::to_owned),
         input_review_revision: input_review_revision.map(str::to_owned),
         capture_review_revision: capture_review_revision.map(str::to_owned),
+        semantic_actuation_review_revision: semantic_actuation_review_revision.map(str::to_owned),
         release_signing_topology_revision: release_signing_topology_revision.map(str::to_owned),
         vocabulary_digests: computer::platform::VocabularyDigestInputs {
             // The manifest and computed-artifact mirrors are recalculated from
@@ -1280,7 +1292,7 @@ impl Planes {
 #[cfg(target_os = "macos")]
 pub fn test_admitted_computer_capabilities() -> Arc<std::collections::BTreeSet<String>> {
     Arc::new(
-        ["computer.screenshot", "computer.wait"]
+        ["computer.click", "computer.screenshot", "computer.wait"]
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -1966,7 +1978,7 @@ async fn handle_tool_request(
     // unknown method -- a refusal that describes the wrong subsystem.
     #[cfg(target_os = "macos")]
     if let Some(servable) = computer_capability::servable(name) {
-        let clock = cerebellum_core::clock::SystemClock::new();
+        let clock = planes.lease_clock.as_ref();
 
         // Refused unless the release gates admitted it, so serving and
         // advertising answer to the same authority.
@@ -2023,7 +2035,7 @@ async fn handle_tool_request(
                         session_kind: accepted_facts.identity.session_kind,
                     },
                     management: &planes.management,
-                    clock: &clock,
+                    clock,
                     // Wall-clock rather than the lease clock: this stamps a
                     // journal entry a person may later read against other
                     // records, where the lease clock only answers whether one
@@ -2609,8 +2621,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            5,
-            "expected five attestations, found {read_here:?}"
+            6,
+            "expected six attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -3381,6 +3393,7 @@ mod tests {
             None,
             Some("cerebellum-capture-review/v1@cb1f669"),
             None,
+            None,
         );
         assert_eq!(
             inputs,
@@ -3389,6 +3402,7 @@ mod tests {
                 attendance_contract_revision: None,
                 input_review_revision: None,
                 capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669".to_string()),
+                semantic_actuation_review_revision: None,
                 release_signing_topology_revision: None,
                 vocabulary_digests: computer::platform::VocabularyDigestInputs {
                     manifest_digest: Some(
@@ -3446,6 +3460,7 @@ mod tests {
                 Some("fixture-attendance-revision"),
                 Some("fixture-input-review"),
                 Some("fixture-capture-review"),
+                Some("fixture-semantic-actuation-review"),
                 Some("fixture-signing-topology"),
             ),
             permissions: Default::default(),
@@ -3460,7 +3475,7 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 8]
+            vec![ComputerGateOutcome::Pass; 9]
         );
     }
 }

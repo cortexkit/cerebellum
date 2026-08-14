@@ -317,14 +317,16 @@ fn journal_boot_failure_message_names_its_path_and_typed_cause() {
     assert!(message.contains("PermissionDenied"));
 }
 
-/// Only the two capabilities with no input path are servable.
+/// The reviewed semantic click path joins the two observing handlers.
 ///
-/// Listed by name rather than matched by a wildcard, so a capability added to
-/// the vocabulary does not become servable by default. Every actuating
-/// capability must be absent until an input path exists: advertising one tells a
-/// caller it has a facility that does not exist, and it finds out by using it.
+/// Listed by name rather than matched by a wildcard, so the five unreviewed
+/// actuating capabilities cannot become servable by default.
 #[test]
-fn only_the_observing_capabilities_are_servable() {
+fn only_reviewed_or_observing_capabilities_are_servable() {
+    assert_eq!(
+        servable("computer.click").map(|s| s.capability()),
+        Some(ComputerCapability::Click)
+    );
     assert_eq!(
         servable("computer.screenshot").map(|s| s.capability()),
         Some(ComputerCapability::Screenshot)
@@ -335,7 +337,6 @@ fn only_the_observing_capabilities_are_servable() {
     );
 
     for actuating in [
-        "computer.click",
         "computer.type",
         "computer.keys",
         "computer.scroll",
@@ -344,7 +345,7 @@ fn only_the_observing_capabilities_are_servable() {
     ] {
         assert!(
             servable(actuating).is_none(),
-            "{actuating} has no input path and must not be servable"
+            "{actuating} has no reviewed wire path and must not be servable"
         );
     }
     assert!(servable("computer.not-a-capability").is_none());
