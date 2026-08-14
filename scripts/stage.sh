@@ -52,6 +52,14 @@ fi
 mkdir -p "$STAGE"
 cp target/release/"$DEPLOYED_NAME" "$STAGE/"
 
+# The backup catalog travels with the binary. It lives in the repo because it is
+# a reviewable declaration rather than generated state, and it is placed into the
+# module's data directory, where the fleet's enrollment scanner looks for it. A
+# catalog that stays in the repo declares nothing: an undeclared data directory
+# is backed up by nobody and excluded by nobody, and its absence from a sweep
+# looks the same as an oversight.
+cp engram-catalog.json "$STAGE/"
+
 codesign --force --sign "$IDENTITY" --identifier "$DEPLOYED_NAME" "$STAGE/$DEPLOYED_NAME"
 codesign --verify --strict "$STAGE/$DEPLOYED_NAME"
 
@@ -117,6 +125,10 @@ echo "    rev:         $HEAD_REV"
 echo "    sha256:      $(shasum -a 256 "$STAGE/$DEPLOYED_NAME" | cut -d' ' -f1)"
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
+echo
+echo "Place engram-catalog.json into the module data directory"
+echo "(~/.local/share/cortexkit/cerebellum/) alongside the binary placement, or"
+echo "the browser profile is neither captured nor deliberately excluded."
 echo
 echo "Placement is a PLAIN COPY -- never re-sign at placement, because a"
 echo "re-sign replaces the pin and invalidates the sha above. Gatekeeper"

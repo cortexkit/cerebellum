@@ -932,6 +932,12 @@ fn browser_data_root() -> Result<PathBuf, ()> {
         .join(".local")
         .join("share")
         .join("cortexkit")
+        // Under the module's own directory rather than beside it: the fleet's
+        // backup enrollment resolves declared paths against
+        // `<data home>/cortexkit/<module id>/` and refuses `..`, so a sibling
+        // directory cannot be declared at all -- neither captured nor
+        // deliberately excluded, and indistinguishable from an oversight.
+        .join("cerebellum")
         .join("browser");
     // Created here because the registry deliberately refuses to: it opens an
     // existing directory and rejects a symlink or a non-directory, which is the

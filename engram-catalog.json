@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "module_id": "cerebellum",
+  "entries": [
+    {
+      "entry_id": "cerebellum/browser-profiles",
+      "class": "device-local",
+      "mechanism": "filetree",
+      "path": "browser"
+    },
+    {
+      "entry_id": "cerebellum/audit-journal",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "journal"
+    }
+  ]
+}
