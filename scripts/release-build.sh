@@ -119,7 +119,7 @@ for name in "${ATTESTATIONS[@]}"; do
   printf '    %-48s %s\n' "$name" "${!name:-<unbound>}"
 done
 
-# The sibling revision this binary is built against.
+# The sibling SOURCE this binary is built against.
 #
 # --locked below fences the REGISTRY half of the dependency set: a registry
 # crate records its source and checksum in Cargo.lock, so its exact bytes are
@@ -128,12 +128,18 @@ done
 # whose SOURCE moved without a version bump satisfies --locked completely, and
 # most commits do not bump a version.
 #
-# That is the half a lockfile cannot reach, so it is declared here instead:
-# the build refuses unless the sibling checkout is exactly this commit and its
-# tree is clean. Re-pinning is then a deliberate commit that the gate verifies,
-# rather than a consequence of whichever afternoon the build happened to run.
-DECLARED_SIBLING_REV="$(tr -d '[:space:]' < "$(dirname "$0")/../subconscious-revision.txt")"
+# Pinned per DEPENDED-ON SUBTREE rather than by the sibling's HEAD commit. A
+# commit id answers "did anything in that repository change", which is the
+# wrong question: only these four crates reach this binary, and the sibling
+# also carries documentation that changes daily. A fence that refuses for
+# reasons that cannot affect the artifact gets re-pinned reflexively, and a
+# reflex is not a decision -- the check would still be present and would have
+# stopped meaning anything.
+#
+# A tree hash answers the right question exactly: it changes when, and only
+# when, the contents of that directory change.
 SIBLING_DIR="$(cd "$(dirname "$0")/../../subconscious" 2>/dev/null && pwd || true)"
+DECLARATION="$(dirname "$0")/../subconscious-source.txt"
 
 if [ -z "$SIBLING_DIR" ]; then
   echo "The subconscious checkout is not beside this repository." >&2
@@ -142,23 +148,30 @@ if [ -z "$SIBLING_DIR" ]; then
   exit 2
 fi
 
-ACTUAL_SIBLING_REV="$(git -C "$SIBLING_DIR" rev-parse HEAD)"
-if [ "$ACTUAL_SIBLING_REV" != "$DECLARED_SIBLING_REV" ]; then
-  echo "The subconscious checkout is not the revision this build declares." >&2
-  echo "  declared: $DECLARED_SIBLING_REV" >&2
-  echo "  actual:   $ACTUAL_SIBLING_REV" >&2
-  echo "" >&2
-  echo "A path dependency records no source or checksum in Cargo.lock, so" >&2
-  echo "--locked cannot see this and the binary would link code no gate has" >&2
-  echo "verified. If the move is intended, update subconscious-revision.txt" >&2
-  echo "and commit it, so the combination is verified before it ships." >&2
+if [ -n "$(git -C "$SIBLING_DIR" status --porcelain -- crates)" ]; then
+  echo "The subconscious crates have uncommitted changes." >&2
+  echo "A recorded hash does not describe what would be compiled, so the" >&2
+  echo "declaration cannot be honoured. Nothing has been produced." >&2
   exit 2
 fi
 
-if [ -n "$(git -C "$SIBLING_DIR" status --porcelain)" ]; then
-  echo "The subconscious checkout has uncommitted changes." >&2
-  echo "A revision alone does not describe what would be compiled, so the" >&2
-  echo "declaration above cannot be honoured. Nothing has been produced." >&2
+DRIFTED=""
+while read -r declared_hash crate; do
+  [ -z "$crate" ] && continue
+  actual_hash="$(git -C "$SIBLING_DIR" rev-parse "HEAD:crates/$crate")"
+  if [ "$actual_hash" != "$declared_hash" ]; then
+    DRIFTED="$DRIFTED  $crate: declared $declared_hash, actual $actual_hash\n"
+  fi
+done < "$DECLARATION"
+
+if [ -n "$DRIFTED" ]; then
+  echo "A subconscious crate this binary links has changed since it was" >&2
+  echo "declared:" >&2
+  printf "%b" "$DRIFTED" >&2
+  echo "A path dependency records no source or checksum in Cargo.lock, so" >&2
+  echo "--locked cannot see this and the binary would link code no gate has" >&2
+  echo "verified. If the move is intended, update subconscious-source.txt and" >&2
+  echo "commit it, so the combination is verified before it ships." >&2
   exit 2
 fi
 
