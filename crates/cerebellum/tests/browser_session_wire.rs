@@ -838,3 +838,53 @@ async fn absent_browser_config_uses_the_route_level_unknown_method_envelope() {
         "no_session"
     );
 }
+
+/// The surface reporter agrees with the predicate it claims to read.
+///
+/// `browser_wire_surface` exists so a person can ask what a caller can reach
+/// without deriving it from three files. That only helps if it reports rather
+/// than asserts: a reporter that can disagree with dispatch is worse than none,
+/// because it carries the authority of having read the production path while
+/// answering from somewhere else.
+///
+/// Nothing else watches it. It is a probe, so no acceptance test fails when it
+/// drifts, and its output looks equally plausible either way -- which is the
+/// exact shape that needs a fence rather than a reader's attention.
+#[test]
+fn the_browser_surface_reporter_agrees_with_dispatch() {
+    for configured in [true, false] {
+        let reported = cerebellum::browser_wire_surface(configured);
+        assert!(
+            !reported.is_empty(),
+            "the reporter returned nothing, so it cannot disagree with anything"
+        );
+
+        let mut any_reachable = false;
+        let mut any_refused = false;
+        for (name, reachable) in &reported {
+            // The predicate `send_hello` filters on, asked directly.
+            let dispatchable = cerebellum::dispatchable_tool_for_test(name, configured).is_some();
+            assert_eq!(
+                *reachable, dispatchable,
+                "the reporter says {name} reachable={reachable} with                  browser_configured={configured}, but dispatch says {dispatchable}"
+            );
+            if *reachable {
+                any_reachable = true;
+            } else {
+                any_refused = true;
+            }
+        }
+
+        // Without this the test passes over a reporter that answers a constant:
+        // every row agreeing that nothing is reachable is agreement about
+        // nothing. A configured host must reach something; a bare one must not.
+        if configured {
+            assert!(any_reachable, "a configured host reached no browser tool");
+        } else {
+            assert!(
+                any_refused,
+                "an unconfigured host reached every browser tool"
+            );
+        }
+    }
+}

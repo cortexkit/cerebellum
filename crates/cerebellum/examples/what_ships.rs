@@ -7,6 +7,34 @@
 //! complete while that manifest stays empty.
 
 fn main() {
+    // The browser half first, because its reachable set is the one that has
+    // been wrong twice: a capability can be implemented, proved against a real
+    // browser, and still answer unknown_method because one predicate does not
+    // name it. `configured` is what a host with a browser configured sees.
+    println!("browser tools (configured / unconfigured):");
+    let configured = cerebellum::browser_wire_surface(true);
+    let unconfigured = cerebellum::browser_wire_surface(false);
+    for (index, (name, reachable_when_configured)) in configured.iter().enumerate() {
+        let reachable_bare = unconfigured
+            .get(index)
+            .map(|(_, reachable)| *reachable)
+            .unwrap_or(false);
+        println!(
+            "  {name:<24} {} / {}",
+            if *reachable_when_configured {
+                "reachable"
+            } else {
+                "REFUSED  "
+            },
+            if reachable_bare {
+                "reachable"
+            } else {
+                "REFUSED"
+            }
+        );
+    }
+    println!();
+
     let context = cerebellum::default_computer_context();
     let evidence = cerebellum::computer_release_evidence(&context);
 
