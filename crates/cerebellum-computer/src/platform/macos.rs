@@ -175,11 +175,11 @@ fn accessibility_read_timeout(settle_interval_ms: u32) -> Result<Duration, Drive
 /// which no test on an arbitrary machine has. Written here, the meaning of an
 /// acceptance is checkable everywhere.
 #[cfg(target_os = "macos")]
-const fn dispatch_result_for_accepted_action(
+fn dispatch_result_for_accepted_action(
     outcome: cerebellum_macos::AxActionRequestOutcome,
 ) -> DispatchResult {
     match outcome {
-        cerebellum_macos::AxActionRequestOutcome::HandlerReturned => DispatchResult {
+        cerebellum_macos::AxActionRequestOutcome::HandlerReturned { .. } => DispatchResult {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
         },
@@ -255,11 +255,11 @@ fn map_ax_action_error(error: cerebellum_macos::AxActionError) -> DriverError {
         // The element is gone or was never there: a fact about the request
         // rather than about the target, so it is not a read failure.
         AxActionError::ElementNotFound { .. } => DriverError::ElementNotFound,
-        // Two elements answer to one identifier, so no action can be delivered
+        // Two elements answer to one supplied key, so no action can be delivered
         // to the one that was resolved. Refused rather than guessing, because
         // guessing is how an action lands on a control nobody chose.
         AxActionError::ElementIdentifierAmbiguous { .. } => {
-            DriverError::InvalidRequest("the element identifier names more than one element")
+            DriverError::InvalidRequest("the element name matches more than one element")
         }
         AxActionError::ElementUniquenessUnestablished { .. } => {
             DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS)
@@ -697,7 +697,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 .ok_or(DriverError::InvalidRequest("unknown accessibility action"))?;
 
             let element_name =
-                cerebellum_macos::AxElementName::new(&request.element.element_identifier)
+                cerebellum_macos::AxElementName::identifier(&request.element.element_identifier)
                     .map_err(|_| DriverError::InvalidRequest("unusable element identifier"))?;
 
             let outcome = cerebellum_macos::request_accessibility_action(
@@ -1237,7 +1237,13 @@ mod accessibility_tests {
     #[test]
     fn platform_acceptance_leaves_the_effect_unclaimed() {
         let result = dispatch_result_for_accepted_action(
-            cerebellum_macos::AxActionRequestOutcome::HandlerReturned,
+            cerebellum_macos::AxActionRequestOutcome::HandlerReturned {
+                matched_by: cerebellum_macos::AxElementName::Identifier("button".to_owned()),
+                alternate_name: Some(cerebellum_macos::AxElementName::RoleAndTitle {
+                    role: "AXButton".to_owned(),
+                    title: "Save".to_owned(),
+                }),
+            },
         );
         assert!(result.accepted_by_platform);
         assert_eq!(result.effect_status, EffectStatus::EffectIndeterminate);
@@ -1265,19 +1271,25 @@ mod accessibility_tests {
             ),
             (
                 AxActionError::ElementNotFound {
-                    identifier: "absent".to_string(),
+                    element_name: cerebellum_macos::AxElementName::Identifier("absent".to_string()),
                 },
                 DriverError::ElementNotFound,
             ),
             (
                 AxActionError::ElementIdentifierAmbiguous {
-                    identifier: "twice".to_string(),
+                    element_name: cerebellum_macos::AxElementName::RoleAndTitle {
+                        role: "AXButton".to_string(),
+                        title: "Save".to_string(),
+                    },
+                    match_count: 2,
                 },
-                DriverError::InvalidRequest("the element identifier names more than one element"),
+                DriverError::InvalidRequest("the element name matches more than one element"),
             ),
             (
                 AxActionError::ElementUniquenessUnestablished {
-                    identifier: "partially-seen".to_string(),
+                    element_name: cerebellum_macos::AxElementName::Identifier(
+                        "partially-seen".to_string(),
+                    ),
                     unreadable_subtrees: 1,
                 },
                 DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS),
@@ -1308,13 +1320,17 @@ mod accessibility_tests {
         use cerebellum_macos::AxActionError;
 
         let absent = map_ax_action_error(AxActionError::ElementNotFound {
-            identifier: "x".to_string(),
+            element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
         });
         let ambiguous = map_ax_action_error(AxActionError::ElementIdentifierAmbiguous {
-            identifier: "x".to_string(),
+            element_name: cerebellum_macos::AxElementName::RoleAndTitle {
+                role: "AXButton".to_string(),
+                title: "Save".to_string(),
+            },
+            match_count: 2,
         });
         let incomplete = map_ax_action_error(AxActionError::ElementUniquenessUnestablished {
-            identifier: "x".to_string(),
+            element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
             unreadable_subtrees: 1,
         });
 
