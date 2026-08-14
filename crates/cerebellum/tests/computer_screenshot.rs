@@ -298,7 +298,7 @@ fn request() -> Value {
 
 #[test]
 fn journal_boot_failure_message_names_its_path_and_typed_cause() {
-    let path = PathBuf::from("/unwritable/cortexkit/journal/computer.json");
+    let path = PathBuf::from("/unwritable/cortexkit/cerebellum/journal/computer.json");
     let reason = ComputerPlaneUnavailable::JournalStorage {
         path: path.clone(),
         error: StorageError::CreateDirectory {

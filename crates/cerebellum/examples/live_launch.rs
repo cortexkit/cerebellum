@@ -398,12 +398,19 @@ fn probe_identity() -> BindIdentity {
 
 /// Read the profile directories themselves. Listing only their parent would
 /// compare equal no matter how many per-agent profiles were minted below it.
+///
+/// An unreadable parent returns EMPTY, which the caller reports as reuse
+/// unproven rather than as reuse. That distinction earned itself: when the data
+/// root moved under the module's own directory, this path went stale and the
+/// probe said "no profile directory observed" while the profile existed and was
+/// being reused correctly. Had absence been read as a verdict instead of as a
+/// missing observation, the probe would have reported a defect that was its own.
 fn profile_directories() -> Vec<String> {
     let Ok(home) = std::env::var("HOME") else {
         return Vec::new();
     };
     let profiles = PathBuf::from(home)
-        .join(".local/share/cortexkit/browser")
+        .join(".local/share/cortexkit/cerebellum/browser")
         .join("profiles");
     let Ok(entries) = std::fs::read_dir(&profiles) else {
         return Vec::new();

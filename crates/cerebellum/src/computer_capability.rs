@@ -90,7 +90,8 @@ impl std::fmt::Display for ComputerPlaneUnavailable {
 /// Binding a truncating policy here would satisfy the same gate while making an
 /// application's own words durable in the journal.
 ///
-/// The journal lives under `~/.local/share/cortexkit/journal/computer.json`:
+/// The journal lives under
+/// `~/.local/share/cortexkit/cerebellum/journal/computer.json`:
 /// audit records are application data, not configuration. Initialization probes
 /// that directory before capabilities are offered and preserves the exact refusal
 /// reason instead of silently substituting process-local storage.
@@ -118,7 +119,12 @@ pub fn production_audit() -> Result<
     let severity = cerebellum_computer::platform::severity::load_severity_taxonomy()
         .map_err(ComputerPlaneUnavailable::SeverityTaxonomy)?;
 
-    let unresolved_path = PathBuf::from("~/.local/share/cortexkit/journal/computer.json");
+    // Only ever shown in the failure below, because the resolved path cannot be
+    // reported when resolution is what failed. It must still name the real
+    // location: an operator reading this error goes looking for the directory it
+    // names, and a stale one sends them to a path nothing writes to.
+    let unresolved_path =
+        PathBuf::from("~/.local/share/cortexkit/cerebellum/journal/computer.json");
     let path = journal_data_path("computer.json").map_err(|error| {
         ComputerPlaneUnavailable::JournalStorage {
             path: unresolved_path,
