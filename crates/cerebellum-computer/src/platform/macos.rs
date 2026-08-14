@@ -466,9 +466,20 @@ impl MacOs26PlatformDriver {
                 ),
             };
         let mut advertised = false;
-        let mut suppression_reason = permission_lookup_failure
-            .clone()
-            .or_else(|| Some("no input dispatch path exists yet".to_string()));
+        // A suppression reason is an operator-facing diagnosis, so it must name
+        // the layer that is actually absent. For the actuating rows the
+        // MECHANISM exists -- a semantic action can be requested of an
+        // application through the closed AxAction vocabulary -- and what is
+        // missing is a wire serving handler, plus the review and activation
+        // that would precede one. Saying "no dispatch path" sent the reader to
+        // the platform layer to look for something already there.
+        let mut suppression_reason = permission_lookup_failure.clone().or_else(|| {
+            Some(
+                "no wire serving handler: the semantic mechanism is built, and serving it \
+                 awaits review and activation"
+                    .to_string(),
+            )
+        });
         if permission_lookup_failure.is_some() {
             // Left as it is: the reason below would overwrite a fact the caller
             // needs more than a release-input note.
@@ -519,6 +530,14 @@ impl MacOs26PlatformDriver {
         // Evaluated even though nothing here advertises a dispatch row, so the
         // gate is exercised by the same path that will eventually consult it
         // rather than first running when something depends on its answer.
+        //
+        // ITS ANSWER CURRENTLY CHANGES NOTHING: every actuating row is
+        // suppressed by the unconditional default above, so binding all of the
+        // release inputs would not advertise one. Whoever adds a serving
+        // handler has to consult this deliberately, which is a thing to
+        // remember rather than a thing enforced --
+        // `dispatch_gate_tests::every_actuating_row_is_suppressed_unconditionally`
+        // is the fence that asks the question at that moment.
         let _dispatch_inputs_resolved = context.inputs.input_dispatch_ready();
         CapabilityDeclaration {
             capability_id: id.to_string(),
@@ -900,6 +919,65 @@ mod tests {
             reason.contains("required permissions are not resolvable"),
             "the suppression reason does not name the permission lookup: {reason}"
         );
+    }
+
+    /// Every actuating row is suppressed no matter what the release inputs say.
+    ///
+    /// A tripwire rather than a description of intent. `input_dispatch_ready()`
+    /// is evaluated in the declaration path and its answer is DISCARDED, so
+    /// binding every release input would still advertise nothing -- which is
+    /// correct while no serving handler exists, and a trap on the day one does,
+    /// because the gate would then be a memory rather than a check.
+    ///
+    /// Fully bound inputs are supplied here deliberately: a fixture leaving
+    /// them absent would pass whether or not the gate were consulted, and could
+    /// not tell the two apart.
+    #[test]
+    fn every_actuating_row_is_suppressed_unconditionally() {
+        let driver = MacOs26PlatformDriver::default();
+        let bound = ImmutableReleaseInputs {
+            attendance_contract_owner: Some("fixture-owner".to_string()),
+            attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
+            input_review_revision: Some("fixture-input-review-v1".to_string()),
+            capture_review_revision: Some("fixture-capture-review-v1".to_string()),
+            release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            bound.input_dispatch_ready(),
+            "the fixture must satisfy the gate, or this test cannot tell a \
+             consulted gate from an ignored one"
+        );
+        let context = CapabilityAdvertisementContext {
+            inputs: bound,
+            permissions: PermissionLivenessReport::default(),
+            startup: driver.startup_probe().clone(),
+        };
+
+        for id in [
+            "computer.click",
+            "computer.type",
+            "computer.keys",
+            "computer.scroll",
+            "computer.move",
+            "computer.drag",
+        ] {
+            let declaration = driver.declaration(id, &context);
+            assert!(
+                !declaration.advertised,
+                "{id} is advertised. If a wire serving handler now exists, this \
+                 test is the question to answer: the declaration path evaluates \
+                 input_dispatch_ready() and throws the answer away, so the gate \
+                 must be consulted deliberately here rather than assumed."
+            );
+            let reason = declaration
+                .suppression_reason
+                .expect("a suppressed capability states why");
+            assert!(
+                reason.contains("no wire serving handler"),
+                "{id} is suppressed for an unexpected reason: {reason}"
+            );
+        }
     }
 
     /// A capability in the vocabulary carries the permissions it lists.
