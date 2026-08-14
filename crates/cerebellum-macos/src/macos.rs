@@ -5,6 +5,7 @@
 //! which is the point of keeping them few.
 
 use std::ffi::CStr;
+use std::fmt;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -600,6 +601,26 @@ pub struct RawCapture {
     pub owner_pid_at_capture: u32,
 }
 
+/// A failure to read a window's pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureError {
+    /// The session was locked when a failed capture was classified.
+    ScreenLocked,
+    /// The framework refused the capture for another reason.
+    Capture(String),
+}
+
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScreenLocked => f.write_str("screen is locked"),
+            Self::Capture(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
 /// Look up one window by id, if the system still describes it.
 fn find_window(window_id: u32, timeout: Duration) -> Result<Retained<SCWindow>, String> {
     let delivery: Arc<Delivery<Result<Option<Retained<SCWindow>>, String>>> = Delivery::new();
@@ -667,20 +688,21 @@ fn find_window(window_id: u32, timeout: Duration) -> Result<Retained<SCWindow>, 
 /// So the deadline has to cover a wait for another process's setup rather than
 /// for the work, and it is a wait that ends in a refusal rather than a late
 /// picture.
-pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, String> {
+pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, CaptureError> {
     // Before any filter is created. Without a window-server connection the
     // filter constructor does not fail -- it aborts the process, which for a
     // module means the whole module dies rather than refusing one capture.
     establish_window_server_connection();
 
-    let window = find_window(window_id, timeout)?;
+    let window = find_window(window_id, timeout).map_err(CaptureError::Capture)?;
     // SAFETY: the window is retained by this frame, so reading its properties
     // is valid for as long as it is held here.
     let (owner_pid_at_capture, frame) = unsafe {
         let owner = window
             .owningApplication()
             .and_then(|owner| u32::try_from(owner.processID()).ok())
-            .ok_or_else(|| format!("window {window_id} reports no owning process"))?;
+            .ok_or_else(|| format!("window {window_id} reports no owning process"))
+            .map_err(CaptureError::Capture)?;
         (owner, window.frame())
     };
     // SAFETY: the window is retained here and outlives the filter's creation.
@@ -732,7 +754,7 @@ pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, S
     outcome.map_err(|reason| explain_capture_failure(reason, screen_is_locked()))
 }
 
-/// Explain a failed capture when the screen being locked is what caused it.
+/// Classify a failed capture when the screen being locked caused it.
 ///
 /// A locked screen refuses pixel contents while still answering questions ABOUT
 /// windows, and it does so with a generic stream failure that reads like a
@@ -746,14 +768,13 @@ pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, S
 /// The state is read AFTER the failure rather than checked before it, so what
 /// is reported is the state that actually applied rather than one that may have
 /// changed since.
-fn explain_capture_failure(reason: String, locked: Option<bool>) -> String {
+fn explain_capture_failure(reason: String, locked: Option<bool>) -> CaptureError {
     if locked == Some(true) {
-        format!("the screen is locked, so window contents are not readable ({reason})")
+        CaptureError::ScreenLocked
     } else {
         // Not locked, or the session could not be read. Neither is evidence
-        // about the capture, so the original reason stands rather than being
-        // replaced by a guess.
-        reason
+        // about the capture, so the original reason remains the error.
+        CaptureError::Capture(reason)
     }
 }
 
@@ -830,33 +851,27 @@ fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize)
 #[cfg(test)]
 mod tests {
 
-    /// A capture that failed because the screen is locked says so.
+    /// A locked screen is classified separately from other capture failures.
     ///
-    /// The system reports a generic stream failure, which reads like a broken
-    /// capture path and sends an operator looking in the wrong place. Only the
-    /// locked case is rewritten: an unknown session state is not evidence about
-    /// the capture, so the original reason stands rather than being replaced by
-    /// a guess.
+    /// The framework reports a generic stream failure for a locked screen, but
+    /// callers can recover by unlocking it. Other failures retain their reason.
     #[test]
-    fn a_locked_screen_explains_a_capture_failure_and_nothing_else_does() {
+    fn a_locked_screen_has_its_own_capture_failure() {
         let raw = "stream stopped with error".to_string();
 
-        assert!(
-            explain_capture_failure(raw.clone(), Some(true)).contains("the screen is locked"),
-            "a locked screen did not explain the failure"
-        );
-        assert!(
-            explain_capture_failure(raw.clone(), Some(true)).contains(&raw),
-            "the original reason was discarded rather than kept alongside"
+        assert_eq!(
+            explain_capture_failure(raw.clone(), Some(true)),
+            CaptureError::ScreenLocked,
+            "a locked screen did not receive its own failure"
         );
         assert_eq!(
             explain_capture_failure(raw.clone(), Some(false)),
-            raw,
+            CaptureError::Capture(raw.clone()),
             "an unlocked screen rewrote a failure it did not cause"
         );
         assert_eq!(
             explain_capture_failure(raw.clone(), None),
-            raw,
+            CaptureError::Capture(raw),
             "an unknown session state was reported as a locked screen"
         );
     }

@@ -317,6 +317,7 @@ pub enum CaptureError {
     BroadCaptureGrantRequired,
     InvalidGrant,
     TeardownInProgress,
+    ScreenIsLocked,
     Backend(String),
 }
 
@@ -329,6 +330,7 @@ impl fmt::Display for CaptureError {
             Self::BroadCaptureGrantRequired => f.write_str("broad_display_grant_required"),
             Self::InvalidGrant => f.write_str("invalid broad display grant"),
             Self::TeardownInProgress => f.write_str("capture teardown in progress"),
+            Self::ScreenIsLocked => f.write_str("screen is locked"),
             Self::Backend(reason) => write!(f, "capture backend failure: {reason}"),
         }
     }
@@ -340,6 +342,7 @@ pub enum BackendError {
     Permission(String),
     Enumeration(String),
     Capture(String),
+    ScreenLocked,
     Teardown(String),
 }
 
@@ -350,10 +353,20 @@ impl fmt::Display for BackendError {
             | Self::Enumeration(reason)
             | Self::Capture(reason)
             | Self::Teardown(reason) => f.write_str(reason),
+            Self::ScreenLocked => f.write_str("screen is locked"),
         }
     }
 }
 impl std::error::Error for BackendError {}
+
+impl From<BackendError> for CaptureError {
+    fn from(error: BackendError) -> Self {
+        match error {
+            BackendError::ScreenLocked => Self::ScreenIsLocked,
+            error => Self::Backend(error.to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendTeardownProgress {
@@ -484,7 +497,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             let frame = self
                 .backend
                 .capture_window(&request)
-                .map_err(|error| CaptureError::Backend(error.to_string()))?;
+                .map_err(CaptureError::from)?;
             if !frame.owner_identity_verified || frame.owner_identity != self.target {
                 // Never return pixels whose identity changed between enumeration
                 // and capture.  A native implementation must re-enumerate rather
@@ -566,7 +579,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             let change = self
                 .backend
                 .poll_window_change(&self.target)
-                .map_err(|error| CaptureError::Backend(error.to_string()))?;
+                .map_err(CaptureError::from)?;
             if let Some(change) = change {
                 reenumerate = true;
                 let interval = now_ms.saturating_sub(change.observed_at_ms);
@@ -578,7 +591,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             let mut windows = self
                 .backend
                 .enumerate_windows(&self.target)
-                .map_err(|error| CaptureError::Backend(error.to_string()))?;
+                .map_err(CaptureError::from)?;
             // Compare each window's verified owner identity with the entire
             // target ProcessGrant; titles, window IDs, and raw process IDs alone
             // are not sufficient evidence of ownership.
@@ -605,11 +618,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         self.teardown_started_ms = Some(now_ms);
         self.windows.clear();
         self.state = CaptureSessionState::RevokedTeardownPending;
-        match self
-            .backend
-            .begin_teardown()
-            .map_err(|error| CaptureError::Backend(error.to_string()))?
-        {
+        match self.backend.begin_teardown().map_err(CaptureError::from)? {
             BackendTeardownProgress::Complete => {
                 self.state = CaptureSessionState::RevokedTeardownComplete;
             }
@@ -650,7 +659,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         match self
             .backend
             .poll_teardown(elapsed_ms)
-            .map_err(|error| CaptureError::Backend(error.to_string()))?
+            .map_err(CaptureError::from)?
         {
             BackendTeardownProgress::Complete => {
                 self.state = CaptureSessionState::RevokedTeardownComplete;
@@ -718,7 +727,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         let artifact = self
             .backend
             .capture_display(&request)
-            .map_err(|error| CaptureError::Backend(error.to_string()))?;
+            .map_err(CaptureError::from)?;
         Ok(BroadDisplayCaptureResult {
             captured_at_ms: request.captured_at_ms,
             artifact,
@@ -929,6 +938,20 @@ mod tests {
             },
             accessibility_root: Some(format!("root-{id}")),
         }
+    }
+
+    /// Map a backend screen-locked failure to the distinct capture error so callers can
+    /// recognize that unlocking the screen may resolve it.
+    #[test]
+    fn a_locked_backend_error_reaches_capture_callers_as_screen_is_locked() {
+        assert_eq!(
+            CaptureError::from(BackendError::ScreenLocked),
+            CaptureError::ScreenIsLocked
+        );
+        assert_eq!(
+            CaptureError::from(BackendError::Capture("window no longer exists".into())),
+            CaptureError::Backend("window no longer exists".into())
+        );
     }
 
     #[test]
