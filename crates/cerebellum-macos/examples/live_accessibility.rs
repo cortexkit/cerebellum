@@ -28,8 +28,32 @@ fn main() {
     );
     println!("target pid: {pid}");
 
+    // Overridable so the probe can answer what a real application NEEDS rather
+    // than only whether the shipped default happens to suit it. A refusal at the
+    // default is not itself a measurement: the useful number is the budget at
+    // which the same read succeeds.
+    let options = cerebellum_macos::AxReadOptions {
+        timeout: std::env::var("CK_AX_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| cerebellum_macos::AxReadOptions::default().timeout),
+        max_depth: std::env::var("CK_AX_MAX_DEPTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| cerebellum_macos::AxReadOptions::default().max_depth),
+        max_elements: std::env::var("CK_AX_MAX_ELEMENTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| cerebellum_macos::AxReadOptions::default().max_elements),
+    };
+    println!(
+        "timeout: {:?}  max_depth: {}  max_elements: {}",
+        options.timeout, options.max_depth, options.max_elements
+    );
+
     let started = std::time::Instant::now();
-    match cerebellum_macos::read_accessibility_tree(pid, Default::default()) {
+    match cerebellum_macos::read_accessibility_tree(pid, options) {
         Ok(tree) => {
             let complete = tree.completeness == cerebellum_macos::AxTreeCompleteness::Complete;
             let mut elements = 0usize;

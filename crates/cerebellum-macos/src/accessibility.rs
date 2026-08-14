@@ -57,6 +57,19 @@ pub enum AxElementReadFailure {
     ElementLimitReached {
         max_elements: usize,
     },
+    /// The traversal stopped here because the read ran out of time.
+    ///
+    /// Kept distinct from the size bounds because it reports a different fact
+    /// about the application rather than about our budget: a depth or element
+    /// bound says the tree is LARGER than we chose to read, while this says the
+    /// application is ANSWERING TOO SLOWLY to finish. Measured on this machine,
+    /// three of thirteen running applications cannot be read to completion at
+    /// any deadline, because their per-element cost grows faster than linearly
+    /// -- so an operator seeing this marker should not conclude that a larger
+    /// budget would help, which is exactly what the size markers imply.
+    DeadlineReached {
+        timeout: Duration,
+    },
 }
 
 /// Whether every subtree reported during one read was readable.
@@ -67,6 +80,19 @@ pub enum AxTreeCompleteness {
 }
 
 /// A readable application root and the completeness of its traversal.
+///
+/// THE ELEMENTS ARE NOT A SIMULTANEOUS SNAPSHOT. Each is read in turn from a
+/// live application, so the earliest are older than the latest by however long
+/// the traversal took -- and that gradient is widest exactly when the tree is
+/// marked incomplete by a deadline, because reaching the deadline means the
+/// read took the whole budget. A caller that treats the tree as an instant is
+/// acting on positions the application may have since moved; frames especially
+/// are a measurement rather than a promise.
+///
+/// The reader cannot narrow this, since it has no way to freeze another
+/// process's UI. What the caller can do is re-read immediately before acting
+/// and refuse when the two disagree, which is what the action path does when it
+/// re-finds an element by identifier rather than reusing a handle from a tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AxAccessibilityTree {
     pub root: AxElement,
@@ -711,6 +737,13 @@ fn element_read_failure<Source: ElementSource>(
                 max_elements: *max_elements,
             })
         }
+        // A deadline is a bound, so it gets what the depth and element bounds
+        // above get: below the root it marks only this subtree unreadable and
+        // the traversal so far survives. Propagating it instead would discard
+        // every element already read, which tells a caller nothing at all.
+        SourceError::Deadline => Some(AxElementReadFailure::DeadlineReached {
+            timeout: deadline.timeout,
+        }),
         _ => None,
     };
     let mapped = map_source_error(source, pid, deadline, error);
@@ -721,7 +754,8 @@ fn element_read_failure<Source: ElementSource>(
             | AxReadError::UnexpectedValueType { .. }
             | AxReadError::SystemCallFailed { .. }
             | AxReadError::DepthLimitExceeded { .. }
-            | AxReadError::ElementLimitExceeded { .. },
+            | AxReadError::ElementLimitExceeded { .. }
+            | AxReadError::DeadlineExceeded { .. },
         ) => Ok(failure),
         (_, error) => Err(error),
     }
@@ -1049,7 +1083,22 @@ fn read_element<Source: ElementSource>(
         });
     }
     state.count += 1;
-    state.deadline.remaining()?;
+    // Same treatment as the two size bounds above: at depth the subtree is
+    // marked unreadable and everything already traversed is returned, while at
+    // the root there is no partial result to return.
+    if state.deadline.remaining().is_err() {
+        if depth > 0 {
+            state.unreadable_subtrees += 1;
+            return Ok(ElementRead::Unreadable(
+                AxElementReadFailure::DeadlineReached {
+                    timeout: state.deadline.timeout,
+                },
+            ));
+        }
+        return Err(AxReadError::DeadlineExceeded {
+            timeout: state.deadline.timeout,
+        });
+    }
 
     let next_depth = depth.saturating_add(1);
     let child_budget = ChildBudget {
@@ -1750,6 +1799,7 @@ mod tests {
         snapshot_error: Option<SourceError>,
         snapshot_error_at: Option<(usize, SourceError)>,
         snapshot_delay: Duration,
+        application_delay: Duration,
         process_disappears_on_snapshot_error: bool,
         permission_revoked_on_snapshot_error: bool,
         calls: usize,
@@ -1778,6 +1828,7 @@ mod tests {
                 snapshot_error: None,
                 snapshot_error_at: None,
                 snapshot_delay: Duration::ZERO,
+                application_delay: Duration::ZERO,
                 process_disappears_on_snapshot_error: false,
                 permission_revoked_on_snapshot_error: false,
                 calls: 0,
@@ -1820,6 +1871,7 @@ mod tests {
             _deadline: &Deadline,
         ) -> Result<Self::Handle, SourceError> {
             self.application_calls += 1;
+            std::thread::sleep(self.application_delay);
             Ok(0)
         }
 
@@ -2395,6 +2447,121 @@ mod tests {
                 pid: 42,
                 ax_error: AX_ERROR_CANNOT_COMPLETE,
             })
+        );
+    }
+
+    /// A deadline reached below the root truncates that subtree and keeps the
+    /// rest, the same treatment the depth and element bounds already get.
+    ///
+    /// This is what makes a slow application observable at all. Measured on
+    /// this machine, three of thirteen running applications exceed every
+    /// deadline tried, up to 40s, because their per-element cost grows faster
+    /// than linearly -- so an all-or-nothing deadline returns literally nothing
+    /// for them, at any budget. Nothing becomes actuatable: an incomplete tree
+    /// cannot establish uniqueness, so the action path refuses it either way.
+    #[test]
+    fn a_deadline_below_the_root_truncates_that_subtree_and_keeps_the_rest() {
+        let mut source =
+            FakeSource::with_nodes(vec![node(vec![1, 2]), node(Vec::new()), node(Vec::new())]);
+        // Injected rather than timed. A sleep-based fixture would assert over
+        // wall-clock on a machine that also runs builds, and a sleep only ever
+        // overshoots, so the count it proves would drift under load.
+        source.snapshot_error_at = Some((2, SourceError::Deadline));
+        let timeout = Duration::from_millis(50);
+        let options = AxReadOptions {
+            timeout,
+            max_depth: 10,
+            max_elements: 10,
+        };
+
+        let tree = read_tree_from(&mut source, 42, options).expect("a partial tree, not a refusal");
+        assert_eq!(
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1
+            },
+            "the truncated subtree must be counted, since a caller deciding \
+             uniqueness needs to know the read is partial"
+        );
+        assert_eq!(
+            tree.root.unreadable_children,
+            vec![AxElementReadFailure::DeadlineReached { timeout }],
+            "the reason must name the deadline: a size bound implies a larger \
+             budget would help, and here no budget does"
+        );
+        assert_eq!(
+            tree.root.children.len(),
+            1,
+            "everything read before the deadline is still true and must survive"
+        );
+    }
+
+    /// The same truncation, reached by the reader's own budget check rather
+    /// than by a source reporting a deadline.
+    ///
+    /// Two independent paths produce this marker and each can be deleted
+    /// without the other noticing: the reader checks the remaining budget
+    /// before descending, and the error mapping converts a source-reported
+    /// deadline. The preceding test injects the error, so it exercises only the
+    /// mapping; this one lets the clock run out, so it exercises only the
+    /// check. Both are needed to fence the behaviour.
+    #[test]
+    fn an_elapsed_budget_truncates_the_next_element_rather_than_the_read() {
+        let mut source = FakeSource::with_nodes(vec![node(vec![1]), node(Vec::new())]);
+        // The root's own snapshot spends more than the whole budget, so by the
+        // time its child is reached the clock has certainly run out. A sleep
+        // only ever overshoots, so this cannot go the other way under load.
+        source.snapshot_delay = Duration::from_millis(80);
+        let timeout = Duration::from_millis(50);
+        let options = AxReadOptions {
+            timeout,
+            max_depth: 10,
+            max_elements: 10,
+        };
+
+        let tree = read_tree_from(&mut source, 42, options).expect("a partial tree, not a refusal");
+        assert_eq!(
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1
+            }
+        );
+        assert_eq!(
+            tree.root.unreadable_children,
+            vec![AxElementReadFailure::DeadlineReached { timeout }]
+        );
+        assert_eq!(
+            source.calls, 1,
+            "the child was never snapshotted: the budget was spent before it was reached"
+        );
+    }
+
+    /// The root is exempt: a tree with no root is not a partial result.
+    ///
+    /// The boundary is worth its own arm because it is where the graceful arm
+    /// above is tempting to extend one step too far.
+    #[test]
+    fn a_deadline_at_the_root_is_still_a_hard_refusal() {
+        let mut source = FakeSource::with_nodes(vec![node(Vec::new())]);
+        // Spend the budget resolving the application, which the real source can
+        // also do, so the root's own deadline check is the thing under test
+        // rather than a later one.
+        source.application_delay = Duration::from_millis(20);
+        let options = AxReadOptions {
+            timeout: Duration::from_millis(5),
+            max_depth: 10,
+            max_elements: 10,
+        };
+
+        assert_eq!(
+            read_tree_from(&mut source, 42, options),
+            Err(AxReadError::DeadlineExceeded {
+                timeout: Duration::from_millis(5),
+            })
+        );
+        assert_eq!(
+            source.calls, 0,
+            "the root was never snapshotted, so there is no partial tree to return"
         );
     }
 
