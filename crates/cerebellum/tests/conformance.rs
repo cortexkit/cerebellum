@@ -823,7 +823,95 @@ impl Drop for LiveDaemonGuard {
     }
 }
 
+/// The browser surface survives the real daemon splice.
+///
+/// The sibling test above proves registration with NO browser configured, which
+/// is the state a machine is in before anyone points the module at a browser.
+/// It cannot see the browser surface at all, so every browser capability could
+/// have failed to register and it would still pass.
+///
+/// Asserted against the DAEMON's catalogue rather than the manifest builder's
+/// output: the difference is between advertising a surface and the daemon
+/// accepting one. A tool the daemon declined would be absent here while every
+/// local manifest test stayed green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured() {
+    let (mut daemon, connection) = start_live_daemon_with_browser(true).await;
+    let mut client = connect_client(&connection).await;
+
+    let catalog = wait_for_cerebellum_catalog(&mut client).await;
+    let ClientControlResponse::CatalogList { modules, .. } = catalog else {
+        panic!("expected catalog.list response");
+    };
+    let entry = modules
+        .iter()
+        .find(|module| module.module_id == MODULE_ID)
+        .expect("real subc catalog must contain cerebellum");
+
+    let Some(tools) = entry.roles.iter().find_map(|role| match role {
+        ProviderRole::ToolProvider { tools, .. } => Some(tools),
+        _ => None,
+    }) else {
+        panic!("cerebellum must register as a tool provider");
+    };
+    let registered: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+    for expected in [
+        "browser.launch",
+        "browser.status",
+        "browser.close",
+        "browser.navigate",
+        "browser.snapshot",
+        "browser.click",
+    ] {
+        assert!(
+            registered.contains(&expected),
+            "the daemon's catalogue is missing {expected}: {registered:?}"
+        );
+    }
+
+    // These two are intentionally absent rather than accidentally omitted.
+    // browser.type refuses any target it classifies as credential- or
+    // payment-bearing, and it has no dispatch route at all; browser.click_point
+    // has never been exercised over the wire. Registering either would advertise
+    // a capability that answers unknown_method, which is worse than not offering
+    // it, because the caller was told otherwise.
+    for withheld in ["browser.type", "browser.click_point"] {
+        assert!(
+            !registered.contains(&withheld),
+            "the daemon's catalogue offers {withheld}, which has no dispatch route: {registered:?}"
+        );
+    }
+
+    // The sibling test asserts this catalogue carries exactly one tool when no
+    // browser is configured. Asserting the count here too is what makes the two
+    // tests measure a DIFFERENCE rather than each measuring its own world.
+    assert_eq!(
+        registered.len(),
+        7,
+        "expected the six browser tools plus computer.wait: {registered:?}"
+    );
+
+    // Close the client before the daemon and module guards are dropped so the
+    // daemon can release the route deterministically.
+    drop(client);
+    daemon.stop();
+}
+
 async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
+    start_live_daemon_with_browser(false).await
+}
+
+/// Start the real daemon, optionally giving the spawned module a browser
+/// configuration in its isolated home.
+///
+/// The config decides which capabilities the module registers, so a test that
+/// wants the browser surface has to put one where the module reads it rather
+/// than where this process reads it -- the isolated HOME is what keeps this
+/// test independent of whatever is installed on the machine running it.
+async fn start_live_daemon_with_browser(
+    browser: bool,
+) -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock must be after the Unix epoch")
@@ -852,6 +940,31 @@ async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo
         .stderr(std::process::Stdio::null())
         .status()
         .await;
+
+    if browser {
+        let config_dir = home.join(".config").join("cortexkit");
+        fs::create_dir_all(&config_dir).expect("create isolated module config directory");
+        // The executable need not exist: the parser requires an absolute path
+        // and defers existence to launch time, and this test is about what the
+        // module REGISTERS rather than whether a browser starts. Pointing at a
+        // real Chrome would make the test depend on the machine having one.
+        fs::write(
+            config_dir.join("cerebellum.jsonc"),
+            serde_json::to_vec(&json!({
+                "browser": {
+                    "executable_path": "/nonexistent/Test Browser",
+                    "expected_identity": "test.browser",
+                    "launch_handshake_deadline_ms": 10_000,
+                    "termination_grace_period_ms": 5_000,
+                    "browser_idle_timeout_ms": 60_000,
+                    "browser_exit_observation_deadline_ms": 5_000,
+                    "navigation_settle_deadline_ms": 10_000
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write isolated browser configuration");
+    }
 
     let daemon_config_path = directory.join("subc.jsonc");
     fs::write(
