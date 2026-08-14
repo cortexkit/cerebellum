@@ -82,7 +82,22 @@ fi
 # fact that signing happened. A transitioned binary's designated requirement
 # names its identifier and a certificate; an ad-hoc one names a cdhash, which
 # is what dies on the next rebuild.
-requirement="$(codesign -d -r- "$STAGE/$DEPLOYED_NAME" 2>&1 | sed -n 's/^designated => //p')"
+# codesign prints the requirement as `# designated => ...` on some paths and
+# `designated => ...` on others, so both prefixes are stripped. Getting this
+# wrong yields an EMPTY string, which falls to the refusing branch below and
+# looks like a working gate while actually having read nothing -- a gate that
+# refuses for the wrong reason passes its own test and fails the next one.
+requirement="$(codesign -d -r- "$STAGE/$DEPLOYED_NAME" 2>&1 |
+  sed -n -e 's/^# designated => //p' -e 's/^designated => //p')"
+if [ -z "$requirement" ]; then
+  echo >&2
+  echo "REFUSING TO STAGE: could not read the designated requirement." >&2
+  echo "Not a signature problem: codesign printed something this script does" >&2
+  echo "not parse, so the identity check below would refuse without reading." >&2
+  codesign -d -r- "$STAGE/$DEPLOYED_NAME" 2>&1 | head -5 >&2
+  rm -rf "$STAGE"
+  exit 1
+fi
 case "$requirement" in
   *"identifier \"$DEPLOYED_NAME\""*"certificate"*) ;;
   *)
