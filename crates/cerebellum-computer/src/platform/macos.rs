@@ -108,6 +108,8 @@ impl StartupCapabilityProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedAccessibilityElement {
     identifier: Option<String>,
+    role: Option<String>,
+    title: Option<String>,
     actions: Vec<String>,
     children: Vec<CachedAccessibilityElement>,
 }
@@ -121,6 +123,9 @@ struct CachedAccessibilityTree {
 
 const INCOMPLETE_TREE_UNIQUENESS: &str =
     "element uniqueness cannot be established from an incomplete accessibility tree";
+const AMBIGUOUS_ELEMENT_NAME: &str =
+    "more than one element matches the supplied accessibility name";
+const UNUSABLE_ELEMENT_NAME: &str = "unusable accessibility element name";
 
 #[derive(Debug, Clone)]
 pub struct MacOs26PlatformDriver {
@@ -184,6 +189,33 @@ fn dispatch_result_for_accepted_action(
             effect_status: EffectStatus::EffectIndeterminate,
         },
     }
+}
+
+#[cfg(target_os = "macos")]
+impl From<cerebellum_macos::AxElementName> for AccessibilityElementName {
+    fn from(name: cerebellum_macos::AxElementName) -> Self {
+        match name {
+            cerebellum_macos::AxElementName::Identifier(identifier) => Self::Identifier(identifier),
+            cerebellum_macos::AxElementName::RoleAndTitle { role, title } => {
+                Self::RoleAndTitle { role, title }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ax_element_name(
+    name: &AccessibilityElementName,
+) -> Result<cerebellum_macos::AxElementName, DriverError> {
+    match name {
+        AccessibilityElementName::Identifier(identifier) => {
+            cerebellum_macos::AxElementName::identifier(identifier)
+        }
+        AccessibilityElementName::RoleAndTitle { role, title } => {
+            cerebellum_macos::AxElementName::role_and_title(role, title)
+        }
+    }
+    .map_err(|_| DriverError::InvalidRequest(UNUSABLE_ELEMENT_NAME))
 }
 
 /// Find an element by exact identifier in a freshly read tree.
@@ -346,22 +378,43 @@ fn map_ax_read_error(error: cerebellum_macos::AxReadError) -> DriverError {
 fn cache_ax_element(element: cerebellum_macos::AxElement) -> CachedAccessibilityElement {
     CachedAccessibilityElement {
         identifier: element.identifier,
+        role: element.role,
+        title: element.title,
         actions: element.actions,
         children: element.children.into_iter().map(cache_ax_element).collect(),
     }
 }
 
+fn cached_element_matches(
+    element: &CachedAccessibilityElement,
+    name: &AccessibilityElementName,
+) -> bool {
+    match name {
+        AccessibilityElementName::Identifier(identifier) => {
+            element.identifier.as_deref() == Some(identifier.as_str())
+        }
+        AccessibilityElementName::RoleAndTitle { role, title } => {
+            element.role.as_deref() == Some(role.as_str())
+                && element.title.as_deref().unwrap_or_default() == title
+        }
+    }
+}
+
 fn find_cached_element<'a>(
     element: &'a CachedAccessibilityElement,
-    identifier: &str,
-) -> Option<&'a CachedAccessibilityElement> {
-    if element.identifier.as_deref() == Some(identifier) {
-        return Some(element);
+    name: &AccessibilityElementName,
+    found: &mut Option<&'a CachedAccessibilityElement>,
+    match_count: &mut usize,
+) {
+    if cached_element_matches(element, name) {
+        *match_count += 1;
+        if found.is_none() {
+            *found = Some(element);
+        }
     }
-    element
-        .children
-        .iter()
-        .find_map(|child| find_cached_element(child, identifier))
+    for child in &element.children {
+        find_cached_element(child, name, found, match_count);
+    }
 }
 
 fn resolve_cached_element<'a>(
@@ -373,7 +426,35 @@ fn resolve_cached_element<'a>(
     if tree.unreadable_subtrees > 0 {
         return Err(DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS));
     }
-    find_cached_element(&tree.tree, &request.element_identifier).ok_or(DriverError::ElementNotFound)
+    if !request.element_name.is_usable() {
+        return Err(DriverError::InvalidRequest(UNUSABLE_ELEMENT_NAME));
+    }
+
+    let mut found = None;
+    let mut match_count = 0;
+    find_cached_element(
+        &tree.tree,
+        &request.element_name,
+        &mut found,
+        &mut match_count,
+    );
+    match match_count {
+        0 => Err(DriverError::ElementNotFound),
+        1 => Ok(found.expect("one counted match stores one element")),
+        _ => Err(DriverError::InvalidRequest(AMBIGUOUS_ELEMENT_NAME)),
+    }
+}
+
+fn resolution_from_cached_tree(
+    tree: &CachedAccessibilityTree,
+    request: &ElementResolutionRequest,
+) -> Result<ElementResolutionResult, DriverError> {
+    let element = resolve_cached_element(tree, request)?;
+    Ok(ElementResolutionResult {
+        element_name: request.element_name.clone(),
+        owning_process: tree.target.clone(),
+        semantic_actions: element.actions.clone(),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -656,14 +737,10 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 return Err(DriverError::ElementNotFound);
             };
             verify_cached_tree_owner(&cached.target)?;
-            let element = resolve_cached_element(cached, &request)?;
-            Ok(ElementResolutionResult {
-                element_identifier: request.element_identifier,
-                // Cloning occurs only after the kernel generation check above;
-                // otherwise a reused PID could be reported as the old grant.
-                owning_process: cached.target.clone(),
-                semantic_actions: element.actions.clone(),
-            })
+            // Resolution clones the owning grant only after the kernel
+            // generation check above; otherwise a reused PID could be reported
+            // as the old grant.
+            resolution_from_cached_tree(cached, &request)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -696,9 +773,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             let action = cerebellum_macos::AxAction::from_name(&request.action)
                 .ok_or(DriverError::InvalidRequest("unknown accessibility action"))?;
 
-            let element_name =
-                cerebellum_macos::AxElementName::identifier(&request.element.element_identifier)
-                    .map_err(|_| DriverError::InvalidRequest("unusable element identifier"))?;
+            let element_name = ax_element_name(&request.element.element_name)?;
 
             let outcome = cerebellum_macos::request_accessibility_action(
                 request.element.owning_process.pid,
@@ -1501,12 +1576,46 @@ mod cached_element_tests {
             },
             tree: CachedAccessibilityElement {
                 identifier: Some("root-actual-id".to_string()),
+                role: Some("AXApplication".to_string()),
+                title: Some("Reader".to_string()),
                 actions: Vec::new(),
-                children: vec![CachedAccessibilityElement {
-                    identifier: Some("child-actual-id".to_string()),
-                    actions: vec!["AXPress".to_string()],
-                    children: Vec::new(),
-                }],
+                children: vec![
+                    CachedAccessibilityElement {
+                        identifier: Some("identifier-only".to_string()),
+                        role: Some("AXButton".to_string()),
+                        title: Some("Shared".to_string()),
+                        actions: vec!["AXPress".to_string()],
+                        children: Vec::new(),
+                    },
+                    CachedAccessibilityElement {
+                        identifier: None,
+                        role: Some("AXButton".to_string()),
+                        title: Some("Save".to_string()),
+                        actions: vec!["AXPress".to_string()],
+                        children: Vec::new(),
+                    },
+                    CachedAccessibilityElement {
+                        identifier: Some("shared-title-peer".to_string()),
+                        role: Some("AXButton".to_string()),
+                        title: Some("Shared".to_string()),
+                        actions: vec!["AXPress".to_string()],
+                        children: Vec::new(),
+                    },
+                    CachedAccessibilityElement {
+                        identifier: Some("duplicate-identifier".to_string()),
+                        role: Some("AXButton".to_string()),
+                        title: Some("First Duplicate".to_string()),
+                        actions: vec!["AXPress".to_string()],
+                        children: Vec::new(),
+                    },
+                    CachedAccessibilityElement {
+                        identifier: Some("duplicate-identifier".to_string()),
+                        role: Some("AXButton".to_string()),
+                        title: Some("Second Duplicate".to_string()),
+                        actions: vec!["AXPress".to_string()],
+                        children: Vec::new(),
+                    },
+                ],
             },
             unreadable_subtrees: 0,
         }
@@ -1516,7 +1625,7 @@ mod cached_element_tests {
     fn missing_element_is_distinct_from_an_unreadable_tree() {
         let request = ElementResolutionRequest {
             root_identifier: "accessibility-root:41:generation-a".to_string(),
-            element_identifier: "missing".to_string(),
+            element_name: AccessibilityElementName::Identifier("missing".to_string()),
         };
 
         assert_eq!(
@@ -1529,7 +1638,7 @@ mod cached_element_tests {
     fn an_incomplete_cached_tree_cannot_establish_element_uniqueness() {
         let request = ElementResolutionRequest {
             root_identifier: "accessibility-root:41:generation-a".to_string(),
-            element_identifier: "child-actual-id".to_string(),
+            element_name: AccessibilityElementName::Identifier("identifier-only".to_string()),
         };
         let mut tree = cached_tree();
         tree.unreadable_subtrees = 1;
@@ -1544,12 +1653,108 @@ mod cached_element_tests {
     fn cached_element_preserves_advertised_action_names() {
         let request = ElementResolutionRequest {
             root_identifier: "accessibility-root:41:generation-a".to_string(),
-            element_identifier: "child-actual-id".to_string(),
+            element_name: AccessibilityElementName::Identifier("identifier-only".to_string()),
         };
 
         let tree = cached_tree();
         let element = resolve_cached_element(&tree, &request)
             .expect("the constructed cache contains the named child");
         assert_eq!(element.actions, vec!["AXPress"]);
+    }
+
+    #[test]
+    fn resolution_reports_the_exact_key_that_established_uniqueness() {
+        let names = [
+            AccessibilityElementName::Identifier("identifier-only".to_string()),
+            AccessibilityElementName::RoleAndTitle {
+                role: "AXButton".to_string(),
+                title: "Save".to_string(),
+            },
+        ];
+        let tree = cached_tree();
+
+        for name in names {
+            let request = ElementResolutionRequest {
+                root_identifier: "accessibility-root:41:generation-a".to_string(),
+                element_name: name.clone(),
+            };
+            let resolution = resolution_from_cached_tree(&tree, &request)
+                .expect("the fixture makes each supplied key unique");
+            assert_eq!(resolution.element_name, name);
+            assert_eq!(resolution.semantic_actions, vec!["AXPress"]);
+        }
+    }
+
+    #[test]
+    fn resolution_never_falls_back_between_key_forms() {
+        let requests = [
+            ElementResolutionRequest {
+                root_identifier: "accessibility-root:41:generation-a".to_string(),
+                element_name: AccessibilityElementName::Identifier("Save".to_string()),
+            },
+            ElementResolutionRequest {
+                root_identifier: "accessibility-root:41:generation-a".to_string(),
+                element_name: AccessibilityElementName::RoleAndTitle {
+                    role: "AXButton".to_string(),
+                    title: "identifier-only".to_string(),
+                },
+            },
+        ];
+        let tree = cached_tree();
+
+        for request in requests {
+            assert_eq!(
+                resolution_from_cached_tree(&tree, &request),
+                Err(DriverError::ElementNotFound)
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_role_and_title_is_refused_instead_of_resolving_the_first_match() {
+        let request = ElementResolutionRequest {
+            root_identifier: "accessibility-root:41:generation-a".to_string(),
+            element_name: AccessibilityElementName::RoleAndTitle {
+                role: "AXButton".to_string(),
+                title: "Shared".to_string(),
+            },
+        };
+
+        assert_eq!(
+            resolution_from_cached_tree(&cached_tree(), &request),
+            Err(DriverError::InvalidRequest(AMBIGUOUS_ELEMENT_NAME))
+        );
+    }
+
+    #[test]
+    fn a_shared_identifier_is_refused_instead_of_resolving_the_first_match() {
+        let request = ElementResolutionRequest {
+            root_identifier: "accessibility-root:41:generation-a".to_string(),
+            element_name: AccessibilityElementName::Identifier("duplicate-identifier".to_string()),
+        };
+
+        assert_eq!(
+            resolution_from_cached_tree(&cached_tree(), &request),
+            Err(DriverError::InvalidRequest(AMBIGUOUS_ELEMENT_NAME))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dispatch_preserves_a_role_and_title_resolution_key() {
+        let name = AccessibilityElementName::RoleAndTitle {
+            role: "AXButton".to_string(),
+            title: "Save".to_string(),
+        };
+
+        let ax_name = ax_element_name(&name).expect("the fixture name is usable");
+        assert_eq!(
+            ax_name,
+            cerebellum_macos::AxElementName::RoleAndTitle {
+                role: "AXButton".to_string(),
+                title: "Save".to_string(),
+            }
+        );
+        assert_eq!(AccessibilityElementName::from(ax_name), name);
     }
 }

@@ -6,7 +6,7 @@
 //! separate makes it impossible for an old screenshot, mark, window identifier,
 //! or accessibility reference to silently become a dispatch authorization.
 
-use crate::platform::ProcessGrant;
+use crate::platform::{AccessibilityElementName, ProcessGrant};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -254,7 +254,7 @@ impl AccessibilityTreeSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessibilityElement {
     pub root_identifier: String,
-    pub element_identifier: String,
+    pub element_name: AccessibilityElementName,
     pub target_process_generation: String,
     pub resolved_at_ms: u64,
     pub geometry: Option<ElementRect>,
@@ -366,7 +366,7 @@ impl FallbackGrounding {
 pub enum GroundingLocator {
     AccessibilityElement {
         root_identifier: String,
-        element_identifier: String,
+        element_name: AccessibilityElementName,
         semantic_action: String,
     },
     Coordinate,
@@ -386,11 +386,25 @@ impl GroundingRequest {
         element_identifier: impl Into<String>,
         semantic_action: impl Into<String>,
     ) -> Self {
+        Self::accessibility_element_named(
+            target,
+            root_identifier,
+            AccessibilityElementName::identifier(element_identifier),
+            semantic_action,
+        )
+    }
+
+    pub fn accessibility_element_named(
+        target: ProcessGrant,
+        root_identifier: impl Into<String>,
+        element_name: AccessibilityElementName,
+        semantic_action: impl Into<String>,
+    ) -> Self {
         Self {
             target,
             locator: GroundingLocator::AccessibilityElement {
                 root_identifier: root_identifier.into(),
-                element_identifier: element_identifier.into(),
+                element_name,
                 semantic_action: semantic_action.into(),
             },
             fallback: None,
@@ -670,7 +684,7 @@ pub trait GroundingDriver {
         &mut self,
         target: &ProcessGrant,
         root_identifier: &str,
-        element_identifier: &str,
+        element_name: &AccessibilityElementName,
     ) -> Result<AccessibilityElement, GroundingDriverError>;
 
     fn hit_test_center(
@@ -888,7 +902,7 @@ impl GroundingResolver {
 
         let GroundingLocator::AccessibilityElement {
             root_identifier,
-            element_identifier,
+            element_name,
             semantic_action,
         } = &request.locator
         else {
@@ -907,15 +921,13 @@ impl GroundingResolver {
                 .fallback_if_authorized(driver, request, now_ms, tree, handshake, degeneracy);
         }
 
-        if root_identifier.is_empty() || element_identifier.is_empty() {
+        if root_identifier.is_empty() || !element_name.is_usable() {
             return Err(GroundingFailure::StaleElement);
         }
         let element = driver
-            .resolve_accessibility_element(&request.target, root_identifier, element_identifier)
+            .resolve_accessibility_element(&request.target, root_identifier, element_name)
             .map_err(|_| GroundingFailure::StaleElement)?;
-        if element.element_identifier != *element_identifier
-            || element.root_identifier != *root_identifier
-        {
+        if element.element_name != *element_name || element.root_identifier != *root_identifier {
             return Err(GroundingFailure::StaleElement);
         }
         if element.target_process_generation != request.target.process_generation_evidence {
@@ -1358,7 +1370,7 @@ impl Default for RecordingGroundingDriver {
             tree: Ok(AccessibilityTreeSnapshot::default()),
             element: Ok(AccessibilityElement {
                 root_identifier: "root".to_string(),
-                element_identifier: "element".to_string(),
+                element_name: AccessibilityElementName::identifier("element"),
                 target_process_generation: "generation".to_string(),
                 resolved_at_ms: 0,
                 geometry: Some(ElementRect::new(10.0, 20.0, 20.0, 10.0)),
@@ -1414,7 +1426,7 @@ impl GroundingDriver for RecordingGroundingDriver {
         &mut self,
         _target: &ProcessGrant,
         _root_identifier: &str,
-        _element_identifier: &str,
+        _element_name: &AccessibilityElementName,
     ) -> Result<AccessibilityElement, GroundingDriverError> {
         self.calls.push(GroundingCall::ResolveElement);
         self.element.clone()

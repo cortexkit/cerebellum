@@ -333,15 +333,45 @@ pub struct AccessibilityTreeResult {
     pub degenerate_reason: Option<String>,
 }
 
+/// The exact accessibility key under which an element must be unique.
+///
+/// Each form is matched independently. Naming one form never authorizes a
+/// resolver or dispatcher to try the other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AccessibilityElementName {
+    Identifier(String),
+    RoleAndTitle { role: String, title: String },
+}
+
+impl AccessibilityElementName {
+    pub fn identifier(identifier: impl Into<String>) -> Self {
+        Self::Identifier(identifier.into())
+    }
+
+    pub fn role_and_title(role: impl Into<String>, title: impl Into<String>) -> Self {
+        Self::RoleAndTitle {
+            role: role.into(),
+            title: title.into(),
+        }
+    }
+
+    pub fn is_usable(&self) -> bool {
+        match self {
+            Self::Identifier(identifier) => !identifier.is_empty(),
+            Self::RoleAndTitle { role, .. } => !role.is_empty(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementResolutionRequest {
     pub root_identifier: String,
-    pub element_identifier: String,
+    pub element_name: AccessibilityElementName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementResolutionResult {
-    pub element_identifier: String,
+    pub element_name: AccessibilityElementName,
     pub owning_process: ProcessGrant,
     pub semantic_actions: Vec<String>,
 }

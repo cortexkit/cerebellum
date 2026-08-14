@@ -1,8 +1,8 @@
 use cerebellum_computer::grounding::{
     AccessibilityTreeSnapshot, ContainmentRung, GroundingCall, GroundingFailure, GroundingPolicy,
-    GroundingRequest, GroundingResolver, RecordingGroundingDriver,
+    GroundingRequest, GroundingResolver, GroundingTarget, RecordingGroundingDriver,
 };
-use cerebellum_computer::platform::ProcessGrant;
+use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
 
 fn target() -> ProcessGrant {
     ProcessGrant {
@@ -108,6 +108,28 @@ fn fresh_element_revalidation_reaches_dispatch_seam() {
     let result = resolver.revalidate_before_dispatch(&mut driver, &decision, 2_000, "gen-1");
     assert!(result.is_ok());
     assert!(driver.calls.contains(&GroundingCall::RevalidateElement));
+}
+
+#[test]
+fn role_and_title_resolution_reaches_the_semantic_grounding_target_unchanged() {
+    let mut driver = element_driver();
+    let name = AccessibilityElementName::role_and_title("AXButton", "Save");
+    driver
+        .element
+        .as_mut()
+        .expect("the recording driver has a default element")
+        .element_name = name.clone();
+    let request =
+        GroundingRequest::accessibility_element_named(target(), "root", name.clone(), "press");
+
+    let decision = GroundingResolver::new(GroundingPolicy::default())
+        .ground(&mut driver, &request, 0)
+        .expect("the role and title uniquely identify the fixture element");
+
+    let GroundingTarget::SemanticElement(element) = decision.target else {
+        panic!("a semantic action was not grounded semantically");
+    };
+    assert_eq!(element.element_name, name);
 }
 
 #[test]
