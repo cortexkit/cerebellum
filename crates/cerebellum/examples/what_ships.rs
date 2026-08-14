@@ -7,10 +7,11 @@
 //! complete while that manifest stays empty.
 
 fn main() {
-    // The browser half first, because its reachable set is the one that has
-    // been wrong twice: a capability can be implemented, proved against a real
-    // browser, and still answer unknown_method because one predicate does not
-    // name it. `configured` is what a host with a browser configured sees.
+    // The browser half first, because its reachable set is the one most likely
+    // to be misjudged: a capability can be implemented and proved against a
+    // real browser, yet still answer unknown_method because the dispatch
+    // predicate does not name it. `configured` is what a host with a browser
+    // configured sees; the other column is what a host without one sees.
     println!("browser tools (configured / unconfigured):");
     let configured = cerebellum::browser_wire_surface(true);
     let unconfigured = cerebellum::browser_wire_surface(false);

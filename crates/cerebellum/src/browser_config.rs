@@ -33,6 +33,7 @@ pub enum BrowserConfigReason {
     OutOfRange,
     PathNotAbsolute,
     ExpectedIdentityRequired,
+    BelowSettlementQuietWindow { quiet_ms: u64 },
 }
 
 impl std::fmt::Display for BrowserConfigError {
@@ -60,6 +61,13 @@ impl std::fmt::Display for BrowserConfigError {
             BrowserConfigReason::ExpectedIdentityRequired => write!(
                 f,
                 "browser.expected_identity: required when browser.executable_path is set"
+            ),
+            BrowserConfigReason::BelowSettlementQuietWindow { quiet_ms } => write!(
+                f,
+                "{}: must exceed {quiet_ms}ms, the network-quiet window a navigation \
+                 must observe before it can settle; at or below it, wait=\"settle\" \
+                 could never succeed on any page",
+                self.field
             ),
         }
     }
@@ -165,11 +173,32 @@ fn parse_browser(value: &Value) -> Result<BrowserConfig, BrowserConfigError> {
             object,
             "browser_exit_observation_deadline_ms",
         )?,
-        navigation_settle_deadline_ms: required_positive_ms(
-            object,
-            "navigation_settle_deadline_ms",
-        )?,
+        navigation_settle_deadline_ms: settle_deadline_ms(object)?,
     })
+}
+
+/// The settle deadline, refused when it cannot reach the quiet window.
+///
+/// Settlement needs `QUIET_MS` of network silence after load, and the drive
+/// loop runs only while the clock is before the deadline. A deadline that does
+/// not exceed the quiet window therefore makes `wait: "settle"` unable to
+/// succeed on any page -- not slow, IMPOSSIBLE, and silently so: every
+/// navigation returns not_settled with nothing to say why.
+///
+/// Refused here rather than documented, because a validator that accepts a
+/// value which disables a capability leaves the next person to discover it the
+/// hard way.
+fn settle_deadline_ms(object: &Map<String, Value>) -> Result<u64, BrowserConfigError> {
+    let value = required_positive_ms(object, "navigation_settle_deadline_ms")?;
+    if value <= crate::browser::QUIET_MS {
+        return Err(BrowserConfigError {
+            field: "browser.navigation_settle_deadline_ms".to_string(),
+            reason: BrowserConfigReason::BelowSettlementQuietWindow {
+                quiet_ms: crate::browser::QUIET_MS,
+            },
+        });
+    }
+    Ok(value)
 }
 
 fn required_positive_ms(
@@ -305,5 +334,51 @@ mod tests {
         );
         value["browser"]["expected_identity"] = serde_json::json!("com.example.Chrome");
         assert!(parse_browser_config(&value.to_string()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod settle_deadline_tests {
+    use super::*;
+
+    /// A settle deadline at or below the quiet window cannot ever settle.
+    ///
+    /// Settlement requires `QUIET_MS` of network silence AFTER load, and the
+    /// drive loop runs only while the clock is before the deadline. So a
+    /// deadline that does not exceed the quiet window leaves `wait: "settle"`
+    /// structurally unable to succeed: every navigation returns not_settled, on
+    /// every page, forever, with nothing in the logs to say why.
+    ///
+    /// Rejected at parse rather than documented, because a validator that
+    /// accepts a value which disables a capability is a footgun the next person
+    /// steps on for the same reason this one existed.
+    #[test]
+    fn a_settle_deadline_that_cannot_reach_the_quiet_window_is_refused() {
+        let with = |ms: u64| {
+            format!(
+                r#"{{"browser":{{
+                    "launch_handshake_deadline_ms": 10000,
+                    "termination_grace_period_ms": 5000,
+                    "browser_idle_timeout_ms": 60000,
+                    "browser_exit_observation_deadline_ms": 5000,
+                    "navigation_settle_deadline_ms": {ms}
+                }}}}"#
+            )
+        };
+
+        let quiet = crate::browser::QUIET_MS;
+
+        let refused = parse_browser_config(&with(quiet)).expect_err("equal to the quiet window");
+        assert_eq!(refused.field, "browser.navigation_settle_deadline_ms");
+
+        parse_browser_config(&with(quiet - 1)).expect_err("below the quiet window");
+        parse_browser_config(&with(1)).expect_err("far below the quiet window");
+
+        // Above it is accepted: the check must not refuse everything, which
+        // would pass this test while making the browser unconfigurable.
+        let accepted = parse_browser_config(&with(quiet + 1))
+            .expect("above the quiet window parses")
+            .expect("a browser section is present");
+        assert_eq!(accepted.navigation_settle_deadline_ms, quiet + 1);
     }
 }
