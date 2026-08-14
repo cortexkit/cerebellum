@@ -240,7 +240,7 @@ fn background_attendance() -> AttendanceContext {
 
 fn semantic_request(row: FrozenDispatchRow) -> DispatchRequest {
     let element = ElementResolutionResult {
-        element_identifier: "element-1".into(),
+        element_name: AccessibilityElementName::Identifier("element-1".into()),
         owning_process: target(),
         semantic_actions: vec!["press".into()],
     };
@@ -736,7 +736,7 @@ fn semantic_unavailability_uses_only_the_selected_background_primitive() {
         ..RecordingDriver::default()
     };
     let element = ElementResolutionResult {
-        element_identifier: "element-1".into(),
+        element_name: AccessibilityElementName::Identifier("element-1".into()),
         owning_process: target(),
         semantic_actions: vec!["press".into()],
     };
@@ -863,7 +863,7 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
     request = request
         .with_semantic(
             ElementResolutionResult {
-                element_identifier: "element-1".into(),
+                element_name: AccessibilityElementName::Identifier("element-1".into()),
                 owning_process: foreign,
                 semantic_actions: vec!["press".into()],
             },
@@ -904,7 +904,7 @@ fn an_unadvertised_action_does_not_take_the_semantic_path() {
     request = request
         .with_semantic(
             ElementResolutionResult {
-                element_identifier: "element-1".into(),
+                element_name: AccessibilityElementName::Identifier("element-1".into()),
                 owning_process: target(),
                 // The element offers only "press".
                 semantic_actions: vec!["press".into()],

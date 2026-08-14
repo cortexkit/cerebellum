@@ -3,7 +3,7 @@ use cerebellum_computer::grounding::{
     FallbackGrounding, GroundingFailure, GroundingRequest, GroundingResolver, PixelEvidence,
     RecordingGroundingDriver,
 };
-use cerebellum_computer::platform::ProcessGrant;
+use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
 
 fn target() -> ProcessGrant {
     ProcessGrant {
@@ -34,7 +34,7 @@ fn failed_center_hit_test_blocks_ax_coordinate_and_uses_authorized_fallback() {
         }),
         element: Ok(AccessibilityElement {
             root_identifier: "root".to_string(),
-            element_identifier: "element".to_string(),
+            element_name: AccessibilityElementName::identifier("element"),
             target_process_generation: "gen-1".to_string(),
             resolved_at_ms: 0,
             geometry: Some(ElementRect::new(10.0, 10.0, 20.0, 20.0)),
@@ -73,7 +73,7 @@ fn failed_center_hit_test_does_not_invalidate_semantic_ax_action() {
         }),
         element: Ok(AccessibilityElement {
             root_identifier: "root".to_string(),
-            element_identifier: "element".to_string(),
+            element_name: AccessibilityElementName::identifier("element"),
             target_process_generation: "gen-1".to_string(),
             resolved_at_ms: 0,
             geometry: Some(ElementRect::new(10.0, 10.0, 20.0, 20.0)),
@@ -106,7 +106,7 @@ fn invalidated_ax_coordinate_is_stale_grounding_not_a_fallback_authorization() {
         }),
         element: Ok(AccessibilityElement {
             root_identifier: "root".to_string(),
-            element_identifier: "element".to_string(),
+            element_name: AccessibilityElementName::identifier("element"),
             target_process_generation: "gen-1".to_string(),
             resolved_at_ms: 0,
             geometry: Some(ElementRect::new(10.0, 10.0, 20.0, 20.0)),
