@@ -41,7 +41,20 @@ export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
 # changes. That matters more than it sounds: a gate that churns on rewording
 # trains whoever maintains this file to rebind without reading, which turns an
 # attestation into a version string someone bumps.
-export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v1"
+# v2 rather than v1, and the difference is operational rather than editorial.
+# v1 permitted ad-hoc signing, under which TCC pins a grant to the binary's
+# CDHASH -- so every rebuild silently orphaned Screen Recording and
+# Accessibility while System Settings kept showing the toggle on, because the
+# pane displays the record rather than whether it still applies. This module
+# consumes both permissions, so it is precisely the consumer the note in the
+# fleet spec means when it says a consumer requiring rebuild-stable grants
+# binds v2 specifically.
+#
+# Binding v2 is a claim about how the binary is SIGNED, which a build cannot
+# verify about itself. scripts/stage.sh is what makes the claim true: it signs
+# with the fleet identity under a pinned identifier, and checks the designated
+# requirement names that identifier and a certificate rather than a cdhash.
+export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 
 # ---------------------------------------------------------------------------
 # Not yet minted

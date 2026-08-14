@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Build, sign, and stage ck-cerebellum for placement.
+#
+# WHAT THIS EXISTS TO PREVENT, and both have happened in this fleet:
+#
+#   A STALE ARTIFACT PUBLISHED AS A FRESH ONE. A build step can be skipped,
+#   filtered by a pipe, or silently reuse a previous target directory, and the
+#   bytes in the staging directory are what actually gets placed. So the gate
+#   asks the ARTIFACT what it is rather than trusting that the build ran. A
+#   build that did not happen cannot pass, however its output was displayed.
+#
+#   AD-HOC SIGNING ORPHANING TCC GRANTS. An ad-hoc signature has no stable
+#   designated requirement, so macOS pins the grant to the binary's cdhash and
+#   every rebuild silently revokes it -- while System Settings keeps showing
+#   the toggle on, because the pane displays the record rather than whether it
+#   still applies. This module needs Screen Recording and Accessibility, so it
+#   is exactly the consumer signing-topology v2 was written for.
+#
+# The dangerous command is ABSENT here rather than present with the right flag:
+# there is no `codesign --sign -` anywhere in this file, and placement is a
+# plain copy, because a pin is not sticky and any later re-sign replaces it.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+HEAD_REV="$(git rev-parse HEAD)"
+STAGE="$HOME/ck-stage/cerebellum-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# The fleet identity on this host, from the Apple Developer account. The
+# identifier is the DEPLOYED name rather than the built one; they coincide here,
+# but a rig binary carrying production's identifier would inherit or disturb
+# production's TCC grant row invisibly.
+IDENTITY="Apple Development: ISMET UFUK ALTINOK (7UX762GU88)"
+DEPLOYED_NAME="ck-cerebellum"
+
+# A dirty tree produces bytes that no commit describes: the rev the binary
+# reports would name a commit that does not contain them. Refused here rather
+# than noted, because the whole point of the artifact check below is that the
+# reported rev means something.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "REFUSING TO STAGE: the tree has uncommitted changes." >&2
+  echo "The staged bytes would report a commit that does not contain them." >&2
+  git status --short >&2
+  exit 1
+fi
+
+# Unfiltered and unpiped: this script's refusals must reach the terminal. The
+# fleet lost a refusal twice by sending it through a filter whose exit code
+# replaced the script's.
+./scripts/release-build.sh
+
+mkdir -p "$STAGE"
+cp target/release/"$DEPLOYED_NAME" "$STAGE/"
+
+codesign --force --sign "$IDENTITY" --identifier "$DEPLOYED_NAME" "$STAGE/$DEPLOYED_NAME"
+codesign --verify --strict "$STAGE/$DEPLOYED_NAME"
+
+# THE ARTIFACT GATE. Ask the signed bytes what they are, after signing, on the
+# exact file that will be placed.
+reported="$("$STAGE/$DEPLOYED_NAME" --version)"
+reported_rev="$(printf '%s' "$reported" | grep -oE '\([0-9a-f]{40}\)' | tr -d '()' || true)"
+reported_tree="$(printf '%s' "$reported" | grep -oE 'tree=[a-z]+' | cut -d= -f2 || true)"
+
+if [ "$reported_rev" != "$HEAD_REV" ]; then
+  echo >&2
+  echo "REFUSING TO STAGE: the artifact reports rev '${reported_rev:-none}'," >&2
+  echo "                   the tree is on $HEAD_REV." >&2
+  echo "The staged bytes are not this commit. A previous build was reused, or" >&2
+  echo "the build did not run. Nothing has been published." >&2
+  rm -rf "$STAGE"
+  exit 1
+fi
+
+if [ "$reported_tree" != "clean" ]; then
+  echo >&2
+  echo "REFUSING TO STAGE: the artifact was built from a ${reported_tree:-unknown} tree." >&2
+  rm -rf "$STAGE"
+  exit 1
+fi
+
+# THE SIGNATURE GATE, and it checks the property v2 is about rather than the
+# fact that signing happened. A transitioned binary's designated requirement
+# names its identifier and a certificate; an ad-hoc one names a cdhash, which
+# is what dies on the next rebuild.
+requirement="$(codesign -d -r- "$STAGE/$DEPLOYED_NAME" 2>&1 | sed -n 's/^designated => //p')"
+case "$requirement" in
+  *"identifier \"$DEPLOYED_NAME\""*"certificate"*) ;;
+  *)
+    echo >&2
+    echo "REFUSING TO STAGE: the designated requirement is not identity-based." >&2
+    echo "  got: ${requirement:-<none>}" >&2
+    echo "A cdhash-based requirement means TCC grants die on the next rebuild," >&2
+    echo "which is the failure signing-topology v2 exists to end." >&2
+    rm -rf "$STAGE"
+    exit 1
+    ;;
+esac
+
+echo
+echo "==> staged $STAGE/$DEPLOYED_NAME"
+echo "    rev:         $HEAD_REV"
+echo "    sha256:      $(shasum -a 256 "$STAGE/$DEPLOYED_NAME" | cut -d' ' -f1)"
+echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
+echo "    requirement: $requirement"
+echo
+echo "Placement is a PLAIN COPY -- never re-sign at placement, because a"
+echo "re-sign replaces the pin and invalidates the sha above. Gatekeeper"
+echo "assesses each file on its own first exec, so warm the PLACED copy on the"
+echo "deploy path: a multi-second first exec inside a supervisor health window"
+echo "reads as a failed start."
