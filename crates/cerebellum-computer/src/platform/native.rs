@@ -241,6 +241,14 @@ impl NativeCaptureBackend {
     }
 }
 
+/// Preserve the macOS classification when translating it to the backend layer.
+fn map_macos_capture_error(error: cerebellum_macos::CaptureError) -> BackendError {
+    match error {
+        cerebellum_macos::CaptureError::ScreenLocked => BackendError::ScreenLocked,
+        cerebellum_macos::CaptureError::Capture(reason) => BackendError::Capture(reason),
+    }
+}
+
 /// Whether a captured window may be handed back, given who owned it at capture.
 ///
 /// Separated from the capture call because that call needs a live window
@@ -382,7 +390,7 @@ impl CaptureBackend for NativeCaptureBackend {
         })?;
 
         let capture = cerebellum_macos::capture_window(window_id, self.timeout)
-            .map_err(BackendError::Capture)?;
+            .map_err(map_macos_capture_error)?;
 
         // Read at capture time by the system, not carried from enumeration.
         capture_ownership_verdict(
@@ -487,6 +495,22 @@ mod tests {
                 "{refused:?} did not refuse the capture"
             );
         }
+    }
+
+    /// Preserve screen-locked captures as a distinct backend error so callers can
+    /// recognize the condition and respond by unlocking the screen.
+    #[test]
+    fn a_locked_screen_maps_to_a_distinct_backend_error() {
+        assert_eq!(
+            map_macos_capture_error(cerebellum_macos::CaptureError::ScreenLocked),
+            BackendError::ScreenLocked
+        );
+        assert_eq!(
+            map_macos_capture_error(cerebellum_macos::CaptureError::Capture(
+                "stream stopped".into()
+            )),
+            BackendError::Capture("stream stopped".into())
+        );
     }
 
     /// Each refusal says something different about what went wrong.
@@ -600,6 +624,32 @@ mod tests {
     fn pixels_are_obtainable() -> bool {
         cerebellum_macos::screen_capture_is_permitted()
             && cerebellum_macos::screen_is_locked() != Some(true)
+    }
+
+    /// Skip a live capture assertion only when the screen became locked after the test
+    /// checked its lock status.
+    fn skip_live_capture_when_screen_is_locked(error: &BackendError, test_name: &str) -> bool {
+        if matches!(error, BackendError::ScreenLocked) {
+            println!("skipping {test_name}: the screen locked during capture");
+            true
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn only_a_locked_screen_skips_live_capture_tests() {
+        assert!(skip_live_capture_when_screen_is_locked(
+            &BackendError::ScreenLocked,
+            "test"
+        ));
+        assert!(
+            !skip_live_capture_when_screen_is_locked(
+                &BackendError::Capture("capture regression".into()),
+                "test"
+            ),
+            "a capture regression must fail the live test rather than skip it"
+        );
     }
 
     fn timeout() -> Duration {
@@ -867,15 +917,24 @@ mod tests {
         };
 
         let mut backend = NativeCaptureBackend::new(timeout());
-        let frame = backend
-            .capture_window(&WindowCaptureRequest {
-                target: grant.clone(),
-                filter: crate::capture::DesktopIndependentWindowFilter::new(
-                    sample.window_id.to_string(),
-                ),
-                captured_at_ms: 1234,
-            })
-            .expect("capture the sampled window");
+        let frame = match backend.capture_window(&WindowCaptureRequest {
+            target: grant.clone(),
+            filter: crate::capture::DesktopIndependentWindowFilter::new(
+                sample.window_id.to_string(),
+            ),
+            captured_at_ms: 1234,
+        }) {
+            Ok(frame) => frame,
+            Err(error)
+                if skip_live_capture_when_screen_is_locked(
+                    &error,
+                    "capturing_through_the_backend_yields_pixels",
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("capture the sampled window: {error}"),
+        };
 
         assert_eq!(frame.owner_identity, grant);
         assert!(frame.owner_identity_verified);
@@ -944,8 +1003,18 @@ mod tests {
         // The refusal must name the ownership mismatch. A capture that failed
         // for any other reason also produces an error, and would satisfy a bare
         // "this failed" while proving nothing about the owner check.
-        let Err(BackendError::Capture(reason)) = result else {
-            panic!("captured a window owned by a process the grant does not name");
+        let reason = match result {
+            Err(error)
+                if skip_live_capture_when_screen_is_locked(
+                    &error,
+                    "capturing_a_window_owned_by_another_process_refuses",
+                ) =>
+            {
+                return;
+            }
+            Err(BackendError::Capture(reason)) => reason,
+            Ok(_) => panic!("captured a window owned by a process the grant does not name"),
+            Err(error) => panic!("refused for an unrelated error: {error}"),
         };
         assert!(
             reason.contains("at capture time"),
