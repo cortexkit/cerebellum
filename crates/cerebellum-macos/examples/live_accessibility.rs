@@ -78,6 +78,14 @@ fn main() {
             let mut role_title: std::collections::BTreeMap<(String, String), usize> =
                 Default::default();
             let mut controls_role_title: Vec<(String, String)> = Vec::new();
+            // Whether each pressable control sits inside rendered page content.
+            // A browser's tree contains both its own interface and whatever the
+            // open pages happen to show, and counting them together describes
+            // the web rather than the application -- every link on every page
+            // lands in the denominator. Page content belongs to the browser
+            // plane, which addresses it through CDP, so the computer plane's
+            // reach over a browser is the OUTSIDE number.
+            let mut controls_in_web: Vec<bool> = Vec::new();
 
             #[allow(clippy::too_many_arguments)]
             fn walk(
@@ -93,6 +101,8 @@ fn main() {
                 controls_pressable: &mut Vec<Option<String>>,
                 role_title: &mut std::collections::BTreeMap<(String, String), usize>,
                 controls_role_title: &mut Vec<(String, String)>,
+                controls_in_web: &mut Vec<bool>,
+                in_web: bool,
             ) {
                 *elements += 1;
                 *depth = (*depth).max(d);
@@ -136,6 +146,7 @@ fn main() {
                             .and_modify(|n| *n += 1)
                             .or_insert(1);
                         controls_role_title.push(key);
+                        controls_in_web.push(in_web);
                     }
                 }
                 if let Some(role) = &e.role {
@@ -158,6 +169,11 @@ fn main() {
                         controls_pressable,
                         role_title,
                         controls_role_title,
+                        controls_in_web,
+                        // AXWebArea is the root of one rendered document, so
+                        // everything below it is page content however deeply
+                        // nested. The flag only ever turns on.
+                        in_web || e.role.as_deref() == Some("AXWebArea"),
                     );
                 }
             }
@@ -174,6 +190,8 @@ fn main() {
                 &mut controls_pressable,
                 &mut role_title,
                 &mut controls_role_title,
+                &mut controls_in_web,
+                false,
             );
             // The three conditions an element must meet TOGETHER before this
             // module will act on it: it advertises the action, it carries an
@@ -210,6 +228,24 @@ fn main() {
             // property is unchanged: whichever key a caller supplies, exactly
             // one element must carry it, and a key matching two elements is
             // refused as it is today.
+            // The same either-key test restricted to controls outside page
+            // content, which is what the computer plane would actually serve in
+            // an application that renders documents.
+            let outside_web = controls_in_web.iter().filter(|in_web| !**in_web).count();
+            let outside_web_addressable = controls_pressable
+                .iter()
+                .zip(controls_role_title.iter())
+                .zip(controls_in_web.iter())
+                .filter(|((identifier, key), in_web)| {
+                    if **in_web {
+                        return false;
+                    }
+                    let unique_identifier = identifier
+                        .as_ref()
+                        .is_some_and(|identifier| identifiers.get(identifier) == Some(&1));
+                    unique_identifier || role_title.get(*key) == Some(&1)
+                })
+                .count();
             let by_either = controls_pressable
                 .iter()
                 .zip(controls_role_title.iter())
@@ -238,6 +274,7 @@ fn main() {
                 "    unique role+title: {by_role_title}   <- the same test under a different key"
             );
             println!("    unique under EITHER: {by_either}   <- reach if a caller may name a control by either");
+            println!("    outside page content: {outside_web} pressable, {outside_web_addressable} addressable   <- the application's own interface");
             println!("  top roles:");
             let mut by_count: Vec<_> = roles.into_iter().collect();
             by_count.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
