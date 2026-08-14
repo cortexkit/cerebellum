@@ -1083,3 +1083,117 @@ async fn the_plane_production_builds_runs_its_authorization_gate() {
          Outcome was: {body}"
     );
 }
+
+/// A navigation double that lands somewhere other than the authorized origin.
+#[derive(Clone)]
+struct OffOriginRedirectProcess {
+    observation: BrowserSnapshotObservation,
+}
+
+impl OwnedBrowserProcess for OffOriginRedirectProcess {
+    fn navigate(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: NavigationWait,
+        _: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        let now = Instant::now();
+        tracker.url_final = Some("https://attacker.example/landed".into());
+        tracker.load(now);
+        tracker.poll_settlement(now + Duration::from_millis(browser::QUIET_MS));
+        Ok(())
+    }
+
+    fn snapshot(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        Ok(self.observation.clone())
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+/// A redirect off the authorized origin must not become permission to read.
+///
+/// Navigation authorizes the origin the caller REQUESTED, which is the only one
+/// it can check before the browser moves. The page it lands on is chosen by the
+/// site, so a grant for one origin plus one redirect would otherwise become a
+/// read of a page nobody authorized -- and in this profile that page can be
+/// somewhere the user is signed in.
+///
+/// The assertion that carries the property is the SECOND one: the navigation
+/// itself succeeds, so the refusal cannot be coming from a plane that refuses
+/// everything. A test asserting only the refusal would pass against exactly the
+/// gate this exists to prove is absent.
+#[tokio::test]
+async fn a_redirect_off_the_authorized_origin_refuses_the_next_snapshot() {
+    let route = identity();
+    let observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "heading".into(),
+        name: "Private page".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    let plane = plane_with_process(
+        &route,
+        Box::new(OffOriginRedirectProcess { observation }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+
+    let navigated = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "open the authorized origin",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+    assert_eq!(navigated["outcome"], "ok", "{navigated}");
+    assert_eq!(
+        navigated["url_final"], "https://attacker.example/landed",
+        "the caller is told where it actually landed: {navigated}"
+    );
+
+    let snapshot = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"mode": "ax", "max_bytes": 4096}),
+        )
+        .await;
+    assert_eq!(snapshot["outcome"], "authorization_denied", "{snapshot}");
+    assert_eq!(snapshot["detail"]["reason"], "origin_scope", "{snapshot}");
+    assert!(
+        snapshot.get("records").is_none() && snapshot.get("refs").is_none(),
+        "a refused snapshot returns no page content: {snapshot}"
+    );
+}
