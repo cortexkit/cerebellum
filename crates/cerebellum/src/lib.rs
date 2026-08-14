@@ -629,6 +629,34 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
     dispatchable_tool_with_browser(name, false)
 }
 
+/// The dispatch predicate, exposed so a test can compare the surface reporter
+/// against it directly rather than against a copy of its rules.
+pub fn dispatchable_tool_for_test(name: &str, browser_configured: bool) -> Option<&str> {
+    dispatchable_tool_with_browser(name, browser_configured)
+}
+
+/// Every browser tool name this build would advertise, and whether a caller
+/// could reach it, read through the same predicate `send_hello` filters on.
+///
+/// Exists because the reachable set is not obvious from any single file: a
+/// capability can be implemented, tested against a real browser, and still
+/// answer `unknown_method` because one predicate does not name it. Reading it
+/// back from the production path is the only honest answer, and asking a person
+/// to derive it from three files is how a wrong belief about it survives.
+///
+/// Reports rather than decides: it adds no capability and grants no authority.
+pub fn browser_wire_surface(browser_configured: bool) -> Vec<(String, bool)> {
+    manifest::browser_control_tools()
+        .into_iter()
+        .chain(manifest::browser_wire_tools())
+        .map(|tool| {
+            let reachable =
+                dispatchable_tool_with_browser(&tool.name, browser_configured).is_some();
+            (tool.name.clone(), reachable)
+        })
+        .collect()
+}
+
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
     if browser_configured
         && (browser_session::CONTROL_TOOLS.contains(&name)
