@@ -7,7 +7,7 @@
 
 fn main() {
     let root = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"))
-        .join(".local/share/cortexkit/browser");
+        .join(".local/share/cortexkit/cerebellum/browser");
     let config = cerebellum::profile::RegistryConfig {
         uuid_protocol_compatible: true,
         grant_verifier_available: true,
