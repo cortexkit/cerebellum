@@ -131,6 +131,7 @@ const UNUSABLE_ELEMENT_NAME: &str = "unusable accessibility element name";
 pub struct MacOs26PlatformDriver {
     startup: StartupCapabilityProbe,
     accessibility_trees: BTreeMap<String, CachedAccessibilityTree>,
+    expected_post_condition_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,7 +501,19 @@ impl MacOs26PlatformDriver {
         Self {
             startup: StartupCapabilityProbe::run(input),
             accessibility_trees: BTreeMap::new(),
+            expected_post_condition_available: true,
         }
+    }
+
+    /// Mark a request surface that cannot express an expected post-condition.
+    ///
+    /// The semantic action still runs and is journaled, but effect observation
+    /// must not invent a predicate and then report that invented claim as the
+    /// caller's. The existing vocabulary represents this as an indeterminate
+    /// effect with an undeclarable post-condition.
+    pub fn without_expected_post_condition(mut self) -> Self {
+        self.expected_post_condition_available = false;
+        self
     }
 
     pub fn startup_probe(&self) -> &StartupCapabilityProbe {
@@ -510,8 +523,8 @@ impl MacOs26PlatformDriver {
     /// Describe all eight actions, advertising only the ones that can be served.
     ///
     /// A declaration says what an action WOULD need; advertising says it can be
-    /// used now. The actions that actuate are described and not advertised,
-    /// because no input path exists to serve them yet.
+    /// used now. Semantic click has a reviewed serving path; the other actuating
+    /// actions remain described but unavailable.
     pub fn declarations(
         &self,
         context: &CapabilityAdvertisementContext,
@@ -587,6 +600,19 @@ impl MacOs26PlatformDriver {
             advertised = context.inputs.vocabulary_ready();
             suppression_reason =
                 (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
+        } else if id == "computer.click" {
+            suppression_reason = if !context.inputs.vocabulary_ready() {
+                Some("computer action vocabulary input unresolved".to_string())
+            } else if !context.inputs.semantic_actuation_ready() {
+                if context.inputs.semantic_actuation_review_revision.is_none() {
+                    Some("semantic actuation review revision is not bound".to_string())
+                } else {
+                    Some("release signing topology revision is not bound".to_string())
+                }
+            } else {
+                None
+            };
+            advertised = suppression_reason.is_none();
         } else if id == "computer.screenshot" {
             // Named separately rather than as one combined reason. The
             // conditions fail for unrelated causes -- a missing release input is
@@ -627,18 +653,10 @@ impl MacOs26PlatformDriver {
             };
             advertised = suppression_reason.is_none();
         }
-        // Evaluated even though nothing here advertises a dispatch row, so the
-        // gate is exercised by the same path that will eventually consult it
-        // rather than first running when something depends on its answer.
-        //
-        // ITS ANSWER CURRENTLY CHANGES NOTHING: every actuating row is
-        // suppressed by the unconditional default above, so binding all of the
-        // release inputs would not advertise one. Whoever adds a serving
-        // handler has to consult this deliberately, which is a thing to
-        // remember rather than a thing enforced --
-        // `dispatch_gate_tests::every_actuating_row_is_suppressed_unconditionally`
-        // is the fence that asks the question at that moment.
-        let _dispatch_inputs_resolved = context.inputs.input_dispatch_ready();
+        // The synthetic-input gate remains evaluated but does not admit any row.
+        // Its review is separate from semantic actuation, and the five remaining
+        // actuating rows keep the unconditional suppression set above.
+        let _synthetic_inputs_resolved = context.inputs.input_dispatch_ready();
         CapabilityDeclaration {
             capability_id: id.to_string(),
             action_kind,
@@ -862,6 +880,13 @@ impl PlatformDriver for MacOs26PlatformDriver {
             use crate::dispatch::post_condition::{evaluate, ConditionOutcome, ObservedElement};
             use crate::dispatch::ExpectedPostCondition;
 
+            if !self.expected_post_condition_available {
+                return Ok(EffectObservationResult {
+                    status: EffectStatus::EffectIndeterminate,
+                    failure_reason: Some("post_condition_undeclarable".to_string()),
+                });
+            }
+
             // A condition this driver cannot decide is reported as
             // INDETERMINATE rather than refused. The action already happened;
             // the caller needs to know that its effect is unestablished, which
@@ -1017,41 +1042,83 @@ mod tests {
         );
     }
 
-    /// Every actuating row is suppressed no matter what the release inputs say.
+    /// Semantic click is offered only under its own review binding.
     ///
-    /// A tripwire rather than a description of intent. `input_dispatch_ready()`
-    /// is evaluated in the declaration path and its answer is DISCARDED, so
-    /// binding every release input would still advertise nothing -- which is
-    /// correct while no serving handler exists, and a trap on the day one does,
-    /// because the gate would then be a memory rather than a check.
-    ///
-    /// Fully bound inputs are supplied here deliberately: a fixture leaving
-    /// them absent would pass whether or not the gate were consulted, and could
-    /// not tell the two apart.
+    /// The synthetic-input review is deliberately present in the unbound case:
+    /// substituting that unrelated gate for the semantic review must still leave
+    /// the capability suppressed.
     #[test]
-    fn every_actuating_row_is_suppressed_unconditionally() {
+    fn computer_click_advertisement_requires_the_semantic_actuation_review() {
         let driver = MacOs26PlatformDriver::default();
-        let bound = ImmutableReleaseInputs {
+        let mut bound = ImmutableReleaseInputs {
             attendance_contract_owner: Some("fixture-owner".to_string()),
             attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
             input_review_revision: Some("fixture-input-review-v1".to_string()),
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
+            semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
             release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
-            ..Default::default()
+            vocabulary_digests: VocabularyDigestInputs {
+                manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+            },
         };
         assert!(
-            bound.input_dispatch_ready(),
-            "the fixture must satisfy the gate, or this test cannot tell a \
-             consulted gate from an ignored one"
+            bound.semantic_actuation_ready(),
+            "the accepting fixture must satisfy the semantic actuation gate"
         );
+        let context = |inputs| CapabilityAdvertisementContext {
+            inputs,
+            permissions: PermissionLivenessReport::default(),
+            startup: driver.startup_probe().clone(),
+        };
+
+        let advertised = driver.declaration("computer.click", &context(bound.clone()));
+        assert!(
+            advertised.advertised,
+            "reviewed semantic click was suppressed: {:?}",
+            advertised.suppression_reason
+        );
+
+        bound.semantic_actuation_review_revision = None;
+        assert!(
+            bound.input_review_revision.is_some(),
+            "the synthetic-input review must remain present for this tripwire"
+        );
+        let suppressed = driver.declaration("computer.click", &context(bound));
+        assert!(
+            !suppressed.advertised,
+            "unreviewed semantic click was advertised"
+        );
+        assert_eq!(
+            suppressed.suppression_reason.as_deref(),
+            Some("semantic actuation review revision is not bound")
+        );
+    }
+
+    /// Binding every release input does not activate another actuating row.
+    #[test]
+    fn other_actuating_rows_remain_suppressed_for_fully_bound_release_inputs() {
+        let driver = MacOs26PlatformDriver::default();
         let context = CapabilityAdvertisementContext {
-            inputs: bound,
+            inputs: ImmutableReleaseInputs {
+                attendance_contract_owner: Some("fixture-owner".to_string()),
+                attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
+                input_review_revision: Some("fixture-input-review-v1".to_string()),
+                capture_review_revision: Some("fixture-capture-review-v1".to_string()),
+                semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+                release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
+                vocabulary_digests: VocabularyDigestInputs {
+                    manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                    source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                    computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                },
+            },
             permissions: PermissionLivenessReport::default(),
             startup: driver.startup_probe().clone(),
         };
 
         for id in [
-            "computer.click",
             "computer.type",
             "computer.keys",
             "computer.scroll",
@@ -1059,13 +1126,7 @@ mod tests {
             "computer.drag",
         ] {
             let declaration = driver.declaration(id, &context);
-            assert!(
-                !declaration.advertised,
-                "{id} is advertised. If a wire serving handler now exists, this \
-                 test is the question to answer: the declaration path evaluates \
-                 input_dispatch_ready() and throws the answer away, so the gate \
-                 must be consulted deliberately here rather than assumed."
-            );
+            assert!(!declaration.advertised, "{id} was advertised");
             let reason = declaration
                 .suppression_reason
                 .expect("a suppressed capability states why");
@@ -1074,6 +1135,38 @@ mod tests {
                 "{id} is suppressed for an unexpected reason: {reason}"
             );
         }
+    }
+
+    /// A wire surface with no expected post-condition makes no effect claim.
+    #[test]
+    fn absent_wire_post_condition_skips_observation_and_reports_the_frozen_coarser_status() {
+        let mut driver = MacOs26PlatformDriver::default().without_expected_post_condition();
+        let result = driver
+            .observe_effect(EffectObservationRequest {
+                target: ProcessGrant {
+                    // No process can be inspected at pid zero. If the dedicated
+                    // branch is removed, the attempted read reports the distinct
+                    // observation-primitive-unavailable reason.
+                    pid: 0,
+                    bundle_identity: "com.example.target".to_string(),
+                    process_generation_evidence: "generation-1".to_string(),
+                },
+                predicate: serde_json::to_string(&crate::dispatch::ExpectedPostCondition::new(
+                    "fixture-effect-v1",
+                    crate::dispatch::post_condition::PostCondition::ElementPresent {
+                        element_identifier: "element-1".to_string(),
+                    },
+                ))
+                .expect("the fixture post-condition serializes"),
+                deadline_ms: 1,
+            })
+            .expect("absence of a claim is a result, not a platform failure");
+
+        assert_eq!(result.status, EffectStatus::EffectIndeterminate);
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("post_condition_undeclarable")
+        );
     }
 
     /// A capability in the vocabulary carries the permissions it lists.

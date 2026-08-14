@@ -1226,19 +1226,23 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     assert_eq!(body["waited_ms"], 5);
 }
 
-/// A capability that actuates is refused as an unknown method.
+/// Reviewed semantic click reaches the computer plane and its compose authority.
 ///
-/// No input path exists to serve one, so it must not be dispatchable. Asserted
-/// through the wire rather than through `servable`, because the property that
-/// matters is what a caller receives: a capability the module cannot perform
-/// must refuse before it reaches a handler that would have to decline it.
+/// This module holds no compose lease, so the authority chain refuses before
+/// accessibility is read. The typed no-lease recipe proves click reached the
+/// serving handler rather than falling through as an unknown method.
 #[tokio::test]
-async fn an_actuating_computer_capability_is_not_dispatchable() {
+async fn reviewed_semantic_click_reaches_the_compose_authority_chain() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let request = json!({
         "name": "computer.click",
-        "arguments": {},
+        "arguments": {
+            "target": "save-button",
+            "button": "left",
+            "click_count": 1,
+            "modifiers": [],
+        },
     });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1258,9 +1262,56 @@ async fn an_actuating_computer_capability_is_not_dispatchable() {
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(
-        body["code"], "unknown_method",
-        "an actuating capability was dispatchable: {body}"
+        body["outcome"], "no_lease",
+        "semantic click did not reach compose authority: {body}"
     );
+    assert!(
+        body["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("action_kind 'compose'")),
+        "the refusal does not request a compose lease: {body}"
+    );
+}
+
+/// Semantic click cannot be served when its review gate withholds it.
+///
+/// The request is valid enough to reach compose authority if the admission check
+/// is removed, so an argument refusal cannot make this tripwire pass by accident.
+#[tokio::test]
+async fn unadvertised_semantic_click_is_refused_before_its_serving_handler() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    let request = json!({
+        "name": "computer.click",
+        "arguments": {
+            "target": "save-button",
+            "button": "left",
+            "click_count": 1,
+            "modifiers": [],
+        },
+    });
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        8,
+        1,
+        103,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+
+    cerebellum::handle_tool_request_for_test_admitting(frame, &tx, &health_state, &[])
+        .await
+        .unwrap();
+
+    let response = rx.recv().await.expect("a response frame");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(
+        body["code"], "capability_unavailable",
+        "unadvertised semantic click reached its serving handler: {body}"
+    );
+    assert_ne!(body["outcome"], "no_lease");
 }
 
 /// A capability the release gates withhold is not served on request.

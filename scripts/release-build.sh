@@ -2,7 +2,7 @@
 #
 # Build the module with the release attestations that have been minted.
 #
-# Five identifiers gate what the computer plane may advertise and serve. Each
+# Six identifiers gate what the computer plane may advertise and serve. Each
 # attests that something happened OUTSIDE this repository -- a review was
 # conducted, a doctrine was written down -- so none of them can be derived from
 # the code they govern. They are supplied to the COMPILER rather than read at
@@ -31,6 +31,10 @@ cd "$(dirname "$0")/.."
 # onto later code -- a subsequent change to the capture surface needs a new
 # review and a new revision.
 export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
+
+# The semantic click path reviewed at c8e7d2f. This binds only identifier-addressed
+# computer.click; synthetic input and the other actuating rows remain unreviewed.
+export CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION="semantic-actuation-review/v1@c8e7d2f"
 
 # The fleet's stage-sign doctrine: sign at build or stage with pinned
 # per-deployment identifiers, place with a plain copy, keep environments on
@@ -67,8 +71,7 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 #
 #   CEREBELLUM_INPUT_REVIEW_REVISION
 #     Synthetic input review. No synthetic input path is implemented, and the
-#     approval that exists covers semantic actuation -- asking an application to
-#     invoke its own control -- which is a mechanism rather than a review.
+#     semantic actuation review above does not cover manufacturing input events.
 #
 #   CEREBELLUM_ATTENDANCE_CONTRACT_OWNER
 #   CEREBELLUM_ATTENDANCE_CONTRACT_REVISION
@@ -87,6 +90,7 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 # the check after it cannot disagree about what exists.
 readonly ATTESTATIONS=(
   CEREBELLUM_CAPTURE_REVIEW_REVISION
+  CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION
   CEREBELLUM_ATTENDANCE_CONTRACT_OWNER

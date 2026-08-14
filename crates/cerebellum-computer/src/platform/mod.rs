@@ -142,6 +142,7 @@ pub struct ImmutableReleaseInputs {
     pub attendance_contract_revision: Option<String>,
     pub input_review_revision: Option<String>,
     pub capture_review_revision: Option<String>,
+    pub semantic_actuation_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
 }
@@ -160,6 +161,11 @@ impl ImmutableReleaseInputs {
 
     fn capture_ready(&self) -> bool {
         self.capture_review_revision.is_some() && self.release_signing_topology_revision.is_some()
+    }
+
+    fn semantic_actuation_ready(&self) -> bool {
+        self.semantic_actuation_review_revision.is_some()
+            && self.release_signing_topology_revision.is_some()
     }
 }
 
