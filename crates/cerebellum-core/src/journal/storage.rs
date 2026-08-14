@@ -227,10 +227,18 @@ impl JournalStorage for FilesystemJournalStorage {
     }
 }
 
-/// Return the stable journal data path under `~/.local/share/cortexkit/journal/`.
+/// Return the stable journal data path under
+/// `~/.local/share/cortexkit/cerebellum/journal/`.
 ///
 /// Journal records are application data rather than configuration, so they do
 /// not live beside `~/.config/cortexkit/cerebellum.jsonc`.
+///
+/// UNDER the module's own directory rather than beside it, because the fleet's
+/// backup enrollment resolves every declared path against `<data
+/// home>/cortexkit/<module id>/` and refuses `..` outright. Data written to a
+/// sibling directory is therefore not merely undeclared — it is UNDECLARABLE,
+/// so it can be neither backed up nor deliberately excluded, and its absence
+/// from a catalog looks identical to an oversight.
 pub fn journal_data_path(file_name: &str) -> Result<PathBuf, StorageError> {
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -241,6 +249,7 @@ pub fn journal_data_path(file_name: &str) -> Result<PathBuf, StorageError> {
         .join(".local")
         .join("share")
         .join("cortexkit")
+        .join("cerebellum")
         .join("journal")
         .join(file_name))
 }
