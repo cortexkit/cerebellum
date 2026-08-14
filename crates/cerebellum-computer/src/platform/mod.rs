@@ -343,6 +343,14 @@ pub enum AccessibilityElementName {
     RoleAndTitle { role: String, title: String },
 }
 
+/// Which accessibility key form uniquely identified the element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessibilityKeyForm {
+    Identifier,
+    RoleAndTitle,
+}
+
 impl AccessibilityElementName {
     pub fn identifier(identifier: impl Into<String>) -> Self {
         Self::Identifier(identifier.into())
@@ -361,6 +369,13 @@ impl AccessibilityElementName {
             Self::RoleAndTitle { role, .. } => !role.is_empty(),
         }
     }
+
+    pub const fn key_form(&self) -> AccessibilityKeyForm {
+        match self {
+            Self::Identifier(_) => AccessibilityKeyForm::Identifier,
+            Self::RoleAndTitle { .. } => AccessibilityKeyForm::RoleAndTitle,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,7 +386,11 @@ pub struct ElementResolutionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementResolutionResult {
+    /// The exact key form that established uniqueness.
     pub element_name: AccessibilityElementName,
+    /// The other supported key when the same resolved element reported one.
+    #[serde(default)]
+    pub alternate_name: Option<AccessibilityElementName>,
     pub owning_process: ProcessGrant,
     pub semantic_actions: Vec<String>,
 }
@@ -523,6 +542,40 @@ impl fmt::Display for AccessibilityReadFailure {
     }
 }
 
+/// A semantic action failure split by the remedy available to its caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticDriverError {
+    ElementNameAmbiguous {
+        key_form: AccessibilityKeyForm,
+        match_count: u64,
+    },
+    ElementNotFound {
+        key_form: AccessibilityKeyForm,
+    },
+    ActionNotAdvertised {
+        action: String,
+        advertised: Vec<String>,
+    },
+    ApplicationRefused {
+        ax_error: i32,
+    },
+    AccessibilityPermissionUnavailable,
+    TargetNoLongerCurrent {
+        disposition: TargetDisposition,
+    },
+    Transient {
+        deadline_ms: u64,
+    },
+    PathUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetDisposition {
+    Gone,
+    Replaced,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverError {
     Unsupported(&'static str),
@@ -532,6 +585,8 @@ pub enum DriverError {
     AccessibilityUnreadable(AccessibilityReadFailure),
     /// The tree was read and the named element is not in it.
     ElementNotFound,
+    /// A semantic driver failure that tells the caller how the refused action can be handled.
+    Semantic(SemanticDriverError),
 }
 
 impl From<AccessibilityReadFailure> for DriverError {
@@ -550,6 +605,7 @@ impl fmt::Display for DriverError {
                 write!(f, "accessibility tree unreadable: {failure}")
             }
             Self::ElementNotFound => f.write_str("accessibility element not found"),
+            Self::Semantic(failure) => write!(f, "semantic action refused: {failure:?}"),
         }
     }
 }

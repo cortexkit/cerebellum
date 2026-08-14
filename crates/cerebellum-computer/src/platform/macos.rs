@@ -266,58 +266,60 @@ fn observable_ax_root(
     }
 }
 
-/// Map an action failure onto the driver's typed vocabulary.
+/// Map an action failure onto the driver's typed remedy vocabulary.
 ///
 /// Every `AxActionError` is handled explicitly rather than through a catch-all,
 /// so a variant added later stops the build here instead of silently inheriting
 /// whichever case happened to be last.
 #[cfg(target_os = "macos")]
-fn map_ax_action_error(error: cerebellum_macos::AxActionError) -> DriverError {
+fn map_ax_action_error(
+    error: cerebellum_macos::AxActionError,
+    requested_action: &str,
+    deadline_ms: u64,
+) -> DriverError {
     use cerebellum_macos::AxActionError;
-    match error {
+
+    let semantic = match error {
         AxActionError::PermissionNotGranted => {
-            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PermissionRequired)
+            SemanticDriverError::AccessibilityPermissionUnavailable
         }
-        AxActionError::NoSuchProcess { .. } => {
-            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetGone)
+        AxActionError::NoSuchProcess { .. } => SemanticDriverError::TargetNoLongerCurrent {
+            disposition: TargetDisposition::Gone,
+        },
+        // No handler was reached, and no caller-controlled variation can make
+        // an application that exposes no accessibility surface inspectable.
+        AxActionError::ProcessNotAccessible { .. } => SemanticDriverError::PathUnavailable,
+        AxActionError::ElementNotFound { element_name } => SemanticDriverError::ElementNotFound {
+            key_form: AccessibilityElementName::from(element_name).key_form(),
+        },
+        AxActionError::ElementIdentifierAmbiguous {
+            element_name,
+            match_count,
+        } => SemanticDriverError::ElementNameAmbiguous {
+            key_form: AccessibilityElementName::from(element_name).key_form(),
+            match_count: u64::try_from(match_count).unwrap_or(u64::MAX),
+        },
+        AxActionError::ActionNotAdvertised { advertised, .. } => {
+            SemanticDriverError::ActionNotAdvertised {
+                action: requested_action.to_owned(),
+                advertised,
+            }
         }
-        AxActionError::ProcessNotAccessible { .. } => {
-            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetNotInspectable)
+        AxActionError::ApplicationRefusedAction { ax_error, .. } => {
+            SemanticDriverError::ApplicationRefused { ax_error }
         }
-        // The element is gone or was never there: a fact about the request
-        // rather than about the target, so it is not a read failure.
-        AxActionError::ElementNotFound { .. } => DriverError::ElementNotFound,
-        // Two elements answer to one supplied key, so no action can be delivered
-        // to the one that was resolved. Refused rather than guessing, because
-        // guessing is how an action lands on a control nobody chose.
-        AxActionError::ElementIdentifierAmbiguous { .. } => {
-            DriverError::InvalidRequest("the element name matches more than one element")
-        }
-        AxActionError::ElementUniquenessUnestablished { .. } => {
-            DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS)
-        }
-        // The element exists and does not offer this action. Distinct from an
-        // application refusing one it does offer: this is answerable before
-        // asking, and asking anyway would request something invented.
-        AxActionError::ActionNotAdvertised { .. } => {
-            DriverError::InvalidRequest("the element does not advertise this action")
-        }
-        AxActionError::ApplicationRefusedAction { .. } => {
-            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PlatformReadFailed)
-        }
-        AxActionError::DeadlineExceeded { .. } => DriverError::AccessibilityUnreadable(
-            AccessibilityReadFailure::RetryableDeadlineExceeded,
-        ),
-        AxActionError::DepthLimitExceeded { .. } | AxActionError::ElementLimitExceeded { .. } => {
-            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TreeExceedsBound)
-        }
-        AxActionError::UnexpectedValueType { .. } => DriverError::AccessibilityUnreadable(
-            AccessibilityReadFailure::IncompatiblePlatformValue,
-        ),
-        AxActionError::SystemCallFailed { .. } => {
-            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PlatformReadFailed)
-        }
-    }
+        AxActionError::DeadlineExceeded { timeout } => SemanticDriverError::Transient {
+            deadline_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        },
+        AxActionError::SystemCallFailed { .. } => SemanticDriverError::Transient { deadline_ms },
+        // Incomplete uniqueness, traversal bounds, and unexpected framework
+        // values are module-internal limits rather than caller remedies.
+        AxActionError::ElementUniquenessUnestablished { .. }
+        | AxActionError::DepthLimitExceeded { .. }
+        | AxActionError::ElementLimitExceeded { .. }
+        | AxActionError::UnexpectedValueType { .. } => SemanticDriverError::PathUnavailable,
+    };
+    DriverError::Semantic(semantic)
 }
 
 fn root_cache_key(target: &ProcessGrant) -> String {
@@ -445,6 +447,22 @@ fn resolve_cached_element<'a>(
     }
 }
 
+fn alternate_element_name(
+    element: &CachedAccessibilityElement,
+    matched_by: &AccessibilityElementName,
+) -> Option<AccessibilityElementName> {
+    match matched_by {
+        AccessibilityElementName::Identifier(_) => Some(AccessibilityElementName::RoleAndTitle {
+            role: element.role.clone()?,
+            title: element.title.clone().unwrap_or_default(),
+        }),
+        AccessibilityElementName::RoleAndTitle { .. } => element
+            .identifier
+            .clone()
+            .map(AccessibilityElementName::Identifier),
+    }
+}
+
 fn resolution_from_cached_tree(
     tree: &CachedAccessibilityTree,
     request: &ElementResolutionRequest,
@@ -452,6 +470,7 @@ fn resolution_from_cached_tree(
     let element = resolve_cached_element(tree, request)?;
     Ok(ElementResolutionResult {
         element_name: request.element_name.clone(),
+        alternate_name: alternate_element_name(element, &request.element_name),
         owning_process: tree.target.clone(),
         semantic_actions: element.actions.clone(),
     })
@@ -775,13 +794,15 @@ impl PlatformDriver for MacOs26PlatformDriver {
 
             let element_name = ax_element_name(&request.element.element_name)?;
 
+            let options = cerebellum_macos::AxActionOptions::default();
+            let deadline_ms = u64::try_from(options.timeout.as_millis()).unwrap_or(u64::MAX);
             let outcome = cerebellum_macos::request_accessibility_action(
                 request.element.owning_process.pid,
                 &element_name,
                 action,
-                cerebellum_macos::AxActionOptions::default(),
+                options,
             )
-            .map_err(map_ax_action_error)?;
+            .map_err(|error| map_ax_action_error(error, &request.action, deadline_ms))?;
 
             Ok(dispatch_result_for_accepted_action(outcome))
         }
@@ -1324,63 +1345,122 @@ mod accessibility_tests {
         assert_eq!(result.effect_status, EffectStatus::EffectIndeterminate);
     }
 
-    /// Every action failure keeps a distinct remedy.
+    /// Every framework action failure maps to its caller remedy.
     ///
-    /// The failures differ in what a caller should do: grant a permission, stop
-    /// entirely, name a different element, ask for an action the element offers,
-    /// or retry. A mapping that collapsed any pair would send a caller down a
-    /// path that cannot succeed, and the plausible guess after a failed action
-    /// is to retry, which is wrong for most of these.
+    /// Internal traversal and value faults deliberately share `PathUnavailable`;
+    /// the remaining cases stay distinct because their callers must take
+    /// different actions.
     #[test]
     fn every_action_failure_maps_to_a_distinct_remedy() {
-        use cerebellum_macos::AxActionError;
+        use cerebellum_macos::{AxAction, AxActionError, AxElementName};
 
+        let advertised = vec!["AXPress".to_string(), "AXConfirm".to_string()];
         let cases = [
             (
                 AxActionError::PermissionNotGranted,
-                DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PermissionRequired),
+                DriverError::Semantic(SemanticDriverError::AccessibilityPermissionUnavailable),
             ),
             (
                 AxActionError::NoSuchProcess { pid: 7 },
-                DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetGone),
+                DriverError::Semantic(SemanticDriverError::TargetNoLongerCurrent {
+                    disposition: TargetDisposition::Gone,
+                }),
+            ),
+            (
+                AxActionError::ProcessNotAccessible {
+                    pid: 7,
+                    ax_error: -25204,
+                },
+                DriverError::Semantic(SemanticDriverError::PathUnavailable),
             ),
             (
                 AxActionError::ElementNotFound {
-                    element_name: cerebellum_macos::AxElementName::Identifier("absent".to_string()),
+                    element_name: AxElementName::Identifier("absent".to_string()),
                 },
-                DriverError::ElementNotFound,
+                DriverError::Semantic(SemanticDriverError::ElementNotFound {
+                    key_form: AccessibilityKeyForm::Identifier,
+                }),
             ),
             (
                 AxActionError::ElementIdentifierAmbiguous {
-                    element_name: cerebellum_macos::AxElementName::RoleAndTitle {
+                    element_name: AxElementName::RoleAndTitle {
                         role: "AXButton".to_string(),
                         title: "Save".to_string(),
                     },
                     match_count: 2,
                 },
-                DriverError::InvalidRequest("the element name matches more than one element"),
+                DriverError::Semantic(SemanticDriverError::ElementNameAmbiguous {
+                    key_form: AccessibilityKeyForm::RoleAndTitle,
+                    match_count: 2,
+                }),
             ),
             (
                 AxActionError::ElementUniquenessUnestablished {
-                    element_name: cerebellum_macos::AxElementName::Identifier(
-                        "partially-seen".to_string(),
-                    ),
+                    element_name: AxElementName::Identifier("partial".to_string()),
                     unreadable_subtrees: 1,
                 },
-                DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS),
+                DriverError::Semantic(SemanticDriverError::PathUnavailable),
+            ),
+            (
+                AxActionError::ActionNotAdvertised {
+                    element_name: AxElementName::Identifier("save".to_string()),
+                    action: AxAction::Press,
+                    advertised: advertised.clone(),
+                },
+                DriverError::Semantic(SemanticDriverError::ActionNotAdvertised {
+                    action: "press".to_string(),
+                    advertised: advertised.clone(),
+                }),
+            ),
+            (
+                AxActionError::ApplicationRefusedAction {
+                    element_name: AxElementName::Identifier("save".to_string()),
+                    action: AxAction::Press,
+                    ax_error: -25205,
+                },
+                DriverError::Semantic(SemanticDriverError::ApplicationRefused { ax_error: -25205 }),
             ),
             (
                 AxActionError::DeadlineExceeded {
-                    timeout: std::time::Duration::from_millis(1),
+                    timeout: Duration::from_millis(1),
                 },
-                DriverError::AccessibilityUnreadable(
-                    AccessibilityReadFailure::RetryableDeadlineExceeded,
-                ),
+                DriverError::Semantic(SemanticDriverError::Transient { deadline_ms: 1 }),
+            ),
+            (
+                AxActionError::DepthLimitExceeded {
+                    max_depth: 32,
+                    attempted_depth: 33,
+                },
+                DriverError::Semantic(SemanticDriverError::PathUnavailable),
+            ),
+            (
+                AxActionError::ElementLimitExceeded {
+                    max_elements: 10_000,
+                    attempted_elements: 10_001,
+                },
+                DriverError::Semantic(SemanticDriverError::PathUnavailable),
+            ),
+            (
+                AxActionError::UnexpectedValueType {
+                    attribute: "AXRole",
+                },
+                DriverError::Semantic(SemanticDriverError::PathUnavailable),
+            ),
+            (
+                AxActionError::SystemCallFailed {
+                    operation: "AXUIElementPerformAction",
+                    ax_error: -25206,
+                },
+                DriverError::Semantic(SemanticDriverError::Transient { deadline_ms: 3_000 }),
             ),
         ];
 
         for (raw, expected) in cases {
-            assert_eq!(map_ax_action_error(raw.clone()), expected, "{raw:?}");
+            assert_eq!(
+                map_ax_action_error(raw.clone(), "press", 3_000),
+                expected,
+                "{raw:?}"
+            );
         }
     }
 
@@ -1394,20 +1474,32 @@ mod accessibility_tests {
     fn incomplete_ambiguous_and_absent_action_targets_remain_distinct() {
         use cerebellum_macos::AxActionError;
 
-        let absent = map_ax_action_error(AxActionError::ElementNotFound {
-            element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
-        });
-        let ambiguous = map_ax_action_error(AxActionError::ElementIdentifierAmbiguous {
-            element_name: cerebellum_macos::AxElementName::RoleAndTitle {
-                role: "AXButton".to_string(),
-                title: "Save".to_string(),
+        let absent = map_ax_action_error(
+            AxActionError::ElementNotFound {
+                element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
             },
-            match_count: 2,
-        });
-        let incomplete = map_ax_action_error(AxActionError::ElementUniquenessUnestablished {
-            element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
-            unreadable_subtrees: 1,
-        });
+            "press",
+            3_000,
+        );
+        let ambiguous = map_ax_action_error(
+            AxActionError::ElementIdentifierAmbiguous {
+                element_name: cerebellum_macos::AxElementName::RoleAndTitle {
+                    role: "AXButton".to_string(),
+                    title: "Save".to_string(),
+                },
+                match_count: 2,
+            },
+            "press",
+            3_000,
+        );
+        let incomplete = map_ax_action_error(
+            AxActionError::ElementUniquenessUnestablished {
+                element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
+                unreadable_subtrees: 1,
+            },
+            "press",
+            3_000,
+        );
 
         assert_ne!(absent, ambiguous);
         assert_ne!(absent, incomplete);
@@ -1664,16 +1756,25 @@ mod cached_element_tests {
 
     #[test]
     fn resolution_reports_the_exact_key_that_established_uniqueness() {
-        let names = [
-            AccessibilityElementName::Identifier("identifier-only".to_string()),
-            AccessibilityElementName::RoleAndTitle {
-                role: "AXButton".to_string(),
-                title: "Save".to_string(),
-            },
+        let cases = [
+            (
+                AccessibilityElementName::Identifier("identifier-only".to_string()),
+                Some(AccessibilityElementName::RoleAndTitle {
+                    role: "AXButton".to_string(),
+                    title: "Shared".to_string(),
+                }),
+            ),
+            (
+                AccessibilityElementName::RoleAndTitle {
+                    role: "AXButton".to_string(),
+                    title: "Save".to_string(),
+                },
+                None,
+            ),
         ];
         let tree = cached_tree();
 
-        for name in names {
+        for (name, alternate_name) in cases {
             let request = ElementResolutionRequest {
                 root_identifier: "accessibility-root:41:generation-a".to_string(),
                 element_name: name.clone(),
@@ -1681,6 +1782,7 @@ mod cached_element_tests {
             let resolution = resolution_from_cached_tree(&tree, &request)
                 .expect("the fixture makes each supplied key unique");
             assert_eq!(resolution.element_name, name);
+            assert_eq!(resolution.alternate_name, alternate_name);
             assert_eq!(resolution.semantic_actions, vec!["AXPress"]);
         }
     }

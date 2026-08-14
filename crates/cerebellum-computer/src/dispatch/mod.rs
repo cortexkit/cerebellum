@@ -17,16 +17,26 @@ pub use effect::*;
 pub use retry::*;
 pub use seize::*;
 
+use crate::audit::{
+    ActuationElementIdentity, ActuationIntent, ActuationOutcome, ComputerAudit, ComputerCapability,
+    ComputerPlaneDescriptor, ObservationState,
+};
+use crate::grounding::ContainmentRung;
 use crate::platform::containment::{
     finalize_containment, ContainmentEvidence, ContainmentFinalization, ContainmentRefusal,
     DeliveryPrimitive, FrontingComparisonEvidence, IdentityCheckEvidence,
     IdentityVerificationStatus,
 };
 use crate::platform::{
-    ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult, DriverError,
-    ElementResolutionResult, FocusQueryRequest, InputObservationRequest, PermissionLiveness,
-    PlatformDriver, ProcessGrant, SemanticDispatchRequest, SyntheticDispatchRequest,
+    AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
+    DriverError, ElementResolutionResult, FocusQueryRequest, InputObservationRequest,
+    PermissionLiveness, PlatformDriver, ProcessGrant, SemanticDispatchRequest, SemanticDriverError,
+    SyntheticDispatchRequest, TargetDisposition,
 };
+use cerebellum_core::journal::redaction::Redactor;
+use cerebellum_core::journal::severity::SeverityTaxonomy;
+use cerebellum_core::journal::storage::JournalStorage;
+use cerebellum_core::journal::{DispatchCommitmentToken, JournalIdentity, ReservationHandle};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -246,10 +256,32 @@ pub enum DispatchPhase {
     EffectObserved,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
 pub enum DispatchError {
     InvalidRequest,
-    SemanticUnavailable,
+    ElementNameAmbiguous {
+        key_form: AccessibilityKeyForm,
+        match_count: u64,
+    },
+    ElementNotFound {
+        key_form: AccessibilityKeyForm,
+    },
+    ActionNotAdvertised {
+        action: String,
+        advertised: Vec<String>,
+    },
+    ApplicationRefused {
+        ax_error: i32,
+    },
+    AccessibilityPermissionUnavailable,
+    TargetNoLongerCurrent {
+        disposition: TargetDisposition,
+    },
+    SemanticDispatchTransient {
+        deadline_ms: u64,
+    },
+    SemanticPathUnavailable,
     SyntheticUnavailable,
     EnvelopeUnrecognized,
     UnsupportedMode,
@@ -266,13 +298,21 @@ pub enum DispatchError {
     BackgroundUnsupportedTarget,
     ContainmentRefused,
     Platform,
+    AuditUnavailable,
 }
 
 impl DispatchError {
-    pub const fn reason_code(self) -> &'static str {
+    pub const fn reason_code(&self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
-            Self::SemanticUnavailable => "semantic_target_unavailable",
+            Self::ElementNameAmbiguous { .. } => "element_name_ambiguous",
+            Self::ElementNotFound { .. } => "element_not_found",
+            Self::ActionNotAdvertised { .. } => "action_not_advertised",
+            Self::ApplicationRefused { .. } => "application_refused",
+            Self::AccessibilityPermissionUnavailable => "accessibility_permission_unavailable",
+            Self::TargetNoLongerCurrent { .. } => "target_no_longer_current",
+            Self::SemanticDispatchTransient { .. } => "semantic_dispatch_transient",
+            Self::SemanticPathUnavailable => "semantic_path_unavailable",
             Self::SyntheticUnavailable => "synthetic_unavailable",
             Self::EnvelopeUnrecognized => "envelope_unrecognized",
             Self::UnsupportedMode => "unsupported_mode",
@@ -289,6 +329,7 @@ impl DispatchError {
             Self::BackgroundUnsupportedTarget => "background_unsupported_target",
             Self::ContainmentRefused => "identity_verification_unavailable",
             Self::Platform => "platform_error",
+            Self::AuditUnavailable => "audit_unavailable",
         }
     }
 }
@@ -304,6 +345,31 @@ impl std::error::Error for DispatchError {}
 pub struct Dispatcher<D> {
     driver: D,
     trace: Vec<DispatchPhase>,
+}
+
+#[derive(Debug)]
+struct ActuationAuditState {
+    handle: ReservationHandle,
+    descriptor: ComputerPlaneDescriptor,
+    token: Option<DispatchCommitmentToken>,
+    finalized: bool,
+    transition_failed: bool,
+}
+
+impl ActuationAuditState {
+    fn reserved(handle: ReservationHandle, descriptor: ComputerPlaneDescriptor) -> Self {
+        Self {
+            handle,
+            descriptor,
+            token: None,
+            finalized: false,
+            transition_failed: false,
+        }
+    }
+
+    fn needs_no_action_terminal(&self) -> bool {
+        self.token.is_none() && !self.finalized && !self.transition_failed
+    }
 }
 
 impl<D> Dispatcher<D> {
@@ -336,7 +402,57 @@ impl<D> Dispatcher<D> {
 }
 
 impl<D: PlatformDriver> Dispatcher<D> {
-    pub fn dispatch(&mut self, request: DispatchRequest) -> Result<DispatchReport, DispatchError> {
+    pub fn dispatch<R, T, S>(
+        &mut self,
+        audit: &mut ComputerAudit<R, T, S>,
+        journal_identity: JournalIdentity,
+        request: DispatchRequest,
+    ) -> Result<DispatchReport, DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
+        let mut audit_state = if request.row.action_kind == ActionKind::Observe {
+            None
+        } else {
+            let descriptor = Self::actuation_descriptor(&request)?;
+            let handle = audit
+                .reserve(journal_identity, descriptor.clone())
+                .map_err(|_| DispatchError::AuditUnavailable)?;
+            Some(ActuationAuditState::reserved(handle, descriptor))
+        };
+
+        let result = self.dispatch_inner(audit, audit_state.as_mut(), request);
+        if let Err(ref refusal) = result {
+            if let Some(state) = audit_state
+                .as_mut()
+                .filter(|state| state.needs_no_action_terminal())
+            {
+                if audit
+                    .finalize_actuation_no_action(state.handle, refusal)
+                    .is_err()
+                {
+                    state.transition_failed = true;
+                    return Err(DispatchError::AuditUnavailable);
+                }
+                state.finalized = true;
+            }
+        }
+        result
+    }
+
+    fn dispatch_inner<R, T, S>(
+        &mut self,
+        audit: &mut ComputerAudit<R, T, S>,
+        audit_state: Option<&mut ActuationAuditState>,
+        request: DispatchRequest,
+    ) -> Result<DispatchReport, DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
         let predicate_bytes = request
             .expected_post_condition
             .serialize_before_dispatch()
@@ -367,7 +483,8 @@ impl<D: PlatformDriver> Dispatcher<D> {
             return Err(DispatchError::IdentityVerificationUnavailable);
         }
 
-        let (delivery_primitive, platform_result, focus) = self.deliver(&request, &mut watcher)?;
+        let (delivery_primitive, platform_result, focus) =
+            self.deliver(audit, audit_state, &request, &mut watcher)?;
         if !watcher.can_post() {
             return Err(
                 match watcher.abort_decision().map(|decision| decision.reason) {
@@ -432,10 +549,65 @@ impl<D: PlatformDriver> Dispatcher<D> {
         })
     }
 
-    pub fn dispatch_sequence(
+    fn actuation_descriptor(
+        request: &DispatchRequest,
+    ) -> Result<ComputerPlaneDescriptor, DispatchError> {
+        let capability = ComputerCapability::parse(&request.row.capability_id)
+            .ok_or(DispatchError::InvalidRequest)?;
+        let containment = if request.semantic.is_some()
+            && request.row.semantic_supported
+            && !request.semantic_known_ineffective
+        {
+            ContainmentRung::SemanticElement
+        } else {
+            match request.mode {
+                DispatchMode::Background => ContainmentRung::PidStructural,
+                DispatchMode::Observed => ContainmentRung::GlobalNone,
+            }
+        };
+        let observation = match request.mode {
+            DispatchMode::Observed => ObservationState::HumanObserved,
+            DispatchMode::Background => ObservationState::HumanUnobserved,
+        };
+        Ok(ComputerPlaneDescriptor::new(
+            capability,
+            containment,
+            observation,
+        ))
+    }
+
+    fn journal_no_action<R, T, S>(
+        audit: &mut ComputerAudit<R, T, S>,
+        journal_identity: JournalIdentity,
+        request: &DispatchRequest,
+        refusal: &DispatchError,
+    ) -> Result<(), DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
+        let descriptor = Self::actuation_descriptor(request)?;
+        let handle = audit
+            .reserve(journal_identity, descriptor)
+            .map_err(|_| DispatchError::AuditUnavailable)?;
+        audit
+            .finalize_actuation_no_action(handle, refusal)
+            .map_err(|_| DispatchError::AuditUnavailable)?;
+        Ok(())
+    }
+
+    pub fn dispatch_sequence<R, T, S>(
         &mut self,
+        audit: &mut ComputerAudit<R, T, S>,
+        journal_identity: &JournalIdentity,
         requests: impl IntoIterator<Item = DispatchRequest>,
-    ) -> Result<SequenceDispatchReport, DispatchError> {
+    ) -> Result<SequenceDispatchReport, DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
         let mut completed = Vec::new();
         let mut watcher: Option<SeizeWatcher> = None;
         let mut previous_post_at_ms = None;
@@ -463,10 +635,18 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 }) {
                     guard.observe_input(observation, index);
                 }
-                if guard.abort_decision().is_some() {
+                if let Some(abort) = guard.abort_decision() {
+                    let refusal = match abort.reason {
+                        AbortReason::ObserverUnavailable
+                        | AbortReason::SeizeLatencyBoundExceeded => {
+                            DispatchError::ObserverUnavailable
+                        }
+                        AbortReason::UserSeizedControl => DispatchError::UserSeizedControl,
+                    };
+                    Self::journal_no_action(audit, journal_identity.clone(), &request, &refusal)?;
                     return Ok(SequenceDispatchReport {
                         completed,
-                        abort: guard.abort_decision(),
+                        abort: Some(abort),
                     });
                 }
             }
@@ -475,7 +655,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 .as_ref()
                 .map(|plan| plan.post_at_ms)
                 .unwrap_or(request.now_ms);
-            match self.dispatch(request) {
+            match self.dispatch(audit, journal_identity.clone(), request) {
                 Ok(report) => {
                     previous_post_at_ms = Some(post_at);
                     completed.push(report)
@@ -591,8 +771,10 @@ impl<D: PlatformDriver> Dispatcher<D> {
         Ok(())
     }
 
-    fn deliver(
+    fn deliver<R, T, S>(
         &mut self,
+        audit: &mut ComputerAudit<R, T, S>,
+        mut audit_state: Option<&mut ActuationAuditState>,
         request: &DispatchRequest,
         watcher: &mut SeizeWatcher,
     ) -> Result<
@@ -602,25 +784,64 @@ impl<D: PlatformDriver> Dispatcher<D> {
             Option<FocusEvidence>,
         ),
         DispatchError,
-    > {
+    >
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
         if let Some(semantic) = request.semantic.clone() {
-            let semantic_expresses_action = semantic.element.owning_process == request.target
-                && semantic
+            let semantic_owns_target = semantic.element.owning_process == request.target;
+            if request.row.semantic_supported
+                && semantic_owns_target
+                && !request.semantic_known_ineffective
+            {
+                if !semantic
                     .element
                     .semantic_actions
                     .iter()
-                    .any(|candidate| candidate == &semantic.action);
-            if request.row.semantic_supported
-                && semantic_expresses_action
-                && !request.semantic_known_ineffective
-            {
-                match self.driver.dispatch_semantic(semantic) {
+                    .any(|candidate| candidate == &semantic.action)
+                {
+                    return Err(DispatchError::ActionNotAdvertised {
+                        action: semantic.action,
+                        advertised: semantic.element.semantic_actions,
+                    });
+                }
+
+                let intent = ActuationIntent {
+                    element: Some(ActuationElementIdentity {
+                        matched_by: semantic.element.element_name.clone(),
+                        alternate_name: semantic.element.alternate_name.clone(),
+                    }),
+                    action: semantic.action.clone(),
+                    grant_identity: request.target.clone(),
+                };
+                let state = audit_state
+                    .as_deref_mut()
+                    .ok_or(DispatchError::AuditUnavailable)?;
+                Self::commit_audit_intent(audit, state, &intent)?;
+
+                match self.driver.dispatch_semantic(semantic.clone()) {
                     Ok(result) => {
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::HandlerReturned,
+                        )?;
                         self.trace.push(DispatchPhase::SemanticDispatch);
                         return Ok((DeliveryPrimitive::SemanticAccessibility, result, None));
                     }
-                    Err(DriverError::Unsupported(_)) => {}
-                    Err(_) => return Err(DispatchError::SemanticUnavailable),
+                    Err(error) => {
+                        let refusal = Self::semantic_refusal(error, &semantic);
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Refused {
+                                refusal: refusal.clone(),
+                            },
+                        )?;
+                        return Err(refusal);
+                    }
                 }
             }
         }
@@ -635,6 +856,23 @@ impl<D: PlatformDriver> Dispatcher<D> {
         {
             return Err(DispatchError::InvalidRequest);
         }
+
+        let element = request.semantic.as_ref().and_then(|semantic| {
+            (semantic.element.owning_process == request.target).then(|| ActuationElementIdentity {
+                matched_by: semantic.element.element_name.clone(),
+                alternate_name: semantic.element.alternate_name.clone(),
+            })
+        });
+        let action = request.semantic.as_ref().map_or_else(
+            || request.row.capability_id.clone(),
+            |semantic| semantic.action.clone(),
+        );
+        let intent = ActuationIntent {
+            element,
+            action,
+            grant_identity: request.target.clone(),
+        };
+
         match request.mode {
             DispatchMode::Background => {
                 if !request.row.private_envelope_recognized {
@@ -648,11 +886,32 @@ impl<D: PlatformDriver> Dispatcher<D> {
                     },
                     0,
                 );
+                let state = audit_state
+                    .as_deref_mut()
+                    .ok_or(DispatchError::AuditUnavailable)?;
+                Self::commit_audit_intent(audit, state, &intent)?;
+                let result = match self.driver.dispatch_per_pid(synthetic) {
+                    Ok(result) => {
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::HandlerReturned,
+                        )?;
+                        result
+                    }
+                    Err(_) => {
+                        let refusal = DispatchError::SyntheticUnavailable;
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Refused {
+                                refusal: refusal.clone(),
+                            },
+                        )?;
+                        return Err(refusal);
+                    }
+                };
                 self.trace.push(DispatchPhase::PerPidDispatch);
-                let result = self
-                    .driver
-                    .dispatch_per_pid(synthetic)
-                    .map_err(|_| DispatchError::SyntheticUnavailable)?;
                 Ok((DeliveryPrimitive::PerPidSynthetic, result, None))
             }
             DispatchMode::Observed => {
@@ -665,13 +924,143 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 if !watcher.take_post_slot() {
                     return Err(DispatchError::UserSeizedControl);
                 }
+                let state = audit_state.ok_or(DispatchError::AuditUnavailable)?;
+                Self::commit_audit_intent(audit, state, &intent)?;
+                let result = match self.driver.dispatch_global(synthetic) {
+                    Ok(result) => {
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::HandlerReturned,
+                        )?;
+                        result
+                    }
+                    Err(_) => {
+                        let refusal = DispatchError::SyntheticUnavailable;
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Refused {
+                                refusal: refusal.clone(),
+                            },
+                        )?;
+                        return Err(refusal);
+                    }
+                };
                 self.trace.push(DispatchPhase::GlobalDispatch);
-                let result = self
-                    .driver
-                    .dispatch_global(synthetic)
-                    .map_err(|_| DispatchError::SyntheticUnavailable)?;
                 Ok((DeliveryPrimitive::GlobalSynthetic, result, Some(focus)))
             }
+        }
+    }
+
+    fn commit_audit_intent<R, T, S>(
+        audit: &mut ComputerAudit<R, T, S>,
+        state: &mut ActuationAuditState,
+        intent: &ActuationIntent,
+    ) -> Result<(), DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
+        if state.token.is_some() || state.finalized || state.transition_failed {
+            return Err(DispatchError::AuditUnavailable);
+        }
+        match audit.commit_actuation_intent(state.handle, &state.descriptor, intent) {
+            Ok(token) => {
+                state.token = Some(token);
+                Ok(())
+            }
+            Err(_) => {
+                state.transition_failed = true;
+                Err(DispatchError::AuditUnavailable)
+            }
+        }
+    }
+
+    fn finalize_audit_outcome<R, T, S>(
+        audit: &mut ComputerAudit<R, T, S>,
+        state: &mut ActuationAuditState,
+        outcome: &ActuationOutcome,
+    ) -> Result<(), DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
+        let token = state.token.ok_or(DispatchError::AuditUnavailable)?;
+        match audit.finalize_actuation_outcome(token, outcome) {
+            Ok(_) => {
+                state.finalized = true;
+                Ok(())
+            }
+            Err(_) => {
+                state.transition_failed = true;
+                Err(DispatchError::AuditUnavailable)
+            }
+        }
+    }
+
+    fn semantic_refusal(error: DriverError, semantic: &SemanticDispatchRequest) -> DispatchError {
+        match error {
+            DriverError::Semantic(failure) => match failure {
+                SemanticDriverError::ElementNameAmbiguous {
+                    key_form,
+                    match_count,
+                } => DispatchError::ElementNameAmbiguous {
+                    key_form,
+                    match_count,
+                },
+                SemanticDriverError::ElementNotFound { key_form } => {
+                    DispatchError::ElementNotFound { key_form }
+                }
+                SemanticDriverError::ActionNotAdvertised { action, advertised } => {
+                    DispatchError::ActionNotAdvertised { action, advertised }
+                }
+                SemanticDriverError::ApplicationRefused { ax_error } => {
+                    DispatchError::ApplicationRefused { ax_error }
+                }
+                SemanticDriverError::AccessibilityPermissionUnavailable => {
+                    DispatchError::AccessibilityPermissionUnavailable
+                }
+                SemanticDriverError::TargetNoLongerCurrent { disposition } => {
+                    DispatchError::TargetNoLongerCurrent { disposition }
+                }
+                SemanticDriverError::Transient { deadline_ms } => {
+                    DispatchError::SemanticDispatchTransient { deadline_ms }
+                }
+                SemanticDriverError::PathUnavailable => DispatchError::SemanticPathUnavailable,
+            },
+            DriverError::AccessibilityUnreadable(failure) => match failure {
+                crate::platform::AccessibilityReadFailure::PermissionRequired => {
+                    DispatchError::AccessibilityPermissionUnavailable
+                }
+                crate::platform::AccessibilityReadFailure::TargetGone => {
+                    DispatchError::TargetNoLongerCurrent {
+                        disposition: TargetDisposition::Gone,
+                    }
+                }
+                crate::platform::AccessibilityReadFailure::TargetReplaced => {
+                    DispatchError::TargetNoLongerCurrent {
+                        disposition: TargetDisposition::Replaced,
+                    }
+                }
+                crate::platform::AccessibilityReadFailure::RetryableDeadlineExceeded => {
+                    DispatchError::SemanticDispatchTransient { deadline_ms: 3_000 }
+                }
+                crate::platform::AccessibilityReadFailure::TargetNotInspectable
+                | crate::platform::AccessibilityReadFailure::TreeExceedsBound
+                | crate::platform::AccessibilityReadFailure::IncompatiblePlatformValue
+                | crate::platform::AccessibilityReadFailure::PlatformReadFailed => {
+                    DispatchError::SemanticPathUnavailable
+                }
+            },
+            DriverError::ElementNotFound => DispatchError::ElementNotFound {
+                key_form: semantic.element.element_name.key_form(),
+            },
+            DriverError::Unsupported(_)
+            | DriverError::InvalidRequest(_)
+            | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
         }
     }
 

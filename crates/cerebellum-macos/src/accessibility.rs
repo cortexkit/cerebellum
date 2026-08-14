@@ -339,6 +339,8 @@ pub enum AxActionError {
     ActionNotAdvertised {
         element_name: AxElementName,
         action: AxAction,
+        /// The exact action-name list read for this refusal.
+        advertised: Vec<String>,
     },
     ApplicationRefusedAction {
         element_name: AxElementName,
@@ -394,6 +396,7 @@ impl fmt::Display for AxActionError {
             Self::ActionNotAdvertised {
                 element_name,
                 action,
+                ..
             } => write!(
                 formatter,
                 "element named by {element_name} did not advertise {}",
@@ -1055,6 +1058,7 @@ fn request_action_from<Source: ActionSource>(
         return Err(AxActionError::ActionNotAdvertised {
             element_name: element_name.clone(),
             action,
+            advertised: advertised_actions,
         });
     }
 
@@ -3246,6 +3250,7 @@ mod tests {
             Err(AxActionError::ActionNotAdvertised {
                 element_name: role_title_name("AXButton", "Save"),
                 action: AxAction::Press,
+                advertised: vec!["AXShowMenu".to_string()],
             })
         );
         assert!(source.perform_attempts.is_empty());

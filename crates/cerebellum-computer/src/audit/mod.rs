@@ -8,8 +8,9 @@
 
 pub mod redaction;
 
+use crate::dispatch::DispatchError;
 use crate::grounding::ContainmentRung;
-use crate::platform::ActionKind;
+use crate::platform::{AccessibilityElementName, ActionKind, ProcessGrant};
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::codec::{
     CompletionInput, DispatchedInput, EncodedJournalState, JournalCodecError, PlaneJournalCodec,
@@ -384,7 +385,7 @@ fn recovery_classification_name(value: RecoveryClassification) -> &'static str {
         RecoveryClassification::UnmarkedOrphan => "unmarked_orphan",
         RecoveryClassification::FailedRejection => "failed_rejection",
         RecoveryClassification::FailedCommitment => "failed_commitment",
-        RecoveryClassification::ProvisionalDispatched => "provisional_dispatched",
+        RecoveryClassification::ProvisionalDispatched => "indeterminate",
     }
 }
 
@@ -681,6 +682,32 @@ impl TypedCaptureDispatch {
 pub struct TypedDispatchMaterial {
     pub bytes: Vec<u8>,
     pub severity_inputs: SeverityInputs,
+}
+
+/// The accessibility names known for the exact element an intent may actuate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActuationElementIdentity {
+    pub matched_by: AccessibilityElementName,
+    pub alternate_name: Option<AccessibilityElementName>,
+}
+
+/// Durable material written before an actuation can reach a platform driver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActuationIntent {
+    pub element: Option<ActuationElementIdentity>,
+    pub action: String,
+    pub grant_identity: ProcessGrant,
+}
+
+/// What is known after an actuation intent has been journaled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ActuationOutcome {
+    HandlerReturned,
+    Refused { refusal: DispatchError },
+    NoAction { refusal: DispatchError },
 }
 
 /// Adapter-owned gate used when building capability advertisements.
@@ -1107,6 +1134,52 @@ where
         )?)
     }
 
+    /// Persist one complete actuation intent before the platform can receive it.
+    pub fn commit_actuation_intent(
+        &mut self,
+        handle: ReservationHandle,
+        descriptor: &ComputerPlaneDescriptor,
+        intent: &ActuationIntent,
+    ) -> Result<DispatchCommitmentToken, ComputerAuditError> {
+        let bytes = serde_json::to_vec(intent)
+            .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        let grant_decision = serde_json::to_vec(&intent.grant_identity)
+            .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        self.commit_dispatched(
+            handle,
+            &TypedDispatchMaterial {
+                bytes,
+                severity_inputs: descriptor.severity_inputs(),
+            },
+            grant_decision,
+            None,
+        )
+    }
+
+    /// Persist the handler result or typed refusal before returning it upstream.
+    pub fn finalize_actuation_outcome(
+        &mut self,
+        token: DispatchCommitmentToken,
+        outcome: &ActuationOutcome,
+    ) -> Result<Committed, ComputerAuditError> {
+        let bytes = serde_json::to_vec(outcome)
+            .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        self.finalize_dispatched(token, bytes, Vec::new())
+    }
+
+    /// Close a gate refusal while explicitly recording that no action was sent.
+    pub fn finalize_actuation_no_action(
+        &mut self,
+        handle: ReservationHandle,
+        refusal: &DispatchError,
+    ) -> Result<Committed, ComputerAuditError> {
+        let bytes = serde_json::to_vec(&ActuationOutcome::NoAction {
+            refusal: refusal.clone(),
+        })
+        .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        self.finalize_rejected(handle, bytes)
+    }
+
     pub fn finalize_dispatched(
         &mut self,
         token: DispatchCommitmentToken,
@@ -1361,6 +1434,21 @@ where
         action_obligation_id: ActionObligationId,
     ) -> Result<cerebellum_core::journal::ObligationAuditRecord, JournalError> {
         self.journal.read_obligation_audit(action_obligation_id)
+    }
+
+    pub fn read_computer_audit_record(
+        &self,
+        action_obligation_id: ActionObligationId,
+    ) -> Result<ComputerAuditRecord, ComputerAuditError> {
+        let record = self.journal.read_obligation_audit(action_obligation_id)?;
+        let descriptor = ComputerPlaneDescriptor::decode(&record.descriptor_bytes)
+            .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        Ok(ComputerAuditRecord {
+            action_obligation_id,
+            descriptor,
+            severity: record.severity,
+            terminal_kind: record.terminal_kind.map(ComputerTerminalKind::from),
+        })
     }
 
     pub fn recover_active(&mut self) -> Vec<cerebellum_core::journal::CoreRecoveryOutcome> {
