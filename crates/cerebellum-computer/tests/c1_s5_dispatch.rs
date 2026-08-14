@@ -1,3 +1,7 @@
+use cerebellum_computer::audit::ComputerAudit;
+use cerebellum_computer::capture_custody::{
+    CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+};
 use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
     authorize_escalation, retry_decision, AbortReason, AttemptDisposition, AttendanceContext,
@@ -10,7 +14,115 @@ use cerebellum_computer::platform::containment::{
     ProcessIdentityObservation, ProcessIdentityPrimitive,
 };
 use cerebellum_computer::platform::*;
+use cerebellum_core::identity::SessionKind;
+use cerebellum_core::journal::storage::JournalStorage;
+use cerebellum_core::journal::{
+    DurableState, EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig,
+    JournalIdentity, LifecycleState, ObservabilityClass, RecoveryClassification, Redactor,
+    SeverityInputs, SeverityRecord, StorageError, ValidatedSeverityTaxonomy,
+};
+use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+struct TestRedactor;
+
+impl Redactor for TestRedactor {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn redact(
+        &self,
+        input: &str,
+        _max_bytes: usize,
+    ) -> Result<String, cerebellum_core::journal::RedactionUnavailable> {
+        Ok(input.to_string())
+    }
+}
+
+fn taxonomy() -> ValidatedSeverityTaxonomy {
+    ValidatedSeverityTaxonomy::new(
+        "dispatch-test-v1",
+        [
+            EffectClass::Read,
+            EffectClass::Mutate,
+            EffectClass::Authorize,
+        ]
+        .into_iter()
+        .flat_map(|effect| {
+            [
+                IsolationClass::ResourceScoped,
+                IsolationClass::OwnerScoped,
+                IsolationClass::Uncontained,
+            ]
+            .into_iter()
+            .flat_map(move |isolation| {
+                [
+                    ObservabilityClass::HumanObserved,
+                    ObservabilityClass::HumanUnobserved,
+                ]
+                .into_iter()
+                .map(move |observation| {
+                    (
+                        SeverityInputs {
+                            effect_class: effect,
+                            isolation_class: isolation,
+                            observability_class: observation,
+                        },
+                        SeverityRecord {
+                            tier: 2,
+                            credential: false,
+                            financial: false,
+                        },
+                    )
+                })
+            })
+        }),
+    )
+    .unwrap()
+}
+
+fn audit_identity() -> JournalIdentity {
+    JournalIdentity {
+        principal: "prefrontal".into(),
+        conversation_key: "conversation-1".into(),
+        agent_project_id: "project-1".into(),
+        session_kind: SessionKind::Primary,
+    }
+}
+
+fn audit_with_storage<S: JournalStorage>(
+    storage: S,
+) -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, S> {
+    let custody = CaptureCustody::new(
+        CustodyBounds {
+            maximum_verification_duration_ms: 100,
+            maximum_pin_lifetime_ms: 50,
+            maximum_concurrently_pinned_artifacts: 4,
+            maximum_total_pinned_artifact_bytes: 10_000,
+            maximum_custody_attachment_bytes: 2_000,
+        },
+        InMemoryGrantAuthority::default(),
+        InMemoryCustodyStorage::new(),
+    )
+    .unwrap();
+    ComputerAudit::new(
+        TestRedactor,
+        taxonomy(),
+        JournalConfig {
+            journal_retention_bytes: 20_000,
+            journal_max_entry_bytes: 4_000,
+        },
+        storage,
+        custody,
+    )
+    .unwrap()
+}
+
+fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
+    audit_with_storage(InMemoryJournalStorage::new())
+}
 
 fn target() -> ProcessGrant {
     ProcessGrant {
@@ -58,6 +170,59 @@ fn fronting(at: u64) -> FrontingSnapshot {
     }
 }
 
+#[derive(Debug, Default)]
+struct DispatchProbe {
+    latest_state: Option<Value>,
+    intent_was_durable_at_dispatch: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RecordingJournalStorage {
+    inner: InMemoryJournalStorage,
+    probe: Arc<Mutex<DispatchProbe>>,
+}
+
+impl RecordingJournalStorage {
+    fn new(probe: Arc<Mutex<DispatchProbe>>) -> Self {
+        Self {
+            inner: InMemoryJournalStorage::new(),
+            probe,
+        }
+    }
+}
+
+impl JournalStorage for RecordingJournalStorage {
+    fn load(&self) -> Result<DurableState, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, state: &DurableState) -> Result<(), StorageError> {
+        self.inner.save(state)?;
+        self.probe.lock().unwrap().latest_state = Some(serde_json::to_value(state).unwrap());
+        Ok(())
+    }
+}
+
+fn has_durable_intent(state: &Value) -> bool {
+    state["reservations"]
+        .as_object()
+        .is_some_and(|reservations| {
+            reservations
+                .values()
+                .any(|reservation| reservation["state"] == json!("dispatched"))
+        })
+}
+
+fn decode_embedded_json(value: &Value) -> Value {
+    let bytes = value
+        .as_array()
+        .expect("journal material is a byte array")
+        .iter()
+        .map(|byte| byte.as_u64().expect("journal byte is numeric") as u8)
+        .collect::<Vec<_>>();
+    serde_json::from_slice(&bytes).expect("journal material is JSON")
+}
+
 #[derive(Debug)]
 struct RecordingDriver {
     semantic_result: Result<cerebellum_computer::platform::DispatchResult, DriverError>,
@@ -77,6 +242,8 @@ struct RecordingDriver {
     /// the wrong application returns an answer of exactly the same shape as one
     /// that ran against the right one.
     effect_targets: Vec<ProcessGrant>,
+    dispatch_probe: Option<Arc<Mutex<DispatchProbe>>>,
+    panic_during_semantic_dispatch: bool,
 }
 
 impl Default for RecordingDriver {
@@ -113,6 +280,8 @@ impl Default for RecordingDriver {
             per_pid_calls: 0,
             global_calls: 0,
             effect_calls: 0,
+            dispatch_probe: None,
+            panic_during_semantic_dispatch: false,
         }
     }
 }
@@ -141,6 +310,14 @@ impl PlatformDriver for RecordingDriver {
         _request: SemanticDispatchRequest,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         self.semantic_calls += 1;
+        if let Some(probe) = &self.dispatch_probe {
+            let mut probe = probe.lock().unwrap();
+            probe.intent_was_durable_at_dispatch =
+                probe.latest_state.as_ref().is_some_and(has_durable_intent);
+        }
+        if self.panic_during_semantic_dispatch {
+            panic!("simulated process crash after durable intent");
+        }
         self.semantic_result.clone()
     }
     fn dispatch_per_pid(
@@ -241,6 +418,7 @@ fn background_attendance() -> AttendanceContext {
 fn semantic_request(row: FrozenDispatchRow) -> DispatchRequest {
     let element = ElementResolutionResult {
         element_name: AccessibilityElementName::Identifier("element-1".into()),
+        alternate_name: None,
         owning_process: target(),
         semantic_actions: vec!["press".into()],
     };
@@ -292,9 +470,11 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
     };
     let mut dispatcher = Dispatcher::new(driver);
     let report = dispatcher
-        .dispatch(semantic_request(
-            FrozenDispatchRow::for_capability("computer.click").unwrap(),
-        ))
+        .dispatch(
+            &mut audit(),
+            audit_identity(),
+            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+        )
         .unwrap();
     assert_eq!(
         report.delivery_primitive,
@@ -346,7 +526,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
     .with_synthetic(1, false);
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
-        dispatcher.dispatch(request),
+        dispatcher.dispatch(&mut audit(), audit_identity(), request),
         Err(DispatchError::EnvelopeUnrecognized)
     );
     assert_eq!(dispatcher.driver().per_pid_calls, 0);
@@ -374,7 +554,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
-        dispatcher.dispatch(request),
+        dispatcher.dispatch(&mut audit(), audit_identity(), request),
         Err(DispatchError::AttendanceUnavailable)
     );
     assert_eq!(dispatcher.driver().per_pid_calls, 0);
@@ -408,13 +588,28 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
     .with_synthetic(1, false)
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let mut dispatcher = Dispatcher::new(driver);
-    let sequence = dispatcher.dispatch_sequence([request]).unwrap();
+    let mut audit = audit();
+    let sequence = dispatcher
+        .dispatch_sequence(&mut audit, &audit_identity(), [request])
+        .unwrap();
     assert_eq!(sequence.completed.len(), 0);
     assert_eq!(
         sequence.abort.unwrap().reason,
         AbortReason::UserSeizedControl
     );
     assert_eq!(dispatcher.driver().global_calls, 0);
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], json!("rejected"));
+    assert_eq!(
+        decode_embedded_json(&entry["rejection_material"]),
+        json!({
+            "outcome": "no_action",
+            "refusal": {"reason": "user_seized_control"},
+        })
+    );
 
     let mut watcher = SeizeWatcher::new(50);
     assert!(watcher.queue_post());
@@ -443,7 +638,9 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
     )
     .with_synthetic(1, true);
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
-    let report = dispatcher.dispatch(request).unwrap();
+    let report = dispatcher
+        .dispatch(&mut audit(), audit_identity(), request)
+        .unwrap();
     assert_eq!(
         report.delivery_primitive,
         cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
@@ -497,7 +694,9 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
     )
     .with_synthetic(1, false);
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
-    assert!(dispatcher.dispatch(valid_request).is_ok());
+    assert!(dispatcher
+        .dispatch(&mut audit(), audit_identity(), valid_request)
+        .is_ok());
     assert_eq!(dispatcher.driver().per_pid_calls, 1);
 
     let expired_request = DispatchRequest::new(
@@ -526,7 +725,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
     )
     .with_synthetic(1, false);
     assert_eq!(
-        dispatcher.dispatch(expired_request),
+        dispatcher.dispatch(&mut audit(), audit_identity(), expired_request),
         Err(DispatchError::AttendanceUnavailable)
     );
     assert_eq!(dispatcher.driver().per_pid_calls, 1);
@@ -720,7 +919,9 @@ fn seize_latency_must_fit_between_observed_posts() {
     .with_synthetic(1, false)
     .with_focus_plan(FocusCheckPlan::immediate(1));
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
-    let result = dispatcher.dispatch_sequence([first, second]).unwrap();
+    let result = dispatcher
+        .dispatch_sequence(&mut audit(), &audit_identity(), [first, second])
+        .unwrap();
     assert_eq!(result.completed.len(), 1);
     assert_eq!(
         result.abort.unwrap().reason,
@@ -730,41 +931,40 @@ fn seize_latency_must_fit_between_observed_posts() {
 }
 
 #[test]
-fn semantic_unavailability_uses_only_the_selected_background_primitive() {
+fn unsupported_semantic_path_reaches_the_caller_without_a_synthetic_retry() {
     let driver = RecordingDriver {
         semantic_result: Err(DriverError::Unsupported("semantic")),
         ..RecordingDriver::default()
     };
-    let element = ElementResolutionResult {
-        element_name: AccessibilityElementName::Identifier("element-1".into()),
-        owning_process: target(),
-        semantic_actions: vec!["press".into()],
-    };
-    let request = DispatchRequest::new(
-        FrozenDispatchRow::for_capability("computer.click").unwrap(),
-        DispatchMode::Background,
-        target(),
-        ExpectedPostCondition::new(
-            "effect-v1",
-            PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
-                expected: true,
-            },
-        ),
-        background_attendance(),
-        0,
-    )
-    .with_semantic(element, "press")
-    .with_synthetic(1, false);
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
+        .with_synthetic(1, false);
     let mut dispatcher = Dispatcher::new(driver);
-    let report = dispatcher.dispatch(request).unwrap();
+    let mut audit = audit();
+
+    let refusal = dispatcher
+        .dispatch(&mut audit, audit_identity(), request)
+        .expect_err("an unsupported semantic attempt is not retried through another primitive");
+
+    assert_eq!(refusal, DispatchError::SemanticPathUnavailable);
     assert_eq!(
-        report.delivery_primitive,
-        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+        serde_json::to_value(&refusal).unwrap(),
+        json!({"reason": "semantic_path_unavailable"})
     );
     assert_eq!(dispatcher.driver().semantic_calls, 1);
-    assert_eq!(dispatcher.driver().per_pid_calls, 1);
+    assert_eq!(dispatcher.driver().per_pid_calls, 0);
     assert_eq!(dispatcher.driver().global_calls, 0);
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], json!("finalized"));
+    assert_eq!(
+        decode_embedded_json(&entry["completed_result"]),
+        json!({
+            "outcome": "refused",
+            "refusal": {"reason": "semantic_path_unavailable"},
+        })
+    );
 }
 
 #[test]
@@ -793,7 +993,7 @@ fn observed_focus_mismatch_prevents_the_global_post() {
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
-        dispatcher.dispatch(request),
+        dispatcher.dispatch(&mut audit(), audit_identity(), request),
         Err(DispatchError::TargetFocusMismatch)
     );
     assert_eq!(dispatcher.driver().global_calls, 0);
@@ -807,9 +1007,11 @@ fn unavailable_effect_observer_is_one_indeterminate_status() {
     };
     let mut dispatcher = Dispatcher::new(driver);
     let report = dispatcher
-        .dispatch(semantic_request(
-            FrozenDispatchRow::for_capability("computer.click").unwrap(),
-        ))
+        .dispatch(
+            &mut audit(),
+            audit_identity(),
+            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+        )
         .unwrap();
     assert_eq!(report.effect.status, EffectStatus::EffectIndeterminate);
     assert_eq!(report.effect.observation_attempts, 1);
@@ -826,7 +1028,9 @@ fn fronting_downgrade_is_a_success_with_exact_global_none_evidence() {
     };
     let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
     let mut dispatcher = Dispatcher::new(driver);
-    let report = dispatcher.dispatch(request).unwrap();
+    let report = dispatcher
+        .dispatch(&mut audit(), audit_identity(), request)
+        .unwrap();
     assert_eq!(
         report.containment.containment_rung,
         Some(cerebellum_computer::platform::containment::ContainmentRung::GlobalNone)
@@ -864,6 +1068,7 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
         .with_semantic(
             ElementResolutionResult {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
+                alternate_name: None,
                 owning_process: foreign,
                 semantic_actions: vec!["press".into()],
             },
@@ -872,7 +1077,9 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
         .with_synthetic(1, false);
 
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
-    let report = dispatcher.dispatch(request).unwrap();
+    let report = dispatcher
+        .dispatch(&mut audit(), audit_identity(), request)
+        .unwrap();
 
     assert_eq!(
         dispatcher.driver().semantic_calls,
@@ -890,40 +1097,52 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
     );
 }
 
-/// An action the element does not advertise does not take the semantic path.
-///
-/// Asking an application to perform an action it never offered is asking it to
-/// do something the caller invented. The lower layer refuses this too, and the
-/// refusals are not redundant: this one decides which PATH is taken, and a
-/// decision that reached the driver and was refused there would report a
-/// semantic attempt that could never have worked.
+/// A gate refusal is a finalized audit event even though no handler ran.
 #[test]
-fn an_unadvertised_action_does_not_take_the_semantic_path() {
-    let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
-    request = request
+fn a_pre_dispatch_refusal_writes_a_finalized_no_action_entry() {
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
         .with_semantic(
             ElementResolutionResult {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
+                alternate_name: None,
                 owning_process: target(),
-                // The element offers only "press".
                 semantic_actions: vec!["press".into()],
             },
             "confirm",
         )
         .with_synthetic(1, false);
-
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
-    let report = dispatcher.dispatch(request).unwrap();
+    let mut audit = audit();
+
+    let refusal = dispatcher
+        .dispatch(&mut audit, audit_identity(), request)
+        .expect_err("an unadvertised action is refused before dispatch");
 
     assert_eq!(
-        dispatcher.driver().semantic_calls,
-        0,
-        "an action the element does not advertise reached the semantic path"
+        serde_json::to_value(&refusal).unwrap(),
+        json!({
+            "reason": "action_not_advertised",
+            "action": "confirm",
+            "advertised": ["press"],
+        })
     );
+    assert_eq!(dispatcher.driver().semantic_calls, 0);
+    assert_eq!(dispatcher.driver().per_pid_calls, 0);
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], json!("rejected"));
     assert_eq!(
-        report.delivery_primitive,
-        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+        decode_embedded_json(&entry["rejection_material"]),
+        json!({
+            "outcome": "no_action",
+            "refusal": {
+                "reason": "action_not_advertised",
+                "action": "confirm",
+                "advertised": ["press"],
+            },
+        })
     );
 }
 
@@ -942,9 +1161,11 @@ fn an_unadvertised_action_does_not_take_the_semantic_path() {
 fn the_effect_is_observed_in_the_authorised_application() {
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     dispatcher
-        .dispatch(semantic_request(
-            FrozenDispatchRow::for_capability("computer.click").unwrap(),
-        ))
+        .dispatch(
+            &mut audit(),
+            audit_identity(),
+            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+        )
         .unwrap();
 
     assert_eq!(
@@ -994,4 +1215,216 @@ fn a_recorded_condition_can_be_decided_when_it_is_read_back() {
         },
     );
     assert_eq!(outcome, ConditionOutcome::Satisfied);
+}
+
+#[test]
+fn every_semantic_refusal_reaches_the_caller_with_its_remedy_payload() {
+    let cases = vec![
+        (
+            DriverError::Semantic(SemanticDriverError::ElementNameAmbiguous {
+                key_form: AccessibilityKeyForm::RoleAndTitle,
+                match_count: 30,
+            }),
+            json!({
+                "reason": "element_name_ambiguous",
+                "key_form": "role_and_title",
+                "match_count": 30,
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::ElementNotFound {
+                key_form: AccessibilityKeyForm::Identifier,
+            }),
+            json!({
+                "reason": "element_not_found",
+                "key_form": "identifier",
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::ActionNotAdvertised {
+                action: "press".to_string(),
+                advertised: vec!["confirm".to_string(), "cancel".to_string()],
+            }),
+            json!({
+                "reason": "action_not_advertised",
+                "action": "press",
+                "advertised": ["confirm", "cancel"],
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::ApplicationRefused { ax_error: -25205 }),
+            json!({
+                "reason": "application_refused",
+                "ax_error": -25205,
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::AccessibilityPermissionUnavailable),
+            json!({"reason": "accessibility_permission_unavailable"}),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::TargetNoLongerCurrent {
+                disposition: TargetDisposition::Gone,
+            }),
+            json!({
+                "reason": "target_no_longer_current",
+                "disposition": "gone",
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::TargetNoLongerCurrent {
+                disposition: TargetDisposition::Replaced,
+            }),
+            json!({
+                "reason": "target_no_longer_current",
+                "disposition": "replaced",
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::Transient { deadline_ms: 3_000 }),
+            json!({
+                "reason": "semantic_dispatch_transient",
+                "deadline_ms": 3_000,
+            }),
+        ),
+        (
+            DriverError::Semantic(SemanticDriverError::PathUnavailable),
+            json!({"reason": "semantic_path_unavailable"}),
+        ),
+    ];
+
+    for (driver_error, expected_caller_payload) in cases {
+        let driver = RecordingDriver {
+            semantic_result: Err(driver_error),
+            ..RecordingDriver::default()
+        };
+        let mut dispatcher = Dispatcher::new(driver);
+        let mut audit = audit();
+        let refusal = dispatcher
+            .dispatch(
+                &mut audit,
+                audit_identity(),
+                semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+            )
+            .expect_err("the semantic driver refusal reaches its caller");
+
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            expected_caller_payload,
+            "caller received the wrong semantic remedy for {refusal:?}"
+        );
+        assert_eq!(dispatcher.driver().semantic_calls, 1);
+        assert_eq!(dispatcher.driver().per_pid_calls, 0);
+    }
+}
+
+#[test]
+fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
+    let probe = Arc::new(Mutex::new(DispatchProbe::default()));
+    let storage = RecordingJournalStorage::new(probe.clone());
+    let driver = RecordingDriver {
+        dispatch_probe: Some(probe.clone()),
+        ..RecordingDriver::default()
+    };
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
+        .with_semantic(
+            ElementResolutionResult {
+                element_name: AccessibilityElementName::Identifier("element-1".into()),
+                alternate_name: Some(AccessibilityElementName::RoleAndTitle {
+                    role: "AXButton".into(),
+                    title: "Save".into(),
+                }),
+                owning_process: target(),
+                semantic_actions: vec!["press".into()],
+            },
+            "press",
+        );
+    let mut dispatcher = Dispatcher::new(driver);
+    let mut audit = audit_with_storage(storage);
+
+    dispatcher
+        .dispatch(&mut audit, audit_identity(), request)
+        .expect("the handler-returned outcome is durable before success returns");
+
+    assert!(
+        probe.lock().unwrap().intent_was_durable_at_dispatch,
+        "the platform driver ran before the intent reached durable storage"
+    );
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], json!("finalized"));
+    assert_eq!(
+        decode_embedded_json(&entry["dispatch_material"]),
+        json!({
+            "element": {
+                "matched_by": {"Identifier": "element-1"},
+                "alternate_name": {
+                    "RoleAndTitle": {"role": "AXButton", "title": "Save"},
+                },
+            },
+            "action": "press",
+            "grant_identity": {
+                "pid": 42,
+                "bundle_identity": "com.example.target",
+                "process_generation_evidence": "generation-1",
+            },
+        })
+    );
+    assert_eq!(
+        decode_embedded_json(&entry["completed_result"]),
+        json!({"outcome": "handler_returned"})
+    );
+    let record = audit.read_computer_audit_record(1).unwrap();
+    assert_eq!(
+        record.descriptor.capability,
+        cerebellum_computer::audit::ComputerCapability::Click
+    );
+    assert_eq!(
+        record.terminal_kind,
+        Some(cerebellum_computer::audit::ComputerTerminalKind::FinalizedCommitted)
+    );
+}
+
+#[test]
+fn a_crash_between_intent_and_outcome_remains_indeterminate_and_is_not_retried() {
+    let probe = Arc::new(Mutex::new(DispatchProbe::default()));
+    let storage = RecordingJournalStorage::new(probe.clone());
+    let driver = RecordingDriver {
+        dispatch_probe: Some(probe),
+        panic_during_semantic_dispatch: true,
+        ..RecordingDriver::default()
+    };
+    let mut dispatcher = Dispatcher::new(driver);
+    let mut audit = audit_with_storage(storage);
+
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = dispatcher.dispatch(
+            &mut audit,
+            audit_identity(),
+            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+        );
+    }));
+    assert!(crash.is_err(), "the fixture did not interrupt dispatch");
+    assert_eq!(
+        audit.read_obligation_audit(1).unwrap().lifecycle,
+        LifecycleState::Dispatched
+    );
+    assert_eq!(dispatcher.driver().semantic_calls, 1);
+
+    let recovery = audit.recover_active();
+    assert_eq!(recovery.len(), 1);
+    assert_eq!(
+        recovery[0].classification,
+        RecoveryClassification::ProvisionalDispatched
+    );
+    assert_eq!(dispatcher.driver().semantic_calls, 1);
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], json!("recovery_terminal"));
+    assert_eq!(entry["classification"], json!("indeterminate"));
+    assert!(entry.get("completed_result").is_none());
 }
