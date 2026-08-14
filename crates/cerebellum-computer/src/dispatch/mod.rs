@@ -296,9 +296,70 @@ pub enum DispatchError {
     IdentityVerificationUnavailable,
     EffectObservationUnavailable,
     BackgroundUnsupportedTarget,
-    ContainmentRefused,
     Platform,
     AuditUnavailable,
+}
+
+/// Every dispatch reason code is distinct.
+///
+/// Two variants sharing a wire string collapse them for the caller, which is
+/// the same defect as a catch-all arm reached one layer later: the remedies
+/// differ and nothing downstream can tell which applies. It is also invisible
+/// to every other kind of test, because both variants individually render a
+/// string that reads correct.
+///
+/// This fires on the ADDITION rather than on the use, which matters because a
+/// duplicate can be introduced by a variant nobody constructs yet -- one was,
+/// and it survived until a reviewer read the arms side by side.
+#[cfg(test)]
+mod reason_code_tests {
+    use super::*;
+
+    #[test]
+    fn no_two_dispatch_errors_share_a_reason_code() {
+        // Listed by hand rather than derived, so adding a variant forces a
+        // decision here. A macro over the enum would keep this green by
+        // construction and prove nothing.
+        let all = [
+            DispatchError::InvalidRequest,
+            DispatchError::SyntheticUnavailable,
+            DispatchError::EnvelopeUnrecognized,
+            DispatchError::UnsupportedMode,
+            DispatchError::ObserverUnavailable,
+            DispatchError::UserSeizedControl,
+            DispatchError::AttendanceUnavailable,
+            DispatchError::TargetFocusMismatch,
+            DispatchError::GroundingUntrusted,
+            DispatchError::StaleElement,
+            DispatchError::StaleGrounding,
+            DispatchError::GrantIdentityMismatch,
+            DispatchError::IdentityVerificationUnavailable,
+            DispatchError::EffectObservationUnavailable,
+            DispatchError::BackgroundUnsupportedTarget,
+            DispatchError::Platform,
+            DispatchError::AuditUnavailable,
+        ];
+
+        let mut seen: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        for error in &all {
+            *seen.entry(error.reason_code()).or_insert(0) += 1;
+        }
+        let shared: Vec<_> = seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(code, count)| format!("{code} is used by {count} variants"))
+            .collect();
+        assert!(
+            shared.is_empty(),
+            "dispatch reason codes must be distinct, or a caller cannot tell \
+             which remedy applies: {shared:?}"
+        );
+        assert_eq!(
+            seen.len(),
+            all.len(),
+            "every listed variant must contribute a code"
+        );
+    }
 }
 
 impl DispatchError {
@@ -327,7 +388,6 @@ impl DispatchError {
             Self::IdentityVerificationUnavailable => "identity_verification_unavailable",
             Self::EffectObservationUnavailable => "observation_primitive_unavailable",
             Self::BackgroundUnsupportedTarget => "background_unsupported_target",
-            Self::ContainmentRefused => "identity_verification_unavailable",
             Self::Platform => "platform_error",
             Self::AuditUnavailable => "audit_unavailable",
         }
