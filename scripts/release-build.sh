@@ -115,6 +115,49 @@ for name in "${ATTESTATIONS[@]}"; do
   printf '    %-48s %s\n' "$name" "${!name:-<unbound>}"
 done
 
+# The sibling revision this binary is built against.
+#
+# --locked below fences the REGISTRY half of the dependency set: a registry
+# crate records its source and checksum in Cargo.lock, so its exact bytes are
+# pinned. A PATH dependency records NEITHER -- compare the subc-protocol entry
+# in Cargo.lock against serde's and the difference is visible. So a sibling
+# whose SOURCE moved without a version bump satisfies --locked completely, and
+# most commits do not bump a version.
+#
+# That is the half a lockfile cannot reach, so it is declared here instead:
+# the build refuses unless the sibling checkout is exactly this commit and its
+# tree is clean. Re-pinning is then a deliberate commit that the gate verifies,
+# rather than a consequence of whichever afternoon the build happened to run.
+DECLARED_SIBLING_REV="$(tr -d '[:space:]' < "$(dirname "$0")/../subconscious-revision.txt")"
+SIBLING_DIR="$(cd "$(dirname "$0")/../../subconscious" 2>/dev/null && pwd || true)"
+
+if [ -z "$SIBLING_DIR" ]; then
+  echo "The subconscious checkout is not beside this repository." >&2
+  echo "Every workspace dependency resolves through it, so there is nothing" >&2
+  echo "to build against. Nothing has been produced." >&2
+  exit 2
+fi
+
+ACTUAL_SIBLING_REV="$(git -C "$SIBLING_DIR" rev-parse HEAD)"
+if [ "$ACTUAL_SIBLING_REV" != "$DECLARED_SIBLING_REV" ]; then
+  echo "The subconscious checkout is not the revision this build declares." >&2
+  echo "  declared: $DECLARED_SIBLING_REV" >&2
+  echo "  actual:   $ACTUAL_SIBLING_REV" >&2
+  echo "" >&2
+  echo "A path dependency records no source or checksum in Cargo.lock, so" >&2
+  echo "--locked cannot see this and the binary would link code no gate has" >&2
+  echo "verified. If the move is intended, update subconscious-revision.txt" >&2
+  echo "and commit it, so the combination is verified before it ships." >&2
+  exit 2
+fi
+
+if [ -n "$(git -C "$SIBLING_DIR" status --porcelain)" ]; then
+  echo "The subconscious checkout has uncommitted changes." >&2
+  echo "A revision alone does not describe what would be compiled, so the" >&2
+  echo "declaration above cannot be honoured. Nothing has been produced." >&2
+  exit 2
+fi
+
 # --locked, because this repo's workspace dependencies are PATH deps on a
 # sibling checkout. Without it a release build re-resolves those siblings
 # against whatever the sibling happens to be at build time, so a binary can
