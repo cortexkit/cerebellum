@@ -115,7 +115,22 @@ for name in "${ATTESTATIONS[@]}"; do
   printf '    %-48s %s\n' "$name" "${!name:-<unbound>}"
 done
 
-cargo build --release -p cerebellum "$@"
+# --locked, because this repo's workspace dependencies are PATH deps on a
+# sibling checkout. Without it a release build re-resolves those siblings
+# against whatever the sibling happens to be at build time, so a binary can
+# ship linked to a version no gate ever verified -- and the only trace is a
+# rewritten Cargo.lock, which reads as ordinary post-build noise.
+#
+# "CI green and the staged sha matches" proves the placed artifact is the built
+# artifact. It says nothing about what that artifact was built AGAINST. This
+# flag is the other half: the stale-artifact check above asks whether the
+# SOURCE is the verified one, and this asks whether the DEPENDENCY SET is.
+#
+# When it refuses because a sibling moved, that refusal is the point. Commit
+# the new lockfile and let the gate verify the combination a staged binary
+# would carry, so re-resolving becomes a decision someone made rather than a
+# side effect of having built on a particular afternoon.
+cargo build --release --locked -p cerebellum "$@"
 
 echo
 echo "==> what this build advertises"
