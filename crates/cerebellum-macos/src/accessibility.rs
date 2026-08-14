@@ -125,27 +125,83 @@ impl Default for AxReadOptions {
     }
 }
 
-/// A non-empty `AXIdentifier` used to re-find an accessibility element.
+/// An owned key used to re-find an accessibility element.
 ///
-/// An action request searches the current tree for this exact identifier and
-/// proceeds only when exactly one element reports it. Keeping only owned text
-/// here ensures a request cannot reuse an `AXUIElement` retained from an older
-/// tree.
+/// The safety property is that exactly one current element matches the supplied
+/// key. `AXIdentifier` was only the original way to establish that property;
+/// applications often expose a unique `AXRole` and `AXTitle` pair instead.
+/// Neither form falls back to the other, and both are matched exactly. An
+/// element with no `AXTitle` is represented by an empty title, so untitled
+/// elements with the same role collide instead of being silently excluded.
+/// Keeping only owned text here also prevents a request from reusing an
+/// `AXUIElement` retained from an older tree.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AxElementName(String);
+pub enum AxElementName {
+    Identifier(String),
+    RoleAndTitle { role: String, title: String },
+}
 
 impl AxElementName {
-    pub fn new(identifier: impl Into<String>) -> Result<Self, AxElementNameError> {
+    pub fn identifier(identifier: impl Into<String>) -> Result<Self, AxElementNameError> {
         let identifier = identifier.into();
         if identifier.is_empty() {
             Err(AxElementNameError::EmptyIdentifier)
         } else {
-            Ok(Self(identifier))
+            Ok(Self::Identifier(identifier))
         }
     }
 
-    pub fn identifier(&self) -> &str {
-        &self.0
+    pub fn role_and_title(
+        role: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Result<Self, AxElementNameError> {
+        let role = role.into();
+        if role.is_empty() {
+            Err(AxElementNameError::EmptyRole)
+        } else {
+            Ok(Self::RoleAndTitle {
+                role,
+                title: title.into(),
+            })
+        }
+    }
+
+    fn matches(&self, identifier: Option<&str>, role: Option<&str>, title: Option<&str>) -> bool {
+        match self {
+            Self::Identifier(expected) => identifier == Some(expected.as_str()),
+            Self::RoleAndTitle {
+                role: expected_role,
+                title: expected_title,
+            } => {
+                role == Some(expected_role.as_str()) && title.unwrap_or_default() == expected_title
+            }
+        }
+    }
+
+    fn alternate_name(
+        &self,
+        identifier: Option<&str>,
+        role: Option<&str>,
+        title: Option<&str>,
+    ) -> Option<Self> {
+        match self {
+            Self::Identifier(_) => Some(Self::RoleAndTitle {
+                role: role?.to_owned(),
+                title: title.unwrap_or_default().to_owned(),
+            }),
+            Self::RoleAndTitle { .. } => identifier.map(|value| Self::Identifier(value.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for AxElementName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identifier(identifier) => write!(formatter, "AXIdentifier {identifier:?}"),
+            Self::RoleAndTitle { role, title } => {
+                write!(formatter, "AXRole {role:?} and AXTitle {title:?}")
+            }
+        }
     }
 }
 
@@ -153,12 +209,14 @@ impl AxElementName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxElementNameError {
     EmptyIdentifier,
+    EmptyRole,
 }
 
 impl fmt::Display for AxElementNameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyIdentifier => formatter.write_str("an AXIdentifier cannot be empty"),
+            Self::EmptyRole => formatter.write_str("an AXRole cannot be empty"),
         }
     }
 }
@@ -244,11 +302,16 @@ fn supported_tree_depth(requested: usize) -> usize {
 }
 
 /// What a successful accessibility action request establishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxActionRequestOutcome {
     /// The target application's action handler returned success. Accessibility
     /// does not report whether the handler changed any visible state.
-    HandlerReturned,
+    HandlerReturned {
+        /// The exact key supplied by the caller and used for the unique match.
+        matched_by: AxElementName,
+        /// The other supported key, when the matched element reported one.
+        alternate_name: Option<AxElementName>,
+    },
 }
 
 /// Why an accessibility action request could not be completed.
@@ -263,21 +326,22 @@ pub enum AxActionError {
         ax_error: i32,
     },
     ElementNotFound {
-        identifier: String,
+        element_name: AxElementName,
     },
     ElementIdentifierAmbiguous {
-        identifier: String,
+        element_name: AxElementName,
+        match_count: usize,
     },
     ElementUniquenessUnestablished {
-        identifier: String,
+        element_name: AxElementName,
         unreadable_subtrees: usize,
     },
     ActionNotAdvertised {
-        identifier: String,
+        element_name: AxElementName,
         action: AxAction,
     },
     ApplicationRefusedAction {
-        identifier: String,
+        element_name: AxElementName,
         action: AxAction,
         ax_error: i32,
     },
@@ -312,33 +376,36 @@ impl fmt::Display for AxActionError {
                 formatter,
                 "process {pid} did not expose accessibility values (AX error {ax_error})"
             ),
-            Self::ElementNotFound { identifier } => {
-                write!(formatter, "no element reports AXIdentifier {identifier:?}")
+            Self::ElementNotFound { element_name } => {
+                write!(formatter, "no element reports {element_name}")
             }
-            Self::ElementIdentifierAmbiguous { identifier } => write!(
-                formatter,
-                "more than one element reports AXIdentifier {identifier:?}"
-            ),
+            Self::ElementIdentifierAmbiguous {
+                element_name,
+                match_count,
+            } => write!(formatter, "{match_count} elements report {element_name}"),
             Self::ElementUniquenessUnestablished {
-                identifier,
+                element_name,
                 unreadable_subtrees,
             } => write!(
                 formatter,
-                "AXIdentifier uniqueness for {identifier:?} could not be established because \
+                "uniqueness for {element_name} could not be established because \
                  {unreadable_subtrees} subtrees were unreadable"
             ),
-            Self::ActionNotAdvertised { identifier, action } => write!(
+            Self::ActionNotAdvertised {
+                element_name,
+                action,
+            } => write!(
                 formatter,
-                "element {identifier:?} did not advertise {}",
+                "element named by {element_name} did not advertise {}",
                 action.name()
             ),
             Self::ApplicationRefusedAction {
-                identifier,
+                element_name,
                 action,
                 ax_error,
             } => write!(
                 formatter,
-                "element {identifier:?} refused {} (AX error {ax_error})",
+                "element named by {element_name} refused {} (AX error {ax_error})",
                 action.name()
             ),
             Self::DeadlineExceeded { timeout } => {
@@ -601,6 +668,8 @@ trait ElementSource {
 
 struct ActionSearchSnapshot<Handle> {
     identifier: Option<String>,
+    role: Option<String>,
+    title: Option<String>,
     children: Vec<Handle>,
 }
 
@@ -763,14 +832,19 @@ fn element_read_failure<Source: ElementSource>(
 
 enum ActionSearchError {
     Read(AxReadError),
-    AmbiguousIdentifier,
+}
+
+struct ActionTarget<Handle> {
+    handle: Handle,
+    alternate_name: Option<AxElementName>,
 }
 
 struct ActionSearchState<'a, Handle> {
     pid: u32,
     element_name: &'a AxElementName,
     count: usize,
-    found: Option<Handle>,
+    match_count: usize,
+    found: Option<ActionTarget<Handle>>,
     unreadable_subtrees: usize,
     options: AxActionOptions,
     deadline: &'a Deadline,
@@ -837,11 +911,22 @@ fn find_action_target<Source: ActionSource>(
             )))
         }
     };
-    if snapshot.identifier.as_deref() == Some(state.element_name.identifier()) {
-        if state.found.is_some() {
-            return Err(ActionSearchError::AmbiguousIdentifier);
+    if state.element_name.matches(
+        snapshot.identifier.as_deref(),
+        snapshot.role.as_deref(),
+        snapshot.title.as_deref(),
+    ) {
+        state.match_count += 1;
+        if state.found.is_none() {
+            state.found = Some(ActionTarget {
+                handle: handle.clone(),
+                alternate_name: state.element_name.alternate_name(
+                    snapshot.identifier.as_deref(),
+                    snapshot.role.as_deref(),
+                    snapshot.title.as_deref(),
+                ),
+            });
         }
-        state.found = Some(handle.clone());
     }
 
     ancestors.push(handle.clone());
@@ -877,11 +962,11 @@ fn map_perform_error<Source: ActionSource>(
                 }
             } else if code == AX_ERROR_INVALID_UI_ELEMENT {
                 AxActionError::ElementNotFound {
-                    identifier: element_name.identifier().to_owned(),
+                    element_name: element_name.clone(),
                 }
             } else if code == AX_ERROR_ACTION_UNSUPPORTED {
                 AxActionError::ApplicationRefusedAction {
-                    identifier: element_name.identifier().to_owned(),
+                    element_name: element_name.clone(),
                     action,
                     ax_error: code,
                 }
@@ -930,6 +1015,7 @@ fn request_action_from<Source: ActionSource>(
         pid,
         element_name,
         count: 0,
+        match_count: 0,
         found: None,
         unreadable_subtrees: 0,
         options,
@@ -938,24 +1024,26 @@ fn request_action_from<Source: ActionSource>(
     match find_action_target(source, &root, 0, &mut Vec::new(), &mut search) {
         Ok(()) => {}
         Err(ActionSearchError::Read(error)) => return Err(error.into()),
-        Err(ActionSearchError::AmbiguousIdentifier) => {
-            return Err(AxActionError::ElementIdentifierAmbiguous {
-                identifier: element_name.identifier().to_owned(),
-            });
-        }
+    }
+    if search.match_count > 1 {
+        return Err(AxActionError::ElementIdentifierAmbiguous {
+            element_name: element_name.clone(),
+            match_count: search.match_count,
+        });
     }
     // A visible match is not unique when another match could be hidden beneath
     // an unreadable element. Refuse before inspecting its actions so no handler
     // can run on a name whose uniqueness was not established.
     if search.unreadable_subtrees > 0 {
         return Err(AxActionError::ElementUniquenessUnestablished {
-            identifier: element_name.identifier().to_owned(),
+            element_name: element_name.clone(),
             unreadable_subtrees: search.unreadable_subtrees,
         });
     }
-    let element = search.found.ok_or_else(|| AxActionError::ElementNotFound {
-        identifier: element_name.identifier().to_owned(),
+    let target = search.found.ok_or_else(|| AxActionError::ElementNotFound {
+        element_name: element_name.clone(),
     })?;
+    let element = target.handle;
     deadline.remaining()?;
     let advertised_actions = source
         .action_names(&element, &deadline)
@@ -965,7 +1053,7 @@ fn request_action_from<Source: ActionSource>(
         .any(|advertised| advertised == action.name())
     {
         return Err(AxActionError::ActionNotAdvertised {
-            identifier: element_name.identifier().to_owned(),
+            element_name: element_name.clone(),
             action,
         });
     }
@@ -983,7 +1071,10 @@ fn request_action_from<Source: ActionSource>(
             timeout: deadline.timeout,
         });
     }
-    Ok(AxActionRequestOutcome::HandlerReturned)
+    Ok(AxActionRequestOutcome::HandlerReturned {
+        matched_by: element_name.clone(),
+        alternate_name: target.alternate_name,
+    })
 }
 
 fn read_tree_from<Source: ElementSource>(
@@ -1602,6 +1693,8 @@ mod platform {
         ) -> Result<ActionSearchSnapshot<Self::Handle>, SourceError> {
             Ok(ActionSearchSnapshot {
                 identifier: self.string_attribute(element, "AXIdentifier", deadline)?,
+                role: self.string_attribute(element, "AXRole", deadline)?,
+                title: self.string_attribute(element, "AXTitle", deadline)?,
                 children: self.children(element, deadline, child_budget)?,
             })
         }
@@ -1762,10 +1855,11 @@ mod platform {
 
     /// Ask one process to run an action its uniquely named current element advertises.
     ///
-    /// The element is found again by exact `AXIdentifier` within the supplied
-    /// bounds; no retained handle from a previous read is accepted. A successful
-    /// result says only that the application's handler returned success, not that
-    /// the action changed application or screen state.
+    /// The element is found again by the exact supplied `AXIdentifier` or
+    /// `AXRole`+`AXTitle` pair within the supplied bounds; no retained handle from
+    /// a previous read is accepted. A successful result says only that the
+    /// application's handler returned success, not that the action changed
+    /// application or screen state.
     pub fn request_accessibility_action(
         pid: u32,
         element_name: &AxElementName,
@@ -1923,6 +2017,8 @@ mod tests {
             let node = &self.nodes[*element];
             Ok(ActionSearchSnapshot {
                 identifier: node.identifier.clone(),
+                role: node.role.clone(),
+                title: node.title.clone(),
                 children: node.children.clone(),
             })
         }
@@ -2019,8 +2115,20 @@ mod tests {
         actions: &[AxAction],
         children: Vec<usize>,
     ) -> ElementSnapshot<usize> {
+        action_node_with_keys(identifier, None, None, actions, children)
+    }
+
+    fn action_node_with_keys(
+        identifier: Option<&str>,
+        role: Option<&str>,
+        title: Option<&str>,
+        actions: &[AxAction],
+        children: Vec<usize>,
+    ) -> ElementSnapshot<usize> {
         let mut node = node(children);
         node.identifier = identifier.map(str::to_owned);
+        node.role = role.map(str::to_owned);
+        node.title = title.map(str::to_owned);
         node.actions = actions
             .iter()
             .map(|action| action.name().to_owned())
@@ -2037,7 +2145,21 @@ mod tests {
     }
 
     fn element_name(identifier: &str) -> AxElementName {
-        AxElementName::new(identifier).expect("non-empty test identifier")
+        AxElementName::identifier(identifier).expect("non-empty test identifier")
+    }
+
+    fn role_title_name(role: &str, title: &str) -> AxElementName {
+        AxElementName::role_and_title(role, title).expect("non-empty test role")
+    }
+
+    fn identifier_outcome(
+        identifier: &str,
+        alternate_name: Option<AxElementName>,
+    ) -> AxActionRequestOutcome {
+        AxActionRequestOutcome::HandlerReturned {
+            matched_by: element_name(identifier),
+            alternate_name,
+        }
     }
 
     #[test]
@@ -2605,16 +2727,25 @@ mod tests {
     }
 
     #[test]
-    fn element_names_require_a_non_empty_exact_identifier() {
+    fn element_names_reject_empty_required_parts_and_keep_exact_values() {
         assert_eq!(
-            AxElementName::new(""),
+            AxElementName::identifier(""),
             Err(AxElementNameError::EmptyIdentifier)
         );
         assert_eq!(
-            AxElementName::new("toolbar.save")
-                .expect("non-empty identifier")
-                .identifier(),
-            "toolbar.save"
+            AxElementName::role_and_title("", "Save"),
+            Err(AxElementNameError::EmptyRole)
+        );
+        assert_eq!(
+            AxElementName::identifier("toolbar.save").expect("non-empty identifier"),
+            AxElementName::Identifier("toolbar.save".to_owned())
+        );
+        assert_eq!(
+            AxElementName::role_and_title("AXButton", "").expect("non-empty role"),
+            AxElementName::RoleAndTitle {
+                role: "AXButton".to_owned(),
+                title: String::new(),
+            }
         );
     }
 
@@ -2671,7 +2802,8 @@ mod tests {
                 action_options(usize::MAX, usize::MAX),
             ),
             Err(AxActionError::ElementIdentifierAmbiguous {
-                identifier: "target".to_string(),
+                element_name: element_name("target"),
+                match_count: 2,
             })
         );
         assert!(
@@ -2695,7 +2827,7 @@ mod tests {
                 AxAction::Press,
                 action_options(usize::MAX, usize::MAX),
             ),
-            Ok(AxActionRequestOutcome::HandlerReturned)
+            Ok(identifier_outcome("target", None))
         );
         assert_eq!(source.action_search_calls, 2);
         assert_eq!(source.performed_actions, vec![(1, AxAction::Press)]);
@@ -2717,13 +2849,270 @@ mod tests {
                 AxAction::Press,
                 action_options(2, 3),
             ),
-            Ok(AxActionRequestOutcome::HandlerReturned)
+            Ok(identifier_outcome("target", None))
         );
         assert_eq!(source.action_search_calls, 3);
         assert_eq!(source.action_name_calls, 1);
         assert_eq!(source.action_timeout_calls, 1);
         assert_eq!(source.perform_attempts, vec![(2, AxAction::Press)]);
         assert_eq!(source.performed_actions, vec![(2, AxAction::Press)]);
+    }
+
+    #[test]
+    fn a_unique_role_and_title_reaches_its_handler_and_echoes_both_keys() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1, 2]),
+            action_node_with_keys(
+                Some("other-id"),
+                Some("AXButton"),
+                Some("Other"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("save-id"),
+                Some("AXButton"),
+                Some("Save"),
+                &[AxAction::Press],
+                vec![],
+            ),
+        ]);
+        let matched_by = role_title_name("AXButton", "Save");
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &matched_by,
+                AxAction::Press,
+                action_options(2, 3),
+            ),
+            Ok(AxActionRequestOutcome::HandlerReturned {
+                matched_by,
+                alternate_name: Some(element_name("save-id")),
+            })
+        );
+        assert_eq!(source.performed_actions, vec![(2, AxAction::Press)]);
+    }
+
+    #[test]
+    fn identifier_success_echoes_the_supplied_key_and_the_role_title_key() {
+        let mut source = FakeSource::with_nodes(vec![action_node_with_keys(
+            Some("save-id"),
+            Some("AXButton"),
+            Some("Save"),
+            &[AxAction::Press],
+            vec![],
+        )]);
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &element_name("save-id"),
+                AxAction::Press,
+                action_options(0, 1),
+            ),
+            Ok(identifier_outcome(
+                "save-id",
+                Some(role_title_name("AXButton", "Save")),
+            ))
+        );
+    }
+
+    #[test]
+    fn an_identifier_request_does_not_fall_back_to_a_role_and_title_match() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1, 2, 3, 4]),
+            // This role+title resembles the requested identifier but carries no
+            // identifier, so accepting it would silently change key forms.
+            action_node_with_keys(
+                None,
+                Some("AXButton"),
+                Some("target"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("shared-id"),
+                Some("AXButton"),
+                Some("Duplicate"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("shared-id"),
+                Some("AXLink"),
+                Some("Other"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("unique-id"),
+                Some("AXButton"),
+                Some("Duplicate"),
+                &[AxAction::Press],
+                vec![],
+            ),
+        ]);
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &element_name("target"),
+                AxAction::Press,
+                action_options(2, 5),
+            ),
+            Err(AxActionError::ElementNotFound {
+                element_name: element_name("target"),
+            })
+        );
+        assert!(source.perform_attempts.is_empty());
+    }
+
+    #[test]
+    fn an_absent_role_and_title_is_reported_with_the_supplied_key() {
+        let mut source = FakeSource::with_nodes(vec![action_node_with_keys(
+            Some("save-id"),
+            Some("AXButton"),
+            Some("Other"),
+            &[AxAction::Press],
+            vec![],
+        )]);
+        let missing_name = role_title_name("AXButton", "Save");
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &missing_name,
+                AxAction::Press,
+                action_options(0, 1),
+            ),
+            Err(AxActionError::ElementNotFound {
+                element_name: missing_name,
+            })
+        );
+        assert!(source.perform_attempts.is_empty());
+    }
+
+    #[test]
+    fn three_role_and_title_matches_are_refused_with_key_form_and_count() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1, 2, 3]),
+            action_node_with_keys(
+                Some("first-id"),
+                Some("AXButton"),
+                Some("Save"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("second-id"),
+                Some("AXButton"),
+                Some("Save"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                None,
+                Some("AXButton"),
+                Some("Save"),
+                &[AxAction::Press],
+                vec![],
+            ),
+        ]);
+        let ambiguous_name = role_title_name("AXButton", "Save");
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &ambiguous_name,
+                AxAction::Press,
+                action_options(2, 4),
+            ),
+            Err(AxActionError::ElementIdentifierAmbiguous {
+                element_name: ambiguous_name,
+                match_count: 3,
+            })
+        );
+        assert_eq!(source.action_search_calls, 4);
+        assert_eq!(source.action_name_calls, 0);
+        assert!(source.perform_attempts.is_empty());
+    }
+
+    #[test]
+    fn role_and_title_matching_is_exact() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1, 2]),
+            action_node_with_keys(
+                Some("upper-id"),
+                Some("AXButton"),
+                Some("SAVE"),
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("save-id"),
+                Some("AXButton"),
+                Some("Save"),
+                &[AxAction::Press],
+                vec![],
+            ),
+        ]);
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &role_title_name("AXButton", "Save"),
+                AxAction::Press,
+                action_options(2, 3),
+            ),
+            Ok(AxActionRequestOutcome::HandlerReturned {
+                matched_by: role_title_name("AXButton", "Save"),
+                alternate_name: Some(element_name("save-id")),
+            })
+        );
+        assert_eq!(source.performed_actions, vec![(2, AxAction::Press)]);
+    }
+
+    #[test]
+    fn missing_and_empty_titles_share_one_role_title_key_and_are_ambiguous() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1, 2]),
+            action_node_with_keys(
+                Some("missing-title-id"),
+                Some("AXButton"),
+                None,
+                &[AxAction::Press],
+                vec![],
+            ),
+            action_node_with_keys(
+                Some("empty-title-id"),
+                Some("AXButton"),
+                Some(""),
+                &[AxAction::Press],
+                vec![],
+            ),
+        ]);
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &role_title_name("AXButton", ""),
+                AxAction::Press,
+                action_options(2, 3),
+            ),
+            Err(AxActionError::ElementIdentifierAmbiguous {
+                element_name: role_title_name("AXButton", ""),
+                match_count: 2,
+            })
+        );
+        assert!(source.perform_attempts.is_empty());
     }
 
     #[test]
@@ -2742,7 +3131,7 @@ mod tests {
                 AxAction::Press,
                 action_options(2, 3),
             ),
-            Ok(AxActionRequestOutcome::HandlerReturned)
+            Ok(identifier_outcome("target", None))
         );
         assert_eq!(source.performed_actions, vec![(2, AxAction::Press)]);
     }
@@ -2763,7 +3152,7 @@ mod tests {
                 action_options(2, 2),
             ),
             Err(AxActionError::ElementNotFound {
-                identifier: "missing".to_owned(),
+                element_name: element_name("missing"),
             })
         );
         assert!(source.perform_attempts.is_empty());
@@ -2786,7 +3175,8 @@ mod tests {
                 action_options(2, 3),
             ),
             Err(AxActionError::ElementIdentifierAmbiguous {
-                identifier: "duplicate".to_owned(),
+                element_name: element_name("duplicate"),
+                match_count: 2,
             })
         );
         assert_eq!(source.action_name_calls, 0);
@@ -2797,7 +3187,13 @@ mod tests {
     fn an_incomplete_action_search_refuses_without_claiming_uniqueness() {
         let mut source = FakeSource::with_nodes(vec![
             action_node(None, &[], vec![1, 2]),
-            action_node(Some("target"), &[AxAction::Press], vec![]),
+            action_node_with_keys(
+                Some("target-id"),
+                Some("AXButton"),
+                Some("Save"),
+                &[AxAction::Press],
+                vec![],
+            ),
             action_node(Some("unreadable-named"), &[AxAction::Press], vec![]),
         ]);
         source.action_search_error_at = Some((
@@ -2812,12 +3208,12 @@ mod tests {
             request_action_from(
                 &mut source,
                 42,
-                &element_name("target"),
+                &role_title_name("AXButton", "Save"),
                 AxAction::Press,
                 action_options(1, 3),
             ),
             Err(AxActionError::ElementUniquenessUnestablished {
-                identifier: "target".to_owned(),
+                element_name: role_title_name("AXButton", "Save"),
                 unreadable_subtrees: 1,
             })
         );
@@ -2831,8 +3227,10 @@ mod tests {
 
     #[test]
     fn an_action_the_current_element_does_not_advertise_is_refused() {
-        let mut source = FakeSource::with_nodes(vec![action_node(
-            Some("target"),
+        let mut source = FakeSource::with_nodes(vec![action_node_with_keys(
+            Some("target-id"),
+            Some("AXButton"),
+            Some("Save"),
             &[AxAction::ShowMenu],
             vec![],
         )]);
@@ -2841,12 +3239,12 @@ mod tests {
             request_action_from(
                 &mut source,
                 42,
-                &element_name("target"),
+                &role_title_name("AXButton", "Save"),
                 AxAction::Press,
                 action_options(0, 1),
             ),
             Err(AxActionError::ActionNotAdvertised {
-                identifier: "target".to_owned(),
+                element_name: role_title_name("AXButton", "Save"),
                 action: AxAction::Press,
             })
         );
@@ -3016,8 +3414,10 @@ mod tests {
 
     #[test]
     fn an_advertised_action_refused_by_the_application_keeps_the_exact_ax_code() {
-        let mut source = FakeSource::with_nodes(vec![action_node(
-            Some("target"),
+        let mut source = FakeSource::with_nodes(vec![action_node_with_keys(
+            Some("target-id"),
+            Some("AXButton"),
+            Some("Save"),
             &[AxAction::Press],
             vec![],
         )]);
@@ -3029,12 +3429,12 @@ mod tests {
             request_action_from(
                 &mut source,
                 42,
-                &element_name("target"),
+                &role_title_name("AXButton", "Save"),
                 AxAction::Press,
                 action_options(0, 1),
             ),
             Err(AxActionError::ApplicationRefusedAction {
-                identifier: "target".to_owned(),
+                element_name: role_title_name("AXButton", "Save"),
                 action: AxAction::Press,
                 ax_error: AX_ERROR_ACTION_UNSUPPORTED,
             })
@@ -3092,7 +3492,7 @@ mod tests {
                 action_options(0, 1),
             ),
             Err(AxActionError::ElementNotFound {
-                identifier: "target".to_owned(),
+                element_name: element_name("target"),
             })
         );
     }
