@@ -19,12 +19,96 @@ cd "$repo_root"
 # change to the build rather than to uncommitted work the author already had.
 tree_before_build="$(git status --porcelain)"
 
+# Only one gate at a time on this checkout, enforced rather than requested.
+#
+# The header above used to ASK for serialized cargo invocations. A neighbouring
+# project learned what a request is worth: three of its gates ran concurrently
+# on one checkout and the losers blocked forever inside store opens, leaving
+# test binaries alive for eight and a half hours and holding this machine at
+# load 12-21 for a working day. Its per-test bound did not help, because the
+# bound sat on one runner's lanes and the wedged children ran under the other.
+#
+# The lock is a directory because mkdir is atomic: two gates racing cannot both
+# believe they hold it. A holder that died without cleaning up leaves a pid
+# nobody can signal, so that case is reclaimed rather than blocking a machine
+# on a corpse -- but a LIVE holder is refused by name, because waiting silently
+# is how the eight-hour version began.
+GATE_LOCK="$repo_root/.git/gate.lock"
+
+acquire_gate_lock() {
+  if mkdir "$GATE_LOCK" 2>/dev/null; then
+    echo $$ > "$GATE_LOCK/holder"
+    return 0
+  fi
+  local holder
+  holder="$(cat "$GATE_LOCK/holder" 2>/dev/null || true)"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    echo "A gate is already running on this checkout (pid $holder)." >&2
+    echo "Two gates on one checkout share a target directory and the same" >&2
+    echo "single-writer test leases, so the second one can block indefinitely" >&2
+    echo "rather than finish. Wait for that run, or stop it deliberately." >&2
+    echo "Nothing has been verified." >&2
+    exit 2
+  fi
+  echo "Reclaiming a gate lock left by pid ${holder:-unknown}, which is gone." >&2
+  rm -rf "$GATE_LOCK"
+  mkdir "$GATE_LOCK" || {
+    echo "Could not take the gate lock after reclaiming it." >&2
+    exit 2
+  }
+  echo $$ > "$GATE_LOCK/holder"
+}
+
+release_gate_lock() {
+  [ -n "${GATE_LOCK:-}" ] && rm -rf "$GATE_LOCK"
+}
+
+acquire_gate_lock
+trap release_gate_lock EXIT INT TERM HUP QUIT
+
+# An upper bound on a single phase, so a test that waits on something which
+# never arrives fails loudly instead of holding the machine until someone
+# notices. Generous on purpose: the workspace suite has legitimately taken 39
+# minutes on a saturated machine, and a bound that fires on a slow run teaches
+# people to raise it rather than to read it.
+GATE_PHASE_TIMEOUT_S="${GATE_PHASE_TIMEOUT_S:-3600}"
+
+# Job control, so each phase becomes its own process group and the whole tree
+# can be signalled. Killing only the direct child would leave cargo's test
+# binaries running -- which is precisely the state this bound exists to end.
+set -m
+
 run_phase() {
   local label="$1"
   shift
   local started=$SECONDS
   echo "==> $label"
-  "$@"
+
+  "$@" &
+  local phase_pid=$!
+  local waited=0
+  while kill -0 "$phase_pid" 2>/dev/null; do
+    if [ "$waited" -ge "$GATE_PHASE_TIMEOUT_S" ]; then
+      echo "" >&2
+      echo "PHASE EXCEEDED ITS BOUND: $label" >&2
+      echo "Ran for ${waited}s without finishing. A phase that does not end is" >&2
+      echo "usually a test waiting on something that will never arrive, and it" >&2
+      echo "holds this machine until someone notices by hand." >&2
+      kill -TERM "-$phase_pid" 2>/dev/null || kill -TERM "$phase_pid" 2>/dev/null || true
+      sleep 5
+      kill -KILL "-$phase_pid" 2>/dev/null || kill -KILL "$phase_pid" 2>/dev/null || true
+      echo "GATE FAILED: $label did not finish within ${GATE_PHASE_TIMEOUT_S}s" >&2
+      exit 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  # `wait` on a finished job reports its exit status, which `set -e` cannot see
+  # for a background child. Without this a failing phase would be reported ok.
+  if ! wait "$phase_pid"; then
+    echo "GATE FAILED: $label" >&2
+    exit 1
+  fi
   echo "    ok ($((SECONDS - started))s)"
 }
 
