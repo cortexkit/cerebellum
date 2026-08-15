@@ -506,6 +506,18 @@ where
                     // The frozen result vocabulary has no distinct status for an
                     // absent effect claim, so this is the honest coarser value.
                     "effect_status": "effect_indeterminate",
+                    // How much of the application's accessibility tree did not
+                    // answer when this element was resolved. Uniqueness is
+                    // established against the tree that was READ -- an element
+                    // that does not answer cannot be named, resolved or
+                    // re-found, so it was never addressable -- and this count is
+                    // what tells the caller the universe was partial. Without it
+                    // the caller cannot distinguish a claim made over a complete
+                    // reading from one made over a fragment, which is the
+                    // difference between scoping the claim and quietly weakening
+                    // it. Zero means the tree was complete; the field is always
+                    // present, because an absent count would read as zero.
+                    "unreadable_subtrees": report.platform_result.unreadable_subtrees,
                 })
             }
             Err(refusal) => dispatch_refusal(refusal),
