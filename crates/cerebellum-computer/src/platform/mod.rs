@@ -169,6 +169,21 @@ impl ImmutableReleaseInputs {
     }
 }
 
+/// The accessibility action name a click asks a control to run.
+///
+/// One owner, because two spellings of this string cannot disagree quietly:
+/// the closed `AxAction` vocabulary parses exactly what macOS advertises, so a
+/// caller-side shorthand is refused as unadvertised and every click fails. That
+/// happened -- the wire handler said "press" while controls advertise
+/// "AXPress" -- and no fixture could see it, because a test double advertises
+/// whatever string the test also passes, so the two agree with each other and
+/// with nothing real.
+///
+/// `the_press_action_name_matches_the_framework_vocabulary` holds this against
+/// the macOS spelling, so a future divergence fails a build rather than every
+/// click.
+pub const SEMANTIC_PRESS_ACTION: &str = "AXPress";
+
 /// A manifest-visible capability declaration. It contains no executor and
 /// therefore cannot cause an input event by being inspected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

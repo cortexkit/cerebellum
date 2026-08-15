@@ -460,7 +460,14 @@ where
             attendance,
             dispatch_at_ms,
         )
-        .with_semantic(element, "press");
+        // The name macOS accessibility actually advertises, not a lowercase
+        // shorthand for it. The closed AxAction vocabulary parses exactly the
+        // framework's spelling, so anything else is refused as unadvertised --
+        // which is correct behaviour and made every wire click fail until a
+        // live probe drove one against a real application. Fixtures could not
+        // catch it: a double declares whatever string the test also passes, so
+        // the two agree with each other and with nothing else.
+        .with_semantic(element, cerebellum_computer::SEMANTIC_PRESS_ACTION);
 
         let mut audit = self.audit.lock().await;
         match Dispatcher::new(driver).dispatch(&mut audit, identity, request) {

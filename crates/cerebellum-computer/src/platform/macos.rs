@@ -1169,6 +1169,28 @@ mod tests {
         );
     }
 
+    /// The click action name matches what the framework vocabulary parses.
+    ///
+    /// Two crates hold this string: `cerebellum-macos` maps `AxAction::Press`
+    /// to the framework's spelling, and the computer plane names the action a
+    /// click requests. If they diverge, every click is refused as unadvertised
+    /// and nothing else notices -- fixtures declare whatever the test passes,
+    /// so a double agrees with the caller and with nothing real. This is the
+    /// only place the two spellings meet.
+    #[test]
+    fn the_press_action_name_matches_the_framework_vocabulary() {
+        assert_eq!(
+            super::SEMANTIC_PRESS_ACTION,
+            cerebellum_macos::AxAction::Press.name(),
+            "the action a click requests is not the one the vocabulary parses, \
+             so every click would be refused as unadvertised"
+        );
+        assert!(
+            cerebellum_macos::AxAction::from_name(super::SEMANTIC_PRESS_ACTION).is_some(),
+            "the vocabulary does not recognise the action a click requests"
+        );
+    }
+
     /// A capability in the vocabulary carries the permissions it lists.
     ///
     /// The accepting case. Without it, a driver that suppressed EVERY capability
