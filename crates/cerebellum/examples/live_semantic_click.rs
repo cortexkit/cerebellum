@@ -176,6 +176,7 @@ mod macos_probe {
         if navigated["outcome"] != "ok" {
             return Err(format!("navigation refused: {navigated}"));
         }
+        let navigation_settled_at = Instant::now();
 
         let target = mint_target_lease(planes, bundle_identity).await?;
         println!(
@@ -184,49 +185,325 @@ mod macos_probe {
         );
         *target_slot = Some(target.clone());
 
-        let before = read_tree(target.pid, "BEFORE")?;
-        if before.completeness != cerebellum_macos::AxTreeCompleteness::Complete {
+        let (before, button) = match wait_for_page_button(
+            target.pid,
+            navigation_settled_at,
+            Duration::from_secs(20),
+        )
+        .await?
+        {
+            PageReadiness::Addressable {
+                tree,
+                button,
+                elapsed,
+                attempts,
+            } => {
+                println!(
+                    "accessibility readiness: page button became addressable {}ms after navigation settled (attempts={attempts})",
+                    elapsed.as_millis()
+                );
+                print_tree_observation("BEFORE", &tree);
+                (tree, button)
+            }
+            PageReadiness::PageUnreachable {
+                tree,
+                elapsed,
+                attempts,
+            } => {
+                println!(
+                    "PAGE ACCESSIBILITY VERDICT: a complete tree still exposed no {BUTTON_LABEL:?} button {}ms after navigation settled (attempts={attempts})",
+                    elapsed.as_millis()
+                );
+                print_tree_observation("PAGE TIMEOUT", &tree);
+                return run_native_ui_fallback(planes, &target, tree).await;
+            }
+        };
+
+        let before_text = exact_text(&before.root, BUTTON_LABEL)
+            .ok_or_else(|| format!("BEFORE tree did not expose visible text {BUTTON_LABEL:?}"))?
+            .to_string();
+        println!("BEFORE visible text: {before_text:?}");
+        actuate_element(planes, &target, &before, &button, 30).await?;
+
+        let (after, after_text, effect_elapsed, attempts) =
+            wait_for_exact_text(target.pid, AFTER_TEXT, Duration::from_secs(5)).await?;
+        print_tree_observation("AFTER", &after);
+        println!(
+            "AFTER visible text: {after_text:?} (observed {}ms after click, attempts={attempts})",
+            effect_elapsed.as_millis()
+        );
+
+        if before_text == after_text || before_text != BUTTON_LABEL || after_text != AFTER_TEXT {
             return Err(format!(
-                "accessibility tree is incomplete, so semantic press is correctly refused: {:?}",
-                before.completeness
+                "visible page text did not prove the click: before={before_text:?} after={after_text:?}"
             ));
         }
-        let button = find_named_button(&before.root, BUTTON_LABEL)?;
-        let before_text = exact_text(&before.root, BUTTON_LABEL)
-            .ok_or_else(|| format!("BEFORE tree did not expose visible text {BUTTON_LABEL:?}"))?;
-        println!("BEFORE visible text: {before_text:?}");
+        println!(
+            "CLICK VERDICT: accessibility text changed from {before_text:?} to {after_text:?}"
+        );
+        Ok(())
+    }
 
+    enum PageReadiness {
+        Addressable {
+            tree: cerebellum_macos::AxAccessibilityTree,
+            button: ElementObservation,
+            elapsed: Duration,
+            attempts: usize,
+        },
+        PageUnreachable {
+            tree: cerebellum_macos::AxAccessibilityTree,
+            elapsed: Duration,
+            attempts: usize,
+        },
+    }
+
+    async fn wait_for_page_button(
+        pid: u32,
+        navigation_settled_at: Instant,
+        maximum_wait: Duration,
+    ) -> Result<PageReadiness, String> {
+        let deadline = navigation_settled_at + maximum_wait;
+        let mut attempts = 0usize;
+        let mut last_complete = None;
+        let mut last_incomplete = None;
+        let mut last_error = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            attempts += 1;
+            match read_tree_once(
+                pid,
+                remaining.min(cerebellum_macos::AxReadOptions::default().timeout),
+            ) {
+                Ok(tree) if tree.completeness == cerebellum_macos::AxTreeCompleteness::Complete => {
+                    let matches = count_role_and_title(&tree.root, "AXButton", BUTTON_LABEL);
+                    if matches > 1 {
+                        return Err(format!(
+                            "page accessibility became available but {BUTTON_LABEL:?} matched {matches} buttons"
+                        ));
+                    }
+                    if matches == 1 {
+                        let button = find_named_button(&tree.root, BUTTON_LABEL)?;
+                        return Ok(PageReadiness::Addressable {
+                            tree,
+                            button,
+                            elapsed: navigation_settled_at.elapsed(),
+                            attempts,
+                        });
+                    }
+                    last_complete = Some(tree);
+                }
+                Ok(tree) => last_incomplete = Some(tree),
+                Err(error) => last_error = Some(error),
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        }
+
+        let elapsed = navigation_settled_at.elapsed();
+        if let Some(tree) = last_complete {
+            return Ok(PageReadiness::PageUnreachable {
+                tree,
+                elapsed,
+                attempts,
+            });
+        }
+        if let Some(tree) = last_incomplete {
+            return Err(format!(
+                "accessibility readiness deadline expired after {}ms with an incomplete tree: {:?}",
+                elapsed.as_millis(),
+                tree.completeness
+            ));
+        }
+        Err(format!(
+            "accessibility readiness deadline expired after {}ms without a readable tree; last refusal: {}",
+            elapsed.as_millis(),
+            last_error.unwrap_or_else(|| "no read completed before the deadline".to_string())
+        ))
+    }
+
+    async fn wait_for_exact_text(
+        pid: u32,
+        expected: &str,
+        maximum_wait: Duration,
+    ) -> Result<
+        (
+            cerebellum_macos::AxAccessibilityTree,
+            String,
+            Duration,
+            usize,
+        ),
+        String,
+    > {
+        let started = Instant::now();
+        let deadline = started + maximum_wait;
+        let mut attempts = 0usize;
+        let mut last_observation = "no tree read completed".to_string();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            attempts += 1;
+            match read_tree_once(
+                pid,
+                remaining.min(cerebellum_macos::AxReadOptions::default().timeout),
+            ) {
+                Ok(tree) => {
+                    last_observation = format!(
+                        "completeness={:?}, root_children={}",
+                        tree.completeness,
+                        tree.root.children.len()
+                    );
+                    if tree.completeness == cerebellum_macos::AxTreeCompleteness::Complete {
+                        if let Some(text) = exact_text(&tree.root, expected).map(str::to_string) {
+                            return Ok((tree, text, started.elapsed(), attempts));
+                        }
+                    }
+                }
+                Err(error) => last_observation = error,
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        }
+
+        Err(format!(
+            "AFTER accessibility deadline expired after {}ms without exact text {expected:?}; last observation: {last_observation}",
+            started.elapsed().as_millis()
+        ))
+    }
+
+    async fn wait_for_window_title_change(
+        pid: u32,
+        before_titles: &[String],
+        maximum_wait: Duration,
+    ) -> Result<
+        (
+            cerebellum_macos::AxAccessibilityTree,
+            Vec<String>,
+            Duration,
+            usize,
+        ),
+        String,
+    > {
+        let started = Instant::now();
+        let deadline = started + maximum_wait;
+        let mut attempts = 0usize;
+        let mut last_titles = before_titles.to_vec();
+        let mut last_observation = "no tree read completed".to_string();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            attempts += 1;
+            match read_tree_once(
+                pid,
+                remaining.min(cerebellum_macos::AxReadOptions::default().timeout),
+            ) {
+                Ok(tree) => {
+                    last_observation = format!("completeness={:?}", tree.completeness);
+                    if tree.completeness == cerebellum_macos::AxTreeCompleteness::Complete {
+                        let titles = window_titles(&tree.root);
+                        if titles.len() > before_titles.len() && titles != before_titles {
+                            return Ok((tree, titles, started.elapsed(), attempts));
+                        }
+                        last_titles = titles;
+                    }
+                }
+                Err(error) => last_observation = error,
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        }
+
+        Err(format!(
+            "native UI effect deadline expired after {}ms; AXWindow titles before={before_titles:?} last={last_titles:?}; last observation: {last_observation}",
+            started.elapsed().as_millis()
+        ))
+    }
+
+    fn read_tree_once(
+        pid: u32,
+        timeout: Duration,
+    ) -> Result<cerebellum_macos::AxAccessibilityTree, String> {
+        let options = cerebellum_macos::AxReadOptions {
+            timeout,
+            ..Default::default()
+        };
+        cerebellum_macos::read_accessibility_tree(pid, options)
+            .map_err(|error| format!("accessibility read refused: {error:?}"))
+    }
+
+    fn print_tree_observation(phase: &str, tree: &cerebellum_macos::AxAccessibilityTree) {
+        let options = cerebellum_macos::AxReadOptions::default();
+        println!(
+            "{phase} accessibility tree: completeness={:?} root_role={:?} root_children={} bounds=default(timeout={:?}, max_depth={}, max_elements={})",
+            tree.completeness,
+            tree.root.role,
+            tree.root.children.len(),
+            options.timeout,
+            options.max_depth,
+            options.max_elements
+        );
+    }
+
+    async fn actuate_element(
+        planes: &Planes,
+        target: &ProcessGrant,
+        tree: &cerebellum_macos::AxAccessibilityTree,
+        element: &ElementObservation,
+        correlation: u64,
+    ) -> Result<(), String> {
         println!(
             "resolved element: role={:?} title={:?} identifier={:?} enabled={:?} actions={:?} frame={:?}",
-            button.role,
-            button.title,
-            button.identifier,
-            button.enabled,
-            button.actions,
-            button.frame
+            element.role,
+            element.title,
+            element.identifier,
+            element.enabled,
+            element.actions,
+            element.frame
         );
-        if !button.actions.iter().any(|action| action == "AXPress") {
+        if !element.actions.iter().any(|action| action == "AXPress") {
             return Err(format!(
                 "named element does not advertise AXPress: {:?}",
-                button.actions
+                element.actions
             ));
         }
 
-        let identifier_count = button
+        let identifier_count = element
             .identifier
             .as_deref()
             .filter(|identifier| !identifier.is_empty())
-            .map(|identifier| count_identifier(&before.root, identifier))
+            .map(|identifier| count_identifier(&tree.root, identifier))
             .unwrap_or_default();
         if identifier_count == 1 {
-            let identifier = button.identifier.as_deref().expect("counted identifier");
+            let identifier = element.identifier.as_deref().expect("counted identifier");
             println!("address key: identifier {identifier:?}");
             println!(
                 "actuation layer: wire tool route -> computer.click handler -> semantic dispatcher -> macOS AXPress"
             );
             let outcome = invoke_tool(
                 planes,
-                30,
+                correlation,
                 "computer.click",
                 json!({
                     "target": identifier,
@@ -240,72 +517,87 @@ mod macos_probe {
             if outcome["outcome"] != "handler_returned_no_effect_claim" {
                 return Err(format!("computer.click refused: {outcome}"));
             }
-        } else {
-            match button.identifier.as_deref() {
-                None | Some("") => println!(
-                    "wire address measurement: the named button has no usable AXIdentifier"
-                ),
-                Some(identifier) => println!(
-                    "wire address measurement: AXIdentifier {identifier:?} occurs {identifier_count} times"
-                ),
-            }
-            let role_title_count = count_role_and_title(&before.root, &button.role, &button.title);
-            println!(
-                "address key: role_and_title {{ role: {:?}, title: {:?} }} (matches={role_title_count})",
-                button.role, button.title
-            );
-            if role_title_count != 1 {
-                return Err(
-                    "neither supported accessibility key uniquely addresses the button".to_string(),
-                );
-            }
-            println!(
-                "actuation layer: cerebellum-computer semantic dispatcher below the frozen wire schema"
-            );
-            println!("left unproven: the wire computer.click schema cannot carry role_and_title");
-            let outcome = dispatch_role_and_title(planes, &target, &button).await?;
-            println!("computer.click dispatcher outcome: {outcome}");
+            return Ok(());
         }
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let after = read_tree(target.pid, "AFTER")?;
-        if after.completeness != cerebellum_macos::AxTreeCompleteness::Complete {
-            return Err(format!(
-                "AFTER accessibility tree is incomplete: {:?}",
-                after.completeness
-            ));
+        match element.identifier.as_deref() {
+            None | Some("") => {
+                println!("wire address measurement: the named element has no usable AXIdentifier")
+            }
+            Some(identifier) => println!(
+                "wire address measurement: AXIdentifier {identifier:?} occurs {identifier_count} times"
+            ),
         }
-        let after_text = exact_text(&after.root, AFTER_TEXT)
-            .ok_or_else(|| format!("AFTER tree did not expose visible text {AFTER_TEXT:?}"))?;
-        println!("AFTER visible text: {after_text:?}");
-
-        if before_text == after_text || before_text != BUTTON_LABEL || after_text != AFTER_TEXT {
-            return Err(format!(
-                "visible page text did not prove the click: before={before_text:?} after={after_text:?}"
-            ));
+        let role_title_count = count_role_and_title(&tree.root, &element.role, &element.title);
+        println!(
+            "address key: role_and_title {{ role: {:?}, title: {:?} }} (matches={role_title_count})",
+            element.role, element.title
+        );
+        if role_title_count != 1 {
+            return Err(
+                "neither supported accessibility key uniquely addresses the element".to_string(),
+            );
         }
         println!(
-            "CLICK VERDICT: accessibility text changed from {before_text:?} to {after_text:?}"
+            "actuation layer: cerebellum-computer semantic dispatcher below the frozen wire schema"
+        );
+        println!("left unproven: the wire computer.click schema cannot carry role_and_title");
+        println!(
+            "lower-layer action name: AXPress; the production computer.click handler's action-name translation remains unproven"
+        );
+        let outcome = dispatch_role_and_title(planes, target, element).await?;
+        println!("computer.click dispatcher outcome: {outcome}");
+        Ok(())
+    }
+
+    async fn run_native_ui_fallback(
+        planes: &Planes,
+        target: &ProcessGrant,
+        before: cerebellum_macos::AxAccessibilityTree,
+    ) -> Result<(), String> {
+        if before.completeness != cerebellum_macos::AxTreeCompleteness::Complete {
+            return Err(format!(
+                "native UI fallback refused an incomplete tree: {:?}",
+                before.completeness
+            ));
+        }
+        let control = find_named_element(&before.root, "AXMenuItem", "New Window")?;
+        let before_titles = window_titles(&before.root);
+        println!(
+            "NATIVE UI FALLBACK: selecting the browser's own {title:?} menu item because a new controlled browser window has an observable AXWindow-title effect; this proves native application UI actuation, not web-content actuation",
+            title = control.title
+        );
+        println!("native fallback BEFORE AXWindow titles: {before_titles:?}");
+        actuate_element(planes, target, &before, &control, 31).await?;
+
+        let (after, after_titles, elapsed, attempts) =
+            wait_for_window_title_change(target.pid, &before_titles, Duration::from_secs(5))
+                .await?;
+        print_tree_observation("NATIVE FALLBACK AFTER", &after);
+        println!(
+            "native fallback AFTER AXWindow titles: {after_titles:?} (observed {}ms after click, attempts={attempts})",
+            elapsed.as_millis()
+        );
+        println!(
+            "NATIVE UI FALLBACK VERDICT: exact AXWindow title list changed from {before_titles:?} to {after_titles:?}; original web-content claim remains unproven"
         );
         Ok(())
     }
 
-    fn read_tree(pid: u32, phase: &str) -> Result<cerebellum_macos::AxAccessibilityTree, String> {
-        let options = cerebellum_macos::AxReadOptions::default();
-        let started = Instant::now();
-        let tree = cerebellum_macos::read_accessibility_tree(pid, options)
-            .map_err(|error| format!("{phase} accessibility read refused: {error:?}"))?;
-        println!(
-            "{phase} accessibility tree: completeness={:?} root_role={:?} root_children={} elapsed_ms={} bounds=default(timeout={:?}, max_depth={}, max_elements={})",
-            tree.completeness,
-            tree.root.role,
-            tree.root.children.len(),
-            started.elapsed().as_millis(),
-            options.timeout,
-            options.max_depth,
-            options.max_elements
-        );
-        Ok(tree)
+    fn window_titles(root: &cerebellum_macos::AxElement) -> Vec<String> {
+        fn collect(element: &cerebellum_macos::AxElement, titles: &mut Vec<String>) {
+            if element.role.as_deref() == Some("AXWindow") {
+                titles.push(element.title.clone().unwrap_or_default());
+            }
+            for child in &element.children {
+                collect(child, titles);
+            }
+        }
+
+        let mut titles = Vec::new();
+        collect(root, &mut titles);
+        titles.sort();
+        titles
     }
 
     async fn dispatch_role_and_title(
@@ -401,7 +693,7 @@ mod macos_probe {
             attendance,
             dispatch_at_ms,
         )
-        .with_semantic(element, "press");
+        .with_semantic(element, "AXPress");
         let identity = JournalIdentity {
             principal: format!("{:?}", Principal::Direct),
             conversation_key: CONVERSATION.to_string(),
@@ -416,7 +708,14 @@ mod macos_probe {
                 let typed = serde_json::to_string(&error).unwrap_or_else(|_| format!("{error:?}"));
                 format!("semantic dispatcher refused: {typed}")
             })?;
-        serde_json::to_value(report).map_err(|error| error.to_string())
+        let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+        Ok(json!({
+            "outcome": "dispatcher_accepted_no_effect_claim",
+            "delivery_primitive": report["delivery_primitive"],
+            "containment_rung": report["containment"]["containment_rung"],
+            "accepted_by_platform": report["platform_result"]["accepted_by_platform"],
+            "effect_status": report["platform_result"]["effect_status"]
+        }))
     }
 
     async fn mint_browser_grant(planes: &Planes, origin: &str) -> Result<(), String> {
@@ -727,13 +1026,21 @@ mod macos_probe {
         root: &cerebellum_macos::AxElement,
         name: &str,
     ) -> Result<ElementObservation, String> {
+        find_named_element(root, "AXButton", name)
+    }
+
+    fn find_named_element(
+        root: &cerebellum_macos::AxElement,
+        role: &str,
+        title: &str,
+    ) -> Result<ElementObservation, String> {
         fn collect(
             element: &cerebellum_macos::AxElement,
-            name: &str,
+            role: &str,
+            title: &str,
             matches: &mut Vec<ElementObservation>,
         ) {
-            if element.role.as_deref() == Some("AXButton") && element.title.as_deref() == Some(name)
-            {
+            if element.role.as_deref() == Some(role) && element.title.as_deref() == Some(title) {
                 matches.push(ElementObservation {
                     role: element.role.clone().unwrap_or_default(),
                     title: element.title.clone().unwrap_or_default(),
@@ -744,16 +1051,16 @@ mod macos_probe {
                 });
             }
             for child in &element.children {
-                collect(child, name, matches);
+                collect(child, role, title, matches);
             }
         }
 
         let mut matches = Vec::new();
-        collect(root, name, &mut matches);
+        collect(root, role, title, &mut matches);
         match matches.len() {
             1 => Ok(matches.remove(0)),
             count => Err(format!(
-                "button name {name:?} resolved {count} elements instead of one"
+                "role {role:?} and title {title:?} resolved {count} elements instead of one"
             )),
         }
     }
