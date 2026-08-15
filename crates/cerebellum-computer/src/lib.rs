@@ -14,3 +14,4 @@ pub use audit::{ComputerJournalCodec, ComputerPlaneDescriptor, TypedCaptureDispa
 pub use capture_custody::{
     CaptureAdmissionToken, CaptureCustody, CaptureDescriptor, CaptureScope, PixelArtifact,
 };
+pub use platform::SEMANTIC_PRESS_ACTION;
