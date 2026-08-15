@@ -1088,4 +1088,41 @@ mod startup_reconciliation_tests {
             ))
         );
     }
+
+    /// The production constructor must REACH reconciliation, which the test
+    /// above does not establish: it calls `reconcile_production_audit`
+    /// directly, so it proves the helper refuses and says nothing about
+    /// whether anything calls it. Deleting the call from `production_audit`
+    /// left that test green -- which is exactly how `startup_reconcile` came
+    /// to have no caller at all, the gap this whole path was written to close.
+    ///
+    /// Asserted over the source because the behavioural route is not available
+    /// here: `production_audit` resolves its journal through
+    /// `journal_data_path`, so driving it would write into the real user data
+    /// directory. A source assertion is weaker than a behavioural one and is
+    /// the strongest available without making that path injectable, which is a
+    /// larger change than this fence.
+    #[test]
+    fn the_production_constructor_reaches_startup_reconciliation() {
+        let source = include_str!("computer_capability.rs");
+        // Split at the test module's own attribute, assembled at runtime so
+        // this literal is not itself the first match. Writing the attribute
+        // whole made the split land on THIS line, which put the test module --
+        // and its direct call to the helper -- on the production side, so the
+        // assertion passed while the production call site was deleted. A
+        // scan whose delimiter appears in the scanner is green for a reason
+        // unrelated to the property it claims to check.
+        let module_attribute =
+            format!("#[cfg(all({}, target_os = \"macos\")))]", "test").replace(")))]", "))]");
+        let (production, _) = source
+            .split_once(module_attribute.as_str())
+            .expect("this module carries a macOS-gated test module");
+        assert!(
+            production.contains("reconcile_production_audit(audit, 0)"),
+            "production_audit no longer reconciles the audit before serving. An \
+             audit whose prior state was never restored cannot account for what \
+             follows: a crash-orphaned actuation stays orphaned, and the entry \
+             recording that a press may have landed is never resolved by anyone."
+        );
+    }
 }
