@@ -18,7 +18,7 @@ use cerebellum_core::journal::codec::{
 };
 use cerebellum_core::journal::{
     ActionObligationId, EffectClass, IsolationClass, JournalIdentity, ObservabilityClass,
-    RecoveryAction, RecoveryClassification, SeverityInputs, SeverityRecord, TerminalKind,
+    RecoveryClassification, SeverityInputs, SeverityRecord, TerminalKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -366,6 +366,12 @@ impl PlaneJournalCodec for ComputerJournalCodec {
         &self,
         input: &RecoveryTerminalInput,
     ) -> Result<EncodedJournalState, JournalCodecError> {
+        let descriptor = ComputerPlaneDescriptor::decode(&input.invocation_descriptor)
+            .map_err(|_| JournalCodecError::DescriptorRefused)?;
+        let (_, terminal_kind) = recovery_surface(
+            recovery_entry_class(descriptor.capability),
+            input.classification,
+        );
         self.encoded(json!({
             "attachments": input.attachments,
             "classification": recovery_classification_name(input.classification),
@@ -375,7 +381,10 @@ impl PlaneJournalCodec for ComputerJournalCodec {
             "invocation_descriptor": input.invocation_descriptor,
             "phase": "recovery_terminal",
             "sequence": input.action_obligation_id,
+            "settled": terminal_kind.is_settled(),
+            "settler": "startup_reconciliation",
             "severity_inputs": Self::severity(input.severity_inputs),
+            "terminal_kind": terminal_kind.as_str(),
         }))
     }
 }
@@ -396,6 +405,7 @@ pub enum ComputerTerminalKind {
     FinalizedCommitted,
     RejectedCommitted,
     RecoveryDispatchFinalized,
+    DispatchOutcomeUnknown,
     RecoveryRejectionCommitted,
     RecoveryCancelled,
 }
@@ -418,8 +428,21 @@ impl ComputerTerminalKind {
             Self::FinalizedCommitted => "finalized_committed",
             Self::RejectedCommitted => "rejected_committed",
             Self::RecoveryDispatchFinalized => "recovery_dispatch_finalized",
+            Self::DispatchOutcomeUnknown => "dispatch_outcome_unknown",
             Self::RecoveryRejectionCommitted => "recovery_rejection_committed",
             Self::RecoveryCancelled => "recovery_cancelled",
+        }
+    }
+
+    /// Whether the terminal says the effect's outcome is known.
+    pub const fn is_settled(self) -> bool {
+        match self {
+            Self::FinalizedCommitted
+            | Self::RejectedCommitted
+            | Self::RecoveryDispatchFinalized
+            | Self::RecoveryRejectionCommitted
+            | Self::RecoveryCancelled => true,
+            Self::DispatchOutcomeUnknown => false,
         }
     }
 }
@@ -898,22 +921,68 @@ mod gate_tests {
     }
 }
 
-/// Neutral recovery mapping is exhaustive and does not silently default.
+/// Recovery separates captures, whose dispatch proves the read happened, from
+/// actuations, whose dispatch does not prove the platform effect occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputerRecoveryEntryClass {
+    Capture,
+    Actuation,
+}
+
+/// The plane-level action taken while reconciling an interrupted entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputerRecoveryAction {
+    Cancelled,
+    RejectionCommitted,
+    DispatchFinalized,
+    DispatchOutcomeUnknown,
+}
+
+/// Classify each capability by whether a recorded dispatch proves completion
+/// or leaves the platform effect uncertain.
+pub const fn recovery_entry_class(capability: ComputerCapability) -> ComputerRecoveryEntryClass {
+    match capability {
+        ComputerCapability::Screenshot | ComputerCapability::Wait => {
+            ComputerRecoveryEntryClass::Capture
+        }
+        ComputerCapability::Click
+        | ComputerCapability::Type
+        | ComputerCapability::Keys
+        | ComputerCapability::Scroll
+        | ComputerCapability::Move
+        | ComputerCapability::Drag => ComputerRecoveryEntryClass::Actuation,
+    }
+}
+
+/// Plane recovery mapping, exhaustive across both entry class and classification.
 pub const fn recovery_surface(
+    entry_class: ComputerRecoveryEntryClass,
     classification: RecoveryClassification,
-) -> (RecoveryAction, ComputerTerminalKind) {
-    match classification {
-        RecoveryClassification::UnmarkedOrphan | RecoveryClassification::FailedCommitment => (
-            RecoveryAction::Cancelled,
+) -> (ComputerRecoveryAction, ComputerTerminalKind) {
+    match (entry_class, classification) {
+        (
+            ComputerRecoveryEntryClass::Capture,
+            RecoveryClassification::UnmarkedOrphan | RecoveryClassification::FailedCommitment,
+        )
+        | (
+            ComputerRecoveryEntryClass::Actuation,
+            RecoveryClassification::UnmarkedOrphan | RecoveryClassification::FailedCommitment,
+        ) => (
+            ComputerRecoveryAction::Cancelled,
             ComputerTerminalKind::RecoveryCancelled,
         ),
-        RecoveryClassification::FailedRejection => (
-            RecoveryAction::RejectionCommitted,
+        (ComputerRecoveryEntryClass::Capture, RecoveryClassification::FailedRejection)
+        | (ComputerRecoveryEntryClass::Actuation, RecoveryClassification::FailedRejection) => (
+            ComputerRecoveryAction::RejectionCommitted,
             ComputerTerminalKind::RecoveryRejectionCommitted,
         ),
-        RecoveryClassification::ProvisionalDispatched => (
-            RecoveryAction::DispatchFinalized,
+        (ComputerRecoveryEntryClass::Capture, RecoveryClassification::ProvisionalDispatched) => (
+            ComputerRecoveryAction::DispatchFinalized,
             ComputerTerminalKind::RecoveryDispatchFinalized,
+        ),
+        (ComputerRecoveryEntryClass::Actuation, RecoveryClassification::ProvisionalDispatched) => (
+            ComputerRecoveryAction::DispatchOutcomeUnknown,
+            ComputerTerminalKind::DispatchOutcomeUnknown,
         ),
     }
 }
@@ -1520,11 +1589,24 @@ where
         let record = self.journal.read_obligation_audit(action_obligation_id)?;
         let descriptor = ComputerPlaneDescriptor::decode(&record.descriptor_bytes)
             .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        let terminal_kind = record.terminal_kind.map(|terminal_kind| {
+            if record.recovery_supplied_terminal
+                && terminal_kind == TerminalKind::RecoveryDispatchFinalized
+            {
+                recovery_surface(
+                    recovery_entry_class(descriptor.capability),
+                    RecoveryClassification::ProvisionalDispatched,
+                )
+                .1
+            } else {
+                ComputerTerminalKind::from(terminal_kind)
+            }
+        });
         Ok(ComputerAuditRecord {
             action_obligation_id,
             descriptor,
             severity: record.severity,
-            terminal_kind: record.terminal_kind.map(ComputerTerminalKind::from),
+            terminal_kind,
         })
     }
 
@@ -1561,9 +1643,15 @@ where
         consumed
     }
 
-    /// Restore pending custody and terminal-feed state before exposing reads.
+    /// Restore journal, custody, and terminal-feed state before exposing reads.
     pub fn startup_reconcile(&mut self, now: u64) -> Result<(), ComputerAuditError> {
         self.custody.begin_process_epoch();
+        self.recover_active();
+        if self.journal.status().active_reservation_count != 0 {
+            return Err(ComputerAuditError::Journal(
+                JournalError::FinalizationPending,
+            ));
+        }
         let ids = self.custody.obligation_ids();
         let mut attachments = Vec::new();
         for id in ids {
@@ -1573,8 +1661,13 @@ where
         }
         self.custody.reconcile_attachments(attachments)?;
         self.consume_terminal_transitions();
-        self.custody.close_elapsed_windows(now);
-        self.custody.sweep_expired_captures(now);
+        let elapsed = self.custody.close_elapsed_windows(now);
+        let expired = self.sweep_expired_captures(now);
+        if elapsed.deletion_failure_count != 0 || expired.deletion_failure_count != 0 {
+            return Err(ComputerAuditError::Custody(
+                CustodyError::StorageUnavailable,
+            ));
+        }
         Ok(())
     }
 
