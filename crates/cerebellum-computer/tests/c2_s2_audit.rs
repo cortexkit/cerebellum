@@ -946,3 +946,73 @@ fn actuation_commit_without_scraped_text_needs_no_redactor() {
         "an element-less intent must commit as element-less: {entry_text}"
     );
 }
+
+/// A recovered actuation records uncertainty instead of claiming the press settled.
+#[test]
+fn crash_orphaned_actuation_is_unsettled_and_names_startup_reconciliation() {
+    let mut audit = audit();
+    let descriptor = actuation_descriptor();
+    let handle = audit.reserve(identity(), descriptor.clone()).unwrap();
+    let intent = ActuationIntent {
+        element: Some(ActuationElementIdentity {
+            matched_by: AccessibilityElementName::Identifier("toolbar-submit".into()),
+            alternate_name: None,
+        }),
+        action: "press".into(),
+        grant_identity: target_grant(),
+    };
+    audit
+        .commit_actuation_intent(handle, &descriptor, &intent)
+        .unwrap();
+
+    audit.startup_reconcile(10).unwrap();
+
+    let entry = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+    assert_eq!(entry["phase"], json!("recovery_terminal"));
+    assert_eq!(entry["terminal_kind"], json!("dispatch_outcome_unknown"));
+    assert_eq!(entry["settled"], json!(false));
+    assert_eq!(entry["settler"], json!("startup_reconciliation"));
+    assert_eq!(
+        audit
+            .read_computer_audit_record(handle.sequence())
+            .unwrap()
+            .terminal_kind,
+        Some(ComputerTerminalKind::DispatchOutcomeUnknown)
+    );
+}
+
+/// A recovered capture remains settled because dispatch itself performed the read.
+#[test]
+fn crash_orphaned_capture_is_finalized_by_startup_reconciliation() {
+    let mut audit = audit();
+    let descriptor = ComputerPlaneDescriptor::new(
+        ComputerCapability::Screenshot,
+        ContainmentRung::PidStructural,
+        ObservationState::HumanUnobserved,
+    );
+    let handle = audit.reserve(identity(), descriptor).unwrap();
+    let dispatch = TypedCaptureDispatch::new(
+        ComputerCapability::Screenshot,
+        ContainmentRung::PidStructural,
+        ObservationState::HumanUnobserved,
+    )
+    .dispatch_material(b"computer.screenshot".to_vec());
+    audit
+        .commit_dispatched(handle, &dispatch, b"lease".to_vec(), None)
+        .unwrap();
+
+    audit.startup_reconcile(10).unwrap();
+
+    let entry = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+    assert_eq!(entry["phase"], json!("recovery_terminal"));
+    assert_eq!(entry["terminal_kind"], json!("recovery_dispatch_finalized"));
+    assert_eq!(entry["settled"], json!(true));
+    assert_eq!(entry["settler"], json!("startup_reconciliation"));
+    assert_eq!(
+        audit
+            .read_computer_audit_record(handle.sequence())
+            .unwrap()
+            .terminal_kind,
+        Some(ComputerTerminalKind::RecoveryDispatchFinalized)
+    );
+}

@@ -74,6 +74,7 @@ pub enum ComputerPlaneUnavailable {
     },
     InvalidJournalConfiguration,
     CaptureCustody,
+    AuditReconciliation(cerebellum_computer::audit::ComputerAuditError),
 }
 
 impl std::fmt::Display for ComputerPlaneUnavailable {
@@ -91,8 +92,30 @@ impl std::fmt::Display for ComputerPlaneUnavailable {
                 formatter.write_str("the production journal configuration is invalid")
             }
             Self::CaptureCustody => formatter.write_str("capture custody could not be initialized"),
+            Self::AuditReconciliation(error) => {
+                write!(
+                    formatter,
+                    "computer audit startup reconciliation failed: {error:?}"
+                )
+            }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_production_audit<R, T, S>(
+    mut audit: ComputerAudit<R, T, S>,
+    now_ms: u64,
+) -> Result<ComputerAudit<R, T, S>, ComputerPlaneUnavailable>
+where
+    R: Redactor,
+    T: SeverityTaxonomy,
+    S: JournalStorage,
+{
+    audit
+        .startup_reconcile(now_ms)
+        .map_err(ComputerPlaneUnavailable::AuditReconciliation)?;
+    Ok(audit)
 }
 
 /// The audit a running module uses for the computer plane.
@@ -171,7 +194,7 @@ pub fn production_audit() -> Result<
     )
     .map_err(|_| ComputerPlaneUnavailable::CaptureCustody)?;
 
-    ComputerAudit::new(
+    let audit = ComputerAudit::new(
         cerebellum_computer::audit::redaction::ExcludeApplicationText,
         severity,
         JournalConfig {
@@ -184,7 +207,9 @@ pub fn production_audit() -> Result<
     .map_err(|error| match error {
         BindingError::Storage(error) => ComputerPlaneUnavailable::JournalStorage { path, error },
         BindingError::InvalidConfiguration => ComputerPlaneUnavailable::InvalidJournalConfiguration,
-    })
+    })?;
+
+    reconcile_production_audit(audit, 0)
 }
 
 /// A capability this module can serve, which cannot be constructed any other way.
@@ -947,4 +972,120 @@ fn base64(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod startup_reconciliation_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use cerebellum_computer::audit::redaction::ExcludeApplicationText;
+    use cerebellum_computer::audit::{ComputerAuditError, TypedCaptureDispatch};
+    use cerebellum_computer::capture_custody::{
+        CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+    };
+    use cerebellum_core::identity::SessionKind;
+    use cerebellum_core::journal::{
+        DurableState, JournalConfig, JournalError, JournalIdentity, JournalStorage, StorageError,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct FailingRecoveryStorage {
+        state: Arc<StdMutex<DurableState>>,
+        fail_saves: Arc<AtomicBool>,
+    }
+
+    impl JournalStorage for FailingRecoveryStorage {
+        fn load(&self) -> Result<DurableState, StorageError> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| StorageError::LockPoisoned {
+                    binding: "computer startup recovery test load".into(),
+                })
+        }
+
+        fn save(&self, state: &DurableState) -> Result<(), StorageError> {
+            if self.fail_saves.load(Ordering::SeqCst) {
+                return Err(StorageError::LockPoisoned {
+                    binding: "computer startup recovery test save".into(),
+                });
+            }
+            *self.state.lock().map_err(|_| StorageError::LockPoisoned {
+                binding: "computer startup recovery test save".into(),
+            })? = state.clone();
+            Ok(())
+        }
+    }
+
+    fn custody() -> CaptureCustody {
+        CaptureCustody::new(
+            CustodyBounds {
+                maximum_verification_duration_ms: 100,
+                maximum_pin_lifetime_ms: 100,
+                maximum_concurrently_pinned_artifacts: 2,
+                maximum_total_pinned_artifact_bytes: 1_000,
+                maximum_custody_attachment_bytes: 1_000,
+            },
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn construction_refuses_when_startup_reconciliation_cannot_commit() {
+        let storage = FailingRecoveryStorage::default();
+        let fail_saves = Arc::clone(&storage.fail_saves);
+        let mut audit = ComputerAudit::new(
+            ExcludeApplicationText,
+            cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+            JournalConfig {
+                journal_retention_bytes: 20_000,
+                journal_max_entry_bytes: 4_000,
+            },
+            storage,
+            custody(),
+        )
+        .unwrap();
+        let descriptor = ComputerPlaneDescriptor::new(
+            ComputerCapability::Screenshot,
+            ContainmentRung::PidStructural,
+            ObservationState::HumanUnobserved,
+        );
+        let handle = audit
+            .reserve(
+                JournalIdentity {
+                    principal: "prefrontal".into(),
+                    conversation_key: "conversation-1".into(),
+                    agent_project_id: "project-1".into(),
+                    session_kind: SessionKind::Primary,
+                },
+                descriptor,
+            )
+            .unwrap();
+        let dispatch = TypedCaptureDispatch::new(
+            ComputerCapability::Screenshot,
+            ContainmentRung::PidStructural,
+            ObservationState::HumanUnobserved,
+        )
+        .dispatch_material(b"computer.screenshot".to_vec());
+        audit
+            .commit_dispatched(handle, &dispatch, b"lease".to_vec(), None)
+            .unwrap();
+        fail_saves.store(true, Ordering::SeqCst);
+
+        let error = match reconcile_production_audit(audit, 0) {
+            Ok(_) => panic!("construction served with unreconciled audit state"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            ComputerPlaneUnavailable::AuditReconciliation(ComputerAuditError::Journal(
+                JournalError::FinalizationPending,
+            ))
+        );
+    }
 }
