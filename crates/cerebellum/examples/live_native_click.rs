@@ -36,6 +36,23 @@ fn main() {
 async fn main() {
     if let Err(reason) = macos_probe::run().await {
         eprintln!("PROBE FAILED: {reason}");
+        // A locked screen is the first thing to rule out, because its
+        // signature is easy to misread as a defect in whatever the probe was
+        // driving. An application LAUNCHED under a locked session appears to
+        // start, answers about itself, and exposes only a menu bar: its
+        // accessibility tree reports a root with one child and no AXWindow,
+        // because the window was never realised. Applications launched BEFORE
+        // the lock keep their full trees, which is why some targets read
+        // normally in the same run and makes the cause look like a property of
+        // the target rather than of the session.
+        if cerebellum_macos::screen_is_locked() == Some(true) {
+            eprintln!(
+                "  the screen is locked. An application launched now does not \
+                 realise its windows, so a menu-bar-only tree is expected and \
+                 says nothing about actuation. Re-run unlocked before treating \
+                 this as a defect."
+            );
+        }
         std::process::exit(1);
     }
 }
