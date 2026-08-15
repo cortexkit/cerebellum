@@ -1258,3 +1258,69 @@ pub type DispatchOutcome = DispatchReport;
 pub type DispatchSequenceOutcome = SequenceDispatchReport;
 pub type ExpectedPredicate = ExpectedPostCondition;
 pub type EffectResult = EffectEvidence;
+
+#[cfg(test)]
+mod delivery_containment_validation_tests {
+    use super::*;
+    use crate::platform::containment::{ContainmentFinalization, ContainmentRung};
+
+    fn finalization(
+        delivery_primitive: DeliveryPrimitive,
+        containment_rung: Option<ContainmentRung>,
+    ) -> ContainmentFinalization {
+        ContainmentFinalization {
+            containment_rung,
+            input_action: true,
+            dispatch_permitted: true,
+            forfeiture_reason: None,
+            identity: None,
+            fronting: None,
+            delivery_primitive,
+        }
+    }
+
+    /// A semantic delivery carrying any other rung is refused, not reported.
+    ///
+    /// This is a backstop rather than the mechanism: the finalizer awards
+    /// SemanticElement to a semantic delivery directly, so nothing that goes
+    /// through it can produce a mismatch. That is exactly why the check needs
+    /// its own test — its refusing branch is unreachable from any dispatch
+    /// fixture, so deleting it left the dispatch-level tests green, and a guard
+    /// nobody can observe failing is one nobody can tell is working.
+    ///
+    /// The state is built directly here for the same reason. Constructing it
+    /// through a dispatch would require breaking the mechanism this backstop
+    /// exists to survive.
+    #[test]
+    fn a_semantic_delivery_carrying_a_weaker_rung_is_refused() {
+        // The exact shape the live probe reported before this was fixed: a
+        // semantic accessibility delivery labelled with the rung meaning an
+        // uncontained global input event, which that path cannot produce.
+        let mismatched = finalization(
+            DeliveryPrimitive::SemanticAccessibility,
+            Some(ContainmentRung::GlobalNone),
+        );
+        assert_eq!(
+            Dispatcher::<crate::platform::macos::MacOs26PlatformDriver>::validate_delivery_containment(
+                DeliveryPrimitive::SemanticAccessibility,
+                &mismatched,
+            ),
+            Err(DispatchError::AuditUnavailable),
+            "a semantic delivery reporting a non-semantic rung must refuse rather than record it"
+        );
+
+        // The accepting case, without which a validator that refused
+        // everything would satisfy the assertion above.
+        let agreeing = finalization(
+            DeliveryPrimitive::SemanticAccessibility,
+            Some(ContainmentRung::SemanticElement),
+        );
+        assert_eq!(
+            Dispatcher::<crate::platform::macos::MacOs26PlatformDriver>::validate_delivery_containment(
+                DeliveryPrimitive::SemanticAccessibility,
+                &agreeing,
+            ),
+            Ok(())
+        );
+    }
+}
