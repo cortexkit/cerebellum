@@ -32,9 +32,21 @@ cd "$(dirname "$0")/.."
 # review and a new revision.
 export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
 
-# The semantic click path reviewed at c8e7d2f. This binds only identifier-addressed
-# computer.click; synthetic input and the other actuating rows remain unreviewed.
-export CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION="semantic-actuation-review/v1@c8e7d2f"
+# The semantic click path, reviewed at c8e7d2f and amended at 928cf90. This
+# binds only identifier-addressed computer.click; synthetic input and the other
+# actuating rows remain unreviewed.
+#
+# The amendment scoped element uniqueness to the tree actually read: a partial
+# tree no longer refuses outright, and the count of unreadable subtrees is
+# disclosed on the resolution outcome, the caller's outcome and the audit
+# record. Uniqueness within the read tree is unchanged -- an in-scope duplicate
+# still refuses before any action call, which is the property that prevents
+# acting on the wrong control. Fenced by mutation:
+# a_duplicate_identifier_in_scope_is_refused_before_any_action_call,
+# platform_acceptance_discloses_partial_tree_without_claiming_effect, and
+# partial_action_tree_disclosure_reaches_caller_and_decoded_audit_entry each
+# fail by name when their guard is removed.
+export CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION="semantic-actuation-review/v2@928cf90"
 
 # The fleet's stage-sign doctrine: sign at build or stage with pinned
 # per-deployment identifiers, place with a plain copy, keep environments on
@@ -128,16 +140,30 @@ done
 # whose SOURCE moved without a version bump satisfies --locked completely, and
 # most commits do not bump a version.
 #
-# Pinned per DEPENDED-ON SUBTREE rather than by the sibling's HEAD commit. A
-# commit id answers "did anything in that repository change", which is the
-# wrong question: only these four crates reach this binary, and the sibling
-# also carries documentation that changes daily. A fence that refuses for
-# reasons that cannot affect the artifact gets re-pinned reflexively, and a
-# reflex is not a decision -- the check would still be present and would have
-# stopped meaning anything.
+# Pinned per DEPENDED-ON SUBTREE: one hash per crate directory inside the
+# sibling subconscious checkout, rather than one hash for that repository's
+# HEAD commit. A commit id answers "did anything in subconscious change",
+# which is the wrong question -- only a few of its crates are compiled into
+# ck-cerebellum, and it also carries documentation that changes daily. A check
+# that refuses a release for changes which cannot affect the produced binary
+# gets re-pinned reflexively, and a reflex is not a decision: the check would
+# still be present and would have stopped meaning anything.
 #
 # A tree hash answers the right question exactly: it changes when, and only
 # when, the contents of that directory change.
+#
+# THE SET IS THE RUNTIME DEPENDENCIES, NOT EVERY SIBLING CRATE THE WORKSPACE
+# NAMES. subc-core and subc-control are dev-dependencies: they build the
+# in-process daemon used by the conformance tests and are absent from the
+# shipped binary, so a change there cannot alter what is released. Declaring
+# them made this fence refuse a release over a supervisor change that this
+# artifact does not contain -- the same over-firing as pinning the sibling's
+# HEAD, one level subtler, and it was hiding a gap in the other direction:
+# subc-jsonc IS linked and was NOT declared, so a change to configuration
+# parsing would have shipped unnoticed.
+#
+# Keep this list equal to the [dependencies] entries that resolve into the
+# sibling, and re-derive it rather than editing by hand when they change.
 SIBLING_DIR="$(cd "$(dirname "$0")/../../subconscious" 2>/dev/null && pwd || true)"
 DECLARATION="$(dirname "$0")/../subconscious-source.txt"
 
