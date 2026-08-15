@@ -1135,15 +1135,34 @@ where
     }
 
     /// Persist one complete actuation intent before the platform can receive it.
+    ///
+    /// THE JOURNAL RECORDS THE CALLER'S WORDS, NEVER THE SCREEN'S. `matched_by`
+    /// is the caller's own intent expression and stays raw, always: a crash
+    /// between intent and outcome must leave an entry naming what might have
+    /// been pressed, and a withheld marker names nothing. A re-found element
+    /// could not be re-identified against a marker either. `alternate_name` is
+    /// enrichment the plane scraped off the screen, not intent the caller
+    /// stated, so it goes through the bound redaction policy, always. That is
+    /// one uniform rule per field -- no branch on key form, no condition on
+    /// content -- and the property that falls out: an identifier-addressed
+    /// actuation journals no application text at all, while a role+title-
+    /// addressed one journals exactly the phrase the caller used to ask.
+    ///
+    /// When the policy cannot redact, the commit is refused. The intent must
+    /// be durable before the platform can receive the action, so a refused
+    /// commit is a refused action: no actuation that carries scraped screen
+    /// text proceeds without a bound, working redactor. That is the intended
+    /// direction -- an action that cannot be audited safely does not happen.
     pub fn commit_actuation_intent(
         &mut self,
         handle: ReservationHandle,
         descriptor: &ComputerPlaneDescriptor,
         intent: &ActuationIntent,
     ) -> Result<DispatchCommitmentToken, ComputerAuditError> {
-        let bytes = serde_json::to_vec(intent)
+        let journaled = self.journaled_intent(intent)?;
+        let bytes = serde_json::to_vec(&journaled)
             .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
-        let grant_decision = serde_json::to_vec(&intent.grant_identity)
+        let grant_decision = serde_json::to_vec(&journaled.grant_identity)
             .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
         self.commit_dispatched(
             handle,
@@ -1154,6 +1173,57 @@ where
             grant_decision,
             None,
         )
+    }
+
+    /// The intent as it may reach the journal: the caller's own key untouched,
+    /// scraped enrichment passed through the bound redaction policy.
+    fn journaled_intent(
+        &self,
+        intent: &ActuationIntent,
+    ) -> Result<ActuationIntent, ComputerAuditError> {
+        let element = match &intent.element {
+            Some(element) => Some(ActuationElementIdentity {
+                matched_by: element.matched_by.clone(),
+                alternate_name: match &element.alternate_name {
+                    Some(name) => Some(self.redact_scraped_element_name(name)?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        Ok(ActuationIntent {
+            element,
+            action: intent.action.clone(),
+            grant_identity: intent.grant_identity.clone(),
+        })
+    }
+
+    /// Pass one scraped element name through the journal's bound redaction
+    /// policy. Every string the plane read off the screen is covered: an
+    /// identifier as a whole, and a role and a title each.
+    fn redact_scraped_element_name(
+        &self,
+        name: &AccessibilityElementName,
+    ) -> Result<AccessibilityElementName, ComputerAuditError> {
+        // A field cannot outgrow the journal entry that carries it, so the
+        // entry bound doubles as the per-field bound.
+        let max_bytes = self.journal.config().journal_max_entry_bytes as usize;
+        let redact = |value: &str| {
+            self.journal
+                .redact(value, max_bytes)
+                .map_err(|_| ComputerAuditError::Journal(JournalError::RedactionUnavailable))
+        };
+        Ok(match name {
+            AccessibilityElementName::Identifier(identifier) => {
+                AccessibilityElementName::Identifier(redact(identifier)?)
+            }
+            AccessibilityElementName::RoleAndTitle { role, title } => {
+                AccessibilityElementName::RoleAndTitle {
+                    role: redact(role)?,
+                    title: redact(title)?,
+                }
+            }
+        })
     }
 
     /// Persist the handler result or typed refusal before returning it upstream.

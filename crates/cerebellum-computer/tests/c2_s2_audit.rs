@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use cerebellum_computer::audit::{
-    AttemptRole, BackgroundEscalationDescriptor, BackgroundFailureCause, ComputerAudit,
-    ComputerAuditError, ComputerCapability, ComputerJournalCodec, ComputerPlaneDescriptor,
-    ComputerTerminalKind, ConsentProvenance, EscalationPair, ObservationState,
-    ReauthorizedEscalationDescriptor, TypedCaptureDispatch,
+    redaction::ExcludeApplicationText, ActuationElementIdentity, ActuationIntent, AttemptRole,
+    BackgroundEscalationDescriptor, BackgroundFailureCause, ComputerAudit, ComputerAuditError,
+    ComputerCapability, ComputerJournalCodec, ComputerPlaneDescriptor, ComputerTerminalKind,
+    ConsentProvenance, EscalationPair, ObservationState, ReauthorizedEscalationDescriptor,
+    TypedCaptureDispatch,
 };
 use cerebellum_computer::capture_custody::{
     redact_accessibility_snapshot, AccessibilityRedactionOutcome, AccessibilityRedactionPath,
@@ -13,6 +14,7 @@ use cerebellum_computer::capture_custody::{
     InMemoryGrantAuthority, PixelArtifact,
 };
 use cerebellum_computer::grounding::ContainmentRung;
+use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
     EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalError,
@@ -124,7 +126,9 @@ fn bounds() -> CustodyBounds {
     }
 }
 
-fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
+fn audit_with_redactor<R: Redactor>(
+    redactor: R,
+) -> ComputerAudit<R, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
     let mut authority = InMemoryGrantAuthority::default();
     authority.insert(CaptureGrant::new(
         "grant-1",
@@ -134,7 +138,7 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
     ));
     let custody = CaptureCustody::new(bounds(), authority, InMemoryCustodyStorage::new()).unwrap();
     ComputerAudit::new(
-        TestRedactor,
+        redactor,
         taxonomy(),
         JournalConfig {
             journal_retention_bytes: 20_000,
@@ -144,6 +148,10 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
         custody,
     )
     .unwrap()
+}
+
+fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
+    audit_with_redactor(TestRedactor)
 }
 
 #[test]
@@ -709,5 +717,232 @@ fn a_field_that_cannot_be_redacted_refuses_rather_than_passing_the_value_through
             cerebellum_computer::capture_custody::AccessibilityRedactionError::RedactionUnavailable
         ),
         "a snapshot survived a redaction policy that could not redact"
+    );
+}
+
+/// The descriptor shared by the actuation-commit tests.
+fn actuation_descriptor() -> ComputerPlaneDescriptor {
+    ComputerPlaneDescriptor::new(
+        ComputerCapability::Click,
+        ContainmentRung::SemanticElement,
+        ObservationState::HumanObserved,
+    )
+}
+
+fn target_grant() -> ProcessGrant {
+    ProcessGrant {
+        pid: 42,
+        bundle_identity: "com.example.target".into(),
+        process_generation_evidence: "generation-1".into(),
+    }
+}
+
+/// The dispatch-material bytes of the single entry a fresh audit exports right
+/// after a commit: the exact bytes the commit made durable.
+///
+/// The entry stores that material as a byte array, so lifting it out is the
+/// only honest way to scan what reached the journal. A text search over the
+/// raw export would find nothing whether or not the material was redacted,
+/// because the codec never embeds it as text, and would pass vacuously.
+fn committed_intent_bytes<R: Redactor>(
+    audit: &ComputerAudit<R, ValidatedSeverityTaxonomy, InMemoryJournalStorage>,
+) -> Vec<u8> {
+    let entry = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes())
+        .expect("a fresh audit exports exactly one decodable entry after a commit");
+    entry["dispatch_material"]
+        .as_array()
+        .expect("dispatch material is stored as a byte array")
+        .iter()
+        .map(|byte| u8::try_from(byte.as_u64().expect("a byte value")).expect("a byte value"))
+        .collect()
+}
+
+/// An identifier-addressed actuation journals no application text at all.
+///
+/// The caller named the element by identifier, so the caller's own identifier
+/// survives, but the alternate name was scraped off the screen by the plane
+/// and may only survive in the form the bound redaction policy emits. Asserted
+/// on the serialized entry bytes rather than the intent struct: the claim is
+/// about what reaches the journal, and the two can differ.
+#[test]
+fn identifier_addressed_actuation_journals_no_screen_text() {
+    let mut audit = audit_with_redactor(ExcludeApplicationText);
+    let descriptor = actuation_descriptor();
+    let handle = audit.reserve(identity(), descriptor.clone()).unwrap();
+    let intent = ActuationIntent {
+        element: Some(ActuationElementIdentity {
+            matched_by: AccessibilityElementName::Identifier("toolbar-submit".into()),
+            alternate_name: Some(AccessibilityElementName::RoleAndTitle {
+                role: "Button".into(),
+                title: "Save Document".into(),
+            }),
+        }),
+        action: "press".into(),
+        grant_identity: target_grant(),
+    };
+
+    audit
+        .commit_actuation_intent(handle, &descriptor, &intent)
+        .expect("a bound redactor admits the commit");
+
+    let entry_text =
+        String::from_utf8(committed_intent_bytes(&audit)).expect("the serialized intent is UTF-8");
+    assert!(
+        entry_text.contains("toolbar-submit"),
+        "the caller's own identifier must survive raw: {entry_text}"
+    );
+    assert!(
+        !entry_text.contains("Save Document"),
+        "the scraped alternate title reached the journal: {entry_text}"
+    );
+    assert!(
+        !entry_text.contains("Button"),
+        "the scraped alternate role reached the journal: {entry_text}"
+    );
+    assert!(
+        entry_text.contains("[withheld]"),
+        "the alternate name was dropped instead of redacted: {entry_text}"
+    );
+}
+
+/// A role+title-addressed actuation journals exactly the key the caller
+/// supplied.
+///
+/// The caller's own phrase is the reason the record exists, so it survives raw
+/// even though it is also text that appears on the screen: the words the
+/// caller asked with are not the words the plane scraped. The scraped
+/// alternate identifier may only survive in redacted form.
+#[test]
+fn role_and_title_actuation_journals_exactly_the_callers_key() {
+    let mut audit = audit_with_redactor(ExcludeApplicationText);
+    let descriptor = actuation_descriptor();
+    let handle = audit.reserve(identity(), descriptor.clone()).unwrap();
+    let intent = ActuationIntent {
+        element: Some(ActuationElementIdentity {
+            matched_by: AccessibilityElementName::RoleAndTitle {
+                role: "Button".into(),
+                title: "Print Document".into(),
+            },
+            alternate_name: Some(AccessibilityElementName::Identifier(
+                "internal-element-42".into(),
+            )),
+        }),
+        action: "press".into(),
+        grant_identity: target_grant(),
+    };
+
+    audit
+        .commit_actuation_intent(handle, &descriptor, &intent)
+        .expect("a bound redactor admits the commit");
+
+    let entry_text =
+        String::from_utf8(committed_intent_bytes(&audit)).expect("the serialized intent is UTF-8");
+    assert!(
+        entry_text.contains("\"role\":\"Button\""),
+        "the caller's role must survive exactly as supplied: {entry_text}"
+    );
+    assert!(
+        entry_text.contains("\"title\":\"Print Document\""),
+        "the caller's title must survive exactly as supplied: {entry_text}"
+    );
+    assert!(
+        !entry_text.contains("internal-element-42"),
+        "the scraped alternate identifier reached the journal: {entry_text}"
+    );
+    assert!(
+        entry_text.contains("[withheld]"),
+        "the alternate identifier was dropped instead of redacted: {entry_text}"
+    );
+}
+
+/// A commit carrying scraped text refuses when the redactor cannot redact.
+///
+/// Fail closed, with no copy-through fallback: the intent must be durable
+/// before dispatch, so refusing the commit refuses the actuation itself. An
+/// action that cannot be audited safely does not happen.
+#[test]
+fn actuation_commit_with_scraped_text_refuses_when_redaction_is_unavailable() {
+    let mut audit = audit_with_redactor(UnavailableRedactor);
+    let descriptor = actuation_descriptor();
+    let handle = audit.reserve(identity(), descriptor.clone()).unwrap();
+    let intent = ActuationIntent {
+        element: Some(ActuationElementIdentity {
+            matched_by: AccessibilityElementName::Identifier("toolbar-submit".into()),
+            alternate_name: Some(AccessibilityElementName::RoleAndTitle {
+                role: "Button".into(),
+                title: "Save Document".into(),
+            }),
+        }),
+        action: "press".into(),
+        grant_identity: target_grant(),
+    };
+
+    let error = audit
+        .commit_actuation_intent(handle, &descriptor, &intent)
+        .expect_err("a commit carrying scraped text must fail closed");
+
+    assert_eq!(
+        error,
+        ComputerAuditError::Journal(JournalError::RedactionUnavailable)
+    );
+    let exported = audit.journal().export_bytes();
+    assert!(
+        exported.is_empty(),
+        "the refused commit still left an entry behind: {exported:?}"
+    );
+}
+
+/// An intent carrying no scraped text commits even when no redactor can act.
+///
+/// The caller's own key is never redacted, and without an alternate name there
+/// is no screen text to protect, so a missing redactor must not refuse it:
+/// refusing here would withhold the caller's words, which the record exists to
+/// keep.
+#[test]
+fn actuation_commit_without_scraped_text_needs_no_redactor() {
+    let descriptor = actuation_descriptor();
+
+    let mut caller_key_audit = audit_with_redactor(UnavailableRedactor);
+    let handle = caller_key_audit
+        .reserve(identity(), descriptor.clone())
+        .unwrap();
+    let caller_key_only = ActuationIntent {
+        element: Some(ActuationElementIdentity {
+            matched_by: AccessibilityElementName::RoleAndTitle {
+                role: "MenuItem".into(),
+                title: "Print".into(),
+            },
+            alternate_name: None,
+        }),
+        action: "press".into(),
+        grant_identity: target_grant(),
+    };
+    caller_key_audit
+        .commit_actuation_intent(handle, &descriptor, &caller_key_only)
+        .expect("the caller's own key needs no redactor");
+    let entry_text = String::from_utf8(committed_intent_bytes(&caller_key_audit))
+        .expect("the serialized intent is UTF-8");
+    assert!(
+        entry_text.contains("\"title\":\"Print\""),
+        "the caller's title must survive raw: {entry_text}"
+    );
+
+    let mut elementless_audit = audit_with_redactor(UnavailableRedactor);
+    let handle = elementless_audit
+        .reserve(identity(), descriptor.clone())
+        .unwrap();
+    let elementless = ActuationIntent {
+        element: None,
+        action: "press".into(),
+        grant_identity: target_grant(),
+    };
+    elementless_audit
+        .commit_actuation_intent(handle, &descriptor, &elementless)
+        .expect("an element-less intent carries nothing to redact");
+    let entry_text = String::from_utf8(committed_intent_bytes(&elementless_audit))
+        .expect("the serialized intent is UTF-8");
+    assert!(
+        entry_text.contains("\"element\":null"),
+        "an element-less intent must commit as element-less: {entry_text}"
     );
 }
