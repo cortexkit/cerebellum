@@ -936,7 +936,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
                         Self::finalize_audit_outcome(
                             audit,
                             state,
-                            &ActuationOutcome::HandlerReturned,
+                            &ActuationOutcome::HandlerReturned {
+                                unreadable_subtrees: result.unreadable_subtrees,
+                            },
                         )?;
                         self.trace.push(DispatchPhase::SemanticDispatch);
                         return Ok((DeliveryPrimitive::SemanticAccessibility, result, None));
@@ -1005,7 +1007,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
                         Self::finalize_audit_outcome(
                             audit,
                             state,
-                            &ActuationOutcome::HandlerReturned,
+                            &ActuationOutcome::HandlerReturned {
+                                unreadable_subtrees: result.unreadable_subtrees,
+                            },
                         )?;
                         result
                     }
@@ -1041,7 +1045,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
                         Self::finalize_audit_outcome(
                             audit,
                             state,
-                            &ActuationOutcome::HandlerReturned,
+                            &ActuationOutcome::HandlerReturned {
+                                unreadable_subtrees: result.unreadable_subtrees,
+                            },
                         )?;
                         result
                     }

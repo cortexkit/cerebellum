@@ -252,6 +252,7 @@ impl Default for RecordingDriver {
             semantic_result: Ok(cerebellum_computer::platform::DispatchResult {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectObserved,
+                unreadable_subtrees: 0,
             }),
             effect: Ok(EffectObservationResult {
                 status: EffectStatus::EffectObserved,
@@ -328,6 +329,7 @@ impl PlatformDriver for RecordingDriver {
         Ok(cerebellum_computer::platform::DispatchResult {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
+            unreadable_subtrees: 0,
         })
     }
     fn dispatch_global(
@@ -338,6 +340,7 @@ impl PlatformDriver for RecordingDriver {
         Ok(cerebellum_computer::platform::DispatchResult {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
+            unreadable_subtrees: 0,
         })
     }
     fn query_focus(
@@ -421,6 +424,7 @@ fn semantic_request(row: FrozenDispatchRow) -> DispatchRequest {
         alternate_name: None,
         owning_process: target(),
         semantic_actions: vec!["press".into()],
+        unreadable_subtrees: 0,
     };
     DispatchRequest::new(
         row,
@@ -1128,6 +1132,7 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
                 alternate_name: None,
                 owning_process: foreign,
                 semantic_actions: vec!["press".into()],
+                unreadable_subtrees: 0,
             },
             "press",
         )
@@ -1164,6 +1169,7 @@ fn a_pre_dispatch_refusal_writes_a_finalized_no_action_entry() {
                 alternate_name: None,
                 owning_process: target(),
                 semantic_actions: vec!["press".into()],
+                unreadable_subtrees: 0,
             },
             "confirm",
         )
@@ -1393,6 +1399,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
                 }),
                 owning_process: target(),
                 semantic_actions: vec!["press".into()],
+                unreadable_subtrees: 0,
             },
             "press",
         );
@@ -1431,7 +1438,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
     );
     assert_eq!(
         decode_embedded_json(&entry["completed_result"]),
-        json!({"outcome": "handler_returned"})
+        json!({"outcome": "handler_returned", "unreadable_subtrees": 0})
     );
     let record = audit.read_computer_audit_record(1).unwrap();
     assert_eq!(
@@ -1441,6 +1448,38 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
     assert_eq!(
         record.terminal_kind,
         Some(cerebellum_computer::audit::ComputerTerminalKind::FinalizedCommitted)
+    );
+}
+
+#[test]
+fn partial_action_tree_disclosure_reaches_caller_and_decoded_audit_entry() {
+    let driver = RecordingDriver {
+        semantic_result: Ok(cerebellum_computer::platform::DispatchResult {
+            accepted_by_platform: true,
+            effect_status: EffectStatus::EffectIndeterminate,
+            unreadable_subtrees: 2,
+        }),
+        ..RecordingDriver::default()
+    };
+    let mut dispatcher = Dispatcher::new(driver);
+    let mut audit = audit();
+
+    let report = dispatcher
+        .dispatch(
+            &mut audit,
+            audit_identity(),
+            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+        )
+        .expect("a unique match in the readable tree reaches its handler");
+
+    assert_eq!(report.platform_result.unreadable_subtrees, 2);
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_embedded_json(&entry["completed_result"]),
+        json!({"outcome": "handler_returned", "unreadable_subtrees": 2})
     );
 }
 

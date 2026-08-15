@@ -414,6 +414,8 @@ pub struct ElementResolutionResult {
     pub alternate_name: Option<AccessibilityElementName>,
     pub owning_process: ProcessGrant,
     pub semantic_actions: Vec<String>,
+    /// Subtrees omitted from the accessibility tree this resolution searched.
+    pub unreadable_subtrees: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +435,8 @@ pub struct SyntheticDispatchRequest {
 pub struct DispatchResult {
     pub accepted_by_platform: bool,
     pub effect_status: EffectStatus,
+    /// Subtrees omitted from the fresh accessibility tree used for this dispatch.
+    pub unreadable_subtrees: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
