@@ -24,8 +24,8 @@ use crate::audit::{
 use crate::grounding::ContainmentRung;
 use crate::platform::containment::{
     finalize_containment, ContainmentEvidence, ContainmentFinalization, ContainmentRefusal,
-    DeliveryPrimitive, FrontingComparisonEvidence, IdentityCheckEvidence,
-    IdentityVerificationStatus,
+    ContainmentRung as FinalizedContainmentRung, DeliveryPrimitive, FrontingComparisonEvidence,
+    IdentityCheckEvidence, IdentityVerificationStatus,
 };
 use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
@@ -586,15 +586,15 @@ impl<D: PlatformDriver> Dispatcher<D> {
             None
         };
 
-        let containment = finalize_containment(ContainmentEvidence::input(
+        let containment = Self::finalize_delivery_containment(
             request.row.action_kind,
             delivery_primitive,
             request.row.coordinate_addressed,
             request.identity,
             fronting.clone(),
             request.row.global_none_authorized,
-        ))
-        .map_err(DispatchError::from)?;
+        )?;
+        Self::validate_delivery_containment(delivery_primitive, &containment)?;
 
         Ok(DispatchReport {
             mode: request.mode,
@@ -609,15 +609,69 @@ impl<D: PlatformDriver> Dispatcher<D> {
         })
     }
 
+    fn finalize_delivery_containment(
+        action_kind: ActionKind,
+        delivery_primitive: DeliveryPrimitive,
+        coordinate_addressed: bool,
+        identity: Option<IdentityCheckEvidence>,
+        fronting: Option<FrontingComparisonEvidence>,
+        global_none_authorized: bool,
+    ) -> Result<ContainmentFinalization, DispatchError> {
+        // Semantic accessibility invokes the resolved element's own action
+        // handler, so missing process or fronting evidence cannot turn that
+        // delivery into an uncontained global input event.
+        if delivery_primitive == DeliveryPrimitive::SemanticAccessibility {
+            return Ok(ContainmentFinalization {
+                containment_rung: Some(FinalizedContainmentRung::SemanticElement),
+                input_action: true,
+                dispatch_permitted: true,
+                forfeiture_reason: None,
+                identity,
+                fronting,
+                delivery_primitive,
+            });
+        }
+
+        finalize_containment(ContainmentEvidence::input(
+            action_kind,
+            delivery_primitive,
+            coordinate_addressed,
+            identity,
+            fronting,
+            global_none_authorized,
+        ))
+        .map_err(DispatchError::from)
+    }
+
+    fn validate_delivery_containment(
+        delivery_primitive: DeliveryPrimitive,
+        containment: &ContainmentFinalization,
+    ) -> Result<(), DispatchError> {
+        if containment.delivery_primitive != delivery_primitive {
+            return Err(DispatchError::AuditUnavailable);
+        }
+        if delivery_primitive == DeliveryPrimitive::SemanticAccessibility
+            && containment.rung() != Some(FinalizedContainmentRung::SemanticElement)
+        {
+            return Err(DispatchError::AuditUnavailable);
+        }
+        Ok(())
+    }
+
+    fn semantic_delivery_selected(request: &DispatchRequest) -> bool {
+        request.semantic.as_ref().is_some_and(|semantic| {
+            request.row.semantic_supported
+                && semantic.element.owning_process == request.target
+                && !request.semantic_known_ineffective
+        })
+    }
+
     fn actuation_descriptor(
         request: &DispatchRequest,
     ) -> Result<ComputerPlaneDescriptor, DispatchError> {
         let capability = ComputerCapability::parse(&request.row.capability_id)
             .ok_or(DispatchError::InvalidRequest)?;
-        let containment = if request.semantic.is_some()
-            && request.row.semantic_supported
-            && !request.semantic_known_ineffective
-        {
+        let containment = if Self::semantic_delivery_selected(request) {
             ContainmentRung::SemanticElement
         } else {
             match request.mode {
@@ -851,11 +905,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
         S: JournalStorage,
     {
         if let Some(semantic) = request.semantic.clone() {
-            let semantic_owns_target = semantic.element.owning_process == request.target;
-            if request.row.semantic_supported
-                && semantic_owns_target
-                && !request.semantic_known_ineffective
-            {
+            if Self::semantic_delivery_selected(request) {
                 if !semantic
                     .element
                     .semantic_actions

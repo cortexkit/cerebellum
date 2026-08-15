@@ -702,19 +702,38 @@ mod macos_probe {
         };
         let mut audit = cerebellum::computer_capability::production_audit()
             .map_err(|error| format!("production audit unavailable: {error}"))?;
+        let action_obligation_id = audit.journal().next_sequence();
         let report = Dispatcher::new(driver)
             .dispatch(&mut audit, identity, request)
             .map_err(|error| {
                 let typed = serde_json::to_string(&error).unwrap_or_else(|_| format!("{error:?}"));
                 format!("semantic dispatcher refused: {typed}")
             })?;
-        let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+        let containment_rung = report
+            .containment
+            .rung()
+            .ok_or_else(|| "semantic dispatch returned no containment rung".to_string())?;
+        let journal_rung = audit
+            .read_computer_audit_record(action_obligation_id)
+            .map_err(|error| format!("semantic audit record unavailable: {error:?}"))?
+            .descriptor
+            .containment_rung;
+        let reported_rung =
+            serde_json::to_value(containment_rung).map_err(|error| error.to_string())?;
+        let recorded_rung =
+            serde_json::to_value(journal_rung).map_err(|error| error.to_string())?;
+        if reported_rung != recorded_rung {
+            return Err(format!(
+                "semantic containment diverged between reply and journal: reply={reported_rung} journal={recorded_rung}"
+            ));
+        }
         Ok(json!({
             "outcome": "dispatcher_accepted_no_effect_claim",
-            "delivery_primitive": report["delivery_primitive"],
-            "containment_rung": report["containment"]["containment_rung"],
-            "accepted_by_platform": report["platform_result"]["accepted_by_platform"],
-            "effect_status": report["platform_result"]["effect_status"]
+            "delivery_primitive": report.delivery_primitive,
+            "containment_rung": reported_rung,
+            "journal_containment_rung": recorded_rung,
+            "accepted_by_platform": report.platform_result.accepted_by_platform,
+            "effect_status": report.effect.status,
         }))
     }
 

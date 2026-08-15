@@ -504,6 +504,66 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
 }
 
 #[test]
+fn semantic_delivery_cannot_report_a_non_semantic_rung() {
+    let mut request =
+        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+    request.identity = None;
+    let report = Dispatcher::new(RecordingDriver::default())
+        .dispatch(&mut audit(), audit_identity(), request)
+        .expect("semantic delivery has element-scoped containment without structural evidence");
+
+    assert_eq!(
+        report.delivery_primitive,
+        cerebellum_computer::platform::containment::DeliveryPrimitive::SemanticAccessibility
+    );
+    assert_eq!(
+        report.containment.rung(),
+        Some(cerebellum_computer::platform::containment::ContainmentRung::SemanticElement),
+        "semantic accessibility delivery reported a weaker containment rung"
+    );
+}
+
+#[test]
+fn semantic_reply_and_journal_use_the_same_containment_rung() {
+    let mut request =
+        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+    request.identity = None;
+    let mut audit = audit();
+    let report = Dispatcher::new(RecordingDriver::default())
+        .dispatch(&mut audit, audit_identity(), request)
+        .expect("semantic delivery is recorded before returning its report");
+
+    assert_eq!(
+        report.delivery_primitive,
+        cerebellum_computer::platform::containment::DeliveryPrimitive::SemanticAccessibility
+    );
+    let reply_rung = serde_json::to_value(
+        report
+            .containment
+            .rung()
+            .expect("an input delivery reports one containment rung"),
+    )
+    .unwrap();
+    let journal_rung = serde_json::to_value(
+        audit
+            .read_computer_audit_record(1)
+            .unwrap()
+            .descriptor
+            .containment_rung,
+    )
+    .unwrap();
+    assert_eq!(
+        reply_rung,
+        json!("semantic_element"),
+        "semantic accessibility delivery reported a non-semantic rung"
+    );
+    assert_eq!(
+        reply_rung, journal_rung,
+        "the reply and durable journal recorded different containment rungs"
+    );
+}
+
+#[test]
 fn mode_and_delivery_primitive_are_not_substituted() {
     let mut driver = RecordingDriver::default();
     let row = FrozenDispatchRow::for_capability("computer.click")
@@ -1019,7 +1079,7 @@ fn unavailable_effect_observer_is_one_indeterminate_status() {
 }
 
 #[test]
-fn fronting_downgrade_is_a_success_with_exact_global_none_evidence() {
+fn fronting_downgrade_does_not_forfeit_semantic_delivery_containment() {
     let mut post = fronting(100);
     post.target_windows[0].z_order = 2;
     let driver = RecordingDriver {
@@ -1033,12 +1093,9 @@ fn fronting_downgrade_is_a_success_with_exact_global_none_evidence() {
         .unwrap();
     assert_eq!(
         report.containment.containment_rung,
-        Some(cerebellum_computer::platform::containment::ContainmentRung::GlobalNone)
+        Some(cerebellum_computer::platform::containment::ContainmentRung::SemanticElement)
     );
-    assert_eq!(
-        report.containment.forfeiture_reason,
-        Some(cerebellum_computer::platform::containment::ContainmentForfeitureReason::FrontingDowngradeDetected)
-    );
+    assert_eq!(report.containment.forfeiture_reason, None);
     assert_eq!(
         report.fronting.unwrap().comparison,
         FrontingComparison::DowngradeDetected

@@ -471,17 +471,18 @@ where
 
         let mut audit = self.audit.lock().await;
         match Dispatcher::new(driver).dispatch(&mut audit, identity, request) {
-            Ok(report) => json!({
-                "outcome": "handler_returned_no_effect_claim",
-                "containment_rung": report
-                    .containment
-                    .rung()
-                    .map(DispatchContainmentRung::as_str)
-                    .unwrap_or("global_none"),
-                // The frozen result vocabulary has no distinct status for an
-                // absent effect claim, so this is the honest coarser value.
-                "effect_status": "effect_indeterminate",
-            }),
+            Ok(report) => {
+                let Some(containment_rung) = report.containment.rung() else {
+                    return dispatch_refusal(DispatchError::AuditUnavailable);
+                };
+                json!({
+                    "outcome": "handler_returned_no_effect_claim",
+                    "containment_rung": DispatchContainmentRung::as_str(containment_rung),
+                    // The frozen result vocabulary has no distinct status for an
+                    // absent effect claim, so this is the honest coarser value.
+                    "effect_status": "effect_indeterminate",
+                })
+            }
             Err(refusal) => dispatch_refusal(refusal),
         }
     }
