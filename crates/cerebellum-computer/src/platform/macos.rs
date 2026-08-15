@@ -121,8 +121,6 @@ struct CachedAccessibilityTree {
     unreadable_subtrees: usize,
 }
 
-const INCOMPLETE_TREE_UNIQUENESS: &str =
-    "element uniqueness cannot be established from an incomplete accessibility tree";
 const AMBIGUOUS_ELEMENT_NAME: &str =
     "more than one element matches the supplied accessibility name";
 const UNUSABLE_ELEMENT_NAME: &str = "unusable accessibility element name";
@@ -185,9 +183,13 @@ fn dispatch_result_for_accepted_action(
     outcome: cerebellum_macos::AxActionRequestOutcome,
 ) -> DispatchResult {
     match outcome {
-        cerebellum_macos::AxActionRequestOutcome::HandlerReturned { .. } => DispatchResult {
+        cerebellum_macos::AxActionRequestOutcome::HandlerReturned {
+            unreadable_subtrees,
+            ..
+        } => DispatchResult {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
+            unreadable_subtrees: u64::try_from(unreadable_subtrees).unwrap_or(u64::MAX),
         },
     }
 }
@@ -313,10 +315,9 @@ fn map_ax_action_error(
             deadline_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         },
         AxActionError::SystemCallFailed { .. } => SemanticDriverError::Transient { deadline_ms },
-        // Incomplete uniqueness, traversal bounds, and unexpected framework
-        // values are module-internal limits rather than caller remedies.
-        AxActionError::ElementUniquenessUnestablished { .. }
-        | AxActionError::DepthLimitExceeded { .. }
+        // Traversal bounds and unexpected framework values are module-internal
+        // limits rather than caller remedies.
+        AxActionError::DepthLimitExceeded { .. }
         | AxActionError::ElementLimitExceeded { .. }
         | AxActionError::UnexpectedValueType { .. } => SemanticDriverError::PathUnavailable,
     };
@@ -424,11 +425,6 @@ fn resolve_cached_element<'a>(
     tree: &'a CachedAccessibilityTree,
     request: &ElementResolutionRequest,
 ) -> Result<&'a CachedAccessibilityElement, DriverError> {
-    // Resolution feeds semantic actuation. A first visible match cannot be used
-    // when another matching element may be hidden below an unreadable subtree.
-    if tree.unreadable_subtrees > 0 {
-        return Err(DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS));
-    }
     if !request.element_name.is_usable() {
         return Err(DriverError::InvalidRequest(UNUSABLE_ELEMENT_NAME));
     }
@@ -474,6 +470,7 @@ fn resolution_from_cached_tree(
         alternate_name: alternate_element_name(element, &request.element_name),
         owning_process: tree.target.clone(),
         semantic_actions: element.actions.clone(),
+        unreadable_subtrees: u64::try_from(tree.unreadable_subtrees).unwrap_or(u64::MAX),
     })
 }
 
@@ -1446,7 +1443,7 @@ mod accessibility_tests {
     /// OBSERVED would skip the observation that establishes it, and would do so
     /// exactly against the applications whose handlers return without acting.
     #[test]
-    fn platform_acceptance_leaves_the_effect_unclaimed() {
+    fn platform_acceptance_discloses_partial_tree_without_claiming_effect() {
         let result = dispatch_result_for_accepted_action(
             cerebellum_macos::AxActionRequestOutcome::HandlerReturned {
                 matched_by: cerebellum_macos::AxElementName::Identifier("button".to_owned()),
@@ -1454,10 +1451,12 @@ mod accessibility_tests {
                     role: "AXButton".to_owned(),
                     title: "Save".to_owned(),
                 }),
+                unreadable_subtrees: 3,
             },
         );
         assert!(result.accepted_by_platform);
         assert_eq!(result.effect_status, EffectStatus::EffectIndeterminate);
+        assert_eq!(result.unreadable_subtrees, 3);
     }
 
     /// Every framework action failure maps to its caller remedy.
@@ -1508,13 +1507,6 @@ mod accessibility_tests {
                     key_form: AccessibilityKeyForm::RoleAndTitle,
                     match_count: 2,
                 }),
-            ),
-            (
-                AxActionError::ElementUniquenessUnestablished {
-                    element_name: AxElementName::Identifier("partial".to_string()),
-                    unreadable_subtrees: 1,
-                },
-                DriverError::Semantic(SemanticDriverError::PathUnavailable),
             ),
             (
                 AxActionError::ActionNotAdvertised {
@@ -1579,47 +1571,6 @@ mod accessibility_tests {
         }
     }
 
-    /// Absence, ambiguity, and an incomplete search require different remedies.
-    ///
-    /// An absent name can be corrected by naming an existing element, an
-    /// ambiguous name by choosing one element, and an incomplete search only by
-    /// obtaining a complete tree. Collapsing them would make at least one remedy
-    /// unsafe or ineffective.
-    #[test]
-    fn incomplete_ambiguous_and_absent_action_targets_remain_distinct() {
-        use cerebellum_macos::AxActionError;
-
-        let absent = map_ax_action_error(
-            AxActionError::ElementNotFound {
-                element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
-            },
-            "press",
-            3_000,
-        );
-        let ambiguous = map_ax_action_error(
-            AxActionError::ElementIdentifierAmbiguous {
-                element_name: cerebellum_macos::AxElementName::RoleAndTitle {
-                    role: "AXButton".to_string(),
-                    title: "Save".to_string(),
-                },
-                match_count: 2,
-            },
-            "press",
-            3_000,
-        );
-        let incomplete = map_ax_action_error(
-            AxActionError::ElementUniquenessUnestablished {
-                element_name: cerebellum_macos::AxElementName::Identifier("x".to_string()),
-                unreadable_subtrees: 1,
-            },
-            "press",
-            3_000,
-        );
-
-        assert_ne!(absent, ambiguous);
-        assert_ne!(absent, incomplete);
-        assert_ne!(ambiguous, incomplete);
-    }
     use super::*;
 
     #[test]
@@ -1842,7 +1793,7 @@ mod cached_element_tests {
     }
 
     #[test]
-    fn an_incomplete_cached_tree_cannot_establish_element_uniqueness() {
+    fn an_incomplete_cached_tree_resolves_a_unique_in_scope_element_and_discloses_scope() {
         let request = ElementResolutionRequest {
             root_identifier: "accessibility-root:41:generation-a".to_string(),
             element_name: AccessibilityElementName::Identifier("identifier-only".to_string()),
@@ -1850,10 +1801,10 @@ mod cached_element_tests {
         let mut tree = cached_tree();
         tree.unreadable_subtrees = 1;
 
-        assert_eq!(
-            resolve_cached_element(&tree, &request),
-            Err(DriverError::InvalidRequest(INCOMPLETE_TREE_UNIQUENESS))
-        );
+        let resolution = resolution_from_cached_tree(&tree, &request)
+            .expect("the readable tree contains one matching element");
+        assert_eq!(resolution.element_name, request.element_name);
+        assert_eq!(resolution.unreadable_subtrees, 1);
     }
 
     #[test]
@@ -1899,6 +1850,7 @@ mod cached_element_tests {
             assert_eq!(resolution.element_name, name);
             assert_eq!(resolution.alternate_name, alternate_name);
             assert_eq!(resolution.semantic_actions, vec!["AXPress"]);
+            assert_eq!(resolution.unreadable_subtrees, 0);
         }
     }
 

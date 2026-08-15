@@ -705,9 +705,16 @@ pub struct ActuationIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ActuationOutcome {
-    HandlerReturned,
-    Refused { refusal: DispatchError },
-    NoAction { refusal: DispatchError },
+    HandlerReturned {
+        /// Subtrees omitted from the accessibility tree used for the actuation.
+        unreadable_subtrees: u64,
+    },
+    Refused {
+        refusal: DispatchError,
+    },
+    NoAction {
+        refusal: DispatchError,
+    },
 }
 
 /// Adapter-owned gate used when building capability advertisements.

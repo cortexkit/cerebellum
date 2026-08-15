@@ -311,6 +311,8 @@ pub enum AxActionRequestOutcome {
         matched_by: AxElementName,
         /// The other supported key, when the matched element reported one.
         alternate_name: Option<AxElementName>,
+        /// Subtrees omitted from the fresh accessibility tree used for the match.
+        unreadable_subtrees: usize,
     },
 }
 
@@ -331,10 +333,6 @@ pub enum AxActionError {
     ElementIdentifierAmbiguous {
         element_name: AxElementName,
         match_count: usize,
-    },
-    ElementUniquenessUnestablished {
-        element_name: AxElementName,
-        unreadable_subtrees: usize,
     },
     ActionNotAdvertised {
         element_name: AxElementName,
@@ -385,14 +383,6 @@ impl fmt::Display for AxActionError {
                 element_name,
                 match_count,
             } => write!(formatter, "{match_count} elements report {element_name}"),
-            Self::ElementUniquenessUnestablished {
-                element_name,
-                unreadable_subtrees,
-            } => write!(
-                formatter,
-                "uniqueness for {element_name} could not be established because \
-                 {unreadable_subtrees} subtrees were unreadable"
-            ),
             Self::ActionNotAdvertised {
                 element_name,
                 action,
@@ -1034,15 +1024,6 @@ fn request_action_from<Source: ActionSource>(
             match_count: search.match_count,
         });
     }
-    // A visible match is not unique when another match could be hidden beneath
-    // an unreadable element. Refuse before inspecting its actions so no handler
-    // can run on a name whose uniqueness was not established.
-    if search.unreadable_subtrees > 0 {
-        return Err(AxActionError::ElementUniquenessUnestablished {
-            element_name: element_name.clone(),
-            unreadable_subtrees: search.unreadable_subtrees,
-        });
-    }
     let target = search.found.ok_or_else(|| AxActionError::ElementNotFound {
         element_name: element_name.clone(),
     })?;
@@ -1078,6 +1059,7 @@ fn request_action_from<Source: ActionSource>(
     Ok(AxActionRequestOutcome::HandlerReturned {
         matched_by: element_name.clone(),
         alternate_name: target.alternate_name,
+        unreadable_subtrees: search.unreadable_subtrees,
     })
 }
 
@@ -2163,6 +2145,7 @@ mod tests {
         AxActionRequestOutcome::HandlerReturned {
             matched_by: element_name(identifier),
             alternate_name,
+            unreadable_subtrees: 0,
         }
     }
 
@@ -2458,9 +2441,9 @@ mod tests {
     /// extending past every depth tried, so discarding the read would mean
     /// returning nothing at all for such an application.
     ///
-    /// The tree is marked incomplete, which is what makes this safe: a caller
-    /// that needs uniqueness or absence refuses on an incomplete tree rather
-    /// than concluding from a partial one.
+    /// The tree is marked incomplete so callers can disclose the omitted scope
+    /// instead of treating the readable elements as the application's complete
+    /// accessibility surface.
     #[test]
     fn reaching_the_depth_bound_stops_that_subtree_and_keeps_the_rest() {
         let mut source = FakeSource::with_nodes(vec![node(vec![1]), node(vec![2]), node(vec![])]);
@@ -2894,6 +2877,7 @@ mod tests {
             Ok(AxActionRequestOutcome::HandlerReturned {
                 matched_by,
                 alternate_name: Some(element_name("save-id")),
+                unreadable_subtrees: 0,
             })
         );
         assert_eq!(source.performed_actions, vec![(2, AxAction::Press)]);
@@ -3078,6 +3062,7 @@ mod tests {
             Ok(AxActionRequestOutcome::HandlerReturned {
                 matched_by: role_title_name("AXButton", "Save"),
                 alternate_name: Some(element_name("save-id")),
+                unreadable_subtrees: 0,
             })
         );
         assert_eq!(source.performed_actions, vec![(2, AxAction::Press)]);
@@ -3163,7 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_identifier_is_refused_before_any_action_call() {
+    fn a_duplicate_identifier_in_scope_is_refused_before_any_action_call() {
         let mut source = FakeSource::with_nodes(vec![
             action_node(None, &[], vec![1, 2]),
             action_node(Some("duplicate"), &[AxAction::Press], vec![]),
@@ -3188,7 +3173,41 @@ mod tests {
     }
 
     #[test]
-    fn an_incomplete_action_search_refuses_without_claiming_uniqueness() {
+    fn a_fresh_action_search_refuses_when_the_tree_gained_a_duplicate() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(None, &[], vec![1]),
+            action_node(Some("target"), &[AxAction::Press], vec![]),
+        ]);
+        let initial =
+            read_tree_from(&mut source, 42, options(1, 2)).expect("the initial tree is readable");
+        assert_eq!(initial.completeness, AxTreeCompleteness::Complete);
+        assert_eq!(initial.root.children.len(), 1);
+
+        source.nodes[0].children.push(2);
+        source
+            .nodes
+            .push(action_node(Some("target"), &[AxAction::Press], vec![]));
+
+        assert_eq!(
+            request_action_from(
+                &mut source,
+                42,
+                &element_name("target"),
+                AxAction::Press,
+                action_options(1, 3),
+            ),
+            Err(AxActionError::ElementIdentifierAmbiguous {
+                element_name: element_name("target"),
+                match_count: 2,
+            })
+        );
+        assert_eq!(source.action_search_calls, 3);
+        assert_eq!(source.action_name_calls, 0);
+        assert!(source.perform_attempts.is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_action_search_acts_and_discloses_the_partial_tree() {
         let mut source = FakeSource::with_nodes(vec![
             action_node(None, &[], vec![1, 2]),
             action_node_with_keys(
@@ -3216,8 +3235,9 @@ mod tests {
                 AxAction::Press,
                 action_options(1, 3),
             ),
-            Err(AxActionError::ElementUniquenessUnestablished {
-                element_name: role_title_name("AXButton", "Save"),
+            Ok(AxActionRequestOutcome::HandlerReturned {
+                matched_by: role_title_name("AXButton", "Save"),
+                alternate_name: Some(element_name("target-id")),
                 unreadable_subtrees: 1,
             })
         );
@@ -3225,8 +3245,8 @@ mod tests {
             source.action_search_calls, 3,
             "the fixture must exercise successful and failed action-search reads"
         );
-        assert_eq!(source.action_name_calls, 0);
-        assert!(source.perform_attempts.is_empty());
+        assert_eq!(source.action_name_calls, 1);
+        assert_eq!(source.perform_attempts, vec![(1, AxAction::Press)]);
     }
 
     #[test]
