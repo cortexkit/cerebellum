@@ -155,7 +155,6 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
             management_surface(),
         ],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             // Spec A has no profile storage (Spec B owns that). The manifest enum
             // has no none/ephemeral storage kind yet, so this is the honest
