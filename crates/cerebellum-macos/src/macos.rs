@@ -1226,6 +1226,54 @@ mod tests {
     /// Creating a capture filter without the window-server connection kills the
     /// process, which is why [`capture_window`] establishes it first.
     ///
+    /// What a child run of the unguarded-filter probe established.
+    ///
+    /// Separated from the test because the interesting case CANNOT BE REACHED
+    /// ON A HEALTHY MACHINE: the child only fails to enumerate when the window
+    /// server is slow to answer, which is why the original defect -- a setup
+    /// failure and a missing abort both leaving exit 0, so the parent read one
+    /// as the other -- survived every run except a loaded workspace build. A
+    /// decision that can only be exercised under contention is a decision that
+    /// must be testable without it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProbeVerdict {
+        /// The child was aborted, which is the property under test.
+        GuardProven,
+        /// The child never reached the filter, so it observed nothing.
+        SetupFailed,
+        /// The child reached the filter and lived, which the guard forbids.
+        ReachedWithoutAborting,
+        /// Neither shape: an unrelated panic or signal, which must not read as
+        /// a confirmation in either direction.
+        Unrecognised,
+    }
+
+    fn probe_verdict(signal: Option<i32>, code: Option<i32>) -> ProbeVerdict {
+        const COULD_NOT_REACH_FILTER: i32 = 79;
+        match (signal, code) {
+            (Some(6), _) => ProbeVerdict::GuardProven,
+            (None, Some(COULD_NOT_REACH_FILTER)) => ProbeVerdict::SetupFailed,
+            (None, Some(0)) => ProbeVerdict::ReachedWithoutAborting,
+            _ => ProbeVerdict::Unrecognised,
+        }
+    }
+
+    #[test]
+    fn a_child_that_could_not_set_up_is_not_read_as_a_missing_abort() {
+        assert_eq!(probe_verdict(None, Some(79)), ProbeVerdict::SetupFailed);
+        // The defect this replaced: both shapes arrived as exit 0, so a window
+        // server that did not answer was indistinguishable from a guard that
+        // failed to fire.
+        assert_eq!(
+            probe_verdict(None, Some(0)),
+            ProbeVerdict::ReachedWithoutAborting
+        );
+        assert_eq!(probe_verdict(Some(6), None), ProbeVerdict::GuardProven);
+        // An unrelated death confirms nothing in either direction.
+        assert_eq!(probe_verdict(Some(11), None), ProbeVerdict::Unrecognised);
+        assert_eq!(probe_verdict(None, Some(101)), ProbeVerdict::Unrecognised);
+    }
+
     /// The connection is established by a call whose result is discarded, so it
     /// reads like a line with no effect and invites removal. This asserts what
     /// removing it costs: not a failed capture but a dead process, which for a
@@ -1246,15 +1294,26 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         const TARGET_WINDOW: &str = "CK_UNGUARDED_FILTER_PROBE_WINDOW";
+        // Any value distinguishable from 0 (reached the filter, no abort) and
+        // from a signal death. 79 has no other meaning here; it is simply not
+        // one this child can produce accidentally.
+        const COULD_NOT_REACH_FILTER: i32 = 79;
 
         if let Ok(window_id) = std::env::var(TARGET_WINDOW) {
             let window_id: u32 = window_id.parse().expect("the parent passes a window id");
             // Deliberately WITHOUT establish_window_server_connection().
             let Ok(window) = find_window(window_id, Duration::from_secs(10)) else {
-                // Could not reach the filter, so this run proves nothing. Exit
-                // cleanly and let the parent report a skip rather than treating
-                // an unrelated failure as a confirmation.
-                std::process::exit(0);
+                // Could not reach the filter, so this run proves nothing.
+                //
+                // A DISTINCT CODE, because exit 0 already means something else
+                // here: it is what the child returns when it DID reach the
+                // filter and was not aborted, which is the failure this test
+                // exists to catch. Signalling "I could not set up" the same way
+                // made the parent read a setup failure as a missing abort --
+                // and enumeration fails more often under load, so the test
+                // failed only in the full workspace run and passed alone, in
+                // its own crate suite, and under process isolation.
+                std::process::exit(COULD_NOT_REACH_FILTER);
             };
             // SAFETY: the window is retained by this frame. This is expected to
             // abort, which is the point of the test.
@@ -1284,9 +1343,29 @@ mod tests {
         .output()
         .expect("run the probe in a child process");
 
+        match probe_verdict(status.status.signal(), status.status.code()) {
+            // The child could not reach the filter, so it observed nothing
+            // about the guard. Reported rather than passed silently: a skip
+            // that looks like a pass is how a test stops meaning anything, and
+            // this one fences a crash boundary -- an unguarded filter does not
+            // fail the capture, it kills the process and every capability it
+            // serves.
+            ProbeVerdict::SetupFailed => {
+                eprintln!(
+                    "SKIPPED: the child could not enumerate the target window, so \
+                     the abort guard was never exercised. This says nothing about \
+                     the guard; it says the window server did not answer in time."
+                );
+                return;
+            }
+            ProbeVerdict::GuardProven => return,
+            ProbeVerdict::ReachedWithoutAborting | ProbeVerdict::Unrecognised => {}
+        }
+
         // SIGABRT specifically, rather than "did not succeed": a child that
-        // panicked for an unrelated reason, or failed to look up the window,
-        // must not read as a confirmation.
+        // panicked for an unrelated reason must not read as a confirmation.
+        // Exit 0 here means the child DID reach the filter and was not
+        // aborted, which is a real failure of the property under test.
         assert_eq!(
             status.status.signal(),
             Some(6),
