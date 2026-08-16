@@ -15,7 +15,7 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_foundation::{CFData, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
+    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGEvent, CGImage,
 };
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
@@ -358,6 +358,28 @@ pub fn screen_is_locked() -> Option<bool> {
         CFRelease(session);
         locked
     }
+}
+
+/// An owned CoreGraphics event that can cross the safe platform seam.
+pub type OwnedCgEvent = CFRetained<CGEvent>;
+
+/// Evidence that CoreGraphics returned from a per-process post call.
+///
+/// `CGEvent::post_to_pid` has no delivery result. This type therefore records
+/// only that the call returned; it says nothing about whether an application
+/// received the event or acted on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a returned post call is not evidence that the event was delivered"]
+pub struct CgEventPostCall;
+
+/// Ask CoreGraphics to post one event to one process.
+///
+/// This is the public `CGEventPostToPid` API exposed through its generated safe
+/// Rust binding. The caller owns all target checks and policy. A returned
+/// [`CgEventPostCall`] means only that the void framework call returned.
+pub fn post_event_to_pid(pid: i32, event: &CGEvent) -> CgEventPostCall {
+    CGEvent::post_to_pid(pid, Some(event));
+    CgEventPostCall
 }
 
 /// When a process was started, as kernel-sourced microseconds since the epoch.
