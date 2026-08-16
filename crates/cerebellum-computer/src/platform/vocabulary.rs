@@ -8,6 +8,19 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
+// TWO INDEPENDENT AXES, and they carry different version numbers on purpose.
+//
+//   schema_id — the document FORMAT contract: which keys a row has and what
+//               they mean. A reader that understands /v1 can parse any /v1
+//               artifact.
+//   revision  — the vocabulary CONTENT version: which capabilities exist and
+//               what each one accepts.
+//
+// Changing what a capability accepts bumps the REVISION only, which is why
+// these currently read /v1 and -v2: the v2 cutover rewrote request schemas
+// inside rows whose shape was unchanged. A reviewer read the mismatch as a
+// mistake before finding both fields in the artifact, so it is stated here
+// rather than left to be re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
 pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v2";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
