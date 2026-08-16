@@ -30,12 +30,24 @@ mod launch;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(target_os = "macos")]
+// The export gate MATCHES the module gate above. `accessibility` compiles off
+// macOS under `test` on purpose, so its platform-neutral logic -- cycle
+// detection, traversal bounds, name resolution -- stays covered on Linux CI.
+// Exporting only on macOS left that module built with no public surface there,
+// so items reachable only through these names read as dead code and failed the
+// deny-warnings build. Two gates describing one decision have to agree.
+#[cfg(any(target_os = "macos", test))]
 pub use accessibility::{
-    accessibility_is_permitted, read_accessibility_tree, request_accessibility_action,
     AxAccessibilityTree, AxAction, AxActionError, AxActionOptions, AxActionRequestOutcome,
     AxElement, AxElementName, AxElementNameError, AxElementReadFailure, AxFrame, AxReadError,
     AxReadOptions, AxTreeCompleteness,
+};
+// The entry points themselves call the framework, so they exist only on macOS.
+// The TYPES above do not, and that split is what lets the platform-neutral
+// logic stay covered on Linux CI while the FFI stays where it belongs.
+#[cfg(target_os = "macos")]
+pub use accessibility::{
+    accessibility_is_permitted, read_accessibility_tree, request_accessibility_action,
 };
 #[cfg(target_os = "macos")]
 pub use launch::{
