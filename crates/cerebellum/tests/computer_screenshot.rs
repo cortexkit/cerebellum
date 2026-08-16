@@ -650,6 +650,117 @@ async fn a_successful_capture_is_retained_and_returned() {
     );
 }
 
+fn patterned_bgra(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            bytes.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 0, 255]);
+        }
+    }
+    bytes
+}
+
+fn decode_base64(encoded: &str) -> Vec<u8> {
+    const TABLE: [i8; 256] = {
+        let mut table = [-1i8; 256];
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < alphabet.len() {
+            table[alphabet[i] as usize] = i as i8;
+            i += 1;
+        }
+        table
+    };
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = TABLE[byte as usize];
+        assert!(value >= 0, "invalid base64");
+        buf = (buf << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// A region request captures that rectangle of the window, not the whole window.
+///
+/// The pixels are a known pattern so ignoring the region, or applying it only
+/// to the declared dimensions, both fail: the first pixel of a 10,20 crop is
+/// (10,20), not (0,0).
+#[tokio::test]
+async fn a_region_request_captures_the_region_and_echoes_it() {
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let png = patterned_bgra(80, 60);
+
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({
+                "scope": "target_windows",
+                "include_cursor": false,
+                "region": { "x_px": 10, "y_px": 20, "width_px": 30, "height_px": 16 }
+            }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &leased_management(&clock).await,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: vec![EnumeratedWindow {
+                    window_id: "window-1".to_string(),
+                    owner_identity: grant(),
+                    owner_identity_verified: true,
+                    frame: WindowFrame {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 60,
+                    },
+                    accessibility_root: None,
+                }],
+                png: png.clone(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        reply["outcome"], "captured",
+        "region capture failed: {reply}"
+    );
+    assert_eq!(
+        reply["region"],
+        json!({ "x_px": 10, "y_px": 20, "width_px": 30, "height_px": 16 })
+    );
+    let windows = reply["windows"].as_array().expect("windows are returned");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["width_px"], 30);
+    assert_eq!(windows[0]["height_px"], 16);
+    assert_eq!(
+        windows[0]["region"],
+        json!({ "x_px": 10, "y_px": 20, "width_px": 30, "height_px": 16 })
+    );
+
+    let captured = decode_base64(windows[0]["image_png_b64"].as_str().expect("image"));
+    assert_eq!(captured.len(), 30 * 16 * 4, "the image was not cropped");
+    assert_eq!(
+        &captured[0..4],
+        &[10, 20, 0, 255],
+        "the crop started at the wrong pixel"
+    );
+    assert_ne!(captured, png, "the reply still carried the whole window");
+}
+
 /// A target whose windows carry no pixels is reported as such.
 ///
 /// Distinct from a capture that failed: there was nothing to capture rather

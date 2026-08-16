@@ -1238,7 +1238,7 @@ async fn reviewed_semantic_click_reaches_the_compose_authority_chain() {
     let request = json!({
         "name": "computer.click",
         "arguments": {
-            "target": "save-button",
+            "target": {"by": "identifier", "identifier": "save-button"},
             "button": "left",
             "click_count": 1,
             "modifiers": [],
@@ -1284,7 +1284,7 @@ async fn unadvertised_semantic_click_is_refused_before_its_serving_handler() {
     let request = json!({
         "name": "computer.click",
         "arguments": {
-            "target": "save-button",
+            "target": {"by": "identifier", "identifier": "save-button"},
             "button": "left",
             "click_count": 1,
             "modifiers": [],

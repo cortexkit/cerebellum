@@ -10,6 +10,7 @@ use cerebellum_computer::platform::{
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v2");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);

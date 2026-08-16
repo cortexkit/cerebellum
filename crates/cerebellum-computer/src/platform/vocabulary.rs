@@ -9,9 +9,9 @@ use std::fmt;
 use std::sync::OnceLock;
 
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v1";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v2";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v1.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v2.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -19,7 +19,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "e450e91850eb00b0269a2a3e5307b7c976a10cfba4bbd4f1532b34d5c013f83c";
+    "3b9fcf44584bfef4cb8edf7073e97c5a5f011fdcce991add1492fd46586d2fd3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
