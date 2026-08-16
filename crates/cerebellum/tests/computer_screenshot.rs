@@ -203,12 +203,42 @@ impl CaptureBackend for CapturingBackend {
             .iter()
             .find(|window| window.window_id == request.filter.window_id)
             .ok_or_else(|| BackendError::Capture("no such window".into()))?;
+        let (frame, bytes) = match request.region {
+            Some(region) => {
+                let expected = (window.frame.width as usize)
+                    .checked_mul(window.frame.height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4));
+                let bytes = if expected == Some(self.png.len()) {
+                    let stride = window.frame.width as usize * 4;
+                    let row_bytes = region.width_px as usize * 4;
+                    let mut cropped = Vec::with_capacity(row_bytes * region.height_px as usize);
+                    for row in 0..region.height_px as usize {
+                        let start =
+                            (region.y_px as usize + row) * stride + region.x_px as usize * 4;
+                        cropped.extend_from_slice(&self.png[start..start + row_bytes]);
+                    }
+                    cropped
+                } else {
+                    vec![0; region.width_px as usize * region.height_px as usize * 4]
+                };
+                (
+                    WindowFrame {
+                        x: window.frame.x + region.x_px as i32,
+                        y: window.frame.y + region.y_px as i32,
+                        width: region.width_px,
+                        height: region.height_px,
+                    },
+                    bytes,
+                )
+            }
+            None => (window.frame, self.png.clone()),
+        };
         Ok(cerebellum_computer::capture::WindowCaptureFrame {
             owner_identity: window.owner_identity.clone(),
             owner_identity_verified: true,
-            frame: window.frame,
+            frame,
             captured_at_ms: request.captured_at_ms,
-            artifact: CaptureArtifact::Bytes(self.png.clone()),
+            artifact: CaptureArtifact::Bytes(bytes),
             accessibility_root: None,
         })
     }
@@ -692,9 +722,9 @@ fn decode_base64(encoded: &str) -> Vec<u8> {
 
 /// A region request captures that rectangle of the window, not the whole window.
 ///
-/// The pixels are a known pattern so ignoring the region, or applying it only
-/// to the declared dimensions, both fail: the first pixel of a 10,20 crop is
-/// (10,20), not (0,0).
+/// Asserted on the returned pixel dimensions (the decoded buffer size), not on
+/// the echoed region: an echo can agree with the request while the image is
+/// still the whole window.
 #[tokio::test]
 async fn a_region_request_captures_the_region_and_echoes_it() {
     let clock = FakeClock::new();
@@ -759,6 +789,112 @@ async fn a_region_request_captures_the_region_and_echoes_it() {
         "the crop started at the wrong pixel"
     );
     assert_ne!(captured, png, "the reply still carried the whole window");
+}
+
+/// A backend that captures the whole window despite a region on the request.
+///
+/// The serving handler must refuse that rather than relabel the full window as
+/// the requested region.
+struct IgnoringRegionBackend {
+    windows: Vec<EnumeratedWindow>,
+    png: Vec<u8>,
+}
+
+impl CaptureBackend for IgnoringRegionBackend {
+    fn screen_recording_liveness(&self) -> cerebellum_computer::platform::PermissionLiveness {
+        cerebellum_computer::platform::PermissionLiveness::Live
+    }
+    fn enumerate_windows(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Vec<EnumeratedWindow>, BackendError> {
+        Ok(self.windows.clone())
+    }
+    fn poll_window_change(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<cerebellum_computer::capture::WindowChange>, BackendError> {
+        Ok(None)
+    }
+    fn capture_window(
+        &mut self,
+        request: &cerebellum_computer::capture::WindowCaptureRequest,
+    ) -> Result<cerebellum_computer::capture::WindowCaptureFrame, BackendError> {
+        let window = self
+            .windows
+            .iter()
+            .find(|window| window.window_id == request.filter.window_id)
+            .ok_or_else(|| BackendError::Capture("no such window".into()))?;
+        Ok(cerebellum_computer::capture::WindowCaptureFrame {
+            owner_identity: window.owner_identity.clone(),
+            owner_identity_verified: true,
+            frame: window.frame,
+            captured_at_ms: request.captured_at_ms,
+            artifact: CaptureArtifact::Bytes(self.png.clone()),
+            accessibility_root: None,
+        })
+    }
+    fn capture_display(
+        &mut self,
+        _request: &cerebellum_computer::capture::BroadDisplayCaptureRequest,
+    ) -> Result<CaptureArtifact, BackendError> {
+        Err(BackendError::Capture(
+            "display capture is not served".into(),
+        ))
+    }
+    fn begin_teardown(
+        &mut self,
+    ) -> Result<cerebellum_computer::capture::BackendTeardownProgress, BackendError> {
+        Ok(cerebellum_computer::capture::BackendTeardownProgress::Complete)
+    }
+    fn poll_teardown(
+        &mut self,
+        _elapsed_ms: u64,
+    ) -> Result<cerebellum_computer::capture::BackendTeardownProgress, BackendError> {
+        Ok(cerebellum_computer::capture::BackendTeardownProgress::Complete)
+    }
+}
+
+#[tokio::test]
+async fn a_full_window_capture_is_refused_when_a_region_was_requested() {
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({
+                "scope": "target_windows",
+                "include_cursor": false,
+                "region": { "x_px": 10, "y_px": 20, "width_px": 30, "height_px": 16 }
+            }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &leased_management(&clock).await,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| IgnoringRegionBackend {
+                windows: vec![EnumeratedWindow {
+                    window_id: "window-1".to_string(),
+                    owner_identity: grant(),
+                    owner_identity_verified: true,
+                    frame: WindowFrame {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 60,
+                    },
+                    accessibility_root: None,
+                }],
+                png: patterned_bgra(80, 60),
+            },
+        )
+        .await;
+
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["field"], "region");
+    assert_eq!(reply["reason"], "region_not_honoured");
 }
 
 /// A target whose windows carry no pixels is reported as such.

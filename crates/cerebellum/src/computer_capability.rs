@@ -17,7 +17,9 @@ use cerebellum_computer::audit::{
     ComputerAudit, ComputerCapability, ComputerPlaneDescriptor, ObservationState,
     TypedCaptureDispatch,
 };
-use cerebellum_computer::capture::{CaptureArtifact, CaptureBackend, ScopedCaptureController};
+use cerebellum_computer::capture::{
+    CaptureArtifact, CaptureBackend, ScopedCaptureController, WindowCaptureRegion,
+};
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
 use cerebellum_computer::grounding::ContainmentRung;
 #[cfg(target_os = "macos")]
@@ -104,56 +106,23 @@ fn parse_screenshot_region(arguments: &Value) -> Result<Option<CaptureRegion>, V
     }))
 }
 
-/// Crop a captured window to the requested region in that window's pixel space.
-///
-/// Tightly packed BGRA (`width * height * 4` bytes) is cropped in place so the
-/// reply cannot advertise a region while still carrying the whole window. Other
-/// encodings keep their bytes and still take the region's dimensions, because
-/// those dimensions are what the reply and custody account for.
-fn apply_capture_region(
-    frame_width: u32,
-    frame_height: u32,
-    bytes: &[u8],
-    region: Option<&CaptureRegion>,
-) -> Result<(u32, u32, Vec<u8>), Value> {
-    let Some(region) = region else {
-        return Ok((frame_width, frame_height, bytes.to_vec()));
-    };
-    let ends_x = region.x_px.checked_add(region.width_px);
-    let ends_y = region.y_px.checked_add(region.height_px);
-    if ends_x.map(|x| x > frame_width).unwrap_or(true)
-        || ends_y.map(|y| y > frame_height).unwrap_or(true)
-    {
-        return Err(invalid_screenshot_request(
-            "region",
-            "region_outside_window",
-        ));
+fn region_fits_window(region: &CaptureRegion, frame_width: u32, frame_height: u32) -> bool {
+    match (
+        region.x_px.checked_add(region.width_px),
+        region.y_px.checked_add(region.height_px),
+    ) {
+        (Some(end_x), Some(end_y)) => end_x <= frame_width && end_y <= frame_height,
+        _ => false,
     }
-    let expected = (frame_width as usize)
-        .checked_mul(frame_height as usize)
-        .and_then(|pixels| pixels.checked_mul(4));
-    let cropped = if expected == Some(bytes.len()) {
-        crop_bgra(bytes, frame_width, frame_height, region)
-    } else {
-        bytes.to_vec()
-    };
-    Ok((region.width_px, region.height_px, cropped))
 }
 
-fn crop_bgra(
-    bytes: &[u8],
-    frame_width: u32,
-    _frame_height: u32,
-    region: &CaptureRegion,
-) -> Vec<u8> {
-    let stride = frame_width as usize * 4;
-    let row_bytes = region.width_px as usize * 4;
-    let mut cropped = Vec::with_capacity(row_bytes * region.height_px as usize);
-    for row in 0..region.height_px as usize {
-        let start = (region.y_px as usize + row) * stride + region.x_px as usize * 4;
-        cropped.extend_from_slice(&bytes[start..start + row_bytes]);
+fn capture_region(region: CaptureRegion) -> WindowCaptureRegion {
+    WindowCaptureRegion {
+        x_px: region.x_px,
+        y_px: region.y_px,
+        width_px: region.width_px,
+        height_px: region.height_px,
     }
-    cropped
 }
 
 /// The computer plane as a running module holds it.
@@ -717,7 +686,27 @@ where
                 },
             };
             let mut controller = controller;
-            let result = controller.capture_scoped(now_ms);
+            if let Some(region) = region {
+                let windows = match controller.enumerated_windows(now_ms) {
+                    Ok(windows) => windows,
+                    Err(error) => {
+                        *capture = Some(controller);
+                        let _ = audit.finalize_rejected(handle, b"capture-failed".to_vec());
+                        return json!({
+                            "outcome": "capture_failed",
+                            "detail": format!("{error:?}"),
+                        });
+                    }
+                };
+                if windows.iter().any(|window| {
+                    !region_fits_window(&region, window.frame.width, window.frame.height)
+                }) {
+                    *capture = Some(controller);
+                    let _ = audit.finalize_rejected(handle, b"region-outside-window".to_vec());
+                    return invalid_screenshot_request("region", "region_outside_window");
+                }
+            }
+            let result = controller.capture_scoped_with_region(now_ms, region.map(capture_region));
             *capture = Some(controller);
             result
         };
@@ -740,18 +729,16 @@ where
             let CaptureArtifact::Bytes(bytes) = &window.artifact else {
                 continue;
             };
-            let (width_px, height_px, bytes) = match apply_capture_region(
-                window.frame.width,
-                window.frame.height,
-                bytes,
-                region.as_ref(),
-            ) {
-                Ok(cropped) => cropped,
-                Err(refusal) => {
-                    let _ = audit.finalize_rejected(handle, b"region-outside-window".to_vec());
-                    return refusal;
+            if let Some(region) = region {
+                if window.frame.width != region.width_px || window.frame.height != region.height_px
+                {
+                    let _ = audit.finalize_rejected(handle, b"region-not-honoured".to_vec());
+                    return invalid_screenshot_request("region", "region_not_honoured");
                 }
-            };
+            }
+            let width_px = window.frame.width;
+            let height_px = window.frame.height;
+            let bytes = bytes.clone();
             total_bytes += bytes.len();
             if total_bytes > MAX_ENCODED_IMAGE_BYTES {
                 let _ = audit.finalize_rejected(handle, b"image-too-large".to_vec());
@@ -1709,45 +1696,24 @@ mod startup_reconciliation_tests {
 mod region_crop_tests {
     use super::*;
 
-    fn patterned(width: u32, height: u32) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for y in 0..height {
-            for x in 0..width {
-                bytes.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 0, 255]);
-            }
-        }
-        bytes
-    }
-
-    #[test]
-    fn apply_capture_region_crops_bgra_to_the_requested_rectangle() {
-        let bytes = patterned(8, 6);
-        let region = CaptureRegion {
-            x_px: 2,
-            y_px: 1,
-            width_px: 3,
-            height_px: 2,
-        };
-        let (width, height, cropped) =
-            apply_capture_region(8, 6, &bytes, Some(&region)).expect("the region fits");
-        assert_eq!((width, height), (3, 2));
-        assert_eq!(cropped.len(), 3 * 2 * 4);
-        assert_eq!(&cropped[0..4], &[2, 1, 0, 255]);
-        assert_ne!(cropped, bytes);
-    }
-
     #[test]
     fn a_region_outside_the_window_is_refused() {
-        let bytes = patterned(8, 6);
         let region = CaptureRegion {
             x_px: 6,
             y_px: 0,
             width_px: 4,
             height_px: 1,
         };
-        let error = apply_capture_region(8, 6, &bytes, Some(&region))
-            .expect_err("a region past the right edge must not crop");
-        assert_eq!(error["field"], "region");
-        assert_eq!(error["reason"], "region_outside_window");
+        assert!(!region_fits_window(&region, 8, 6));
+        assert!(region_fits_window(
+            &CaptureRegion {
+                x_px: 2,
+                y_px: 1,
+                width_px: 3,
+                height_px: 2,
+            },
+            8,
+            6
+        ));
     }
 }

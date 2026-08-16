@@ -27,7 +27,8 @@ fn main() {
     let mut shown = 0;
     for window in windows.iter().filter(|w| w.on_screen && w.width >= 200.0) {
         let capture =
-            match cerebellum_macos::capture_window(window.window_id, Duration::from_secs(10)) {
+            match cerebellum_macos::capture_window(window.window_id, Duration::from_secs(10), None)
+            {
                 Ok(capture) => capture,
                 Err(reason) => {
                     println!("window {}: {reason}", window.window_id);
