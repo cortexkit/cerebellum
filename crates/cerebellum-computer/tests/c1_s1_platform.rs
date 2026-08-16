@@ -5,12 +5,14 @@ use serde_json::{json, Value};
 const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v3.json");
 
 use cerebellum_computer::platform::{
-    computed_vocabulary_sha256, implementation_source_lock_digest, validate_vocabulary,
-    validate_vocabulary_digests, CapabilityAdvertisementContext, ImmutableReleaseInputs,
-    MacOs26PlatformDriver, PermissionLiveness, PermissionLivenessReport, PermissionProbeResult,
-    PermissionService, StartupProbeInput, VocabularyDigestInputs,
-    COMPUTER_ACTION_VOCABULARY_SHA256,
+    attributed_permission_liveness, capability_declarations, computed_vocabulary_sha256,
+    implementation_source_lock_digest, validate_vocabulary, validate_vocabulary_digests,
+    CapabilityAdvertisementContext, ImmutableReleaseInputs, PermissionLiveness,
+    PermissionLivenessProbe, PermissionLivenessReport, PermissionProbeResult, PermissionService,
+    StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
 };
+#[cfg(target_os = "macos")]
+use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
@@ -69,6 +71,7 @@ fn computer_click_action_is_optional_and_closed_to_press_and_cancel() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
     // The grant is attributed to the launching process rather than to this
@@ -134,24 +137,17 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
 /// case would still pass, because they all supply a matching process.
 #[test]
 fn a_grant_attributed_to_another_process_is_not_counted() {
-    let input = StartupProbeInput {
-        os_major: 26,
-        private_envelope_revision: None,
-        resolved_private_symbols: Default::default(),
-        permission_results: vec![PermissionProbeResult {
-            service: PermissionService::ScreenRecording,
-            liveness: PermissionLiveness::Live,
-            responsible_process: "some-other-launcher".to_string(),
-            off_main: true,
-        }],
-        responsible_process: Some("ck-subc".to_string()),
-    };
-    let driver = MacOs26PlatformDriver::new(&input);
+    let report = PermissionLivenessProbe {
+        responsible_process: "ck-subc".to_string(),
+    }
+    .run(&[PermissionProbeResult {
+        service: PermissionService::ScreenRecording,
+        liveness: PermissionLiveness::Live,
+        responsible_process: "some-other-launcher".to_string(),
+        off_main: true,
+    }]);
     assert_eq!(
-        driver
-            .startup_probe()
-            .permissions
-            .state(PermissionService::ScreenRecording),
+        report.state(PermissionService::ScreenRecording),
         PermissionLiveness::Unresolved
     );
 }
@@ -168,33 +164,27 @@ fn a_grant_attributed_to_another_process_is_not_counted() {
 /// the same answer by filtering rather than by refusing.
 #[test]
 fn an_unestablished_attribution_counts_no_grant_at_all() {
-    let input = StartupProbeInput {
-        os_major: 26,
-        private_envelope_revision: None,
-        resolved_private_symbols: Default::default(),
-        permission_results: vec![
-            PermissionProbeResult {
-                service: PermissionService::ScreenRecording,
-                liveness: PermissionLiveness::Live,
-                responsible_process: "ck-subc".to_string(),
-                off_main: true,
-            },
-            PermissionProbeResult {
-                service: PermissionService::Accessibility,
-                liveness: PermissionLiveness::Live,
-                responsible_process: "cerebellum-computer".to_string(),
-                off_main: true,
-            },
-        ],
-        responsible_process: None,
-    };
-    let driver = MacOs26PlatformDriver::new(&input);
+    let results = [
+        PermissionProbeResult {
+            service: PermissionService::ScreenRecording,
+            liveness: PermissionLiveness::Live,
+            responsible_process: "ck-subc".to_string(),
+            off_main: true,
+        },
+        PermissionProbeResult {
+            service: PermissionService::Accessibility,
+            liveness: PermissionLiveness::Live,
+            responsible_process: "cerebellum-computer".to_string(),
+            off_main: true,
+        },
+    ];
+    let report = attributed_permission_liveness(None, &results);
     for service in [
         PermissionService::ScreenRecording,
         PermissionService::Accessibility,
     ] {
         assert_eq!(
-            driver.startup_probe().permissions.state(service),
+            report.state(service),
             PermissionLiveness::Unresolved,
             "{service:?} was credited without an established attribution"
         );
@@ -203,13 +193,12 @@ fn an_unestablished_attribution_counts_no_grant_at_all() {
 
 #[test]
 fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
-    let driver = MacOs26PlatformDriver::default();
     let context = CapabilityAdvertisementContext {
         inputs: ImmutableReleaseInputs::default(),
         permissions: PermissionLivenessReport::default(),
-        startup: driver.startup_probe().clone(),
+        startup: StartupCapabilityProbe::default(),
     };
-    let declarations = driver.declarations(&context);
+    let declarations = capability_declarations(&context, false, true);
     let move_declaration = declarations
         .iter()
         .find(|item| item.capability_id == "computer.move")

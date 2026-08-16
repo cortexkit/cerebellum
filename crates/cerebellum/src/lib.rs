@@ -35,7 +35,9 @@ pub mod profile_custody;
 pub mod snapshot_store;
 pub mod wire;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -97,11 +99,13 @@ const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 
+#[cfg(target_os = "macos")]
+pub use computer::platform::StartupProbeInput;
 pub use computer::platform::{
     CapabilityAdvertisementContext as ComputerCapabilityAdvertisementContext,
     CapabilityDeclaration as ComputerCapabilityDeclaration,
     ImmutableReleaseInputs as ComputerReleaseInputs, PermissionLiveness, PermissionLivenessReport,
-    PermissionProbeResult, PermissionService, StartupCapabilityProbe, StartupProbeInput,
+    PermissionProbeResult, PermissionService, StartupCapabilityProbe,
 };
 
 /// A release gate outcome preserves the difference between an input that has not
@@ -462,24 +466,11 @@ fn gate_admitted_computer_declarations<'a>(
 fn canonical_computer_declarations(
     context: &ComputerCapabilityAdvertisementContext,
 ) -> (Vec<ComputerCapabilityDeclaration>, ComputerGateOutcomes) {
-    let driver = computer::platform::MacOs26PlatformDriver::new(&StartupProbeInput {
-        os_major: context.startup.os_major,
-        private_envelope_revision: if context.startup.private_envelope_recognized {
-            Some(computer::platform::macos::PRIVATE_ENVELOPE_REVISION.to_string())
-        } else {
-            None
-        },
-        resolved_private_symbols: if context.startup.private_envelope_recognized {
-            [computer::platform::macos::PRIVATE_PID_POST_SYMBOL.to_string()]
-                .into_iter()
-                .collect()
-        } else {
-            BTreeSet::new()
-        },
-        permission_results: Vec::new(),
-        responsible_process: None,
-    });
-    let declarations = driver.declarations(context);
+    let declarations = computer::platform::capability_declarations(
+        context,
+        context.startup.private_envelope_recognized,
+        cfg!(target_os = "macos"),
+    );
     let outcomes = computer_gate_outcomes(context);
     (declarations, outcomes)
 }
@@ -780,7 +771,11 @@ fn release_inputs_from_build_bindings(
 /// capture is performed, so this does not pay the first-capture cost that
 /// contends with other processes.
 pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
+    #[cfg(target_os = "macos")]
     let (permission_results, responsible_process) = computer_permission_readings();
+    #[cfg(not(target_os = "macos"))]
+    let (permission_results, _) = computer_permission_readings();
+    #[cfg(target_os = "macos")]
     let startup = StartupCapabilityProbe::run(&StartupProbeInput {
         os_major: computer::platform::MACOS_MAJOR_VERSION,
         private_envelope_revision: None,
@@ -788,6 +783,11 @@ pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
         permission_results,
         responsible_process,
     });
+    #[cfg(not(target_os = "macos"))]
+    let startup = StartupCapabilityProbe {
+        permissions: PermissionLivenessReport::from_results(permission_results),
+        ..Default::default()
+    };
     ComputerCapabilityAdvertisementContext {
         inputs: compiled_release_inputs(),
         permissions: startup.permissions.clone(),
@@ -877,7 +877,10 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let health_state = Arc::new(HealthState::with_config(config.health));
+    #[cfg(target_os = "macos")]
     let mut planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
+    #[cfg(not(target_os = "macos"))]
+    let planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
     #[cfg(target_os = "macos")]
     if planes.launch_service.is_none() {
         if let Some(browser) = config.browser.clone() {
@@ -3366,8 +3369,7 @@ mod tests {
     #[test]
     fn malformed_canonical_declaration_set_never_reaches_manifest_filter() {
         let context = default_computer_context();
-        let driver = computer::platform::MacOs26PlatformDriver::default();
-        let mut declarations = driver.declarations(&context);
+        let (mut declarations, _) = canonical_computer_declarations(&context);
         for declaration in &mut declarations {
             declaration.advertised = true;
         }
@@ -3464,13 +3466,7 @@ mod tests {
                 Some("fixture-signing-topology"),
             ),
             permissions: Default::default(),
-            startup: StartupCapabilityProbe::run(&StartupProbeInput {
-                os_major: computer::platform::MACOS_MAJOR_VERSION,
-                private_envelope_revision: None,
-                resolved_private_symbols: BTreeSet::new(),
-                permission_results: Vec::new(),
-                responsible_process: None,
-            }),
+            startup: StartupCapabilityProbe::default(),
         };
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(

@@ -17,10 +17,7 @@ use cerebellum_computer::{
         ContainmentRung, GroundingPath, GroundingPolicy, GroundingRequirement,
         GroundingResolutionPath,
     },
-    platform::{
-        CapabilityAdvertisementContext, ImmutableReleaseInputs, MacOs26PlatformDriver,
-        PermissionLivenessReport, PermissionService,
-    },
+    platform::{vocabulary::required_permission_services, PermissionService},
 };
 use serde_json::Value;
 
@@ -158,18 +155,8 @@ fn frozen_permission_services(row: &Value) -> Vec<PermissionService> {
 }
 
 fn code_permission_services(capability: &str) -> Vec<PermissionService> {
-    let driver = MacOs26PlatformDriver::default();
-    let context = CapabilityAdvertisementContext {
-        inputs: ImmutableReleaseInputs::default(),
-        permissions: PermissionLivenessReport::default(),
-        startup: driver.startup_probe().clone(),
-    };
-    driver
-        .declarations(&context)
-        .into_iter()
-        .find(|declaration| declaration.capability_id == capability)
+    required_permission_services(capability)
         .expect("every vocabulary capability has a platform declaration")
-        .required_permissions
 }
 
 /// Every capability resolves elements, permits coordinates, and authorizes

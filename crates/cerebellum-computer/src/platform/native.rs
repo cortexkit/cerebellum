@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+use super::PermissionLivenessProbe;
 use super::{
     PermissionLiveness, PermissionProbeResult, PermissionService, ProcessGrant, TargetResolution,
 };
@@ -716,7 +718,7 @@ mod tests {
             result.liveness = PermissionLiveness::Live;
         }
 
-        let report = super::super::macos::PermissionLivenessProbe {
+        let report = PermissionLivenessProbe {
             responsible_process: attribution,
         }
         .run(&results);

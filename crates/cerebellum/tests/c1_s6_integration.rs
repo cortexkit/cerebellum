@@ -6,8 +6,8 @@ use cerebellum::{
     ComputerCapabilityAdvertisementContext, ComputerGateOutcome, ComputerReleaseInputs,
 };
 use cerebellum_computer::platform::{
-    MacOs26PlatformDriver, PermissionLiveness, PermissionProbeResult, PermissionService,
-    StartupCapabilityProbe, StartupProbeInput, VocabularyDigestInputs,
+    capability_declarations, PermissionLiveness, PermissionLivenessReport, PermissionProbeResult,
+    PermissionService, StartupCapabilityProbe, VocabularyDigestInputs,
     COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 use subc_protocol::manifest::{ProviderRole, Tool};
@@ -28,24 +28,34 @@ fn valid_inputs() -> ComputerReleaseInputs {
     }
 }
 
-fn valid_context() -> ComputerCapabilityAdvertisementContext {
-    let startup = StartupCapabilityProbe::run(&StartupProbeInput {
+fn startup_with_screen_recording(screen_recording: PermissionLiveness) -> StartupCapabilityProbe {
+    StartupCapabilityProbe {
         os_major: 26,
-        private_envelope_revision: Some("skylight-macos26-v1".into()),
-        resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
-        permission_results: vec![PermissionProbeResult {
+        private_envelope_recognized: true,
+        permissions: PermissionLivenessReport::from_results([PermissionProbeResult {
             service: PermissionService::ScreenRecording,
-            liveness: PermissionLiveness::Live,
+            liveness: screen_recording,
             responsible_process: "ck-subc".into(),
             off_main: true,
-        }],
-        responsible_process: Some("ck-subc".into()),
-    });
+        }]),
+    }
+}
+
+fn valid_context() -> ComputerCapabilityAdvertisementContext {
+    let startup = startup_with_screen_recording(PermissionLiveness::Live);
     ComputerCapabilityAdvertisementContext {
         inputs: valid_inputs(),
         permissions: startup.permissions.clone(),
         startup,
     }
+}
+
+fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> Vec<String> {
+    capability_declarations(context, true, true)
+        .into_iter()
+        .filter(|declaration| declaration.advertised)
+        .map(|declaration| declaration.capability_id)
+        .collect()
 }
 
 fn tools(manifest: &subc_protocol::manifest::ModuleManifest) -> Vec<&Tool> {
@@ -60,13 +70,7 @@ fn empty_runtime_advertisement_reports_frozen_eight_row_scope_without_functional
     let context = ComputerCapabilityAdvertisementContext {
         inputs: ComputerReleaseInputs::default(),
         permissions: Default::default(),
-        startup: StartupCapabilityProbe::run(&StartupProbeInput {
-            os_major: 26,
-            private_envelope_revision: None,
-            resolved_private_symbols: BTreeSet::new(),
-            permission_results: Vec::new(),
-            responsible_process: None,
-        }),
+        startup: StartupCapabilityProbe::default(),
     };
     let evidence = computer_release_evidence(&context);
     assert_eq!(evidence.frozen_row_count, 8);
@@ -98,8 +102,16 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // dispatchability, so the identifier half is asserted here and the manifest
     // half below.
     assert_eq!(
-        evidence.gate_admitted_capabilities,
+        available_capabilities(&context),
         vec!["computer.click", "computer.screenshot", "computer.wait"]
+    );
+    assert_eq!(
+        evidence.gate_admitted_capabilities,
+        if cfg!(target_os = "macos") {
+            vec!["computer.click", "computer.screenshot", "computer.wait"]
+        } else {
+            vec!["computer.wait"]
+        }
     );
 
     // Everything advertised can be dispatched. The advertised set is DERIVED
@@ -132,7 +144,11 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     );
     assert_eq!(
         computer_tools,
-        vec!["computer.click", "computer.screenshot", "computer.wait"],
+        if cfg!(target_os = "macos") {
+            vec!["computer.click", "computer.screenshot", "computer.wait"]
+        } else {
+            vec!["computer.wait"]
+        },
         "the advertised set is no longer exactly semantic click plus the two observing capabilities"
     );
     assert_eq!(evidence.exercised_row_count, 0);
@@ -154,13 +170,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let empty = ComputerCapabilityAdvertisementContext {
         inputs: ComputerReleaseInputs::default(),
         permissions: Default::default(),
-        startup: StartupCapabilityProbe::run(&StartupProbeInput {
-            os_major: 26,
-            private_envelope_revision: None,
-            resolved_private_symbols: BTreeSet::new(),
-            permission_results: Vec::new(),
-            responsible_process: None,
-        }),
+        startup: StartupCapabilityProbe::default(),
     };
     assert!(!computer_release_evidence_with_exercised_rows(&empty, 1).functional_computer_plane);
 }
@@ -169,10 +179,19 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
 #[test]
 fn caller_manifest_requires_the_semantic_review_to_advertise_computer_click() {
     let advertised = |context: &ComputerCapabilityAdvertisementContext| {
-        tools(&build_manifest_with_computer_plane("cerebellum", context))
-            .into_iter()
-            .map(|tool| tool.name.clone())
-            .collect::<BTreeSet<_>>()
+        #[cfg(target_os = "macos")]
+        {
+            tools(&build_manifest_with_computer_plane("cerebellum", context))
+                .into_iter()
+                .map(|tool| tool.name.clone())
+                .collect::<BTreeSet<_>>()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            available_capabilities(context)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        }
     };
 
     let bound = valid_context();
@@ -203,18 +222,11 @@ fn caller_manifest_requires_the_semantic_review_to_advertise_computer_click() {
 #[test]
 fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     let declaration_reason = |context: &ComputerCapabilityAdvertisementContext| {
-        MacOs26PlatformDriver::new(&StartupProbeInput {
-            os_major: 26,
-            private_envelope_revision: Some("skylight-macos26-v1".into()),
-            resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
-            permission_results: Vec::new(),
-            responsible_process: None,
-        })
-        .declarations(context)
-        .into_iter()
-        .find(|declaration| declaration.capability_id == "computer.screenshot")
-        .expect("the frozen rows always include screenshot")
-        .suppression_reason
+        capability_declarations(context, true, true)
+            .into_iter()
+            .find(|declaration| declaration.capability_id == "computer.screenshot")
+            .expect("the frozen rows always include screenshot")
+            .suppression_reason
     };
 
     // The permission is granted and every input present, so nothing is
@@ -230,18 +242,7 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     );
 
     let mut permission_denied = valid_context();
-    let denied = StartupCapabilityProbe::run(&StartupProbeInput {
-        os_major: 26,
-        private_envelope_revision: Some("skylight-macos26-v1".into()),
-        resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
-        permission_results: vec![PermissionProbeResult {
-            service: PermissionService::ScreenRecording,
-            liveness: PermissionLiveness::Unavailable,
-            responsible_process: "ck-subc".into(),
-            off_main: true,
-        }],
-        responsible_process: Some("ck-subc".into()),
-    });
+    let denied = startup_with_screen_recording(PermissionLiveness::Unavailable);
     permission_denied.permissions = denied.permissions.clone();
     permission_denied.startup = denied;
     assert_eq!(
@@ -254,13 +255,11 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     // someone to the permission settings for a probe that ran in the wrong
     // place.
     let mut permission_unresolved = valid_context();
-    let unresolved = StartupCapabilityProbe::run(&StartupProbeInput {
+    let unresolved = StartupCapabilityProbe {
         os_major: 26,
-        private_envelope_revision: Some("skylight-macos26-v1".into()),
-        resolved_private_symbols: ["SLEventPostToPid".into()].into_iter().collect(),
-        permission_results: Vec::new(),
-        responsible_process: Some("ck-subc".into()),
-    });
+        private_envelope_recognized: true,
+        permissions: PermissionLivenessReport::default(),
+    };
     permission_unresolved.permissions = unresolved.permissions.clone();
     permission_unresolved.startup = unresolved;
     assert_eq!(
@@ -398,7 +397,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             }),
             "missing pin {gate} must remain externally unresolved"
         );
-        let admitted = evidence.gate_admitted_capabilities;
+        let admitted = available_capabilities(&context);
         match gate {
             "attendance_contract_owner"
             | "attendance_contract_revision"
