@@ -107,6 +107,16 @@ pub fn browser_control_tools() -> Vec<Tool> {
 /// does not find one it could mistake for an action.
 fn management_surface() -> ProviderRole {
     ProviderRole::ManagementSurface {
+        // subc may deliver management calls concurrently across channels while
+        // preserving FIFO submission within each; this module then schedules
+        // them itself. That is what it already does -- the wire loop reads
+        // frames in order and spawns each request, and the ordering this
+        // module genuinely needs (one dispatch at a time per browser context)
+        // is enforced internally by its own lane rather than by subc.
+        // Serial would understate what the module can accept and needlessly
+        // serialise unrelated conversations; StatelessParallel would overstate
+        // it by claiming no ordering matters, which is false for that lane.
+        concurrency: Concurrency::ModuleManaged,
         operations: [
             crate::management::OPEN_TARGET,
             crate::management::OPEN_GRANT,
