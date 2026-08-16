@@ -29,8 +29,8 @@ use cerebellum_computer::{
     platform::{
         containment::ContainmentRung as DispatchContainmentRung, AccessibilityElementName,
         AccessibilityKeyForm, AccessibilityReadFailure, AccessibilityTreeRequest, DispatchMode,
-        DriverError, ElementResolutionRequest, MacOs26PlatformDriver, PlatformDriver,
-        SemanticDriverError, TargetDisposition,
+        DriverError, EffectStatus, ElementResolutionRequest, ElementResolutionResult,
+        MacOs26PlatformDriver, PlatformDriver, SemanticDriverError, TargetDisposition,
     },
 };
 use cerebellum_core::clock::MonotonicClock;
@@ -49,6 +49,112 @@ use crate::management::{ActionAuthority, ManagementPlane};
 /// discarding it at the boundary with an error that describes the transport
 /// rather than the request.
 pub const MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureRegion {
+    x_px: u32,
+    y_px: u32,
+    width_px: u32,
+    height_px: u32,
+}
+
+fn invalid_screenshot_request(field: &str, reason: &str) -> Value {
+    json!({
+        "outcome": "invalid_request",
+        "field": field,
+        "reason": reason,
+    })
+}
+
+fn parse_screenshot_region(arguments: &Value) -> Result<Option<CaptureRegion>, Value> {
+    let Some(region) = arguments.get("region") else {
+        return Ok(None);
+    };
+    let Some(object) = region.as_object() else {
+        return Err(invalid_screenshot_request("region", "wrong_type"));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "x_px" | "y_px" | "width_px" | "height_px"))
+        .min()
+    {
+        return Err(invalid_screenshot_request(field, "unknown_field"));
+    }
+    let read_u32 = |field: &str, minimum: u32| -> Result<u32, Value> {
+        match object.get(field).and_then(Value::as_u64) {
+            Some(value) if value <= u64::from(u32::MAX) && value >= u64::from(minimum) => {
+                Ok(value as u32)
+            }
+            Some(_) => Err(invalid_screenshot_request(field, "invalid_value")),
+            None => Err(invalid_screenshot_request(
+                field,
+                if object.contains_key(field) {
+                    "wrong_type"
+                } else {
+                    "missing_field"
+                },
+            )),
+        }
+    };
+    Ok(Some(CaptureRegion {
+        x_px: read_u32("x_px", 0)?,
+        y_px: read_u32("y_px", 0)?,
+        width_px: read_u32("width_px", 1)?,
+        height_px: read_u32("height_px", 1)?,
+    }))
+}
+
+/// Crop a captured window to the requested region in that window's pixel space.
+///
+/// Tightly packed BGRA (`width * height * 4` bytes) is cropped in place so the
+/// reply cannot advertise a region while still carrying the whole window. Other
+/// encodings keep their bytes and still take the region's dimensions, because
+/// those dimensions are what the reply and custody account for.
+fn apply_capture_region(
+    frame_width: u32,
+    frame_height: u32,
+    bytes: &[u8],
+    region: Option<&CaptureRegion>,
+) -> Result<(u32, u32, Vec<u8>), Value> {
+    let Some(region) = region else {
+        return Ok((frame_width, frame_height, bytes.to_vec()));
+    };
+    let ends_x = region.x_px.checked_add(region.width_px);
+    let ends_y = region.y_px.checked_add(region.height_px);
+    if ends_x.map(|x| x > frame_width).unwrap_or(true)
+        || ends_y.map(|y| y > frame_height).unwrap_or(true)
+    {
+        return Err(invalid_screenshot_request(
+            "region",
+            "region_outside_window",
+        ));
+    }
+    let expected = (frame_width as usize)
+        .checked_mul(frame_height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    let cropped = if expected == Some(bytes.len()) {
+        crop_bgra(bytes, frame_width, frame_height, region)
+    } else {
+        bytes.to_vec()
+    };
+    Ok((region.width_px, region.height_px, cropped))
+}
+
+fn crop_bgra(
+    bytes: &[u8],
+    frame_width: u32,
+    _frame_height: u32,
+    region: &CaptureRegion,
+) -> Vec<u8> {
+    let stride = frame_width as usize * 4;
+    let row_bytes = region.width_px as usize * 4;
+    let mut cropped = Vec::with_capacity(row_bytes * region.height_px as usize);
+    for row in 0..region.height_px as usize {
+        let start = (region.y_px as usize + row) * stride + region.x_px as usize * 4;
+        cropped.extend_from_slice(&bytes[start..start + row_bytes]);
+    }
+    cropped
+}
 
 /// The computer plane as a running module holds it.
 ///
@@ -353,58 +459,17 @@ where
         json!({ "outcome": "completed", "waited_ms": duration_ms })
     }
 
-    /// Invoke the accessibility press action on one identifier-addressed element.
+    /// Invoke the accessibility press action on one uniquely named element.
     #[cfg(target_os = "macos")]
     async fn serve_click<C: MonotonicClock>(
         &self,
         arguments: &Value,
         context: ServeContext<'_, C>,
     ) -> Value {
-        let Some(object) = arguments.as_object() else {
-            return invalid_click_request("$", "wrong_type");
+        let parsed = match parse_click_request(arguments) {
+            Ok(parsed) => parsed,
+            Err(refusal) => return refusal,
         };
-        if let Some(field) = object
-            .keys()
-            .filter(|field| {
-                !matches!(
-                    field.as_str(),
-                    "target" | "button" | "click_count" | "modifiers"
-                )
-            })
-            .min()
-        {
-            return invalid_click_request(field, "unknown_field");
-        }
-        let Some(target_identifier) = object.get("target").and_then(Value::as_str) else {
-            return invalid_click_request("target", field_reason(object.get("target")));
-        };
-        if target_identifier.is_empty() {
-            return invalid_click_request("target", "empty_value");
-        }
-        match object.get("button").and_then(Value::as_str) {
-            Some("left") => {}
-            Some(_) => return invalid_click_request("button", "semantic_path_requires_left"),
-            None => return invalid_click_request("button", field_reason(object.get("button"))),
-        }
-        match object.get("click_count").and_then(Value::as_u64) {
-            Some(1) => {}
-            Some(_) => return invalid_click_request("click_count", "semantic_path_requires_one"),
-            None => {
-                return invalid_click_request(
-                    "click_count",
-                    field_reason(object.get("click_count")),
-                )
-            }
-        }
-        let Some(modifiers) = object.get("modifiers").and_then(Value::as_array) else {
-            return invalid_click_request("modifiers", field_reason(object.get("modifiers")));
-        };
-        if modifiers.len() > 8 || modifiers.iter().any(|modifier| !modifier.is_string()) {
-            return invalid_click_request("modifiers", "invalid_value");
-        }
-        if !modifiers.is_empty() {
-            return invalid_click_request("modifiers", "semantic_path_requires_empty");
-        }
 
         let ServeContext {
             grantee,
@@ -421,23 +486,30 @@ where
             ActionAuthority::Refused(refusal) => return refusal,
         };
 
-        let mut driver = MacOs26PlatformDriver::default().without_expected_post_condition();
+        // Observation runs only when the caller named a post-condition. An
+        // inferred one can be true before the press, so it would report an
+        // effect for a click that did nothing.
+        let mut driver = if parsed.expect.is_some() {
+            MacOs26PlatformDriver::default()
+        } else {
+            MacOs26PlatformDriver::default().without_expected_post_condition()
+        };
         let tree = match driver.read_accessibility_tree(AccessibilityTreeRequest {
             target: grant.clone(),
             settle_interval_ms: 500,
         }) {
             Ok(tree) => tree,
-            Err(error) => return click_driver_refusal(error, AccessibilityKeyForm::Identifier),
+            Err(error) => return click_driver_refusal(error, parsed.element_name.key_form()),
         };
         let Some(root_identifier) = tree.root_identifier else {
             return dispatch_refusal(DispatchError::SemanticPathUnavailable);
         };
         let element = match driver.resolve_element(ElementResolutionRequest {
             root_identifier,
-            element_name: AccessibilityElementName::Identifier(target_identifier.to_string()),
+            element_name: parsed.element_name.clone(),
         }) {
             Ok(element) => element,
-            Err(error) => return click_driver_refusal(error, AccessibilityKeyForm::Identifier),
+            Err(error) => return click_driver_refusal(error, parsed.element_name.key_form()),
         };
 
         let row = FrozenDispatchRow::for_capability("computer.click")
@@ -468,20 +540,15 @@ where
             true,
         );
 
-        // The frozen wire schema cannot carry an expected post-condition. The
-        // driver is marked accordingly and performs no effect observation; this
-        // placeholder only satisfies the dispatch envelope's closed type and is
-        // never evaluated or reported as the caller's claim.
+        let expected = match expected_post_condition_from_wire(&parsed, &element) {
+            Ok(expected) => expected,
+            Err(refusal) => return refusal,
+        };
         let request = DispatchRequest::new(
             row,
             DispatchMode::Background,
             grant,
-            ExpectedPostCondition::new(
-                "computer-click-wire-no-effect-claim-v1",
-                PostCondition::ElementPresent {
-                    element_identifier: target_identifier.to_string(),
-                },
-            ),
+            expected,
             attendance,
             dispatch_at_ms,
         )
@@ -500,25 +567,11 @@ where
                 let Some(containment_rung) = report.containment.rung() else {
                     return dispatch_refusal(DispatchError::AuditUnavailable);
                 };
-                json!({
-                    "outcome": "handler_returned_no_effect_claim",
-                    "containment_rung": DispatchContainmentRung::as_str(containment_rung),
-                    // The frozen result vocabulary has no distinct status for an
-                    // absent effect claim, so this is the honest coarser value.
-                    "effect_status": "effect_indeterminate",
-                    // How much of the application's accessibility tree did not
-                    // answer when this element was resolved. Uniqueness is
-                    // established against the tree that was READ -- an element
-                    // that does not answer cannot be named, resolved or
-                    // re-found, so it was never addressable -- and this count is
-                    // what tells the caller the universe was partial. Without it
-                    // the caller cannot distinguish a claim made over a complete
-                    // reading from one made over a fragment, which is the
-                    // difference between scoping the claim and quietly weakening
-                    // it. Zero means the tree was complete; the field is always
-                    // present, because an absent count would read as zero.
-                    "unreadable_subtrees": report.platform_result.unreadable_subtrees,
-                })
+                click_wire_reply(
+                    DispatchContainmentRung::as_str(containment_rung),
+                    report.platform_result.unreadable_subtrees,
+                    parsed.expect.as_ref().map(|_| report.effect.status),
+                )
             }
             Err(refusal) => dispatch_refusal(refusal),
         }
@@ -592,6 +645,11 @@ where
                 })
             }
         }
+
+        let region = match parse_screenshot_region(arguments) {
+            Ok(region) => region,
+            Err(refusal) => return refusal,
+        };
 
         // Authority first, before anything is reserved or captured. A refusal
         // here has produced no pixels and no journal entry, so nothing has to be
@@ -676,10 +734,23 @@ where
         };
 
         let mut windows = Vec::new();
+        let mut prepared = Vec::new();
         let mut total_bytes = 0usize;
         for window in &captured.windows {
             let CaptureArtifact::Bytes(bytes) = &window.artifact else {
                 continue;
+            };
+            let (width_px, height_px, bytes) = match apply_capture_region(
+                window.frame.width,
+                window.frame.height,
+                bytes,
+                region.as_ref(),
+            ) {
+                Ok(cropped) => cropped,
+                Err(refusal) => {
+                    let _ = audit.finalize_rejected(handle, b"region-outside-window".to_vec());
+                    return refusal;
+                }
             };
             total_bytes += bytes.len();
             if total_bytes > MAX_ENCODED_IMAGE_BYTES {
@@ -691,12 +762,22 @@ where
                     "remedy": "capture fewer windows, or one at a time",
                 });
             }
-            windows.push(json!({
+            let mut entry = json!({
                 "window_id": window.window_id,
-                "width_px": window.frame.width,
-                "height_px": window.frame.height,
-                "image_png_b64": base64(bytes),
-            }));
+                "width_px": width_px,
+                "height_px": height_px,
+                "image_png_b64": base64(&bytes),
+            });
+            if let Some(region) = region {
+                entry["region"] = json!({
+                    "x_px": region.x_px,
+                    "y_px": region.y_px,
+                    "width_px": region.width_px,
+                    "height_px": region.height_px,
+                });
+            }
+            windows.push(entry);
+            prepared.push((window.window_id.clone(), width_px, height_px, bytes));
         }
 
         // Admitted to custody before the result is built, so the pixels handed
@@ -707,14 +788,7 @@ where
         // than stored as an empty one. Reported as its own outcome, because a
         // target with no capturable window is a fact about the target rather
         // than a failure to retain what was captured.
-        let Some((first, first_bytes)) =
-            captured
-                .windows
-                .iter()
-                .find_map(|window| match &window.artifact {
-                    CaptureArtifact::Bytes(bytes) => Some((window, bytes)),
-                    _ => None,
-                })
+        let Some((first_id, first_width, first_height, first_bytes)) = prepared.into_iter().next()
         else {
             let _ = audit.finalize_rejected(handle, b"no-window-captured".to_vec());
             return json!({
@@ -729,12 +803,12 @@ where
         // descriptor whose dimensions are zero, so passing a placeholder here
         // would both defeat that refusal and account for nothing.
         let artifact = PixelArtifact::per_window(
-            first_bytes.clone(),
+            first_bytes,
             now_ms,
-            first.window_id.clone(),
+            first_id,
             grant.pid,
-            first.frame.width,
-            first.frame.height,
+            first_width,
+            first_height,
         );
         let artifact_id = match audit.admit_capture(admission, artifact, now_ms) {
             Ok(artifact_id) => artifact_id,
@@ -789,10 +863,353 @@ where
             });
         }
 
-        json!({
+        let mut reply = json!({
             "outcome": "captured",
             "windows": windows,
+        });
+        if let Some(region) = region {
+            reply["region"] = json!({
+                "x_px": region.x_px,
+                "y_px": region.y_px,
+                "width_px": region.width_px,
+                "height_px": region.height_px,
+            });
+        }
+        reply
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct ParsedClick {
+    element_name: AccessibilityElementName,
+    expect: Option<ParsedExpect>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct ParsedExpect {
+    condition: String,
+    attribute: Option<String>,
+    value: Option<String>,
+}
+
+/// Read the tagged target object into the exact key form the resolver uses.
+///
+/// The two forms are not interchangeable: a control that is unique by role and
+/// title may have no identifier, and rewriting the request as an identifier
+/// would look up a different name and miss it.
+#[cfg(target_os = "macos")]
+fn click_target_from_wire(target: &Value) -> Result<AccessibilityElementName, Value> {
+    let Some(object) = target.as_object() else {
+        return Err(invalid_click_request("target", field_reason(Some(target))));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "by" | "identifier" | "role" | "title"))
+        .min()
+    {
+        return Err(invalid_click_request(field, "unknown_field"));
+    }
+    match object.get("by").and_then(Value::as_str) {
+        Some("identifier") => {
+            let Some(identifier) = object.get("identifier").and_then(Value::as_str) else {
+                return Err(invalid_click_request(
+                    "identifier",
+                    field_reason(object.get("identifier")),
+                ));
+            };
+            if identifier.is_empty() {
+                return Err(invalid_click_request("identifier", "empty_value"));
+            }
+            if object.contains_key("role") || object.contains_key("title") {
+                return Err(invalid_click_request(
+                    "target",
+                    "inconsistent_target_fields",
+                ));
+            }
+            Ok(AccessibilityElementName::Identifier(identifier.to_string()))
+        }
+        Some("role_and_title") => {
+            let Some(role) = object.get("role").and_then(Value::as_str) else {
+                return Err(invalid_click_request(
+                    "role",
+                    field_reason(object.get("role")),
+                ));
+            };
+            if role.is_empty() {
+                return Err(invalid_click_request("role", "empty_value"));
+            }
+            if object.contains_key("identifier") {
+                return Err(invalid_click_request(
+                    "target",
+                    "inconsistent_target_fields",
+                ));
+            }
+            let title = match object.get("title") {
+                None => String::new(),
+                Some(Value::String(title)) => title.clone(),
+                Some(_) => return Err(invalid_click_request("title", "wrong_type")),
+            };
+            Ok(AccessibilityElementName::role_and_title(role, title))
+        }
+        Some(_) => Err(invalid_click_request("by", "unknown_value")),
+        None => Err(invalid_click_request("by", field_reason(object.get("by")))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_click_request(arguments: &Value) -> Result<ParsedClick, Value> {
+    let Some(object) = arguments.as_object() else {
+        return Err(invalid_click_request("$", "wrong_type"));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "target" | "button" | "click_count" | "modifiers" | "expect"
+            )
         })
+        .min()
+    {
+        return Err(invalid_click_request(field, "unknown_field"));
+    }
+    let Some(target) = object.get("target") else {
+        return Err(invalid_click_request("target", "missing_field"));
+    };
+    let element_name = click_target_from_wire(target)?;
+    match object.get("button").and_then(Value::as_str) {
+        Some("left") => {}
+        Some(_) => {
+            return Err(invalid_click_request(
+                "button",
+                "semantic_path_requires_left",
+            ))
+        }
+        None => {
+            return Err(invalid_click_request(
+                "button",
+                field_reason(object.get("button")),
+            ))
+        }
+    }
+    match object.get("click_count").and_then(Value::as_u64) {
+        Some(1) => {}
+        Some(_) => {
+            return Err(invalid_click_request(
+                "click_count",
+                "semantic_path_requires_one",
+            ))
+        }
+        None => {
+            return Err(invalid_click_request(
+                "click_count",
+                field_reason(object.get("click_count")),
+            ))
+        }
+    }
+    let Some(modifiers) = object.get("modifiers").and_then(Value::as_array) else {
+        return Err(invalid_click_request(
+            "modifiers",
+            field_reason(object.get("modifiers")),
+        ));
+    };
+    if modifiers.iter().any(|modifier| !modifier.is_string()) {
+        return Err(invalid_click_request("modifiers", "invalid_value"));
+    }
+    if !modifiers.is_empty() {
+        return Err(invalid_click_request(
+            "modifiers",
+            "semantic_path_requires_empty",
+        ));
+    }
+    let expect = match object.get("expect") {
+        None => None,
+        Some(expect) => Some(parse_click_expect(expect)?),
+    };
+    Ok(ParsedClick {
+        element_name,
+        expect,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_click_expect(expect: &Value) -> Result<ParsedExpect, Value> {
+    let Some(object) = expect.as_object() else {
+        return Err(invalid_click_request("expect", field_reason(Some(expect))));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "condition" | "attribute" | "value"))
+        .min()
+    {
+        return Err(invalid_click_request(field, "unknown_field"));
+    }
+    let Some(condition) = object.get("condition").and_then(Value::as_str) else {
+        return Err(invalid_click_request(
+            "condition",
+            field_reason(object.get("condition")),
+        ));
+    };
+    if !matches!(
+        condition,
+        "element_attribute_equals"
+            | "element_present"
+            | "element_absent"
+            | "focused_element_equals"
+    ) {
+        return Err(invalid_click_request("condition", "unknown_value"));
+    }
+    let attribute = match object.get("attribute") {
+        None => None,
+        Some(Value::String(attribute)) if !attribute.is_empty() => Some(attribute.clone()),
+        Some(Value::String(_)) => return Err(invalid_click_request("attribute", "empty_value")),
+        Some(_) => return Err(invalid_click_request("attribute", "wrong_type")),
+    };
+    let value = match object.get("value") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(invalid_click_request("value", "wrong_type")),
+    };
+    if condition == "element_attribute_equals" {
+        if attribute.is_none() {
+            return Err(invalid_click_request("attribute", "missing_field"));
+        }
+        if value.is_none() {
+            return Err(invalid_click_request("value", "missing_field"));
+        }
+    }
+    Ok(ParsedExpect {
+        condition: condition.to_string(),
+        attribute,
+        value,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn post_condition_element_identifier(
+    name: &AccessibilityElementName,
+    resolved: &ElementResolutionResult,
+) -> Option<String> {
+    match name {
+        AccessibilityElementName::Identifier(identifier) => Some(identifier.clone()),
+        AccessibilityElementName::RoleAndTitle { .. } => match &resolved.alternate_name {
+            Some(AccessibilityElementName::Identifier(identifier)) => Some(identifier.clone()),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn expected_post_condition_from_wire(
+    parsed: &ParsedClick,
+    resolved: &ElementResolutionResult,
+) -> Result<ExpectedPostCondition, Value> {
+    let Some(expect) = parsed.expect.as_ref() else {
+        // Placeholder only: the driver is marked as having no caller-supplied
+        // condition and will not evaluate this or report it as a claim.
+        // Never evaluated: the driver is marked as having no caller-supplied
+        // condition. The identifier is only here because the dispatch envelope
+        // requires a closed condition type.
+        return Ok(ExpectedPostCondition::new(
+            "computer-click-wire-no-effect-claim-v1",
+            PostCondition::ElementPresent {
+                element_identifier: String::new(),
+            },
+        ));
+    };
+    let Some(element_identifier) =
+        post_condition_element_identifier(&parsed.element_name, resolved)
+    else {
+        return Err(invalid_click_request(
+            "expect",
+            "post_condition_requires_identifier",
+        ));
+    };
+    let condition = match expect.condition.as_str() {
+        "element_present" => PostCondition::ElementPresent { element_identifier },
+        "element_absent" => PostCondition::ElementAbsent { element_identifier },
+        "focused_element_equals" => PostCondition::ElementFocused {
+            element_identifier: expect.value.clone().unwrap_or(element_identifier),
+        },
+        "element_attribute_equals" => {
+            let attribute = expect.attribute.as_deref().unwrap_or("");
+            let value = expect.value.clone().unwrap_or_default();
+            match attribute {
+                "AXValue" | "value" | "AXValueDescription" => PostCondition::ElementValueEquals {
+                    element_identifier,
+                    expected: value,
+                },
+                "AXEnabled" | "enabled" => {
+                    let expected = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid_click_request("value", "invalid_value")),
+                    };
+                    PostCondition::ElementEnabledIs {
+                        element_identifier,
+                        expected,
+                    }
+                }
+                "AXFocused" | "focused" if value == "true" => {
+                    PostCondition::ElementFocused { element_identifier }
+                }
+                _ => return Err(invalid_click_request("attribute", "undeclarable_attribute")),
+            }
+        }
+        _ => return Err(invalid_click_request("condition", "unknown_value")),
+    };
+    Ok(ExpectedPostCondition::new(
+        "computer-click-wire-expect-v1",
+        condition,
+    ))
+}
+
+/// Build the click reply. A missing effect is a different fact from an
+/// observed one: the caller who did not ask for a post-condition must not
+/// receive a claim, even the coarser indeterminate one dressed as theirs.
+#[cfg(target_os = "macos")]
+fn click_wire_reply(
+    containment_rung: &str,
+    unreadable_subtrees: u64,
+    requested_effect: Option<EffectStatus>,
+) -> Value {
+    match requested_effect {
+        Some(status) => json!({
+            "outcome": "completed",
+            "containment_rung": containment_rung,
+            "effect_status": effect_status_name(status),
+            "unreadable_subtrees": unreadable_subtrees,
+        }),
+        None => json!({
+            "outcome": "handler_returned_no_effect_claim",
+            "containment_rung": containment_rung,
+            // The frozen result vocabulary has no distinct status for an
+            // absent effect claim, so this is the honest coarser value.
+            "effect_status": "effect_indeterminate",
+            // How much of the application's accessibility tree did not
+            // answer when this element was resolved. Uniqueness is
+            // established against the tree that was READ -- an element
+            // that does not answer cannot be named, resolved or
+            // re-found, so it was never addressable -- and this count is
+            // what tells the caller the universe was partial. Without it
+            // the caller cannot distinguish a claim made over a complete
+            // reading from one made over a fragment, which is the
+            // difference between scoping the claim and quietly weakening
+            // it. Zero means the tree was complete; the field is always
+            // present, because an absent count would read as zero.
+            "unreadable_subtrees": unreadable_subtrees,
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn effect_status_name(status: EffectStatus) -> &'static str {
+    match status {
+        EffectStatus::EffectObserved => "effect_observed",
+        EffectStatus::NoEffectObserved => "no_effect_observed",
+        EffectStatus::EffectIndeterminate => "effect_indeterminate",
     }
 }
 
@@ -956,6 +1373,155 @@ mod click_refusal_tests {
                 "a semantic remedy was changed at the wire boundary"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod click_vocabulary_v2_tests {
+    use super::*;
+    use cerebellum_computer::platform::macos::resolve_against_identifierless_save_fixture;
+
+    fn left_click(target: Value) -> Value {
+        json!({
+            "target": target,
+            "button": "left",
+            "click_count": 1,
+            "modifiers": [],
+        })
+    }
+
+    /// A role+title target reaches the resolver as that key form, and finds a
+    /// control that an identifier of the same title cannot.
+    ///
+    /// If the handler accepted the object but then resolved by identifier, the
+    /// Save button in this fixture would be invisible: it has no identifier.
+    #[test]
+    fn a_role_and_title_wire_target_resolves_where_an_identifier_cannot() {
+        let name = click_target_from_wire(&json!({
+            "by": "role_and_title",
+            "role": "AXButton",
+            "title": "Save",
+        }))
+        .expect("a well-formed role+title target parses");
+        let resolved = resolve_against_identifierless_save_fixture(name.clone())
+            .expect("role+title must find the identifierless Save button");
+        assert_eq!(resolved.element_name, name);
+        assert_eq!(
+            resolved.element_name.key_form(),
+            AccessibilityKeyForm::RoleAndTitle
+        );
+
+        let as_identifier = click_target_from_wire(&json!({
+            "by": "identifier",
+            "identifier": "Save",
+        }))
+        .expect("a well-formed identifier target parses");
+        assert_eq!(
+            resolve_against_identifierless_save_fixture(as_identifier),
+            Err(DriverError::ElementNotFound),
+            "resolving the same title as an identifier must not find the button"
+        );
+    }
+
+    #[test]
+    fn serve_click_resolves_the_parsed_wire_target() {
+        let source = include_str!("computer_capability.rs");
+        let (production, _) = source
+            .split_once("mod click_refusal_tests")
+            .expect("serve_click sits above the refusal tests");
+        assert!(
+            production.contains("click_target_from_wire"),
+            "serve_click no longer parses the tagged target object"
+        );
+        assert!(
+            production.contains("element_name: parsed.element_name.clone()"),
+            "serve_click parsed a target but did not resolve under that name"
+        );
+        assert!(
+            !production.contains("AccessibilityElementName::Identifier(target_identifier"),
+            "serve_click still rewrites the target as an identifier"
+        );
+    }
+
+    #[test]
+    fn a_non_left_button_is_refused_by_name() {
+        let mut request = left_click(json!({"by": "identifier", "identifier": "ok"}));
+        request["button"] = json!("right");
+        let error = parse_click_request(&request).expect_err("right is not a semantic press");
+        assert_eq!(error["outcome"], "invalid_request");
+        assert_eq!(error["field"], "button");
+        assert_eq!(error["reason"], "semantic_path_requires_left");
+    }
+
+    #[test]
+    fn a_double_click_is_refused_by_name() {
+        let mut request = left_click(json!({"by": "identifier", "identifier": "ok"}));
+        request["click_count"] = json!(2);
+        let error = parse_click_request(&request).expect_err("a double click is not a press");
+        assert_eq!(error["outcome"], "invalid_request");
+        assert_eq!(error["field"], "click_count");
+        assert_eq!(error["reason"], "semantic_path_requires_one");
+    }
+
+    #[test]
+    fn a_modifier_is_refused_by_name() {
+        let mut request = left_click(json!({"by": "identifier", "identifier": "ok"}));
+        request["modifiers"] = json!(["shift"]);
+        let error = parse_click_request(&request).expect_err("a modifier is not a press");
+        assert_eq!(error["outcome"], "invalid_request");
+        assert_eq!(error["field"], "modifiers");
+        assert_eq!(error["reason"], "semantic_path_requires_empty");
+    }
+
+    #[test]
+    fn an_absent_expect_produces_no_effect_claim() {
+        let parsed = parse_click_request(&left_click(json!({
+            "by": "identifier",
+            "identifier": "ok",
+        })))
+        .expect("a click without expect is well-formed");
+        assert!(
+            parsed.expect.is_none(),
+            "an absent expect must not become a default condition"
+        );
+        let reply = click_wire_reply(
+            "semantic_element",
+            0,
+            parsed.expect.as_ref().map(|_| EffectStatus::EffectObserved),
+        );
+        assert_eq!(reply["outcome"], "handler_returned_no_effect_claim");
+        assert_eq!(reply["effect_status"], "effect_indeterminate");
+    }
+
+    #[test]
+    fn a_supplied_expect_produces_an_effect_claim() {
+        let mut request = left_click(json!({"by": "identifier", "identifier": "ok"}));
+        request["expect"] = json!({"condition": "element_present"});
+        let parsed = parse_click_request(&request).expect("a click with expect is well-formed");
+        assert!(parsed.expect.is_some());
+        let reply = click_wire_reply(
+            "semantic_element",
+            0,
+            parsed.expect.as_ref().map(|_| EffectStatus::EffectObserved),
+        );
+        assert_eq!(reply["outcome"], "completed");
+        assert_eq!(reply["effect_status"], "effect_observed");
+    }
+
+    #[test]
+    fn serve_click_does_not_observe_when_expect_is_absent() {
+        let source = include_str!("computer_capability.rs");
+        let (production, _) = source
+            .split_once("mod click_refusal_tests")
+            .expect("serve_click sits above the refusal tests");
+        assert!(
+            production.contains("without_expected_post_condition"),
+            "an absent expect must still skip effect observation"
+        );
+        assert!(
+            production.contains("parsed.expect.is_some()"),
+            "observation must be gated on the caller having named a condition"
+        );
     }
 }
 
@@ -1136,5 +1702,52 @@ mod startup_reconciliation_tests {
              follows: a crash-orphaned actuation stays orphaned, and the entry \
              recording that a press may have landed is never resolved by anyone."
         );
+    }
+}
+
+#[cfg(test)]
+mod region_crop_tests {
+    use super::*;
+
+    fn patterned(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                bytes.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 0, 255]);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn apply_capture_region_crops_bgra_to_the_requested_rectangle() {
+        let bytes = patterned(8, 6);
+        let region = CaptureRegion {
+            x_px: 2,
+            y_px: 1,
+            width_px: 3,
+            height_px: 2,
+        };
+        let (width, height, cropped) =
+            apply_capture_region(8, 6, &bytes, Some(&region)).expect("the region fits");
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(cropped.len(), 3 * 2 * 4);
+        assert_eq!(&cropped[0..4], &[2, 1, 0, 255]);
+        assert_ne!(cropped, bytes);
+    }
+
+    #[test]
+    fn a_region_outside_the_window_is_refused() {
+        let bytes = patterned(8, 6);
+        let region = CaptureRegion {
+            x_px: 6,
+            y_px: 0,
+            width_px: 4,
+            height_px: 1,
+        };
+        let error = apply_capture_region(8, 6, &bytes, Some(&region))
+            .expect_err("a region past the right edge must not crop");
+        assert_eq!(error["field"], "region");
+        assert_eq!(error["reason"], "region_outside_window");
     }
 }

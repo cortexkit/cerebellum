@@ -474,6 +474,42 @@ fn resolution_from_cached_tree(
     })
 }
 
+/// Resolve `name` against a tree whose Save button has a role and title and no
+/// identifier. An identifier lookup for "Save" cannot find it; a role+title
+/// lookup can. That is the distinction the wire target object exists to carry.
+pub fn resolve_against_identifierless_save_fixture(
+    name: AccessibilityElementName,
+) -> Result<ElementResolutionResult, DriverError> {
+    let tree = CachedAccessibilityTree {
+        target: ProcessGrant {
+            pid: 41,
+            bundle_identity: "com.example.reader".to_string(),
+            process_generation_evidence: "generation-a".to_string(),
+        },
+        tree: CachedAccessibilityElement {
+            identifier: Some("root-actual-id".to_string()),
+            role: Some("AXApplication".to_string()),
+            title: Some("Reader".to_string()),
+            actions: Vec::new(),
+            children: vec![CachedAccessibilityElement {
+                identifier: None,
+                role: Some("AXButton".to_string()),
+                title: Some("Save".to_string()),
+                actions: vec!["AXPress".to_string()],
+                children: Vec::new(),
+            }],
+        },
+        unreadable_subtrees: 0,
+    };
+    resolution_from_cached_tree(
+        &tree,
+        &ElementResolutionRequest {
+            root_identifier: "fixture".to_string(),
+            element_name: name,
+        },
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn verify_cached_tree_owner(target: &ProcessGrant) -> Result<(), DriverError> {
     match super::native::verify_grant(target.pid, target) {

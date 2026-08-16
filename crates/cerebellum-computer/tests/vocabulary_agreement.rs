@@ -1,6 +1,6 @@
 //! The frozen vocabulary and the code that decides the same things must agree.
 //!
-//! Several fields in `computer_action_vocabulary-v1.json` state a rule that a
+//! Several fields in `computer_action_vocabulary-v2.json` state a rule that a
 //! hand-written function also states. Validation checks those fields are
 //! PRESENT and never reads them, so the two statements can drift apart with
 //! nothing failing: the file is the contract and the function is what runs.
@@ -24,7 +24,7 @@ use cerebellum_computer::{
 };
 use serde_json::Value;
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v1.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v2.json");
 
 /// These frozen fields have no per-capability code counterpart to compare.
 ///
