@@ -5,14 +5,27 @@
 //! body may use only async-signal-safe calls. Framework churn and concurrent
 //! launch attempts keep the unsafe pre-exec window under pressure.
 
+#[cfg(target_os = "macos")]
 use std::ffi::OsString;
+#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("this probe stresses the macOS launch barrier under fork pressure and has nothing to run here");
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     let threads: usize = std::env::args()
         .nth(1)

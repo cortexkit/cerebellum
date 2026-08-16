@@ -6,18 +6,25 @@
 //! session that connects and then cannot load a page. Every assertion in the
 //! readiness tests would still call such a session ready.
 
+#[cfg(target_os = "macos")]
 use std::ffi::OsString;
+#[cfg(target_os = "macos")]
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 fn send(p: &mut UnixStream, v: serde_json::Value) {
     let mut b = serde_json::to_vec(&v).expect("json");
     b.push(0);
     p.write_all(&b).expect("write");
 }
 
+#[cfg(target_os = "macos")]
 fn recv(p: &mut UnixStream, want: u64, buffer: &mut Vec<u8>) -> serde_json::Value {
     loop {
         if let Some(at) = buffer.iter().position(|b| *b == 0) {
@@ -36,6 +43,12 @@ fn recv(p: &mut UnixStream, want: u64, buffer: &mut Vec<u8>) -> serde_json::Valu
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("this probe checks macOS browser renderers under the launch barrier and has nothing to run here");
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     let chrome = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
     if !chrome.is_file() {

@@ -1191,6 +1191,7 @@ async fn feature_gated_identity_observer_records_resolved_facts() {
 /// The plane refuses this particular request, because the test module holds no
 /// lease. That refusal is the evidence: only the computer plane produces it, so
 /// receiving it establishes which handler ran.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_computer_capability_reaches_the_computer_plane() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
@@ -1231,6 +1232,7 @@ async fn a_computer_capability_reaches_the_computer_plane() {
 /// This module holds no compose lease, so the authority chain refuses before
 /// accessibility is read. The typed no-lease recipe proves click reached the
 /// serving handler rather than falling through as an unknown method.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn reviewed_semantic_click_reaches_the_compose_authority_chain() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
@@ -1277,6 +1279,7 @@ async fn reviewed_semantic_click_reaches_the_compose_authority_chain() {
 ///
 /// The request is valid enough to reach compose authority if the admission check
 /// is removed, so an argument refusal cannot make this tripwire pass by accident.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn unadvertised_semantic_click_is_refused_before_its_serving_handler() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
@@ -1326,6 +1329,7 @@ async fn unadvertised_semantic_click_is_refused_before_its_serving_handler() {
 /// who reads the vocabulary — it only hides it from one who looks at the
 /// manifest. A gate that governs what the module SAYS rather than what it DOES
 /// is not a gate.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);

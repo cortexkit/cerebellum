@@ -39,12 +39,14 @@
 /// count does not move when the menu opens — the contents appear INSIDE the
 /// AXMenu. Observing both levels is what makes the assertion independent of
 /// which of the two shapes an application uses.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MenuCounts {
     bar_children: usize,
     menu_children: Option<usize>,
 }
 
+#[cfg(target_os = "macos")]
 fn menu_opened(before: &MenuCounts, after: &MenuCounts) -> Result<(), String> {
     let bar_changed = before.bar_children != after.bar_children;
     let menu_changed = match (before.menu_children, after.menu_children) {
@@ -61,6 +63,7 @@ fn menu_opened(before: &MenuCounts, after: &MenuCounts) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn menu_closed(before: &MenuCounts, after: &MenuCounts) -> Result<(), String> {
     if before == after {
         Ok(())
