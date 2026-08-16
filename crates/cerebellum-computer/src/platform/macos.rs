@@ -1202,26 +1202,38 @@ mod tests {
         );
     }
 
-    /// The click action name matches what the framework vocabulary parses.
+    /// The click action names match what the framework vocabulary parses.
     ///
-    /// Two crates hold this string: `cerebellum-macos` maps `AxAction::Press`
-    /// to the framework's spelling, and the computer plane names the action a
-    /// click requests. If they diverge, every click is refused as unadvertised
-    /// and nothing else notices -- fixtures declare whatever the test passes,
-    /// so a double agrees with the caller and with nothing real. This is the
-    /// only place the two spellings meet.
+    /// Two crates hold these strings: `cerebellum-macos` maps the closed
+    /// `AxAction` variants to framework spellings, and the computer plane names
+    /// the actions a click may request. If they diverge, a requested action is
+    /// refused as unadvertised and nothing else notices because a test double
+    /// advertises whatever string its caller also passes.
     #[test]
-    fn the_press_action_name_matches_the_framework_vocabulary() {
-        assert_eq!(
-            super::SEMANTIC_PRESS_ACTION,
-            cerebellum_macos::AxAction::Press.name(),
-            "the action a click requests is not the one the vocabulary parses, \
-             so every click would be refused as unadvertised"
-        );
-        assert!(
-            cerebellum_macos::AxAction::from_name(super::SEMANTIC_PRESS_ACTION).is_some(),
-            "the vocabulary does not recognise the action a click requests"
-        );
+    fn the_click_action_names_match_the_framework_vocabulary() {
+        let actions = [
+            (
+                super::SEMANTIC_PRESS_ACTION,
+                cerebellum_macos::AxAction::Press,
+            ),
+            (
+                super::SEMANTIC_CANCEL_ACTION,
+                cerebellum_macos::AxAction::Cancel,
+            ),
+        ];
+
+        for (name, action) in actions {
+            assert_eq!(
+                name,
+                action.name(),
+                "the action a click requests is not the one the vocabulary parses"
+            );
+            assert_eq!(
+                cerebellum_macos::AxAction::from_name(name),
+                Some(action),
+                "the framework vocabulary does not recognise a click action"
+            );
+        }
     }
 
     /// A capability in the vocabulary carries the permissions it lists.

@@ -32,7 +32,8 @@ use cerebellum_computer::{
         containment::ContainmentRung as DispatchContainmentRung, AccessibilityElementName,
         AccessibilityKeyForm, AccessibilityReadFailure, AccessibilityTreeRequest, DispatchMode,
         DriverError, EffectStatus, ElementResolutionRequest, ElementResolutionResult,
-        MacOs26PlatformDriver, PlatformDriver, SemanticDriverError, TargetDisposition,
+        MacOs26PlatformDriver, PlatformDriver, SemanticDispatchRequest, SemanticDriverError,
+        TargetDisposition, SEMANTIC_CANCEL_ACTION, SEMANTIC_PRESS_ACTION,
     },
 };
 use cerebellum_core::clock::MonotonicClock;
@@ -513,22 +514,15 @@ where
             Ok(expected) => expected,
             Err(refusal) => return refusal,
         };
-        let request = DispatchRequest::new(
+        let mut request = DispatchRequest::new(
             row,
             DispatchMode::Background,
             grant,
             expected,
             attendance,
             dispatch_at_ms,
-        )
-        // The name macOS accessibility actually advertises, not a lowercase
-        // shorthand for it. The closed AxAction vocabulary parses exactly the
-        // framework's spelling, so anything else is refused as unadvertised --
-        // which is correct behaviour and made every wire click fail until a
-        // live probe drove one against a real application. Fixtures could not
-        // catch it: a double declares whatever string the test also passes, so
-        // the two agree with each other and with nothing else.
-        .with_semantic(element, cerebellum_computer::SEMANTIC_PRESS_ACTION);
+        );
+        request.semantic = Some(click_semantic_request(&parsed, element));
 
         let mut audit = self.audit.lock().await;
         match Dispatcher::new(driver).dispatch(&mut audit, identity, request) {
@@ -870,7 +864,19 @@ where
 #[derive(Debug)]
 struct ParsedClick {
     element_name: AccessibilityElementName,
+    action: &'static str,
     expect: Option<ParsedExpect>,
+}
+
+#[cfg(target_os = "macos")]
+fn click_semantic_request(
+    parsed: &ParsedClick,
+    element: ElementResolutionResult,
+) -> SemanticDispatchRequest {
+    SemanticDispatchRequest {
+        element,
+        action: parsed.action.to_owned(),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -955,7 +961,7 @@ fn parse_click_request(arguments: &Value) -> Result<ParsedClick, Value> {
         .filter(|field| {
             !matches!(
                 field.as_str(),
-                "target" | "button" | "click_count" | "modifiers" | "expect"
+                "target" | "button" | "click_count" | "modifiers" | "action" | "expect"
             )
         })
         .min()
@@ -1011,12 +1017,22 @@ fn parse_click_request(arguments: &Value) -> Result<ParsedClick, Value> {
             "semantic_path_requires_empty",
         ));
     }
+    // Omission preserves the original wire contract: before this field existed,
+    // every computer.click requested AXPress.
+    let action = match object.get("action") {
+        None => SEMANTIC_PRESS_ACTION,
+        Some(Value::String(action)) if action == SEMANTIC_PRESS_ACTION => SEMANTIC_PRESS_ACTION,
+        Some(Value::String(action)) if action == SEMANTIC_CANCEL_ACTION => SEMANTIC_CANCEL_ACTION,
+        Some(Value::String(_)) => return Err(invalid_click_request("action", "unknown_value")),
+        Some(action) => return Err(invalid_click_request("action", field_reason(Some(action)))),
+    };
     let expect = match object.get("expect") {
         None => None,
         Some(expect) => Some(parse_click_expect(expect)?),
     };
     Ok(ParsedClick {
         element_name,
+        action,
         expect,
     })
 }
@@ -1364,7 +1380,7 @@ mod click_refusal_tests {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod click_vocabulary_v2_tests {
+mod click_vocabulary_v3_tests {
     use super::*;
     use cerebellum_computer::platform::macos::resolve_against_identifierless_save_fixture;
 
@@ -1375,6 +1391,153 @@ mod click_vocabulary_v2_tests {
             "click_count": 1,
             "modifiers": [],
         })
+    }
+
+    #[derive(Debug, Default)]
+    struct ActionRecordingPlatform {
+        requested_action: Option<String>,
+    }
+
+    impl PlatformDriver for ActionRecordingPlatform {
+        fn capability_declarations(
+            &self,
+            _context: &cerebellum_computer::platform::CapabilityAdvertisementContext,
+        ) -> Vec<cerebellum_computer::platform::CapabilityDeclaration> {
+            Vec::new()
+        }
+
+        fn read_accessibility_tree(
+            &mut self,
+            _request: AccessibilityTreeRequest,
+        ) -> Result<cerebellum_computer::platform::AccessibilityTreeResult, DriverError> {
+            Err(DriverError::Unsupported("test does not read a tree"))
+        }
+
+        fn resolve_element(
+            &mut self,
+            _request: ElementResolutionRequest,
+        ) -> Result<ElementResolutionResult, DriverError> {
+            Err(DriverError::Unsupported("test does not resolve an element"))
+        }
+
+        fn dispatch_semantic(
+            &mut self,
+            request: SemanticDispatchRequest,
+        ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+            self.requested_action = Some(request.action);
+            Ok(cerebellum_computer::platform::DispatchResult {
+                accepted_by_platform: true,
+                effect_status: EffectStatus::EffectIndeterminate,
+                unreadable_subtrees: 0,
+            })
+        }
+
+        fn dispatch_per_pid(
+            &mut self,
+            _request: cerebellum_computer::platform::SyntheticDispatchRequest,
+        ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+            Err(DriverError::Unsupported(
+                "test does not dispatch synthetic input",
+            ))
+        }
+
+        fn dispatch_global(
+            &mut self,
+            _request: cerebellum_computer::platform::SyntheticDispatchRequest,
+        ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+            Err(DriverError::Unsupported(
+                "test does not dispatch synthetic input",
+            ))
+        }
+
+        fn query_focus(
+            &mut self,
+            _request: cerebellum_computer::platform::FocusQueryRequest,
+        ) -> Result<cerebellum_computer::platform::FocusQueryResult, DriverError> {
+            Err(DriverError::Unsupported("test does not query focus"))
+        }
+
+        fn fronting_snapshot(
+            &mut self,
+            _target: &cerebellum_computer::platform::ProcessGrant,
+        ) -> Result<cerebellum_computer::platform::FrontingSnapshot, DriverError> {
+            Err(DriverError::Unsupported(
+                "test does not inspect fronting state",
+            ))
+        }
+
+        fn input_observer_liveness(&self) -> cerebellum_computer::platform::InputObserverLiveness {
+            cerebellum_computer::platform::InputObserverLiveness {
+                session_tap_live: false,
+                raw_hid_live: false,
+                self_echo_filter_live: false,
+            }
+        }
+
+        fn observe_input(
+            &mut self,
+            _request: cerebellum_computer::platform::InputObservationRequest,
+        ) -> Result<cerebellum_computer::platform::InputObservationResult, DriverError> {
+            Err(DriverError::Unsupported("test does not observe input"))
+        }
+
+        fn observe_effect(
+            &mut self,
+            _request: cerebellum_computer::platform::EffectObservationRequest,
+        ) -> Result<cerebellum_computer::platform::EffectObservationResult, DriverError> {
+            Err(DriverError::Unsupported("test does not observe effects"))
+        }
+
+        fn verify_attendance(
+            &mut self,
+            _request: cerebellum_computer::platform::AttendancePreconditionRequest,
+        ) -> Result<cerebellum_computer::platform::AttendancePreconditionResult, DriverError>
+        {
+            Err(DriverError::Unsupported("test does not verify attendance"))
+        }
+    }
+
+    fn action_that_reached_platform(wire_request: Value) -> String {
+        let parsed = parse_click_request(&wire_request).expect("the click request is valid");
+        let semantic = click_semantic_request(
+            &parsed,
+            ElementResolutionResult {
+                element_name: parsed.element_name.clone(),
+                alternate_name: None,
+                owning_process: cerebellum_computer::platform::ProcessGrant {
+                    pid: 42,
+                    bundle_identity: "com.example.target".into(),
+                    process_generation_evidence: "generation-1".into(),
+                },
+                semantic_actions: vec![SEMANTIC_PRESS_ACTION.into(), SEMANTIC_CANCEL_ACTION.into()],
+                unreadable_subtrees: 0,
+            },
+        );
+        let mut platform = ActionRecordingPlatform::default();
+        platform
+            .dispatch_semantic(semantic)
+            .expect("the recording platform accepts the action");
+        platform
+            .requested_action
+            .expect("the action reached the platform boundary")
+    }
+
+    #[test]
+    fn a_named_cancel_reaches_the_platform_as_cancel_not_press() {
+        let mut request = left_click(json!({"by": "identifier", "identifier": "menu"}));
+        request["action"] = json!("AXCancel");
+
+        assert_eq!(
+            action_that_reached_platform(request),
+            SEMANTIC_CANCEL_ACTION
+        );
+    }
+
+    #[test]
+    fn an_absent_action_reaches_the_platform_as_press() {
+        let request = left_click(json!({"by": "identifier", "identifier": "button"}));
+
+        assert_eq!(action_that_reached_platform(request), SEMANTIC_PRESS_ACTION);
     }
 
     /// A role+title target reaches the resolver as that key form, and finds a

@@ -486,7 +486,7 @@ fn canonical_computer_declarations(
 
 fn computer_tool(id: &str) -> Option<subc_protocol::manifest::Tool> {
     let artifact: Value = serde_json::from_slice(include_bytes!(
-        "../../cerebellum-computer/resources/computer_action_vocabulary-v2.json"
+        "../../cerebellum-computer/resources/computer_action_vocabulary-v3.json"
     ))
     .ok()?;
     let row = artifact
