@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_core_foundation::{CFData, CFRetained, CFString};
+use objc2_core_foundation::{CFData, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
 };
@@ -588,6 +588,19 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
 /// enumeration, so a caller can tell whether the window it asked for is still
 /// owned by the process it meant. A window id is reused after its window
 /// closes, so the id alone does not answer that.
+/// A rectangle in the captured window's own space, origin at its top-left.
+///
+/// Units match the width and height already passed to the stream configuration
+/// for a full-window capture. This type carries no policy: the caller decides
+/// whether the rectangle is admissible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureSourceRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 pub struct RawCapture {
     pub width: usize,
     pub height: usize,
@@ -688,7 +701,11 @@ fn find_window(window_id: u32, timeout: Duration) -> Result<Retained<SCWindow>, 
 /// So the deadline has to cover a wait for another process's setup rather than
 /// for the work, and it is a wait that ends in a refusal rather than a late
 /// picture.
-pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, CaptureError> {
+pub fn capture_window(
+    window_id: u32,
+    timeout: Duration,
+    source_rect: Option<CaptureSourceRect>,
+) -> Result<RawCapture, CaptureError> {
     // Before any filter is created. Without a window-server connection the
     // filter constructor does not fail -- it aborts the process, which for a
     // module means the whole module dies rather than refusing one capture.
@@ -711,11 +728,23 @@ pub fn capture_window(window_id: u32, timeout: Duration) -> Result<RawCapture, C
     };
 
     // SAFETY: plain object construction and property sets on an object owned
-    // by this frame.
+    // by this frame. sourceRect is in the display's logical coordinate system;
+    // the incoming rectangle is window-local, so it is offset by the window
+    // origin the framework just reported.
     let configuration = unsafe {
         let configuration = SCStreamConfiguration::new();
-        configuration.setWidth((frame.size.width.max(1.0)) as usize);
-        configuration.setHeight((frame.size.height.max(1.0)) as usize);
+        let (width, height) = match source_rect {
+            Some(rect) => {
+                configuration.setSourceRect(CGRect::new(
+                    CGPoint::new(frame.origin.x + rect.x, frame.origin.y + rect.y),
+                    CGSize::new(rect.width, rect.height),
+                ));
+                (rect.width, rect.height)
+            }
+            None => (frame.size.width, frame.size.height),
+        };
+        configuration.setWidth((width.max(1.0)) as usize);
+        configuration.setHeight((height.max(1.0)) as usize);
         configuration.setShowsCursor(false);
         configuration
     };
@@ -1114,7 +1143,7 @@ mod tests {
             return;
         };
 
-        let capture = capture_window(window.window_id, Duration::from_secs(10))
+        let capture = capture_window(window.window_id, Duration::from_secs(10), None)
             .expect("a window the system just listed can be captured");
 
         assert_eq!(
@@ -1134,6 +1163,48 @@ mod tests {
             capture.height,
             capture.bgra.len()
         );
+    }
+
+    /// A source rectangle is captured at that size, not the whole window.
+    ///
+    /// The returned pixel dimensions are the proof. An ignored sourceRect would
+    /// still produce a full-window buffer and fail here.
+    #[test]
+    fn a_source_rect_yields_pixels_of_the_requested_size() {
+        if !pixels_are_obtainable() {
+            return;
+        }
+        let _serialized = WINDOW_SERVER.lock();
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            return;
+        };
+        let Some(window) = windows
+            .iter()
+            .find(|window| window.on_screen && window.width >= 64.0 && window.height >= 64.0)
+        else {
+            return;
+        };
+
+        let capture = capture_window(
+            window.window_id,
+            Duration::from_secs(10),
+            Some(CaptureSourceRect {
+                x: 0.0,
+                y: 0.0,
+                width: 32.0,
+                height: 32.0,
+            }),
+        )
+        .expect("a listed window can be captured");
+
+        assert_eq!(
+            (capture.width, capture.height),
+            (32, 32),
+            "sourceRect was not honoured: captured {}x{} instead of 32x32",
+            capture.width,
+            capture.height
+        );
+        assert_eq!(capture.bgra.len(), 32 * 32 * 4);
     }
 
     /// Padding is dropped and the pixels keep their order.
@@ -1206,7 +1277,7 @@ mod tests {
             return;
         };
 
-        let Ok(capture) = capture_window(window.window_id, Duration::from_secs(10)) else {
+        let Ok(capture) = capture_window(window.window_id, Duration::from_secs(10), None) else {
             return;
         };
         assert_eq!(capture.bgra.len(), capture.width * capture.height * 4);
@@ -1220,7 +1291,7 @@ mod tests {
     fn capturing_a_window_that_is_gone_refuses() {
         let _serialized = WINDOW_SERVER.lock();
         // Above any id the window server has assigned on a running system.
-        assert!(capture_window(u32::MAX - 1, Duration::from_secs(10)).is_err());
+        assert!(capture_window(u32::MAX - 1, Duration::from_secs(10), None).is_err());
     }
 
     /// Creating a capture filter without the window-server connection kills the
@@ -1399,7 +1470,7 @@ mod tests {
 
         if let Ok(window_id) = std::env::var(TARGET_WINDOW) {
             let window_id: u32 = window_id.parse().expect("the parent passes a window id");
-            match capture_window(window_id, Duration::from_secs(10)) {
+            match capture_window(window_id, Duration::from_secs(10), None) {
                 Ok(_) => std::process::exit(0),
                 // A typed refusal is still a survival, and it is reported
                 // separately so the parent does not read it as a capture.

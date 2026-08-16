@@ -389,7 +389,15 @@ impl CaptureBackend for NativeCaptureBackend {
             BackendError::Capture(format!("not a window id: {}", request.filter.window_id))
         })?;
 
-        let capture = cerebellum_macos::capture_window(window_id, self.timeout)
+        let source_rect = request
+            .region
+            .map(|region| cerebellum_macos::CaptureSourceRect {
+                x: f64::from(region.x_px),
+                y: f64::from(region.y_px),
+                width: f64::from(region.width_px),
+                height: f64::from(region.height_px),
+            });
+        let capture = cerebellum_macos::capture_window(window_id, self.timeout, source_rect)
             .map_err(map_macos_capture_error)?;
 
         // Read at capture time by the system, not carried from enumeration.
@@ -923,6 +931,7 @@ mod tests {
                 sample.window_id.to_string(),
             ),
             captured_at_ms: 1234,
+            region: None,
         }) {
             Ok(frame) => frame,
             Err(error)
@@ -998,6 +1007,7 @@ mod tests {
                 sample.window_id.to_string(),
             ),
             captured_at_ms: 0,
+            region: None,
         });
 
         // The refusal must name the ownership mismatch. A capture that failed
