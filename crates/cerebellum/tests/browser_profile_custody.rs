@@ -147,6 +147,7 @@ fn context(
         conversation_key: conversation.into(),
         agent_project_id: "project-1".into(),
         session_kind: Some(kind.into()),
+        session_kind_attested: true,
         profile_disposition: Some(disposition.into()),
         effective_capability_scope: Some(vec!["browser.launch".into()]),
         provenance: "daemon_attested_spec_a".into(),

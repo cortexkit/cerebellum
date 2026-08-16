@@ -802,6 +802,7 @@ fn stamped_context(accepted: &AcceptedBindFacts) -> Result<StampedBindContext, (
         conversation_key: accepted.identity.conversation_key.clone(),
         agent_project_id: accepted.identity.agent_project_id.clone(),
         session_kind: Some(accepted.identity.session_kind.as_str().to_string()),
+        session_kind_attested: accepted.session_kind_attested,
         profile_disposition: Some(accepted.identity.profile_disposition.as_str().to_string()),
         effective_capability_scope: accepted
             .effective_capability_scope

@@ -8,6 +8,8 @@ use cerebellum::profile::{
     implementation_digest_for, stamped_bind_context, verify_implementation_digest, BindFacts,
     BindValidationError, ProfileLifecycle, ProfileOutcome, RegistryConfig, REGISTRY_ARTIFACT,
 };
+use cerebellum::{AcceptedBindFacts, ProfileDisposition, SessionKind};
+use subc_protocol::{BindIdentity, Principal, RouteTarget};
 
 /// Bind facts that pass every clause of the strict validator.
 ///
@@ -20,6 +22,7 @@ fn valid_facts() -> BindFacts {
         conversation_key: "s8-conversation".to_string(),
         agent_project_id: "s8-project".to_string(),
         session_kind: Some("primary".to_string()),
+        session_kind_attested: true,
         profile_disposition: Some("durable".to_string()),
         effective_capability_scope: Some(vec!["browser.navigate".to_string()]),
         provenance: "daemon_attested_spec_a".to_string(),
@@ -94,6 +97,82 @@ fn absent_session_kind_is_refused_rather_than_defaulted() {
         }),
         Err(BindValidationError::MissingFact("session_kind"))
     );
+}
+
+fn bind_with_attested_project_and_no_session_kind() -> AcceptedBindFacts {
+    AcceptedBindFacts::from_bind(
+        &BindIdentity {
+            project_root: std::path::PathBuf::from("/tmp/project"),
+            harness: "opencode".to_string(),
+            session: "s8-conversation".to_string(),
+        },
+        Some(Principal::Direct),
+        Some(&serde_json::json!({
+            "agentProjectId": "s8-project",
+        })),
+        None,
+        &RouteTarget::ToolProvider {
+            module_id: "cerebellum".to_string(),
+        },
+    )
+}
+
+fn bind_facts_from_accepted(accepted: &AcceptedBindFacts) -> BindFacts {
+    BindFacts {
+        principal: accepted
+            .principal
+            .as_ref()
+            .map(|principal| format!("{principal:?}"))
+            .unwrap_or_default(),
+        conversation_key: accepted.identity.conversation_key.clone(),
+        agent_project_id: accepted.identity.agent_project_id.clone(),
+        session_kind: Some(accepted.identity.session_kind.as_str().to_string()),
+        session_kind_attested: accepted.session_kind_attested,
+        profile_disposition: Some(accepted.identity.profile_disposition.as_str().to_string()),
+        effective_capability_scope: accepted
+            .effective_capability_scope
+            .clone()
+            .or(Some(vec!["*".to_string()])),
+        provenance: if accepted.agent_project_id_attested {
+            "daemon_attested_spec_a".to_string()
+        } else {
+            "compatibility_fallback".to_string()
+        },
+    }
+}
+
+/// A bind with an attested project id and no sessionKind still resolves as
+/// Primary, but the durable path names the missing attestation rather than
+/// treating the defaulted kind as stamped.
+#[test]
+fn attested_project_without_session_kind_is_a_typed_durable_refusal() {
+    let accepted = bind_with_attested_project_and_no_session_kind();
+    assert!(accepted.agent_project_id_attested);
+    assert!(!accepted.session_kind_attested);
+    assert_eq!(accepted.identity.session_kind, SessionKind::Primary);
+    assert_eq!(
+        accepted.identity.profile_disposition,
+        ProfileDisposition::Durable
+    );
+    assert_eq!(
+        stamped_bind_context(bind_facts_from_accepted(&accepted)),
+        Err(BindValidationError::MissingAttestation("session_kind"))
+    );
+}
+
+/// The same unattested bind is still admitted when the disposition is not
+/// durable. A refusal that applied to every disposition would reject this
+/// bind, which is the product we did not choose.
+#[test]
+fn unattested_session_kind_is_admitted_for_ephemeral_disposition() {
+    let accepted = bind_with_attested_project_and_no_session_kind();
+    assert!(stamped_bind_context(BindFacts {
+        session_kind: Some("ephemeral".to_string()),
+        profile_disposition: Some("none".to_string()),
+        session_kind_attested: accepted.session_kind_attested,
+        ..valid_facts()
+    })
+    .is_ok());
 }
 
 #[test]
