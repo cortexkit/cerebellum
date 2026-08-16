@@ -122,6 +122,9 @@ pub struct BindFacts {
     pub conversation_key: String,
     pub agent_project_id: String,
     pub session_kind: Option<String>,
+    /// Whether daemon facts identified the kind. Distinct from `session_kind`
+    /// being `Some`: a defaulted Primary is present and still unattested.
+    pub session_kind_attested: bool,
     pub profile_disposition: Option<String>,
     pub effective_capability_scope: Option<Vec<String>>,
     pub provenance: String,
@@ -148,6 +151,10 @@ pub type ValidatedBindContext = StampedBindContext;
 pub enum BindValidationError {
     MissingFact(&'static str),
     EmptyFact(&'static str),
+    /// The named fact is present, but nobody attested it. Distinct from
+    /// [`Self::MissingFact`]: asking the caller to supply the fact again would
+    /// not create an attestation they do not have.
+    MissingAttestation(&'static str),
     InvalidProvenance,
     UnknownSessionKind,
     UnknownDisposition,
@@ -160,6 +167,9 @@ impl fmt::Display for BindValidationError {
         match self {
             Self::MissingFact(name) => write!(f, "missing stamped bind fact {name}"),
             Self::EmptyFact(name) => write!(f, "empty stamped bind fact {name}"),
+            Self::MissingAttestation(name) => {
+                write!(f, "missing attestation for stamped bind fact {name}")
+            }
             Self::InvalidProvenance => write!(f, "bind facts are not daemon stamped"),
             Self::UnknownSessionKind => write!(f, "unknown session kind"),
             Self::UnknownDisposition => write!(f, "unknown profile disposition"),
@@ -204,6 +214,12 @@ impl StampedBindContext {
             })?;
         if !disposition.valid_for(kind) {
             return Err(BindValidationError::IncompatibleKindDisposition);
+        }
+        // A defaulted kind arrives here as Some("primary"), so refusing absence
+        // would admit it. Privilege attaches to Durable, and a kind nobody
+        // stamped must not select that profile.
+        if matches!(disposition, ProfileDisposition::Durable) && !facts.session_kind_attested {
+            return Err(BindValidationError::MissingAttestation("session_kind"));
         }
         if let Some(scope) = &facts.effective_capability_scope {
             if scope.iter().any(|entry| entry.is_empty()) {
@@ -3267,6 +3283,7 @@ mod tests {
             conversation_key: conversation.into(),
             agent_project_id: "project-1".into(),
             session_kind: Some(kind.into()),
+            session_kind_attested: true,
             profile_disposition: Some(disposition.into()),
             effective_capability_scope: Some(vec!["browser.navigate".into()]),
             provenance: "daemon_attested_spec_a".into(),
@@ -3329,6 +3346,7 @@ mod tests {
                 conversation_key: "c".into(),
                 agent_project_id: "a".into(),
                 session_kind: Some(kind.into()),
+                session_kind_attested: true,
                 profile_disposition: Some(disposition.into()),
                 effective_capability_scope: Some(vec![]),
                 provenance: "daemon_attested_spec_a".into(),

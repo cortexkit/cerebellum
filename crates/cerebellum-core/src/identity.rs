@@ -376,11 +376,10 @@ fn admitted_session_kind(facts: Option<&Value>) -> Option<SessionKind> {
 }
 
 fn session_kind_from_facts(facts: Option<&Value>) -> SessionKind {
-    // An absent kind resolves to the MOST privileged one, since `Primary` is the
-    // kind that owns a durable profile. That is safe only on this path, and only
-    // for the reason given above `agent_project_id_from_facts`: the durable
-    // validators require a present, attested `session_kind` and refuse rather
-    // than defaulting, so a defaulted kind never selects durable storage.
+    // An absent or unrecognised kind resolves to Primary for identity purposes.
+    // That default is not an attestation: the durable disposition path refuses
+    // a kind nobody stamped, so a compatibility bind still resolves as Primary
+    // without selecting the durable profile.
     admitted_session_kind(facts).unwrap_or(SessionKind::Primary)
 }
 
@@ -803,6 +802,27 @@ mod tests {
         let route = RouteIdentity::from_bind(&identity, &None);
         assert_eq!(route.session_kind, SessionKind::Primary);
         assert_eq!(route.profile_disposition, ProfileDisposition::Durable);
+    }
+
+    #[test]
+    fn absent_session_kind_is_not_attested() {
+        let identity = bind_identity("/tmp/project", "session-0001");
+        let accepted = AcceptedBindFacts::from_bind(
+            &identity,
+            Some(Principal::Direct),
+            Some(&serde_json::json!({
+                "agentProjectId": "pj-attested",
+            })),
+            None,
+            &tool_route(),
+        );
+        assert!(accepted.agent_project_id_attested);
+        assert!(!accepted.session_kind_attested);
+        assert_eq!(accepted.identity.session_kind, SessionKind::Primary);
+        assert_eq!(
+            accepted.identity.profile_disposition,
+            ProfileDisposition::Durable
+        );
     }
 
     #[test]
