@@ -41,6 +41,11 @@ pub fn build_error_frame(
     let body = serde_json::to_vec(&ErrorBody {
         code: code.to_string(),
         message: message.to_string(),
+        // Absent rather than empty: this builder is the generic transport-error
+        // path and knows only a code and a message. A caller reads `detail` as
+        // structured facts about THIS failure, so inventing one here would
+        // describe the frame builder rather than the error.
+        detail: None,
     })
     .map_err(SubcError::Json)?;
     Frame::build_with_version(
