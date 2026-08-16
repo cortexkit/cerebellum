@@ -233,6 +233,7 @@ struct RecordingDriver {
     attendance: Result<AttendancePreconditionResult, DriverError>,
     fronting: VecDeque<FrontingSnapshot>,
     semantic_calls: usize,
+    semantic_actions: Vec<String>,
     per_pid_calls: usize,
     global_calls: usize,
     effect_calls: usize,
@@ -278,6 +279,7 @@ impl Default for RecordingDriver {
             }),
             fronting: VecDeque::from([fronting(0), fronting(100)]),
             semantic_calls: 0,
+            semantic_actions: Vec::new(),
             per_pid_calls: 0,
             global_calls: 0,
             effect_calls: 0,
@@ -308,9 +310,10 @@ impl PlatformDriver for RecordingDriver {
     }
     fn dispatch_semantic(
         &mut self,
-        _request: SemanticDispatchRequest,
+        request: SemanticDispatchRequest,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         self.semantic_calls += 1;
+        self.semantic_actions.push(request.action);
         if let Some(probe) = &self.dispatch_probe {
             let mut probe = probe.lock().unwrap();
             probe.intent_was_durable_at_dispatch =
@@ -419,11 +422,15 @@ fn background_attendance() -> AttendanceContext {
 }
 
 fn semantic_request(row: FrozenDispatchRow) -> DispatchRequest {
+    semantic_request_for_action(row, SEMANTIC_PRESS_ACTION)
+}
+
+fn semantic_request_for_action(row: FrozenDispatchRow, action: &str) -> DispatchRequest {
     let element = ElementResolutionResult {
         element_name: AccessibilityElementName::Identifier("element-1".into()),
         alternate_name: None,
         owning_process: target(),
-        semantic_actions: vec!["press".into()],
+        semantic_actions: vec![action.into()],
         unreadable_subtrees: 0,
     };
     DispatchRequest::new(
@@ -459,7 +466,7 @@ fn semantic_request(row: FrozenDispatchRow) -> DispatchRequest {
         ),
         0,
     )
-    .with_semantic(element, "press")
+    .with_semantic(element, action)
     .with_identity(identity())
 }
 
@@ -505,6 +512,45 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
         report.containment.containment_rung,
         Some(cerebellum_computer::platform::containment::ContainmentRung::SemanticElement)
     );
+}
+
+#[test]
+fn press_and_cancel_reach_the_same_audited_semantic_platform_path() {
+    for action in [SEMANTIC_PRESS_ACTION, SEMANTIC_CANCEL_ACTION] {
+        let request = semantic_request_for_action(
+            FrozenDispatchRow::for_capability("computer.click").unwrap(),
+            action,
+        );
+        let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+        let mut audit = audit();
+
+        let report = dispatcher
+            .dispatch(&mut audit, audit_identity(), request)
+            .expect("both click actions use semantic dispatch");
+
+        assert_eq!(dispatcher.driver().semantic_actions, [action]);
+        assert_eq!(
+            report.delivery_primitive,
+            cerebellum_computer::platform::containment::DeliveryPrimitive::SemanticAccessibility
+        );
+        assert_eq!(
+            report.containment.rung(),
+            Some(cerebellum_computer::platform::containment::ContainmentRung::SemanticElement)
+        );
+        let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+            &audit.journal().export_bytes(),
+        )
+        .unwrap();
+        assert_eq!(entry["phase"], json!("finalized"));
+        assert_eq!(
+            decode_embedded_json(&entry["dispatch_material"])["action"],
+            json!(action)
+        );
+        assert_eq!(
+            decode_embedded_json(&entry["completed_result"])["outcome"],
+            json!("handler_returned")
+        );
+    }
 }
 
 #[test]
@@ -1131,10 +1177,10 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
                 alternate_name: None,
                 owning_process: foreign,
-                semantic_actions: vec!["press".into()],
+                semantic_actions: vec!["AXPress".into()],
                 unreadable_subtrees: 0,
             },
-            "press",
+            "AXPress",
         )
         .with_synthetic(1, false);
 
@@ -1161,17 +1207,17 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
 
 /// A gate refusal is a finalized audit event even though no handler ran.
 #[test]
-fn a_pre_dispatch_refusal_writes_a_finalized_no_action_entry() {
+fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
     let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
         .with_semantic(
             ElementResolutionResult {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
                 alternate_name: None,
                 owning_process: target(),
-                semantic_actions: vec!["press".into()],
+                semantic_actions: vec!["AXPress".into()],
                 unreadable_subtrees: 0,
             },
-            "confirm",
+            "AXCancel",
         )
         .with_synthetic(1, false);
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
@@ -1185,8 +1231,8 @@ fn a_pre_dispatch_refusal_writes_a_finalized_no_action_entry() {
         serde_json::to_value(&refusal).unwrap(),
         json!({
             "reason": "action_not_advertised",
-            "action": "confirm",
-            "advertised": ["press"],
+            "action": "AXCancel",
+            "advertised": ["AXPress"],
         })
     );
     assert_eq!(dispatcher.driver().semantic_calls, 0);
@@ -1202,8 +1248,8 @@ fn a_pre_dispatch_refusal_writes_a_finalized_no_action_entry() {
             "outcome": "no_action",
             "refusal": {
                 "reason": "action_not_advertised",
-                "action": "confirm",
-                "advertised": ["press"],
+                "action": "AXCancel",
+                "advertised": ["AXPress"],
             },
         })
     );
@@ -1305,13 +1351,13 @@ fn every_semantic_refusal_reaches_the_caller_with_its_remedy_payload() {
         ),
         (
             DriverError::Semantic(SemanticDriverError::ActionNotAdvertised {
-                action: "press".to_string(),
-                advertised: vec!["confirm".to_string(), "cancel".to_string()],
+                action: "AXPress".to_string(),
+                advertised: vec!["AXConfirm".to_string(), "AXCancel".to_string()],
             }),
             json!({
                 "reason": "action_not_advertised",
-                "action": "press",
-                "advertised": ["confirm", "cancel"],
+                "action": "AXPress",
+                "advertised": ["AXConfirm", "AXCancel"],
             }),
         ),
         (
@@ -1398,10 +1444,10 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
                     title: "Save".into(),
                 }),
                 owning_process: target(),
-                semantic_actions: vec!["press".into()],
+                semantic_actions: vec!["AXPress".into()],
                 unreadable_subtrees: 0,
             },
-            "press",
+            "AXPress",
         );
     let mut dispatcher = Dispatcher::new(driver);
     let mut audit = audit_with_storage(storage);
@@ -1428,7 +1474,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
                     "RoleAndTitle": {"role": "AXButton", "title": "Save"},
                 },
             },
-            "action": "press",
+            "action": "AXPress",
             "grant_identity": {
                 "pid": 42,
                 "bundle_identity": "com.example.target",

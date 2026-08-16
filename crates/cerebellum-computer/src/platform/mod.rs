@@ -169,7 +169,7 @@ impl ImmutableReleaseInputs {
     }
 }
 
-/// The accessibility action name a click asks a control to run.
+/// Accessibility action names a click may ask a control to run.
 ///
 /// One owner, because two spellings of this string cannot disagree quietly:
 /// the closed `AxAction` vocabulary parses exactly what macOS advertises, so a
@@ -179,10 +179,11 @@ impl ImmutableReleaseInputs {
 /// whatever string the test also passes, so the two agree with each other and
 /// with nothing real.
 ///
-/// `the_press_action_name_matches_the_framework_vocabulary` holds this against
-/// the macOS spelling, so a future divergence fails a build rather than every
+/// `the_click_action_names_match_the_framework_vocabulary` holds these against
+/// the macOS spellings, so a future divergence fails a build rather than every
 /// click.
 pub const SEMANTIC_PRESS_ACTION: &str = "AXPress";
+pub const SEMANTIC_CANCEL_ACTION: &str = "AXCancel";
 
 /// A manifest-visible capability declaration. It contains no executor and
 /// therefore cannot cause an input event by being inspected.
