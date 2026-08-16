@@ -8,15 +8,16 @@
 //! `unsafe`, so the calls live here instead and the guarantee stays exact.
 //!
 //! The bargain only works if this crate stays small and stays dumb. It returns
-//! plain framework values and exposes one typed accessibility action request.
-//! It decides nothing: not which permissions a capability needs, not whether a
-//! grant counts, not what a missing reading implies. Every one of those lives in
-//! the platform-neutral code, which is built and tested on every host rather
-//! than only on this one.
+//! plain framework values, exposes one typed accessibility action request, and
+//! makes one public CoreGraphics post call. It decides nothing: not which
+//! permissions a capability needs, not whether a grant counts, not what a
+//! missing reading implies. Every one of those lives in the platform-neutral
+//! code, which is built and tested on every host rather than only on this one.
 //!
 //! The action request asks an application to invoke one control action that the
-//! application itself advertised. Synthetic input, direct focus changes, and
-//! window-raising actions are intentionally outside this seam.
+//! application itself advertised. The event-post request only forwards an event
+//! the caller already built; event synthesis, direct focus changes, and
+//! window-raising actions remain outside this seam.
 //!
 //! Read anything added here as code that no continuous build can check.
 
@@ -45,7 +46,7 @@ pub use launch::{
 #[cfg(target_os = "macos")]
 pub use macos::{
     capture_window, encode_png, enumerate_windows, establish_window_server_connection,
-    is_off_main_thread, process_start_time, process_start_time_micros, responsible_process,
-    screen_capture_is_permitted, screen_is_locked, CaptureError, CaptureSourceRect,
-    ProcessStartTime, RawCapture, RawWindow,
+    is_off_main_thread, post_event_to_pid, process_start_time, process_start_time_micros,
+    responsible_process, screen_capture_is_permitted, screen_is_locked, CaptureError,
+    CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessStartTime, RawCapture, RawWindow,
 };
