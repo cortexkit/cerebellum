@@ -643,6 +643,26 @@ impl ChildBudget {
     }
 }
 
+/// Refuse a reported child list before the source retains or allocates for it.
+///
+/// The platform source and the test source share this check so Linux tests cover
+/// the same preflight bounds that protect Core Foundation child arrays on macOS.
+fn validate_child_budget(child_count: usize, budget: ChildBudget) -> Result<(), SourceError> {
+    if child_count > 0 && budget.attempted_depth > budget.max_depth {
+        return Err(SourceError::DepthLimitExceeded {
+            max_depth: budget.max_depth,
+            attempted_depth: budget.attempted_depth,
+        });
+    }
+    if child_count > budget.remaining_elements() {
+        return Err(SourceError::ElementLimitExceeded {
+            max_elements: budget.max_elements,
+            attempted_elements: budget.counted_elements.saturating_add(child_count),
+        });
+    }
+    Ok(())
+}
+
 trait ElementSource {
     type Handle: Clone;
 
@@ -1231,10 +1251,10 @@ mod platform {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGSize};
 
     use super::{
-        ActionSearchSnapshot, ActionSource, AxAccessibilityTree, AxAction, AxActionError,
-        AxActionOptions, AxActionRequestOutcome, AxElementName, AxFrame, AxReadError,
-        AxReadOptions, ChildBudget, Deadline, ElementSnapshot, ElementSource, PerformSourceError,
-        SourceError, AX_ERROR_API_DISABLED,
+        validate_child_budget, ActionSearchSnapshot, ActionSource, AxAccessibilityTree, AxAction,
+        AxActionError, AxActionOptions, AxActionRequestOutcome, AxElementName, AxFrame,
+        AxReadError, AxReadOptions, ChildBudget, Deadline, ElementSnapshot, ElementSource,
+        PerformSourceError, SourceError, AX_ERROR_API_DISABLED,
     };
 
     type CfTypeRef = *const c_void;
@@ -1543,18 +1563,7 @@ mod platform {
             })?;
             // Check the array's reported size before retaining or allocating for
             // any child, so a malformed array cannot consume past either bound.
-            if count > 0 && budget.attempted_depth > budget.max_depth {
-                return Err(SourceError::DepthLimitExceeded {
-                    max_depth: budget.max_depth,
-                    attempted_depth: budget.attempted_depth,
-                });
-            }
-            if count > budget.remaining_elements() {
-                return Err(SourceError::ElementLimitExceeded {
-                    max_elements: budget.max_elements,
-                    attempted_elements: budget.max_elements.saturating_add(1),
-                });
-            }
+            validate_child_budget(count, budget)?;
             let mut copied = Vec::with_capacity(count);
             for index in 0..count {
                 // SAFETY: the index is within the count read from this retained
@@ -1959,7 +1968,7 @@ mod tests {
             &mut self,
             element: &Self::Handle,
             _deadline: &Deadline,
-            _child_budget: ChildBudget,
+            child_budget: ChildBudget,
         ) -> Result<ElementSnapshot<Self::Handle>, SourceError> {
             self.calls += 1;
             std::thread::sleep(self.snapshot_delay);
@@ -1979,7 +1988,9 @@ mod tests {
                 }
                 return Err(error);
             }
-            Ok(self.nodes[*element].clone())
+            let snapshot = self.nodes[*element].clone();
+            validate_child_budget(snapshot.children.len(), child_budget)?;
+            Ok(snapshot)
         }
     }
 
@@ -2303,6 +2314,41 @@ mod tests {
     }
 
     #[test]
+    fn a_source_unexpected_value_type_marks_only_its_subtree_unreadable() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("root"), &[], vec![1, 2]),
+            action_node(Some("still-readable"), &[], Vec::new()),
+            action_node(Some("wrong-type"), &[], Vec::new()),
+        ]);
+        source.snapshot_error_at = Some((
+            2,
+            SourceError::UnexpectedValueType {
+                attribute: "AXChildren",
+            },
+        ));
+
+        let tree = read_tree_from(&mut source, 42, options(1, 3))
+            .expect("a malformed descendant must not discard its readable sibling");
+
+        assert_eq!(
+            tree.completeness,
+            AxTreeCompleteness::Incomplete {
+                unreadable_subtrees: 1,
+            }
+        );
+        assert_eq!(
+            tree.root.children[0].identifier.as_deref(),
+            Some("still-readable")
+        );
+        assert_eq!(
+            tree.root.unreadable_children,
+            vec![AxElementReadFailure::UnexpectedValueType {
+                attribute: "AXChildren",
+            }]
+        );
+    }
+
+    #[test]
     fn process_and_permission_loss_during_a_descendant_read_remain_whole_tree_errors() {
         let failure = SourceError::Ax {
             operation: "AXUIElementCopyAttributeValue",
@@ -2388,7 +2434,9 @@ mod tests {
             deepest = child;
         }
 
-        assert_eq!(elements, MAX_RECURSIVE_TREE_DEPTH + 1);
+        // The source refuses the node whose reported child list would require
+        // another depth beyond the cap, before allocating that list.
+        assert_eq!(elements, MAX_RECURSIVE_TREE_DEPTH);
         assert_eq!(
             deepest.unreadable_children,
             vec![AxElementReadFailure::DepthLimitReached {
@@ -2434,6 +2482,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_source_depth_bound_reports_the_actual_child_depth() {
+        let mut source = FakeSource::with_nodes(vec![node(vec![1]), node(Vec::new())]);
+
+        assert_eq!(
+            read_tree_from(&mut source, 42, options(0, 10)),
+            Err(AxReadError::DepthLimitExceeded {
+                max_depth: 0,
+                attempted_depth: 1,
+            })
+        );
+        assert_eq!(
+            source.calls, 1,
+            "the root source check reports its child depth"
+        );
+    }
+
     /// Reaching the depth bound stops that subtree and keeps the rest.
     ///
     /// The bound is OUR limit rather than the application's failure, so what was
@@ -2446,7 +2511,12 @@ mod tests {
     /// accessibility surface.
     #[test]
     fn reaching_the_depth_bound_stops_that_subtree_and_keeps_the_rest() {
-        let mut source = FakeSource::with_nodes(vec![node(vec![1]), node(vec![2]), node(vec![])]);
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("root"), &[], vec![1, 3]),
+            action_node(Some("too-deep"), &[], vec![2]),
+            action_node(Some("omitted-grandchild"), &[], Vec::new()),
+            action_node(Some("still-readable"), &[], Vec::new()),
+        ]);
         let tree = read_tree_from(&mut source, 42, options(1, 10)).expect("the read completes");
 
         assert_eq!(
@@ -2455,12 +2525,25 @@ mod tests {
                 unreadable_subtrees: 1
             }
         );
-        // The element AT the bound is present; only its children are missing,
-        // and they are named as bounded rather than reported as absent.
-        assert_eq!(tree.root.children.len(), 1);
-        assert!(tree.root.children[0].children.is_empty());
         assert_eq!(
-            tree.root.children[0].unreadable_children,
+            tree.root.children,
+            vec![AxElement {
+                role: None,
+                subrole: None,
+                title: None,
+                value_description: None,
+                identifier: Some("still-readable".to_string()),
+                enabled: None,
+                focused: None,
+                frame: None,
+                actions: Vec::new(),
+                children: Vec::new(),
+                unreadable_children: Vec::new(),
+            }],
+            "a source-reported depth bound must retain siblings already within the bound"
+        );
+        assert_eq!(
+            tree.root.unreadable_children,
             vec![AxElementReadFailure::DepthLimitReached { max_depth: 1 }]
         );
     }
@@ -2481,14 +2564,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_source_element_bound_reports_the_actual_counted_elements() {
+        let mut source = FakeSource::with_nodes(vec![
+            node(vec![1, 2, 3, 4]),
+            node(Vec::new()),
+            node(Vec::new()),
+            node(Vec::new()),
+            node(Vec::new()),
+        ]);
+
+        assert_eq!(
+            read_tree_from(&mut source, 42, options(10, 3)),
+            Err(AxReadError::ElementLimitExceeded {
+                max_elements: 3,
+                attempted_elements: 5,
+            })
+        );
+        assert_eq!(
+            source.calls, 1,
+            "the source reports the root plus every child in the refused list"
+        );
+    }
+
     /// Reaching the element budget stops further subtrees and keeps the rest.
     ///
     /// Unlike the depth bound this budget is shared across the whole read, so
     /// once it is reached nothing further is descended anywhere.
     #[test]
     fn reaching_the_element_budget_stops_further_subtrees_and_keeps_the_rest() {
-        let mut source = FakeSource::with_nodes(vec![node(vec![1, 2]), node(vec![]), node(vec![])]);
-        let tree = read_tree_from(&mut source, 42, options(10, 2)).expect("the read completes");
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("root"), &[], vec![1, 2]),
+            action_node(Some("still-readable"), &[], Vec::new()),
+            action_node(Some("over-budget"), &[], vec![3, 4, 5]),
+            action_node(Some("omitted-one"), &[], Vec::new()),
+            action_node(Some("omitted-two"), &[], Vec::new()),
+            action_node(Some("omitted-three"), &[], Vec::new()),
+        ]);
+        let tree = read_tree_from(&mut source, 42, options(10, 3)).expect("the read completes");
 
         assert_eq!(
             tree.completeness,
@@ -2496,11 +2609,41 @@ mod tests {
                 unreadable_subtrees: 1
             }
         );
-        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(
+            tree.root.children,
+            vec![AxElement {
+                role: None,
+                subrole: None,
+                title: None,
+                value_description: None,
+                identifier: Some("still-readable".to_string()),
+                enabled: None,
+                focused: None,
+                frame: None,
+                actions: Vec::new(),
+                children: Vec::new(),
+                unreadable_children: Vec::new(),
+            }],
+            "a source-reported element bound must retain earlier readable siblings"
+        );
         assert_eq!(
             tree.root.unreadable_children,
-            vec![AxElementReadFailure::ElementLimitReached { max_elements: 2 }]
+            vec![AxElementReadFailure::ElementLimitReached { max_elements: 3 }]
         );
+    }
+
+    #[test]
+    fn a_tree_within_both_source_bounds_is_complete() {
+        let mut source = FakeSource::with_nodes(vec![
+            action_node(Some("root"), &[], vec![1]),
+            action_node(Some("child"), &[], Vec::new()),
+        ]);
+
+        let tree = read_tree_from(&mut source, 42, options(1, 2))
+            .expect("a tree within both bounds must be readable");
+
+        assert_eq!(tree.completeness, AxTreeCompleteness::Complete);
+        assert_eq!(tree.root.children[0].identifier.as_deref(), Some("child"));
     }
 
     #[test]
