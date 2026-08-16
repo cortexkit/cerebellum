@@ -1031,7 +1031,11 @@ impl PlatformDriver for MacOs26PlatformDriver {
     }
 }
 
-#[cfg(test)]
+// The whole module is target-gated, not only `test`: `cerebellum-macos` builds
+// to an empty library off macOS, so a test naming its types fails to COMPILE on
+// Linux CI rather than failing to run. The production code above is already
+// gated the same way; these tests exercise it and inherit the constraint.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
@@ -1261,7 +1265,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod accessibility_tests {
 
     /// A replaced target fails attendance even when the lease is otherwise good.
@@ -1769,7 +1773,7 @@ mod accessibility_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod cached_element_tests {
     use super::*;
 
