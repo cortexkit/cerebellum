@@ -1268,7 +1268,10 @@ pub type EffectResult = EffectEvidence;
 #[cfg(test)]
 mod delivery_containment_validation_tests {
     use super::*;
-    use crate::platform::containment::{ContainmentFinalization, ContainmentRung};
+    use crate::platform::{
+        containment::{ContainmentFinalization, ContainmentRung},
+        PlatformNeutralTestDriver,
+    };
 
     fn finalization(
         delivery_primitive: DeliveryPrimitive,
@@ -1307,22 +1310,27 @@ mod delivery_containment_validation_tests {
             Some(ContainmentRung::GlobalNone),
         );
         assert_eq!(
-            Dispatcher::<crate::platform::macos::MacOs26PlatformDriver>::validate_delivery_containment(
+            Dispatcher::<PlatformNeutralTestDriver>::validate_delivery_containment(
                 DeliveryPrimitive::SemanticAccessibility,
                 &mismatched,
             ),
             Err(DispatchError::AuditUnavailable),
             "a semantic delivery reporting a non-semantic rung must refuse rather than record it"
         );
+    }
 
-        // The accepting case, without which a validator that refused
-        // everything would satisfy the assertion above.
+    /// A semantic delivery with the earned rung is accepted.
+    ///
+    /// This test complements the weaker-rung refusal case by ensuring that the
+    /// validator does not pass it merely by rejecting every semantic delivery.
+    #[test]
+    fn a_semantic_delivery_with_the_semantic_rung_is_accepted() {
         let agreeing = finalization(
             DeliveryPrimitive::SemanticAccessibility,
             Some(ContainmentRung::SemanticElement),
         );
         assert_eq!(
-            Dispatcher::<crate::platform::macos::MacOs26PlatformDriver>::validate_delivery_containment(
+            Dispatcher::<PlatformNeutralTestDriver>::validate_delivery_containment(
                 DeliveryPrimitive::SemanticAccessibility,
                 &agreeing,
             ),

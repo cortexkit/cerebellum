@@ -78,7 +78,7 @@ struct AttachedTarget {
 /// Owns every CDP write, frame decoder, and request correlator for one browser.
 /// Keeping these together prevents a lifecycle command and a navigation command
 /// from assigning competing request ids or interleaving frames on the pipe.
-pub(crate) struct CdpNavigationDriver<IO> {
+pub struct CdpNavigationDriver<IO> {
     pipe: IO,
     transport: CdpTransport,
     decoder: CdpFrameDecoder,
@@ -88,7 +88,7 @@ pub(crate) struct CdpNavigationDriver<IO> {
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
-    pub(crate) fn new(pipe: IO, mut transport: CdpTransport, decoder: CdpFrameDecoder) -> Self {
+    pub fn new(pipe: IO, mut transport: CdpTransport, decoder: CdpFrameDecoder) -> Self {
         // Readiness can observe browser-wide startup events before this route has
         // attached a target. They have no route identity and must not remain in
         // the established session's bounded event queue.
@@ -103,7 +103,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
     }
 
-    pub(crate) fn navigate(
+    pub fn navigate(
         &mut self,
         context_key: &str,
         url: &str,
@@ -128,7 +128,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         self.navigate_with_clock(context_key, url, wait, deadline_ms, tracker, clock)
     }
 
-    pub(crate) fn snapshot(
+    pub fn snapshot(
         &mut self,
         context_key: &str,
         mode: SnapshotKind,
@@ -138,7 +138,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         self.snapshot_with_clock(context_key, mode, deadline_ms, None, &mut clock)
     }
 
-    pub(crate) fn snapshot_classified(
+    pub fn snapshot_classified(
         &mut self,
         context_key: &str,
         mode: SnapshotKind,
@@ -157,7 +157,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn click_classified(
+    pub fn click_classified(
         &mut self,
         context_key: &str,
         identity: &BackendNodeIdentity,
@@ -668,7 +668,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         Ok(())
     }
 
-    pub(crate) fn request_browser_close(&mut self) -> Result<(), NavigationDriveError> {
+    pub fn request_browser_close(&mut self) -> Result<(), NavigationDriveError> {
         // Teardown uses the same correlator as navigation so request ids remain
         // unique until the descriptor closes; a fixed close id could alias a
         // completed navigation response on a long-lived session.

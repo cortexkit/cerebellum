@@ -14,6 +14,7 @@ pub mod process_event;
 pub mod severity;
 pub use containment::*;
 pub use process_event::*;
+#[cfg(target_os = "macos")]
 pub mod macos;
 
 /// Converts raw operating-system permission readings into the
@@ -24,9 +25,9 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod native;
 
+#[cfg(target_os = "macos")]
 pub use macos::{
-    MacOs26PlatformDriver, PrivateEnvelopeStartupProbe, StartupCapabilityProbe, StartupProbeInput,
-    MACOS_MAJOR_VERSION,
+    MacOs26PlatformDriver, PrivateEnvelopeStartupProbe, StartupProbeInput, MACOS_MAJOR_VERSION,
 };
 
 pub mod vocabulary;
@@ -134,6 +135,55 @@ impl PermissionLivenessReport {
     }
 }
 
+/// Filters permission readings to the process responsible for the current module.
+///
+/// A reading attributed to another process cannot establish this module's grant,
+/// even when the operating system reports that the other process is permitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionLivenessProbe {
+    pub responsible_process: String,
+}
+
+impl PermissionLivenessProbe {
+    pub fn run(&self, results: &[PermissionProbeResult]) -> PermissionLivenessReport {
+        PermissionLivenessReport::from_results(
+            results
+                .iter()
+                .filter(|result| {
+                    result.responsible_process == self.responsible_process && result.off_main
+                })
+                .cloned(),
+        )
+    }
+}
+
+/// Keeps only permission readings that can be credited to the identified process.
+///
+/// Without an identified responsible process, no reading is sufficient evidence
+/// to advertise a capability, so the report remains unresolved for every service.
+pub fn attributed_permission_liveness(
+    responsible_process: Option<&str>,
+    results: &[PermissionProbeResult],
+) -> PermissionLivenessReport {
+    responsible_process.map_or_else(PermissionLivenessReport::default, |process| {
+        PermissionLivenessProbe {
+            responsible_process: process.to_string(),
+        }
+        .run(results)
+    })
+}
+
+/// Startup results that capability advertisement consumes on every platform.
+///
+/// Platform-specific probes populate this report; hosts without a supported
+/// probe retain the default, which advertises no private envelope or grants.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupCapabilityProbe {
+    pub os_major: u16,
+    pub private_envelope_recognized: bool,
+    pub permissions: PermissionLivenessReport,
+}
+
 /// Immutable release inputs are optional until release binding. External values
 /// attest to work performed outside this repository, so an absent value suppresses
 /// only rows that consume it. The vocabulary digests are mirrors of checked-in
@@ -168,6 +218,176 @@ impl ImmutableReleaseInputs {
     fn semantic_actuation_ready(&self) -> bool {
         self.semantic_actuation_review_revision.is_some()
             && self.release_signing_topology_revision.is_some()
+    }
+}
+
+/// Builds the fixed declaration set from release inputs and startup evidence.
+///
+/// `platform_available` distinguishes a host that can serve the platform driver
+/// from one that can only report the frozen vocabulary. The latter keeps all
+/// rows visible for release evidence and may still advertise `computer.wait`,
+/// because waiting has no platform operation to perform.
+pub fn capability_declarations(
+    context: &CapabilityAdvertisementContext,
+    private_envelope_recognized: bool,
+    platform_available: bool,
+) -> Vec<CapabilityDeclaration> {
+    [
+        "computer.click",
+        "computer.type",
+        "computer.keys",
+        "computer.scroll",
+        "computer.move",
+        "computer.drag",
+        "computer.screenshot",
+        "computer.wait",
+    ]
+    .into_iter()
+    .map(|id| capability_declaration(id, context, private_envelope_recognized, platform_available))
+    .collect()
+}
+
+fn capability_declaration(
+    id: &str,
+    context: &CapabilityAdvertisementContext,
+    private_envelope_recognized: bool,
+    platform_available: bool,
+) -> CapabilityDeclaration {
+    let action_kind = if id == "computer.drag" {
+        ActionKind::MutateDurable
+    } else if id == "computer.screenshot" || id == "computer.wait" {
+        ActionKind::Observe
+    } else {
+        ActionKind::Compose
+    };
+    let retry_class = match id {
+        "computer.scroll" => RetryClass::ReconcileBeforeRetry,
+        "computer.move" | "computer.screenshot" | "computer.wait" => RetryClass::Idempotent,
+        _ => RetryClass::NeverAutomaticRetry,
+    };
+    // Use the shared capability-vocabulary lookup instead of duplicating its
+    // permission table. A second hand-written table could drift from the
+    // vocabulary and produce incorrect declarations. If the lookup cannot
+    // resolve an action or service, suppress that capability rather than using
+    // a default or stopping the module.
+    let (permissions, permission_lookup_failure) =
+        match vocabulary::required_permission_services(id) {
+            Ok(permissions) => (permissions, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("required permissions are not resolvable: {error}")),
+            ),
+        };
+    let mut advertised = false;
+    // A suppression reason is an operator-facing diagnosis, so it must
+    // identify the missing layer. The application can already request a
+    // closed-vocabulary AxAction, but no handler serves those requests over the
+    // wire. Advertising this capability also requires the serving path to be
+    // explicitly approved and enabled; the platform layer itself is present.
+    let mut suppression_reason = permission_lookup_failure.clone().or_else(|| {
+        Some(
+            "no wire serving handler: the semantic mechanism is built, and serving it \
+             awaits review and activation"
+                .to_string(),
+        )
+    });
+    if permission_lookup_failure.is_some() {
+        // Keep the permission-lookup failure reason unchanged. It identifies
+        // an inability to resolve required permissions, which is more useful
+        // to the caller than a release-input status.
+    } else if id == "computer.wait" {
+        advertised = context.inputs.vocabulary_ready();
+        suppression_reason =
+            (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
+    } else if id == "computer.click" {
+        suppression_reason = if !context.inputs.vocabulary_ready() {
+            Some("computer action vocabulary input unresolved".to_string())
+        } else if !context.inputs.semantic_actuation_ready() {
+            if context.inputs.semantic_actuation_review_revision.is_none() {
+                Some("semantic actuation review revision is not bound".to_string())
+            } else {
+                Some("release signing topology revision is not bound".to_string())
+            }
+        } else {
+            None
+        };
+        advertised = suppression_reason.is_none();
+    } else if id == "computer.screenshot" {
+        // Named separately rather than as one combined reason. The
+        // conditions fail for unrelated causes -- a missing release input is
+        // a build-time omission, an unresolved permission is a property of
+        // the machine -- and a reader given one message for both has to
+        // rule out the other by hand.
+        let liveness = context
+            .startup
+            .permissions
+            .state(PermissionService::ScreenRecording);
+        suppression_reason = if !context.inputs.vocabulary_ready() {
+            Some("computer action vocabulary input unresolved".to_string())
+        } else if !context.inputs.capture_ready() {
+            Some("capture release input unresolved".to_string())
+        } else {
+            // Matching on the state rather than testing it against Live
+            // keeps the accepting case an ordinary arm. A branch that can
+            // "never" be reached is a crash waiting for the day the
+            // surrounding condition changes.
+            match liveness {
+                PermissionLiveness::Live => None,
+                PermissionLiveness::Unavailable => {
+                    Some("screen recording permission is not granted".to_string())
+                }
+                PermissionLiveness::GrantedPendingRelaunch => Some(
+                    "screen recording permission is granted but not usable until this \
+                     process restarts"
+                        .to_string(),
+                ),
+                // Nothing denied the permission; no usable reading was
+                // recorded for it. A reading is discarded when it comes from
+                // the process main thread, or when the system attributes the
+                // grant to a process other than the one expected here.
+                PermissionLiveness::Unresolved => {
+                    Some("screen recording permission is not established".to_string())
+                }
+            }
+        };
+        advertised = suppression_reason.is_none();
+    }
+    // Evaluate the synthetic-input gate for reporting and review, but do not
+    // let it advertise any capability here. Semantic actuation is governed
+    // separately, so the five remaining actuating rows retain the unconditional
+    // suppression set above.
+    let _synthetic_inputs_resolved = context.inputs.input_dispatch_ready();
+    CapabilityDeclaration {
+        capability_id: id.to_string(),
+        action_kind,
+        dispatch_modes: if id == "computer.move" {
+            vec![DispatchMode::Observed]
+        } else if id == "computer.screenshot" || id == "computer.wait" {
+            vec![]
+        } else {
+            vec![DispatchMode::Background, DispatchMode::Observed]
+        },
+        semantic_path: if matches!(id, "computer.click" | "computer.type" | "computer.scroll") {
+            SupportState::Supported
+        } else {
+            SupportState::Unsupported
+        },
+        synthetic_background: if private_envelope_recognized {
+            SupportState::Supported
+        } else {
+            SupportState::Unsupported
+        },
+        synthetic_observed: SupportState::ConsentGated,
+        required_permissions: permissions,
+        retry_class,
+        // A capability whose permission requirements could not be read is
+        // never advertised, whatever the rest of the gate concluded: a
+        // permission that is not known cannot be checked, and offering the
+        // capability would promise a check nobody performs.
+        advertised: (platform_available || id == "computer.wait")
+            && advertised
+            && permission_lookup_failure.is_none(),
+        suppression_reason,
     }
 }
 
@@ -707,6 +927,93 @@ pub const COMPUTER_PLANE_TYPE_IDENTIFIERS: &[&str] = &[
 ];
 
 #[cfg(test)]
+pub(crate) struct PlatformNeutralTestDriver;
+
+#[cfg(test)]
+impl PlatformDriver for PlatformNeutralTestDriver {
+    fn capability_declarations(
+        &self,
+        _context: &CapabilityAdvertisementContext,
+    ) -> Vec<CapabilityDeclaration> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn read_accessibility_tree(
+        &mut self,
+        _request: AccessibilityTreeRequest,
+    ) -> Result<AccessibilityTreeResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn resolve_element(
+        &mut self,
+        _request: ElementResolutionRequest,
+    ) -> Result<ElementResolutionResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn dispatch_semantic(
+        &mut self,
+        _request: SemanticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn dispatch_per_pid(
+        &mut self,
+        _request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn dispatch_global(
+        &mut self,
+        _request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn query_focus(
+        &mut self,
+        _request: FocusQueryRequest,
+    ) -> Result<FocusQueryResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn fronting_snapshot(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<FrontingSnapshot, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn input_observer_liveness(&self) -> InputObserverLiveness {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn observe_input(
+        &mut self,
+        _request: InputObservationRequest,
+    ) -> Result<InputObservationResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn observe_effect(
+        &mut self,
+        _request: EffectObservationRequest,
+    ) -> Result<EffectObservationResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+
+    fn verify_attendance(
+        &mut self,
+        _request: AttendancePreconditionRequest,
+    ) -> Result<AttendancePreconditionResult, DriverError> {
+        panic!("test driver must not execute platform operations")
+    }
+}
+
+#[cfg(test)]
 mod target_resolution_tests {
     use super::*;
 
@@ -846,10 +1153,34 @@ mod tests {
 
     #[test]
     fn bounded_duration_rejects_values_above_five_minutes() {
-        assert!(<MacOs26PlatformDriver as PlatformDriver>::bounded_duration(300_001).is_err());
+        assert!(<PlatformNeutralTestDriver as PlatformDriver>::bounded_duration(300_001).is_err());
         assert_eq!(
-            <MacOs26PlatformDriver as PlatformDriver>::bounded_duration(300_000).unwrap(),
+            <PlatformNeutralTestDriver as PlatformDriver>::bounded_duration(300_000).unwrap(),
             Duration::from_millis(300_000)
         );
+    }
+
+    #[test]
+    fn an_unavailable_platform_advertises_only_the_platform_neutral_wait() {
+        let digest = COMPUTER_ACTION_VOCABULARY_SHA256.to_string();
+        let context = CapabilityAdvertisementContext {
+            inputs: ImmutableReleaseInputs {
+                vocabulary_digests: VocabularyDigestInputs {
+                    manifest_digest: Some(digest.clone()),
+                    source_lock_digest: Some(digest.clone()),
+                    computed_artifact_digest: Some(digest),
+                },
+                ..ImmutableReleaseInputs::default()
+            },
+            permissions: PermissionLivenessReport::default(),
+            startup: StartupCapabilityProbe::default(),
+        };
+        let advertised: Vec<_> = capability_declarations(&context, false, false)
+            .into_iter()
+            .filter(|declaration| declaration.advertised)
+            .map(|declaration| declaration.capability_id)
+            .collect();
+
+        assert_eq!(advertised, vec!["computer.wait"]);
     }
 }

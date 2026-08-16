@@ -62,41 +62,13 @@ impl PrivateEnvelopeStartupProbe {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionLivenessProbe {
-    pub responsible_process: String,
-}
-
-impl PermissionLivenessProbe {
-    pub fn run(&self, results: &[PermissionProbeResult]) -> PermissionLivenessReport {
-        PermissionLivenessReport::from_results(
-            results
-                .iter()
-                .filter(|result| {
-                    result.responsible_process == self.responsible_process && result.off_main
-                })
-                .cloned(),
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartupCapabilityProbe {
-    pub os_major: u16,
-    pub private_envelope_recognized: bool,
-    pub permissions: PermissionLivenessReport,
-}
-
 impl StartupCapabilityProbe {
     pub fn run(input: &StartupProbeInput) -> Self {
         let envelope = PrivateEnvelopeStartupProbe::default();
-        let permissions = match input.responsible_process.as_deref() {
-            Some(process) => PermissionLivenessProbe {
-                responsible_process: process.to_string(),
-            }
-            .run(&input.permission_results),
-            None => PermissionLivenessReport::default(),
-        };
+        let permissions = attributed_permission_liveness(
+            input.responsible_process.as_deref(),
+            &input.permission_results,
+        );
         Self {
             os_major: input.os_major,
             private_envelope_recognized: envelope.run(input),
@@ -555,171 +527,22 @@ impl MacOs26PlatformDriver {
 
     /// Describe all eight actions, advertising only the ones that can be served.
     ///
-    /// A declaration says what an action WOULD need; advertising says it can be
-    /// used now. Semantic click has a reviewed serving path; the other actuating
-    /// actions remain described but unavailable.
+    /// The platform-neutral policy owns the declaration data. This driver only
+    /// reports that macOS is available and supplies its startup probe result.
     pub fn declarations(
         &self,
         context: &CapabilityAdvertisementContext,
     ) -> Vec<CapabilityDeclaration> {
-        let ids = [
-            "computer.click",
-            "computer.type",
-            "computer.keys",
-            "computer.scroll",
-            "computer.move",
-            "computer.drag",
-            "computer.screenshot",
-            "computer.wait",
-        ];
-        ids.into_iter()
-            .map(|id| self.declaration(id, context))
-            .collect()
+        capability_declarations(context, self.startup.private_envelope_recognized, true)
     }
 
+    #[cfg(test)]
     fn declaration(
         &self,
         id: &str,
         context: &CapabilityAdvertisementContext,
     ) -> CapabilityDeclaration {
-        let action_kind = if id == "computer.drag" {
-            ActionKind::MutateDurable
-        } else if id == "computer.screenshot" || id == "computer.wait" {
-            ActionKind::Observe
-        } else {
-            ActionKind::Compose
-        };
-        let retry_class = match id {
-            "computer.scroll" => RetryClass::ReconcileBeforeRetry,
-            "computer.move" | "computer.screenshot" | "computer.wait" => RetryClass::Idempotent,
-            _ => RetryClass::NeverAutomaticRetry,
-        };
-        // Taken from the frozen vocabulary rather than restated here: a second
-        // hand-written table drifts the moment a row changes, and the digest
-        // would still only pin the document. An unknown id or unrecognised
-        // service name refuses inside the lookup; there is no default set.
-        //
-        // A lookup that fails SUPPRESSES the capability rather than ending the
-        // process. Not knowing which permissions an action needs is a reason not
-        // to offer it, and taking the module down would take every other
-        // capability with it — including the ones whose permissions resolved.
-        let (permissions, permission_lookup_failure) =
-            match super::vocabulary::required_permission_services(id) {
-                Ok(permissions) => (permissions, None),
-                Err(error) => (
-                    Vec::new(),
-                    Some(format!("required permissions are not resolvable: {error}")),
-                ),
-            };
-        let mut advertised = false;
-        // A suppression reason is an operator-facing diagnosis, so it must name
-        // the layer that is actually absent. For the actuating rows the
-        // MECHANISM exists -- a semantic action can be requested of an
-        // application through the closed AxAction vocabulary -- and what is
-        // missing is a wire serving handler, plus the review and activation
-        // that would precede one. Saying "no dispatch path" sent the reader to
-        // the platform layer to look for something already there.
-        let mut suppression_reason = permission_lookup_failure.clone().or_else(|| {
-            Some(
-                "no wire serving handler: the semantic mechanism is built, and serving it \
-                 awaits review and activation"
-                    .to_string(),
-            )
-        });
-        if permission_lookup_failure.is_some() {
-            // Left as it is: the reason below would overwrite a fact the caller
-            // needs more than a release-input note.
-        } else if id == "computer.wait" {
-            advertised = context.inputs.vocabulary_ready();
-            suppression_reason =
-                (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
-        } else if id == "computer.click" {
-            suppression_reason = if !context.inputs.vocabulary_ready() {
-                Some("computer action vocabulary input unresolved".to_string())
-            } else if !context.inputs.semantic_actuation_ready() {
-                if context.inputs.semantic_actuation_review_revision.is_none() {
-                    Some("semantic actuation review revision is not bound".to_string())
-                } else {
-                    Some("release signing topology revision is not bound".to_string())
-                }
-            } else {
-                None
-            };
-            advertised = suppression_reason.is_none();
-        } else if id == "computer.screenshot" {
-            // Named separately rather than as one combined reason. The
-            // conditions fail for unrelated causes -- a missing release input is
-            // a build-time omission, an unresolved permission is a property of
-            // the machine -- and a reader given one message for both has to
-            // rule out the other by hand.
-            let liveness = context
-                .startup
-                .permissions
-                .state(PermissionService::ScreenRecording);
-            suppression_reason = if !context.inputs.vocabulary_ready() {
-                Some("computer action vocabulary input unresolved".to_string())
-            } else if !context.inputs.capture_ready() {
-                Some("capture release input unresolved".to_string())
-            } else {
-                // Matching on the state rather than testing it against Live
-                // keeps the accepting case an ordinary arm. A branch that can
-                // "never" be reached is a crash waiting for the day the
-                // surrounding condition changes.
-                match liveness {
-                    PermissionLiveness::Live => None,
-                    PermissionLiveness::Unavailable => {
-                        Some("screen recording permission is not granted".to_string())
-                    }
-                    PermissionLiveness::GrantedPendingRelaunch => Some(
-                        "screen recording permission is granted but not usable until this \
-                         process restarts"
-                            .to_string(),
-                    ),
-                    // Nothing denied the permission; no usable reading was
-                    // recorded for it. A reading is discarded when it comes from
-                    // the process main thread, or when the system attributes the
-                    // grant to a process other than the one expected here.
-                    PermissionLiveness::Unresolved => {
-                        Some("screen recording permission is not established".to_string())
-                    }
-                }
-            };
-            advertised = suppression_reason.is_none();
-        }
-        // The synthetic-input gate remains evaluated but does not admit any row.
-        // Its review is separate from semantic actuation, and the five remaining
-        // actuating rows keep the unconditional suppression set above.
-        let _synthetic_inputs_resolved = context.inputs.input_dispatch_ready();
-        CapabilityDeclaration {
-            capability_id: id.to_string(),
-            action_kind,
-            dispatch_modes: if id == "computer.move" {
-                vec![DispatchMode::Observed]
-            } else if id == "computer.screenshot" || id == "computer.wait" {
-                vec![]
-            } else {
-                vec![DispatchMode::Background, DispatchMode::Observed]
-            },
-            semantic_path: if matches!(id, "computer.click" | "computer.type" | "computer.scroll") {
-                SupportState::Supported
-            } else {
-                SupportState::Unsupported
-            },
-            synthetic_background: if self.startup.private_envelope_recognized {
-                SupportState::Supported
-            } else {
-                SupportState::Unsupported
-            },
-            synthetic_observed: SupportState::ConsentGated,
-            required_permissions: permissions,
-            retry_class,
-            // A capability whose permission requirements could not be read is
-            // never advertised, whatever the rest of the gate concluded: a
-            // permission that is not known cannot be checked, and offering the
-            // capability would promise a check nobody performs.
-            advertised: advertised && permission_lookup_failure.is_none(),
-            suppression_reason,
-        }
+        capability_declaration(id, context, self.startup.private_envelope_recognized, true)
     }
 }
 
