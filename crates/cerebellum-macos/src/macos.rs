@@ -1169,19 +1169,42 @@ mod tests {
     ///
     /// The returned pixel dimensions are the proof. An ignored sourceRect would
     /// still produce a full-window buffer and fail here.
+    ///
+    /// EVERY SKIP SAYS SO. Three preconditions can stop this test before it
+    /// observes anything, and a silent `return` makes a skipped run
+    /// indistinguishable from a passing one -- which is not hypothetical here:
+    /// removing the `setSourceRect` call entirely left this test green,
+    /// because it was skipping, and that reads exactly like "the framework
+    /// honoured a rect we never set".
     #[test]
     fn a_source_rect_yields_pixels_of_the_requested_size() {
         if !pixels_are_obtainable() {
+            eprintln!(
+                "SKIPPED: screen capture is not permitted, or the screen is locked. \
+                 Nothing was observed about sourceRect."
+            );
             return;
         }
         let _serialized = WINDOW_SERVER.lock();
-        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
-            return;
+        let windows = match enumerate_windows(Duration::from_secs(10)) {
+            Ok(windows) => windows,
+            Err(error) => {
+                eprintln!(
+                    "SKIPPED: the window list could not be read ({error:?}), so no \
+                     capture target could be chosen."
+                );
+                return;
+            }
         };
         let Some(window) = windows
             .iter()
             .find(|window| window.on_screen && window.width >= 64.0 && window.height >= 64.0)
         else {
+            eprintln!(
+                "SKIPPED: none of the {} listed windows is on screen and at least \
+                 64x64, so a 32x32 rect proves nothing.",
+                windows.len()
+            );
             return;
         };
 
@@ -1205,6 +1228,54 @@ mod tests {
             capture.height
         );
         assert_eq!(capture.bgra.len(), 32 * 32 * 4);
+
+        // SIZE ALONE PROVES NOTHING HERE. `setWidth`/`setHeight` are applied
+        // whether or not a rect is set, so an IGNORED sourceRect still yields
+        // 32x32 -- the whole window, scaled down. That is not a region: the
+        // caller asked for a detail and would receive a squashed thumbnail of
+        // everything, at the requested dimensions, with the reply confirming
+        // the region. Removing the setSourceRect call left the assertions
+        // above green, which is how this was found.
+        //
+        // Two rects far apart discriminate it: honoured, they show different
+        // parts of the window and differ; ignored, both are the same scaled
+        // whole window and are byte-identical.
+        let elsewhere = capture_window(
+            window.window_id,
+            Duration::from_secs(10),
+            Some(CaptureSourceRect {
+                // Offset from the first rect but well inside the window: a
+                // rect near the far edge is rejected outright as an invalid
+                // parameter once offset by the window origin.
+                x: 32.0,
+                y: 32.0,
+                width: 32.0,
+                height: 32.0,
+            }),
+        )
+        .expect("a listed window can be captured twice");
+
+        if capture.bgra == elsewhere.bgra {
+            // A window of one flat colour makes the comparison meaningless, so
+            // this reports rather than failing -- but it reports, because
+            // passing here would mean claiming the framework honoured a rect
+            // when the evidence could not tell.
+            let uniform = capture
+                .bgra
+                .chunks_exact(4)
+                .all(|p| p == &capture.bgra[..4]);
+            assert!(
+                uniform,
+                "two different rects of the same window returned identical \
+                 pixels and the content is not uniform: sourceRect is being \
+                 ignored and the whole window is being scaled to the requested \
+                 size instead"
+            );
+            eprintln!(
+                "SKIPPED the content check: the chosen window is a single flat \
+                 colour, so two rects cannot be told apart. Size was verified."
+            );
+        }
     }
 
     /// Padding is dropped and the pixels keep their order.
