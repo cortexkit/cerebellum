@@ -16,6 +16,7 @@
 //! cargo run -p cerebellum --example live_native_click
 //! ```
 
+#[cfg(target_os = "macos")]
 fn display_value_changed(before: &str, after: &str) -> Result<(), String> {
     if before == after {
         Err(format!(

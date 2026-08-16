@@ -4,6 +4,12 @@
 //! A probe rather than a test, because it needs a granted permission and a
 //! running application, so as a test it would skip in most runs.
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("this probe reads a macOS accessibility tree and has nothing to run here");
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     let pid: u32 = std::env::args()
         .nth(1)

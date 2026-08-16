@@ -3,8 +3,15 @@
 //! An example rather than a test because the numbers are the point, and a test
 //! that asserted them would be asserting a property of whatever happens to be on
 //! screen. Run it on an unlocked machine with capture permission.
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("this probe measures macOS window capture encoding and has nothing to run here");
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     if cerebellum_macos::screen_is_locked() == Some(true) {
         // Said plainly: a locked screen lists windows and refuses their
