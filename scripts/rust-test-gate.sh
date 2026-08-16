@@ -33,7 +33,15 @@ tree_before_build="$(git status --porcelain)"
 # nobody can signal, so that case is reclaimed rather than blocking a machine
 # on a corpse -- but a LIVE holder is refused by name, because waiting silently
 # is how the eight-hour version began.
-GATE_LOCK="$repo_root/.git/gate.lock"
+# Resolved rather than assumed to be "$repo_root/.git": IN A GIT WORKTREE THAT
+# PATH IS A FILE, not a directory, so mkdir under it fails with "Not a
+# directory" and the gate refuses to start. Every mason runs in a worktree, so
+# the first version of this lock broke the gate for every worker while working
+# perfectly here -- they fell back to running the phases by hand, which is
+# honest and is not the gate. `--git-dir` resolves to the real directory in
+# both layouts, and it is per-checkout in both, which is what the lock wants:
+# a worktree has its own target directory, so it may hold its own gate.
+GATE_LOCK="$(git -C "$repo_root" rev-parse --git-dir)/gate.lock"
 
 acquire_gate_lock() {
   if mkdir "$GATE_LOCK" 2>/dev/null; then
