@@ -610,19 +610,6 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
 /// enumeration, so a caller can tell whether the window it asked for is still
 /// owned by the process it meant. A window id is reused after its window
 /// closes, so the id alone does not answer that.
-/// A rectangle in the captured window's own space, origin at its top-left.
-///
-/// Units match the width and height already passed to the stream configuration
-/// for a full-window capture. This type carries no policy: the caller decides
-/// whether the rectangle is admissible.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CaptureSourceRect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
 pub struct RawCapture {
     pub width: usize,
     pub height: usize,
@@ -634,6 +621,19 @@ pub struct RawCapture {
     /// from the dimensions alone.
     pub bgra: Vec<u8>,
     pub owner_pid_at_capture: u32,
+}
+
+/// A rectangle in the captured window's own space, with its origin at the top-left.
+///
+/// This is retained for a controlled framework measurement; the wire layer refuses
+/// caller-facing `region` requests until that measurement settles whether the
+/// framework honors this rectangle with a desktop-independent window filter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureSourceRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// A failure to read a window's pixels.
@@ -750,13 +750,16 @@ pub fn capture_window(
     };
 
     // SAFETY: plain object construction and property sets on an object owned
-    // by this frame. sourceRect is in the display's logical coordinate system;
-    // the incoming rectangle is window-local, so it is offset by the window
-    // origin the framework just reported.
+    // by this frame. The desktop-independent filter intentionally captures one
+    // window's full bounds: Apple documents sourceRect as not referenced for
+    // this filter, so setting it may scale the whole window rather than crop it.
     let configuration = unsafe {
         let configuration = SCStreamConfiguration::new();
         let (width, height) = match source_rect {
             Some(rect) => {
+                // This parameter exists for a pending controlled measurement. Apple
+                // documents sourceRect as not referenced for this filter, while the
+                // wire layer refuses `region` until that measurement settles the fact.
                 configuration.setSourceRect(CGRect::new(
                     CGPoint::new(frame.origin.x + rect.x, frame.origin.y + rect.y),
                     CGSize::new(rect.width, rect.height),
@@ -1185,119 +1188,6 @@ mod tests {
             capture.height,
             capture.bgra.len()
         );
-    }
-
-    /// A source rectangle is captured at that size, not the whole window.
-    ///
-    /// The returned pixel dimensions are the proof. An ignored sourceRect would
-    /// still produce a full-window buffer and fail here.
-    ///
-    /// EVERY SKIP SAYS SO. Three preconditions can stop this test before it
-    /// observes anything, and a silent `return` makes a skipped run
-    /// indistinguishable from a passing one -- which is not hypothetical here:
-    /// removing the `setSourceRect` call entirely left this test green,
-    /// because it was skipping, and that reads exactly like "the framework
-    /// honoured a rect we never set".
-    #[test]
-    fn a_source_rect_yields_pixels_of_the_requested_size() {
-        if !pixels_are_obtainable() {
-            eprintln!(
-                "SKIPPED: screen capture is not permitted, or the screen is locked. \
-                 Nothing was observed about sourceRect."
-            );
-            return;
-        }
-        let _serialized = WINDOW_SERVER.lock();
-        let windows = match enumerate_windows(Duration::from_secs(10)) {
-            Ok(windows) => windows,
-            Err(error) => {
-                eprintln!(
-                    "SKIPPED: the window list could not be read ({error:?}), so no \
-                     capture target could be chosen."
-                );
-                return;
-            }
-        };
-        let Some(window) = windows
-            .iter()
-            .find(|window| window.on_screen && window.width >= 64.0 && window.height >= 64.0)
-        else {
-            eprintln!(
-                "SKIPPED: none of the {} listed windows is on screen and at least \
-                 64x64, so a 32x32 rect proves nothing.",
-                windows.len()
-            );
-            return;
-        };
-
-        let capture = capture_window(
-            window.window_id,
-            Duration::from_secs(10),
-            Some(CaptureSourceRect {
-                x: 0.0,
-                y: 0.0,
-                width: 32.0,
-                height: 32.0,
-            }),
-        )
-        .expect("a listed window can be captured");
-
-        assert_eq!(
-            (capture.width, capture.height),
-            (32, 32),
-            "sourceRect was not honoured: captured {}x{} instead of 32x32",
-            capture.width,
-            capture.height
-        );
-        assert_eq!(capture.bgra.len(), 32 * 32 * 4);
-
-        // SIZE ALONE PROVES NOTHING HERE. `setWidth`/`setHeight` are applied
-        // whether or not a rect is set, so an IGNORED sourceRect still yields
-        // 32x32 -- the whole window, scaled down. That is not a region: the
-        // caller asked for a detail and would receive a squashed thumbnail of
-        // everything, at the requested dimensions, with the reply confirming
-        // the region. Removing the setSourceRect call left the assertions
-        // above green, which is how this was found.
-        //
-        // Two rects far apart discriminate it: honoured, they show different
-        // parts of the window and differ; ignored, both are the same scaled
-        // whole window and are byte-identical.
-        let elsewhere = capture_window(
-            window.window_id,
-            Duration::from_secs(10),
-            Some(CaptureSourceRect {
-                // Offset from the first rect but well inside the window: a
-                // rect near the far edge is rejected outright as an invalid
-                // parameter once offset by the window origin.
-                x: 32.0,
-                y: 32.0,
-                width: 32.0,
-                height: 32.0,
-            }),
-        )
-        .expect("a listed window can be captured twice");
-
-        if capture.bgra == elsewhere.bgra {
-            // A window of one flat colour makes the comparison meaningless, so
-            // this reports rather than failing -- but it reports, because
-            // passing here would mean claiming the framework honoured a rect
-            // when the evidence could not tell.
-            let uniform = capture
-                .bgra
-                .chunks_exact(4)
-                .all(|p| p == &capture.bgra[..4]);
-            assert!(
-                uniform,
-                "two different rects of the same window returned identical \
-                 pixels and the content is not uniform: sourceRect is being \
-                 ignored and the whole window is being scaled to the requested \
-                 size instead"
-            );
-            eprintln!(
-                "SKIPPED the content check: the chosen window is a single flat \
-                 colour, so two rects cannot be told apart. Size was verified."
-            );
-        }
     }
 
     /// Padding is dropped and the pixels keep their order.

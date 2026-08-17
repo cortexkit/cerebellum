@@ -17,9 +17,7 @@ use cerebellum_computer::audit::{
     ComputerAudit, ComputerCapability, ComputerPlaneDescriptor, ObservationState,
     TypedCaptureDispatch,
 };
-use cerebellum_computer::capture::{
-    CaptureArtifact, CaptureBackend, ScopedCaptureController, WindowCaptureRegion,
-};
+use cerebellum_computer::capture::{CaptureArtifact, CaptureBackend, ScopedCaptureController};
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
 use cerebellum_computer::grounding::ContainmentRung;
 #[cfg(target_os = "macos")]
@@ -52,79 +50,6 @@ use crate::management::{ActionAuthority, ManagementPlane};
 /// discarding it at the boundary with an error that describes the transport
 /// rather than the request.
 pub const MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CaptureRegion {
-    x_px: u32,
-    y_px: u32,
-    width_px: u32,
-    height_px: u32,
-}
-
-fn invalid_screenshot_request(field: &str, reason: &str) -> Value {
-    json!({
-        "outcome": "invalid_request",
-        "field": field,
-        "reason": reason,
-    })
-}
-
-fn parse_screenshot_region(arguments: &Value) -> Result<Option<CaptureRegion>, Value> {
-    let Some(region) = arguments.get("region") else {
-        return Ok(None);
-    };
-    let Some(object) = region.as_object() else {
-        return Err(invalid_screenshot_request("region", "wrong_type"));
-    };
-    if let Some(field) = object
-        .keys()
-        .filter(|field| !matches!(field.as_str(), "x_px" | "y_px" | "width_px" | "height_px"))
-        .min()
-    {
-        return Err(invalid_screenshot_request(field, "unknown_field"));
-    }
-    let read_u32 = |field: &str, minimum: u32| -> Result<u32, Value> {
-        match object.get(field).and_then(Value::as_u64) {
-            Some(value) if value <= u64::from(u32::MAX) && value >= u64::from(minimum) => {
-                Ok(value as u32)
-            }
-            Some(_) => Err(invalid_screenshot_request(field, "invalid_value")),
-            None => Err(invalid_screenshot_request(
-                field,
-                if object.contains_key(field) {
-                    "wrong_type"
-                } else {
-                    "missing_field"
-                },
-            )),
-        }
-    };
-    Ok(Some(CaptureRegion {
-        x_px: read_u32("x_px", 0)?,
-        y_px: read_u32("y_px", 0)?,
-        width_px: read_u32("width_px", 1)?,
-        height_px: read_u32("height_px", 1)?,
-    }))
-}
-
-fn region_fits_window(region: &CaptureRegion, frame_width: u32, frame_height: u32) -> bool {
-    match (
-        region.x_px.checked_add(region.width_px),
-        region.y_px.checked_add(region.height_px),
-    ) {
-        (Some(end_x), Some(end_y)) => end_x <= frame_width && end_y <= frame_height,
-        _ => false,
-    }
-}
-
-fn capture_region(region: CaptureRegion) -> WindowCaptureRegion {
-    WindowCaptureRegion {
-        x_px: region.x_px,
-        y_px: region.y_px,
-        width_px: region.width_px,
-        height_px: region.height_px,
-    }
-}
 
 /// The computer plane as a running module holds it.
 ///
@@ -558,6 +483,21 @@ where
             clock,
             now_ms,
         } = context;
+
+        // This capture deliberately uses `SCContentFilter(desktopIndependentWindow:)`
+        // so another application's pixels can never composite into the result. Apple
+        // documents `SCStreamConfiguration.sourceRect` as not referenced for that
+        // filter, so a requested rectangle would only scale the whole window. Reject
+        // its presence before inspecting its shape; otherwise a field-level error
+        // would imply that correcting the field could make the unsupported feature work.
+        if arguments.get("region").is_some() {
+            return json!({
+                "outcome": "invalid_request",
+                "field": "region",
+                "reason": "region_unsupported_for_window_capture",
+            });
+        }
+
         let scope = match arguments.get("scope").and_then(Value::as_str) {
             Some("target_windows") => CaptureScope::PerWindow,
             // Refused here rather than attempted and refused deeper, so the
@@ -608,11 +548,6 @@ where
                 })
             }
         }
-
-        let region = match parse_screenshot_region(arguments) {
-            Ok(region) => region,
-            Err(refusal) => return refusal,
-        };
 
         // Authority first, before anything is reserved or captured. A refusal
         // here has produced no pixels and no journal entry, so nothing has to be
@@ -680,27 +615,7 @@ where
                 },
             };
             let mut controller = controller;
-            if let Some(region) = region {
-                let windows = match controller.enumerated_windows(now_ms) {
-                    Ok(windows) => windows,
-                    Err(error) => {
-                        *capture = Some(controller);
-                        let _ = audit.finalize_rejected(handle, b"capture-failed".to_vec());
-                        return json!({
-                            "outcome": "capture_failed",
-                            "detail": format!("{error:?}"),
-                        });
-                    }
-                };
-                if windows.iter().any(|window| {
-                    !region_fits_window(&region, window.frame.width, window.frame.height)
-                }) {
-                    *capture = Some(controller);
-                    let _ = audit.finalize_rejected(handle, b"region-outside-window".to_vec());
-                    return invalid_screenshot_request("region", "region_outside_window");
-                }
-            }
-            let result = controller.capture_scoped_with_region(now_ms, region.map(capture_region));
+            let result = controller.capture_scoped(now_ms);
             *capture = Some(controller);
             result
         };
@@ -723,13 +638,6 @@ where
             let CaptureArtifact::Bytes(bytes) = &window.artifact else {
                 continue;
             };
-            if let Some(region) = region {
-                if window.frame.width != region.width_px || window.frame.height != region.height_px
-                {
-                    let _ = audit.finalize_rejected(handle, b"region-not-honoured".to_vec());
-                    return invalid_screenshot_request("region", "region_not_honoured");
-                }
-            }
             let width_px = window.frame.width;
             let height_px = window.frame.height;
             let bytes = bytes.clone();
@@ -743,21 +651,12 @@ where
                     "remedy": "capture fewer windows, or one at a time",
                 });
             }
-            let mut entry = json!({
+            windows.push(json!({
                 "window_id": window.window_id,
                 "width_px": width_px,
                 "height_px": height_px,
                 "image_png_b64": base64(&bytes),
-            });
-            if let Some(region) = region {
-                entry["region"] = json!({
-                    "x_px": region.x_px,
-                    "y_px": region.y_px,
-                    "width_px": region.width_px,
-                    "height_px": region.height_px,
-                });
-            }
-            windows.push(entry);
+            }));
             prepared.push((window.window_id.clone(), width_px, height_px, bytes));
         }
 
@@ -844,19 +743,10 @@ where
             });
         }
 
-        let mut reply = json!({
+        json!({
             "outcome": "captured",
             "windows": windows,
-        });
-        if let Some(region) = region {
-            reply["region"] = json!({
-                "x_px": region.x_px,
-                "y_px": region.y_px,
-                "width_px": region.width_px,
-                "height_px": region.height_px,
-            });
-        }
-        reply
+        })
     }
 }
 
@@ -1852,31 +1742,5 @@ mod startup_reconciliation_tests {
              follows: a crash-orphaned actuation stays orphaned, and the entry \
              recording that a press may have landed is never resolved by anyone."
         );
-    }
-}
-
-#[cfg(test)]
-mod region_crop_tests {
-    use super::*;
-
-    #[test]
-    fn a_region_outside_the_window_is_refused() {
-        let region = CaptureRegion {
-            x_px: 6,
-            y_px: 0,
-            width_px: 4,
-            height_px: 1,
-        };
-        assert!(!region_fits_window(&region, 8, 6));
-        assert!(region_fits_window(
-            &CaptureRegion {
-                x_px: 2,
-                y_px: 1,
-                width_px: 3,
-                height_px: 2,
-            },
-            8,
-            6
-        ));
     }
 }
