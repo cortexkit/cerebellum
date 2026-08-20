@@ -1215,7 +1215,10 @@ mod tests {
             src[y * width * 4..(y + 1) * width * 4].to_vec()
         };
         let distance = |a: &[u8], b: &[u8]| -> u64 {
-            a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum()
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| u64::from(x.abs_diff(*y)))
+                .sum()
         };
 
         // WHICH row of the window did the capture end on? Asking only whether
@@ -1226,7 +1229,12 @@ mod tests {
         // the assertion name the region rather than its shape.
         let last_output_row = row(&half.bgra, half.width, half.height - 1);
         let (landed_on, _) = (0..full.height)
-            .map(|y| (y, distance(&last_output_row, &row(&full.bgra, full.width, y))))
+            .map(|y| {
+                (
+                    y,
+                    distance(&last_output_row, &row(&full.bgra, full.width, y)),
+                )
+            })
             .min_by_key(|(_, distance)| *distance)
             .expect("a capture has at least one row");
 
