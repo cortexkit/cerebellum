@@ -1218,26 +1218,27 @@ mod tests {
             a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum()
         };
 
+        // WHICH row of the window did the capture end on? Asking only whether
+        // it is nearer the halfway row than the last row is too weak, and this
+        // test has already been fooled by it: an out-of-bounds rect is CLAMPED
+        // by the framework, so a wrong offset still returns a crop -- just the
+        // wrong one -- and "is this a crop" answers yes. Locating the row makes
+        // the assertion name the region rather than its shape.
         let last_output_row = row(&half.bgra, half.width, half.height - 1);
-        let to_crop_end = distance(&last_output_row, &row(&full.bgra, full.width, half.height - 1));
-        let to_window_end = distance(&last_output_row, &row(&full.bgra, full.width, full.height - 1));
+        let (landed_on, _) = (0..full.height)
+            .map(|y| (y, distance(&last_output_row, &row(&full.bgra, full.width, y))))
+            .min_by_key(|(_, distance)| *distance)
+            .expect("a capture has at least one row");
 
-        // Equal distances mean this window's content cannot tell the two apart,
-        // which is a reason to report rather than to pass: a verdict drawn from
-        // evidence that cannot discriminate is the defect this test exists to
-        // catch, one level up.
-        if to_crop_end == to_window_end {
-            eprintln!(
-                "SKIPPED: this window's content is equidistant from both candidates, so it \
-                 cannot discriminate a crop from a scaled window."
-            );
-            return;
-        }
+        let expected = half.height - 1;
+        // Resampling moves the best match by a row at most; anything further is
+        // a different region, not a rounding artefact.
         assert!(
-            to_crop_end < to_window_end,
-            "the source rect was not honoured: the last row of a half-window capture is closer \
-             to the window's LAST row ({to_window_end}) than to its HALFWAY row ({to_crop_end}), \
-             which is what returning the whole window scaled into the requested size looks like"
+            landed_on.abs_diff(expected) <= 1,
+            "the source rect returned the wrong region: the last row of a capture requesting \
+             the window's top half matches window row {landed_on}, not row {expected}. A rect \
+             outside the window's own coordinate space is clamped rather than refused, so this \
+             is what an offset applied in the wrong space looks like"
         );
     }
 
