@@ -760,8 +760,21 @@ pub fn capture_window(
                 // This parameter exists for a pending controlled measurement. Apple
                 // documents sourceRect as not referenced for this filter, while the
                 // wire layer refuses `region` until that measurement settles the fact.
+                // WINDOW-LOCAL, not display coordinates. A desktop-independent
+                // filter's content IS the window, so its space starts at the
+                // window's top-left; adding the window's screen position pushed
+                // the rect outside that space and the framework then returned
+                // neither the region nor a clean crop.
+                //
+                // Measured on macOS 26 rather than taken from documentation,
+                // which states that sourceRect is not referenced for this filter
+                // type. It is: capturing half a window returns the half whose
+                // last row matches the halfway row of a full capture, at 150
+                // times the confidence of the alternative. See the
+                // `source_rect_truth` example for the instrument, and its header
+                // for the four instruments that looked conclusive and were not.
                 configuration.setSourceRect(CGRect::new(
-                    CGPoint::new(frame.origin.x + rect.x, frame.origin.y + rect.y),
+                    CGPoint::new(rect.x, rect.y),
                     CGSize::new(rect.width, rect.height),
                 ));
                 (rect.width, rect.height)
@@ -1142,6 +1155,89 @@ mod tests {
         assert!(
             enumerate_windows(Duration::ZERO).is_err(),
             "an expired deadline produced a window list, so it was not applied"
+        );
+    }
+
+    /// A source rect returns THE REGION, not the whole window scaled into it.
+    ///
+    /// The distinction is invisible to the obvious assertions. `setWidth` and
+    /// `setHeight` are applied whether or not a rect is honoured, so an ignored
+    /// rect still yields exactly the requested dimensions -- the caller asks
+    /// for a detail and receives a squashed thumbnail of everything, at the
+    /// size it asked for, with the reply naming the region it did not get.
+    ///
+    /// Half the window is captured rather than a small tile, and the comparison
+    /// is a row DISTANCE rather than equality, because the capture path
+    /// resamples: the correct answer still differs from a crop computed here by
+    /// about one unit per channel, so byte equality reports "matches nothing"
+    /// while the rect is being honoured. The last output row of a crop
+    /// resembles the halfway row of the full capture; of a scaled window, the
+    /// last row. Those are far apart, so the verdict survives filtering,
+    /// rounding, and a caret blinking somewhere in the window.
+    #[test]
+    fn a_source_rect_returns_the_region_rather_than_the_whole_window() {
+        if !pixels_are_obtainable() {
+            eprintln!("SKIPPED: capture is not available, so no rect can be measured.");
+            return;
+        }
+        let _serialized = WINDOW_SERVER.lock();
+        let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
+            eprintln!("SKIPPED: the window list could not be read.");
+            return;
+        };
+        let Some(window) = windows
+            .iter()
+            .find(|window| window.on_screen && window.width >= 256.0 && window.height >= 256.0)
+        else {
+            eprintln!("SKIPPED: no on-screen window is at least 256x256.");
+            return;
+        };
+
+        let Ok(full) = capture_window(window.window_id, Duration::from_secs(10), None) else {
+            eprintln!("SKIPPED: the full capture failed.");
+            return;
+        };
+        let Ok(half) = capture_window(
+            window.window_id,
+            Duration::from_secs(10),
+            Some(CaptureSourceRect {
+                x: 0.0,
+                y: 0.0,
+                width: window.width,
+                height: window.height / 2.0,
+            }),
+        ) else {
+            eprintln!("SKIPPED: the half-window capture failed.");
+            return;
+        };
+
+        let row = |src: &[u8], width: usize, y: usize| -> Vec<u8> {
+            src[y * width * 4..(y + 1) * width * 4].to_vec()
+        };
+        let distance = |a: &[u8], b: &[u8]| -> u64 {
+            a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum()
+        };
+
+        let last_output_row = row(&half.bgra, half.width, half.height - 1);
+        let to_crop_end = distance(&last_output_row, &row(&full.bgra, full.width, half.height - 1));
+        let to_window_end = distance(&last_output_row, &row(&full.bgra, full.width, full.height - 1));
+
+        // Equal distances mean this window's content cannot tell the two apart,
+        // which is a reason to report rather than to pass: a verdict drawn from
+        // evidence that cannot discriminate is the defect this test exists to
+        // catch, one level up.
+        if to_crop_end == to_window_end {
+            eprintln!(
+                "SKIPPED: this window's content is equidistant from both candidates, so it \
+                 cannot discriminate a crop from a scaled window."
+            );
+            return;
+        }
+        assert!(
+            to_crop_end < to_window_end,
+            "the source rect was not honoured: the last row of a half-window capture is closer \
+             to the window's LAST row ({to_window_end}) than to its HALFWAY row ({to_crop_end}), \
+             which is what returning the whole window scaled into the requested size looks like"
         );
     }
 
