@@ -32,12 +32,16 @@
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    println!("this probe measures macOS ScreenCaptureKit behaviour and has nothing to measure here");
+    println!(
+        "this probe measures macOS ScreenCaptureKit behaviour and has nothing to measure here"
+    );
 }
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use cerebellum_macos::{capture_window, enumerate_windows, screen_is_locked, CaptureSourceRect};
+    use cerebellum_macos::{
+        capture_window, enumerate_windows, screen_is_locked, CaptureSourceRect,
+    };
     use std::time::Duration;
 
     if screen_is_locked() == Some(true) {
@@ -106,15 +110,24 @@ fn main() {
         &src[y * width * 4..(y + 1) * width * 4]
     }
     let distance = |a: &[u8], b: &[u8]| -> u64 {
-        a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum()
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum()
     };
 
     let last_output_row = row(&half.bgra, gw, gh - 1);
     let to_crop_end = distance(last_output_row, row(&full.bgra, fw, gh - 1));
     let to_window_end = distance(last_output_row, row(&full.bgra, fw, fh - 1));
 
-    println!("  last output row vs full row {} (a crop would end here):   {to_crop_end}", gh - 1);
-    println!("  last output row vs full row {} (a scale would end here): {to_window_end}", fh - 1);
+    println!(
+        "  last output row vs full row {} (a crop would end here):   {to_crop_end}",
+        gh - 1
+    );
+    println!(
+        "  last output row vs full row {} (a scale would end here): {to_window_end}",
+        fh - 1
+    );
 
     if to_crop_end == to_window_end {
         println!(
@@ -122,8 +135,12 @@ fn main() {
              content cannot discriminate them. Try another window."
         );
     } else if to_crop_end < to_window_end {
-        println!("VERDICT: HONOURED. sourceRect crops, in window-local coordinates, top-left origin.");
+        println!(
+            "VERDICT: HONOURED. sourceRect crops, in window-local coordinates, top-left origin."
+        );
     } else {
-        println!("VERDICT: NOT HONOURED. The output is the whole window scaled to the requested size.");
+        println!(
+            "VERDICT: NOT HONOURED. The output is the whole window scaled to the requested size."
+        );
     }
 }
