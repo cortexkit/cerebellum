@@ -788,9 +788,17 @@ impl BrowserSessions {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        for key in keys {
-            self.teardown_route(&key, BrowserSessionTerminalOutcome::ModuleShutdown, config);
-        }
+        std::thread::scope(|scope| {
+            for key in keys {
+                scope.spawn(move || {
+                    self.teardown_route(
+                        &key,
+                        BrowserSessionTerminalOutcome::ModuleShutdown,
+                        config,
+                    );
+                });
+            }
+        });
     }
 
     fn finish_teardown(
@@ -1020,6 +1028,31 @@ mod tests {
 
         fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
             self.events.lock().unwrap().push("reap");
+            Ok(())
+        }
+    }
+
+    struct SleepingExitProcess;
+
+    impl OwnedBrowserProcess for SleepingExitProcess {
+        fn generation_matches(&self) -> bool {
+            true
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure> {
+            std::thread::sleep(grace_period);
+            Ok(true)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            unreachable!("graceful exit was already observed")
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
             Ok(())
         }
     }
@@ -1579,6 +1612,55 @@ mod tests {
             sessions.status("route", &clock, UNIX_EPOCH)["terminal_outcome"],
             "idle_expired"
         );
+    }
+
+    #[test]
+    fn teardown_all_finishes_n_sessions_in_about_one_grace_period() {
+        const SESSION_COUNT: u64 = 6;
+        const GRACE_PERIOD_MS: u64 = 100;
+
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let mut shutdown_config = config();
+        shutdown_config.termination_grace_period_ms = GRACE_PERIOD_MS;
+        for session in 0..SESSION_COUNT {
+            let route = format!("route-{session}");
+            let _ = sessions.acquire_launch_slot(&route);
+            let (_, _, cancelled) = sessions
+                .establish_ready(
+                    &route,
+                    ProfileDisposition::Durable,
+                    &shutdown_config,
+                    &clock,
+                    Box::new(SleepingExitProcess),
+                    Box::new(RecordingCleanup::default()),
+                )
+                .expect("establish sleeping session");
+            assert!(!cancelled);
+        }
+
+        let started = std::time::Instant::now();
+        sessions.teardown_all(&shutdown_config);
+        let elapsed = started.elapsed();
+        eprintln!(
+            "teardown_all elapsed {elapsed:?} for {SESSION_COUNT} sessions with {GRACE_PERIOD_MS}ms grace"
+        );
+
+        assert!(
+            elapsed >= Duration::from_millis(GRACE_PERIOD_MS),
+            "the process double did not exercise the configured grace period: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(GRACE_PERIOD_MS * 4),
+            "teardown scaled toward N grace periods: {elapsed:?}"
+        );
+        for session in 0..SESSION_COUNT {
+            assert_eq!(
+                sessions.status(&format!("route-{session}"), &clock, UNIX_EPOCH)
+                    ["terminal_outcome"],
+                "module_shutdown"
+            );
+        }
     }
 
     #[test]
