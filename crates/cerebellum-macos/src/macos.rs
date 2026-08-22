@@ -915,6 +915,47 @@ fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize)
     packed
 }
 
+/// Which row of a captured image most resembles `needle`.
+///
+/// Used to answer where a cropped capture came from, by distance rather than
+/// equality: the capture path resamples, so the correct row still differs from
+/// a locally computed one by about a unit per channel and exact comparison
+/// finds nothing.
+///
+/// The caller must establish that the image CAN place a row before trusting an
+/// answer. A window with a large flat region has many near-identical rows, the
+/// winner among them turns on rendering noise, and this returns one of them
+/// with no indication that the question was unanswerable. Locating a row whose
+/// position is already known is the check; `rows_are_placeable` is that check.
+#[cfg(test)]
+fn best_matching_row(image: &[u8], width: usize, height: usize, needle: &[u8]) -> usize {
+    (0..height)
+        .map(|y| {
+            let row = &image[y * width * 4..(y + 1) * width * 4];
+            let distance: u64 = needle
+                .iter()
+                .zip(row)
+                .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                .sum();
+            (y, distance)
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .expect("an image has at least one row")
+        .0
+}
+
+/// Whether rows of this image can be told apart well enough to place one.
+///
+/// Takes a row FROM the image and asks where it is. An image whose rows differ
+/// answers with the row it was given; one with a large uniform region answers
+/// with whichever near-identical row won, and cannot support any conclusion
+/// drawn from locating a row.
+#[cfg(test)]
+fn rows_are_placeable(image: &[u8], width: usize, height: usize, probe_row: usize) -> bool {
+    let known = &image[probe_row * width * 4..(probe_row + 1) * width * 4];
+    best_matching_row(image, width, height, known) == probe_row
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1158,6 +1199,49 @@ mod tests {
         );
     }
 
+    /// An image whose rows differ can place a row; a uniform one cannot.
+    ///
+    /// Both directions, on constructed pixels rather than a live window,
+    /// because the live test's SKIP branch fires only on windows that happen to
+    /// be flat -- so on this machine it may never run, and a guard nothing
+    /// exercises is a guard nobody has checked. The uniform case is the one
+    /// that matters: it is the state in which locating a row returns an answer
+    /// indistinguishable from a real one.
+    #[test]
+    fn a_uniform_image_cannot_place_a_row_and_a_varied_one_can() {
+        const WIDTH: usize = 8;
+        const HEIGHT: usize = 16;
+
+        // Every row identical, so any row matches row 0 as well as its own.
+        let uniform = vec![0x7f_u8; WIDTH * HEIGHT * 4];
+        assert!(
+            !rows_are_placeable(&uniform, WIDTH, HEIGHT, HEIGHT - 1),
+            "a flat image reported that it can place a row, so the live test would trust a \
+             verdict drawn from rendering noise"
+        );
+
+        // Each row a distinct value, so a row can only match itself.
+        let mut varied = Vec::with_capacity(WIDTH * HEIGHT * 4);
+        for y in 0..HEIGHT {
+            varied.extend(std::iter::repeat((y as u8) * 8).take(WIDTH * 4));
+        }
+        assert!(
+            rows_are_placeable(&varied, WIDTH, HEIGHT, HEIGHT - 1),
+            "an image with distinct rows reported that it cannot place one, which would skip \
+             every window and make the live test vacuous in the other direction"
+        );
+        assert_eq!(
+            best_matching_row(
+                &varied,
+                WIDTH,
+                HEIGHT,
+                &varied[4 * WIDTH * 4..5 * WIDTH * 4]
+            ),
+            4,
+            "a row taken from a varied image was located somewhere other than its own position"
+        );
+    }
+
     /// A source rect returns THE REGION, not the whole window scaled into it.
     ///
     /// The distinction is invisible to the obvious assertions. `setWidth` and
@@ -1214,12 +1298,6 @@ mod tests {
         let row = |src: &[u8], width: usize, y: usize| -> Vec<u8> {
             src[y * width * 4..(y + 1) * width * 4].to_vec()
         };
-        let distance = |a: &[u8], b: &[u8]| -> u64 {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| u64::from(x.abs_diff(*y)))
-                .sum()
-        };
 
         // WHICH row of the window did the capture end on? Asking only whether
         // it is nearer the halfway row than the last row is too weak, and this
@@ -1227,18 +1305,26 @@ mod tests {
         // by the framework, so a wrong offset still returns a crop -- just the
         // wrong one -- and "is this a crop" answers yes. Locating the row makes
         // the assertion name the region rather than its shape.
-        let last_output_row = row(&half.bgra, half.width, half.height - 1);
-        let (landed_on, _) = (0..full.height)
-            .map(|y| {
-                (
-                    y,
-                    distance(&last_output_row, &row(&full.bgra, full.width, y)),
-                )
-            })
-            .min_by_key(|(_, distance)| *distance)
-            .expect("a capture has at least one row");
-
         let expected = half.height - 1;
+
+        // SELF-CHECK THE INSTRUMENT BEFORE TRUSTING IT. Locating a row only
+        // means something in a window whose rows differ from each other. A
+        // window with a large flat region has many near-identical rows, the
+        // winner among them turns on rendering noise, and the verdict is
+        // decided by whichever happened to win -- which is how this test
+        // produced three different wrong answers on captures that were
+        // perfectly correct.
+        if !rows_are_placeable(&full.bgra, full.width, full.height, expected) {
+            eprintln!(
+                "SKIPPED: this window cannot be measured -- a row taken FROM the full capture \
+                 cannot be located back at its own position, so its rows do not differ enough \
+                 to place anything."
+            );
+            return;
+        }
+
+        let last_output_row = row(&half.bgra, half.width, expected);
+        let landed_on = best_matching_row(&full.bgra, full.width, full.height, &last_output_row);
         // Resampling moves the best match by a row at most; anything further is
         // a different region, not a rounding artefact.
         assert!(
