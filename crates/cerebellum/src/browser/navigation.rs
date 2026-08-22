@@ -950,7 +950,7 @@ fn parse_flattened_dom_nodes(result: &Map<String, Value>) -> Option<Vec<RawDomNo
             return None;
         }
         let mut attributes = HashMap::new();
-        for pair in attribute_values.chunks_exact(2) {
+        for pair in attribute_values.as_chunks::<2>().0 {
             let name = pair[0].as_str()?.to_ascii_lowercase();
             let value = pair[1].as_str()?.to_string();
             if attributes.insert(name, value).is_some() {

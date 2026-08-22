@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cerebellum::computer_capability::{
-    servable, ComputerPlane, ComputerPlaneUnavailable, ServeContext,
+    servable, ComputerPlane, ComputerPlaneUnavailable, ResultSchemaEnforcement, ServeContext,
 };
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
@@ -19,6 +19,9 @@ use cerebellum_computer::capture::{
 use cerebellum_computer::capture_custody::{
     CaptureCustody, CaptureGrant, CaptureScope, CustodyBounds, InMemoryCustodyStorage,
     InMemoryGrantAuthority,
+};
+use cerebellum_computer::platform::vocabulary::{
+    CapabilityResultValidationError, CapabilityResultViolation,
 };
 use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
 use cerebellum_core::clock::FakeClock;
@@ -377,7 +380,8 @@ async fn a_screenshot_without_a_lease_is_refused_with_the_recipe() {
             },
             |_| InMemoryCaptureBackend::default(),
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the no-lease reply");
 
     assert_eq!(reply["outcome"], "no_lease");
     let remedy = reply["remedy"]
@@ -409,7 +413,8 @@ async fn whole_display_capture_is_refused() {
             },
             |_| InMemoryCaptureBackend::default(),
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the broad-grant refusal");
 
     assert_eq!(reply["outcome"], "broad_grant_required");
 }
@@ -437,7 +442,8 @@ async fn asking_for_the_cursor_is_an_invalid_request() {
             },
             |_| InMemoryCaptureBackend::default(),
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the invalid request reply");
 
     assert_eq!(reply["outcome"], "invalid_request");
     assert_eq!(reply["field"], "include_cursor");
@@ -462,10 +468,91 @@ async fn waiting_needs_no_lease() {
             },
             |_| InMemoryCaptureBackend::default(),
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the wait reply");
 
     assert_eq!(reply["outcome"], "completed");
     assert_eq!(reply["waited_ms"], 250);
+}
+
+/// The common serving boundary detects divergence without withholding it yet.
+///
+/// This drives the public `serve` method rather than the validator directly. If
+/// the common check is removed, the reply still looks normal but the named
+/// finding disappears and this test fails.
+#[tokio::test]
+async fn every_served_reply_runs_result_schema_detection_before_it_escapes() {
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
+    let clock = FakeClock::new();
+
+    let reply = plane
+        .serve(
+            servable("computer.wait").expect("wait is servable"),
+            &json!({ "duration_ms": 25 }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &management(),
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation must not withhold the existing reply");
+
+    assert_eq!(reply, json!({"outcome": "completed", "waited_ms": 25}));
+    assert_eq!(
+        plane.result_schema_findings(),
+        vec![cerebellum::computer_capability::ResultSchemaFinding {
+            error: CapabilityResultValidationError::ReplyViolations {
+                capability_id: "computer.wait".into(),
+                violations: vec![
+                    CapabilityResultViolation::MissingRequiredProperty {
+                        path: "$".into(),
+                        property: "evidence".into(),
+                    },
+                    CapabilityResultViolation::UndeclaredProperty {
+                        path: "$.waited_ms".into(),
+                    },
+                    CapabilityResultViolation::EnumMismatch {
+                        path: "$.outcome".into(),
+                    },
+                ],
+            },
+            occurrences: 1,
+        }]
+    );
+}
+
+/// Fail-closed behavior is already wired but remains an explicit opt-in.
+#[tokio::test]
+async fn withholding_mode_prevents_a_divergent_reply_from_escaping() {
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
+        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
+    let clock = FakeClock::new();
+
+    let error = plane
+        .serve(
+            servable("computer.wait").expect("wait is servable"),
+            &json!({ "duration_ms": 25 }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &management(),
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect_err("withholding mode must not return a divergent reply");
+
+    assert!(matches!(
+        error,
+        CapabilityResultValidationError::ReplyViolations { .. }
+    ));
+    assert_eq!(plane.result_schema_findings()[0].occurrences, 1);
 }
 
 /// A capture that fails still leaves an audit record behind.
@@ -510,7 +597,8 @@ async fn a_failed_capture_is_still_recorded() {
                 }],
             },
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the capture failure");
 
     assert_eq!(reply["outcome"], "capture_failed");
     assert!(
@@ -558,7 +646,8 @@ async fn runtime_journal_save_failure_prevents_capture() {
                 InMemoryCaptureBackend::default()
             },
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the audit refusal");
 
     assert_eq!(reply["outcome"], "audit_unavailable");
     assert_eq!(reply["detail"], "Journal(StorageUnavailable)");
@@ -632,7 +721,8 @@ async fn a_request_without_region_captures_the_whole_window() {
                 png: png.clone(),
             },
         )
-        .await;
+        .await
+        .expect("the conforming capture reply passes result-schema validation");
 
     assert_eq!(
         reply["outcome"], "captured",
@@ -680,7 +770,8 @@ async fn a_well_formed_region_request_is_refused_at_the_wire() {
                 png: Vec::new(),
             },
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the region refusal");
 
     assert_eq!(
         reply,
@@ -717,7 +808,8 @@ async fn a_null_region_request_is_refused_at_the_wire() {
                 png: Vec::new(),
             },
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the region refusal");
 
     assert_eq!(
         reply,
@@ -755,7 +847,8 @@ async fn a_target_with_no_capturable_window_says_so() {
                 png: Vec::new(),
             },
         )
-        .await;
+        .await
+        .expect("detect-only validation preserves the no-window reply");
 
     assert_eq!(
         reply["outcome"], "no_window_captured",

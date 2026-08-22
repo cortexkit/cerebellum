@@ -895,7 +895,7 @@ fn decode_canonical_base64(input: &str) -> Option<Vec<u8>> {
     }
 
     let mut output = Vec::with_capacity(bytes.len() / 4 * 3 - padding);
-    for (index, quartet) in bytes.chunks_exact(4).enumerate() {
+    for (index, quartet) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == bytes.len() / 4;
         let a = decode_base64_char(quartet[0])?;
         let b = decode_base64_char(quartet[1])?;

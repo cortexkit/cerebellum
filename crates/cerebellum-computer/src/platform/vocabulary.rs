@@ -62,6 +62,36 @@ impl fmt::Display for VocabularyValidationError {
 }
 impl std::error::Error for VocabularyValidationError {}
 
+/// Why a capability result could not be certified against its frozen schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CapabilityResultValidationError {
+    /// The capability id is absent from the frozen vocabulary.
+    UnknownCapability(String),
+    /// The embedded result-schema table cannot be interpreted safely.
+    MalformedArtifact(String),
+    /// The reply itself violates the named capability's result schema.
+    ReplyViolations {
+        capability_id: String,
+        violations: Vec<CapabilityResultViolation>,
+    },
+}
+
+impl fmt::Display for CapabilityResultValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+impl std::error::Error for CapabilityResultValidationError {}
+
+/// The precise result-schema rule a reply violated.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CapabilityResultViolation {
+    ExpectedType { path: String, expected: String },
+    MissingRequiredProperty { path: String, property: String },
+    UndeclaredProperty { path: String },
+    EnumMismatch { path: String },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VocabularyDigestInputs {
     pub manifest_digest: Option<String>,
@@ -449,6 +479,294 @@ fn validate_numeric_invariants(
     Ok(())
 }
 
+fn validate_runtime_result_schema(
+    schema: &Value,
+    path: &str,
+) -> Result<(), CapabilityResultValidationError> {
+    let object = schema.as_object().ok_or_else(|| {
+        CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path} result schema is not an object"
+        ))
+    })?;
+    for keyword in object.keys() {
+        if !matches!(
+            keyword.as_str(),
+            "additionalProperties" | "enum" | "items" | "properties" | "required" | "type"
+        ) {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path} uses unsupported result-schema keyword {keyword}"
+            )));
+        }
+    }
+
+    let schema_type = object.get("type").and_then(Value::as_str).ok_or_else(|| {
+        CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path} result schema has no string type"
+        ))
+    })?;
+    if !matches!(
+        schema_type,
+        "array" | "boolean" | "integer" | "null" | "number" | "object" | "string"
+    ) {
+        return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path} has unsupported result type {schema_type}"
+        )));
+    }
+    for keyword in object.keys() {
+        let applicable = match schema_type {
+            "object" => matches!(
+                keyword.as_str(),
+                "additionalProperties" | "enum" | "properties" | "required" | "type"
+            ),
+            "array" => matches!(keyword.as_str(), "enum" | "items" | "type"),
+            _ => matches!(keyword.as_str(), "enum" | "type"),
+        };
+        if !applicable {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.{keyword} does not apply to result type {schema_type}"
+            )));
+        }
+    }
+
+    if let Some(choices) = object.get("enum") {
+        let choices = choices.as_array().ok_or_else(|| {
+            CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.enum is not an array"
+            ))
+        })?;
+        if choices.is_empty()
+            || choices
+                .iter()
+                .any(|choice| !value_has_type(choice, schema_type))
+        {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.enum is empty or disagrees with its type"
+            )));
+        }
+    }
+
+    match schema_type {
+        "object" => {
+            let properties = object
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.properties is not an object"
+                    ))
+                })?;
+            if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path} is not closed"
+                )));
+            }
+            let required = object
+                .get("required")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.required is not an array"
+                    ))
+                })?;
+            for required_name in required {
+                let required_name = required_name.as_str().ok_or_else(|| {
+                    CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.required contains a non-string"
+                    ))
+                })?;
+                if !properties.contains_key(required_name) {
+                    return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.required names undeclared property {required_name}"
+                    )));
+                }
+            }
+            for (name, property_schema) in properties {
+                validate_runtime_result_schema(property_schema, &format!("{path}.{name}"))?;
+            }
+        }
+        "array" => {
+            if let Some(items) = object.get("items") {
+                validate_runtime_result_schema(items, &format!("{path}[]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn value_has_type(value: &Value, schema_type: &str) -> bool {
+    match schema_type {
+        "array" => value.is_array(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        "number" => value.is_number(),
+        "object" => value.is_object(),
+        "string" => value.is_string(),
+        _ => false,
+    }
+}
+
+fn parse_result_schema_table(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, Value>, CapabilityResultValidationError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| CapabilityResultValidationError::MalformedArtifact(error.to_string()))?;
+    validate_value(&value).map_err(|error| {
+        CapabilityResultValidationError::MalformedArtifact(format!(
+            "vocabulary validation failed: {error}"
+        ))
+    })?;
+    let rows = value["rows"].as_array().ok_or_else(|| {
+        CapabilityResultValidationError::MalformedArtifact("missing rows array".into())
+    })?;
+    let mut table = BTreeMap::new();
+    for row in rows {
+        let capability_id = row["capability_id"].as_str().ok_or_else(|| {
+            CapabilityResultValidationError::MalformedArtifact("row missing capability_id".into())
+        })?;
+        let schema = row.get("result_schema").ok_or_else(|| {
+            CapabilityResultValidationError::MalformedArtifact(format!(
+                "{capability_id} missing result_schema"
+            ))
+        })?;
+        validate_runtime_result_schema(schema, &format!("{capability_id}.result_schema"))?;
+        if table
+            .insert(capability_id.to_string(), schema.clone())
+            .is_some()
+        {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "duplicate result schema for {capability_id}"
+            )));
+        }
+    }
+    Ok(table)
+}
+
+fn result_schema_table() -> Result<&'static BTreeMap<String, Value>, CapabilityResultValidationError>
+{
+    static TABLE: OnceLock<Result<BTreeMap<String, Value>, CapabilityResultValidationError>> =
+        OnceLock::new();
+    match TABLE.get_or_init(|| parse_result_schema_table(COMPUTER_ACTION_VOCABULARY_ARTIFACT)) {
+        Ok(table) => Ok(table),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn collect_result_violations(
+    schema: &Value,
+    result: &Value,
+    path: &str,
+    violations: &mut Vec<CapabilityResultViolation>,
+) {
+    let object = schema
+        .as_object()
+        .expect("cached result schemas were validated while loading");
+    let schema_type = object["type"]
+        .as_str()
+        .expect("cached result schema types were validated while loading");
+    if !value_has_type(result, schema_type) {
+        violations.push(CapabilityResultViolation::ExpectedType {
+            path: path.to_string(),
+            expected: schema_type.to_string(),
+        });
+        return;
+    }
+    if object
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.contains(result))
+    {
+        violations.push(CapabilityResultViolation::EnumMismatch {
+            path: path.to_string(),
+        });
+    }
+
+    match schema_type {
+        "object" => {
+            let result = result
+                .as_object()
+                .expect("the result type was checked above");
+            let properties = object["properties"]
+                .as_object()
+                .expect("cached object schemas have properties");
+            for required_name in object["required"]
+                .as_array()
+                .expect("cached object schemas have required lists")
+            {
+                let required_name = required_name
+                    .as_str()
+                    .expect("cached required names are strings");
+                if !result.contains_key(required_name) {
+                    violations.push(CapabilityResultViolation::MissingRequiredProperty {
+                        path: path.to_string(),
+                        property: required_name.to_string(),
+                    });
+                }
+            }
+            for (name, value) in result {
+                let Some(property_schema) = properties.get(name) else {
+                    violations.push(CapabilityResultViolation::UndeclaredProperty {
+                        path: format!("{path}.{name}"),
+                    });
+                    continue;
+                };
+                collect_result_violations(
+                    property_schema,
+                    value,
+                    &format!("{path}.{name}"),
+                    violations,
+                );
+            }
+        }
+        "array" => {
+            if let Some(items) = object.get("items") {
+                for (index, value) in result
+                    .as_array()
+                    .expect("the result type was checked above")
+                    .iter()
+                    .enumerate()
+                {
+                    collect_result_violations(
+                        items,
+                        value,
+                        &format!("{path}[{index}]"),
+                        violations,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check a served capability reply against the digest-pinned result schema.
+///
+/// The artifact is parsed and checked once per process. Each call then walks the
+/// reply once, without cloning it; arrays with no `items` schema need no element
+/// traversal. An unknown capability or an unsupported schema keyword fails
+/// closed rather than silently weakening the contract.
+pub fn validate_capability_result(
+    capability_id: &str,
+    result: &Value,
+) -> Result<(), CapabilityResultValidationError> {
+    let table = result_schema_table()?;
+    let schema = table.get(capability_id).ok_or_else(|| {
+        CapabilityResultValidationError::UnknownCapability(capability_id.to_string())
+    })?;
+    let mut violations = Vec::new();
+    collect_result_violations(schema, result, "$", &mut violations);
+    violations.sort();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(CapabilityResultValidationError::ReplyViolations {
+            capability_id: capability_id.to_string(),
+            violations,
+        })
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     bytes
@@ -573,6 +891,55 @@ pub fn required_permission_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_with_a_field_its_closed_result_schema_does_not_declare_is_caught() {
+        let reply = serde_json::json!({
+            "outcome": "predicate_satisfied",
+            "evidence": "duration elapsed",
+            "waited_ms": 25,
+        });
+
+        assert_eq!(
+            validate_capability_result("computer.wait", &reply),
+            Err(CapabilityResultValidationError::ReplyViolations {
+                capability_id: "computer.wait".into(),
+                violations: vec![CapabilityResultViolation::UndeclaredProperty {
+                    path: "$.waited_ms".into(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_reply_conforming_to_its_frozen_result_schema_passes() {
+        let reply = serde_json::json!({
+            "outcome": "predicate_satisfied",
+            "evidence": "duration elapsed",
+        });
+
+        assert_eq!(validate_capability_result("computer.wait", &reply), Ok(()));
+    }
+
+    #[test]
+    fn computer_click_unreadable_subtrees_remains_a_known_result_schema_divergence() {
+        let reply = serde_json::json!({
+            "outcome": "completed",
+            "containment_rung": "semantic_element",
+            "effect_status": "effect_indeterminate",
+            "unreadable_subtrees": 1,
+        });
+
+        assert_eq!(
+            validate_capability_result("computer.click", &reply),
+            Err(CapabilityResultValidationError::ReplyViolations {
+                capability_id: "computer.click".into(),
+                violations: vec![CapabilityResultViolation::UndeclaredProperty {
+                    path: "$.unreadable_subtrees".into(),
+                }],
+            })
+        );
+    }
 
     #[test]
     fn frozen_rows_require_exactly_the_services_the_vocabulary_lists() {

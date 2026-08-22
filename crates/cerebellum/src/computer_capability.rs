@@ -10,8 +10,9 @@
 //! An observation that reached the caller while leaving no durable record is one
 //! nobody can account for later.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use cerebellum_computer::audit::{
     ComputerAudit, ComputerCapability, ComputerPlaneDescriptor, ObservationState,
@@ -20,6 +21,9 @@ use cerebellum_computer::audit::{
 use cerebellum_computer::capture::{CaptureArtifact, CaptureBackend, ScopedCaptureController};
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
 use cerebellum_computer::grounding::ContainmentRung;
+use cerebellum_computer::platform::vocabulary::{
+    validate_capability_result, CapabilityResultValidationError,
+};
 #[cfg(target_os = "macos")]
 use cerebellum_computer::{
     dispatch::{
@@ -277,6 +281,27 @@ pub struct ServeContext<'a, C: MonotonicClock> {
     pub now_ms: u64,
 }
 
+/// What the serving boundary does after detecting a result-schema violation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResultSchemaEnforcement {
+    /// Record the violation and preserve the reply while differences between
+    /// the frozen result schemas and current serving behavior are identified and
+    /// resolved.
+    #[default]
+    DetectOnly,
+    /// Record the violation and withhold the reply. Enable this fail-closed mode
+    /// only after all differences between the frozen result schemas and current
+    /// serving behavior have been identified and resolved.
+    Withhold,
+}
+
+/// One distinct result-schema violation observed at the serving boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultSchemaFinding {
+    pub error: CapabilityResultValidationError,
+    pub occurrences: u64,
+}
+
 /// What a served capability needs beyond the request itself.
 pub struct ComputerPlane<B, R, T, S>
 where
@@ -286,6 +311,8 @@ where
 {
     audit: Mutex<ComputerAudit<R, T, S>>,
     capture: Mutex<Option<ScopedCaptureController<B>>>,
+    result_schema_enforcement: ResultSchemaEnforcement,
+    result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
 }
 
 impl<B, R, T, S> ComputerPlane<B, R, T, S>
@@ -305,21 +332,82 @@ where
     }
 
     pub fn new(audit: ComputerAudit<R, T, S>) -> Self {
+        Self::with_result_schema_enforcement(audit, ResultSchemaEnforcement::DetectOnly)
+    }
+
+    /// Construct a plane with an explicit result-schema enforcement mode.
+    ///
+    /// Production remains detect-only until differences between the frozen
+    /// result schemas and current serving behavior have been identified and
+    /// resolved. After that, use `Withhold` as the serving-boundary mode to
+    /// prevent a divergent reply from being returned.
+    pub fn with_result_schema_enforcement(
+        audit: ComputerAudit<R, T, S>,
+        result_schema_enforcement: ResultSchemaEnforcement,
+    ) -> Self {
         Self {
             audit: Mutex::new(audit),
             capture: Mutex::new(None),
+            result_schema_enforcement,
+            result_schema_findings: StdMutex::new(BTreeMap::new()),
         }
     }
 
-    /// Serve one capability, or refuse with a reason the caller can act on.
+    /// Distinct result-schema violations detected so far, with occurrence counts.
+    pub fn result_schema_findings(&self) -> Vec<ResultSchemaFinding> {
+        let findings = self
+            .result_schema_findings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        findings
+            .iter()
+            .map(|(error, occurrences)| ResultSchemaFinding {
+                error: error.clone(),
+                occurrences: *occurrences,
+            })
+            .collect()
+    }
+
+    fn finish_reply(
+        &self,
+        capability: ComputerCapability,
+        reply: Value,
+    ) -> Result<Value, CapabilityResultValidationError> {
+        match validate_capability_result(capability.capability_id(), &reply) {
+            Ok(()) => Ok(reply),
+            Err(error) => {
+                let mut findings = self
+                    .result_schema_findings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let occurrences = findings.entry(error.clone()).or_default();
+                *occurrences = occurrences.saturating_add(1);
+                drop(findings);
+
+                match self.result_schema_enforcement {
+                    ResultSchemaEnforcement::DetectOnly => Ok(reply),
+                    ResultSchemaEnforcement::Withhold => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Serve one capability, detecting result-schema divergence before any reply
+    /// leaves this common boundary.
+    ///
+    /// Detect-only mode records and preserves today's divergent replies. In
+    /// withholding mode a violation is returned separately, so the wire can say
+    /// that the operation may have happened without misreporting it as an action
+    /// failure.
     pub async fn serve<C: MonotonicClock>(
         &self,
         capability: Servable,
         arguments: &Value,
         context: ServeContext<'_, C>,
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
-    ) -> Value {
-        match capability.capability() {
+    ) -> Result<Value, CapabilityResultValidationError> {
+        let served_capability = capability.capability();
+        let reply = match served_capability {
             ComputerCapability::Wait => self.serve_wait(arguments),
             ComputerCapability::Screenshot => {
                 self.serve_screenshot(arguments, context, make_backend)
@@ -336,7 +424,8 @@ where
                 "capability": other.capability_id(),
                 "remedy": "this capability is advertised but has no implementation; report it",
             }),
-        }
+        };
+        self.finish_reply(served_capability, reply)
     }
 
     /// Wait for a bounded interval.

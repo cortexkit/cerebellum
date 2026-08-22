@@ -118,7 +118,8 @@ fn main() {
                     )
                 },
             )
-            .await;
+            .await
+            .expect("detect-only result-schema validation preserves the live reply");
         let elapsed = started.elapsed();
 
         println!(

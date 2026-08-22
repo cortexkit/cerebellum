@@ -2055,7 +2055,25 @@ async fn handle_tool_request(
                 },
             )
             .await;
-        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
+        return match result {
+            Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "computer_result_schema_violation",
+                    &format!(
+                        "the capability reply violated its frozen result schema ({error}); the \
+                         operation may already have completed, so do not retry it based on this \
+                         response"
+                    ),
+                )
+                .await
+            }
+        };
     }
 
     let Some(capability) = browser::BrowserCapability::parse(name) else {
