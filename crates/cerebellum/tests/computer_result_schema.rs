@@ -5,17 +5,19 @@
 //! either side changes. Entries can be removed as the frozen schemas and serving
 //! behavior are reconciled, until the inventory reaches zero.
 //!
-//! The artifact has no uniform refusal contract. `computer.wait.outcome` is an
-//! enum containing only `predicate_satisfied` and `timeout`, so its refusal is
-//! outside the schema by value. Click and screenshot accept any outcome string,
-//! but still require success-only fields (`containment_rung`/`effect_status` or
-//! `windows`), so their current refusals are outside those schemas by shape.
+//! The capability-result schema has no uniform refusal contract. Click and
+//! screenshot accept any outcome string but still require success-only fields
+//! (`containment_rung`/`effect_status` or `windows`), so their current refusals do
+//! not match those schemas. Wait always returns the closed `{outcome,evidence}`
+//! shape. Its evidence string distinguishes settled, timed-out, and indeterminate
+//! results, while vocabulary v3 maps the latter two to `timeout`.
 //!
-//! The wait request is independently divergent: the artifact requires
-//! `predicate` and `timeout_ms`, while the handler reads `duration_ms`. That is
-//! request-contract debt rather than a result-validator exemption. Type, keys,
-//! scroll, move, and drag have no current wire serving path, so they produce no
-//! reply shapes to inventory here.
+//! The wait request also differs between the handler and the declared vocabulary
+//! schema: both require `timeout_ms`, but the handler accepts `predicate` as the
+//! typed `PostCondition` object while the schema declares it as a string. This is
+//! a request-contract mismatch requiring a future schema revision, not an
+//! exception to result validation. Type, keys, scroll, move, and drag have no
+//! current wire-serving path and therefore produce no reply shapes to validate.
 
 use std::collections::BTreeSet;
 
@@ -87,17 +89,6 @@ fn observed_facts(
 
 #[test]
 fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
-    let wait = observed_facts(
-        "computer.wait",
-        [
-            json!({
-                "outcome": "invalid_request",
-                "field": "duration_ms",
-                "reason": "missing_field",
-            }),
-            json!({"outcome": "completed", "waited_ms": 25}),
-        ],
-    );
     let screenshot = observed_facts(
         "computer.screenshot",
         [
@@ -175,33 +166,8 @@ fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
         ],
     );
 
-    let actual: BTreeSet<_> = wait.into_iter().chain(screenshot).chain(click).collect();
+    let actual: BTreeSet<_> = screenshot.into_iter().chain(click).collect();
     let expected = BTreeSet::from([
-        fact(
-            "computer.wait",
-            "$.evidence",
-            WrongSide::SchemaRequiresFieldReplyLacks,
-        ),
-        fact(
-            "computer.wait",
-            "$.outcome",
-            WrongSide::ReplyUsesUnlistedEnumValue,
-        ),
-        fact(
-            "computer.wait",
-            "$.field",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.wait",
-            "$.reason",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.wait",
-            "$.waited_ms",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
         fact(
             "computer.screenshot",
             "$.windows",
@@ -340,6 +306,28 @@ fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
     ]);
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn all_three_current_wait_terminal_values_conform() {
+    let replies = [
+        json!({
+            "outcome": "predicate_satisfied",
+            "evidence": r#"{"status":"settled","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":true,"focused":null,"enabled":null,"value":null}}"#,
+        }),
+        json!({
+            "outcome": "timeout",
+            "evidence": r#"{"status":"timed_out","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":false,"focused":null,"enabled":null,"value":null}}"#,
+        }),
+        json!({
+            "outcome": "timeout",
+            "evidence": r#"{"status":"indeterminate","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":null,"reason":"target_not_inspectable"}"#,
+        }),
+    ];
+
+    for reply in replies {
+        assert_eq!(validate_capability_result("computer.wait", &reply), Ok(()));
+    }
 }
 
 #[test]

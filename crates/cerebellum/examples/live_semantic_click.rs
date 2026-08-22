@@ -704,7 +704,7 @@ mod macos_probe {
             ExpectedPostCondition::new(
                 "live-semantic-click-no-effect-claim-v1",
                 PostCondition::ElementPresent {
-                    element_identifier: button.title.clone(),
+                    element: element.element_name.clone(),
                 },
             ),
             attendance,

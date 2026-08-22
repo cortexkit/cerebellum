@@ -193,54 +193,6 @@ fn ax_element_name(
     .map_err(|_| DriverError::InvalidRequest(UNUSABLE_ELEMENT_NAME))
 }
 
-/// Find an element by exact identifier in a freshly read tree.
-///
-/// Returns the observation for the condition to be checked against, or absence
-/// when the element is not there. Absence is a real observation rather than a
-/// failure: an element that has gone answers an absence condition and fails
-/// every other, which the evaluator decides.
-///
-/// A duplicate identifier yields NO observation rather than the first match.
-/// Two elements answering to one name means the condition cannot be checked
-/// against the element it was written about, and picking one would report an
-/// effect belonging to whichever the walk reached first.
-#[cfg(target_os = "macos")]
-fn observe_element(
-    element: &cerebellum_macos::AxElement,
-    identifier: &str,
-    found: &mut Option<crate::dispatch::post_condition::ObservedElement>,
-    duplicate: &mut bool,
-) {
-    if element.identifier.as_deref() == Some(identifier) {
-        if found.is_some() {
-            *duplicate = true;
-            return;
-        }
-        *found = Some(crate::dispatch::post_condition::ObservedElement {
-            present: true,
-            focused: element.focused,
-            enabled: element.enabled,
-            value: element.value_description.clone(),
-        });
-    }
-    for child in &element.children {
-        observe_element(child, identifier, found, duplicate);
-    }
-}
-
-/// Return an observation root only when absence and uniqueness can be decided.
-/// A readable node in a partial tree cannot establish either fact because a
-/// matching node may be present below an unreadable element.
-#[cfg(target_os = "macos")]
-fn observable_ax_root(
-    tree: &cerebellum_macos::AxAccessibilityTree,
-) -> Option<&cerebellum_macos::AxElement> {
-    match tree.completeness {
-        cerebellum_macos::AxTreeCompleteness::Complete => Some(&tree.root),
-        cerebellum_macos::AxTreeCompleteness::Incomplete { .. } => None,
-    }
-}
-
 /// Map an action failure onto the driver's typed remedy vocabulary.
 ///
 /// Every `AxActionError` is handled explicitly rather than through a catch-all,
@@ -348,6 +300,25 @@ fn map_ax_read_error(error: cerebellum_macos::AxReadError) -> DriverError {
         }
     };
     AccessibilityReadFailure::from(failure).into()
+}
+
+#[cfg(target_os = "macos")]
+fn map_ax_element_read_error(error: cerebellum_macos::AxElementReadError) -> DriverError {
+    match error {
+        cerebellum_macos::AxElementReadError::Read(error) => map_ax_read_error(error),
+        cerebellum_macos::AxElementReadError::ElementNameAmbiguous {
+            element_name,
+            match_count,
+        } => DriverError::Semantic(SemanticDriverError::ElementNameAmbiguous {
+            key_form: AccessibilityElementName::from(element_name).key_form(),
+            match_count: u64::try_from(match_count).unwrap_or(u64::MAX),
+        }),
+        // An omitted subtree may contain the named element or a duplicate key,
+        // so neither absence nor uniqueness can be established from this read.
+        cerebellum_macos::AxElementReadError::IncompleteSearch { .. } => {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PlatformReadFailed)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -620,6 +591,72 @@ impl PlatformDriver for MacOs26PlatformDriver {
             Err(DriverError::Unsupported("accessibility tree read"))
         }
     }
+    fn read_accessibility_element(
+        &mut self,
+        request: AccessibilityElementReadRequest,
+    ) -> Result<AccessibilityElementReadResult, DriverError> {
+        request.target.validate()?;
+        let timeout = <Self as PlatformDriver>::bounded_duration(u64::from(request.deadline_ms))?;
+
+        #[cfg(target_os = "macos")]
+        {
+            match super::native::verify_grant(request.target.pid, &request.target) {
+                super::native::GrantVerification::Current => {}
+                super::native::GrantVerification::TargetGone => {
+                    return Err(AccessibilityReadFailure::TargetGone.into())
+                }
+                super::native::GrantVerification::TargetReplaced => {
+                    return Err(AccessibilityReadFailure::TargetReplaced.into())
+                }
+                super::native::GrantVerification::TargetUnreadable => {
+                    return Err(AccessibilityReadFailure::TargetNotInspectable.into())
+                }
+                super::native::GrantVerification::DifferentProcess => {
+                    return Err(DriverError::InvalidRequest(
+                        "scoped read target differs from its grant",
+                    ))
+                }
+            }
+            let attribute = match request.attribute {
+                AccessibilityReadbackAttribute::Presence => {
+                    cerebellum_macos::AxReadbackAttribute::Presence
+                }
+                AccessibilityReadbackAttribute::Focused => {
+                    cerebellum_macos::AxReadbackAttribute::Focused
+                }
+                AccessibilityReadbackAttribute::Enabled => {
+                    cerebellum_macos::AxReadbackAttribute::Enabled
+                }
+                AccessibilityReadbackAttribute::Value => {
+                    cerebellum_macos::AxReadbackAttribute::Value
+                }
+            };
+            let readback = cerebellum_macos::read_accessibility_element(
+                request.target.pid,
+                &ax_element_name(&request.element_name)?,
+                attribute,
+                cerebellum_macos::AxReadOptions {
+                    timeout,
+                    ..Default::default()
+                },
+            )
+            .map_err(map_ax_element_read_error)?;
+            Ok(AccessibilityElementReadResult {
+                element_name: request.element_name,
+                present: readback.present,
+                focused: readback.focused,
+                enabled: readback.enabled,
+                value: readback.value,
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = timeout;
+            Err(DriverError::Unsupported("scoped accessibility read"))
+        }
+    }
+
     fn resolve_element(
         &mut self,
         request: ElementResolutionRequest,
@@ -759,50 +796,36 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 });
             };
 
-            // Read FRESH rather than consulting the cached tree. The cache was
-            // populated before the action, so answering from it would report
-            // the state the action was meant to change.
-            let tree = match cerebellum_macos::read_accessibility_tree(
-                request.target.pid,
-                cerebellum_macos::AxReadOptions {
-                    timeout: Duration::from_millis(u64::from(request.deadline_ms)),
-                    ..Default::default()
-                },
-            ) {
-                Ok(tree) => tree,
-                Err(cerebellum_macos::AxReadError::DeadlineExceeded { .. }) => {
+            // Read fresh rather than using the cached tree: the cache was
+            // populated before the action, so it would report the pre-action
+            // state. This scoped read walks only element keys and retrieves
+            // only the predicate's attribute.
+            let readback = match self.read_accessibility_element(AccessibilityElementReadRequest {
+                target: request.target,
+                element_name: envelope.condition.element().clone(),
+                attribute: envelope.condition.readback_attribute(),
+                deadline_ms: request.deadline_ms,
+            }) {
+                Ok(readback) => readback,
+                Err(error) => {
+                    let failure_reason = match error {
+                        DriverError::AccessibilityUnreadable(
+                            AccessibilityReadFailure::RetryableDeadlineExceeded,
+                        ) => "deadline_exceeded",
+                        _ => "observation_primitive_unavailable",
+                    };
                     return Ok(EffectObservationResult {
                         status: EffectStatus::EffectIndeterminate,
-                        failure_reason: Some("deadline_exceeded".to_string()),
-                    })
-                }
-                Err(_) => {
-                    return Ok(EffectObservationResult {
-                        status: EffectStatus::EffectIndeterminate,
-                        failure_reason: Some("observation_primitive_unavailable".to_string()),
-                    })
+                        failure_reason: Some(failure_reason.to_string()),
+                    });
                 }
             };
-
-            let Some(root) = observable_ax_root(&tree) else {
-                return Ok(EffectObservationResult {
-                    status: EffectStatus::EffectIndeterminate,
-                    failure_reason: Some("observation_tree_incomplete".to_string()),
-                });
+            let observed = ObservedElement {
+                present: readback.present,
+                focused: readback.focused,
+                enabled: readback.enabled,
+                value: readback.value,
             };
-
-            let identifier = envelope.condition.element_identifier();
-            let mut found = None;
-            let mut duplicate = false;
-            observe_element(root, identifier, &mut found, &mut duplicate);
-            if duplicate {
-                return Ok(EffectObservationResult {
-                    status: EffectStatus::EffectIndeterminate,
-                    failure_reason: Some("post_condition_undeclarable".to_string()),
-                });
-            }
-
-            let observed = found.unwrap_or_else(ObservedElement::absent);
             let status = match evaluate(&envelope.condition, &observed) {
                 ConditionOutcome::Satisfied => EffectStatus::EffectObserved,
                 ConditionOutcome::Unsatisfied => EffectStatus::NoEffectObserved,
@@ -1014,7 +1037,7 @@ mod tests {
                 predicate: serde_json::to_string(&crate::dispatch::ExpectedPostCondition::new(
                     "fixture-effect-v1",
                     crate::dispatch::post_condition::PostCondition::ElementPresent {
-                        element_identifier: "element-1".to_string(),
+                        element: AccessibilityElementName::identifier("element-1"),
                     },
                 ))
                 .expect("the fixture post-condition serializes"),
@@ -1162,152 +1185,6 @@ mod accessibility_tests {
             })
             .expect("the check answers rather than refusing");
         assert!(!result.valid);
-    }
-
-    /// An element is observed by exact identifier, with its attributes.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn observing_an_element_reports_the_attributes_a_condition_reads() {
-        let tree = cerebellum_macos::AxElement {
-            role: None,
-            subrole: None,
-            title: None,
-            value_description: Some("typed".to_string()),
-            identifier: Some("field-1".to_string()),
-            enabled: Some(true),
-            focused: Some(true),
-            frame: None,
-            actions: Vec::new(),
-            children: Vec::new(),
-            unreadable_children: Vec::new(),
-        };
-
-        let mut found = None;
-        let mut duplicate = false;
-        observe_element(&tree, "field-1", &mut found, &mut duplicate);
-
-        assert!(!duplicate);
-        assert_eq!(
-            found,
-            Some(crate::dispatch::post_condition::ObservedElement {
-                present: true,
-                focused: Some(true),
-                enabled: Some(true),
-                value: Some("typed".to_string()),
-            })
-        );
-    }
-
-    /// Two elements answering to one identifier yield no observation.
-    ///
-    /// Picking the first would check the condition against whichever element
-    /// the walk reached, and report an effect that may belong to the other. The
-    /// caller receives INDETERMINATE, which is true: the condition was written
-    /// about one element and the tree offers two.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_duplicate_identifier_yields_no_observation_rather_than_the_first_match() {
-        fn node(identifier: &str, focused: bool) -> cerebellum_macos::AxElement {
-            cerebellum_macos::AxElement {
-                role: None,
-                subrole: None,
-                title: None,
-                value_description: None,
-                identifier: Some(identifier.to_string()),
-                enabled: None,
-                focused: Some(focused),
-                frame: None,
-                actions: Vec::new(),
-                children: Vec::new(),
-                unreadable_children: Vec::new(),
-            }
-        }
-        let tree = cerebellum_macos::AxElement {
-            role: None,
-            subrole: None,
-            title: None,
-            value_description: None,
-            identifier: None,
-            enabled: None,
-            focused: None,
-            frame: None,
-            actions: Vec::new(),
-            // The two disagree, so picking either would give a different answer.
-            children: vec![node("button-1", true), node("button-1", false)],
-            unreadable_children: Vec::new(),
-        };
-
-        let mut found = None;
-        let mut duplicate = false;
-        observe_element(&tree, "button-1", &mut found, &mut duplicate);
-
-        assert!(
-            duplicate,
-            "a duplicate identifier was resolved to a single element"
-        );
-    }
-
-    /// An element that is not in the tree is absent rather than missing.
-    ///
-    /// Absence is a real observation: it satisfies a condition expecting the
-    /// element to be gone and fails every other. Reporting it as a failed read
-    /// would make a successful dismissal indistinguishable from a broken one.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_element_outside_the_tree_produces_no_observation() {
-        let tree = cerebellum_macos::AxElement {
-            role: None,
-            subrole: None,
-            title: None,
-            value_description: None,
-            identifier: Some("other".to_string()),
-            enabled: None,
-            focused: None,
-            frame: None,
-            actions: Vec::new(),
-            children: Vec::new(),
-            unreadable_children: Vec::new(),
-        };
-
-        let mut found = None;
-        let mut duplicate = false;
-        observe_element(&tree, "gone", &mut found, &mut duplicate);
-
-        assert!(found.is_none());
-        assert!(!duplicate);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn only_a_complete_tree_can_supply_an_observation_root() {
-        fn tree(
-            completeness: cerebellum_macos::AxTreeCompleteness,
-        ) -> cerebellum_macos::AxAccessibilityTree {
-            cerebellum_macos::AxAccessibilityTree {
-                root: cerebellum_macos::AxElement {
-                    role: None,
-                    subrole: None,
-                    title: None,
-                    value_description: None,
-                    identifier: Some("readable-root".to_string()),
-                    enabled: None,
-                    focused: None,
-                    frame: None,
-                    actions: Vec::new(),
-                    children: Vec::new(),
-                    unreadable_children: Vec::new(),
-                },
-                completeness,
-            }
-        }
-
-        let complete = tree(cerebellum_macos::AxTreeCompleteness::Complete);
-        assert_eq!(observable_ax_root(&complete), Some(&complete.root));
-
-        let incomplete = tree(cerebellum_macos::AxTreeCompleteness::Incomplete {
-            unreadable_subtrees: 1,
-        });
-        assert_eq!(observable_ax_root(&incomplete), None);
     }
 
     /// A platform acceptance does not claim an effect.

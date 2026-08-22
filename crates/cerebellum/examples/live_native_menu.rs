@@ -1080,7 +1080,7 @@ mod macos_probe {
             ExpectedPostCondition::new(
                 "live-native-menu-no-effect-claim-v1",
                 PostCondition::ElementPresent {
-                    element_identifier: menu.title.clone(),
+                    element: element.element_name.clone(),
                 },
             ),
             attendance,

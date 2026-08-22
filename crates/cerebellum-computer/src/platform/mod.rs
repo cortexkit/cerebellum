@@ -622,6 +622,37 @@ impl AccessibilityElementName {
     }
 }
 
+/// The one predicate attribute a scoped accessibility read must retrieve.
+///
+/// Presence needs only a complete uniqueness search. The other variants read
+/// exactly one attribute from the uniquely named element after that search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessibilityReadbackAttribute {
+    Presence,
+    Focused,
+    Enabled,
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessibilityElementReadRequest {
+    pub target: ProcessGrant,
+    pub element_name: AccessibilityElementName,
+    pub attribute: AccessibilityReadbackAttribute,
+    pub deadline_ms: u32,
+}
+
+/// The scoped state read from one uniquely named accessibility element.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessibilityElementReadResult {
+    pub element_name: AccessibilityElementName,
+    pub present: bool,
+    pub focused: Option<bool>,
+    pub enabled: Option<bool>,
+    pub value: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementResolutionRequest {
     pub root_identifier: String,
@@ -870,6 +901,13 @@ pub trait PlatformDriver {
         &mut self,
         request: AccessibilityTreeRequest,
     ) -> Result<AccessibilityTreeResult, DriverError>;
+    /// Read only the element and attribute named by a predicate.
+    fn read_accessibility_element(
+        &mut self,
+        _request: AccessibilityElementReadRequest,
+    ) -> Result<AccessibilityElementReadResult, DriverError> {
+        Err(DriverError::Unsupported("scoped accessibility read"))
+    }
     fn resolve_element(
         &mut self,
         request: ElementResolutionRequest,

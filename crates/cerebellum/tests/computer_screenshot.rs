@@ -449,16 +449,22 @@ async fn asking_for_the_cursor_is_an_invalid_request() {
     assert_eq!(reply["field"], "include_cursor");
 }
 
-/// Waiting needs no lease, because it touches nothing.
+/// Predicate waiting resolves the authorized target before attempting readback.
 #[tokio::test]
-async fn waiting_needs_no_lease() {
+async fn waiting_reports_an_unreadable_authorized_target_as_indeterminate() {
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
     let clock = FakeClock::new();
 
     let reply = plane
         .serve(
             servable("computer.wait").expect("wait is servable"),
-            &json!({ "duration_ms": 250 }),
+            &json!({
+                "predicate": {
+                    "kind": "element_present",
+                    "element": {"Identifier": "ready"},
+                },
+                "timeout_ms": 250,
+            }),
             ServeContext {
                 grantee: "pj-example",
                 identity: identity(),
@@ -469,10 +475,17 @@ async fn waiting_needs_no_lease() {
             |_| InMemoryCaptureBackend::default(),
         )
         .await
-        .expect("detect-only validation preserves the wait reply");
+        .expect("the schema-conformant indeterminate reply is returned");
 
-    assert_eq!(reply["outcome"], "completed");
-    assert_eq!(reply["waited_ms"], 250);
+    assert_eq!(reply["outcome"], "timeout");
+    let evidence: Value = serde_json::from_str(
+        reply["evidence"]
+            .as_str()
+            .expect("wait evidence is a JSON string"),
+    )
+    .expect("wait evidence contains a typed value");
+    assert_eq!(evidence["status"], "indeterminate");
+    assert_eq!(evidence["predicate"]["kind"], "element_present");
 }
 
 /// The common serving boundary detects divergence without withholding it yet.
@@ -487,8 +500,8 @@ async fn every_served_reply_runs_result_schema_detection_before_it_escapes() {
 
     let reply = plane
         .serve(
-            servable("computer.wait").expect("wait is servable"),
-            &json!({ "duration_ms": 25 }),
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": true }),
             ServeContext {
                 grantee: "pj-example",
                 identity: identity(),
@@ -501,22 +514,23 @@ async fn every_served_reply_runs_result_schema_detection_before_it_escapes() {
         .await
         .expect("detect-only validation must not withhold the existing reply");
 
-    assert_eq!(reply, json!({"outcome": "completed", "waited_ms": 25}));
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["field"], "include_cursor");
     assert_eq!(
         plane.result_schema_findings(),
         vec![cerebellum::computer_capability::ResultSchemaFinding {
             error: CapabilityResultValidationError::ReplyViolations {
-                capability_id: "computer.wait".into(),
+                capability_id: "computer.screenshot".into(),
                 violations: vec![
                     CapabilityResultViolation::MissingRequiredProperty {
                         path: "$".into(),
-                        property: "evidence".into(),
+                        property: "windows".into(),
                     },
                     CapabilityResultViolation::UndeclaredProperty {
-                        path: "$.waited_ms".into(),
+                        path: "$.field".into(),
                     },
-                    CapabilityResultViolation::EnumMismatch {
-                        path: "$.outcome".into(),
+                    CapabilityResultViolation::UndeclaredProperty {
+                        path: "$.reason".into(),
                     },
                 ],
             },
@@ -534,8 +548,8 @@ async fn withholding_mode_prevents_a_divergent_reply_from_escaping() {
 
     let error = plane
         .serve(
-            servable("computer.wait").expect("wait is servable"),
-            &json!({ "duration_ms": 25 }),
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": true }),
             ServeContext {
                 grantee: "pj-example",
                 identity: identity(),

@@ -194,6 +194,37 @@ impl AxElementName {
     }
 }
 
+/// The only target attribute a scoped readback retrieves after finding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxReadbackAttribute {
+    Presence,
+    Focused,
+    Enabled,
+    Value,
+}
+
+/// State read from one uniquely named accessibility element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxElementReadback {
+    pub element_name: AxElementName,
+    pub present: bool,
+    pub focused: Option<bool>,
+    pub enabled: Option<bool>,
+    pub value: Option<String>,
+}
+
+impl AxElementReadback {
+    fn absent(element_name: AxElementName) -> Self {
+        Self {
+            element_name,
+            present: false,
+            focused: None,
+            enabled: None,
+            value: None,
+        }
+    }
+}
+
 impl fmt::Display for AxElementName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -547,6 +578,45 @@ impl fmt::Display for AxReadError {
 
 impl std::error::Error for AxReadError {}
 
+/// Why a scoped element read could not produce an unambiguous readback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxElementReadError {
+    Read(AxReadError),
+    ElementNameAmbiguous {
+        element_name: AxElementName,
+        match_count: usize,
+    },
+    IncompleteSearch {
+        unreadable_subtrees: usize,
+    },
+}
+
+impl fmt::Display for AxElementReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(formatter),
+            Self::ElementNameAmbiguous {
+                element_name,
+                match_count,
+            } => write!(formatter, "{match_count} elements report {element_name}"),
+            Self::IncompleteSearch {
+                unreadable_subtrees,
+            } => write!(
+                formatter,
+                "{unreadable_subtrees} accessibility subtrees could not be searched"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AxElementReadError {}
+
+impl From<AxReadError> for AxElementReadError {
+    fn from(error: AxReadError) -> Self {
+        Self::Read(error)
+    }
+}
+
 struct Deadline {
     started: Instant,
     timeout: Duration,
@@ -686,6 +756,12 @@ struct ActionSearchSnapshot<Handle> {
     children: Vec<Handle>,
 }
 
+struct ElementReadbackSnapshot {
+    focused: Option<bool>,
+    enabled: Option<bool>,
+    value: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 enum PerformSourceError {
     Ax { code: i32 },
@@ -699,6 +775,12 @@ trait ActionSource: ElementSource {
         deadline: &Deadline,
         child_budget: ChildBudget,
     ) -> Result<ActionSearchSnapshot<Self::Handle>, SourceError>;
+    fn readback(
+        &mut self,
+        element: &Self::Handle,
+        attribute: AxReadbackAttribute,
+        deadline: &Deadline,
+    ) -> Result<ElementReadbackSnapshot, SourceError>;
     fn action_names(
         &mut self,
         element: &Self::Handle,
@@ -1083,6 +1165,71 @@ fn request_action_from<Source: ActionSource>(
     })
 }
 
+fn read_element_from<Source: ActionSource>(
+    source: &mut Source,
+    pid: u32,
+    element_name: &AxElementName,
+    attribute: AxReadbackAttribute,
+    options: AxReadOptions,
+) -> Result<AxElementReadback, AxElementReadError> {
+    let options = AxActionOptions {
+        timeout: options.timeout,
+        max_depth: supported_tree_depth(options.max_depth),
+        max_elements: options.max_elements,
+    };
+    if !source.process_exists(pid) {
+        return Err(AxReadError::NoSuchProcess { pid }.into());
+    }
+    if !source.accessibility_is_permitted() {
+        return Err(AxReadError::PermissionNotGranted.into());
+    }
+
+    let deadline = Deadline::new(options.timeout);
+    deadline.remaining()?;
+    let root = source
+        .application(pid, &deadline)
+        .map_err(|error| map_source_error(source, pid, &deadline, error))?;
+    let mut search = ActionSearchState {
+        pid,
+        element_name,
+        count: 0,
+        match_count: 0,
+        found: None,
+        unreadable_subtrees: 0,
+        options,
+        deadline: &deadline,
+    };
+    match find_action_target(source, &root, 0, &mut Vec::new(), &mut search) {
+        Ok(()) => {}
+        Err(ActionSearchError::Read(error)) => return Err(error.into()),
+    }
+    if search.unreadable_subtrees > 0 {
+        return Err(AxElementReadError::IncompleteSearch {
+            unreadable_subtrees: search.unreadable_subtrees,
+        });
+    }
+    if search.match_count > 1 {
+        return Err(AxElementReadError::ElementNameAmbiguous {
+            element_name: element_name.clone(),
+            match_count: search.match_count,
+        });
+    }
+    let Some(target) = search.found else {
+        return Ok(AxElementReadback::absent(element_name.clone()));
+    };
+    deadline.remaining()?;
+    let readback = source
+        .readback(&target.handle, attribute, &deadline)
+        .map_err(|error| map_source_error(source, pid, &deadline, error))?;
+    Ok(AxElementReadback {
+        element_name: element_name.clone(),
+        present: true,
+        focused: readback.focused,
+        enabled: readback.enabled,
+        value: readback.value,
+    })
+}
+
 fn read_tree_from<Source: ElementSource>(
     source: &mut Source,
     pid: u32,
@@ -1252,9 +1399,10 @@ mod platform {
 
     use super::{
         validate_child_budget, ActionSearchSnapshot, ActionSource, AxAccessibilityTree, AxAction,
-        AxActionError, AxActionOptions, AxActionRequestOutcome, AxElementName, AxFrame,
-        AxReadError, AxReadOptions, ChildBudget, Deadline, ElementSnapshot, ElementSource,
-        PerformSourceError, SourceError, AX_ERROR_API_DISABLED,
+        AxActionError, AxActionOptions, AxActionRequestOutcome, AxElementName, AxElementReadError,
+        AxElementReadback, AxFrame, AxReadError, AxReadOptions, AxReadbackAttribute, ChildBudget,
+        Deadline, ElementReadbackSnapshot, ElementSnapshot, ElementSource, PerformSourceError,
+        SourceError, AX_ERROR_API_DISABLED,
     };
 
     type CfTypeRef = *const c_void;
@@ -1694,6 +1842,33 @@ mod platform {
             })
         }
 
+        fn readback(
+            &mut self,
+            element: &Self::Handle,
+            attribute: AxReadbackAttribute,
+            deadline: &Deadline,
+        ) -> Result<ElementReadbackSnapshot, SourceError> {
+            let mut readback = ElementReadbackSnapshot {
+                focused: None,
+                enabled: None,
+                value: None,
+            };
+            match attribute {
+                AxReadbackAttribute::Presence => {}
+                AxReadbackAttribute::Focused => {
+                    readback.focused = self.bool_attribute(element, "AXFocused", deadline)?;
+                }
+                AxReadbackAttribute::Enabled => {
+                    readback.enabled = self.bool_attribute(element, "AXEnabled", deadline)?;
+                }
+                AxReadbackAttribute::Value => {
+                    readback.value =
+                        self.string_attribute(element, "AXValueDescription", deadline)?;
+                }
+            }
+            Ok(readback)
+        }
+
         fn action_names(
             &mut self,
             element: &Self::Handle,
@@ -1848,6 +2023,26 @@ mod platform {
         super::read_tree_from(&mut MacElementSource::new(), pid, options)
     }
 
+    /// Read one attribute from a uniquely named current element.
+    ///
+    /// The traversal reads only the keys needed to find the target. After
+    /// uniqueness is established it reads only `attribute`; it never builds an
+    /// accessibility tree or reads unrelated element values.
+    pub fn read_accessibility_element(
+        pid: u32,
+        element_name: &AxElementName,
+        attribute: AxReadbackAttribute,
+        options: AxReadOptions,
+    ) -> Result<AxElementReadback, AxElementReadError> {
+        super::read_element_from(
+            &mut MacElementSource::new(),
+            pid,
+            element_name,
+            attribute,
+            options,
+        )
+    }
+
     /// Ask one process to run an action its uniquely named current element advertises.
     ///
     /// The element is found again by the exact supplied `AXIdentifier` or
@@ -1873,7 +2068,8 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 pub use platform::{
-    accessibility_is_permitted, read_accessibility_tree, request_accessibility_action,
+    accessibility_is_permitted, read_accessibility_element, read_accessibility_tree,
+    request_accessibility_action,
 };
 
 #[cfg(test)]
@@ -2020,6 +2216,26 @@ mod tests {
             })
         }
 
+        fn readback(
+            &mut self,
+            element: &Self::Handle,
+            attribute: AxReadbackAttribute,
+            _deadline: &Deadline,
+        ) -> Result<ElementReadbackSnapshot, SourceError> {
+            let node = &self.nodes[*element];
+            Ok(ElementReadbackSnapshot {
+                focused: (attribute == AxReadbackAttribute::Focused)
+                    .then_some(node.focused)
+                    .flatten(),
+                enabled: (attribute == AxReadbackAttribute::Enabled)
+                    .then_some(node.enabled)
+                    .flatten(),
+                value: (attribute == AxReadbackAttribute::Value)
+                    .then(|| node.value_description.clone())
+                    .flatten(),
+            })
+        }
+
         fn action_names(
             &mut self,
             element: &Self::Handle,
@@ -2147,6 +2363,35 @@ mod tests {
 
     fn role_title_name(role: &str, title: &str) -> AxElementName {
         AxElementName::role_and_title(role, title).expect("non-empty test role")
+    }
+
+    #[test]
+    fn a_role_and_title_scoped_read_returns_only_the_named_predicate_attribute() {
+        let root = action_node(None, &[], vec![1]);
+        let mut button =
+            action_node_with_keys(None, Some("AXButton"), Some("Save"), &[], Vec::new());
+        button.enabled = Some(true);
+        button.focused = Some(false);
+        button.value_description = Some("unrelated value".to_string());
+        let mut source = FakeSource::with_nodes(vec![root, button]);
+        let name = role_title_name("AXButton", "Save");
+
+        let readback = read_element_from(
+            &mut source,
+            42,
+            &name,
+            AxReadbackAttribute::Enabled,
+            options(4, 10),
+        )
+        .expect("the role-and-title target is uniquely readable");
+
+        assert_eq!(readback.element_name, name);
+        assert!(readback.present);
+        assert_eq!(readback.enabled, Some(true));
+        assert_eq!(readback.focused, None);
+        assert_eq!(readback.value, None);
+        assert_eq!(source.calls, 0, "a scoped read must not build a full tree");
+        assert_eq!(source.action_name_calls, 0);
     }
 
     fn identifier_outcome(

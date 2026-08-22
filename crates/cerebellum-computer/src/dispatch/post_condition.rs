@@ -20,17 +20,18 @@
 //! express a condition about pixels, timing, or another process, because none
 //! of those are observable through the seam that checks it.
 
+use crate::platform::{AccessibilityElementName, AccessibilityReadbackAttribute};
 use serde::{Deserialize, Serialize};
 
 /// A condition an action claims will hold once it has taken effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PostCondition {
     /// The element carries keyboard focus.
     ///
     /// What a click on a text field claims. Focus is reported by the element
     /// itself rather than inferred from what was clicked.
-    ElementFocused { element_identifier: String },
+    ElementFocused { element: AccessibilityElementName },
 
     /// The element's value reads as the expected text.
     ///
@@ -38,7 +39,7 @@ pub enum PostCondition {
     /// expected text would also match a field that already held it plus
     /// something else, which is a different outcome from the one claimed.
     ElementValueEquals {
-        element_identifier: String,
+        element: AccessibilityElementName,
         expected: String,
     },
 
@@ -47,7 +48,7 @@ pub enum PostCondition {
     /// What invoking a control that disables itself claims, and the weakest
     /// useful condition: many actions change nothing else observable.
     ElementEnabledIs {
-        element_identifier: String,
+        element: AccessibilityElementName,
         expected: bool,
     },
 
@@ -56,32 +57,40 @@ pub enum PostCondition {
     /// What dismissing a dialog or closing a panel claims. Absence is stated
     /// separately from a changed attribute because an element that has gone
     /// cannot report anything about itself.
-    ElementAbsent { element_identifier: String },
+    ElementAbsent { element: AccessibilityElementName },
 
     /// A named element exists that did not before.
     ///
     /// What opening a menu or a dialog claims. The observation is existence
     /// only: what the new element contains is a separate question needing a
     /// separate read.
-    ElementPresent { element_identifier: String },
+    ElementPresent { element: AccessibilityElementName },
 }
 
 impl PostCondition {
-    /// The element this condition is about.
+    /// The exact accessibility key for the element this condition is about.
     ///
-    /// Every condition names exactly one, which is what lets an observer read a
-    /// single element rather than walking the tree.
-    pub fn element_identifier(&self) -> &str {
+    /// Every condition names exactly one, which lets an observer scope each
+    /// readback to that element instead of materializing the full tree.
+    pub fn element(&self) -> &AccessibilityElementName {
         match self {
-            Self::ElementFocused { element_identifier }
-            | Self::ElementValueEquals {
-                element_identifier, ..
+            Self::ElementFocused { element }
+            | Self::ElementValueEquals { element, .. }
+            | Self::ElementEnabledIs { element, .. }
+            | Self::ElementAbsent { element }
+            | Self::ElementPresent { element } => element,
+        }
+    }
+
+    /// The only attribute the scoped readback needs after naming the element.
+    pub const fn readback_attribute(&self) -> AccessibilityReadbackAttribute {
+        match self {
+            Self::ElementFocused { .. } => AccessibilityReadbackAttribute::Focused,
+            Self::ElementValueEquals { .. } => AccessibilityReadbackAttribute::Value,
+            Self::ElementEnabledIs { .. } => AccessibilityReadbackAttribute::Enabled,
+            Self::ElementAbsent { .. } | Self::ElementPresent { .. } => {
+                AccessibilityReadbackAttribute::Presence
             }
-            | Self::ElementEnabledIs {
-                element_identifier, ..
-            }
-            | Self::ElementAbsent { element_identifier }
-            | Self::ElementPresent { element_identifier } => element_identifier,
         }
     }
 
@@ -102,7 +111,8 @@ impl PostCondition {
 /// condition can be written about. A wider observation would let a caller read
 /// application content through the effect-checking path, which exists to
 /// answer one yes-or-no question.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedElement {
     pub present: bool,
     pub focused: Option<bool>,
@@ -210,7 +220,7 @@ mod tests {
     #[test]
     fn an_unreported_attribute_is_indeterminate_rather_than_unsatisfied() {
         let condition = PostCondition::ElementFocused {
-            element_identifier: "field-1".to_string(),
+            element: AccessibilityElementName::identifier("field-1"),
         };
         assert_eq!(
             evaluate(&condition, &observed(None, None, None)),
@@ -234,7 +244,7 @@ mod tests {
     #[test]
     fn a_value_condition_is_not_satisfied_by_a_superstring() {
         let condition = PostCondition::ElementValueEquals {
-            element_identifier: "field-1".to_string(),
+            element: AccessibilityElementName::identifier("field-1"),
             expected: "hello".to_string(),
         };
         assert_eq!(
@@ -263,7 +273,7 @@ mod tests {
         assert_eq!(
             evaluate(
                 &PostCondition::ElementAbsent {
-                    element_identifier: "dialog-1".to_string(),
+                    element: AccessibilityElementName::identifier("dialog-1"),
                 },
                 &gone
             ),
@@ -272,7 +282,7 @@ mod tests {
         assert_eq!(
             evaluate(
                 &PostCondition::ElementFocused {
-                    element_identifier: "dialog-1".to_string(),
+                    element: AccessibilityElementName::identifier("dialog-1"),
                 },
                 &gone
             ),
@@ -281,7 +291,7 @@ mod tests {
         assert_eq!(
             evaluate(
                 &PostCondition::ElementPresent {
-                    element_identifier: "dialog-1".to_string(),
+                    element: AccessibilityElementName::identifier("dialog-1"),
                 },
                 &gone
             ),
@@ -295,7 +305,7 @@ mod tests {
         assert_eq!(
             evaluate(
                 &PostCondition::ElementAbsent {
-                    element_identifier: "dialog-1".to_string(),
+                    element: AccessibilityElementName::identifier("dialog-1"),
                 },
                 &observed(None, None, None)
             ),
@@ -308,7 +318,7 @@ mod tests {
     #[test]
     fn an_enabled_condition_reads_both_directions() {
         let expect_disabled = PostCondition::ElementEnabledIs {
-            element_identifier: "save".to_string(),
+            element: AccessibilityElementName::identifier("save"),
             expected: false,
         };
         assert_eq!(
@@ -325,38 +335,37 @@ mod tests {
         );
     }
 
-    /// Every condition names the element it is about.
+    /// Every condition names its element with the dispatch key type.
     ///
-    /// An observer reads one element rather than walking the tree, which is
-    /// only possible while this holds for every variant. Written out per
-    /// variant rather than derived from the enum, so that adding one without
-    /// an identifier fails here rather than at the observer.
+    /// This is the type-level sharing assertion: a predicate cannot introduce a
+    /// second identifier-only target dialect while every variant stores
+    /// `AccessibilityElementName`. Written out per variant so adding one without
+    /// the shared key fails here.
     #[test]
-    fn every_condition_names_its_element() {
+    fn every_condition_uses_the_dispatch_accessibility_key_type() {
         let conditions = [
             PostCondition::ElementFocused {
-                element_identifier: "a".to_string(),
+                element: AccessibilityElementName::identifier("a"),
             },
             PostCondition::ElementValueEquals {
-                element_identifier: "b".to_string(),
+                element: AccessibilityElementName::identifier("b"),
                 expected: String::new(),
             },
             PostCondition::ElementEnabledIs {
-                element_identifier: "c".to_string(),
+                element: AccessibilityElementName::identifier("c"),
                 expected: true,
             },
             PostCondition::ElementAbsent {
-                element_identifier: "d".to_string(),
+                element: AccessibilityElementName::identifier("d"),
             },
             PostCondition::ElementPresent {
-                element_identifier: "e".to_string(),
+                element: AccessibilityElementName::identifier("e"),
             },
         ];
-        let named: Vec<&str> = conditions
-            .iter()
-            .map(PostCondition::element_identifier)
-            .collect();
-        assert_eq!(named, ["a", "b", "c", "d", "e"]);
+        let named: Vec<&AccessibilityElementName> =
+            conditions.iter().map(PostCondition::element).collect();
+        let expected = ["a", "b", "c", "d", "e"].map(AccessibilityElementName::identifier);
+        assert_eq!(named, expected.iter().collect::<Vec<_>>());
     }
 
     /// A condition survives being written out and read back.
@@ -367,7 +376,7 @@ mod tests {
     #[test]
     fn a_condition_survives_serialization() {
         let condition = PostCondition::ElementValueEquals {
-            element_identifier: "field-1".to_string(),
+            element: AccessibilityElementName::role_and_title("AXTextField", "Account"),
             expected: "typed text".to_string(),
         };
         let bytes = serde_json::to_vec(&condition).expect("serializes");
