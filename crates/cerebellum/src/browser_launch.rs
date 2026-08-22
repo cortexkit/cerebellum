@@ -1148,6 +1148,64 @@ mod tests {
 
     struct FakeReleasedProcess;
 
+    struct ImmediateExitProcess;
+
+    impl crate::browser_session::OwnedBrowserProcess for ImmediateExitProcess {
+        fn generation_matches(&self) -> bool {
+            true
+        }
+
+        fn request_graceful_termination(
+            &mut self,
+        ) -> Result<(), crate::browser_session::ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_for_exit(
+            &mut self,
+            _grace_period: std::time::Duration,
+        ) -> Result<bool, crate::browser_session::ProcessControlFailure> {
+            Ok(true)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), crate::browser_session::ProcessControlFailure> {
+            unreachable!("graceful exit was already observed")
+        }
+
+        fn wait_until_reaped(
+            &mut self,
+        ) -> Result<(), crate::browser_session::ProcessControlFailure> {
+            Ok(())
+        }
+    }
+
+    struct JournalFinalizingCleanup {
+        journal: Arc<Mutex<DurableLaunchJournal<InMemoryJournalStorage>>>,
+        launch_attempt_id: String,
+        terminal_outcome: Option<crate::browser_session::BrowserSessionTerminalOutcome>,
+    }
+
+    impl crate::browser_session::SessionCleanup for JournalFinalizingCleanup {
+        fn set_terminal_outcome(
+            &mut self,
+            outcome: crate::browser_session::BrowserSessionTerminalOutcome,
+        ) {
+            self.terminal_outcome = Some(outcome);
+        }
+
+        fn after_reap(&mut self) -> Result<(), crate::browser_session::CleanupStage> {
+            let outcome = self
+                .terminal_outcome
+                .take()
+                .ok_or(crate::browser_session::CleanupStage::RecordTerminalization)?;
+            self.journal
+                .lock()
+                .map_err(|_| crate::browser_session::CleanupStage::RecordTerminalization)?
+                .finalize_session(&self.launch_attempt_id, outcome)
+                .map_err(|_| crate::browser_session::CleanupStage::RecordTerminalization)
+        }
+    }
+
     impl BarredLaunchProcess for FakeBarredProcess {
         type Released = FakeReleasedProcess;
 
@@ -1717,6 +1775,96 @@ mod tests {
         assert_eq!(journal.core.status().active_reservation_count, 0);
         assert_eq!(journal.core.status().entry_count, 1);
         assert_eq!(terminal_completion(&journal, sequence), expected);
+    }
+
+    #[test]
+    fn concurrent_session_teardowns_write_distinct_decodable_journal_records() {
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            InMemoryJournalStorage::new(),
+        )
+        .expect("open launch journal");
+        let mut first_request = request();
+        first_request.launch_attempt_id = "concurrent-attempt-a".to_string();
+        let mut second_request = request();
+        second_request.launch_attempt_id = "concurrent-attempt-b".to_string();
+        let (first_sequence, _) = dispatch_attempt(&mut journal, &first_request);
+        let (second_sequence, _) = dispatch_attempt(&mut journal, &second_request);
+        assert_ne!(first_sequence, second_sequence);
+
+        let journal = Arc::new(Mutex::new(journal));
+        let sessions = crate::browser_session::BrowserSessions::default();
+        let clock = cerebellum_core::clock::FakeClock::new();
+        let session_config = crate::browser_config::BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 10,
+            termination_grace_period_ms: 10,
+            browser_idle_timeout_ms: 100,
+            browser_exit_observation_deadline_ms: 10,
+            navigation_settle_deadline_ms: 10,
+        };
+        for (route, launch_attempt_id) in [
+            ("journal-route-a", first_request.launch_attempt_id.clone()),
+            ("journal-route-b", second_request.launch_attempt_id.clone()),
+        ] {
+            let _ = sessions.acquire_launch_slot(route);
+            let (_, _, cancelled) = sessions
+                .establish_ready(
+                    route,
+                    cerebellum_core::identity::ProfileDisposition::Durable,
+                    &session_config,
+                    &clock,
+                    Box::new(ImmediateExitProcess),
+                    Box::new(JournalFinalizingCleanup {
+                        journal: Arc::clone(&journal),
+                        launch_attempt_id,
+                        terminal_outcome: None,
+                    }),
+                )
+                .expect("establish journal-backed session");
+            assert!(!cancelled);
+        }
+
+        sessions.teardown_all(&session_config);
+
+        let journal = journal.lock().expect("launch journal");
+        for sequence in [first_sequence, second_sequence] {
+            let record = journal
+                .read_attempt(sequence)
+                .expect("read terminal record");
+            assert_eq!(record.action_obligation_id, sequence);
+            assert_eq!(
+                record.lifecycle,
+                cerebellum_core::journal::LifecycleState::Finalized
+            );
+            assert_eq!(
+                record.terminal_kind,
+                Some(cerebellum_core::journal::TerminalKind::FinalizedCommitted)
+            );
+        }
+        let bytes = journal.core.export_bytes();
+        let mut completions = serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<LaunchSessionCompletion>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode every launch completion");
+        completions.sort_by(|left, right| left.launch_attempt_id.cmp(&right.launch_attempt_id));
+        assert_eq!(
+            completions,
+            vec![
+                LaunchSessionCompletion::new(
+                    &first_request.launch_attempt_id,
+                    crate::browser_session::BrowserSessionTerminalOutcome::ModuleShutdown,
+                ),
+                LaunchSessionCompletion::new(
+                    &second_request.launch_attempt_id,
+                    crate::browser_session::BrowserSessionTerminalOutcome::ModuleShutdown,
+                ),
+            ]
+        );
     }
 
     #[test]
