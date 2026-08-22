@@ -11,11 +11,13 @@ mod effect;
 pub mod post_condition;
 mod retry;
 mod seize;
+mod wait;
 
 pub use attendance::*;
 pub use effect::*;
 pub use retry::*;
 pub use seize::*;
+pub use wait::*;
 
 use crate::audit::{
     ActuationElementIdentity, ActuationIntent, ActuationOutcome, ComputerAudit, ComputerCapability,

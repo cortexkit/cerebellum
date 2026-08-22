@@ -20,22 +20,27 @@ use cerebellum_computer::audit::{
 };
 use cerebellum_computer::capture::{CaptureArtifact, CaptureBackend, ScopedCaptureController};
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
+use cerebellum_computer::dispatch::{
+    post_condition::PostCondition, wait_until_predicate, PlatformPredicatePoller, WaitEvidence,
+    WaitOutcome, WaitResult,
+};
 use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
 };
+use cerebellum_computer::platform::AccessibilityElementName;
 #[cfg(target_os = "macos")]
 use cerebellum_computer::{
     dispatch::{
-        post_condition::PostCondition, AttendanceContext, AttendanceLease, DispatchError,
-        DispatchRequest, Dispatcher, ExpectedPostCondition, FrozenDispatchRow,
+        AttendanceContext, AttendanceLease, DispatchError, DispatchRequest, Dispatcher,
+        ExpectedPostCondition, FrozenDispatchRow,
     },
     platform::{
-        containment::ContainmentRung as DispatchContainmentRung, AccessibilityElementName,
-        AccessibilityKeyForm, AccessibilityReadFailure, AccessibilityTreeRequest, DispatchMode,
-        DriverError, EffectStatus, ElementResolutionRequest, ElementResolutionResult,
-        MacOs26PlatformDriver, PlatformDriver, SemanticDispatchRequest, SemanticDriverError,
-        TargetDisposition, SEMANTIC_CANCEL_ACTION, SEMANTIC_PRESS_ACTION,
+        containment::ContainmentRung as DispatchContainmentRung, AccessibilityKeyForm,
+        AccessibilityReadFailure, AccessibilityTreeRequest, DispatchMode, DriverError,
+        EffectStatus, ElementResolutionRequest, ElementResolutionResult, MacOs26PlatformDriver,
+        PlatformDriver, SemanticDispatchRequest, SemanticDriverError, TargetDisposition,
+        SEMANTIC_CANCEL_ACTION, SEMANTIC_PRESS_ACTION,
     },
 };
 use cerebellum_core::clock::MonotonicClock;
@@ -408,7 +413,7 @@ where
     ) -> Result<Value, CapabilityResultValidationError> {
         let served_capability = capability.capability();
         let reply = match served_capability {
-            ComputerCapability::Wait => self.serve_wait(arguments),
+            ComputerCapability::Wait => self.serve_wait(arguments, context).await,
             ComputerCapability::Screenshot => {
                 self.serve_screenshot(arguments, context, make_backend)
                     .await
@@ -428,19 +433,59 @@ where
         self.finish_reply(served_capability, reply)
     }
 
-    /// Wait for a bounded interval.
-    ///
-    /// Reads a clock and touches nothing, which is why it needs no lease and no
-    /// target: there is no application to name.
-    fn serve_wait(&self, arguments: &Value) -> Value {
-        let Some(duration_ms) = arguments.get("duration_ms").and_then(Value::as_u64) else {
-            return json!({
-                "outcome": "invalid_request",
-                "field": "duration_ms",
-                "reason": "missing_field",
-            });
+    /// Poll one accessibility predicate until it settles or its deadline passes.
+    async fn serve_wait<C: MonotonicClock>(
+        &self,
+        arguments: &Value,
+        context: ServeContext<'_, C>,
+    ) -> Value {
+        let parsed = match parse_wait_request(arguments) {
+            Ok(parsed) => parsed,
+            Err(refusal) => return wait_indeterminate_reply(None, refusal),
         };
-        json!({ "outcome": "completed", "waited_ms": duration_ms })
+        let ServeContext {
+            grantee,
+            identity: _,
+            management,
+            clock,
+            now_ms: _,
+        } = context;
+        let grant = match management
+            .authority_for(grantee, ActionKind::Observe, clock)
+            .await
+        {
+            ActionAuthority::Admitted(grant) => grant,
+            ActionAuthority::Refused(refusal) => {
+                return wait_indeterminate_reply(Some(parsed.predicate), refusal)
+            }
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let predicate = parsed.predicate;
+            let timeout_ms = parsed.timeout_ms;
+            match tokio::task::spawn_blocking(move || {
+                let mut poller =
+                    PlatformPredicatePoller::new(MacOs26PlatformDriver::default(), grant);
+                wait_until_predicate(&mut poller, predicate, timeout_ms)
+            })
+            .await
+            {
+                Ok(result) => wait_wire_reply(result),
+                Err(_) => {
+                    wait_indeterminate_reply(None, json!({"reason": "polling_task_unavailable"}))
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = grant;
+            wait_indeterminate_reply(
+                Some(parsed.predicate),
+                json!({"reason": "scoped_accessibility_read_unsupported"}),
+            )
+        }
     }
 
     /// Invoke the accessibility press action on one uniquely named element.
@@ -524,7 +569,7 @@ where
             true,
         );
 
-        let expected = match expected_post_condition_from_wire(&parsed, &element) {
+        let expected = match expected_post_condition_from_wire(&parsed) {
             Ok(expected) => expected,
             Err(refusal) => return refusal,
         };
@@ -839,6 +884,96 @@ where
     }
 }
 
+const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedWait {
+    predicate: PostCondition,
+    timeout_ms: u64,
+}
+
+fn parse_wait_request(arguments: &Value) -> Result<ParsedWait, Value> {
+    let Some(object) = arguments.as_object() else {
+        return Err(invalid_wait_request("$", "wrong_type"));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "predicate" | "timeout_ms"))
+        .min()
+    {
+        return Err(invalid_wait_request(field, "unknown_field"));
+    }
+    let Some(predicate) = object.get("predicate") else {
+        return Err(invalid_wait_request("predicate", "missing_field"));
+    };
+    let predicate = serde_json::from_value::<PostCondition>(predicate.clone())
+        .map_err(|_| invalid_wait_request("predicate", "invalid_predicate"))?;
+    if !predicate.element().is_usable() {
+        return Err(invalid_wait_request("predicate", "unusable_element_name"));
+    }
+    let Some(timeout_ms) = object.get("timeout_ms").and_then(Value::as_u64) else {
+        return Err(invalid_wait_request(
+            "timeout_ms",
+            if object.contains_key("timeout_ms") {
+                "wrong_type"
+            } else {
+                "missing_field"
+            },
+        ));
+    };
+    if timeout_ms > MAX_WAIT_TIMEOUT_MS {
+        return Err(invalid_wait_request("timeout_ms", "exceeds_maximum"));
+    }
+    Ok(ParsedWait {
+        predicate,
+        timeout_ms,
+    })
+}
+
+fn invalid_wait_request(field: &str, reason: &str) -> Value {
+    json!({
+        "reason": "invalid_request",
+        "field": field,
+        "detail": reason,
+    })
+}
+
+fn wait_wire_reply(result: WaitResult) -> Value {
+    let outcome = match result.outcome {
+        WaitOutcome::Settled => "predicate_satisfied",
+        // The declared version-3 wire vocabulary cannot represent an
+        // indeterminate outcome directly, so
+        // the wire maps both non-settled results to `timeout` while preserving
+        // their typed status in evidence. A future schema revision must add a
+        // distinct indeterminate outcome.
+        WaitOutcome::TimedOut | WaitOutcome::Indeterminate => "timeout",
+    };
+    json!({
+        "outcome": outcome,
+        "evidence": serde_json::to_string(&result.evidence)
+            .expect("the closed wait evidence type serializes"),
+    })
+}
+
+fn wait_indeterminate_reply(predicate: Option<PostCondition>, reason: Value) -> Value {
+    let evidence = match predicate {
+        Some(predicate) => serde_json::to_string(&WaitEvidence::Indeterminate {
+            predicate,
+            readback: None,
+            reason: reason.to_string(),
+        })
+        .expect("the closed wait evidence type serializes"),
+        None => json!({
+            "status": "indeterminate",
+            "predicate": null,
+            "readback": null,
+            "reason": reason,
+        })
+        .to_string(),
+    };
+    json!({"outcome": "timeout", "evidence": evidence})
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct ParsedClick {
@@ -1070,57 +1205,28 @@ fn parse_click_expect(expect: &Value) -> Result<ParsedExpect, Value> {
 }
 
 #[cfg(target_os = "macos")]
-fn post_condition_element_identifier(
-    name: &AccessibilityElementName,
-    resolved: &ElementResolutionResult,
-) -> Option<String> {
-    match name {
-        AccessibilityElementName::Identifier(identifier) => Some(identifier.clone()),
-        AccessibilityElementName::RoleAndTitle { .. } => match &resolved.alternate_name {
-            Some(AccessibilityElementName::Identifier(identifier)) => Some(identifier.clone()),
-            _ => None,
-        },
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn expected_post_condition_from_wire(
-    parsed: &ParsedClick,
-    resolved: &ElementResolutionResult,
-) -> Result<ExpectedPostCondition, Value> {
+fn expected_post_condition_from_wire(parsed: &ParsedClick) -> Result<ExpectedPostCondition, Value> {
     let Some(expect) = parsed.expect.as_ref() else {
         // Placeholder only: the driver is marked as having no caller-supplied
         // condition and will not evaluate this or report it as a claim.
-        // Never evaluated: the driver is marked as having no caller-supplied
-        // condition. The identifier is only here because the dispatch envelope
-        // requires a closed condition type.
         return Ok(ExpectedPostCondition::new(
             "computer-click-wire-no-effect-claim-v1",
             PostCondition::ElementPresent {
-                element_identifier: String::new(),
+                element: parsed.element_name.clone(),
             },
         ));
     };
-    let Some(element_identifier) =
-        post_condition_element_identifier(&parsed.element_name, resolved)
-    else {
-        return Err(invalid_click_request(
-            "expect",
-            "post_condition_requires_identifier",
-        ));
-    };
+    let element = parsed.element_name.clone();
     let condition = match expect.condition.as_str() {
-        "element_present" => PostCondition::ElementPresent { element_identifier },
-        "element_absent" => PostCondition::ElementAbsent { element_identifier },
-        "focused_element_equals" => PostCondition::ElementFocused {
-            element_identifier: expect.value.clone().unwrap_or(element_identifier),
-        },
+        "element_present" => PostCondition::ElementPresent { element },
+        "element_absent" => PostCondition::ElementAbsent { element },
+        "focused_element_equals" => PostCondition::ElementFocused { element },
         "element_attribute_equals" => {
             let attribute = expect.attribute.as_deref().unwrap_or("");
             let value = expect.value.clone().unwrap_or_default();
             match attribute {
                 "AXValue" | "value" | "AXValueDescription" => PostCondition::ElementValueEquals {
-                    element_identifier,
+                    element,
                     expected: value,
                 },
                 "AXEnabled" | "enabled" => {
@@ -1129,13 +1235,10 @@ fn expected_post_condition_from_wire(
                         "false" => false,
                         _ => return Err(invalid_click_request("value", "invalid_value")),
                     };
-                    PostCondition::ElementEnabledIs {
-                        element_identifier,
-                        expected,
-                    }
+                    PostCondition::ElementEnabledIs { element, expected }
                 }
                 "AXFocused" | "focused" if value == "true" => {
-                    PostCondition::ElementFocused { element_identifier }
+                    PostCondition::ElementFocused { element }
                 }
                 _ => return Err(invalid_click_request("attribute", "undeclarable_attribute")),
             }
@@ -1275,6 +1378,119 @@ fn click_driver_refusal(error: DriverError, key_form: AccessibilityKeyForm) -> V
         | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
     };
     dispatch_refusal(refusal)
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    use cerebellum_computer::dispatch::post_condition::ObservedElement;
+
+    fn predicate() -> PostCondition {
+        PostCondition::ElementEnabledIs {
+            element: AccessibilityElementName::role_and_title("AXButton", "Save"),
+            expected: true,
+        }
+    }
+
+    fn readback(enabled: bool) -> ObservedElement {
+        ObservedElement {
+            present: true,
+            focused: None,
+            enabled: Some(enabled),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn wait_parses_the_shared_typed_predicate_with_role_and_title_addressing() {
+        let expected = predicate();
+        let parsed = parse_wait_request(&json!({
+            "predicate": expected,
+            "timeout_ms": 250,
+        }))
+        .expect("the typed predicate request parses");
+
+        assert_eq!(parsed.predicate, predicate());
+        assert_eq!(parsed.timeout_ms, 250);
+    }
+
+    #[test]
+    fn request_inventory_is_timeout_ms_plus_a_typed_predicate_not_a_string() {
+        let refusal = parse_wait_request(&json!({
+            "predicate": "element_present",
+            "timeout_ms": 250,
+        }))
+        .expect_err("the frozen artifact's string predicate remains a schema mismatch");
+
+        assert_eq!(refusal["field"], "predicate");
+        assert_eq!(refusal["detail"], "invalid_predicate");
+    }
+
+    #[test]
+    fn duration_ms_has_no_wait_compatibility_path() {
+        let refusal = parse_wait_request(&json!({
+            "duration_ms": 25,
+            "predicate": predicate(),
+        }))
+        .expect_err("the obsolete sleep request must stay unreachable");
+
+        assert_eq!(refusal["field"], "duration_ms");
+        assert_eq!(refusal["detail"], "unknown_field");
+        assert_eq!(
+            validate_capability_result("computer.wait", &wait_indeterminate_reply(None, refusal),),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn every_wait_terminal_state_conforms_and_remains_distinct_in_evidence() {
+        let cases = [
+            WaitResult {
+                outcome: WaitOutcome::Settled,
+                evidence: WaitEvidence::Settled {
+                    predicate: predicate(),
+                    readback: readback(true),
+                },
+                attempts: 1,
+            },
+            WaitResult {
+                outcome: WaitOutcome::TimedOut,
+                evidence: WaitEvidence::TimedOut {
+                    predicate: predicate(),
+                    readback: readback(false),
+                },
+                attempts: 3,
+            },
+            WaitResult {
+                outcome: WaitOutcome::Indeterminate,
+                evidence: WaitEvidence::Indeterminate {
+                    predicate: predicate(),
+                    readback: None,
+                    reason: "target_not_inspectable".to_string(),
+                },
+                attempts: 1,
+            },
+        ];
+
+        let replies: Vec<Value> = cases.into_iter().map(wait_wire_reply).collect();
+        for reply in &replies {
+            assert_eq!(validate_capability_result("computer.wait", reply), Ok(()));
+        }
+        assert_eq!(replies[0]["outcome"], "predicate_satisfied");
+        assert_eq!(replies[1]["outcome"], "timeout");
+        assert_eq!(replies[2]["outcome"], "timeout");
+
+        let evidence: Vec<WaitEvidence> = replies
+            .iter()
+            .map(|reply| {
+                serde_json::from_str(reply["evidence"].as_str().expect("evidence is a string"))
+                    .expect("evidence carries the typed terminal state")
+            })
+            .collect();
+        assert!(matches!(evidence[0], WaitEvidence::Settled { .. }));
+        assert!(matches!(evidence[1], WaitEvidence::TimedOut { .. }));
+        assert!(matches!(evidence[2], WaitEvidence::Indeterminate { .. }));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1549,6 +1765,26 @@ mod click_vocabulary_v3_tests {
             resolve_against_identifierless_save_fixture(as_identifier),
             Err(DriverError::ElementNotFound),
             "resolving the same title as an identifier must not find the button"
+        );
+    }
+
+    #[test]
+    fn a_role_and_title_click_post_condition_keeps_the_actions_exact_key() {
+        let target = json!({
+            "by": "role_and_title",
+            "role": "AXButton",
+            "title": "Save",
+        });
+        let mut request = left_click(target);
+        request["expect"] = json!({"condition": "element_present"});
+        let parsed = parse_click_request(&request).expect("the click request parses");
+        let expected = expected_post_condition_from_wire(&parsed)
+            .expect("role-and-title can name its own post-condition");
+
+        assert_eq!(expected.condition.element(), &parsed.element_name);
+        assert_eq!(
+            expected.condition.element().key_form(),
+            AccessibilityKeyForm::RoleAndTitle
         );
     }
 

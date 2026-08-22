@@ -1198,7 +1198,13 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let request = json!({
         "name": "computer.wait",
-        "arguments": { "duration_ms": 5 },
+        "arguments": {
+            "predicate": {
+                "kind": "element_present",
+                "element": {"Identifier": "ready"},
+            },
+            "timeout_ms": 5,
+        },
     });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1218,13 +1224,21 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
-    // Waiting needs no lease and no target, so the computer plane completes it.
-    // The browser handler has no such capability and would refuse.
+    // Predicate waiting reaches the computer plane's observe authority. This
+    // test module has no lease, so typed indeterminate evidence is expected;
+    // the browser handler has no such capability and would refuse it as unknown.
     assert_eq!(
-        body["outcome"], "completed",
+        body["outcome"], "timeout",
         "computer.wait was not served by the computer plane: {body}"
     );
-    assert_eq!(body["waited_ms"], 5);
+    let evidence: Value = serde_json::from_str(
+        body["evidence"]
+            .as_str()
+            .expect("wait evidence is a JSON string"),
+    )
+    .expect("wait evidence contains a typed value");
+    assert_eq!(evidence["status"], "indeterminate");
+    assert_eq!(evidence["predicate"]["kind"], "element_present");
 }
 
 /// Reviewed semantic click reaches the computer plane and its compose authority.
@@ -1336,7 +1350,13 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let request = json!({
         "name": "computer.wait",
-        "arguments": { "duration_ms": 5 },
+        "arguments": {
+            "predicate": {
+                "kind": "element_present",
+                "element": {"Identifier": "ready"},
+            },
+            "timeout_ms": 5,
+        },
     });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1362,8 +1382,8 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
         "a withheld capability was served on request: {body}"
     );
     assert_ne!(
-        body["outcome"], "completed",
-        "the request was carried out despite the gate withholding it"
+        body["outcome"], "timeout",
+        "the request reached wait handling despite the gate withholding it"
     );
 }
 

@@ -39,15 +39,17 @@ mod macos;
 #[cfg(any(target_os = "macos", test))]
 pub use accessibility::{
     AxAccessibilityTree, AxAction, AxActionError, AxActionOptions, AxActionRequestOutcome,
-    AxElement, AxElementName, AxElementNameError, AxElementReadFailure, AxFrame, AxReadError,
-    AxReadOptions, AxTreeCompleteness,
+    AxElement, AxElementName, AxElementNameError, AxElementReadError, AxElementReadFailure,
+    AxElementReadback, AxFrame, AxReadError, AxReadOptions, AxReadbackAttribute,
+    AxTreeCompleteness,
 };
 // The entry points themselves call the framework, so they exist only on macOS.
 // The TYPES above do not, and that split is what lets the platform-neutral
 // logic stay covered on Linux CI while the FFI stays where it belongs.
 #[cfg(target_os = "macos")]
 pub use accessibility::{
-    accessibility_is_permitted, read_accessibility_tree, request_accessibility_action,
+    accessibility_is_permitted, read_accessibility_element, read_accessibility_tree,
+    request_accessibility_action,
 };
 #[cfg(target_os = "macos")]
 pub use launch::{

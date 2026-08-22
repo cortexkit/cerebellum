@@ -440,7 +440,7 @@ fn semantic_request_for_action(row: FrozenDispatchRow, action: &str) -> Dispatch
         ExpectedPostCondition::new(
             "computer-effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -626,7 +626,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -653,7 +653,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -688,7 +688,7 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -739,7 +739,7 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -785,7 +785,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -816,7 +816,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -1003,7 +1003,7 @@ fn seize_latency_must_fit_between_observed_posts() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -1019,7 +1019,7 @@ fn seize_latency_must_fit_between_observed_posts() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -1092,7 +1092,7 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         ExpectedPostCondition::new(
             "effect-v1",
             PostCondition::ElementEnabledIs {
-                element_identifier: "element-1".into(),
+                element: AccessibilityElementName::identifier("element-1"),
                 expected: true,
             },
         ),
@@ -1303,7 +1303,7 @@ fn a_recorded_condition_can_be_decided_when_it_is_read_back() {
     let expected = ExpectedPostCondition::new(
         "computer-effect-v1",
         PostCondition::ElementValueEquals {
-            element_identifier: "field-1".into(),
+            element: AccessibilityElementName::identifier("field-1"),
             expected: "typed".into(),
         },
     );

@@ -5,7 +5,9 @@
 //! with the row's deadline and produces one of the three closed statuses.
 
 use crate::dispatch::post_condition::PostCondition;
-use crate::platform::{EffectObservationRequest, EffectStatus, PlatformDriver};
+use crate::platform::{
+    AccessibilityElementName, EffectObservationRequest, EffectStatus, PlatformDriver,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -32,9 +34,9 @@ impl ExpectedPostCondition {
         }
     }
 
-    /// The element this condition will be checked against.
-    pub fn element_identifier(&self) -> &str {
-        self.condition.element_identifier()
+    /// The exact accessibility key this condition will be checked against.
+    pub fn element(&self) -> &AccessibilityElementName {
+        self.condition.element()
     }
 
     pub fn serialize_before_dispatch(&self) -> Result<Vec<u8>, EffectError> {
