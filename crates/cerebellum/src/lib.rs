@@ -52,6 +52,7 @@ use crate::elicit::{Elicitor, SharedElicitor};
 use crate::management::ManagementPlane;
 use cerebellum_core::clock::SystemClock;
 use cerebellum_core::identity::RouteSurface;
+use socket2::{SockRef, TcpKeepalive};
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -98,6 +99,9 @@ pub use wire::{build_error_frame, control_flags};
 const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_RETRIES: u32 = 4;
 
 #[cfg(target_os = "macos")]
 pub use computer::platform::StartupProbeInput;
@@ -873,8 +877,6 @@ impl ModuleConfig {
 async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let health_state = Arc::new(HealthState::with_config(config.health));
     #[cfg(target_os = "macos")]
@@ -916,24 +918,16 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
             }
         })
     });
-    let loop_result = module_loop(&mut read_half, tx.clone(), &config, planes.clone()).await;
+    let connection_result =
+        run_connection(&mut read_half, write_half, &config, planes.clone()).await;
     if let Some(enforcer) = idle_enforcer {
         enforcer.abort();
     }
     if let Some(browser) = config.browser.as_ref() {
         planes.sessions.teardown_all(browser);
     }
-    drop(tx);
 
-    let writer_result = writer
-        .await
-        .map_err(|e| ModuleError::Message(e.to_string()));
-    match (loop_result, writer_result) {
-        (Err(loop_err), _) => Err(loop_err),
-        (Ok(()), Ok(Ok(()))) => Ok(()),
-        (Ok(()), Ok(Err(writer_err))) => Err(ModuleError::Message(writer_err.to_string())),
-        (Ok(()), Err(join_err)) => Err(join_err),
-    }
+    connection_result
 }
 
 async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, ModuleError> {
@@ -947,10 +941,112 @@ async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, Mo
     let mut stream = TcpStream::connect(&addr)
         .await
         .map_err(|e| ModuleError::Message(format!("connect {addr}: {e}")))?;
+    configure_tcp_keepalive(&stream)?;
     authenticate_client(&mut stream, &conn, std::time::Duration::from_secs(5))
         .await
         .map_err(|e| ModuleError::Message(format!("authenticate: {e}")))?;
     Ok(stream)
+}
+
+/// Enable keepalive soon enough to detect an idle peer that disappears without
+/// sending FIN or RST. A healthy idle connection sends at most one probe after
+/// each quiet minute; only an unresponsive peer incurs four retries at 15-second
+/// intervals, bounding detection to roughly two minutes without waking a laptop
+/// every few seconds. The kernel's multi-hour defaults are too slow for a module
+/// whose supervisor can restart it as soon as the dead connection is reported.
+fn configure_tcp_keepalive(stream: &TcpStream) -> Result<(), ModuleError> {
+    let socket = SockRef::from(stream);
+    let requested = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    socket
+        .set_tcp_keepalive(&requested)
+        .map_err(|e| ModuleError::Message(format!("set TCP keepalive: {e}")))?;
+
+    let enabled = socket
+        .keepalive()
+        .map_err(|e| ModuleError::Message(format!("read TCP keepalive enabled state: {e}")))?;
+    let idle = socket
+        .tcp_keepalive_time()
+        .map_err(|e| ModuleError::Message(format!("read TCP keepalive idle time: {e}")))?;
+    let interval = socket
+        .tcp_keepalive_interval()
+        .map_err(|e| ModuleError::Message(format!("read TCP keepalive interval: {e}")))?;
+    let retries = socket
+        .tcp_keepalive_retries()
+        .map_err(|e| ModuleError::Message(format!("read TCP keepalive retry count: {e}")))?;
+    if !enabled
+        || idle != TCP_KEEPALIVE_IDLE
+        || interval != TCP_KEEPALIVE_INTERVAL
+        || retries != TCP_KEEPALIVE_RETRIES
+    {
+        return Err(ModuleError::Message(format!(
+            "TCP keepalive was not applied: enabled={enabled}, idle={idle:?}, interval={interval:?}, retries={retries}"
+        )));
+    }
+
+    Ok(())
+}
+
+type WriterTaskResult = Result<Result<(), ModuleError>, ModuleError>;
+
+fn normalize_writer_task_result(
+    result: Result<Result<(), ModuleError>, tokio::task::JoinError>,
+) -> WriterTaskResult {
+    result.map_err(|e| ModuleError::Message(e.to_string()))
+}
+
+fn reconcile_connection_results(
+    loop_result: Result<(), ModuleError>,
+    writer_result: WriterTaskResult,
+) -> Result<(), ModuleError> {
+    match (loop_result, writer_result) {
+        (Err(loop_err), _) => Err(loop_err),
+        (Ok(()), Ok(Ok(()))) => Ok(()),
+        (Ok(()), Ok(Err(writer_err))) => Err(ModuleError::Message(writer_err.to_string())),
+        (Ok(()), Err(join_err)) => Err(join_err),
+    }
+}
+
+fn report_writer_first(writer_result: WriterTaskResult) -> Result<(), ModuleError> {
+    match writer_result {
+        Ok(Ok(())) => Err(ModuleError::Message(
+            "writer task exited while the connection loop was still active".into(),
+        )),
+        failed => reconcile_connection_results(Ok(()), failed),
+    }
+}
+
+async fn run_connection<R, W>(
+    read_half: &mut R,
+    write_half: W,
+    config: &ModuleConfig,
+    planes: Planes,
+) -> Result<(), ModuleError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
+    let mut writer = tokio::spawn(drain_writer(write_half, rx));
+    let mut loop_task = Box::pin(module_loop(read_half, tx.clone(), config, planes));
+
+    let loop_result = tokio::select! {
+        // Preserve the existing diagnostic precedence when both sides become
+        // ready together: a concrete loop error is more specific than the
+        // writer shutdown it can induce.
+        biased;
+        loop_result = &mut loop_task => loop_result,
+        writer_result = &mut writer => {
+            return report_writer_first(normalize_writer_task_result(writer_result));
+        }
+    };
+
+    drop(loop_task);
+    drop(tx);
+    let writer_result = normalize_writer_task_result(writer.await);
+    reconcile_connection_results(loop_result, writer_result)
 }
 
 /// Derive the bounded idle-wake cadence from the configured heartbeat stale
@@ -3490,6 +3586,113 @@ mod tests {
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
             vec![ComputerGateOutcome::Pass; 9]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection liveness tests.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod connection_liveness_tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writer-side sentinel",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn connection_test_config() -> ModuleConfig {
+        ModuleConfig {
+            connection_file_path: PathBuf::new(),
+            module_id: DEFAULT_MODULE_ID.into(),
+            health: HealthConfig {
+                dispatch_heartbeat_stale_ms: 100,
+                action_age_stale_ms: 30_000,
+            },
+            browser: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_failure_ends_connection_while_read_is_parked() {
+        // A true vanished TCP peer requires a packet-filter rule that silently
+        // drops traffic; closing a loopback peer would substitute EOF/RST and
+        // test the wrong failure. This writer instead isolates the listener
+        // contract after the kernel has diagnosed a write failure: the read peer
+        // remains open and silent, so only hearing the writer can end the loop.
+        let (_silent_peer, mut parked_reader) = tokio::io::duplex(1024);
+        let config = connection_test_config();
+        let planes = Planes::new(Arc::new(HealthState::with_config(config.health)));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_connection(&mut parked_reader, FailingWriter, &config, planes),
+        )
+        .await
+        .expect("writer failure must end the connection while the read remains parked");
+        let error = result.expect_err("the writer failure must be reported");
+        assert_eq!(error.to_string(), "writer-side sentinel");
+    }
+
+    #[test]
+    fn loop_and_writer_failures_remain_distinguishable() {
+        let loop_error = reconcile_connection_results(
+            Err(ModuleError::Message("loop-side sentinel".into())),
+            Ok(Err(ModuleError::Message("writer-side sentinel".into()))),
+        )
+        .expect_err("a loop failure must remain the primary diagnosis");
+        assert_eq!(loop_error.to_string(), "loop-side sentinel");
+
+        let writer_error = reconcile_connection_results(
+            Ok(()),
+            Ok(Err(ModuleError::Message("writer-side sentinel".into()))),
+        )
+        .expect_err("a writer failure must be reported when the loop was healthy");
+        assert_eq!(writer_error.to_string(), "writer-side sentinel");
+    }
+
+    #[tokio::test]
+    async fn tcp_keepalive_is_verified_on_the_connected_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let client = client.unwrap();
+        let (_server, _) = accepted.unwrap();
+
+        configure_tcp_keepalive(&client).unwrap();
+
+        let socket = SockRef::from(&client);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), TCP_KEEPALIVE_IDLE);
+        assert_eq!(
+            socket.tcp_keepalive_interval().unwrap(),
+            TCP_KEEPALIVE_INTERVAL
+        );
+        assert_eq!(
+            socket.tcp_keepalive_retries().unwrap(),
+            TCP_KEEPALIVE_RETRIES
         );
     }
 }
