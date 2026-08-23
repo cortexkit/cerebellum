@@ -1223,7 +1223,7 @@ mod tests {
         // Each row a distinct value, so a row can only match itself.
         let mut varied = Vec::with_capacity(WIDTH * HEIGHT * 4);
         for y in 0..HEIGHT {
-            varied.extend(std::iter::repeat((y as u8) * 8).take(WIDTH * 4));
+            varied.extend(std::iter::repeat_n((y as u8) * 8, WIDTH * 4));
         }
         assert!(
             rows_are_placeable(&varied, WIDTH, HEIGHT, HEIGHT - 1),
