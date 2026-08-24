@@ -25,4 +25,4 @@ pub use launch::{
     ReleasedChild, SpawnError, TerminationOutcome,
 };
 #[cfg(any(target_os = "linux", test))]
-pub use linux::{process_start_time, process_start_time_micros, ProcessStartTime};
+pub use linux::{process_start_time, ProcessStartTime};

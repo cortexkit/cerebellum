@@ -16,6 +16,9 @@ pub enum ProcessStartTime {
 }
 
 /// Read a kernel-sourced process start time that distinguishes PID reuse.
+///
+/// The full enum is intentional: collapsing `NotPermitted` and `NoSuchProcess`
+/// would erase the distinction between an unreadable generation and a mismatch.
 pub fn process_start_time(pid: u32) -> ProcessStartTime {
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
@@ -55,14 +58,6 @@ pub fn process_start_time(pid: u32) -> ProcessStartTime {
         })
         .map(ProcessStartTime::Started)
         .unwrap_or(ProcessStartTime::NoStartTime)
-}
-
-/// Read a process start time for callers that need only the value.
-pub fn process_start_time_micros(pid: u32) -> Option<u64> {
-    match process_start_time(pid) {
-        ProcessStartTime::Started(value) => Some(value),
-        _ => None,
-    }
 }
 
 fn boot_time_seconds() -> Option<u64> {

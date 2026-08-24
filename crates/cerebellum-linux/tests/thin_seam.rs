@@ -1,7 +1,30 @@
 //! Mechanical enforcement of the thin-seam rule.
 //!
-//! This crate reports Linux readings and owns the syscalls that require unsafe.
-//! It decides nothing about whether those readings satisfy a browser policy.
+//! This crate is the only one permitted to contain `unsafe`, which is what lets
+//! `cerebellum-computer` keep `#![forbid(unsafe_code)]` on the crate that will
+//! eventually synthesize input events. That bargain holds only while this crate
+//! stays a set of raw Linux syscall and procfs readings: it reports what the
+//! system says and decides nothing.
+//!
+//! The rule is also load-bearing for a second reason that is easy to miss.
+//! Continuous integration runs on non-Linux hosts, where the Linux-specific
+//! implementation is target-gated out and this crate compiles to an empty
+//! library. So code added here is code no automated build compiles, let alone
+//! tests. Judgment that moves in stops being verified, silently and without a
+//! failing check.
+//!
+//! These tests make the rule mechanical instead of a comment:
+//!
+//! 1. [`no_dependency_on_any_cerebellum_crate`] fails if this crate takes a
+//!    dependency on a plane or the substrate.
+//! 2. [`no_policy_type_appears_in_the_seam`] fails if a decision-carrying type
+//!    name appears in this crate's source.
+//! 3. [`no_function_here_claims_to_judge`] fails if a function is named for a
+//!    verdict rather than for a reading.
+//!
+//! They run on every host, including the ones where the crate itself compiles
+//! to nothing, because they read text rather than linking Linux facilities.
+//! That is deliberate: the check has to work where the code does not.
 
 use std::path::{Path, PathBuf};
 
