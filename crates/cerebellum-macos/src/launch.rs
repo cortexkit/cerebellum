@@ -12,6 +12,8 @@ use std::path::Path;
 
 use crate::{process_start_time, ProcessStartTime};
 
+const POSIX_SPAWN_SETSIGDEF: c_short = 0x0004;
+const POSIX_SPAWN_SETSIGMASK: c_short = 0x0008;
 const POSIX_SPAWN_START_SUSPENDED: c_short = 0x0080;
 const POSIX_SPAWN_CLOEXEC_DEFAULT: c_short = 0x4000;
 const F_DUPFD_CLOEXEC: c_int = 67;
@@ -39,6 +41,16 @@ const GUARDIAN_READ_FAILED: c_int = 103;
 const GUARDIAN_SIGNAL_FAILED: c_int = 10;
 const SIGCONT: c_int = 19;
 const SIGKILL: c_int = 9;
+#[cfg(test)]
+const SIGTERM: c_int = 15;
+#[cfg(test)]
+const SIGUSR1: c_int = 30;
+#[cfg(test)]
+const SIG_BLOCK: c_int = 1;
+#[cfg(test)]
+const SIG_IGN: usize = 1;
+#[cfg(test)]
+const SIG_ERR: usize = usize::MAX;
 #[cfg(test)]
 const WNOHANG: c_int = 1;
 const PROC_PIDLISTFDS: c_int = 1;
@@ -74,6 +86,7 @@ struct ProcFdInfo {
 
 type PosixSpawnAttr = *mut c_void;
 type PosixSpawnFileActions = *mut c_void;
+type SignalSet = u32;
 type CfTypeRef = *const c_void;
 type CfDictionaryRef = *const c_void;
 type CfStringRef = *const c_void;
@@ -134,6 +147,16 @@ extern "C" {
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     #[cfg(test)]
     fn flock(fd: c_int, operation: c_int) -> c_int;
+    #[cfg(test)]
+    fn pthread_sigmask(how: c_int, set: *const SignalSet, old_set: *mut SignalSet) -> c_int;
+    #[cfg(test)]
+    fn sigaddset(set: *mut SignalSet, signal: c_int) -> c_int;
+    fn sigemptyset(set: *mut SignalSet) -> c_int;
+    fn sigfillset(set: *mut SignalSet) -> c_int;
+    #[cfg(test)]
+    fn sigprocmask(how: c_int, set: *const SignalSet, old_set: *mut SignalSet) -> c_int;
+    #[cfg(test)]
+    fn signal(signal: c_int, handler: *const c_void) -> *const c_void;
     fn getdtablesize() -> c_int;
     fn kill(pid: c_int, signal: c_int) -> c_int;
     /// The thread's `errno` location. Read directly because the safe wrapper
@@ -157,6 +180,14 @@ extern "C" {
     fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: c_short) -> c_int;
+    fn posix_spawnattr_setsigdefault(
+        attributes: *mut PosixSpawnAttr,
+        signals: *const SignalSet,
+    ) -> c_int;
+    fn posix_spawnattr_setsigmask(
+        attributes: *mut PosixSpawnAttr,
+        signals: *const SignalSet,
+    ) -> c_int;
     fn posix_spawn(
         pid: *mut c_int,
         path: *const c_char,
@@ -425,7 +456,8 @@ impl Drop for ReleasedChild {
 /// The target inherits descriptors 0, 1, 2 and the two CDP descriptors, mapped
 /// to Chromium's fixed descriptors 3 and 4. `POSIX_SPAWN_CLOEXEC_DEFAULT` closes
 /// every other descriptor rather than relying on unrelated code to have marked
-/// its descriptors close-on-exec.
+/// its descriptors close-on-exec. Its signal mask starts empty and all inherited
+/// ignored dispositions start at their defaults.
 pub fn spawn_barred(
     executable: &Path,
     arguments: &[OsString],
@@ -720,11 +752,28 @@ fn prepare_spawn(
     if status == 0 {
         status = unsafe { posix_spawnattr_init(&mut attributes) };
     }
+    let mut signal_mask = 0;
+    if status == 0 {
+        status = unsafe { sigemptyset(&mut signal_mask) };
+    }
+    if status == 0 {
+        status = unsafe { posix_spawnattr_setsigmask(&mut attributes, &signal_mask) };
+    }
+    let mut default_signals = 0;
+    if status == 0 {
+        status = unsafe { sigfillset(&mut default_signals) };
+    }
+    if status == 0 {
+        status = unsafe { posix_spawnattr_setsigdefault(&mut attributes, &default_signals) };
+    }
     if status == 0 {
         status = unsafe {
             posix_spawnattr_setflags(
                 &mut attributes,
-                POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT,
+                POSIX_SPAWN_START_SUSPENDED
+                    | POSIX_SPAWN_CLOEXEC_DEFAULT
+                    | POSIX_SPAWN_SETSIGMASK
+                    | POSIX_SPAWN_SETSIGDEF,
             )
         };
     }
@@ -1070,6 +1119,110 @@ mod tests {
             response_write.as_raw_fd(),
         )
         .expect("spawn barred shell")
+    }
+
+    fn observed_signal_state(name: &str) -> (u32, usize) {
+        let directory = TestDirectory::new(name);
+        let report = directory.join("signal-state");
+        let helper = std::env::current_exe().expect("test executable");
+        let status = Command::new(helper)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("launch::tests::signal_state_parent_launches_observer")
+            .env("CEREBELLUM_SIGNAL_STATE_REPORT", &report)
+            .status()
+            .expect("run signal-state parent helper");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "signal-state helper failed: {status}"
+        );
+
+        let raw = fs::read_to_string(report).expect("spawned observer wrote signal state");
+        let mut values = raw.lines();
+        let mask = values
+            .next()
+            .expect("observer reported a mask")
+            .parse()
+            .expect("numeric signal mask");
+        let disposition = values
+            .next()
+            .expect("observer reported a disposition")
+            .parse()
+            .expect("numeric signal disposition");
+        assert!(values.next().is_none(), "unexpected signal report: {raw:?}");
+        (mask, disposition)
+    }
+
+    #[test]
+    fn spawned_child_starts_with_empty_signal_mask() {
+        let _serial = serialize_launch_fixtures();
+        let (mask, _) = observed_signal_state("signal-mask");
+        assert_eq!(mask, 0, "spawned child reported signal mask {mask}");
+    }
+
+    #[test]
+    fn spawned_child_starts_with_default_signal_disposition() {
+        let _serial = serialize_launch_fixtures();
+        let (_, disposition) = observed_signal_state("signal-disposition");
+        assert_eq!(
+            disposition, 0,
+            "spawned child reported signal disposition {disposition}"
+        );
+    }
+
+    #[test]
+    #[ignore = "launched by the signal-state regression tests"]
+    fn signal_state_parent_launches_observer() {
+        let Some(report) = std::env::var_os("CEREBELLUM_SIGNAL_STATE_REPORT") else {
+            return;
+        };
+
+        let mut blocked = 0;
+        assert_eq!(unsafe { sigemptyset(&mut blocked) }, 0);
+        assert_eq!(unsafe { sigaddset(&mut blocked, SIGTERM) }, 0);
+        assert_eq!(
+            unsafe { pthread_sigmask(SIG_BLOCK, &blocked, std::ptr::null_mut()) },
+            0
+        );
+        let previous = unsafe { signal(SIGUSR1, SIG_IGN as *const c_void) };
+        assert_ne!(previous as usize, SIG_ERR, "ignore SIGUSR1");
+
+        let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
+        let executable = std::env::current_exe().expect("test executable");
+        let child = spawn_barred(
+            &executable,
+            &[
+                OsString::from("--ignored"),
+                OsString::from("--exact"),
+                OsString::from("launch::tests::signal_state_observer_reports_own_state"),
+            ],
+            &[(OsString::from("CEREBELLUM_SIGNAL_STATE_REPORT"), report)],
+            command_read.as_raw_fd(),
+            response_write.as_raw_fd(),
+        )
+        .expect("spawn barred signal observer");
+        child
+            .release()
+            .expect("release signal observer")
+            .wait()
+            .expect("reap signal observer");
+    }
+
+    #[test]
+    #[ignore = "launched by the signal-state parent helper"]
+    fn signal_state_observer_reports_own_state() {
+        let Some(report) = std::env::var_os("CEREBELLUM_SIGNAL_STATE_REPORT") else {
+            return;
+        };
+
+        let mut mask = 0;
+        assert_eq!(
+            unsafe { sigprocmask(SIG_BLOCK, std::ptr::null(), &mut mask) },
+            0
+        );
+        let disposition = unsafe { signal(SIGUSR1, std::ptr::null()) } as usize;
+        fs::write(report, format!("{mask}\n{disposition}\n")).expect("write observed signal state");
     }
 
     #[test]
