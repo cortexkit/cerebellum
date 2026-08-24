@@ -10,6 +10,7 @@
 pub mod authorization;
 pub mod browser;
 pub mod browser_config;
+pub mod browser_executable_identity;
 pub mod browser_launch;
 pub mod browser_launch_readiness;
 #[cfg(target_os = "macos")]

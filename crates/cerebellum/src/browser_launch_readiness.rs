@@ -537,7 +537,7 @@ mod tests {
 
     use super::*;
     use crate::browser_launch::{
-        AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentity,
+        AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentityClaim,
         LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
         LaunchRouteIdentity,
     };
@@ -882,8 +882,8 @@ mod tests {
         }
     }
 
-    fn executable_identity() -> ExecutableIdentity {
-        ExecutableIdentity {
+    fn executable_identity() -> ExecutableIdentityClaim {
+        ExecutableIdentityClaim::CodeSigned {
             signing_identifier: "com.example.browser".to_string(),
             unique_code_hash: "abc123".to_string(),
         }
@@ -1150,7 +1150,7 @@ mod tests {
             }
         }
 
-        fn executed_image_identity(&self) -> Result<ExecutableIdentity, PlatformLaunchError> {
+        fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError> {
             Ok(executable_identity())
         }
 
@@ -1214,9 +1214,9 @@ mod live_chrome_test {
 
     use super::*;
     use crate::browser_launch::{
-        AttestedLaunchRequest, AuthorizedLaunchIntent, ExecutableIdentity, LaunchGenerationRecord,
-        LaunchIdentityMismatchRecord, LaunchProfileIdentity, LaunchRouteIdentity,
-        MacOsProcessLauncher,
+        AttestedLaunchRequest, AuthorizedLaunchIntent, ExecutableIdentityClaim,
+        LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
+        LaunchRouteIdentity, MacOsProcessLauncher,
     };
 
     struct PassingJournal;
@@ -1259,7 +1259,7 @@ mod live_chrome_test {
     fn request(
         executable: PathBuf,
         arguments: Vec<OsString>,
-        identity: ExecutableIdentity,
+        identity: ExecutableIdentityClaim,
         profile: &Path,
     ) -> AttestedLaunchRequest {
         AttestedLaunchRequest {
@@ -1329,7 +1329,7 @@ mod live_chrome_test {
         let request = request(
             chrome,
             arguments,
-            ExecutableIdentity {
+            ExecutableIdentityClaim::CodeSigned {
                 signing_identifier: observed.signing_identifier,
                 unique_code_hash: observed.unique_code_hash,
             },
