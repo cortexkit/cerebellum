@@ -482,6 +482,9 @@ async fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_ex
         "every code-owned result divergence must be removed"
     );
 
+    // `mut` is conditional: only the macOS arm below extends this, so binding it
+    // mutable unconditionally is dead on every other platform.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut expected_artifact_debt = BTreeSet::from([
         fact(
             "computer.screenshot",

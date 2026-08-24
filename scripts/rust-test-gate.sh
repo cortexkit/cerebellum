@@ -155,6 +155,22 @@ run_phase "scripts/module-wiring-gate.sh" \
 run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
   cargo clippy --workspace --all-targets --quiet -- -D warnings
 
+# The same lint against the platform CI actually runs on. A macOS-only gate
+# cannot see code that stops compiling when the macOS seam disappears, and this
+# repository has now been red on Linux twice while every local run was green --
+# both times found by someone else reading our CI rather than by us.
+#
+# Skipped rather than failed when the target is absent, because a developer
+# without it installed should not be blocked; CI has it, and CI is where the
+# verdict binds.
+if rustc --print target-libdir --target x86_64-unknown-linux-gnu >/dev/null 2>&1; then
+  run_phase "cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
+    cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
+else
+  printf '==> SKIPPED: the linux target is not installed, so cross-platform lint did not run\n'
+  printf '    install it with: rustup target add x86_64-unknown-linux-gnu\n'
+fi
+
 # Phase 4: compile + all tests (lib, bins, integration).
 run_phase "cargo test --workspace --quiet" \
   cargo test --workspace --quiet
