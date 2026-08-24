@@ -1,24 +1,45 @@
 //! Exact inventory of computer replies against the frozen v4 result schemas.
 //!
+//! Every reply recorded here is returned by `ComputerPlane::serve`. The shared
+//! fixture from `computer_screenshot` supplies fake clocks, leases, audit storage,
+//! capture backends, and a resolver whose answer can change after consent.
+//!
+//! The inventory reaches these refusal states: invalid screenshot region and
+//! scope, missing broad grant, ambiguous target, unavailable audit, failed and
+//! oversized capture, no capturable window, invalid click request, ambiguous
+//! click target, and a wait target that becomes unreadable after consent.
+//!
+//! The following states cannot be reached deterministically through `serve` yet:
+//! semantic click-driver refusals (the production macOS driver is constructed
+//! inside `serve`), successful and timed-out waits (the predicate poller is also
+//! constructed there), and `not_servable` (the `servable` gate rejects that
+//! capability before the serving boundary). They are intentionally absent rather
+//! than represented by literals that could drift away from production replies.
+//!
 //! Code-owned divergence must stay empty. The remaining entries are fields the
 //! reply deliberately preserves because they tell callers how to repair a
 //! refusal, but which the digest-pinned artifact does not yet declare. They are
 //! recorded as artifact-owned debt rather than mislabelled as reply defects.
-//! Every sample still passes through the serving-boundary validator, and both
-//! inventories are asserted exactly, so adding or removing one field reddens the
-//! test by capability and JSON path.
-//!
-//! The wait request still differs between the handler and the declared request
-//! schema: the handler accepts `predicate` as the typed `PostCondition` object
-//! while the artifact declares a string. That request-contract mismatch is not a
-//! result-schema divergence and is tracked separately from this file.
+
+mod support;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
+use cerebellum_computer::capture::{EnumeratedWindow, InMemoryCaptureBackend, WindowFrame};
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError, CapabilityResultViolation,
 };
+use cerebellum_computer::platform::{TargetCandidate, TargetResolution};
+use cerebellum_core::clock::FakeClock;
+use cerebellum_core::consent::ActionKind;
 use serde_json::{json, Value};
+use support::computer::{
+    audit, failing_audit, grant, grant_lease, identity, leased_management,
+    management as unleased_management, management_with, request, CapturingBackend,
+    MutableTargetResolver, RefusingBackend, GRANTEE,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OwedBy {
@@ -60,17 +81,7 @@ fn undeclared_field_owner(capability_id: &str, path: &str) -> OwedBy {
     let useful = match capability_id {
         "computer.click" => matches!(
             path,
-            "$.field"
-                | "$.reason"
-                | "$.bundle_identity"
-                | "$.instances"
-                | "$.remedy"
-                | "$.key_form"
-                | "$.match_count"
-                | "$.action"
-                | "$.advertised"
-                | "$.disposition"
-                | "$.deadline_ms"
+            "$.field" | "$.reason" | "$.bundle_identity" | "$.instances" | "$.remedy"
         ),
         "computer.screenshot" => matches!(
             path,
@@ -136,147 +147,328 @@ fn observed_facts(
     facts
 }
 
-fn click_refusal(mut refusal: Value, unreadable_subtrees: u64) -> Value {
-    let object = refusal.as_object_mut().expect("fixture is an object");
-    object
-        .entry("outcome")
-        .or_insert_with(|| Value::String("refused".to_string()));
-    object.insert("containment_rung".into(), json!("global_none"));
-    object.insert("effect_status".into(), json!("effect_indeterminate"));
-    object.insert("unreadable_subtrees".into(), json!(unreadable_subtrees));
-    refusal
+fn named_reply(reply: Value, expected_outcome: &str) -> Value {
+    assert_eq!(
+        reply["outcome"], expected_outcome,
+        "fixture did not reach {expected_outcome}: {reply}"
+    );
+    reply
 }
 
-fn screenshot_refusal(mut refusal: Value) -> Value {
-    refusal
-        .as_object_mut()
-        .expect("fixture is an object")
-        .insert("windows".into(), json!([]));
-    refusal
+async fn served_screenshot_replies() -> Vec<Value> {
+    let mut replies = Vec::new();
+
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let management = leased_management(&clock).await;
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({
+                "scope": "target_windows",
+                "include_cursor": false,
+                "region": null,
+            }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: Vec::new(),
+                png: Vec::new(),
+            },
+        )
+        .await
+        .expect("detect-only validation preserves the invalid-region reply");
+    replies.push(named_reply(reply, "invalid_request"));
+
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let management = unleased_management();
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "display", "include_cursor": false }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the broad-grant reply");
+    replies.push(named_reply(reply, "broad_grant_required"));
+
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let management = unleased_management();
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "all_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the unknown-scope reply");
+    replies.push(named_reply(reply, "invalid_request"));
+
+    let clock = FakeClock::new();
+    let resolver = MutableTargetResolver::new(TargetResolution::Resolved(grant()));
+    let management = management_with(Arc::new(resolver.clone()));
+    grant_lease(&management, ActionKind::Observe, &clock).await;
+    resolver.replace(TargetResolution::Ambiguous(vec![
+        TargetCandidate {
+            pid: 4242,
+            window_count: 1,
+        },
+        TargetCandidate {
+            pid: 4343,
+            window_count: 2,
+        },
+    ]));
+    let plane = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the ambiguous-target reply");
+    replies.push(named_reply(reply, "ambiguous"));
+
+    let clock = FakeClock::new();
+    let management = leased_management(&clock).await;
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(failing_audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the audit-unavailable reply");
+    replies.push(named_reply(reply, "audit_unavailable"));
+
+    let clock = FakeClock::new();
+    let management = leased_management(&clock).await;
+    let plane = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &request(),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| RefusingBackend {
+                windows: vec![fixture_window(1, 1)],
+            },
+        )
+        .await
+        .expect("detect-only validation preserves the capture-failed reply");
+    replies.push(named_reply(reply, "capture_failed"));
+
+    let clock = FakeClock::new();
+    let management = leased_management(&clock).await;
+    let plane = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: vec![fixture_window(1, 1)],
+                png: vec![0; 16 * 1024 * 1024 + 1],
+            },
+        )
+        .await
+        .expect("detect-only validation preserves the image-too-large reply");
+    replies.push(named_reply(reply, "image_too_large"));
+
+    let clock = FakeClock::new();
+    let management = leased_management(&clock).await;
+    let plane = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({ "scope": "target_windows", "include_cursor": false }),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: Vec::new(),
+                png: Vec::new(),
+            },
+        )
+        .await
+        .expect("detect-only validation preserves the no-window reply");
+    replies.push(named_reply(reply, "no_window_captured"));
+
+    replies
 }
 
-#[test]
-fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() {
-    let screenshot = observed_facts(
-        "computer.screenshot",
-        [
-            screenshot_refusal(json!({
-                "outcome": "invalid_request",
-                "field": "region",
-                "reason": "wrong_type",
-            })),
-            screenshot_refusal(json!({
-                "outcome": "broad_grant_required",
-                "remedy": "obtain a broad grant",
-            })),
-            screenshot_refusal(json!({
-                "outcome": "invalid_request",
-                "field": "scope",
-                "reason": "unknown_value",
-            })),
-            screenshot_refusal(json!({
-                "outcome": "ambiguous",
-                "bundle_identity": "com.example.app",
-                "instances": [],
-                "remedy": "choose one target",
-            })),
-            screenshot_refusal(json!({
-                "outcome": "audit_unavailable",
-                "remedy": "retry after repair",
-            })),
-            screenshot_refusal(json!({"outcome": "capture_failed"})),
-            screenshot_refusal(json!({
-                "outcome": "image_too_large",
-                "bytes": 20_000_000,
-                "bound_bytes": 16_777_216,
-                "remedy": "capture fewer windows",
-            })),
-            screenshot_refusal(json!({
-                "outcome": "no_window_captured",
-                "remedy": "open a window",
-            })),
-        ],
-    );
-    let click = observed_facts(
-        "computer.click",
-        [
-            click_refusal(
-                json!({
-                    "outcome": "invalid_request",
-                    "field": "target",
-                    "reason": "missing_field",
-                }),
-                0,
-            ),
-            click_refusal(
-                json!({
-                    "outcome": "ambiguous",
-                    "bundle_identity": "com.example.app",
-                    "instances": [],
-                    "remedy": "choose one target",
-                }),
-                0,
-            ),
-            click_refusal(
-                json!({
-                    "reason": "element_name_ambiguous",
-                    "key_form": "identifier",
-                    "match_count": 2,
-                }),
-                0,
-            ),
-            click_refusal(
-                json!({
-                    "reason": "action_not_advertised",
-                    "action": "AXPress",
-                    "advertised": ["AXCancel"],
-                }),
-                0,
-            ),
-            click_refusal(json!({"reason": "application_refused"}), 0),
-            click_refusal(
-                json!({
-                    "reason": "target_no_longer_current",
-                    "disposition": "gone",
-                }),
-                0,
-            ),
-            click_refusal(
-                json!({
-                    "reason": "semantic_dispatch_transient",
-                    "deadline_ms": 3000,
-                }),
-                0,
-            ),
-            click_refusal(
-                json!({
-                    "outcome": "not_servable",
-                    "remedy": "report the missing implementation",
-                }),
-                0,
-            ),
-        ],
-    );
-    let wait = observed_facts(
-        "computer.wait",
-        [
-            json!({
-                "outcome": "predicate_satisfied",
-                "evidence": r#"{"status":"settled","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":true,"focused":null,"enabled":null,"value":null}}"#,
-                "settle_path": "poll_with_deadline",
+async fn served_wait_replies() -> Vec<Value> {
+    let clock = FakeClock::new();
+    let resolver = MutableTargetResolver::new(TargetResolution::Resolved(grant()));
+    let management = management_with(Arc::new(resolver.clone()));
+    grant_lease(&management, ActionKind::Observe, &clock).await;
+    resolver.replace(TargetResolution::Unreadable);
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.wait").expect("wait is servable"),
+            &json!({
+                "predicate": {
+                    "kind": "element_present",
+                    "element": { "Identifier": "ready" },
+                },
+                "timeout_ms": 250,
             }),
-            json!({
-                "outcome": "timeout",
-                "evidence": r#"{"status":"timed_out","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":false,"focused":null,"enabled":null,"value":null}}"#,
-                "settle_path": "poll_with_deadline",
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("the target-unreadable wait reply conforms");
+
+    vec![named_reply(reply, "indeterminate")]
+}
+
+#[cfg(target_os = "macos")]
+async fn served_click_replies() -> Vec<Value> {
+    let mut replies = Vec::new();
+
+    let clock = FakeClock::new();
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
+    let management = unleased_management();
+    let reply = plane
+        .serve(
+            servable("computer.click").expect("click is servable"),
+            &json!({}),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the invalid-click reply");
+    replies.push(named_reply(reply, "invalid_request"));
+
+    let clock = FakeClock::new();
+    let resolver = MutableTargetResolver::new(TargetResolution::Resolved(grant()));
+    let management = management_with(Arc::new(resolver.clone()));
+    grant_lease(&management, ActionKind::Compose, &clock).await;
+    resolver.replace(TargetResolution::Ambiguous(vec![
+        TargetCandidate {
+            pid: 4242,
+            window_count: 1,
+        },
+        TargetCandidate {
+            pid: 4343,
+            window_count: 2,
+        },
+    ]));
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.click").expect("click is servable"),
+            &json!({
+                "target": { "by": "identifier", "identifier": "confirm" },
+                "button": "left",
+                "click_count": 1,
+                "modifiers": [],
             }),
-            json!({
-                "outcome": "indeterminate",
-                "evidence": r#"{"status":"indeterminate","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":null,"reason":"target_not_inspectable"}"#,
-                "settle_path": "poll_with_deadline",
-            }),
-        ],
-    );
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the ambiguous-click reply");
+    replies.push(named_reply(reply, "ambiguous"));
+
+    replies
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn served_click_replies() -> Vec<Value> {
+    Vec::new()
+}
+
+fn fixture_window(width: u32, height: u32) -> EnumeratedWindow {
+    EnumeratedWindow {
+        window_id: "window-1".to_string(),
+        owner_identity: grant(),
+        owner_identity_verified: true,
+        frame: WindowFrame {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        accessibility_root: None,
+    }
+}
+
+#[tokio::test]
+async fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() {
+    let screenshot = observed_facts("computer.screenshot", served_screenshot_replies().await);
+    let wait = observed_facts("computer.wait", served_wait_replies().await);
+    let click = observed_facts("computer.click", served_click_replies().await);
 
     let actual: BTreeSet<_> = screenshot.into_iter().chain(click).chain(wait).collect();
     let code_owned: BTreeSet<_> = actual
@@ -290,7 +482,7 @@ fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() 
         "every code-owned result divergence must be removed"
     );
 
-    let expected_artifact_debt = BTreeSet::from([
+    let mut expected_artifact_debt = BTreeSet::from([
         fact(
             "computer.screenshot",
             "$.field",
@@ -333,6 +525,10 @@ fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() 
             DivergenceKind::UndeclaredProperty,
             OwedBy::Artifact,
         ),
+    ]);
+
+    #[cfg(target_os = "macos")]
+    expected_artifact_debt.extend([
         fact(
             "computer.click",
             "$.field",
@@ -363,116 +559,7 @@ fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() 
             DivergenceKind::UndeclaredProperty,
             OwedBy::Artifact,
         ),
-        fact(
-            "computer.click",
-            "$.key_form",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.match_count",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.action",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.advertised",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.disposition",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.deadline_ms",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
     ]);
+
     assert_eq!(actual, expected_artifact_debt);
-}
-
-#[test]
-fn all_three_v4_wait_terminal_values_conform_with_the_current_settle_path() {
-    let replies = [
-        json!({
-            "outcome": "predicate_satisfied",
-            "evidence": r#"{"status":"settled","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":true,"focused":null,"enabled":null,"value":null}}"#,
-            "settle_path": "poll_with_deadline",
-        }),
-        json!({
-            "outcome": "timeout",
-            "evidence": r#"{"status":"timed_out","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":false,"focused":null,"enabled":null,"value":null}}"#,
-            "settle_path": "poll_with_deadline",
-        }),
-        json!({
-            "outcome": "indeterminate",
-            "evidence": r#"{"status":"indeterminate","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":null,"reason":"target_not_inspectable"}"#,
-            "settle_path": "poll_with_deadline",
-        }),
-    ];
-
-    for reply in replies {
-        assert_eq!(validate_capability_result("computer.wait", &reply), Ok(()));
-    }
-}
-
-#[test]
-fn current_click_success_and_unreadable_post_action_state_conform() {
-    let current = json!({
-        "outcome": "completed",
-        "containment_rung": "semantic_element",
-        "effect_status": "effect_indeterminate",
-        "unreadable_subtrees": 1,
-    });
-    let queried_but_unreadable = json!({
-        "outcome": "completed",
-        "containment_rung": "semantic_element",
-        "effect_status": "effect_indeterminate",
-        "unreadable_subtrees": 1,
-        "post_action_state": {
-            "status": "tree_unreadable",
-            "elements": [],
-            "read_after_action_ms": 42,
-            "unreadable_subtrees": 1,
-        },
-    });
-
-    assert_eq!(
-        validate_capability_result("computer.click", &current),
-        Ok(())
-    );
-    assert_eq!(
-        validate_capability_result("computer.click", &queried_but_unreadable),
-        Ok(())
-    );
-}
-
-#[test]
-fn a_current_screenshot_success_conforms_instead_of_every_reply_being_rejected() {
-    let reply = json!({
-        "outcome": "captured",
-        "windows": [{
-            "window_id": "window-1",
-            "width_px": 800,
-            "height_px": 600,
-            "image_png_b64": "iVBORw==",
-        }],
-    });
-
-    assert_eq!(
-        validate_capability_result("computer.screenshot", &reply),
-        Ok(())
-    );
 }
