@@ -65,12 +65,7 @@ fn verify_code_signed_executable(
         signing_identifier,
         unique_code_hash,
     };
-    let configured_matches = match &observed {
-        ExecutableIdentityClaim::CodeSigned {
-            signing_identifier, ..
-        } => expected == signing_identifier || expected == observed.display_identity(),
-        ExecutableIdentityClaim::ImageDigest { .. } => false,
-    };
+    let configured_matches = observed.matches_configured(expected);
     if !configured_matches {
         return Err(json!({
             "outcome": "executable_identity_mismatch",

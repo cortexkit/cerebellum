@@ -67,6 +67,29 @@ impl ExecutableIdentityClaim {
         }
     }
 
+    /// Whether this observed claim satisfies the configured identity.
+    ///
+    /// Lives on the claim rather than at the verifier, so that each kind states
+    /// its own comparison and a kind added later must state one too. A match
+    /// written at a call site needs a catch-all, a catch-all answers `false`,
+    /// and `false` here means MISMATCH -- so an unhandled kind would be
+    /// reported as "the identity differed" when the truth is that nothing
+    /// compared it. That is the collapse this module has removed three times.
+    ///
+    /// Comparing a digest is not the same as producing one: no platform reads
+    /// an image to construct `ImageDigest` yet, and this says nothing about
+    /// when one will.
+    pub fn matches_configured(&self, expected: &str) -> bool {
+        match self {
+            Self::CodeSigned {
+                signing_identifier, ..
+            } => expected == signing_identifier || expected == self.display_identity(),
+            Self::ImageDigest { sha256 } => {
+                expected == sha256 || expected == self.display_identity()
+            }
+        }
+    }
+
     /// Render the platform identity for human-readable logs.
     pub fn display_identity(&self) -> String {
         match self {
