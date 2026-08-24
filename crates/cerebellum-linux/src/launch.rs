@@ -454,24 +454,52 @@ pub fn terminate_exact_generation(
     start_time_micros: u64,
     reap_deadline: Instant,
 ) -> Result<TerminationOutcome, ProcessControlError> {
-    match process_start_time(pid) {
+    terminate_exact_generation_with(
+        pid,
+        start_time_micros,
+        reap_deadline,
+        process_start_time,
+        |pid| {
+            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                Err(io::Error::last_os_error().kind())
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn terminate_exact_generation_with(
+    pid: u32,
+    start_time_micros: u64,
+    reap_deadline: Instant,
+    mut read_start_time: impl FnMut(u32) -> ProcessStartTime,
+    signal_kill: impl FnOnce(c_int) -> Result<(), io::ErrorKind>,
+) -> Result<TerminationOutcome, ProcessControlError> {
+    match read_start_time(pid) {
         ProcessStartTime::Started(start) if start == start_time_micros => {}
         ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
             return Ok(TerminationOutcome::AlreadyGoneOrReplaced)
         }
         ProcessStartTime::NotPermitted
+        | ProcessStartTime::StatReadFailed
+        | ProcessStartTime::SystemTimeBaseUnavailable
         | ProcessStartTime::LayoutMismatch
         | ProcessStartTime::NoStartTime => return Err(ProcessControlError::GenerationUnreadable),
     }
-    if unsafe { libc::kill(pid as c_int, libc::SIGKILL) } != 0 {
-        return match process_start_time(pid) {
-            ProcessStartTime::Started(start) if start == start_time_micros => Err(
-                ProcessControlError::Signal(io::Error::last_os_error().kind()),
-            ),
+    if let Err(error) = signal_kill(pid as c_int) {
+        return match read_start_time(pid) {
+            ProcessStartTime::Started(start) if start == start_time_micros => {
+                Err(ProcessControlError::Signal(error))
+            }
             ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
                 Ok(TerminationOutcome::AlreadyGoneOrReplaced)
             }
-            _ => Err(ProcessControlError::GenerationUnreadable),
+            ProcessStartTime::NotPermitted
+            | ProcessStartTime::StatReadFailed
+            | ProcessStartTime::SystemTimeBaseUnavailable
+            | ProcessStartTime::LayoutMismatch
+            | ProcessStartTime::NoStartTime => Err(ProcessControlError::GenerationUnreadable),
         };
     }
     reap_if_owned(pid as c_int, reap_deadline)?;
@@ -559,7 +587,9 @@ fn start_time_for_spawn(pid: u32) -> Result<u64, SpawnError> {
     match process_start_time(pid) {
         ProcessStartTime::Started(value) => Ok(value),
         ProcessStartTime::NoSuchProcess => Err(SpawnError::ProcessMissing),
-        ProcessStartTime::NotPermitted => Err(SpawnError::ProcessInspectionDenied),
+        ProcessStartTime::NotPermitted
+        | ProcessStartTime::StatReadFailed
+        | ProcessStartTime::SystemTimeBaseUnavailable => Err(SpawnError::ProcessInspectionDenied),
         ProcessStartTime::LayoutMismatch => Err(SpawnError::ProcessLayoutMismatch),
         ProcessStartTime::NoStartTime => Err(SpawnError::ProcessStartTimeMissing),
     }
@@ -569,7 +599,11 @@ fn start_time_for_identity(pid: u32) -> Result<u64, ImageIdentityError> {
     match process_start_time(pid) {
         ProcessStartTime::Started(value) => Ok(value),
         ProcessStartTime::NoSuchProcess => Err(ImageIdentityError::ProcessMissing),
-        ProcessStartTime::NotPermitted => Err(ImageIdentityError::ProcessInspectionDenied),
+        ProcessStartTime::NotPermitted
+        | ProcessStartTime::StatReadFailed
+        | ProcessStartTime::SystemTimeBaseUnavailable => {
+            Err(ImageIdentityError::ProcessInspectionDenied)
+        }
         ProcessStartTime::LayoutMismatch => Err(ImageIdentityError::ProcessLayoutMismatch),
         ProcessStartTime::NoStartTime => Err(ImageIdentityError::ProcessStartTimeMissing),
     }
@@ -582,6 +616,8 @@ fn ensure_generation(generation: ProcessGeneration) -> Result<(), ProcessControl
             Err(ProcessControlError::GenerationChanged)
         }
         ProcessStartTime::NotPermitted
+        | ProcessStartTime::StatReadFailed
+        | ProcessStartTime::SystemTimeBaseUnavailable
         | ProcessStartTime::LayoutMismatch
         | ProcessStartTime::NoStartTime => Err(ProcessControlError::GenerationUnreadable),
     }
@@ -976,6 +1012,15 @@ mod tests {
                     panic!("target {pid} survived launcher death");
                 }
                 ProcessStartTime::Started(_) => std::thread::sleep(Duration::from_millis(10)),
+                ProcessStartTime::NotPermitted
+                | ProcessStartTime::StatReadFailed
+                | ProcessStartTime::SystemTimeBaseUnavailable
+                | ProcessStartTime::LayoutMismatch
+                | ProcessStartTime::NoStartTime
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 observed => panic!("cannot observe target {pid}: {observed:?}"),
             }
         }
@@ -1067,6 +1112,31 @@ mod tests {
             child.release().map(|_| ()),
             Err(ProcessControlError::GenerationChanged)
         );
+    }
+
+    #[test]
+    fn termination_refuses_unreadable_start_times_without_signalling() {
+        for observed in [
+            ProcessStartTime::NotPermitted,
+            ProcessStartTime::StatReadFailed,
+            ProcessStartTime::SystemTimeBaseUnavailable,
+        ] {
+            let mut signalled = false;
+            assert_eq!(
+                terminate_exact_generation_with(
+                    42,
+                    123,
+                    Instant::now() + Duration::from_secs(1),
+                    |_| observed,
+                    |_| {
+                        signalled = true;
+                        Ok(())
+                    },
+                ),
+                Err(ProcessControlError::GenerationUnreadable)
+            );
+            assert!(!signalled, "{observed:?} must refuse before signalling");
+        }
     }
 
     #[test]
