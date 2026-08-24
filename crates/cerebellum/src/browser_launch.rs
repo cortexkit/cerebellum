@@ -41,21 +41,41 @@ pub struct LaunchProfileIdentity {
     pub disposition: cerebellum_core::identity::ProfileDisposition,
 }
 
-/// Signature identity recorded after verifying that the selected executable has
-/// the expected code-signing identifier and unique code hash.
+/// Guarantee established for the executable selected by launch policy.
+///
+/// A code-signing claim is an authenticated assertion by the signer, while an
+/// image digest establishes only byte equality with a previously pinned image.
+/// Keeping those guarantees as distinct variants prevents a digest from being
+/// presented to a refusal caller as though it carried signing authenticity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutableIdentity {
-    pub signing_identifier: String,
-    pub unique_code_hash: String,
+#[serde(tag = "claim_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutableIdentityClaim {
+    CodeSigned {
+        signing_identifier: String,
+        unique_code_hash: String,
+    },
+    ImageDigest {
+        sha256: String,
+    },
 }
 
-impl ExecutableIdentity {
+impl ExecutableIdentityClaim {
+    pub const fn claim_kind(&self) -> &'static str {
+        match self {
+            Self::CodeSigned { .. } => "code_signed",
+            Self::ImageDigest { .. } => "image_digest",
+        }
+    }
+
+    /// Render the platform identity for human-readable logs.
     pub fn display_identity(&self) -> String {
-        format!(
-            "identifier={};cdhash={}",
-            self.signing_identifier, self.unique_code_hash
-        )
+        match self {
+            Self::CodeSigned {
+                signing_identifier,
+                unique_code_hash,
+            } => format!("identifier={signing_identifier};cdhash={unique_code_hash}"),
+            Self::ImageDigest { sha256 } => format!("sha256={sha256}"),
+        }
     }
 }
 
@@ -103,7 +123,7 @@ pub struct AuthorizedLaunchIntent {
     pub holder_id: String,
     pub route: LaunchRouteIdentity,
     pub profile: LaunchProfileIdentity,
-    pub verified_executable_identity: ExecutableIdentity,
+    pub verified_executable_identity: ExecutableIdentityClaim,
     pub launch_vector: VerifiedLaunchVector,
 }
 
@@ -128,7 +148,7 @@ pub struct LaunchGenerationRecord {
 #[serde(deny_unknown_fields)]
 pub struct LaunchAttestationRecord {
     pub generation: LaunchGenerationRecord,
-    pub observed_executable_identity: ExecutableIdentity,
+    pub observed_executable_identity: ExecutableIdentityClaim,
 }
 
 /// Durable result recorded when the launched browser session ends.
@@ -226,6 +246,7 @@ struct ActiveLaunchAttempt {
 #[serde(deny_unknown_fields)]
 pub struct LaunchIdentityMismatchRecord {
     pub generation: LaunchGenerationRecord,
+    pub claim_kind: String,
     pub expected_identity: String,
     pub observed_identity: String,
 }
@@ -241,7 +262,7 @@ pub struct AttestedLaunchRequest {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
-    pub verified_executable_identity: ExecutableIdentity,
+    pub verified_executable_identity: ExecutableIdentityClaim,
 }
 
 impl AttestedLaunchRequest {
@@ -281,6 +302,7 @@ pub enum AttestedLaunchError {
         expected_identity: String,
     },
     ExecutableIdentityMismatch {
+        claim_kind: String,
         expected_identity: String,
         observed_identity: String,
     },
@@ -327,7 +349,7 @@ pub trait BarredLaunchProcess: Sized {
     type Released;
 
     fn generation(&self) -> BrowserProcessGeneration;
-    fn executed_image_identity(&self) -> Result<ExecutableIdentity, PlatformLaunchError>;
+    fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError>;
     fn terminate_and_reap(self) -> Result<(), PlatformLaunchError>;
     fn release(self) -> Result<Self::Released, PlatformLaunchError>;
 }
@@ -423,6 +445,10 @@ where
     if observed != request.verified_executable_identity {
         let mismatch = LaunchIdentityMismatchRecord {
             generation,
+            claim_kind: request
+                .verified_executable_identity
+                .claim_kind()
+                .to_string(),
             expected_identity: request.verified_executable_identity.display_identity(),
             observed_identity: observed.display_identity(),
         };
@@ -437,6 +463,7 @@ where
             });
         }
         return Err(AttestedLaunchError::ExecutableIdentityMismatch {
+            claim_kind: mismatch.claim_kind,
             expected_identity: mismatch.expected_identity,
             observed_identity: mismatch.observed_identity,
         });
@@ -894,7 +921,7 @@ impl BarredLaunchProcess for MacOsBarredProcess {
         }
     }
 
-    fn executed_image_identity(&self) -> Result<ExecutableIdentity, PlatformLaunchError> {
+    fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError> {
         let generation = self.0.generation();
         let observed = cerebellum_macos::executed_image_identity(generation.pid)
             .map_err(|_| PlatformLaunchError::ImageIdentity)?;
@@ -903,7 +930,7 @@ impl BarredLaunchProcess for MacOsBarredProcess {
         {
             return Err(PlatformLaunchError::ImageIdentity);
         }
-        Ok(ExecutableIdentity {
+        Ok(ExecutableIdentityClaim::CodeSigned {
             signing_identifier: observed.signing_identifier,
             unique_code_hash: observed.unique_code_hash,
         })
@@ -1136,7 +1163,7 @@ mod tests {
 
     struct FakeBarredProcess {
         events: Events,
-        observed: Result<ExecutableIdentity, PlatformLaunchError>,
+        observed: Result<ExecutableIdentityClaim, PlatformLaunchError>,
         generation: BrowserProcessGeneration,
     }
 
@@ -1219,7 +1246,7 @@ mod tests {
             self.generation
         }
 
-        fn executed_image_identity(&self) -> Result<ExecutableIdentity, PlatformLaunchError> {
+        fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError> {
             self.events.push("image_attested");
             self.observed.clone()
         }
@@ -1237,7 +1264,7 @@ mod tests {
 
     struct FakeLauncher {
         events: Events,
-        observed: Result<ExecutableIdentity, PlatformLaunchError>,
+        observed: Result<ExecutableIdentityClaim, PlatformLaunchError>,
         spawn: Result<(), PlatformLaunchError>,
     }
 
@@ -1261,8 +1288,8 @@ mod tests {
         }
     }
 
-    fn identity() -> ExecutableIdentity {
-        ExecutableIdentity {
+    fn identity() -> ExecutableIdentityClaim {
+        ExecutableIdentityClaim::CodeSigned {
             signing_identifier: "com.example.browser".to_string(),
             unique_code_hash: "a1b2c3".to_string(),
         }
@@ -1327,7 +1354,7 @@ mod tests {
 
     fn harness(
         fail: FailJournalAt,
-        observed: Result<ExecutableIdentity, PlatformLaunchError>,
+        observed: Result<ExecutableIdentityClaim, PlatformLaunchError>,
     ) -> (RecordingJournal, FakeLauncher, Events) {
         let events = Events::new();
         (
@@ -1444,7 +1471,7 @@ mod tests {
 
     #[test]
     fn image_mismatch_records_exact_identities_then_terminates_without_release() {
-        let observed = ExecutableIdentity {
+        let observed = ExecutableIdentityClaim::CodeSigned {
             signing_identifier: "com.example.substitute".to_string(),
             unique_code_hash: "deadbeef".to_string(),
         };
@@ -1456,6 +1483,7 @@ mod tests {
         assert_eq!(
             outcome.map(|_| ()),
             Err(AttestedLaunchError::ExecutableIdentityMismatch {
+                claim_kind: "code_signed".to_string(),
                 expected_identity: identity().display_identity(),
                 observed_identity: observed.display_identity(),
             })
@@ -2035,7 +2063,7 @@ mod tests {
             OsString::from("-c"),
             OsString::from(format!("printf ran > '{}'", effect.display())),
         ];
-        launch_request.verified_executable_identity = ExecutableIdentity {
+        launch_request.verified_executable_identity = ExecutableIdentityClaim::CodeSigned {
             signing_identifier: expected.signing_identifier,
             unique_code_hash: expected.unique_code_hash,
         };
@@ -2054,9 +2082,11 @@ mod tests {
 
         match outcome {
             Err(AttestedLaunchError::ExecutableIdentityMismatch {
+                claim_kind,
                 expected_identity,
                 observed_identity,
             }) => {
+                assert_eq!(claim_kind, "code_signed");
                 assert_eq!(
                     expected_identity,
                     launch_request

@@ -13,13 +13,14 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::browser::navigation::{BrowserSnapshotObservation, CdpNavigationDriver};
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
+use crate::browser_executable_identity::verify_configured_executable;
 use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
 use serde_json::{json, Value};
 
 use crate::browser_launch::{
     recover_browser_launches, AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome,
     BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
-    ExecutableIdentity, LaunchProfileIdentity, LaunchRouteIdentity, MacOsProcessLauncher,
+    ExecutableIdentityClaim, LaunchProfileIdentity, LaunchRouteIdentity, MacOsProcessLauncher,
     OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
     OrphanProfileCustodyFailure, ProfileBoundLaunch,
 };
@@ -902,53 +903,11 @@ fn stamped_context(accepted: &AcceptedBindFacts) -> Result<StampedBindContext, (
     .map_err(|_| ())
 }
 
-fn verify_configured_executable(path: &Path, expected: &str) -> Result<ExecutableIdentity, Value> {
-    let output = std::process::Command::new("/usr/bin/codesign")
-        .args(["-d", "--verbose=4"])
-        .arg(path)
-        .output()
-        .map_err(|_| {
-            json!({
-                "outcome": "executable_identity_mismatch",
-                "expected_identity": expected,
-                "observed_identity": "unavailable",
-            })
-        })?;
-    let details = String::from_utf8_lossy(&output.stderr);
-    let mut signing_identifier = None;
-    let mut unique_code_hash = None;
-    for line in details.lines() {
-        if let Some(value) = line.strip_prefix("Identifier=") {
-            signing_identifier = Some(value.to_string());
-        } else if let Some(value) = line.strip_prefix("CDHash=") {
-            unique_code_hash = Some(value.to_ascii_lowercase());
-        }
-    }
-    let observed = ExecutableIdentity {
-        signing_identifier: signing_identifier.unwrap_or_else(|| "unavailable".to_string()),
-        unique_code_hash: unique_code_hash.unwrap_or_else(|| "unavailable".to_string()),
-    };
-    let configured_matches = expected == observed.signing_identifier
-        || expected
-            == format!(
-                "identifier={};cdhash={}",
-                observed.signing_identifier, observed.unique_code_hash
-            );
-    if !output.status.success() || !configured_matches {
-        return Err(json!({
-            "outcome": "executable_identity_mismatch",
-            "expected_identity": expected,
-            "observed_identity": observed.display_identity(),
-        }));
-    }
-    Ok(observed)
-}
-
 fn record_profile_admission(
     accepted: &AcceptedBindFacts,
     browser_session_id: &str,
     executable: &Path,
-    identity: &ExecutableIdentity,
+    identity: &ExecutableIdentityClaim,
 ) -> Result<(), Value> {
     let path = cerebellum_core::journal::journal_data_path("browser-launch-admission.jsonl")
         .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?;
@@ -984,11 +943,13 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
     match error {
         AttestedReadinessError::AttestedLaunch(
             AttestedLaunchError::ExecutableIdentityMismatch {
+                claim_kind,
                 expected_identity,
                 observed_identity,
             },
         ) => json!({
             "outcome": "executable_identity_mismatch",
+            "claim_kind": claim_kind,
             "expected_identity": expected_identity,
             "observed_identity": observed_identity,
         }),
@@ -1059,6 +1020,77 @@ fn pipe_pair() -> Result<
     Value,
 > {
     std::os::unix::net::UnixStream::pair().map_err(|_| json!({"outcome":"internal_failure"}))
+}
+
+#[cfg(test)]
+mod executable_identity_launch_tests {
+    use super::*;
+    use cerebellum_core::identity::{RouteIdentity, RouteSurface, SessionKind};
+
+    struct UnsignedExecutable(PathBuf);
+
+    impl UnsignedExecutable {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ck-unsigned-browser-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::write(&path, b"not a signed executable").expect("write unsigned executable");
+            Self(path)
+        }
+    }
+
+    impl Drop for UnsignedExecutable {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn accepted_facts(project_root: &Path) -> AcceptedBindFacts {
+        AcceptedBindFacts {
+            identity: RouteIdentity {
+                conversation_key: "conversation-1".to_string(),
+                agent_project_id: "project-1".to_string(),
+                session_kind: SessionKind::Primary,
+                profile_disposition: ProfileDisposition::Durable,
+                project_root: project_root.to_path_buf(),
+            },
+            principal: None,
+            agent_project_id_attested: true,
+            session_kind_attested: true,
+            control_operations: Vec::new(),
+            effective_capability_scope: None,
+            consumer_capabilities: Vec::new(),
+            surface: RouteSurface::Tools,
+        }
+    }
+
+    #[test]
+    fn launch_refuses_when_executable_identity_cannot_be_established() {
+        let executable = UnsignedExecutable::new();
+        let config = BrowserConfig {
+            executable_path: Some(executable.0.clone()),
+            expected_identity: Some("com.example.browser".to_string()),
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 1_000,
+        };
+        let service = ProductionLaunchService::open_with_recovery(config, |_| (None, None));
+        let refusal = match service.launch(&accepted_facts(Path::new("/tmp")), "session-1") {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("launch proceeded without an executable identity"),
+        };
+
+        assert_eq!(refusal["outcome"], "identity_unverifiable");
+        assert_ne!(refusal["outcome"], "executable_identity_mismatch");
+        assert_eq!(refusal["reason"], "verifier_failed");
+    }
 }
 
 #[cfg(test)]
@@ -1455,7 +1487,7 @@ mod orphan_recovery_tests {
                 canonical_profile_path: path_bytes(&root.join("profiles/profile-1")),
                 disposition: ProfileDisposition::Durable,
             },
-            verified_executable_identity: ExecutableIdentity {
+            verified_executable_identity: ExecutableIdentityClaim::CodeSigned {
                 signing_identifier: "com.example.browser".to_string(),
                 unique_code_hash: "abc123".to_string(),
             },
