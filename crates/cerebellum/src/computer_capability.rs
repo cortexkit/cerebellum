@@ -22,14 +22,21 @@ use cerebellum_computer::capture::{
     CaptureArtifact, CaptureBackend, ScopedCaptureController, WindowCaptureRegion,
 };
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
-use cerebellum_computer::dispatch::{
-    post_condition::PostCondition, wait_until_predicate, PlatformPredicatePoller, WaitEvidence,
-    WaitOutcome, WaitResult,
-};
+use cerebellum_computer::dispatch::post_condition::PostCondition;
+// Evidence is shaped on every platform: the indeterminate reply is not gated.
+use cerebellum_computer::dispatch::WaitEvidence;
+// The outcome and result types belong to a completed poll, which only the macOS
+// handler performs -- and to the tests that shape its reply on any platform.
+#[cfg(any(target_os = "macos", test))]
+use cerebellum_computer::dispatch::{WaitOutcome, WaitResult};
+// The poller drives the macOS platform driver, so only that build reaches it.
+#[cfg(target_os = "macos")]
+use cerebellum_computer::dispatch::{wait_until_predicate, PlatformPredicatePoller};
 use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
 };
+#[cfg(any(target_os = "macos", test))]
 use cerebellum_computer::platform::AccessibilityElementName;
 #[cfg(target_os = "macos")]
 use cerebellum_computer::{
@@ -1114,6 +1121,7 @@ fn invalid_wait_request(field: &str, reason: &str) -> Value {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn wait_wire_reply(result: WaitResult) -> Value {
     let outcome = match result.outcome {
         WaitOutcome::Settled => "predicate_satisfied",
@@ -1561,6 +1569,33 @@ fn click_driver_refusal(
         | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
     };
     dispatch_refusal(refusal, unreadable_subtrees)
+}
+
+/// Encode bytes as base64, the form the wire carries an image in.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2080,33 +2115,6 @@ mod click_vocabulary_v3_tests {
             "observation must be gated on the caller having named a condition"
         );
     }
-}
-
-/// Encode bytes as base64, the form the wire carries an image in.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 #[cfg(all(test, target_os = "macos"))]
