@@ -21,6 +21,22 @@ const FD_CLOEXEC: c_int = 1;
 // constants rather than pulled from a crate, matching this module's existing
 // practice of naming exactly the libc surface it uses.
 const EINTR: c_int = 4;
+/// Why a guardian exited, carried in its exit status.
+///
+/// The launcher cannot ask a dead guardian what happened, and a release that
+/// fails with a broken pipe has already lost the answer. These make the exit
+/// status the record instead. Offset by the signal-failure code when the
+/// guardian could not signal the target at all.
+///
+/// Zero means the guardian carried out a command it was given -- release or
+/// terminate. Both are normal, so neither is distinguished here: the code
+/// answers "why did this guardian exit WITHOUT being commanded", which is the
+/// question a launcher asks when it finds the pipe already closed.
+const GUARDIAN_COMMANDED: c_int = 0;
+const GUARDIAN_LAUNCHER_GONE: c_int = 101;
+const GUARDIAN_UNKNOWN_COMMAND: c_int = 102;
+const GUARDIAN_READ_FAILED: c_int = 103;
+const GUARDIAN_SIGNAL_FAILED: c_int = 10;
 const SIGCONT: c_int = 19;
 const SIGKILL: c_int = 9;
 #[cfg(test)]
@@ -216,7 +232,13 @@ pub enum ProcessControlError {
     AlreadyReleased,
     GenerationChanged,
     Signal(io::ErrorKind),
-    GuardianProtocol,
+    /// The guardian exited without releasing, carrying its reason in the code.
+    ///
+    /// See the `GUARDIAN_*` constants: the value distinguishes a launcher that
+    /// died, a command byte that was not the release byte, and a read that
+    /// failed outright, so an intermittent failure names its own branch rather
+    /// than requiring a theory.
+    GuardianExited(c_int),
     Reap(io::ErrorKind),
 }
 
@@ -757,10 +779,18 @@ fn guardian_main(death_read: RawFd, target_pid: c_int, descriptor_limit: c_int) 
             break result;
         }
     };
-    let signal = if received == 1 && command == b'R' {
-        SIGCONT
-    } else {
-        SIGKILL
+    // The exit code records WHICH branch was taken, because the launcher can
+    // otherwise only observe that the guardian is gone. A release that finds a
+    // closed pipe has already lost the reason unless the guardian carried it.
+    let (signal, reason) = match (received, command) {
+        // Both commanded outcomes exit zero: the guardian did what it was told.
+        (1, b'R') => (SIGCONT, GUARDIAN_COMMANDED),
+        (1, b'T') => (SIGKILL, GUARDIAN_COMMANDED),
+        // Every write end closed. The launcher holds one until it commands, so
+        // this means the launcher died -- which is what the guardian exists for.
+        (0, _) => (SIGKILL, GUARDIAN_LAUNCHER_GONE),
+        (1, _) => (SIGKILL, GUARDIAN_UNKNOWN_COMMAND),
+        _ => (SIGKILL, GUARDIAN_READ_FAILED),
     };
     // Before release the launcher is still the target's parent, so an exited
     // target retains its PID until that parent reaps it. After launcher death,
@@ -769,7 +799,13 @@ fn guardian_main(death_read: RawFd, target_pid: c_int, descriptor_limit: c_int) 
     // reuse in the interval between death-pipe wakeup and this signal.
     let signalled = unsafe { kill(target_pid, signal) } == 0;
     let _ = unsafe { close(death_read) };
-    unsafe { _exit(if signalled { 0 } else { 112 }) }
+    unsafe {
+        _exit(if signalled {
+            reason
+        } else {
+            reason + GUARDIAN_SIGNAL_FAILED
+        })
+    }
 }
 
 fn verify_generation(generation: ProcessGeneration) -> Result<(), ProcessControlError> {
@@ -792,6 +828,15 @@ fn release_guarded_target(
         // reused. A failed guardian command is therefore safe to contain here.
         let _ = unsafe { kill(target_pid, SIGKILL) };
         let _ = wait_for_pid(target_pid);
+    }
+    // PREFER THE GUARDIAN'S REASON OVER THE WRITE'S SYMPTOM. A failed write
+    // means the pipe had no reader, which means the guardian had already
+    // exited -- and its exit code says why. Reporting the write error first
+    // discards the answer in favour of the observation that prompted the
+    // question, so a broken pipe reads as an unexplained transport failure
+    // while the cause sits unread in a value this function already holds.
+    if write_result.is_err() && guardian_result.is_err() {
+        return guardian_result;
     }
     write_result?;
     guardian_result
@@ -819,7 +864,11 @@ fn terminate_guarded_target(
 fn wait_for_guardian(guardian_pid: c_int) -> Result<(), ProcessControlError> {
     let status = waitpid_status_retry(guardian_pid).map_err(ProcessControlError::Reap)?;
     if status != 0 {
-        return Err(ProcessControlError::GuardianProtocol);
+        // Report the EXIT CODE, not the raw wait status. The raw value packs the
+        // code into its high byte, so a guardian that exited 102 surfaces as
+        // 26112 -- a number that looks like corruption and hides the reason the
+        // guardian went to the trouble of recording.
+        return Err(ProcessControlError::GuardianExited(exit_code(status)));
     }
     Ok(())
 }
@@ -832,6 +881,21 @@ fn wait_for_pid(pid: c_int) -> Result<(), ProcessControlError> {
 
 fn waitpid_retry(pid: c_int) -> Result<(), io::ErrorKind> {
     waitpid_status_retry(pid).map(|_| ())
+}
+
+/// The exit code inside a `waitpid` status.
+///
+/// A normal exit packs the code into the high byte of the low 16 bits. A status
+/// that does not describe a normal exit -- a signalled or stopped child -- has
+/// no exit code, and is reported as the raw value negated so it cannot be
+/// mistaken for one.
+fn exit_code(status: c_int) -> c_int {
+    const WAIT_STATUS_MASK: c_int = 0x7f;
+    if status & WAIT_STATUS_MASK == 0 {
+        (status >> 8) & 0xff
+    } else {
+        -status
+    }
 }
 
 fn waitpid_status_retry(pid: c_int) -> Result<c_int, io::ErrorKind> {
