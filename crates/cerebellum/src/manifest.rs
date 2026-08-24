@@ -32,6 +32,7 @@ use crate::browser_type::{
     BROWSER_EVIDENCE_ELIGIBILITY_SHA256, BROWSER_TYPE_TOOL,
 };
 use crate::journal::JournalConfig;
+use subc_protocol::manifest::{CapabilityDeclarations};
 use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
     ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
@@ -165,12 +166,37 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
             management_surface(),
         ],
         consumes: Vec::new(),
-        // No capability-grammar claims. The upstream field documents omission as
-        // preserving the manifest contract we already had, so this is the
-        // no-change value rather than a gap to fill in later -- declaring a
-        // grammar we have not designed would be static discovery metadata the
-        // daemon validates against behaviour we never promised.
-        capabilities: None,
+        // One negative claim, and nothing else yet.
+        //
+        // `must_never_reach` fences THIS MODULE AS CALLER: the daemon refuses
+        // any route we open toward a provider of the named capability, and
+        // force-closes live ones if a matching provider appears later. It is
+        // not a claim that nothing may be handed to us -- receipt rides routes
+        // the sender opens, so the inbound half of the credential boundary is
+        // not expressible here and remains an agreement with the vault module.
+        //
+        // We declare it because this module must never pull a secret. It holds
+        // live browser sessions and durable per-agent profiles, so a path from
+        // here into a secret store is the one route whose absence is worth
+        // enforcing rather than remembering.
+        //
+        // Costs nothing today and is not expected to: the vault's sealing
+        // surface, which durable profiles are designed to consult, is a
+        // SEPARATE capability that does not exist yet. Enforcement is
+        // module-granular though, so when sealing lands it will need one of an
+        // op-scoped deny, a distinct provider module, or a visible relaxation
+        // of this line -- a decision that design pass owns explicitly rather
+        // than discovering.
+        //
+        // `provides` stays empty because it is capability-grammar naming, a
+        // different axis from the provider roles above, and this module's
+        // capabilities have no grammar names cut yet. Empty claims nothing; it
+        // does not claim we provide nothing.
+        capabilities: Some(CapabilityDeclarations {
+            provides: Vec::new(),
+            requires: Vec::new(),
+            must_never_reach: vec!["credentials-provider/v1".to_string()],
+        }),
         bindings: Bindings {
             // Spec A has no profile storage (Spec B owns that). The manifest enum
             // has no none/ephemeral storage kind yet, so this is the honest

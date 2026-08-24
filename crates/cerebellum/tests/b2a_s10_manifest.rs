@@ -140,3 +140,48 @@ fn missing_input_and_implementation_failure_are_distinct() {
     // The two facts never collapse into one outcome.
     assert_ne!(missing_report.outcomes, failed_report.outcomes);
 }
+
+/// The module declares that it must never reach a credential store.
+///
+/// A negative capability claim is enforced by the daemon refusing routes we
+/// open toward a provider of the named capability -- so it protects nothing
+/// that this module does, and everything it must never start doing. Precisely
+/// because it constrains only future code, nothing in the current build fails
+/// if the line is deleted: no test would notice, no behaviour would change,
+/// and the fence would be gone until someone read the manifest.
+///
+/// This module holds live browser sessions and durable per-agent profiles.
+/// A route from here into a secret store is the one whose absence is worth
+/// enforcing rather than remembering.
+#[test]
+fn the_manifest_forbids_this_module_from_reaching_a_credential_store() {
+    // The plain constructor: the deny edge is a property of the module, not of
+    // any release-gate outcome, so it must hold on the simplest manifest we
+    // can build.
+    let manifest = cerebellum::manifest::build("cerebellum");
+    let capabilities = manifest
+        .capabilities
+        .as_ref()
+        .expect("the manifest declares a capability grammar block");
+
+    assert!(
+        capabilities
+            .must_never_reach
+            .iter()
+            .any(|capability| capability == "credentials-provider/v1"),
+        "the credential-store deny edge is missing: this module may never pull a secret, and \
+         the manifest is the only place a supervisor can be told so"
+    );
+
+    // The deny must not sit beside a requirement for the same capability --
+    // claiming both is a self-contradiction, and the fleet lint reports it as
+    // one. Asserted here so it is caught at our own gate rather than theirs.
+    assert!(
+        !capabilities
+            .requires
+            .iter()
+            .any(|requirement| capabilities.must_never_reach.contains(&requirement.capability)),
+        "a capability is both required and forbidden, which is a manifest that contradicts \
+         itself"
+    );
+}
