@@ -43,6 +43,7 @@ pub enum SpawnError {
     DuplicateDescriptor(io::ErrorKind),
     Fork(io::ErrorKind),
     Ptrace(io::ErrorKind),
+    Signal(io::ErrorKind),
     Wait(io::ErrorKind),
     UnexpectedStop,
     ProcessMissing,
@@ -277,17 +278,20 @@ pub fn spawn_barred(
         libc::close(response_source);
     }
 
-    let status = wait_for_status_spawn(pid)?;
-    if !is_stopped(status) || stop_signal(status) != libc::SIGTRAP {
+    let status = wait_for_status_spawn(pid, libc::WUNTRACED)?;
+    if !is_stopped(status) || stop_signal(status) != libc::SIGSTOP {
         let _ = signal_kill(pid);
         let _ = wait_for_pid(pid);
         return Err(SpawnError::UnexpectedStop);
     }
+
+    // A launcher death before SEIZE leaves this child stopped before execve, so it
+    // never maps or runs the browser rather than escaping as an unattended process.
     let options = (libc::PTRACE_O_EXITKILL | libc::PTRACE_O_TRACEEXEC) as usize;
-    // SAFETY: pid is this process's stopped tracee and options is the ptrace ABI value.
+    // SAFETY: pid is this process's group-stopped child and options is the ptrace ABI value.
     if unsafe {
         libc::ptrace(
-            libc::PTRACE_SETOPTIONS,
+            libc::PTRACE_SEIZE,
             pid,
             std::ptr::null_mut::<c_void>(),
             options as *mut c_void,
@@ -299,6 +303,77 @@ pub fn spawn_barred(
         let _ = wait_for_pid(pid);
         return Err(SpawnError::Ptrace(error));
     }
+    #[cfg(test)]
+    test_parent_death_checkpoint(ParentDeathCheckpoint::AfterSeizeBeforeExec, pid);
+
+    if unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
+        let error = io::Error::last_os_error().kind();
+        let _ = signal_kill(pid);
+        let _ = wait_for_pid(pid);
+        return Err(SpawnError::Signal(error));
+    }
+    let status = wait_for_status_spawn(pid, 0)?;
+    if !is_stopped(status) {
+        let _ = signal_kill(pid);
+        let _ = wait_for_pid(pid);
+        return Err(SpawnError::UnexpectedStop);
+    }
+    // SAFETY: pid is this process's stopped tracee; LISTEN preserves its group stop.
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_LISTEN,
+            pid,
+            std::ptr::null_mut::<c_void>(),
+            std::ptr::null_mut::<c_void>(),
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error().kind();
+        let _ = signal_kill(pid);
+        let _ = wait_for_pid(pid);
+        return Err(SpawnError::Ptrace(error));
+    }
+    if unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
+        let error = io::Error::last_os_error().kind();
+        let _ = signal_kill(pid);
+        let _ = wait_for_pid(pid);
+        return Err(SpawnError::Signal(error));
+    }
+
+    let mut status = wait_for_status_spawn(pid, 0)?;
+    for _ in 0..5 {
+        if is_exec_stop(status) {
+            break;
+        }
+        if !is_stopped(status) {
+            let _ = signal_kill(pid);
+            let _ = wait_for_pid(pid);
+            return Err(SpawnError::UnexpectedStop);
+        }
+        // SAFETY: pid is this process's stopped tracee; no pointer is dereferenced.
+        if unsafe {
+            libc::ptrace(
+                libc::PTRACE_CONT,
+                pid,
+                std::ptr::null_mut::<c_void>(),
+                std::ptr::null_mut::<c_void>(),
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error().kind();
+            let _ = signal_kill(pid);
+            let _ = wait_for_pid(pid);
+            return Err(SpawnError::Ptrace(error));
+        }
+        status = wait_for_status_spawn(pid, 0)?;
+    }
+    if !is_exec_stop(status) {
+        let _ = signal_kill(pid);
+        let _ = wait_for_pid(pid);
+        return Err(SpawnError::UnexpectedStop);
+    }
+    #[cfg(test)]
+    test_parent_death_checkpoint(ParentDeathCheckpoint::AfterExecStop, pid);
     let start_time_micros = start_time_for_spawn(pid as u32)?;
     Ok(BarredChild {
         generation: ProcessGeneration {
@@ -308,6 +383,32 @@ pub fn spawn_barred(
         active: true,
         exec_hops: 0,
     })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ParentDeathCheckpoint {
+    AfterSeizeBeforeExec,
+    AfterExecStop,
+}
+
+#[cfg(test)]
+fn test_parent_death_checkpoint(checkpoint: ParentDeathCheckpoint, pid: c_int) {
+    let expected = match checkpoint {
+        ParentDeathCheckpoint::AfterSeizeBeforeExec => "after-seize-before-exec",
+        ParentDeathCheckpoint::AfterExecStop => "after-exec-stop",
+    };
+    if std::env::var_os("CEREBELLUM_LINUX_BARRIER_CHECKPOINT").as_deref()
+        != Some(OsStr::new(expected))
+    {
+        return;
+    }
+    let Some(report) = std::env::var_os("CEREBELLUM_LINUX_BARRIER_HELPER_REPORT") else {
+        return;
+    };
+    fs::write(report, pid.to_string()).expect("write checkpoint target pid");
+    // SAFETY: the test helper intentionally models an owner that dies at this point.
+    unsafe { libc::_exit(0) }
 }
 
 /// Read raw identity facts from the executable currently mapped into `pid`.
@@ -387,7 +488,7 @@ fn child_exec(
         for fd in 5..descriptor_limit {
             libc::close(fd);
         }
-        if libc::ptrace(libc::PTRACE_TRACEME, 0, std::ptr::null_mut::<c_void>(), 0) != 0 {
+        if libc::raise(libc::SIGSTOP) != 0 {
             libc::_exit(111);
         }
         libc::execve(executable, argv, envp);
@@ -488,11 +589,11 @@ fn signal_kill(pid: c_int) -> Result<(), ProcessControlError> {
     Ok(())
 }
 
-fn wait_for_status_spawn(pid: c_int) -> Result<c_int, SpawnError> {
+fn wait_for_status_spawn(pid: c_int, options: c_int) -> Result<c_int, SpawnError> {
     let mut status = 0;
     loop {
         // SAFETY: status points to owned storage and pid is passed by value.
-        let observed = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let observed = unsafe { libc::waitpid(pid, &mut status, options) };
         if observed == pid {
             return Ok(status);
         }
@@ -689,6 +790,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::Command;
 
     fn pipe() -> (OwnedFd, OwnedFd) {
         let mut descriptors = [-1; 2];
@@ -717,6 +819,46 @@ mod tests {
         .expect("spawn barred sleep")
     }
 
+    fn wait_for_target_death(report: &Path) {
+        let pid: u32 = fs::read_to_string(report)
+            .expect("helper wrote target pid")
+            .parse()
+            .expect("numeric target pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_start_time(pid) {
+                ProcessStartTime::NoSuchProcess => return,
+                ProcessStartTime::Started(start) if Instant::now() >= deadline => {
+                    let _ = terminate_exact_generation(
+                        pid,
+                        start,
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    panic!("target {pid} survived launcher death");
+                }
+                ProcessStartTime::Started(_) => std::thread::sleep(Duration::from_millis(10)),
+                observed => panic!("cannot observe target {pid}: {observed:?}"),
+            }
+        }
+    }
+
+    fn launcher_death_at_checkpoint_kills_target(checkpoint: &str, name: &str) {
+        let report =
+            std::env::temp_dir().join(format!("cerebellum-linux-{name}-{}", std::process::id()));
+        let _ = fs::remove_file(&report);
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("launch::tests::owner_process_exits_at_requested_checkpoint")
+            .env("CEREBELLUM_LINUX_BARRIER_CHECKPOINT", checkpoint)
+            .env("CEREBELLUM_LINUX_BARRIER_HELPER_REPORT", &report)
+            .status()
+            .expect("run owner helper");
+        assert_eq!(status.code(), Some(0), "owner helper failed: {status}");
+        wait_for_target_death(&report);
+        let _ = fs::remove_file(report);
+    }
+
     #[test]
     fn release_refuses_a_process_generation_that_no_longer_matches() {
         let mut child = spawn_sleep();
@@ -725,5 +867,25 @@ mod tests {
             child.release().map(|_| ()),
             Err(ProcessControlError::GenerationChanged)
         );
+    }
+
+    #[test]
+    fn parent_death_after_exec_stop_kills_the_target_before_the_next_ptrace_call() {
+        launcher_death_at_checkpoint_kills_target("after-exec-stop", "exec-stop-owner-death");
+    }
+
+    #[test]
+    fn parent_death_after_seize_kills_the_target_before_execve() {
+        launcher_death_at_checkpoint_kills_target("after-seize-before-exec", "seize-owner-death");
+    }
+
+    #[test]
+    #[ignore = "launched by the launcher-death regression tests"]
+    fn owner_process_exits_at_requested_checkpoint() {
+        if std::env::var_os("CEREBELLUM_LINUX_BARRIER_HELPER_REPORT").is_none() {
+            return;
+        }
+        let _ = spawn_sleep();
+        panic!("spawn barrier missed the requested test checkpoint");
     }
 }

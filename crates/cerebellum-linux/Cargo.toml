@@ -3,7 +3,7 @@ name = "cerebellum-linux"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Raw Linux process readings and ptrace launch barrier for ck-cerebellum. The only crate in the workspace permitted to contain unsafe code."
+description = "Raw Linux process readings and ptrace launch barrier for ck-cerebellum. One of two seam crates in the workspace permitted to contain unsafe code."
 
 [lib]
 name = "cerebellum_linux"
