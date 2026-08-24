@@ -17,6 +17,10 @@ const POSIX_SPAWN_CLOEXEC_DEFAULT: c_short = 0x4000;
 const F_DUPFD_CLOEXEC: c_int = 67;
 const F_SETFD: c_int = 2;
 const FD_CLOEXEC: c_int = 1;
+// The value on Darwin. Declared here beside the other signal and fcntl
+// constants rather than pulled from a crate, matching this module's existing
+// practice of naming exactly the libc surface it uses.
+const EINTR: c_int = 4;
 const SIGCONT: c_int = 19;
 const SIGKILL: c_int = 9;
 #[cfg(test)]
@@ -116,6 +120,10 @@ extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
     fn getdtablesize() -> c_int;
     fn kill(pid: c_int, signal: c_int) -> c_int;
+    /// The thread's `errno` location. Read directly because the safe wrapper
+    /// allocates, and the one caller runs in a fork child where only
+    /// async-signal-safe calls are permitted.
+    fn __error() -> *mut c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(status: c_int) -> !;
 
@@ -722,7 +730,33 @@ fn guardian_main(death_read: RawFd, target_pid: c_int, descriptor_limit: c_int) 
     }
 
     let mut command = 0u8;
-    let received = unsafe { read(death_read, (&mut command as *mut u8).cast(), 1) };
+    // RETRY ON EINTR. A signal arriving while this read is parked returns -1
+    // without consuming anything, and treating that as "no release command"
+    // makes the guardian KILL a target the launcher was about to release.
+    //
+    // Unproven as the cause of the intermittent broken-pipe failure seen in
+    // full workspace runs, and kept because it is a defect on its own terms:
+    // an interrupted blocking read must be retried, and this one destroys a
+    // process if it is not. Proving it needs a signal that actually interrupts,
+    // which means a handler installed WITHOUT SA_RESTART -- `signal()` on this
+    // platform sets restart semantics, so a test would have to reach for
+    // `sigaction`. Recorded rather than done.
+    //
+    // `errno` is read through the raw location because the safe wrapper is not
+    // async-signal-safe and this runs in a fork child.
+    let received = loop {
+        // SAFETY: a one-byte buffer this frame owns, and a descriptor kept open
+        // above.
+        let result = unsafe { read(death_read, (&mut command as *mut u8).cast(), 1) };
+        if result >= 0 {
+            break result;
+        }
+        // SAFETY: reading the thread's errno location, which is valid whenever
+        // a libc call has just reported failure.
+        if unsafe { *__error() } != EINTR {
+            break result;
+        }
+    };
     let signal = if received == 1 && command == b'R' {
         SIGCONT
     } else {
