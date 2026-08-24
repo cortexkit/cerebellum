@@ -492,18 +492,21 @@ fn child_exec(
         for fd in 5..descriptor_limit {
             libc::close(fd);
         }
-        // Orphaned stopped groups receive SIGHUP then SIGCONT; inherited handling would
-        // choose between termination and a pre-exec escape instead of failing closed.
+        // Orphaned stopped groups receive SIGHUP then SIGCONT. Dispositions and masks
+        // cross fork separately; execve resets handled dispositions but preserves ignored
+        // dispositions and the mask. A default SIGHUP prevents inherited SIG_IGN from
+        // escaping the stop, while an empty mask prevents inherited blocks from escaping it
+        // or surviving into the exec'd target.
         let mut default_sighup: libc::sigaction = std::mem::zeroed();
         default_sighup.sa_sigaction = libc::SIG_DFL;
         if libc::sigaction(libc::SIGHUP, &default_sighup, std::ptr::null_mut()) != 0 {
             libc::_exit(113);
         }
-        let mut sighup_mask: libc::sigset_t = std::mem::zeroed();
-        if libc::sigaddset(&mut sighup_mask, libc::SIGHUP) != 0
-            || libc::sigprocmask(libc::SIG_UNBLOCK, &sighup_mask, std::ptr::null_mut()) != 0
+        let mut empty_mask: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut empty_mask) != 0
+            || libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut()) != 0
         {
-            libc::_exit(114);
+            libc::_exit(115);
         }
         if libc::raise(libc::SIGSTOP) != 0 {
             libc::_exit(111);
@@ -837,19 +840,19 @@ mod tests {
         .expect("spawn barred sleep")
     }
 
-    fn sighup_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn signal_state_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    struct SighupState {
+    struct SignalState {
         disposition: libc::sighandler_t,
         mask: libc::sigset_t,
     }
 
-    impl Drop for SighupState {
+    impl Drop for SignalState {
         fn drop(&mut self) {
             // SAFETY: these values came from this process immediately before the test mutation.
             unsafe {
@@ -859,7 +862,7 @@ mod tests {
         }
     }
 
-    fn ignore_and_block_sighup() -> SighupState {
+    fn ignore_sighup_and_block_sighup_and_sigterm() -> SignalState {
         // SAFETY: the test serializes its process-wide signal state and restores it in Drop.
         unsafe {
             let disposition = libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -874,11 +877,16 @@ mod tests {
             let mut blocked = mask;
             assert_eq!(libc::sigaddset(&mut blocked, libc::SIGHUP), 0, "add SIGHUP");
             assert_eq!(
+                libc::sigaddset(&mut blocked, libc::SIGTERM),
+                0,
+                "add SIGTERM"
+            );
+            assert_eq!(
                 libc::sigprocmask(libc::SIG_SETMASK, &blocked, std::ptr::null_mut()),
                 0,
-                "block SIGHUP"
+                "block SIGHUP and SIGTERM"
             );
-            SighupState { disposition, mask }
+            SignalState { disposition, mask }
         }
     }
 
@@ -945,9 +953,9 @@ mod tests {
     }
 
     #[test]
-    fn stopped_child_resets_inherited_sighup_disposition_and_mask() {
-        let _lock = sighup_state_lock();
-        let _sighup_state = ignore_and_block_sighup();
+    fn initial_barrier_clears_the_entire_inherited_signal_mask() {
+        let _lock = signal_state_lock();
+        let _signal_state = ignore_sighup_and_block_sighup_and_sigterm();
         let report = std::env::temp_dir().join(format!(
             "cerebellum-linux-sighup-state-{}",
             std::process::id()
@@ -981,9 +989,33 @@ mod tests {
             0,
             "child inherited a blocked SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
+        assert_eq!(
+            blocked,
+            0,
+            "child retained an inherited signal mask at the barrier (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+        );
 
         drop(child);
         let _ = fs::remove_file(report);
+    }
+
+    #[test]
+    fn execd_image_does_not_inherit_the_launchers_signal_mask() {
+        let _lock = signal_state_lock();
+        let _signal_state = ignore_sighup_and_block_sighup_and_sigterm();
+        let child = spawn_sleep();
+        let ignored = proc_signal_mask(child.generation().pid, "SigIgn:");
+        let blocked = proc_signal_mask(child.generation().pid, "SigBlk:");
+        assert_eq!(
+            ignored & 1,
+            0,
+            "exec'd image inherited an ignored SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+        );
+        assert_eq!(
+            blocked,
+            0,
+            "exec'd image retained the launcher's signal mask (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+        );
     }
 
     #[test]
