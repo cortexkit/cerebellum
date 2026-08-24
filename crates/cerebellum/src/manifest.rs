@@ -46,6 +46,9 @@ pub const BROWSER_STATUS: &str = "browser.status";
 pub fn browser_wire_tools() -> Vec<Tool> {
     crate::browser::tool_definitions()
         .into_iter()
+        // Deliberately advertise only operations with working wire dispatch routes.
+        // The omitted operations once returned `outcome: ok` with a fabricated
+        // `url_final` even when no browser process existed.
         .filter(|(name, _, _)| {
             matches!(
                 *name,
@@ -129,6 +132,7 @@ fn management_surface() -> ProviderRole {
             // pending request and arrange authority without performing the
             // browser or computer action the authority may later admit.
             kind: ManagementOperationKind::Query,
+            description: None,
         })
         .collect(),
         config_schema: json!({

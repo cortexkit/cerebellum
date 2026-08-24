@@ -668,9 +668,14 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
     )
     .await;
     let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
-    assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
+    assert_eq!(clicked["outcome"], "hazard_not_disclosed", "{clicked}");
     assert_eq!(
         clicked["detail"]["missing_hazard"], "credential_form_submit",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["remedy"],
+        "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
         "{clicked}"
     );
     assert_eq!(

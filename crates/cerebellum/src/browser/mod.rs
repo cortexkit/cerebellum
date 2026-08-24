@@ -103,7 +103,7 @@ pub enum BrowserError {
     },
     ElementIntercepted,
     InvalidCoordinates {
-        reason_code: &'static str,
+        reason: InvalidCoordinatesReason,
     },
     ImageTooLarge {
         encoded_bytes: usize,
@@ -142,15 +142,61 @@ impl BrowserError {
             Self::ElementIntercepted => "element_intercepted",
             Self::InvalidCoordinates { .. } => "invalid_coordinates",
             Self::ImageTooLarge { .. } => "image_too_large",
-            Self::AuthorizationDenied { .. } | Self::HazardNotDisclosed { .. } => {
-                "authorization_denied"
-            }
+            Self::AuthorizationDenied { .. } => "authorization_denied",
+            Self::HazardNotDisclosed { .. } => "hazard_not_disclosed",
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
             Self::NotSettled { .. } => "not_settled",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
         }
     }
+    /// Tell a caller which action can change this refusal, or explicitly when none exists.
+    fn remedy(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest { .. } => {
+                "correct detail.field according to detail.reason_code, then resubmit the request"
+            }
+            Self::NoSession => "call browser.launch, then retry the browser action",
+            Self::BrowserLaunchPending => {
+                "poll browser.status until the session is ready, then retry the browser action"
+            }
+            Self::StaleSnapshot { .. } => {
+                "call browser.snapshot again and use only its new snapshot_id and refs"
+            }
+            Self::RefNotFound { .. } => {
+                "choose a ref listed in the snapshot identified by snapshot_id"
+            }
+            Self::RefAmbiguous { .. } => {
+                "take a fresh browser.snapshot and choose a ref that identifies exactly one current element"
+            }
+            Self::ElementIntercepted => {
+                "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position"
+            }
+            Self::InvalidCoordinates { reason } => reason.remedy(),
+            Self::ImageTooLarge { .. } => {
+                "use browser.snapshot for a text observation, or reduce the viewport before capturing another image"
+            }
+            Self::AuthorizationDenied { .. } => {
+                "call browser.open_grant to mint a grant covering this action, then retry"
+            }
+            Self::HazardNotDisclosed { .. } => {
+                "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry"
+            }
+            Self::NavigationPolicyRejected { .. } => {
+                "navigate to an http or https URL allowed by browser policy"
+            }
+            Self::NotSettled { .. } => {
+                "call browser.snapshot to re-observe the page before depending on its current state"
+            }
+            Self::BrowserCrashed => {
+                "no caller remedy in v1: this module does not reconnect a crashed browser"
+            }
+            Self::Internal { .. } => {
+                "report this module failure with detail.reason_code and do not assume the action completed"
+            }
+        }
+    }
+
     fn detail(&self) -> Option<Value> {
         Some(match self {
             Self::InvalidRequest { field, reason_code } => {
@@ -159,7 +205,9 @@ impl BrowserError {
             Self::StaleSnapshot { reason_code } => json!({"reason_code":reason_code}),
             Self::RefNotFound { reference } => json!({"ref":reference}),
             Self::RefAmbiguous { candidate_count } => json!({"candidates":candidate_count}),
-            Self::InvalidCoordinates { reason_code } => json!({"reason_code":reason_code}),
+            Self::InvalidCoordinates { reason } => {
+                json!({"reason_code":reason.reason_code()})
+            }
             Self::ImageTooLarge {
                 encoded_bytes,
                 bound_bytes,
@@ -283,6 +331,21 @@ impl LateEvent {
             Self::JsDialogDismissed => "unsupported_js_dialog",
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
             Self::AuthorizationDenied { .. } => "authorization_denied",
+        }
+    }
+
+    fn remedy(&self) -> &'static str {
+        match self {
+            Self::DownloadBlocked => "choose an in-page action that does not start a download",
+            Self::JsDialogDismissed => {
+                "call browser.snapshot and continue from the page state after the dialog was dismissed"
+            }
+            Self::NavigationPolicyRejected { .. } => {
+                "navigate to an http or https URL allowed by browser policy"
+            }
+            Self::AuthorizationDenied { .. } => {
+                "call browser.open_grant to mint a grant covering this action, then retry"
+            }
         }
     }
 }
@@ -733,6 +796,7 @@ impl BrowserPlane {
             Err(error) => {
                 let mut object = Map::new();
                 object.insert("outcome".into(), Value::String(error.outcome().into()));
+                object.insert("remedy".into(), Value::String(error.remedy().into()));
                 object.insert("context".into(), context);
                 if let Some(detail) = error.detail() {
                     object.insert("detail".into(), detail);
@@ -1041,9 +1105,12 @@ impl BrowserPlane {
         };
         self.finalize(identity, BrowserCapability::Navigate, outcome, json!({"outcome":if should_settle && !tracker.settled {"not_settled"} else {"ok"},"url_final":tracker.url_final,"lifecycle":tracker.lifecycle})).await?;
         if should_settle && !tracker.settled {
-            return Ok(
-                json!({"outcome":"not_settled","url_final":tracker.url_final,"lifecycle":tracker.lifecycle}),
-            );
+            return Ok(json!({
+                "outcome":"not_settled",
+                "remedy":"call browser.snapshot to re-observe the page before depending on its current state",
+                "url_final":tracker.url_final,
+                "lifecycle":tracker.lifecycle,
+            }));
         }
         Ok(json!({"outcome":"ok","url_final":tracker.url_final,"lifecycle":tracker.lifecycle}))
     }
@@ -1629,7 +1696,7 @@ impl BrowserPlane {
                 || i128::from(screenshot.image_height_px) != addressed_height
             {
                 return Err(BrowserError::InvalidCoordinates {
-                    reason_code: InvalidCoordinatesReason::ImageSizeMismatch.reason_code(),
+                    reason: InvalidCoordinatesReason::ImageSizeMismatch,
                 });
             }
 
@@ -1681,6 +1748,7 @@ impl BrowserPlane {
         if let Some(events) = state.late_events.get_mut(&identity.conversation_key) {
             if let Some(event) = events.pop_front() {
                 let outcome = event.outcome();
+                let remedy = event.remedy();
                 let detail = match event {
                     LateEvent::NavigationPolicyRejected { reason_code } => {
                         json!({"reason_code":reason_code})
@@ -1689,7 +1757,7 @@ impl BrowserPlane {
                     _ => json!({}),
                 };
                 return Ok(
-                    json!({"outcome":outcome,"detail":detail,"url_final":Value::Null,"lifecycle":[],"inflight_count":0}),
+                    json!({"outcome":outcome,"remedy":remedy,"detail":detail,"url_final":Value::Null,"lifecycle":[],"inflight_count":0}),
                 );
             }
         }
@@ -2192,9 +2260,9 @@ fn map_snapshot_error(error: SnapshotError) -> BrowserError {
 }
 fn map_coordinate_error(error: CoordinateError) -> BrowserError {
     match error {
-        CoordinateError::InvalidCoordinates { reason } => BrowserError::InvalidCoordinates {
-            reason_code: reason.reason_code(),
-        },
+        CoordinateError::InvalidCoordinates { reason } => {
+            BrowserError::InvalidCoordinates { reason }
+        }
         CoordinateError::ImageTooLarge {
             encoded_bytes,
             bound_bytes,
@@ -2245,6 +2313,233 @@ mod tests {
             },
             ["https://example.test"],
         )])
+    }
+
+    #[tokio::test]
+    async fn authorization_refusals_with_different_remedies_have_distinct_wire_outcomes() {
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        let denied = plane
+            .result(
+                &identity,
+                Err(BrowserError::AuthorizationDenied { reason: "no_grant" }),
+            )
+            .await;
+        let undisclosed = plane
+            .result(
+                &identity,
+                Err(BrowserError::HazardNotDisclosed {
+                    missing: HazardClass::CredentialFormSubmit,
+                }),
+            )
+            .await;
+
+        assert_eq!(denied["outcome"], "authorization_denied");
+        assert_eq!(undisclosed["outcome"], "hazard_not_disclosed");
+        assert_ne!(
+            denied["outcome"], undisclosed["outcome"],
+            "refusals requiring different grants must not collapse to one wire outcome"
+        );
+        assert_eq!(
+            undisclosed["detail"]["missing_hazard"],
+            "credential_form_submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_browser_error_serializes_its_exact_caller_remedy() {
+        let cases = vec![
+            (
+                "invalid_request",
+                BrowserError::InvalidRequest {
+                    field: "url".to_string(),
+                    reason_code: "wrong_type",
+                },
+                "invalid_request",
+                "correct detail.field according to detail.reason_code, then resubmit the request",
+            ),
+            (
+                "no_session",
+                BrowserError::NoSession,
+                "no_session",
+                "call browser.launch, then retry the browser action",
+            ),
+            (
+                "browser_launch_pending",
+                BrowserError::BrowserLaunchPending,
+                "browser_launch_pending",
+                "poll browser.status until the session is ready, then retry the browser action",
+            ),
+            (
+                "stale_snapshot",
+                BrowserError::StaleSnapshot {
+                    reason_code: "document_epoch_changed",
+                },
+                "stale_snapshot",
+                "call browser.snapshot again and use only its new snapshot_id and refs",
+            ),
+            (
+                "ref_not_found",
+                BrowserError::RefNotFound {
+                    reference: "e1".to_string(),
+                },
+                "ref_not_found",
+                "choose a ref listed in the snapshot identified by snapshot_id",
+            ),
+            (
+                "ref_ambiguous",
+                BrowserError::RefAmbiguous { candidate_count: 2 },
+                "ref_ambiguous",
+                "take a fresh browser.snapshot and choose a ref that identifies exactly one current element",
+            ),
+            (
+                "element_intercepted",
+                BrowserError::ElementIntercepted,
+                "element_intercepted",
+                "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position",
+            ),
+            (
+                "coordinates_out_of_bounds",
+                BrowserError::InvalidCoordinates {
+                    reason: InvalidCoordinatesReason::PointOutOfBounds,
+                },
+                "invalid_coordinates",
+                "address a pixel inside the declared image: 0 <= x < image_width_px and 0 <= y < image_height_px",
+            ),
+            (
+                "coordinates_non_finite",
+                BrowserError::InvalidCoordinates {
+                    reason: InvalidCoordinatesReason::NonFiniteMetadata,
+                },
+                "invalid_coordinates",
+                "take a fresh screenshot: this one's retained geometry cannot be mapped",
+            ),
+            (
+                "coordinates_non_positive_dimensions",
+                BrowserError::InvalidCoordinates {
+                    reason: InvalidCoordinatesReason::NonPositiveDimensions,
+                },
+                "invalid_coordinates",
+                "take a fresh screenshot: this one reports no area to address",
+            ),
+            (
+                "coordinates_conversion_failure",
+                BrowserError::InvalidCoordinates {
+                    reason: InvalidCoordinatesReason::ConversionFailure,
+                },
+                "invalid_coordinates",
+                "take a fresh screenshot: this one's retained geometry cannot be mapped",
+            ),
+            (
+                "coordinates_image_size_mismatch",
+                BrowserError::InvalidCoordinates {
+                    reason: InvalidCoordinatesReason::ImageSizeMismatch,
+                },
+                "invalid_coordinates",
+                "send coordinates in the space of the image this module declared, and pass its image_width_px and image_height_px. If a model was shown a resized copy, multiply its coordinates by declared/shown before sending them.",
+            ),
+            (
+                "image_too_large",
+                BrowserError::ImageTooLarge {
+                    encoded_bytes: 20,
+                    bound_bytes: 10,
+                },
+                "image_too_large",
+                "use browser.snapshot for a text observation, or reduce the viewport before capturing another image",
+            ),
+            (
+                "authorization_denied",
+                BrowserError::AuthorizationDenied { reason: "no_grant" },
+                "authorization_denied",
+                "call browser.open_grant to mint a grant covering this action, then retry",
+            ),
+            (
+                "hazard_not_disclosed",
+                BrowserError::HazardNotDisclosed {
+                    missing: HazardClass::CredentialFormSubmit,
+                },
+                "hazard_not_disclosed",
+                "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
+            ),
+            (
+                "navigation_policy_rejected",
+                BrowserError::NavigationPolicyRejected {
+                    reason_code: "scheme_not_allowed",
+                },
+                "navigation_policy_rejected",
+                "navigate to an http or https URL allowed by browser policy",
+            ),
+            (
+                "not_settled",
+                BrowserError::NotSettled {
+                    url_final: Some("https://example.test/".to_string()),
+                    lifecycle: vec!["load".to_string()],
+                    inflight_count: 1,
+                    deadline_ms: 1_000,
+                },
+                "not_settled",
+                "call browser.snapshot to re-observe the page before depending on its current state",
+            ),
+            (
+                "browser_crashed",
+                BrowserError::BrowserCrashed,
+                "browser_crashed",
+                "no caller remedy in v1: this module does not reconnect a crashed browser",
+            ),
+            (
+                "internal_error",
+                BrowserError::Internal {
+                    reason_code: JournalReasonCode::InternalFailure,
+                },
+                "internal_error",
+                "report this module failure with detail.reason_code and do not assume the action completed",
+            ),
+        ];
+        let plane = BrowserPlane::new();
+        let identity = identity();
+
+        for (name, error, expected_outcome, expected_remedy) in cases {
+            let reply = plane.result(&identity, Err(error)).await;
+            assert_eq!(
+                reply["outcome"], expected_outcome,
+                "wrong outcome for {name}"
+            );
+            assert_eq!(reply["remedy"], expected_remedy, "wrong remedy for {name}");
+        }
+    }
+
+    #[test]
+    fn every_late_browser_refusal_names_its_exact_caller_remedy() {
+        let cases = [
+            (
+                LateEvent::DownloadBlocked,
+                "choose an in-page action that does not start a download",
+            ),
+            (
+                LateEvent::JsDialogDismissed,
+                "call browser.snapshot and continue from the page state after the dialog was dismissed",
+            ),
+            (
+                LateEvent::NavigationPolicyRejected {
+                    reason_code: "scheme_not_allowed".to_string(),
+                },
+                "navigate to an http or https URL allowed by browser policy",
+            ),
+            (
+                LateEvent::AuthorizationDenied {
+                    reason: "no_grant".to_string(),
+                },
+                "call browser.open_grant to mint a grant covering this action, then retry",
+            ),
+        ];
+
+        for (event, expected_remedy) in cases {
+            assert_eq!(
+                event.remedy(),
+                expected_remedy,
+                "wrong remedy for {event:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2336,5 +2631,9 @@ mod tests {
             )
             .await;
         assert_eq!(result["outcome"], "unsupported_download");
+        assert_eq!(
+            result["remedy"],
+            "choose an in-page action that does not start a download"
+        );
     }
 }

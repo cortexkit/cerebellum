@@ -3080,9 +3080,14 @@ mod tests {
             )
             .await;
 
-        assert_eq!(result["outcome"], "authorization_denied", "{result}");
+        assert_eq!(result["outcome"], "hazard_not_disclosed", "{result}");
         assert_eq!(
             result["detail"]["missing_hazard"], "credential_form_submit",
+            "{result}"
+        );
+        assert_eq!(
+            result["remedy"],
+            "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
             "{result}"
         );
 
@@ -3098,9 +3103,14 @@ mod tests {
                 }),
             )
             .await;
-        assert_eq!(unknown["outcome"], "authorization_denied", "{unknown}");
+        assert_eq!(unknown["outcome"], "hazard_not_disclosed", "{unknown}");
         assert_eq!(
             unknown["detail"]["missing_hazard"], "unverified_form_contents",
+            "{unknown}"
+        );
+        assert_eq!(
+            unknown["remedy"],
+            "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
             "{unknown}"
         );
     }
