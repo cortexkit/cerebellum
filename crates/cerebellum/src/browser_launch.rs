@@ -1193,7 +1193,12 @@ mod tests {
             self.terminal_outcome = Some(outcome);
         }
 
-        fn after_reap(&mut self) -> Result<(), crate::browser_session::CleanupStage> {
+        fn after_reap(
+            &mut self,
+        ) -> Result<
+            crate::browser_session::SessionCleanupOutcome,
+            crate::browser_session::CleanupStage,
+        > {
             let outcome = self
                 .terminal_outcome
                 .take()
@@ -1202,6 +1207,7 @@ mod tests {
                 .lock()
                 .map_err(|_| crate::browser_session::CleanupStage::RecordTerminalization)?
                 .finalize_session(&self.launch_attempt_id, outcome)
+                .map(|()| crate::browser_session::SessionCleanupOutcome::Complete)
                 .map_err(|_| crate::browser_session::CleanupStage::RecordTerminalization)
         }
     }

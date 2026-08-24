@@ -6,8 +6,9 @@ use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::browser::navigation::{BrowserSnapshotObservation, CdpNavigationDriver};
 use crate::browser::Tracker;
@@ -28,7 +29,7 @@ use crate::browser_launch_readiness::{
 use crate::browser_session::{
     BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher, BrowserSessionTerminalOutcome,
     CleanupStage, ClickDriveError, LaunchedBrowser, NavigationDriveError, NavigationWait,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
 };
 use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
@@ -292,6 +293,7 @@ impl ProductionLaunchService {
             .ok_or_else(|| json!({"outcome": "internal_failure"}))?;
         let mut clock = SystemLaunchClock;
         let mut readiness_rollback = rollback.clone();
+        let launch_started_at = SystemTime::now();
         let ready = launch_attested_to_readiness_with(
             journal,
             &mut launcher,
@@ -314,6 +316,11 @@ impl ProductionLaunchService {
                 journal: Arc::clone(&self.journal),
                 launch_attempt_id: browser_session_id.to_string(),
                 terminal_outcome: None,
+                persistence: ProfilePersistenceCheck {
+                    disposition: accepted.identity.profile_disposition,
+                    profile_directory,
+                    launch_started_at,
+                },
                 profile: rollback,
             }),
         })
@@ -729,10 +736,81 @@ impl SharedRollback {
     }
 }
 
+struct ProfilePersistenceCheck {
+    disposition: ProfileDisposition,
+    profile_directory: PathBuf,
+    launch_started_at: SystemTime,
+}
+
+impl ProfilePersistenceCheck {
+    fn observe(&self) -> SessionCleanupOutcome {
+        if self.disposition != ProfileDisposition::Durable {
+            return SessionCleanupOutcome::Complete;
+        }
+
+        let local_state_written_since_launch =
+            std::fs::metadata(self.profile_directory.join("Local State"))
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified >= self.launch_started_at);
+        let profile_writable = profile_directory_is_writable(&self.profile_directory);
+
+        if local_state_written_since_launch && profile_writable {
+            SessionCleanupOutcome::Complete
+        } else {
+            SessionCleanupOutcome::DurableStateAtRisk {
+                local_state_not_written_since_launch: !local_state_written_since_launch,
+                profile_not_writable: !profile_writable,
+            }
+        }
+    }
+}
+
+fn profile_directory_is_writable(profile_directory: &Path) -> bool {
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(1);
+
+    let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+    let probe_path = profile_directory.join(format!(
+        ".cerebellum-write-probe-{}-{sequence}",
+        std::process::id()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut probe = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)?;
+        probe.write_all(b"profile writable probe")?;
+        drop(probe);
+        std::fs::remove_file(&probe_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(probe_path);
+    }
+    result.is_ok()
+}
+
+fn run_cleanup_obligations<P, J, C>(
+    persistence_check: P,
+    journal_finalization: J,
+    profile_cleanup: C,
+) -> Result<SessionCleanupOutcome, CleanupStage>
+where
+    P: FnOnce() -> SessionCleanupOutcome,
+    J: FnOnce() -> Result<(), CleanupStage>,
+    C: FnOnce() -> Result<(), CleanupStage>,
+{
+    let persistence_outcome = persistence_check();
+    let journal_result = journal_finalization();
+    let profile_result = profile_cleanup();
+    journal_result
+        .and(profile_result)
+        .map(|()| persistence_outcome)
+}
+
 struct ProductionSessionCleanup {
     journal: SharedLaunchJournal,
     launch_attempt_id: String,
     terminal_outcome: Option<BrowserSessionTerminalOutcome>,
+    persistence: ProfilePersistenceCheck,
     profile: SharedRollback,
 }
 
@@ -742,20 +820,22 @@ impl ProductionSessionCleanup {
     /// Separate from profile cleanup so that neither can skip the other: they
     /// are independent obligations over different resources, and a single `?`
     /// chain between them silently makes the second conditional on the first.
-    fn finalize_journal(&mut self) -> Result<(), CleanupStage> {
-        let outcome = self
-            .terminal_outcome
+    fn finalize_journal(
+        journal: &SharedLaunchJournal,
+        launch_attempt_id: &str,
+        terminal_outcome: &mut Option<BrowserSessionTerminalOutcome>,
+    ) -> Result<(), CleanupStage> {
+        let outcome = terminal_outcome
             .take()
             .ok_or(CleanupStage::RecordTerminalization)?;
-        let mut journal_guard = self
-            .journal
+        let mut journal_guard = journal
             .lock()
             .map_err(|_| CleanupStage::RecordTerminalization)?;
         let journal = journal_guard
             .as_mut()
             .ok_or(CleanupStage::RecordTerminalization)?;
         journal
-            .finalize_session(&self.launch_attempt_id, outcome)
+            .finalize_session(launch_attempt_id, outcome)
             .map_err(|_| CleanupStage::RecordTerminalization)
     }
 }
@@ -765,18 +845,23 @@ impl SessionCleanup for ProductionSessionCleanup {
         self.terminal_outcome = Some(outcome);
     }
 
-    fn after_reap(&mut self) -> Result<(), CleanupStage> {
-        // Both steps always run, and the journal's failure never skips the
-        // profile's. The custody lock released here is what lets this agent
-        // launch again: stranding it because a journal write failed would turn
-        // a lost audit record into an agent permanently locked out of its own
-        // browser, which is far the worse of the two.
-        //
-        // The journal failure is still reported, and reported in preference to
-        // a later profile failure, because it is the earlier fact.
-        let journal_result = self.finalize_journal();
-        let profile_result = self.profile.after_reap();
-        journal_result.and(profile_result)
+    fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+        // All obligations run even when an earlier one fails. Custody release
+        // permits this agent's next launch, while journal finalization accounts
+        // for the completed one; neither may depend on a persistence warning or
+        // on the other obligation succeeding.
+        let Self {
+            journal,
+            launch_attempt_id,
+            terminal_outcome,
+            persistence,
+            profile,
+        } = self;
+        run_cleanup_obligations(
+            || persistence.observe(),
+            || Self::finalize_journal(journal, launch_attempt_id, terminal_outcome),
+            || profile.after_reap(),
+        )
     }
 }
 
@@ -1030,6 +1115,11 @@ mod cleanup_ordering_tests {
             journal: Arc::new(Mutex::new(None)),
             launch_attempt_id: "attempt-under-test".to_string(),
             terminal_outcome: Some(BrowserSessionTerminalOutcome::Closed),
+            persistence: ProfilePersistenceCheck {
+                disposition: ProfileDisposition::Disposable,
+                profile_directory: root.clone(),
+                launch_started_at: SystemTime::now(),
+            },
             profile: rollback,
         };
 
@@ -1046,6 +1136,248 @@ mod cleanup_ordering_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persistence_warning_still_finalizes_the_journal_and_releases_custody() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let persistence_events = Arc::clone(&events);
+        let journal_events = Arc::clone(&events);
+        let custody_events = Arc::clone(&events);
+
+        let result = run_cleanup_obligations(
+            move || {
+                persistence_events.lock().unwrap().push("persistence");
+                SessionCleanupOutcome::DurableStateAtRisk {
+                    local_state_not_written_since_launch: false,
+                    profile_not_writable: true,
+                }
+            },
+            move || {
+                journal_events.lock().unwrap().push("journal");
+                Ok(())
+            },
+            move || {
+                custody_events.lock().unwrap().push("custody");
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Ok(SessionCleanupOutcome::DurableStateAtRisk {
+                local_state_not_written_since_launch: false,
+                profile_not_writable: true,
+            })
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["persistence", "journal", "custody"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod profile_persistence_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    use cerebellum_core::clock::FakeClock;
+    use serde_json::json;
+
+    use crate::browser_session::{BrowserSessions, OwnedBrowserProcess, ProcessControlFailure};
+
+    struct PersistenceTestRoot(PathBuf);
+
+    impl PersistenceTestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ck-profile-persistence-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("create profile test root");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for PersistenceTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PermissionRestore {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl PermissionRestore {
+        fn make_unwritable(path: &Path) -> Self {
+            let mode = std::fs::metadata(path)
+                .expect("profile metadata")
+                .permissions()
+                .mode();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+                .expect("make profile unwritable");
+            Self {
+                path: path.to_path_buf(),
+                mode,
+            }
+        }
+    }
+
+    impl Drop for PermissionRestore {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode))
+                .expect("restore profile permissions");
+        }
+    }
+
+    struct AlreadyReapedProcess;
+
+    impl OwnedBrowserProcess for AlreadyReapedProcess {
+        fn generation_matches(&self) -> bool {
+            false
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_for_exit(
+            &mut self,
+            _grace_period: Duration,
+        ) -> Result<bool, ProcessControlFailure> {
+            Ok(true)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+    }
+
+    struct PersistenceOnlyCleanup(ProfilePersistenceCheck);
+
+    impl SessionCleanup for PersistenceOnlyCleanup {
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            Ok(self.0.observe())
+        }
+    }
+
+    fn close_with_check(check: ProfilePersistenceCheck) -> Value {
+        let disposition = check.disposition;
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let config = BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 1,
+            termination_grace_period_ms: 1,
+            browser_idle_timeout_ms: 1,
+            browser_exit_observation_deadline_ms: 1,
+            navigation_settle_deadline_ms: 1,
+        };
+        let _ = sessions.acquire_launch_slot("persistence-test");
+        let (session_id, _, cancelled) = sessions
+            .establish_ready(
+                "persistence-test",
+                disposition,
+                &config,
+                &clock,
+                Box::new(AlreadyReapedProcess),
+                Box::new(PersistenceOnlyCleanup(check)),
+            )
+            .expect("establish test session");
+        assert!(!cancelled);
+        sessions.close("persistence-test", &session_id, &config)
+    }
+
+    fn durable_check(path: &Path, launch_started_at: SystemTime) -> ProfilePersistenceCheck {
+        ProfilePersistenceCheck {
+            disposition: ProfileDisposition::Durable,
+            profile_directory: path.to_path_buf(),
+            launch_started_at,
+        }
+    }
+
+    #[test]
+    fn local_state_signal_reports_when_chrome_write_was_not_observed() {
+        let root = PersistenceTestRoot::new("old-local-state");
+        std::fs::write(root.path().join("Local State"), b"before launch")
+            .expect("write old Local State");
+
+        let result = close_with_check(durable_check(
+            root.path(),
+            SystemTime::now() + Duration::from_secs(60),
+        ));
+
+        assert_eq!(
+            result,
+            json!({
+                "outcome": "durable_state_at_risk",
+                "browser_session_id": result["browser_session_id"],
+                "failed_signals": ["local_state_not_written_since_launch"],
+            })
+        );
+    }
+
+    #[test]
+    fn writable_probe_reports_when_profile_becomes_unwritable_after_launch() {
+        let root = PersistenceTestRoot::new("unwritable");
+        std::fs::write(root.path().join("Local State"), b"written after launch")
+            .expect("write Local State");
+        let restore = PermissionRestore::make_unwritable(root.path());
+
+        let result = close_with_check(durable_check(root.path(), std::time::UNIX_EPOCH));
+        drop(restore);
+
+        assert_eq!(
+            result,
+            json!({
+                "outcome": "durable_state_at_risk",
+                "browser_session_id": result["browser_session_id"],
+                "failed_signals": ["profile_not_writable"],
+            })
+        );
+    }
+
+    #[test]
+    fn healthy_durable_teardown_adds_no_persistence_claim_or_warning() {
+        let root = PersistenceTestRoot::new("healthy");
+        std::fs::write(root.path().join("Local State"), b"written after launch")
+            .expect("write Local State");
+
+        let result = close_with_check(durable_check(root.path(), std::time::UNIX_EPOCH));
+
+        assert_eq!(result["outcome"], "closed");
+        assert!(result.get("failed_signals").is_none());
+        assert!(result.get("persisted").is_none());
+    }
+
+    #[test]
+    fn disposable_teardown_reports_no_persistence_outcome() {
+        let root = PersistenceTestRoot::new("disposable");
+        let result = close_with_check(ProfilePersistenceCheck {
+            disposition: ProfileDisposition::Disposable,
+            profile_directory: root.path().join("already-discarded"),
+            launch_started_at: SystemTime::now() + Duration::from_secs(60),
+        });
+
+        assert_eq!(result["outcome"], "closed");
+        assert!(result.get("failed_signals").is_none());
+        assert!(result.get("persisted").is_none());
     }
 }
 

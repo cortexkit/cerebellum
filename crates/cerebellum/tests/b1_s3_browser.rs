@@ -184,8 +184,10 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
 struct NoopCleanup;
 
 impl SessionCleanup for NoopCleanup {
-    fn after_reap(&mut self) -> Result<(), CleanupStage> {
-        Ok(())
+    fn after_reap(
+        &mut self,
+    ) -> Result<cerebellum::browser_session::SessionCleanupOutcome, CleanupStage> {
+        Ok(cerebellum::browser_session::SessionCleanupOutcome::Complete)
     }
 }
 
