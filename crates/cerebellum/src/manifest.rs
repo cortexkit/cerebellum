@@ -165,6 +165,12 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
             management_surface(),
         ],
         consumes: Vec::new(),
+        // No capability-grammar claims. The upstream field documents omission as
+        // preserving the manifest contract we already had, so this is the
+        // no-change value rather than a gap to fill in later -- declaring a
+        // grammar we have not designed would be static discovery metadata the
+        // daemon validates against behaviour we never promised.
+        capabilities: None,
         bindings: Bindings {
             // Spec A has no profile storage (Spec B owns that). The manifest enum
             // has no none/ephemeral storage kind yet, so this is the honest
