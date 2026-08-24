@@ -1,6 +1,6 @@
 //! The frozen vocabulary and the code that decides the same things must agree.
 //!
-//! Several fields in `computer_action_vocabulary-v3.json` state a rule that a
+//! Several fields in `computer_action_vocabulary-v4.json` state a rule that a
 //! hand-written function also states. Validation checks those fields are
 //! PRESENT and never reads them, so the two statements can drift apart with
 //! nothing failing: the file is the contract and the function is what runs.
@@ -21,7 +21,7 @@ use cerebellum_computer::{
 };
 use serde_json::Value;
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v3.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v4.json");
 
 /// These frozen fields have no per-capability code counterpart to compare.
 ///
@@ -295,7 +295,8 @@ fn permission_services_agree_with_the_frozen_vocabulary() {
 }
 
 /// Every capability the vocabulary names is one the code serves, so a frozen
-/// row cannot silently describe an action that grounding refuses as unknown.
+/// capability row cannot silently describe a dispatch path that grounding refuses
+/// as unknown. Per-action admission is fenced separately against the action catalog.
 #[test]
 fn the_code_serves_every_capability_the_vocabulary_names() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");

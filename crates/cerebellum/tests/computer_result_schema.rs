@@ -129,12 +129,6 @@ fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
         "computer.click",
         [
             json!({
-                "outcome": "completed",
-                "containment_rung": "semantic_element",
-                "effect_status": "effect_indeterminate",
-                "unreadable_subtrees": 1,
-            }),
-            json!({
                 "outcome": "invalid_request",
                 "field": "target",
                 "reason": "missing_field",
@@ -166,7 +160,25 @@ fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
         ],
     );
 
-    let actual: BTreeSet<_> = screenshot.into_iter().chain(click).collect();
+    let wait = observed_facts(
+        "computer.wait",
+        [
+            json!({
+                "outcome": "predicate_satisfied",
+                "evidence": r#"{"status":"settled","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":true,"focused":null,"enabled":null,"value":null}}"#,
+            }),
+            json!({
+                "outcome": "timeout",
+                "evidence": r#"{"status":"timed_out","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":false,"focused":null,"enabled":null,"value":null}}"#,
+            }),
+            json!({
+                "outcome": "timeout",
+                "evidence": r#"{"status":"indeterminate","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":null,"reason":"target_not_inspectable"}"#,
+            }),
+        ],
+    );
+
+    let actual: BTreeSet<_> = screenshot.into_iter().chain(click).chain(wait).collect();
     let expected = BTreeSet::from([
         fact(
             "computer.screenshot",
@@ -236,7 +248,7 @@ fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
         fact(
             "computer.click",
             "$.unreadable_subtrees",
-            WrongSide::ReplyCarriesUndeclaredField,
+            WrongSide::SchemaRequiresFieldReplyLacks,
         ),
         fact(
             "computer.click",
@@ -303,31 +315,70 @@ fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
             "$.capability",
             WrongSide::ReplyCarriesUndeclaredField,
         ),
+        fact(
+            "computer.wait",
+            "$.settle_path",
+            WrongSide::SchemaRequiresFieldReplyLacks,
+        ),
     ]);
 
     assert_eq!(actual, expected);
 }
 
 #[test]
-fn all_three_current_wait_terminal_values_conform() {
+fn all_three_v4_wait_terminal_values_conform_with_the_current_settle_path() {
     let replies = [
         json!({
             "outcome": "predicate_satisfied",
             "evidence": r#"{"status":"settled","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":true,"focused":null,"enabled":null,"value":null}}"#,
+            "settle_path": "poll_with_deadline",
         }),
         json!({
             "outcome": "timeout",
             "evidence": r#"{"status":"timed_out","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":false,"focused":null,"enabled":null,"value":null}}"#,
+            "settle_path": "poll_with_deadline",
         }),
         json!({
-            "outcome": "timeout",
+            "outcome": "indeterminate",
             "evidence": r#"{"status":"indeterminate","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":null,"reason":"target_not_inspectable"}"#,
+            "settle_path": "poll_with_deadline",
         }),
     ];
 
     for reply in replies {
         assert_eq!(validate_capability_result("computer.wait", &reply), Ok(()));
     }
+}
+
+#[test]
+fn current_click_success_and_unreadable_post_action_state_conform() {
+    let current = json!({
+        "outcome": "completed",
+        "containment_rung": "semantic_element",
+        "effect_status": "effect_indeterminate",
+        "unreadable_subtrees": 1,
+    });
+    let queried_but_unreadable = json!({
+        "outcome": "completed",
+        "containment_rung": "semantic_element",
+        "effect_status": "effect_indeterminate",
+        "unreadable_subtrees": 1,
+        "post_action_state": {
+            "status": "tree_unreadable",
+            "elements": [],
+            "read_after_action_ms": 42,
+            "unreadable_subtrees": 1,
+        },
+    });
+
+    assert_eq!(
+        validate_capability_result("computer.click", &current),
+        Ok(())
+    );
+    assert_eq!(
+        validate_capability_result("computer.click", &queried_but_unreadable),
+        Ok(())
+    );
 }
 
 #[test]

@@ -1384,6 +1384,7 @@ fn click_driver_refusal(error: DriverError, key_form: AccessibilityKeyForm) -> V
 mod wait_tests {
     use super::*;
     use cerebellum_computer::dispatch::post_condition::ObservedElement;
+    use cerebellum_computer::platform::vocabulary::CapabilityResultViolation;
 
     fn predicate() -> PostCondition {
         PostCondition::ElementEnabledIs {
@@ -1399,6 +1400,19 @@ mod wait_tests {
             enabled: Some(enabled),
             value: None,
         }
+    }
+
+    fn assert_missing_v4_settle_path(reply: &Value) {
+        assert_eq!(
+            validate_capability_result("computer.wait", reply),
+            Err(CapabilityResultValidationError::ReplyViolations {
+                capability_id: "computer.wait".into(),
+                violations: vec![CapabilityResultViolation::MissingRequiredProperty {
+                    path: "$".into(),
+                    property: "settle_path".into(),
+                }],
+            })
+        );
     }
 
     #[test]
@@ -1436,14 +1450,11 @@ mod wait_tests {
 
         assert_eq!(refusal["field"], "duration_ms");
         assert_eq!(refusal["detail"], "unknown_field");
-        assert_eq!(
-            validate_capability_result("computer.wait", &wait_indeterminate_reply(None, refusal),),
-            Ok(())
-        );
+        assert_missing_v4_settle_path(&wait_indeterminate_reply(None, refusal));
     }
 
     #[test]
-    fn every_wait_terminal_state_conforms_and_remains_distinct_in_evidence() {
+    fn current_wait_terminal_states_keep_distinct_evidence_and_miss_v4_settle_path() {
         let cases = [
             WaitResult {
                 outcome: WaitOutcome::Settled,
@@ -1474,7 +1485,7 @@ mod wait_tests {
 
         let replies: Vec<Value> = cases.into_iter().map(wait_wire_reply).collect();
         for reply in &replies {
-            assert_eq!(validate_capability_result("computer.wait", reply), Ok(()));
+            assert_missing_v4_settle_path(reply);
         }
         assert_eq!(replies[0]["outcome"], "predicate_satisfied");
         assert_eq!(replies[1]["outcome"], "timeout");
