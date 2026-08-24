@@ -254,6 +254,8 @@ pub fn spawn_barred(
     let response_source = duplicate_descriptor(cdp_response_write_fd)?;
     // Read this before fork: post-fork code must do only async-signal-safe work.
     let descriptor_limit = descriptor_limit();
+    let real_time_min = libc::SIGRTMIN();
+    let real_time_max = libc::SIGRTMAX();
 
     // SAFETY: fork has no pointer arguments. The child calls only raw syscalls
     // before execve or _exit, avoiding allocator and runtime state after fork.
@@ -269,6 +271,8 @@ pub fn spawn_barred(
             executable.as_ptr(),
             argv.as_ptr(),
             envp.as_ptr(),
+            real_time_min,
+            real_time_max,
         );
     }
 
@@ -481,6 +485,8 @@ fn child_exec(
     executable: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
+    real_time_min: c_int,
+    real_time_max: c_int,
 ) -> ! {
     // SAFETY: the descriptors and C-string pointers were checked before fork.
     unsafe {
@@ -492,15 +498,31 @@ fn child_exec(
         for fd in 5..descriptor_limit {
             libc::close(fd);
         }
-        // Orphaned stopped groups receive SIGHUP then SIGCONT. Dispositions and masks
-        // cross fork separately; execve resets handled dispositions but preserves ignored
-        // dispositions and the mask. A default SIGHUP prevents inherited SIG_IGN from
-        // escaping the stop, while an empty mask prevents inherited blocks from escaping it
-        // or surviving into the exec'd target.
-        let mut default_sighup: libc::sigaction = std::mem::zeroed();
-        default_sighup.sa_sigaction = libc::SIG_DFL;
-        if libc::sigaction(libc::SIGHUP, &default_sighup, std::ptr::null_mut()) != 0 {
-            libc::_exit(113);
+        // Orphaned stopped groups receive SIGHUP then SIGCONT. execve resets caught
+        // dispositions but preserves ignored ones, so the ignored set is exactly what
+        // crosses into the target. Resetting it and clearing the mask makes the child
+        // start clean rather than inherit launcher-runtime signal behaviour.
+        let mut default_disposition: libc::sigaction = std::mem::zeroed();
+        default_disposition.sa_sigaction = libc::SIG_DFL;
+        if libc::sigemptyset(&mut default_disposition.sa_mask) != 0 {
+            libc::_exit(114);
+        }
+        for signal in 1..=real_time_max {
+            if signal == libc::SIGKILL
+                || signal == libc::SIGSTOP
+                || (signal > 32 && signal < real_time_min)
+            {
+                continue;
+            }
+            let mut current: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 {
+                continue;
+            }
+            if current.sa_sigaction == libc::SIG_IGN
+                && libc::sigaction(signal, &default_disposition, std::ptr::null_mut()) != 0
+            {
+                libc::_exit(113);
+            }
         }
         let mut empty_mask: libc::sigset_t = std::mem::zeroed();
         if libc::sigemptyset(&mut empty_mask) != 0
@@ -848,7 +870,7 @@ mod tests {
     }
 
     struct SignalState {
-        disposition: libc::sighandler_t,
+        dispositions: Vec<(c_int, libc::sigaction)>,
         mask: libc::sigset_t,
     }
 
@@ -857,16 +879,40 @@ mod tests {
             // SAFETY: these values came from this process immediately before the test mutation.
             unsafe {
                 libc::sigprocmask(libc::SIG_SETMASK, &self.mask, std::ptr::null_mut());
-                libc::signal(libc::SIGHUP, self.disposition);
+                for (signal, disposition) in &self.dispositions {
+                    libc::sigaction(*signal, disposition, std::ptr::null_mut());
+                }
             }
         }
     }
 
-    fn ignore_sighup_and_block_sighup_and_sigterm() -> SignalState {
+    fn ignore_signals_and_block_sighup_and_sigterm() -> SignalState {
         // SAFETY: the test serializes its process-wide signal state and restores it in Drop.
         unsafe {
-            let disposition = libc::signal(libc::SIGHUP, libc::SIG_IGN);
-            assert_ne!(disposition, libc::SIG_ERR, "ignore SIGHUP");
+            let signals = [libc::SIGHUP, libc::SIGUSR1, libc::SIGRTMIN()];
+            let mut dispositions = Vec::with_capacity(signals.len());
+            for signal in signals {
+                let mut disposition = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(signal, std::ptr::null(), &mut disposition),
+                    0,
+                    "read signal disposition for {signal}"
+                );
+                dispositions.push((signal, disposition));
+
+                let mut ignored: libc::sigaction = std::mem::zeroed();
+                ignored.sa_sigaction = libc::SIG_IGN;
+                assert_eq!(
+                    libc::sigemptyset(&mut ignored.sa_mask),
+                    0,
+                    "empty signal mask"
+                );
+                assert_eq!(
+                    libc::sigaction(signal, &ignored, std::ptr::null_mut()),
+                    0,
+                    "ignore signal {signal}"
+                );
+            }
 
             let mut mask = std::mem::zeroed();
             assert_eq!(
@@ -886,7 +932,7 @@ mod tests {
                 0,
                 "block SIGHUP and SIGTERM"
             );
-            SignalState { disposition, mask }
+            SignalState { dispositions, mask }
         }
     }
 
@@ -953,9 +999,9 @@ mod tests {
     }
 
     #[test]
-    fn initial_barrier_clears_the_entire_inherited_signal_mask() {
+    fn initial_barrier_clears_the_inherited_signal_environment() {
         let _lock = signal_state_lock();
-        let _signal_state = ignore_sighup_and_block_sighup_and_sigterm();
+        let _signal_state = ignore_signals_and_block_sighup_and_sigterm();
         let report = std::env::temp_dir().join(format!(
             "cerebellum-linux-sighup-state-{}",
             std::process::id()
@@ -980,14 +1026,9 @@ mod tests {
         let ignored = proc_signal_mask(child.pid, "SigIgn:");
         let blocked = proc_signal_mask(child.pid, "SigBlk:");
         assert_eq!(
-            ignored & 1,
+            ignored,
             0,
-            "child inherited an ignored SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
-        );
-        assert_eq!(
-            blocked & 1,
-            0,
-            "child inherited a blocked SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+            "child retained ignored dispositions at the barrier (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
         assert_eq!(
             blocked,
@@ -1000,16 +1041,16 @@ mod tests {
     }
 
     #[test]
-    fn execd_image_does_not_inherit_the_launchers_signal_mask() {
+    fn execd_image_does_not_inherit_the_launchers_signal_environment() {
         let _lock = signal_state_lock();
-        let _signal_state = ignore_sighup_and_block_sighup_and_sigterm();
+        let _signal_state = ignore_signals_and_block_sighup_and_sigterm();
         let child = spawn_sleep();
         let ignored = proc_signal_mask(child.generation().pid, "SigIgn:");
         let blocked = proc_signal_mask(child.generation().pid, "SigBlk:");
         assert_eq!(
-            ignored & 1,
+            ignored,
             0,
-            "exec'd image inherited an ignored SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+            "exec'd image retained ignored launch dispositions (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
         assert_eq!(
             blocked,
