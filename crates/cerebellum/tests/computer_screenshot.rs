@@ -206,8 +206,27 @@ impl CaptureBackend for CapturingBackend {
             .iter()
             .find(|window| window.window_id == request.filter.window_id)
             .ok_or_else(|| BackendError::Capture("no such window".into()))?;
-        let frame = window.frame;
-        let bytes = self.png.clone();
+        let (frame, bytes) = match request.region {
+            Some(region) => {
+                let stride = window.frame.width as usize * 4;
+                let row_bytes = region.width_px as usize * 4;
+                let mut cropped = Vec::with_capacity(row_bytes * region.height_px as usize);
+                for row in 0..region.height_px as usize {
+                    let start = (region.y_px as usize + row) * stride + region.x_px as usize * 4;
+                    cropped.extend_from_slice(&self.png[start..start + row_bytes]);
+                }
+                (
+                    WindowFrame {
+                        x: window.frame.x + region.x_px as i32,
+                        y: window.frame.y + region.y_px as i32,
+                        width: region.width_px,
+                        height: region.height_px,
+                    },
+                    cropped,
+                )
+            }
+            None => (window.frame, self.png.clone()),
+        };
         Ok(cerebellum_computer::capture::WindowCaptureFrame {
             owner_identity: window.owner_identity.clone(),
             owner_identity_verified: true,
@@ -477,7 +496,8 @@ async fn waiting_reports_an_unreadable_authorized_target_as_indeterminate() {
         .await
         .expect("the schema-conformant indeterminate reply is returned");
 
-    assert_eq!(reply["outcome"], "timeout");
+    assert_eq!(reply["outcome"], "indeterminate");
+    assert_eq!(reply["settle_path"], "poll_with_deadline");
     let evidence: Value = serde_json::from_str(
         reply["evidence"]
             .as_str()
@@ -522,10 +542,6 @@ async fn every_served_reply_runs_result_schema_detection_before_it_escapes() {
             error: CapabilityResultValidationError::ReplyViolations {
                 capability_id: "computer.screenshot".into(),
                 violations: vec![
-                    CapabilityResultViolation::MissingRequiredProperty {
-                        path: "$".into(),
-                        property: "windows".into(),
-                    },
                     CapabilityResultViolation::UndeclaredProperty {
                         path: "$.field".into(),
                     },
@@ -664,7 +680,14 @@ async fn runtime_journal_save_failure_prevents_capture() {
         .expect("detect-only validation preserves the audit refusal");
 
     assert_eq!(reply["outcome"], "audit_unavailable");
-    assert_eq!(reply["detail"], "Journal(StorageUnavailable)");
+    assert_eq!(
+        reply["remedy"],
+        "the action was not performed; retry once the journal is available"
+    );
+    assert!(
+        reply.get("detail").is_none(),
+        "journal diagnostics are not a public refusal field"
+    );
     assert!(!backend_built.load(Ordering::SeqCst));
 }
 
@@ -756,14 +779,57 @@ async fn a_request_without_region_captures_the_whole_window() {
     );
 }
 
-/// A region is refused at the wire even when its shape is valid.
+fn patterned_bgra(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            bytes.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 0, 255]);
+        }
+    }
+    bytes
+}
+
+fn decode_base64(encoded: &str) -> Vec<u8> {
+    const TABLE: [i8; 256] = {
+        let mut table = [-1i8; 256];
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < alphabet.len() {
+            table[alphabet[i] as usize] = i as i8;
+            i += 1;
+        }
+        table
+    };
+    let mut out = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0;
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = TABLE[byte as usize];
+        assert!(value >= 0, "invalid base64");
+        buffer = (buffer << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// A region request returns pixels from that window-local rectangle.
 ///
-/// The handler refuses before parsing because a shape error would imply that
-/// correcting the fields could make window-local capture work.
+/// Dimensions alone cannot distinguish a crop from a scaled or clamped window.
+/// The final output row must carry row 35's marker: y=20 plus height=16 ends
+/// there. The whole window or a rect shifted by its screen position cannot
+/// produce that marker.
 #[tokio::test]
-async fn a_well_formed_region_request_is_refused_at_the_wire() {
+async fn a_region_request_returns_the_named_window_rows() {
     let clock = FakeClock::new();
     let plane = ComputerPlane::new(audit());
+    let pixels = patterned_bgra(80, 60);
     let reply = plane
         .serve(
             servable("computer.screenshot").expect("screenshot is servable"),
@@ -780,26 +846,60 @@ async fn a_well_formed_region_request_is_refused_at_the_wire() {
                 now_ms: 10,
             },
             |_| CapturingBackend {
-                windows: Vec::new(),
-                png: Vec::new(),
+                windows: vec![EnumeratedWindow {
+                    window_id: "window-1".to_string(),
+                    owner_identity: grant(),
+                    owner_identity_verified: true,
+                    frame: WindowFrame {
+                        x: 500,
+                        y: 300,
+                        width: 80,
+                        height: 60,
+                    },
+                    accessibility_root: None,
+                }],
+                png: pixels,
             },
         )
         .await
-        .expect("detect-only validation preserves the region refusal");
+        .expect("the region capture conforms to the result schema");
 
     assert_eq!(
-        reply,
-        json!({
-            "outcome": "invalid_request",
-            "field": "region",
-            "reason": "region_unsupported_for_window_capture"
+        reply["outcome"], "captured",
+        "region capture failed: {reply}"
+    );
+    let window = &reply["windows"][0];
+    let captured = decode_base64(
+        window["image_png_b64"]
+            .as_str()
+            .expect("the captured bytes are encoded"),
+    );
+    let row_bytes = 30 * 4;
+    let final_row = &captured[captured.len() - row_bytes..];
+    let source_rows: Vec<u8> = (0_u8..60)
+        .filter(|source_row| {
+            final_row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[1] == *source_row)
         })
+        .collect();
+    assert_eq!(
+        source_rows,
+        vec![35],
+        "the requested region must end on source row 35"
+    );
+    assert_ne!(
+        source_rows,
+        vec![59],
+        "the whole window was scaled or clamped"
     );
 }
 
-/// Presence, rather than validity, controls the refusal: null is unsupported too.
+/// A present region must have the object shape declared by vocabulary v4.
 #[tokio::test]
-async fn a_null_region_request_is_refused_at_the_wire() {
+async fn a_null_region_request_is_rejected_as_the_wrong_type() {
     let clock = FakeClock::new();
     let plane = ComputerPlane::new(audit());
     let reply = plane
@@ -823,14 +923,15 @@ async fn a_null_region_request_is_refused_at_the_wire() {
             },
         )
         .await
-        .expect("detect-only validation preserves the region refusal");
+        .expect("detect-only validation preserves actionable request fields");
 
     assert_eq!(
         reply,
         json!({
             "outcome": "invalid_request",
+            "windows": [],
             "field": "region",
-            "reason": "region_unsupported_for_window_capture"
+            "reason": "wrong_type"
         })
     );
 }
@@ -913,4 +1014,49 @@ async fn an_unreadable_window_list_is_not_reported_as_the_application_being_abse
         question.is_none(),
         "a person was asked to approve a target nothing could see: {body}"
     );
+}
+
+/// A region outside any target window is refused before capture.
+#[tokio::test]
+async fn a_region_outside_the_window_is_refused() {
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let reply = plane
+        .serve(
+            servable("computer.screenshot").expect("screenshot is servable"),
+            &json!({
+                "scope": "target_windows",
+                "include_cursor": false,
+                "region": { "x_px": 70, "y_px": 20, "width_px": 30, "height_px": 16 }
+            }),
+            ServeContext {
+                grantee: "pj-example",
+                identity: identity(),
+                management: &leased_management(&clock).await,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| CapturingBackend {
+                windows: vec![EnumeratedWindow {
+                    window_id: "window-1".to_string(),
+                    owner_identity: grant(),
+                    owner_identity_verified: true,
+                    frame: WindowFrame {
+                        x: 500,
+                        y: 300,
+                        width: 80,
+                        height: 60,
+                    },
+                    accessibility_root: None,
+                }],
+                png: patterned_bgra(80, 60),
+            },
+        )
+        .await
+        .expect("detect-only validation preserves actionable request fields");
+
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["field"], "region");
+    assert_eq!(reply["reason"], "region_outside_window");
+    assert_eq!(reply["windows"], json!([]));
 }

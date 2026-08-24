@@ -1228,9 +1228,10 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     // test module has no lease, so typed indeterminate evidence is expected;
     // the browser handler has no such capability and would refuse it as unknown.
     assert_eq!(
-        body["outcome"], "timeout",
+        body["outcome"], "indeterminate",
         "computer.wait was not served by the computer plane: {body}"
     );
+    assert_eq!(body["settle_path"], "poll_with_deadline");
     let evidence: Value = serde_json::from_str(
         body["evidence"]
             .as_str()

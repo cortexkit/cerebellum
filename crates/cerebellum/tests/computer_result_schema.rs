@@ -1,23 +1,17 @@
-//! Exact inventory of replies that disagree with the frozen computer result schemas.
+//! Exact inventory of computer replies against the frozen v4 result schemas.
 //!
-//! This is asserted content, not an exemption list: every sample is passed
-//! through the same validator as the serving boundary, and the test fails when
-//! either side changes. Entries can be removed as the frozen schemas and serving
-//! behavior are reconciled, until the inventory reaches zero.
+//! Code-owned divergence must stay empty. The remaining entries are fields the
+//! reply deliberately preserves because they tell callers how to repair a
+//! refusal, but which the digest-pinned artifact does not yet declare. They are
+//! recorded as artifact-owned debt rather than mislabelled as reply defects.
+//! Every sample still passes through the serving-boundary validator, and both
+//! inventories are asserted exactly, so adding or removing one field reddens the
+//! test by capability and JSON path.
 //!
-//! The capability-result schema has no uniform refusal contract. Click and
-//! screenshot accept any outcome string but still require success-only fields
-//! (`containment_rung`/`effect_status` or `windows`), so their current refusals do
-//! not match those schemas. Wait always returns the closed `{outcome,evidence}`
-//! shape. Its evidence string distinguishes settled, timed-out, and indeterminate
-//! results, while vocabulary v3 maps the latter two to `timeout`.
-//!
-//! The wait request also differs between the handler and the declared vocabulary
-//! schema: both require `timeout_ms`, but the handler accepts `predicate` as the
-//! typed `PostCondition` object while the schema declares it as a string. This is
-//! a request-contract mismatch requiring a future schema revision, not an
-//! exception to result validation. Type, keys, scroll, move, and drag have no
-//! current wire-serving path and therefore produce no reply shapes to validate.
+//! The wait request still differs between the handler and the declared request
+//! schema: the handler accepts `predicate` as the typed `PostCondition` object
+//! while the artifact declares a string. That request-contract mismatch is not a
+//! result-schema divergence and is tracked separately from this file.
 
 use std::collections::BTreeSet;
 
@@ -26,30 +20,74 @@ use cerebellum_computer::platform::vocabulary::{
 };
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OwedBy {
+    Artifact,
+    Reply,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum WrongSide {
-    ReplyCarriesUndeclaredField,
-    ReplyUsesUnlistedEnumValue,
-    ReplyUsesWrongType,
-    SchemaRequiresFieldReplyLacks,
+enum DivergenceKind {
+    UndeclaredProperty,
+    UnlistedEnumValue,
+    WrongType,
+    MissingRequiredProperty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DivergenceFact {
     capability_id: &'static str,
     path: String,
-    wrong_side: WrongSide,
+    kind: DivergenceKind,
+    owed_by: OwedBy,
 }
 
 fn fact(
     capability_id: &'static str,
     path: impl Into<String>,
-    wrong_side: WrongSide,
+    kind: DivergenceKind,
+    owed_by: OwedBy,
 ) -> DivergenceFact {
     DivergenceFact {
         capability_id,
         path: path.into(),
-        wrong_side,
+        kind,
+        owed_by,
+    }
+}
+
+fn undeclared_field_owner(capability_id: &str, path: &str) -> OwedBy {
+    let useful = match capability_id {
+        "computer.click" => matches!(
+            path,
+            "$.field"
+                | "$.reason"
+                | "$.bundle_identity"
+                | "$.instances"
+                | "$.remedy"
+                | "$.key_form"
+                | "$.match_count"
+                | "$.action"
+                | "$.advertised"
+                | "$.disposition"
+                | "$.deadline_ms"
+        ),
+        "computer.screenshot" => matches!(
+            path,
+            "$.field"
+                | "$.reason"
+                | "$.remedy"
+                | "$.bundle_identity"
+                | "$.instances"
+                | "$.bytes"
+                | "$.bound_bytes"
+        ),
+        _ => false,
+    };
+    if useful {
+        OwedBy::Artifact
+    } else {
+        OwedBy::Reply
     }
 }
 
@@ -57,272 +95,312 @@ fn observed_facts(
     capability_id: &'static str,
     replies: impl IntoIterator<Item = Value>,
 ) -> BTreeSet<DivergenceFact> {
-    replies
-        .into_iter()
-        .flat_map(|reply| {
-            let error = validate_capability_result(capability_id, &reply)
-                .expect_err("every inventoried reply shape is currently divergent");
-            let CapabilityResultValidationError::ReplyViolations { violations, .. } = error else {
-                panic!("the frozen result schema itself could not be checked: {error}");
+    let mut facts = BTreeSet::new();
+    for reply in replies {
+        let Err(error) = validate_capability_result(capability_id, &reply) else {
+            continue;
+        };
+        let CapabilityResultValidationError::ReplyViolations { violations, .. } = error else {
+            panic!("the frozen result schema itself could not be checked: {error}");
+        };
+        for violation in violations {
+            let fact = match violation {
+                CapabilityResultViolation::ExpectedType { path, .. } => fact(
+                    capability_id,
+                    path,
+                    DivergenceKind::WrongType,
+                    OwedBy::Reply,
+                ),
+                CapabilityResultViolation::MissingRequiredProperty { path, property } => fact(
+                    capability_id,
+                    format!("{path}.{property}"),
+                    DivergenceKind::MissingRequiredProperty,
+                    OwedBy::Reply,
+                ),
+                CapabilityResultViolation::UndeclaredProperty { path } => fact(
+                    capability_id,
+                    path.clone(),
+                    DivergenceKind::UndeclaredProperty,
+                    undeclared_field_owner(capability_id, &path),
+                ),
+                CapabilityResultViolation::EnumMismatch { path } => fact(
+                    capability_id,
+                    path,
+                    DivergenceKind::UnlistedEnumValue,
+                    OwedBy::Reply,
+                ),
             };
-            violations
-                .into_iter()
-                .map(move |violation| match violation {
-                    CapabilityResultViolation::ExpectedType { path, .. } => {
-                        fact(capability_id, path, WrongSide::ReplyUsesWrongType)
-                    }
-                    CapabilityResultViolation::MissingRequiredProperty { path, property } => fact(
-                        capability_id,
-                        format!("{path}.{property}"),
-                        WrongSide::SchemaRequiresFieldReplyLacks,
-                    ),
-                    CapabilityResultViolation::UndeclaredProperty { path } => {
-                        fact(capability_id, path, WrongSide::ReplyCarriesUndeclaredField)
-                    }
-                    CapabilityResultViolation::EnumMismatch { path } => {
-                        fact(capability_id, path, WrongSide::ReplyUsesUnlistedEnumValue)
-                    }
-                })
-        })
-        .collect()
+            facts.insert(fact);
+        }
+    }
+    facts
+}
+
+fn click_refusal(mut refusal: Value, unreadable_subtrees: u64) -> Value {
+    let object = refusal.as_object_mut().expect("fixture is an object");
+    object
+        .entry("outcome")
+        .or_insert_with(|| Value::String("refused".to_string()));
+    object.insert("containment_rung".into(), json!("global_none"));
+    object.insert("effect_status".into(), json!("effect_indeterminate"));
+    object.insert("unreadable_subtrees".into(), json!(unreadable_subtrees));
+    refusal
+}
+
+fn screenshot_refusal(mut refusal: Value) -> Value {
+    refusal
+        .as_object_mut()
+        .expect("fixture is an object")
+        .insert("windows".into(), json!([]));
+    refusal
 }
 
 #[test]
-fn current_served_reply_schema_divergences_are_exactly_this_inventory() {
+fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() {
     let screenshot = observed_facts(
         "computer.screenshot",
         [
-            json!({
+            screenshot_refusal(json!({
                 "outcome": "invalid_request",
                 "field": "region",
-                "reason": "region_unsupported_for_window_capture",
-            }),
-            json!({"outcome": "broad_grant_required", "remedy": "obtain a broad grant"}),
-            json!({
+                "reason": "wrong_type",
+            })),
+            screenshot_refusal(json!({
+                "outcome": "broad_grant_required",
+                "remedy": "obtain a broad grant",
+            })),
+            screenshot_refusal(json!({
                 "outcome": "invalid_request",
                 "field": "scope",
                 "reason": "unknown_value",
-                "value": "other",
-            }),
-            json!({
+            })),
+            screenshot_refusal(json!({
                 "outcome": "ambiguous",
                 "bundle_identity": "com.example.app",
                 "instances": [],
                 "remedy": "choose one target",
-            }),
-            json!({
+            })),
+            screenshot_refusal(json!({
                 "outcome": "audit_unavailable",
-                "detail": "storage unavailable",
                 "remedy": "retry after repair",
-            }),
-            json!({"outcome": "capture_failed", "detail": "backend failed"}),
-            json!({
+            })),
+            screenshot_refusal(json!({"outcome": "capture_failed"})),
+            screenshot_refusal(json!({
                 "outcome": "image_too_large",
                 "bytes": 20_000_000,
                 "bound_bytes": 16_777_216,
                 "remedy": "capture fewer windows",
-            }),
-            json!({"outcome": "no_window_captured", "remedy": "open a window"}),
+            })),
+            screenshot_refusal(json!({
+                "outcome": "no_window_captured",
+                "remedy": "open a window",
+            })),
         ],
     );
     let click = observed_facts(
         "computer.click",
         [
-            json!({
-                "outcome": "invalid_request",
-                "field": "target",
-                "reason": "missing_field",
-            }),
-            json!({
-                "outcome": "ambiguous",
-                "bundle_identity": "com.example.app",
-                "instances": [],
-                "remedy": "choose one target",
-            }),
-            json!({
-                "reason": "element_name_ambiguous",
-                "key_form": "identifier",
-                "match_count": 2,
-            }),
-            json!({
-                "reason": "action_not_advertised",
-                "action": "AXPress",
-                "advertised": ["AXCancel"],
-            }),
-            json!({"reason": "application_refused", "ax_error": -25205}),
-            json!({"reason": "target_no_longer_current", "disposition": "gone"}),
-            json!({"reason": "semantic_dispatch_transient", "deadline_ms": 3000}),
-            json!({
-                "outcome": "not_servable",
-                "capability": "computer.click",
-                "remedy": "report the missing implementation",
-            }),
+            click_refusal(
+                json!({
+                    "outcome": "invalid_request",
+                    "field": "target",
+                    "reason": "missing_field",
+                }),
+                0,
+            ),
+            click_refusal(
+                json!({
+                    "outcome": "ambiguous",
+                    "bundle_identity": "com.example.app",
+                    "instances": [],
+                    "remedy": "choose one target",
+                }),
+                0,
+            ),
+            click_refusal(
+                json!({
+                    "reason": "element_name_ambiguous",
+                    "key_form": "identifier",
+                    "match_count": 2,
+                }),
+                0,
+            ),
+            click_refusal(
+                json!({
+                    "reason": "action_not_advertised",
+                    "action": "AXPress",
+                    "advertised": ["AXCancel"],
+                }),
+                0,
+            ),
+            click_refusal(json!({"reason": "application_refused"}), 0),
+            click_refusal(
+                json!({
+                    "reason": "target_no_longer_current",
+                    "disposition": "gone",
+                }),
+                0,
+            ),
+            click_refusal(
+                json!({
+                    "reason": "semantic_dispatch_transient",
+                    "deadline_ms": 3000,
+                }),
+                0,
+            ),
+            click_refusal(
+                json!({
+                    "outcome": "not_servable",
+                    "remedy": "report the missing implementation",
+                }),
+                0,
+            ),
         ],
     );
-
     let wait = observed_facts(
         "computer.wait",
         [
             json!({
                 "outcome": "predicate_satisfied",
                 "evidence": r#"{"status":"settled","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":true,"focused":null,"enabled":null,"value":null}}"#,
+                "settle_path": "poll_with_deadline",
             }),
             json!({
                 "outcome": "timeout",
                 "evidence": r#"{"status":"timed_out","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":{"present":false,"focused":null,"enabled":null,"value":null}}"#,
+                "settle_path": "poll_with_deadline",
             }),
             json!({
-                "outcome": "timeout",
+                "outcome": "indeterminate",
                 "evidence": r#"{"status":"indeterminate","predicate":{"kind":"element_present","element":{"Identifier":"ready"}},"readback":null,"reason":"target_not_inspectable"}"#,
+                "settle_path": "poll_with_deadline",
             }),
         ],
     );
 
     let actual: BTreeSet<_> = screenshot.into_iter().chain(click).chain(wait).collect();
-    let expected = BTreeSet::from([
-        fact(
-            "computer.screenshot",
-            "$.windows",
-            WrongSide::SchemaRequiresFieldReplyLacks,
-        ),
+    let code_owned: BTreeSet<_> = actual
+        .iter()
+        .filter(|fact| fact.owed_by == OwedBy::Reply)
+        .cloned()
+        .collect();
+    assert_eq!(
+        code_owned,
+        BTreeSet::new(),
+        "every code-owned result divergence must be removed"
+    );
+
+    let expected_artifact_debt = BTreeSet::from([
         fact(
             "computer.screenshot",
             "$.field",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.screenshot",
             "$.reason",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.screenshot",
             "$.remedy",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.value",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.screenshot",
             "$.bundle_identity",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.screenshot",
             "$.instances",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.detail",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.screenshot",
             "$.bytes",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.screenshot",
             "$.bound_bytes",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.click",
-            "$.outcome",
-            WrongSide::SchemaRequiresFieldReplyLacks,
-        ),
-        fact(
-            "computer.click",
-            "$.containment_rung",
-            WrongSide::SchemaRequiresFieldReplyLacks,
-        ),
-        fact(
-            "computer.click",
-            "$.effect_status",
-            WrongSide::SchemaRequiresFieldReplyLacks,
-        ),
-        fact(
-            "computer.click",
-            "$.unreadable_subtrees",
-            WrongSide::SchemaRequiresFieldReplyLacks,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.field",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.reason",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.bundle_identity",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.instances",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.remedy",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.key_form",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.match_count",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.action",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.advertised",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.click",
-            "$.ax_error",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.disposition",
-            WrongSide::ReplyCarriesUndeclaredField,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
         fact(
             "computer.click",
             "$.deadline_ms",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.click",
-            "$.capability",
-            WrongSide::ReplyCarriesUndeclaredField,
-        ),
-        fact(
-            "computer.wait",
-            "$.settle_path",
-            WrongSide::SchemaRequiresFieldReplyLacks,
+            DivergenceKind::UndeclaredProperty,
+            OwedBy::Artifact,
         ),
     ]);
-
-    assert_eq!(actual, expected);
+    assert_eq!(actual, expected_artifact_debt);
 }
 
 #[test]

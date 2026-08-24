@@ -18,7 +18,9 @@ use cerebellum_computer::audit::{
     ComputerAudit, ComputerCapability, ComputerPlaneDescriptor, ObservationState,
     TypedCaptureDispatch,
 };
-use cerebellum_computer::capture::{CaptureArtifact, CaptureBackend, ScopedCaptureController};
+use cerebellum_computer::capture::{
+    CaptureArtifact, CaptureBackend, ScopedCaptureController, WindowCaptureRegion,
+};
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
 use cerebellum_computer::dispatch::{
     post_condition::PostCondition, wait_until_predicate, PlatformPredicatePoller, WaitEvidence,
@@ -59,6 +61,143 @@ use crate::management::{ActionAuthority, ManagementPlane};
 /// discarding it at the boundary with an error that describes the transport
 /// rather than the request.
 pub const MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureRegion {
+    x_px: u32,
+    y_px: u32,
+    width_px: u32,
+    height_px: u32,
+}
+
+fn invalid_screenshot_request(field: &str, reason: &str) -> Value {
+    json!({
+        "outcome": "invalid_request",
+        "field": field,
+        "reason": reason,
+    })
+}
+
+fn screenshot_region_component(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<u32, Value> {
+    match object.get(field) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| invalid_screenshot_request(field, "invalid_value")),
+        Some(_) => Err(invalid_screenshot_request(field, "wrong_type")),
+        None => Err(invalid_screenshot_request(field, "missing_field")),
+    }
+}
+
+fn parse_screenshot_region(arguments: &Value) -> Result<Option<CaptureRegion>, Value> {
+    let Some(region) = arguments.get("region") else {
+        return Ok(None);
+    };
+    let Some(object) = region.as_object() else {
+        return Err(invalid_screenshot_request("region", "wrong_type"));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "x_px" | "y_px" | "width_px" | "height_px"))
+        .min()
+    {
+        return Err(invalid_screenshot_request(field, "unknown_field"));
+    }
+    let parsed = CaptureRegion {
+        x_px: screenshot_region_component(object, "x_px")?,
+        y_px: screenshot_region_component(object, "y_px")?,
+        width_px: screenshot_region_component(object, "width_px")?,
+        height_px: screenshot_region_component(object, "height_px")?,
+    };
+    if parsed.width_px == 0 {
+        return Err(invalid_screenshot_request("width_px", "invalid_value"));
+    }
+    if parsed.height_px == 0 {
+        return Err(invalid_screenshot_request("height_px", "invalid_value"));
+    }
+    Ok(Some(parsed))
+}
+
+fn region_fits_window(region: &CaptureRegion, width_px: u32, height_px: u32) -> bool {
+    region
+        .x_px
+        .checked_add(region.width_px)
+        .is_some_and(|right| right <= width_px)
+        && region
+            .y_px
+            .checked_add(region.height_px)
+            .is_some_and(|bottom| bottom <= height_px)
+}
+
+fn capture_region(region: CaptureRegion) -> WindowCaptureRegion {
+    WindowCaptureRegion {
+        x_px: region.x_px,
+        y_px: region.y_px,
+        width_px: region.width_px,
+        height_px: region.height_px,
+    }
+}
+
+/// Give every screenshot outcome the result envelope declared by vocabulary v4.
+///
+/// `value` repeats the caller's request and `detail` exposes backend diagnostics;
+/// neither is part of the public refusal contract. The remaining refusal fields
+/// name actionable remedies and stay on the wire until the artifact declares them.
+fn screenshot_wire_reply(mut reply: Value) -> Value {
+    let object = reply
+        .as_object_mut()
+        .expect("computer.screenshot replies are objects");
+    object
+        .entry("windows")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object.remove("value");
+    object.remove("detail");
+    reply
+}
+
+/// Give every click outcome the mandatory action-result envelope.
+///
+/// A refusal has no delivered containment or observed effect. A zero unreadable
+/// count on a pre-read refusal means no tree read was attempted; callers receive
+/// the measured count instead on paths that did read a tree.
+#[cfg(target_os = "macos")]
+fn click_wire_envelope(mut reply: Value) -> Value {
+    let object = reply
+        .as_object_mut()
+        .expect("computer.click replies are objects");
+    object
+        .entry("outcome")
+        .or_insert_with(|| Value::String("refused".to_string()));
+    object
+        .entry("containment_rung")
+        .or_insert_with(|| Value::String("global_none".to_string()));
+    object
+        .entry("effect_status")
+        .or_insert_with(|| Value::String("effect_indeterminate".to_string()));
+    object
+        .entry("unreadable_subtrees")
+        .or_insert_with(|| Value::from(0));
+    // The typed reason is the public diagnosis. These values are implementation
+    // diagnostics or repeat the invoked capability and do not identify a remedy.
+    object.remove("ax_error");
+    object.remove("capability");
+    reply
+}
+
+#[cfg(target_os = "macos")]
+fn click_refusal_after_read(mut refusal: Value, unreadable_subtrees: u64) -> Value {
+    refusal
+        .as_object_mut()
+        .expect("computer.click refusals are objects")
+        .insert(
+            "unreadable_subtrees".to_string(),
+            Value::from(unreadable_subtrees),
+        );
+    click_wire_envelope(refusal)
+}
 
 /// The computer plane as a running module holds it.
 ///
@@ -430,6 +569,12 @@ where
                 "remedy": "this capability is advertised but has no implementation; report it",
             }),
         };
+        let reply = match served_capability {
+            ComputerCapability::Screenshot => screenshot_wire_reply(reply),
+            #[cfg(target_os = "macos")]
+            ComputerCapability::Click => click_wire_envelope(reply),
+            _ => reply,
+        };
         self.finish_reply(served_capability, reply)
     }
 
@@ -528,17 +673,28 @@ where
             settle_interval_ms: 500,
         }) {
             Ok(tree) => tree,
-            Err(error) => return click_driver_refusal(error, parsed.element_name.key_form()),
+            Err(error) => {
+                // The root itself was unreadable, so the omitted tree is one
+                // unreadable subtree rather than a fabricated complete read.
+                return click_driver_refusal(error, parsed.element_name.key_form(), 1);
+            }
         };
+        let unreadable_subtrees = tree.unreadable_subtrees;
         let Some(root_identifier) = tree.root_identifier else {
-            return dispatch_refusal(DispatchError::SemanticPathUnavailable);
+            return dispatch_refusal(DispatchError::SemanticPathUnavailable, unreadable_subtrees);
         };
         let element = match driver.resolve_element(ElementResolutionRequest {
             root_identifier,
             element_name: parsed.element_name.clone(),
         }) {
             Ok(element) => element,
-            Err(error) => return click_driver_refusal(error, parsed.element_name.key_form()),
+            Err(error) => {
+                return click_driver_refusal(
+                    error,
+                    parsed.element_name.key_form(),
+                    unreadable_subtrees,
+                )
+            }
         };
 
         let row = FrozenDispatchRow::for_capability("computer.click")
@@ -555,7 +711,9 @@ where
             "cerebellum-serve-context-v1",
         ) {
             Ok(lease) => lease,
-            Err(_) => return dispatch_refusal(DispatchError::AttendanceUnavailable),
+            Err(_) => {
+                return dispatch_refusal(DispatchError::AttendanceUnavailable, unreadable_subtrees)
+            }
         };
         let attendance = AttendanceContext::background(
             identity.conversation_key.clone(),
@@ -571,7 +729,7 @@ where
 
         let expected = match expected_post_condition_from_wire(&parsed) {
             Ok(expected) => expected,
-            Err(refusal) => return refusal,
+            Err(refusal) => return click_refusal_after_read(refusal, unreadable_subtrees),
         };
         let mut request = DispatchRequest::new(
             row,
@@ -587,7 +745,7 @@ where
         match Dispatcher::new(driver).dispatch(&mut audit, identity, request) {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
-                    return dispatch_refusal(DispatchError::AuditUnavailable);
+                    return dispatch_refusal(DispatchError::AuditUnavailable, unreadable_subtrees);
                 };
                 click_wire_reply(
                     DispatchContainmentRung::as_str(containment_rung),
@@ -595,7 +753,7 @@ where
                     parsed.expect.as_ref().map(|_| report.effect.status),
                 )
             }
-            Err(refusal) => dispatch_refusal(refusal),
+            Err(refusal) => dispatch_refusal(refusal, unreadable_subtrees),
         }
     }
 
@@ -617,20 +775,6 @@ where
             clock,
             now_ms,
         } = context;
-
-        // This capture deliberately uses `SCContentFilter(desktopIndependentWindow:)`
-        // so another application's pixels can never composite into the result. Apple
-        // documents `SCStreamConfiguration.sourceRect` as not referenced for that
-        // filter, so a requested rectangle would only scale the whole window. Reject
-        // its presence before inspecting its shape; otherwise a field-level error
-        // would imply that correcting the field could make the unsupported feature work.
-        if arguments.get("region").is_some() {
-            return json!({
-                "outcome": "invalid_request",
-                "field": "region",
-                "reason": "region_unsupported_for_window_capture",
-            });
-        }
 
         let scope = match arguments.get("scope").and_then(Value::as_str) {
             Some("target_windows") => CaptureScope::PerWindow,
@@ -682,6 +826,11 @@ where
                 })
             }
         }
+
+        let region = match parse_screenshot_region(arguments) {
+            Ok(region) => region,
+            Err(refusal) => return refusal,
+        };
 
         // Authority first, before anything is reserved or captured. A refusal
         // here has produced no pixels and no journal entry, so nothing has to be
@@ -749,7 +898,27 @@ where
                 },
             };
             let mut controller = controller;
-            let result = controller.capture_scoped(now_ms);
+            if let Some(region) = region {
+                let enumerated = match controller.enumerated_windows(now_ms) {
+                    Ok(windows) => windows,
+                    Err(error) => {
+                        *capture = Some(controller);
+                        let _ = audit.finalize_rejected(handle, b"capture-failed".to_vec());
+                        return json!({
+                            "outcome": "capture_failed",
+                            "detail": format!("{error:?}"),
+                        });
+                    }
+                };
+                if enumerated.iter().any(|window| {
+                    !region_fits_window(&region, window.frame.width, window.frame.height)
+                }) {
+                    *capture = Some(controller);
+                    let _ = audit.finalize_rejected(handle, b"region-outside-window".to_vec());
+                    return invalid_screenshot_request("region", "region_outside_window");
+                }
+            }
+            let result = controller.capture_scoped_with_region(now_ms, region.map(capture_region));
             *capture = Some(controller);
             result
         };
@@ -772,6 +941,13 @@ where
             let CaptureArtifact::Bytes(bytes) = &window.artifact else {
                 continue;
             };
+            if let Some(region) = region {
+                if window.frame.width != region.width_px || window.frame.height != region.height_px
+                {
+                    let _ = audit.finalize_rejected(handle, b"region-not-honoured".to_vec());
+                    return invalid_screenshot_request("region", "region_not_honoured");
+                }
+            }
             let width_px = window.frame.width;
             let height_px = window.frame.height;
             let bytes = bytes.clone();
@@ -941,17 +1117,14 @@ fn invalid_wait_request(field: &str, reason: &str) -> Value {
 fn wait_wire_reply(result: WaitResult) -> Value {
     let outcome = match result.outcome {
         WaitOutcome::Settled => "predicate_satisfied",
-        // The declared version-3 wire vocabulary cannot represent an
-        // indeterminate outcome directly, so
-        // the wire maps both non-settled results to `timeout` while preserving
-        // their typed status in evidence. A future schema revision must add a
-        // distinct indeterminate outcome.
-        WaitOutcome::TimedOut | WaitOutcome::Indeterminate => "timeout",
+        WaitOutcome::TimedOut => "timeout",
+        WaitOutcome::Indeterminate => "indeterminate",
     };
     json!({
         "outcome": outcome,
         "evidence": serde_json::to_string(&result.evidence)
             .expect("the closed wait evidence type serializes"),
+        "settle_path": "poll_with_deadline",
     })
 }
 
@@ -971,7 +1144,11 @@ fn wait_indeterminate_reply(predicate: Option<PostCondition>, reason: Value) -> 
         })
         .to_string(),
     };
-    json!({"outcome": "timeout", "evidence": evidence})
+    json!({
+        "outcome": "indeterminate",
+        "evidence": evidence,
+        "settle_path": "poll_with_deadline",
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1309,20 +1486,26 @@ fn field_reason(value: Option<&Value>) -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn invalid_click_request(field: &str, reason: &str) -> Value {
-    json!({
+    click_wire_envelope(json!({
         "outcome": "invalid_request",
         "field": field,
         "reason": reason,
-    })
+    }))
 }
 
 #[cfg(target_os = "macos")]
-fn dispatch_refusal(refusal: DispatchError) -> Value {
-    serde_json::to_value(refusal).expect("the closed dispatch refusal taxonomy serializes")
+fn dispatch_refusal(refusal: DispatchError, unreadable_subtrees: u64) -> Value {
+    let refusal =
+        serde_json::to_value(refusal).expect("the closed dispatch refusal taxonomy serializes");
+    click_refusal_after_read(refusal, unreadable_subtrees)
 }
 
 #[cfg(target_os = "macos")]
-fn click_driver_refusal(error: DriverError, key_form: AccessibilityKeyForm) -> Value {
+fn click_driver_refusal(
+    error: DriverError,
+    key_form: AccessibilityKeyForm,
+    unreadable_subtrees: u64,
+) -> Value {
     let refusal = match error {
         DriverError::Semantic(failure) => match failure {
             SemanticDriverError::ElementNameAmbiguous {
@@ -1377,14 +1560,13 @@ fn click_driver_refusal(error: DriverError, key_form: AccessibilityKeyForm) -> V
         | DriverError::InvalidRequest(_)
         | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
     };
-    dispatch_refusal(refusal)
+    dispatch_refusal(refusal, unreadable_subtrees)
 }
 
 #[cfg(test)]
 mod wait_tests {
     use super::*;
     use cerebellum_computer::dispatch::post_condition::ObservedElement;
-    use cerebellum_computer::platform::vocabulary::CapabilityResultViolation;
 
     fn predicate() -> PostCondition {
         PostCondition::ElementEnabledIs {
@@ -1400,19 +1582,6 @@ mod wait_tests {
             enabled: Some(enabled),
             value: None,
         }
-    }
-
-    fn assert_missing_v4_settle_path(reply: &Value) {
-        assert_eq!(
-            validate_capability_result("computer.wait", reply),
-            Err(CapabilityResultValidationError::ReplyViolations {
-                capability_id: "computer.wait".into(),
-                violations: vec![CapabilityResultViolation::MissingRequiredProperty {
-                    path: "$".into(),
-                    property: "settle_path".into(),
-                }],
-            })
-        );
     }
 
     #[test]
@@ -1450,11 +1619,14 @@ mod wait_tests {
 
         assert_eq!(refusal["field"], "duration_ms");
         assert_eq!(refusal["detail"], "unknown_field");
-        assert_missing_v4_settle_path(&wait_indeterminate_reply(None, refusal));
+        let reply = wait_indeterminate_reply(None, refusal);
+        assert_eq!(reply["outcome"], "indeterminate");
+        assert_eq!(reply["settle_path"], "poll_with_deadline");
+        assert_eq!(validate_capability_result("computer.wait", &reply), Ok(()));
     }
 
     #[test]
-    fn current_wait_terminal_states_keep_distinct_evidence_and_miss_v4_settle_path() {
+    fn all_wait_terminal_states_use_distinct_outcomes_and_the_current_settle_path() {
         let cases = [
             WaitResult {
                 outcome: WaitOutcome::Settled,
@@ -1485,11 +1657,12 @@ mod wait_tests {
 
         let replies: Vec<Value> = cases.into_iter().map(wait_wire_reply).collect();
         for reply in &replies {
-            assert_missing_v4_settle_path(reply);
+            assert_eq!(reply["settle_path"], "poll_with_deadline");
+            assert_eq!(validate_capability_result("computer.wait", reply), Ok(()));
         }
         assert_eq!(replies[0]["outcome"], "predicate_satisfied");
         assert_eq!(replies[1]["outcome"], "timeout");
-        assert_eq!(replies[2]["outcome"], "timeout");
+        assert_eq!(replies[2]["outcome"], "indeterminate");
 
         let evidence: Vec<WaitEvidence> = replies
             .iter()
@@ -1546,7 +1719,6 @@ mod click_refusal_tests {
                 DispatchError::ApplicationRefused { ax_error: -25205 },
                 json!({
                     "reason": "application_refused",
-                    "ax_error": -25205,
                 }),
             ),
             (
@@ -1575,10 +1747,19 @@ mod click_refusal_tests {
             ),
         ];
 
-        for (refusal, expected) in cases {
+        for (refusal, expected_payload) in cases {
+            let mut actual = dispatch_refusal(refusal, 7);
+            assert_eq!(actual["outcome"], "refused");
+            assert_eq!(actual["containment_rung"], "global_none");
+            assert_eq!(actual["effect_status"], "effect_indeterminate");
+            assert_eq!(actual["unreadable_subtrees"], 7);
+            let object = actual.as_object_mut().expect("the refusal is an object");
+            object.remove("outcome");
+            object.remove("containment_rung");
+            object.remove("effect_status");
+            object.remove("unreadable_subtrees");
             assert_eq!(
-                dispatch_refusal(refusal),
-                expected,
+                actual, expected_payload,
                 "a semantic remedy was changed at the wire boundary"
             );
         }

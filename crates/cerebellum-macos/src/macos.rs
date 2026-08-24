@@ -625,9 +625,8 @@ pub struct RawCapture {
 
 /// A rectangle in the captured window's own space, with its origin at the top-left.
 ///
-/// This is retained for a controlled framework measurement; the wire layer refuses
-/// caller-facing `region` requests until that measurement settles whether the
-/// framework honors this rectangle with a desktop-independent window filter.
+/// Measured on macOS 26: ScreenCaptureKit honors this window-local rectangle
+/// with a desktop-independent window filter.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureSourceRect {
     pub x: f64,
@@ -750,16 +749,12 @@ pub fn capture_window(
     };
 
     // SAFETY: plain object construction and property sets on an object owned
-    // by this frame. The desktop-independent filter intentionally captures one
-    // window's full bounds: Apple documents sourceRect as not referenced for
-    // this filter, so setting it may scale the whole window rather than crop it.
+    // by this frame. The desktop-independent filter captures one window, and
+    // the measured source rect is interpreted in that window's own space.
     let configuration = unsafe {
         let configuration = SCStreamConfiguration::new();
         let (width, height) = match source_rect {
             Some(rect) => {
-                // This parameter exists for a pending controlled measurement. Apple
-                // documents sourceRect as not referenced for this filter, while the
-                // wire layer refuses `region` until that measurement settles the fact.
                 // WINDOW-LOCAL, not display coordinates. A desktop-independent
                 // filter's content IS the window, so its space starts at the
                 // window's top-left; adding the window's screen position pushed

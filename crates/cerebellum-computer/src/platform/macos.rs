@@ -582,6 +582,8 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 child_count,
                 handshake_attempted: true,
                 degenerate_reason: root_degenerate_reason(child_count, unreadable_subtrees),
+                unreadable_subtrees: u64::try_from(unreadable_subtrees)
+                    .expect("the accessibility reader's element bound fits u64"),
             })
         }
 

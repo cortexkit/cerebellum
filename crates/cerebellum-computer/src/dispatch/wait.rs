@@ -44,9 +44,7 @@ pub enum WaitEvidence {
     },
 }
 
-/// The runtime distinguishes all three terminal states even though the current
-/// wire format represents only settled and timed-out results. Keep this enum
-/// separate until the wire can represent indeterminate directly.
+/// The three terminal states exposed by the v4 wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     Settled,

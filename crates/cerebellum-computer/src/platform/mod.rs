@@ -575,6 +575,8 @@ pub struct AccessibilityTreeResult {
     pub child_count: u32,
     pub handshake_attempted: bool,
     pub degenerate_reason: Option<String>,
+    /// Subtrees omitted from this read because they did not answer.
+    pub unreadable_subtrees: u64,
 }
 
 /// The exact accessibility key under which an element must be unique.
