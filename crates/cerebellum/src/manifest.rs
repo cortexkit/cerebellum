@@ -122,17 +122,31 @@ fn management_surface() -> ProviderRole {
         // it by claiming no ordering matters, which is false for that lane.
         concurrency: Concurrency::ModuleManaged,
         operations: [
-            crate::management::OPEN_TARGET,
-            crate::management::OPEN_GRANT,
+            (
+                crate::management::OPEN_TARGET,
+                "Ask the person for access to an application, so computer actions \
+                 can name it as a target. Returns once the request is pending; \
+                 access begins only if they agree.",
+            ),
+            (
+                crate::management::OPEN_GRANT,
+                "Ask the person to authorise browser actions on an origin, \
+                 disclosing the hazards the page carries. Returns once the \
+                 request is pending; the grant exists only if they agree.",
+            ),
         ]
         .into_iter()
-        .map(|name| ManagementOperation {
+        .map(|(name, description)| ManagementOperation {
             name: name.to_string(),
             // Both operations return before a person answers. They report the
             // pending request and arrange authority without performing the
             // browser or computer action the authority may later admit.
             kind: ManagementOperationKind::Query,
-            description: None,
+            // These are the operations our refusals NAME as the remedy -- a
+            // caller told to "mint a covering grant" arrives here to find out
+            // what that means. An empty description satisfies the compiler and
+            // leaves the remedy pointing at nothing.
+            description: Some(description.to_string()),
         })
         .collect(),
         config_schema: json!({
