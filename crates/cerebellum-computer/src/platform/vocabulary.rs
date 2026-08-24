@@ -17,14 +17,14 @@ use std::sync::OnceLock;
 //               what each one accepts.
 //
 // Changing what a capability accepts bumps the REVISION only, which is why
-// these currently read /v1 and -v3: the v2 and v3 cutovers changed request schemas
-// inside rows whose shape was unchanged. A reviewer read the mismatch as a
-// mistake before finding both fields in the artifact, so it is stated here
-// rather than left to be re-derived.
+// these currently read /v1 and -v4: the v2-v4 cutovers changed nested request
+// and result schemas or action annotations inside rows whose shape was unchanged.
+// A reviewer read the mismatch as a mistake before finding both fields in the
+// artifact, so it is stated here rather than left to be re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v3";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v4";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v3.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v4.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -32,7 +32,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "f6f5268556c9c1a85d645fcc379c2c844ca62eee672ed3108447eef59e84fd82";
+    "cb4ddc2810ce59d57498f561a56d1acc7e669d04e3467ecfff7da80830443e02";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -116,6 +116,23 @@ const ROW_IDS: [&str; 8] = [
     "computer.drag",
     "computer.screenshot",
     "computer.wait",
+];
+
+const ACTION_DEMOTION_RULE: &str = "An unserved conservative default MUST be measured in the same migration that first serves it. There is no serve-at-4-and-measure-later path: without this, the laundering risk returns as schedule pressure — a shipped action sitting at a conservative level with the measurement owed and nothing forcing it.";
+
+const MACOS_ACTION_ROWS: [(&str, u64, &str, bool); 12] = [
+    ("AXPress", 2, "measured", true),
+    ("AXCancel", 2, "doc_derived", true),
+    ("AXConfirm", 4, "conservative_default", false),
+    ("AXPick", 4, "conservative_default", false),
+    ("AXShowMenu", 4, "conservative_default", false),
+    ("AXShowAlternateUI", 4, "conservative_default", false),
+    ("AXShowDefaultUI", 4, "conservative_default", false),
+    ("AXRaise", 4, "doc_derived", false),
+    ("AXIncrement", 4, "conservative_default", false),
+    ("AXDecrement", 4, "conservative_default", false),
+    ("AXDelete", 4, "conservative_default", false),
+    ("AXScrollToVisible", 4, "conservative_default", false),
 ];
 
 /// RFC 8785 canonical bytes for the artifact. The artifact intentionally uses
@@ -398,7 +415,76 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
             "computer.type pixel fallback".into(),
         ));
     }
+    if id == "computer.click" {
+        validate_click_action_catalog(row)?;
+    }
     validate_numeric_invariants(id, object)
+}
+
+fn validate_click_action_catalog(row: &Value) -> Result<(), VocabularyValidationError> {
+    let action_schema = row
+        .get("request_schema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(|properties| properties.get("action"))
+        .ok_or_else(|| VocabularyValidationError::RowBinding("computer.click action".into()))?;
+    let catalog = action_schema
+        .get("catalog")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            VocabularyValidationError::RowBinding("computer.click action catalog".into())
+        })?;
+    if catalog.keys().map(String::as_str).collect::<Vec<_>>() != ["demotion_rule", "entries"]
+        || catalog.get("demotion_rule").and_then(Value::as_str) != Some(ACTION_DEMOTION_RULE)
+    {
+        return Err(VocabularyValidationError::RowBinding(
+            "computer.click action catalog policy".into(),
+        ));
+    }
+    let entries = catalog
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            VocabularyValidationError::RowBinding("computer.click action catalog entries".into())
+        })?;
+    if entries.len() != MACOS_ACTION_ROWS.len() {
+        return Err(VocabularyValidationError::RowBinding(
+            "computer.click action catalog row count".into(),
+        ));
+    }
+    for (entry, (action, disruption_level, level_evidence, served)) in
+        entries.iter().zip(MACOS_ACTION_ROWS)
+    {
+        if entry
+            != &serde_json::json!({
+                "action": action,
+                "disruption_level": disruption_level,
+                "level_evidence": level_evidence,
+                "served": served,
+            })
+        {
+            return Err(VocabularyValidationError::RowBinding(format!(
+                "computer.click action catalog row {action}"
+            )));
+        }
+    }
+
+    let admitted = action_schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            VocabularyValidationError::RowBinding("computer.click admitted set".into())
+        })?;
+    let served = entries
+        .iter()
+        .filter(|entry| entry.get("served").and_then(Value::as_bool) == Some(true))
+        .filter_map(|entry| entry.get("action").cloned())
+        .collect::<Vec<_>>();
+    if admitted != &served {
+        return Err(VocabularyValidationError::RowBinding(
+            "computer.click admitted actions disagree with served rows".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_closed_schema(value: &Value, path: &str) -> Result<(), VocabularyValidationError> {
@@ -491,7 +577,13 @@ fn validate_runtime_result_schema(
     for keyword in object.keys() {
         if !matches!(
             keyword.as_str(),
-            "additionalProperties" | "enum" | "items" | "properties" | "required" | "type"
+            "additionalProperties"
+                | "description"
+                | "enum"
+                | "items"
+                | "properties"
+                | "required"
+                | "type"
         ) {
             return Err(CapabilityResultValidationError::MalformedArtifact(format!(
                 "{path} uses unsupported result-schema keyword {keyword}"
@@ -516,16 +608,30 @@ fn validate_runtime_result_schema(
         let applicable = match schema_type {
             "object" => matches!(
                 keyword.as_str(),
-                "additionalProperties" | "enum" | "properties" | "required" | "type"
+                "additionalProperties"
+                    | "description"
+                    | "enum"
+                    | "properties"
+                    | "required"
+                    | "type"
             ),
-            "array" => matches!(keyword.as_str(), "enum" | "items" | "type"),
-            _ => matches!(keyword.as_str(), "enum" | "type"),
+            "array" => matches!(keyword.as_str(), "description" | "enum" | "items" | "type"),
+            _ => matches!(keyword.as_str(), "description" | "enum" | "type"),
         };
         if !applicable {
             return Err(CapabilityResultValidationError::MalformedArtifact(format!(
                 "{path}.{keyword} does not apply to result type {schema_type}"
             )));
         }
+    }
+
+    if object
+        .get("description")
+        .is_some_and(|description| !description.is_string())
+    {
+        return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path}.description is not a string"
+        )));
     }
 
     if let Some(choices) = object.get("enum") {
@@ -897,6 +1003,7 @@ mod tests {
         let reply = serde_json::json!({
             "outcome": "predicate_satisfied",
             "evidence": "duration elapsed",
+            "settle_path": "poll_with_deadline",
             "waited_ms": 25,
         });
 
@@ -916,13 +1023,14 @@ mod tests {
         let reply = serde_json::json!({
             "outcome": "predicate_satisfied",
             "evidence": "duration elapsed",
+            "settle_path": "poll_with_deadline",
         });
 
         assert_eq!(validate_capability_result("computer.wait", &reply), Ok(()));
     }
 
     #[test]
-    fn computer_click_unreadable_subtrees_remains_a_known_result_schema_divergence() {
+    fn computer_click_unreadable_subtrees_conforms_to_the_v4_result_schema() {
         let reply = serde_json::json!({
             "outcome": "completed",
             "containment_rung": "semantic_element",
@@ -930,15 +1038,7 @@ mod tests {
             "unreadable_subtrees": 1,
         });
 
-        assert_eq!(
-            validate_capability_result("computer.click", &reply),
-            Err(CapabilityResultValidationError::ReplyViolations {
-                capability_id: "computer.click".into(),
-                violations: vec![CapabilityResultViolation::UndeclaredProperty {
-                    path: "$.unreadable_subtrees".into(),
-                }],
-            })
-        );
+        assert_eq!(validate_capability_result("computer.click", &reply), Ok(()));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v3.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v4.json");
 
 use cerebellum_computer::platform::{
     attributed_permission_liveness, capability_declarations, computed_vocabulary_sha256,
@@ -17,7 +17,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v3");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v4");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -40,7 +40,7 @@ fn vocabulary_requires_all_three_digest_sources() {
 }
 
 #[test]
-fn implementation_source_lock_digest_matches_the_v3_artifact() {
+fn implementation_source_lock_digest_matches_the_v4_artifact() {
     assert_eq!(
         implementation_source_lock_digest().as_deref(),
         Some(COMPUTER_ACTION_VOCABULARY_SHA256)
@@ -59,8 +59,8 @@ fn computer_click_action_is_optional_and_closed_to_press_and_cancel() {
     let request = &click["request_schema"];
 
     assert_eq!(
-        request["properties"]["action"],
-        json!({"enum": ["AXPress", "AXCancel"], "type": "string"})
+        request["properties"]["action"]["enum"],
+        json!(["AXPress", "AXCancel"])
     );
     assert!(
         !request["required"]
@@ -68,6 +68,134 @@ fn computer_click_action_is_optional_and_closed_to_press_and_cancel() {
             .expect("the request schema names required fields")
             .contains(&json!("action")),
         "omitting action must preserve the historical AXPress default"
+    );
+}
+
+#[test]
+fn macos_action_catalog_matches_the_authored_table() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let click = vocabulary["rows"]
+        .as_array()
+        .expect("the vocabulary has rows")
+        .iter()
+        .find(|row| row["capability_id"] == "computer.click")
+        .expect("the vocabulary contains computer.click");
+    let catalog = &click["request_schema"]["properties"]["action"]["catalog"];
+
+    assert_eq!(
+        catalog["entries"],
+        json!([
+            {"action":"AXPress","disruption_level":2,"level_evidence":"measured","served":true},
+            {"action":"AXCancel","disruption_level":2,"level_evidence":"doc_derived","served":true},
+            {"action":"AXConfirm","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXPick","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXShowMenu","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXShowAlternateUI","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXShowDefaultUI","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXRaise","disruption_level":4,"level_evidence":"doc_derived","served":false},
+            {"action":"AXIncrement","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXDecrement","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXDelete","disruption_level":4,"level_evidence":"conservative_default","served":false},
+            {"action":"AXScrollToVisible","disruption_level":4,"level_evidence":"conservative_default","served":false},
+        ])
+    );
+    assert_eq!(
+        catalog["demotion_rule"],
+        "An unserved conservative default MUST be measured in the same migration that first serves it. There is no serve-at-4-and-measure-later path: without this, the laundering risk returns as schedule pressure — a shipped action sitting at a conservative level with the measurement owed and nothing forcing it."
+    );
+}
+
+#[test]
+fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let click = vocabulary["rows"]
+        .as_array()
+        .expect("the vocabulary has rows")
+        .iter()
+        .find(|row| row["capability_id"] == "computer.click")
+        .expect("the vocabulary contains computer.click");
+    let action = &click["request_schema"]["properties"]["action"];
+    let admitted = action["enum"]
+        .as_array()
+        .expect("the admitted actions are an enum");
+    let entries = action["catalog"]["entries"]
+        .as_array()
+        .expect("the action catalog has entries");
+
+    for entry in entries {
+        if entry["served"] == false {
+            let name = entry["action"].as_str().expect("an action name");
+            assert!(
+                !admitted.contains(&json!(name)),
+                "unserved action {name} is present in the admitted set"
+            );
+        }
+    }
+}
+
+#[test]
+fn click_query_and_wait_settle_markers_are_closed_to_v4_values() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let rows = vocabulary["rows"].as_array().expect("rows");
+    let click = rows
+        .iter()
+        .find(|row| row["capability_id"] == "computer.click")
+        .expect("click");
+    let wait = rows
+        .iter()
+        .find(|row| row["capability_id"] == "computer.wait")
+        .expect("wait");
+    let screenshot = rows
+        .iter()
+        .find(|row| row["capability_id"] == "computer.screenshot")
+        .expect("screenshot");
+    let click_request = &click["request_schema"];
+    let click_result = &click["result_schema"];
+    let post_action_query = &click_request["properties"]["post_action_query"];
+    let post_action_state = &click_result["properties"]["post_action_state"];
+
+    assert!(!click_request["required"]
+        .as_array()
+        .expect("click required fields")
+        .contains(&json!("post_action_query")));
+    assert_eq!(post_action_query["properties"]["elements"]["maxItems"], 8);
+    assert_eq!(
+        post_action_query["properties"]["attributes"]["items"]["enum"],
+        json!(["presence", "focused", "enabled", "value"])
+    );
+    assert_eq!(
+        post_action_state["required"],
+        json!([
+            "status",
+            "elements",
+            "read_after_action_ms",
+            "unreadable_subtrees"
+        ])
+    );
+    assert_eq!(
+        post_action_state["properties"]["status"]["enum"],
+        json!([
+            "read",
+            "target_gone",
+            "tree_unreadable",
+            "deadline_exceeded"
+        ])
+    );
+    assert!(click_result["required"]
+        .as_array()
+        .expect("click result required fields")
+        .contains(&json!("unreadable_subtrees")));
+    assert_eq!(
+        wait["result_schema"]["properties"]["outcome"]["enum"],
+        json!(["predicate_satisfied", "timeout", "indeterminate"])
+    );
+    assert_eq!(
+        wait["result_schema"]["properties"]["settle_path"]["enum"],
+        json!(["poll_with_deadline"])
+    );
+    assert_eq!(
+        screenshot["request_schema"]["properties"]["region"]["description"],
+        "Rectangle cropped from the target window in the window's own pixels, with a top-left origin; single-window capture honors this rectangle."
     );
 }
 
