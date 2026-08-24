@@ -284,6 +284,8 @@ pub fn spawn_barred(
         let _ = wait_for_pid(pid);
         return Err(SpawnError::UnexpectedStop);
     }
+    #[cfg(test)]
+    test_parent_death_checkpoint(ParentDeathCheckpoint::AfterInitialStop, pid);
 
     // A launcher death before SEIZE leaves this child stopped before execve, so it
     // never maps or runs the browser rather than escaping as an unattended process.
@@ -388,6 +390,7 @@ pub fn spawn_barred(
 #[cfg(test)]
 #[derive(Clone, Copy)]
 enum ParentDeathCheckpoint {
+    AfterInitialStop,
     AfterSeizeBeforeExec,
     AfterExecStop,
 }
@@ -395,6 +398,7 @@ enum ParentDeathCheckpoint {
 #[cfg(test)]
 fn test_parent_death_checkpoint(checkpoint: ParentDeathCheckpoint, pid: c_int) {
     let expected = match checkpoint {
+        ParentDeathCheckpoint::AfterInitialStop => "after-initial-stop",
         ParentDeathCheckpoint::AfterSeizeBeforeExec => "after-seize-before-exec",
         ParentDeathCheckpoint::AfterExecStop => "after-exec-stop",
     };
@@ -487,6 +491,19 @@ fn child_exec(
         }
         for fd in 5..descriptor_limit {
             libc::close(fd);
+        }
+        // Orphaned stopped groups receive SIGHUP then SIGCONT; inherited handling would
+        // choose between termination and a pre-exec escape instead of failing closed.
+        let mut default_sighup: libc::sigaction = std::mem::zeroed();
+        default_sighup.sa_sigaction = libc::SIG_DFL;
+        if libc::sigaction(libc::SIGHUP, &default_sighup, std::ptr::null_mut()) != 0 {
+            libc::_exit(113);
+        }
+        let mut sighup_mask: libc::sigset_t = std::mem::zeroed();
+        if libc::sigaddset(&mut sighup_mask, libc::SIGHUP) != 0
+            || libc::sigprocmask(libc::SIG_UNBLOCK, &sighup_mask, std::ptr::null_mut()) != 0
+        {
+            libc::_exit(114);
         }
         if libc::raise(libc::SIGSTOP) != 0 {
             libc::_exit(111);
@@ -791,6 +808,7 @@ mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
 
     fn pipe() -> (OwnedFd, OwnedFd) {
         let mut descriptors = [-1; 2];
@@ -817,6 +835,73 @@ mod tests {
             response_write.as_raw_fd(),
         )
         .expect("spawn barred sleep")
+    }
+
+    fn sighup_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct SighupState {
+        disposition: libc::sighandler_t,
+        mask: libc::sigset_t,
+    }
+
+    impl Drop for SighupState {
+        fn drop(&mut self) {
+            // SAFETY: these values came from this process immediately before the test mutation.
+            unsafe {
+                libc::sigprocmask(libc::SIG_SETMASK, &self.mask, std::ptr::null_mut());
+                libc::signal(libc::SIGHUP, self.disposition);
+            }
+        }
+    }
+
+    fn ignore_and_block_sighup() -> SighupState {
+        // SAFETY: the test serializes its process-wide signal state and restores it in Drop.
+        unsafe {
+            let disposition = libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            assert_ne!(disposition, libc::SIG_ERR, "ignore SIGHUP");
+
+            let mut mask = std::mem::zeroed();
+            assert_eq!(
+                libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask),
+                0,
+                "read signal mask"
+            );
+            let mut blocked = mask;
+            assert_eq!(libc::sigaddset(&mut blocked, libc::SIGHUP), 0, "add SIGHUP");
+            assert_eq!(
+                libc::sigprocmask(libc::SIG_SETMASK, &blocked, std::ptr::null_mut()),
+                0,
+                "block SIGHUP"
+            );
+            SighupState { disposition, mask }
+        }
+    }
+
+    struct StoppedChild {
+        pid: u32,
+    }
+
+    impl Drop for StoppedChild {
+        fn drop(&mut self) {
+            // SAFETY: this is the exact PID reported by the checkpoint helper.
+            unsafe {
+                libc::kill(self.pid as c_int, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn proc_signal_mask(pid: u32, field: &str) -> u64 {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("read child status");
+        let value = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .expect("signal mask field");
+        u64::from_str_radix(value.trim(), 16).expect("hex signal mask")
     }
 
     fn wait_for_target_death(report: &Path) {
@@ -856,6 +941,48 @@ mod tests {
             .expect("run owner helper");
         assert_eq!(status.code(), Some(0), "owner helper failed: {status}");
         wait_for_target_death(&report);
+        let _ = fs::remove_file(report);
+    }
+
+    #[test]
+    fn stopped_child_resets_inherited_sighup_disposition_and_mask() {
+        let _lock = sighup_state_lock();
+        let _sighup_state = ignore_and_block_sighup();
+        let report = std::env::temp_dir().join(format!(
+            "cerebellum-linux-sighup-state-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&report);
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("launch::tests::owner_process_exits_at_requested_checkpoint")
+            .env("CEREBELLUM_LINUX_BARRIER_CHECKPOINT", "after-initial-stop")
+            .env("CEREBELLUM_LINUX_BARRIER_HELPER_REPORT", &report)
+            .status()
+            .expect("run owner helper");
+        assert_eq!(status.code(), Some(0), "owner helper failed: {status}");
+
+        let child = StoppedChild {
+            pid: fs::read_to_string(&report)
+                .expect("helper wrote child pid")
+                .parse()
+                .expect("numeric child pid"),
+        };
+        let ignored = proc_signal_mask(child.pid, "SigIgn:");
+        let blocked = proc_signal_mask(child.pid, "SigBlk:");
+        assert_eq!(
+            ignored & 1,
+            0,
+            "child inherited an ignored SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+        );
+        assert_eq!(
+            blocked & 1,
+            0,
+            "child inherited a blocked SIGHUP (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+        );
+
+        drop(child);
         let _ = fs::remove_file(report);
     }
 
