@@ -4,6 +4,7 @@ members = [
     "crates/cerebellum",
     "crates/cerebellum-core",
     "crates/cerebellum-computer",
+    "crates/cerebellum-linux",
     "crates/cerebellum-macos",
 ]
 

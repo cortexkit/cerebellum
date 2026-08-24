@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "cerebellum-computer",
  "cerebellum-core",
+ "cerebellum-linux",
  "cerebellum-macos",
  "serde",
  "serde_json",
@@ -81,6 +82,14 @@ dependencies = [
  "sha2",
  "subc-jsonc",
  "subc-protocol",
+]
+
+[[package]]
+name = "cerebellum-linux"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
 ]
 
 [[package]]
