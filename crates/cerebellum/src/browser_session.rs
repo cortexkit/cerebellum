@@ -136,6 +136,40 @@ impl CleanupStage {
     }
 }
 
+/// An observation made while session resources were being released.
+///
+/// `Complete` intentionally makes no persistence claim. Chrome does not expose
+/// whether every profile write succeeded, so teardown can only name evidence
+/// that puts durable state at risk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCleanupOutcome {
+    Complete,
+    DurableStateAtRisk {
+        local_state_not_written_since_launch: bool,
+        profile_not_writable: bool,
+    },
+}
+
+impl SessionCleanupOutcome {
+    fn failed_signals(self) -> Option<Vec<&'static str>> {
+        let Self::DurableStateAtRisk {
+            local_state_not_written_since_launch,
+            profile_not_writable,
+        } = self
+        else {
+            return None;
+        };
+        let mut signals = Vec::with_capacity(2);
+        if local_state_not_written_since_launch {
+            signals.push("local_state_not_written_since_launch");
+        }
+        if profile_not_writable {
+            signals.push("profile_not_writable");
+        }
+        Some(signals)
+    }
+}
+
 pub type LaunchedBrowser = (Box<dyn OwnedBrowserProcess>, Box<dyn SessionCleanup>);
 
 pub trait BrowserSessionLauncher: Send + Sync {
@@ -263,7 +297,7 @@ pub trait SessionCleanup: Send {
         let _ = outcome;
     }
 
-    fn after_reap(&mut self) -> Result<(), CleanupStage>;
+    fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage>;
 }
 
 struct ReadySession {
@@ -273,6 +307,7 @@ struct ReadySession {
     pending_operations: usize,
     terminal: Option<BrowserSessionTerminalOutcome>,
     cleanup_failure: Option<CleanupStage>,
+    cleanup_outcome: Option<SessionCleanupOutcome>,
     process: Option<Box<dyn OwnedBrowserProcess>>,
     cleanup: Option<Box<dyn SessionCleanup>>,
 }
@@ -285,6 +320,17 @@ impl ReadySession {
                 "browser_session_id": self.browser_session_id,
                 "profile_disposition": self.disposition.as_str(),
                 "stage": stage.as_str(),
+            });
+        }
+        if let Some(failed_signals) = self
+            .cleanup_outcome
+            .and_then(SessionCleanupOutcome::failed_signals)
+        {
+            return json!({
+                "outcome": "durable_state_at_risk",
+                "browser_session_id": self.browser_session_id,
+                "profile_disposition": self.disposition.as_str(),
+                "failed_signals": failed_signals,
             });
         }
         if let Some(outcome) = self.terminal {
@@ -483,6 +529,7 @@ impl BrowserSessions {
             pending_operations: 0,
             terminal: None,
             cleanup_failure: None,
+            cleanup_outcome: None,
             process: None,
             cleanup: None,
         });
@@ -882,9 +929,12 @@ impl BrowserSessions {
         let mut session = route.active.take().expect("matched active session");
         session.process = Some(process);
         session.cleanup = cleanup;
-        if let Err(stage) = outcome {
-            session.cleanup_failure = Some(stage);
-            session.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
+        match outcome {
+            Ok(cleanup_outcome) => session.cleanup_outcome = Some(cleanup_outcome),
+            Err(stage) => {
+                session.cleanup_failure = Some(stage);
+                session.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
+            }
         }
         route.retained.push(session);
         wake.notify_all();
@@ -897,6 +947,16 @@ fn close_result(session: &ReadySession) -> Value {
             "outcome": "cleanup_failure",
             "browser_session_id": session.browser_session_id,
             "stage": stage.as_str(),
+        });
+    }
+    if let Some(failed_signals) = session
+        .cleanup_outcome
+        .and_then(SessionCleanupOutcome::failed_signals)
+    {
+        return json!({
+            "outcome": "durable_state_at_risk",
+            "browser_session_id": session.browser_session_id,
+            "failed_signals": failed_signals,
         });
     }
     json!({
@@ -1084,7 +1144,7 @@ mod tests {
     struct FailingCleanup(CleanupStage);
 
     impl SessionCleanup for FailingCleanup {
-        fn after_reap(&mut self) -> Result<(), CleanupStage> {
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
             Err(self.0)
         }
     }
@@ -1093,9 +1153,9 @@ mod tests {
     struct RecordingCleanup(Arc<Mutex<Vec<&'static str>>>);
 
     impl SessionCleanup for RecordingCleanup {
-        fn after_reap(&mut self) -> Result<(), CleanupStage> {
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
             self.0.lock().unwrap().push("cleanup");
-            Ok(())
+            Ok(SessionCleanupOutcome::Complete)
         }
     }
 
@@ -1106,8 +1166,8 @@ mod tests {
             self.0.lock().unwrap().push(outcome);
         }
 
-        fn after_reap(&mut self) -> Result<(), CleanupStage> {
-            Ok(())
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            Ok(SessionCleanupOutcome::Complete)
         }
     }
 

@@ -295,9 +295,11 @@ struct RecordingCleanup {
 }
 
 impl SessionCleanup for RecordingCleanup {
-    fn after_reap(&mut self) -> Result<(), CleanupStage> {
+    fn after_reap(
+        &mut self,
+    ) -> Result<cerebellum::browser_session::SessionCleanupOutcome, CleanupStage> {
         self.effects.lock().unwrap().push("cleanup");
-        Ok(())
+        Ok(cerebellum::browser_session::SessionCleanupOutcome::Complete)
     }
 }
 
