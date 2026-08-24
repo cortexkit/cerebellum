@@ -20,9 +20,9 @@ use serde_json::{json, Value};
 use crate::browser_launch::{
     recover_browser_launches, AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome,
     BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
-    ExecutableIdentityClaim, LaunchProfileIdentity, LaunchRouteIdentity, MacOsProcessLauncher,
-    OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
-    OrphanProfileCustodyFailure, ProfileBoundLaunch,
+    ExecutableIdentityClaim, LaunchAttestationRecord, LaunchProfileIdentity, LaunchRouteIdentity,
+    MacOsProcessLauncher, OrphanBrowserProcessControl, OrphanProcessControlFailure,
+    OrphanProfileCustody, OrphanProfileCustodyFailure, ProfileBoundLaunch,
 };
 use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
@@ -132,7 +132,8 @@ impl ProductionLaunchService {
             .expected_identity
             .as_deref()
             .ok_or_else(|| json!({"outcome": "internal_failure"}))?;
-        let expected_identity = verify_configured_executable(executable, expected)?;
+        let (expected_identity, pre_spawn_identity_verification) =
+            verify_configured_executable(executable, expected)?;
         let context =
             stamped_context(accepted).map_err(|_| json!({"outcome": "authorization_denied"}))?;
         if context.profile_disposition() == crate::profile::ProfileDisposition::None {
@@ -266,6 +267,7 @@ impl ProductionLaunchService {
             arguments,
             environment: Vec::new(),
             verified_executable_identity: expected_identity,
+            pre_spawn_identity_verification,
         };
         let (command_parent, command_child) = match pipe_pair() {
             Ok(pair) => pair,
@@ -309,6 +311,7 @@ impl ProductionLaunchService {
         drop(journal_guard);
 
         Ok(ReadyProductionBrowser {
+            attestation: ready.attestation,
             process: Some(ready.process),
             pipe: Some(ready.pipe),
             transport: Some(ready.transport),
@@ -495,6 +498,7 @@ fn release_orphan_profile_custody_at(
 }
 
 pub struct ReadyProductionBrowser {
+    attestation: LaunchAttestationRecord,
     process: Option<cerebellum_macos::ReleasedChild>,
     pipe: Option<UnixCdpPipe>,
     transport: Option<CdpTransport>,
@@ -503,9 +507,14 @@ pub struct ReadyProductionBrowser {
 }
 
 impl ReadyProductionBrowser {
+    pub fn attestation(&self) -> &LaunchAttestationRecord {
+        &self.attestation
+    }
+
     pub fn into_parts(self) -> LaunchedBrowser {
-        (
-            Box::new(ProductionProcess {
+        LaunchedBrowser {
+            executable_identity_checkpoints: self.attestation.executable_identity_checkpoints,
+            process: Box::new(ProductionProcess {
                 process: self.process,
                 driver: Some(CdpNavigationDriver::new(
                     self.pipe.expect("ready browser owns its CDP pipe"),
@@ -515,8 +524,8 @@ impl ReadyProductionBrowser {
                 )),
                 reaped: false,
             }),
-            Box::new(self.cleanup.expect("ready browser owns profile cleanup")),
-        )
+            cleanup: Box::new(self.cleanup.expect("ready browser owns profile cleanup")),
+        }
     }
 }
 

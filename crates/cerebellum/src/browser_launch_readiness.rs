@@ -537,9 +537,9 @@ mod tests {
 
     use super::*;
     use crate::browser_launch::{
-        AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentityClaim,
-        LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
-        LaunchRouteIdentity,
+        AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentityCheckpoints,
+        ExecutableIdentityClaim, LaunchGenerationRecord, LaunchIdentityMismatchRecord,
+        LaunchProfileIdentity, LaunchRouteIdentity, PreSpawnIdentityVerification,
     };
 
     fn instant() -> Instant {
@@ -908,6 +908,7 @@ mod tests {
             arguments: vec![OsString::from("--remote-debugging-pipe")],
             environment: vec![],
             verified_executable_identity: executable_identity(),
+            pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
         }
     }
 
@@ -934,6 +935,7 @@ mod tests {
                 },
             },
             observed_executable_identity: request.verified_executable_identity,
+            executable_identity_checkpoints: ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
         }
     }
 
@@ -1216,7 +1218,7 @@ mod live_chrome_test {
     use crate::browser_launch::{
         AttestedLaunchRequest, AuthorizedLaunchIntent, ExecutableIdentityClaim,
         LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
-        LaunchRouteIdentity, MacOsProcessLauncher,
+        LaunchRouteIdentity, MacOsProcessLauncher, PreSpawnIdentityVerification,
     };
 
     struct PassingJournal;
@@ -1280,6 +1282,7 @@ mod live_chrome_test {
             arguments,
             environment: Vec::new(),
             verified_executable_identity: identity,
+            pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
         }
     }
 
