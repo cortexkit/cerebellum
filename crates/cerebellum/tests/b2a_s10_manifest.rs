@@ -177,10 +177,9 @@ fn the_manifest_forbids_this_module_from_reaching_a_credential_store() {
     // claiming both is a self-contradiction, and the fleet lint reports it as
     // one. Asserted here so it is caught at our own gate rather than theirs.
     assert!(
-        !capabilities
-            .requires
-            .iter()
-            .any(|requirement| capabilities.must_never_reach.contains(&requirement.capability)),
+        !capabilities.requires.iter().any(|requirement| capabilities
+            .must_never_reach
+            .contains(&requirement.capability)),
         "a capability is both required and forbidden, which is a manifest that contradicts \
          itself"
     );

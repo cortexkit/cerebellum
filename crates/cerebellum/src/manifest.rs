@@ -32,7 +32,7 @@ use crate::browser_type::{
     BROWSER_EVIDENCE_ELIGIBILITY_SHA256, BROWSER_TYPE_TOOL,
 };
 use crate::journal::JournalConfig;
-use subc_protocol::manifest::{CapabilityDeclarations};
+use subc_protocol::manifest::CapabilityDeclarations;
 use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
     ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
