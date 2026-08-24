@@ -176,8 +176,17 @@ impl DesktopIndependentWindowFilter {
     }
 }
 
+/// A rectangle in the target window's own pixel space, origin at its top-left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowCaptureRegion {
+    pub x_px: u32,
+    pub y_px: u32,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
 /// A backend capture request always carries the grant, even though the window
-/// list was already filtered.  This makes the identity binding visible at the
+/// list was already filtered. This makes the identity binding visible at the
 /// platform seam and lets a native implementation re-check it before calling
 /// `SCContentFilter(desktopIndependentWindow:)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +194,8 @@ pub struct WindowCaptureRequest {
     pub target: ProcessGrant,
     pub filter: DesktopIndependentWindowFilter,
     pub captured_at_ms: u64,
+    /// When set, the backend must capture this rectangle, not the whole window.
+    pub region: Option<WindowCaptureRegion>,
 }
 
 /// Image data may stay in memory for tests or be represented by an artifact
@@ -456,6 +467,15 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         &self.backend
     }
 
+    /// The windows the controller last enumerated for this grant.
+    ///
+    /// Used by the serving handler to check a requested region against the
+    /// window's own size before asking the backend to capture it.
+    pub fn enumerated_windows(&mut self, now_ms: u64) -> Result<&[EnumeratedWindow], CaptureError> {
+        self.refresh_if_needed(now_ms)?;
+        Ok(&self.windows)
+    }
+
     pub fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
     }
@@ -475,6 +495,15 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
     /// Capture one scoped frame.  A permission loss observed at this boundary
     /// stops frames immediately and starts asynchronous teardown.
     pub fn capture_scoped(&mut self, now_ms: u64) -> Result<ScopedCaptureResult, CaptureError> {
+        self.capture_scoped_with_region(now_ms, None)
+    }
+
+    /// Capture one scoped frame, optionally restricted to a window-local region.
+    pub fn capture_scoped_with_region(
+        &mut self,
+        now_ms: u64,
+        region: Option<WindowCaptureRegion>,
+    ) -> Result<ScopedCaptureResult, CaptureError> {
         self.ensure_capture_permission(now_ms)?;
         if matches!(
             self.state,
@@ -493,6 +522,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
                 target: self.target.clone(),
                 filter: DesktopIndependentWindowFilter::new(window.window_id.clone()),
                 captured_at_ms: now_ms,
+                region,
             };
             let frame = self
                 .backend
@@ -873,10 +903,22 @@ impl CaptureBackend for InMemoryCaptureBackend {
             .get(&window.window_id)
             .cloned()
             .unwrap_or_else(|| CaptureArtifact::Bytes(Vec::new()));
+        let (frame, artifact) = match request.region {
+            Some(region) => (
+                WindowFrame {
+                    x: window.frame.x.saturating_add(region.x_px as i32),
+                    y: window.frame.y.saturating_add(region.y_px as i32),
+                    width: region.width_px,
+                    height: region.height_px,
+                },
+                honour_capture_region(artifact, window.frame, region)?,
+            ),
+            None => (window.frame, artifact),
+        };
         Ok(WindowCaptureFrame {
             owner_identity: window.owner_identity.clone(),
             owner_identity_verified: window.owner_identity_verified,
-            frame: window.frame,
+            frame,
             captured_at_ms: request.captured_at_ms,
             artifact,
             accessibility_root: window.accessibility_root.clone(),
@@ -912,6 +954,50 @@ impl CaptureBackend for InMemoryCaptureBackend {
             }
         })
     }
+}
+
+fn honour_capture_region(
+    artifact: CaptureArtifact,
+    window: WindowFrame,
+    region: WindowCaptureRegion,
+) -> Result<CaptureArtifact, BackendError> {
+    let CaptureArtifact::Bytes(bytes) = artifact else {
+        return Ok(artifact);
+    };
+    let expected = (window.width as usize)
+        .checked_mul(window.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected == Some(bytes.len()) {
+        let right = region
+            .x_px
+            .checked_add(region.width_px)
+            .filter(|right| *right <= window.width);
+        let bottom = region
+            .y_px
+            .checked_add(region.height_px)
+            .filter(|bottom| *bottom <= window.height);
+        if right.is_none() || bottom.is_none() {
+            return Err(BackendError::Capture(
+                "window-local capture region lies outside the window".into(),
+            ));
+        }
+        let stride = window.width as usize * 4;
+        let row_bytes = region.width_px as usize * 4;
+        let mut cropped = Vec::with_capacity(row_bytes * region.height_px as usize);
+        for row in 0..region.height_px as usize {
+            let start = (region.y_px as usize + row) * stride + region.x_px as usize * 4;
+            cropped.extend_from_slice(&bytes[start..start + row_bytes]);
+        }
+        return Ok(CaptureArtifact::Bytes(cropped));
+    }
+    // An in-memory fixture may use encoded bytes that cannot be cropped here.
+    // Preserve the region dimensions without relabelling the original image.
+    Ok(CaptureArtifact::Bytes(vec![
+        0;
+        region.width_px as usize
+            * region.height_px as usize
+            * 4
+    ]))
 }
 
 #[cfg(test)]
