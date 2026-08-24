@@ -4,15 +4,16 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::browser_launch::ExecutableIdentityClaim;
+use crate::browser_launch::{ExecutableIdentityClaim, PreSpawnIdentityVerification};
 
 pub fn verify_configured_executable(
     path: &Path,
     expected: &str,
-) -> Result<ExecutableIdentityClaim, Value> {
+) -> Result<(ExecutableIdentityClaim, PreSpawnIdentityVerification), Value> {
     #[cfg(target_os = "macos")]
     {
         verify_code_signed_executable(Path::new("/usr/bin/codesign"), path, expected)
+            .map(|identity| (identity, PreSpawnIdentityVerification::Established))
     }
 
     #[cfg(not(target_os = "macos"))]

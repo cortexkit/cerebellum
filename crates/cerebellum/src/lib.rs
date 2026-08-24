@@ -2258,7 +2258,11 @@ async fn handle_browser_control(
                 Err(json!({"outcome": "profile_storage_unavailable"}))
             };
             match launch {
-                Ok((process, cleanup)) => {
+                Ok(browser_session::LaunchedBrowser {
+                    process,
+                    cleanup,
+                    executable_identity_checkpoints,
+                }) => {
                     let Some((id, lease, cancelled)) = planes.sessions.establish_ready(
                         &accepted.identity.conversation_key,
                         accepted.identity.profile_disposition,
@@ -2312,6 +2316,7 @@ async fn handle_browser_control(
                         "outcome": "launched",
                         "browser_session_id": id,
                         "profile_disposition": accepted.identity.profile_disposition.as_str(),
+                        "executable_identity_checkpoints": executable_identity_checkpoints,
                         "lease": lease.as_json(clock, std::time::SystemTime::now()),
                     })
                 }

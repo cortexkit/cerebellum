@@ -4,10 +4,11 @@ use std::time::Duration;
 use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity, OBSERVE};
 use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::{BrowserPlane, Tracker};
+use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
 use cerebellum::browser_session::{
     BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher, CleanupStage, ClickDriveError,
-    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
-    SessionCleanup,
+    LaunchedBrowser, NavigationDriveError, NavigationWait, OwnedBrowserProcess,
+    ProcessControlFailure, SessionCleanup,
 };
 use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
@@ -173,18 +174,19 @@ impl BrowserSessionLauncher for RecordingLauncher {
         &self,
         _: &cerebellum_core::identity::AcceptedBindFacts,
         _: &str,
-    ) -> Result<(Box<dyn OwnedBrowserProcess>, Box<dyn SessionCleanup>), Value> {
+    ) -> Result<LaunchedBrowser, Value> {
         *self.launches.lock().unwrap() += 1;
-        Ok((
-            Box::new(RecordingProcess {
+        Ok(LaunchedBrowser {
+            process: Box::new(RecordingProcess {
                 effects: Arc::clone(&self.effects),
                 clicked: false,
                 hazardous_target: self.hazardous_target,
             }),
-            Box::new(RecordingCleanup {
+            cleanup: Box::new(RecordingCleanup {
                 effects: Arc::clone(&self.effects),
             }),
-        ))
+            executable_identity_checkpoints: ExecutableIdentityCheckpoints::AfterExecOnly,
+        })
     }
 }
 
@@ -195,7 +197,7 @@ impl BrowserSessionLauncher for RecoveryFailedLauncher {
         &self,
         _: &cerebellum_core::identity::AcceptedBindFacts,
         _: &str,
-    ) -> Result<(Box<dyn OwnedBrowserProcess>, Box<dyn SessionCleanup>), Value> {
+    ) -> Result<LaunchedBrowser, Value> {
         Err(json!({
             "outcome": "internal_failure",
             "reason_code": "browser_launch_recovery_failed",
@@ -363,6 +365,10 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     let launched: Value = serde_json::from_slice(&launched.body).unwrap();
     assert_eq!(launched["outcome"], "launched");
     assert_eq!(launched["profile_disposition"], "durable");
+    assert_eq!(
+        launched["executable_identity_checkpoints"],
+        "after_exec_only"
+    );
     assert!(launched["browser_session_id"]
         .as_str()
         .is_some_and(|id| !id.is_empty()));

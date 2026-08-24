@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::browser::navigation::BrowserSnapshotObservation;
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
+use crate::browser_launch::ExecutableIdentityCheckpoints;
 use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 use cerebellum_core::clock::{MonoInstant, MonotonicClock};
 use serde_json::{json, Value};
@@ -170,7 +171,12 @@ impl SessionCleanupOutcome {
     }
 }
 
-pub type LaunchedBrowser = (Box<dyn OwnedBrowserProcess>, Box<dyn SessionCleanup>);
+/// A successful browser launch and the executable-identity checks it completed.
+pub struct LaunchedBrowser {
+    pub process: Box<dyn OwnedBrowserProcess>,
+    pub cleanup: Box<dyn SessionCleanup>,
+    pub executable_identity_checkpoints: ExecutableIdentityCheckpoints,
+}
 
 pub trait BrowserSessionLauncher: Send + Sync {
     fn launch(

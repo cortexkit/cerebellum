@@ -102,6 +102,34 @@ impl ExecutableIdentityClaim {
     }
 }
 
+/// Executable identity checks completed before returning a successful browser launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutableIdentityCheckpoints {
+    /// The configured executable's identity matched before spawning, and the
+    /// image mapped into the new process matched again before it could run.
+    BeforeSpawnAndAfterExec,
+    /// The executable image could not be identified before spawning, so only
+    /// the image mapped into the new process established identity before it ran.
+    AfterExecOnly,
+}
+
+/// Whether launch preparation established executable identity before spawning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreSpawnIdentityVerification {
+    Established,
+    Unavailable,
+}
+
+impl PreSpawnIdentityVerification {
+    fn completed_by_after_exec(self) -> ExecutableIdentityCheckpoints {
+        match self {
+            Self::Established => ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
+            Self::Unavailable => ExecutableIdentityCheckpoints::AfterExecOnly,
+        }
+    }
+}
+
 /// The exact executable and argument bytes submitted to the platform launcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +200,7 @@ pub struct LaunchGenerationRecord {
 pub struct LaunchAttestationRecord {
     pub generation: LaunchGenerationRecord,
     pub observed_executable_identity: ExecutableIdentityClaim,
+    pub executable_identity_checkpoints: ExecutableIdentityCheckpoints,
 }
 
 /// Durable result recorded when the launched browser session ends.
@@ -275,7 +304,7 @@ pub struct LaunchIdentityMismatchRecord {
 }
 
 /// Inputs whose route, profile, executable, arguments, and environment have
-/// already been authorized and verified before process creation begins.
+/// already been authorized before process creation begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedLaunchRequest {
     pub launch_attempt_id: String,
@@ -286,6 +315,7 @@ pub struct AttestedLaunchRequest {
     pub arguments: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
     pub verified_executable_identity: ExecutableIdentityClaim,
+    pub pre_spawn_identity_verification: PreSpawnIdentityVerification,
 }
 
 impl AttestedLaunchRequest {
@@ -495,6 +525,9 @@ where
     let attestation = LaunchAttestationRecord {
         generation,
         observed_executable_identity: observed,
+        executable_identity_checkpoints: request
+            .pre_spawn_identity_verification
+            .completed_by_after_exec(),
     };
     if journal
         .commit_attestation(&mut handle, &attestation)
@@ -1337,6 +1370,7 @@ mod tests {
             arguments: vec![OsString::from("--remote-debugging-pipe")],
             environment: vec![],
             verified_executable_identity: identity(),
+            pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
         }
     }
 
@@ -1360,6 +1394,7 @@ mod tests {
         let attestation = LaunchAttestationRecord {
             generation,
             observed_executable_identity: identity(),
+            executable_identity_checkpoints: ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
         };
         journal
             .commit_attestation(&mut handle, &attestation)
@@ -1401,13 +1436,19 @@ mod tests {
         let result = launch_attested_with(&mut journal, &mut launcher, &request());
 
         match result {
-            Ok(released) => assert_eq!(
-                released.attestation.generation.process_generation,
-                BrowserProcessGeneration {
-                    pid: 42,
-                    start_time_micros: 77,
-                }
-            ),
+            Ok(released) => {
+                assert_eq!(
+                    released.attestation.generation.process_generation,
+                    BrowserProcessGeneration {
+                        pid: 42,
+                        start_time_micros: 77,
+                    }
+                );
+                assert_eq!(
+                    released.attestation.executable_identity_checkpoints,
+                    ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec
+                );
+            }
             Err(error) => panic!("expected release, got {error:?}"),
         }
         assert_eq!(
@@ -1421,6 +1462,21 @@ mod tests {
                 "released",
                 "barred_dropped",
             ]
+        );
+    }
+
+    #[test]
+    fn launch_without_pre_spawn_verification_records_after_exec_only() {
+        let (mut journal, mut launcher, _) = harness(FailJournalAt::Never, Ok(identity()));
+        let mut launch_request = request();
+        launch_request.pre_spawn_identity_verification = PreSpawnIdentityVerification::Unavailable;
+
+        let released = launch_attested_with(&mut journal, &mut launcher, &launch_request)
+            .expect("release after barred-image attestation");
+
+        assert_eq!(
+            released.attestation.executable_identity_checkpoints,
+            ExecutableIdentityCheckpoints::AfterExecOnly
         );
     }
 
@@ -1552,6 +1608,7 @@ mod tests {
         let attestation = LaunchAttestationRecord {
             generation,
             observed_executable_identity: identity(),
+            executable_identity_checkpoints: ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
         };
         journal
             .commit_attestation(&mut handle, &attestation)
@@ -1580,6 +1637,21 @@ mod tests {
         let decoded: LaunchAttestationRecord =
             serde_json::from_slice(&stored.opaque_bytes).expect("decode attestation");
         assert_eq!(decoded, attestation);
+
+        let mut serialized: serde_json::Value =
+            serde_json::from_slice(&stored.opaque_bytes).expect("decode attestation JSON");
+        assert_eq!(
+            serialized["executable_identity_checkpoints"],
+            "before_spawn_and_after_exec"
+        );
+        serialized
+            .as_object_mut()
+            .expect("attestation object")
+            .remove("executable_identity_checkpoints");
+        assert!(
+            serde_json::from_value::<LaunchAttestationRecord>(serialized).is_err(),
+            "durable attestation accepted a missing checkpoint disclosure"
+        );
     }
 
     fn reopened_dispatched_journal(
@@ -2045,6 +2117,47 @@ mod tests {
                 "raw macOS seam accumulated browser policy term {policy_term:?}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_real_launch_records_before_spawn_and_after_exec_checkpoints() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let executable = Path::new("/bin/sleep");
+        let (expected_identity, pre_spawn_identity_verification) =
+            crate::browser_executable_identity::verify_configured_executable(
+                executable,
+                "com.apple.sleep",
+            )
+            .expect("verify configured sleep executable before spawn");
+        let mut launch_request = request();
+        launch_request.executable = executable.to_path_buf();
+        launch_request.arguments = vec![OsString::from("30")];
+        launch_request.verified_executable_identity = expected_identity;
+        launch_request.pre_spawn_identity_verification = pre_spawn_identity_verification;
+
+        let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
+        let (_response_parent, response_child) = UnixStream::pair().expect("response pair");
+        let mut launcher =
+            MacOsProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        let mut journal = RecordingJournal {
+            events: Events::new(),
+            fail: FailJournalAt::Never,
+        };
+
+        let released = launch_attested_with(&mut journal, &mut launcher, &launch_request)
+            .expect("release pre-spawn-verified and re-attested image");
+
+        assert_eq!(
+            released.attestation.executable_identity_checkpoints,
+            ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec
+        );
+        released
+            .process
+            .terminate_and_reap()
+            .expect("reap released sleep fixture");
     }
 
     #[cfg(target_os = "macos")]
