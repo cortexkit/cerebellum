@@ -15,6 +15,7 @@ use crate::classification::{
     self, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
     NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
 };
+use crate::coordinate::{TransformInputs, ViewportObservation};
 use crate::snapshot_store::{
     truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
     MAX_NAME_BYTES, MAX_REFS, MAX_ROLE_BYTES, MAX_VALUE_BYTES,
@@ -36,6 +37,15 @@ pub struct BrowserSnapshotObservation {
     pub refs: Vec<RefRecord>,
     pub ax_truncated: bool,
     pub refs_truncated: bool,
+}
+
+/// Browser-reported image bytes and geometry bracketing one visual viewport capture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrowserScreenshotObservation {
+    pub image_png_b64: String,
+    pub before: ViewportObservation,
+    pub after: ViewportObservation,
+    pub invalidation_observed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +166,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )
     }
 
+    pub fn screenshot(
+        &mut self,
+        context_key: &str,
+        document_epoch: u64,
+        deadline_ms: u64,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, &mut clock)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn click_classified(
         &mut self,
@@ -206,6 +226,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.snapshot_with_clock(context_key, mode, deadline_ms, None, clock)
+    }
+
+    #[cfg(test)]
+    fn screenshot_for_test<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        document_epoch: u64,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, clock)
     }
 
     #[cfg(test)]
@@ -484,6 +515,108 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             ));
         }
         Ok(position)
+    }
+
+    fn screenshot_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        document_epoch: u64,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, clock)?;
+        let session_id = self
+            .attachment
+            .as_ref()
+            .filter(|attachment| attachment.context_key == context_key)
+            .map(|attachment| attachment.session_id.clone())
+            .ok_or(NavigationDriveError::CdpFailure)?;
+
+        let before =
+            self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
+        let mut params = Map::new();
+        params.insert("format".into(), Value::String("png".into()));
+        params.insert("fromSurface".into(), Value::Bool(true));
+        params.insert("captureBeyondViewport".into(), Value::Bool(false));
+        let captured = self.command(
+            "Page.captureScreenshot",
+            Some(params),
+            Some(session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let image_png_b64 = required_result_string(&captured, "data")?;
+        let after = self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
+
+        Ok(BrowserScreenshotObservation {
+            image_png_b64,
+            before,
+            after,
+            invalidation_observed: false,
+        })
+    }
+
+    fn read_viewport_observation<C: NavigationClock>(
+        &mut self,
+        document_epoch: u64,
+        session_id: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<ViewportObservation, NavigationDriveError> {
+        let metrics = self.command(
+            "Page.getLayoutMetrics",
+            None,
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let visual_viewport = metrics
+            .get("visualViewport")
+            .and_then(Value::as_object)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let x_input_css = required_result_number(visual_viewport, "offsetX")?;
+        let y_input_css = required_result_number(visual_viewport, "offsetY")?;
+        let width_input_css = required_result_number(visual_viewport, "clientWidth")?;
+        let height_input_css = required_result_number(visual_viewport, "clientHeight")?;
+        let visual_viewport_scale = required_result_number(visual_viewport, "scale")?;
+
+        let mut params = Map::new();
+        params.insert(
+            "expression".into(),
+            Value::String("window.devicePixelRatio".into()),
+        );
+        params.insert("returnByValue".into(), Value::Bool(true));
+        let evaluated = self.command(
+            "Runtime.evaluate",
+            Some(params),
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let remote_object = evaluated
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let device_scale_factor = required_result_number(remote_object, "value")?;
+
+        Ok(ViewportObservation::new(
+            document_epoch,
+            TransformInputs::from_values(
+                x_input_css,
+                y_input_css,
+                width_input_css,
+                height_input_css,
+                device_scale_factor,
+                visual_viewport_scale,
+            ),
+        ))
     }
 
     fn snapshot_with_clock<C: NavigationClock>(
@@ -1614,6 +1747,17 @@ fn required_result_string(
         .ok_or(NavigationDriveError::CdpFailure)
 }
 
+fn required_result_number(
+    result: &Map<String, Value>,
+    field: &str,
+) -> Result<f64, NavigationDriveError> {
+    result
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or(NavigationDriveError::CdpFailure)
+}
+
 pub(crate) trait NavigationClock {
     fn now(&mut self) -> Instant;
     fn sleep(&mut self, duration: Duration);
@@ -1806,6 +1950,65 @@ mod tests {
             node["parentId"] = json!(parent_id);
         }
         node
+    }
+
+    #[test]
+    fn screenshot_reads_device_and_visual_scales_from_cdp_responses() {
+        const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let viewport = json!({
+            "offsetX": 10.5,
+            "offsetY": 20.25,
+            "clientWidth": 320.0,
+            "clientHeight": 180.0,
+            "scale": 1.75
+        });
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{"visualViewport":viewport.clone()}}),
+            json!({"id":2,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
+            json!({"id":3,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
+            json!({"id":4,"sessionId":"session-own","result":{"visualViewport":viewport}}),
+            json!({"id":5,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let mut clock = FakeClock::new();
+
+        let screenshot = driver
+            .screenshot_for_test("route-own", 7, 100, &mut clock)
+            .expect("the CDP responses describe a coherent screenshot");
+
+        assert_eq!(screenshot.image_png_b64, ONE_BY_ONE_PNG_B64);
+        assert_eq!(screenshot.before, screenshot.after);
+        assert_eq!(screenshot.before.document_epoch, 7);
+        assert_eq!(screenshot.before.transform.x_input_css, 10.5);
+        assert_eq!(screenshot.before.transform.y_input_css, 20.25);
+        assert_eq!(screenshot.before.transform.width_input_css, 320.0);
+        assert_eq!(screenshot.before.transform.height_input_css, 180.0);
+        assert_eq!(screenshot.before.transform.device_scale_factor, 2.25);
+        assert_eq!(screenshot.before.transform.visual_viewport_scale, 1.75);
+        assert!(!screenshot.invalidation_observed);
+
+        let methods: Vec<_> = driver
+            .pipe
+            .writes
+            .iter()
+            .map(|write| &write["method"])
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "Page.getLayoutMetrics",
+                "Runtime.evaluate",
+                "Page.captureScreenshot",
+                "Page.getLayoutMetrics",
+                "Runtime.evaluate",
+            ]
+        );
+        assert_eq!(driver.pipe.writes[2]["params"]["format"], "png");
+        assert_eq!(driver.pipe.writes[2]["params"]["fromSurface"], true);
+        assert_eq!(
+            driver.pipe.writes[2]["params"]["captureBeyondViewport"],
+            false
+        );
     }
 
     #[test]

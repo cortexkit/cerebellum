@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::browser::navigation::{BrowserSnapshotObservation, CdpNavigationDriver};
+use crate::browser::navigation::{
+    BrowserScreenshotObservation, BrowserSnapshotObservation, CdpNavigationDriver,
+};
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
 use crate::browser_executable_identity::verify_configured_executable;
@@ -582,6 +584,18 @@ impl OwnedBrowserProcess for ProductionProcess {
                 current_origin,
                 deadline_ms,
             )
+    }
+
+    fn screenshot(
+        &mut self,
+        context_key: &str,
+        document_epoch: u64,
+        deadline_ms: u64,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .screenshot(context_key, document_epoch, deadline_ms)
     }
 
     fn click_classified(
