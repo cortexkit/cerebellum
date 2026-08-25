@@ -159,6 +159,7 @@ extern "C" {
     fn signal(signal: c_int, handler: *const c_void) -> *const c_void;
     fn getdtablesize() -> c_int;
     fn kill(pid: c_int, signal: c_int) -> c_int;
+    fn notify_is_valid_token(token: c_int) -> bool;
     /// The thread's `errno` location. Read directly because the safe wrapper
     /// allocates, and the one caller runs in a fork child where only
     /// async-signal-safe calls are permitted.
@@ -513,6 +514,8 @@ pub fn spawn_barred(
         .collect();
     envp.push(std::ptr::null_mut());
 
+    prepare_fork_handlers();
+
     let command_source = duplicate_descriptor(cdp_command_read_fd)?;
     let response_source = duplicate_descriptor(cdp_response_write_fd)?;
     let (death_read, death_write) = create_pipe()?;
@@ -806,6 +809,17 @@ fn prepare_spawn(
     Ok((actions, attributes))
 }
 
+fn prepare_fork_handlers() {
+    // libnotify installs a child-side `fork` handler backed by lazily initialized
+    // once-state. If another thread starts that initialization while `fork`
+    // snapshots the process, the child inherits an in-progress gate whose owner
+    // thread no longer exists. libSystem detects that gate in `_notify_fork_child`
+    // and kills the child before `fork` returns. This side-effect-free public
+    // query initializes libnotify's process-global state before the guardian can
+    // enter the child side of `fork`.
+    let _ = unsafe { notify_is_valid_token(0) };
+}
+
 fn guardian_main(death_read: RawFd, target_pid: c_int, descriptor_limit: c_int) -> ! {
     // Only async-signal-safe calls are allowed here: another thread may have held
     // any userspace lock when `fork` copied the process. Closing every inherited
@@ -818,20 +832,10 @@ fn guardian_main(death_read: RawFd, target_pid: c_int, descriptor_limit: c_int) 
     }
 
     let mut command = 0u8;
-    // RETRY ON EINTR. A signal arriving while this read is parked returns -1
-    // without consuming anything, and treating that as "no release command"
-    // makes the guardian KILL a target the launcher was about to release.
-    //
-    // Unproven as the cause of the intermittent broken-pipe failure seen in
-    // full workspace runs, and kept because it is a defect on its own terms:
-    // an interrupted blocking read must be retried, and this one destroys a
-    // process if it is not. Proving it needs a signal that actually interrupts,
-    // which means a handler installed WITHOUT SA_RESTART -- `signal()` on this
-    // platform sets restart semantics, so a test would have to reach for
-    // `sigaction`. Recorded rather than done.
-    //
-    // `errno` is read through the raw location because the safe wrapper is not
-    // async-signal-safe and this runs in a fork child.
+    // A signal may interrupt this read without consuming the command. Retry
+    // rather than treating that interruption as a command failure and killing a
+    // target the launcher was about to release. `errno` is read through the raw
+    // location because the safe wrapper is not async-signal-safe in a fork child.
     let received = loop {
         // SAFETY: a one-byte buffer this frame owns, and a descriptor kept open
         // above.
