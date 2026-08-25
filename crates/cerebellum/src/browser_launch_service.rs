@@ -1240,7 +1240,7 @@ mod executable_identity_launch_tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod cleanup_ordering_tests {
     use super::*;
 
@@ -1257,6 +1257,7 @@ mod cleanup_ordering_tests {
     /// step failed left a `.lock` file behind, and the next launch was refused
     /// `profile_busy` naming a holder that no longer existed.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_journal_failure_still_releases_the_profile_lock() {
         let root = std::env::temp_dir().join(format!(
             "ck-cleanup-order-{}-{}",
@@ -1746,5 +1747,71 @@ mod orphan_recovery_tests {
                 "reason_code": "browser_launch_recovery_failed",
             }))
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_orphan_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn linux_orphan_control_observes_and_reaps_the_exact_generation() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn orphan-control fixture");
+        let pid = child.id();
+        let start_time = match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
+            other => panic!("unexpected fixture generation reading: {other:?}"),
+        };
+        let mut control = LinuxOrphanProcessControl {
+            reap_deadline: Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            control.observed_start_time_micros(pid),
+            Ok(Some(start_time))
+        );
+        control
+            .terminate_and_reap(BrowserProcessGeneration {
+                pid,
+                start_time_micros: start_time,
+            })
+            .expect("terminate exact orphan generation");
+        assert_eq!(
+            cerebellum_linux::process_start_time(pid),
+            cerebellum_linux::ProcessStartTime::NoSuchProcess
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn linux_orphan_control_does_not_signal_a_different_generation() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn generation-mismatch fixture");
+        let pid = child.id();
+        let start_time = match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
+            other => panic!("unexpected fixture generation reading: {other:?}"),
+        };
+        let mut control = LinuxOrphanProcessControl {
+            reap_deadline: Duration::from_secs(1),
+        };
+
+        control
+            .terminate_and_reap(BrowserProcessGeneration {
+                pid,
+                start_time_micros: start_time.saturating_sub(1),
+            })
+            .expect("mismatched generation is already gone-or-replaced");
+        assert_eq!(
+            cerebellum_linux::process_start_time(pid),
+            cerebellum_linux::ProcessStartTime::Started(start_time)
+        );
+        child.kill().expect("clean up mismatch fixture");
+        let _ = child.wait();
     }
 }

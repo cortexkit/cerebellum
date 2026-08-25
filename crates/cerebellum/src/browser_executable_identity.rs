@@ -166,7 +166,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn malformed_configured_digest_remains_unverifiable() {
-        let refusal = verify_configured_executable(Path::new("/bin/sh"), "configured-identity")
+        let refusal = verify_configured_executable(Path::new("/bin/sh"), &"g".repeat(64))
             .expect_err("an unusable digest must refuse");
 
         assert_eq!(refusal["outcome"], "identity_unverifiable");

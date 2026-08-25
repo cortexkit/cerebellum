@@ -78,8 +78,11 @@ impl ExecutableIdentityClaim {
     /// reported as "the identity differed" when the truth is that nothing
     /// compared it. That is the collapse this module has removed three times.
     ///
-    /// Comparing a digest is not the same as producing one: Linux reads the
-    /// final mapped image to construct `ImageDigest` after following execs.
+    /// Comparing a digest is not the same as producing one: Linux reads mapped
+    /// images and attests the first image whose digest matches the configured
+    /// identity. The configured digest must name the final binary: pinning a
+    /// wrapper's digest attests and releases that wrapper before it can exec
+    /// the real browser outside this barrier.
     pub fn matches_configured(&self, expected: &str) -> bool {
         match self {
             Self::CodeSigned {
@@ -1047,7 +1050,7 @@ impl BarredLaunchProcess for LinuxBarredProcess {
         let mut child = self.0.borrow_mut();
         let mut observed = cerebellum_linux::executed_image_identity(child.generation().pid)
             .map_err(map_linux_image_identity_error)?;
-        for _ in 0..LINUX_EXEC_CHAIN_HOP_LIMIT {
+        for _ in 0..=LINUX_EXEC_CHAIN_HOP_LIMIT {
             if observed.image_sha256 == *expected {
                 return Ok(ExecutableIdentityClaim::ImageDigest {
                     sha256: observed.image_sha256,
@@ -1076,25 +1079,6 @@ impl BarredLaunchProcess for LinuxBarredProcess {
 }
 
 #[cfg(target_os = "linux")]
-fn map_linux_process_start_time(
-    start_time: cerebellum_linux::ProcessStartTime,
-) -> Result<(), PlatformLaunchError> {
-    match start_time {
-        cerebellum_linux::ProcessStartTime::Started(_) => Ok(()),
-        cerebellum_linux::ProcessStartTime::NoSuchProcess => {
-            Err(PlatformLaunchError::ImageIdentity)
-        }
-        cerebellum_linux::ProcessStartTime::NotPermitted
-        | cerebellum_linux::ProcessStartTime::StatReadFailed
-        | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
-        | cerebellum_linux::ProcessStartTime::LayoutMismatch
-        | cerebellum_linux::ProcessStartTime::NoStartTime => {
-            Err(PlatformLaunchError::GenerationUnreadable)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn map_linux_image_identity_error(
     error: cerebellum_linux::ImageIdentityError,
 ) -> PlatformLaunchError {
@@ -1104,10 +1088,10 @@ fn map_linux_image_identity_error(
         | cerebellum_linux::ImageIdentityError::ProcessStartTimeMissing => {
             PlatformLaunchError::GenerationUnreadable
         }
-        cerebellum_linux::ImageIdentityError::ProcessMissing
-        | cerebellum_linux::ImageIdentityError::GenerationChanged
+        cerebellum_linux::ImageIdentityError::GenerationChanged
         | cerebellum_linux::ImageIdentityError::Executable(_)
         | cerebellum_linux::ImageIdentityError::Read(_) => PlatformLaunchError::ImageIdentity,
+        cerebellum_linux::ImageIdentityError::ProcessMissing => PlatformLaunchError::ProcessControl,
     }
 }
 
@@ -2532,31 +2516,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_identity_attestation_refuses_when_the_exec_chain_bound_is_exhausted() {
-        use std::fs;
+    fn linux_identity_attestation_accepts_a_terminal_image_at_the_hop_bound() {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixStream;
 
-        let root =
-            std::env::temp_dir().join(format!("cerebellum-linux-hop-bound-{}", std::process::id()));
-        fs::create_dir(&root).expect("create chain fixture directory");
-        let mut paths = Vec::new();
-        for index in 0..16 {
-            let path = root.join(format!("hop-{index}"));
-            let next = if index == 15 {
-                "/bin/sleep".to_string()
-            } else {
-                root.join(format!("hop-{}", index + 1))
-                    .display()
-                    .to_string()
-            };
-            fs::write(&path, format!("#!/bin/sh\nexec {next} 30\n")).expect("write chain fixture");
-            let mut permissions = fs::metadata(&path).expect("chain metadata").permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&path, permissions).expect("make chain fixture executable");
-            paths.push(path);
-        }
+        let (root, paths) = linux_exec_chain_fixture(8, "exact-hop-bound");
 
         let mut launch_request = request();
         launch_request.executable = paths[0].clone();
@@ -2569,12 +2533,75 @@ mod tests {
             LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
         let child = launcher
             .spawn_barred(&launch_request)
-            .expect("spawn bounded chain fixture");
+            .expect("spawn exact-bound chain fixture");
+        assert!(child.executed_image_identity().is_ok());
+        child
+            .terminate_and_reap()
+            .expect("reap exact-bound fixture");
+        remove_linux_exec_chain_fixture(root, paths);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_identity_attestation_refuses_a_terminal_image_beyond_the_hop_bound() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (root, paths) = linux_exec_chain_fixture(9, "beyond-hop-bound");
+        let mut launch_request = request();
+        launch_request.executable = paths[0].clone();
+        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+            sha256: sha256_file_for_test(Path::new("/bin/sleep")),
+        };
+        let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
+        let (_response_parent, response_child) = UnixStream::pair().expect("response pair");
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        let child = launcher
+            .spawn_barred(&launch_request)
+            .expect("spawn beyond-bound chain fixture");
         assert_eq!(
             child.executed_image_identity(),
             Err(PlatformLaunchError::ExecChainUnresolved)
         );
         drop(child);
+        remove_linux_exec_chain_fixture(root, paths);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_exec_chain_fixture(
+        script_count: usize,
+        label: &str,
+    ) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("cerebellum-linux-{label}-{}", std::process::id()));
+        fs::create_dir(&root).expect("create chain fixture directory");
+        let mut paths = Vec::new();
+        for index in 0..script_count {
+            let path = root.join(format!("hop-{index}"));
+            let next = if index + 1 == script_count {
+                "/bin/sleep".to_string()
+            } else {
+                root.join(format!("hop-{}", index + 1))
+                    .display()
+                    .to_string()
+            };
+            fs::write(&path, format!("#!/bin/sh\nexec {next} 30\n")).expect("write chain fixture");
+            let mut permissions = fs::metadata(&path).expect("chain metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).expect("make chain fixture executable");
+            paths.push(path);
+        }
+        (root, paths)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_linux_exec_chain_fixture(root: std::path::PathBuf, paths: Vec<std::path::PathBuf>) {
+        use std::fs;
+
         for path in paths {
             fs::remove_file(path).expect("remove chain fixture");
         }
@@ -2620,6 +2647,12 @@ mod tests {
             released.attestation.executable_identity_checkpoints,
             ExecutableIdentityCheckpoints::AfterExecOnly
         );
+        assert_eq!(
+            released.attestation.observed_executable_identity,
+            ExecutableIdentityClaim::ImageDigest {
+                sha256: sha256_file_for_test(Path::new("/bin/sleep")),
+            }
+        );
         released
             .process
             .terminate_and_reap()
@@ -2631,12 +2664,20 @@ mod tests {
     #[test]
     fn linux_unreadable_generation_is_not_an_identity_mismatch() {
         assert_eq!(
-            map_linux_process_start_time(cerebellum_linux::ProcessStartTime::NotPermitted),
-            Err(PlatformLaunchError::GenerationUnreadable)
+            map_linux_image_identity_error(
+                cerebellum_linux::ImageIdentityError::ProcessInspectionDenied
+            ),
+            PlatformLaunchError::GenerationUnreadable
         );
         assert_ne!(
-            map_linux_process_start_time(cerebellum_linux::ProcessStartTime::NotPermitted),
-            Err(PlatformLaunchError::ImageIdentity)
+            map_linux_image_identity_error(
+                cerebellum_linux::ImageIdentityError::ProcessInspectionDenied
+            ),
+            PlatformLaunchError::ImageIdentity
+        );
+        assert_eq!(
+            map_linux_image_identity_error(cerebellum_linux::ImageIdentityError::ProcessMissing),
+            PlatformLaunchError::ProcessControl
         );
     }
 
