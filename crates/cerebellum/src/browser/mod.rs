@@ -46,6 +46,16 @@ pub const SCREENSHOT: &str = "browser.screenshot";
 pub const CLICK_POINT: &str = "browser.click_point";
 pub const WAIT_FOR: &str = "browser.wait_for";
 pub const ALL_TOOLS: [&str; 6] = [NAVIGATE, SNAPSHOT, CLICK, SCREENSHOT, CLICK_POINT, WAIT_FOR];
+
+/// Whether a browser capability has a working module-wire dispatch route.
+///
+/// Deliberately admit only operations with working wire dispatch routes. The
+/// omitted operations once returned `outcome: ok` with a fabricated `url_final`
+/// even when no browser process existed.
+pub fn has_wire_dispatch_route(name: &str) -> bool {
+    matches!(name, NAVIGATE | SNAPSHOT | CLICK)
+}
+
 pub const SETTLEMENT_MS: u64 = 30_000;
 pub const QUIET_MS: u64 = 500;
 

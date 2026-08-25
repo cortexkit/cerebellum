@@ -46,15 +46,7 @@ pub const BROWSER_STATUS: &str = "browser.status";
 pub fn browser_wire_tools() -> Vec<Tool> {
     crate::browser::tool_definitions()
         .into_iter()
-        // Deliberately advertise only operations with working wire dispatch routes.
-        // The omitted operations once returned `outcome: ok` with a fabricated
-        // `url_final` even when no browser process existed.
-        .filter(|(name, _, _)| {
-            matches!(
-                *name,
-                crate::browser::NAVIGATE | crate::browser::SNAPSHOT | crate::browser::CLICK
-            )
-        })
+        .filter(|(name, _, _)| crate::browser::has_wire_dispatch_route(name))
         .map(|(name, description, schema)| Tool {
             name: name.to_string(),
             description: Some(description.to_string()),
@@ -254,15 +246,9 @@ pub fn build_with_browser_plane_pins(
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
         return manifest;
     };
-    for (name, description, schema) in
-        crate::browser::tool_definitions()
-            .into_iter()
-            .filter(|(name, _, _)| {
-                matches!(
-                    *name,
-                    crate::browser::NAVIGATE | crate::browser::SNAPSHOT | crate::browser::CLICK
-                )
-            })
+    for (name, description, schema) in crate::browser::tool_definitions()
+        .into_iter()
+        .filter(|(name, _, _)| crate::browser::has_wire_dispatch_route(name))
     {
         let requires_extraction = matches!(name, crate::browser::SNAPSHOT | crate::browser::CLICK);
         if requires_extraction
