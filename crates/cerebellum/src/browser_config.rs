@@ -1,6 +1,9 @@
 //! Browser-plane configuration parsing kept out of the shared substrate.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use serde_json::{Map, Value};
 
@@ -150,16 +153,29 @@ pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), Bro
             command_child.as_raw_fd(),
             response_child.as_raw_fd(),
         );
-        let probe_profile = std::env::temp_dir().join(format!(
-            "cerebellum-config-probe-profile-{}",
-            std::process::id()
-        ));
-        let arguments = crate::browser_launch_service::browser_launch_arguments(&probe_profile);
-        crate::browser_executable_identity::validate_configured_executable_at_load(
+        let probe_profile = browser_probe_profile_path();
+        // A killed browser leaves `SingletonLock` as a symlink naming
+        // `<hostname>-<pid>` without a timestamp or generation counter. The
+        // custody path cannot prove that link stale and refuses to break it,
+        // so probing the real profile would make the first real launch after
+        // every boot fail with `profile_held_externally`. Crashpad's database
+        // path does not follow `--user-data-dir`, so it needs its own
+        // throwaway path as well. `XDG_CONFIG_HOME` contains that database and
+        // any other home-derived Chromium writes without changing argv. The
+        // `--crash-dumps-dir` switch remains belt-and-braces for builds that
+        // honor it; this Chromium build (measured 2026-08-25) still derives
+        // the handler database from XDG configuration.
+        let crash_dumps_directory = probe_profile.join("crash-dumps");
+        let probe_environment = browser_probe_environment(&probe_profile);
+        let arguments = crate::browser_launch_service::browser_launch_arguments(
+            &probe_profile,
+            &crash_dumps_directory,
+        );
+        let result = crate::browser_executable_identity::validate_configured_executable_at_load(
             &mut launcher,
             path,
             &arguments,
-            &[],
+            &probe_environment,
             expected,
         )
         .map_err(|refusal| BrowserConfigError {
@@ -176,11 +192,52 @@ pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), Bro
             } else {
                 BrowserConfigReason::ExecutableProbeFailed(refusal.to_string())
             },
-        })?;
+        });
+        // Probe cleanup is part of config refusal: leaving SingletonLock or
+        // XDG-derived Crashpad state behind would turn every later boot into a
+        // false `profile_held_externally` refusal. Removal is strict rather
+        // than best-effort so a cleanup failure remains visible at boot.
+        let cleanup = cleanup_browser_probe(&probe_profile);
+        match (result, cleanup) {
+            (Err(error), _) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = config;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_environment(probe_profile: &Path) -> Vec<(OsString, OsString)> {
+    vec![(
+        OsString::from("XDG_CONFIG_HOME"),
+        probe_profile.join("config").into_os_string(),
+    )]
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_profile_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cerebellum-config-probe-profile-{}",
+        std::process::id()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_browser_probe(probe_profile: &Path) -> Result<(), BrowserConfigError> {
+    match std::fs::remove_dir_all(probe_profile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(BrowserConfigError {
+            field: "browser.executable_path".to_string(),
+            reason: BrowserConfigReason::ExecutableProbeFailed(format!(
+                "cannot remove browser probe tree {}: {error}",
+                probe_profile.display()
+            )),
+        }),
+    }
 }
 
 pub fn parse_browser_config(text: &str) -> Result<Option<BrowserConfig>, BrowserConfigError> {
@@ -432,6 +489,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn config_probe_redirects_home_derived_writes_without_changing_argv() {
+        let environment = browser_probe_environment(Path::new("/tmp/probe-profile"));
+        assert_eq!(
+            environment,
+            vec![(
+                OsString::from("XDG_CONFIG_HOME"),
+                OsString::from("/tmp/probe-profile/config"),
+            )]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn config_load_refuses_a_wrapper_pin_with_the_final_image_sha256() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -462,6 +532,7 @@ mod tests {
             text.contains(&sha256_file_for_test(Path::new("/bin/sleep"))),
             "missing final image digest: {text}"
         );
+        assert!(!probe_profile_path().exists(), "refusal leaked probe tree");
         std::fs::remove_dir_all(root).expect("remove config probe directory");
     }
 
@@ -488,7 +559,13 @@ mod tests {
         config.expected_identity = Some(sha256_file_for_test(Path::new("/bin/sleep")));
 
         validate_browser_config_at_load(&config).expect("terminal image pin accepted");
+        assert!(!probe_profile_path().exists(), "success leaked probe tree");
         std::fs::remove_dir_all(root).expect("remove terminal config directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_profile_path() -> PathBuf {
+        browser_probe_profile_path()
     }
 
     #[cfg(target_os = "linux")]
