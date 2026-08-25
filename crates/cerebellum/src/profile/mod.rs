@@ -978,16 +978,59 @@ impl Default for RegistryConfig {
     }
 }
 
+/// Untrusted registry conditions whose caller response must be chosen by value.
+///
+/// Display text remains diagnostic only; lifecycle refusal mapping matches this
+/// closed enum so wording changes cannot alter the wire outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrustworthyRegistryReason {
+    LockContentionWithoutOwnerProof,
+    MalformedRegistry,
+    UnsupportedRegistrySchema,
+    ManagedRootIdentityChanged,
+    IntegrityMismatch,
+    InvalidRegistryIdentity,
+    NonCanonicalTarget,
+    MissingRegistry,
+    MissingRecord,
+    MissingProfileUuid,
+    PossiblyManagedPath,
+    DurableKindConflict,
+    DurableDeletionState,
+    RecordTargetMissing,
+}
+
+impl fmt::Display for UntrustworthyRegistryReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::LockContentionWithoutOwnerProof => "lock contention without positive owner proof",
+            Self::MalformedRegistry => "malformed registry",
+            Self::UnsupportedRegistrySchema => "unsupported registry schema",
+            Self::ManagedRootIdentityChanged => "managed root identity changed",
+            Self::IntegrityMismatch => "integrity mismatch",
+            Self::InvalidRegistryIdentity => "invalid registry identity",
+            Self::NonCanonicalTarget => "non-canonical target",
+            Self::MissingRegistry => "missing registry",
+            Self::MissingRecord => "missing record",
+            Self::MissingProfileUuid => "missing profile UUID",
+            Self::PossiblyManagedPath => "possibly managed path",
+            Self::DurableKindConflict => "durable profile kind conflict",
+            Self::DurableDeletionState => "durable profile deletion state",
+            Self::RecordTargetMissing => "durable profile target missing",
+        };
+        f.write_str(reason)
+    }
+}
+
 #[derive(Debug)]
 pub enum RegistryError {
     Root(RootError),
     Artifact(ArtifactError),
     Io(io::Error),
-    Integrity,
     UnknownField(String),
     UnsupportedState,
     Conflict,
-    Untrustworthy(String),
+    Untrustworthy(UntrustworthyRegistryReason),
     InvalidTransition,
 }
 impl fmt::Display for RegistryError {
@@ -996,7 +1039,6 @@ impl fmt::Display for RegistryError {
             Self::Root(error) => write!(f, "{error}"),
             Self::Artifact(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "profile registry I/O: {error}"),
-            Self::Integrity => write!(f, "profile registry integrity failure"),
             Self::UnknownField(field) => write!(f, "unknown profile registry field {field}"),
             Self::UnsupportedState => write!(f, "unsupported profile registry state"),
             Self::Conflict => write!(f, "profile registry identity conflict"),
@@ -1125,7 +1167,8 @@ impl Drop for RegistryLock {
 pub enum DurableResolution {
     TrustworthyExisting(RegistryRecord),
     AffirmativeAbsence,
-    UntrustworthyOrUnavailable { reason: String },
+    Untrustworthy(UntrustworthyRegistryReason),
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -1238,7 +1281,7 @@ impl ProfileRegistry {
             Ok(file) => Ok(RegistryLock { path, _file: file }),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 Err(RegistryError::Untrustworthy(
-                    "lock contention without positive owner proof".to_string(),
+                    UntrustworthyRegistryReason::LockContentionWithoutOwnerProof,
                 ))
             }
             Err(error) => Err(error.into()),
@@ -1255,23 +1298,26 @@ impl ProfileRegistry {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         }
-        let document: RegistryDocument = serde_json::from_slice(&bytes)
-            .map_err(|_| RegistryError::Untrustworthy("malformed registry".to_string()))?;
+        let document: RegistryDocument = serde_json::from_slice(&bytes).map_err(|_| {
+            RegistryError::Untrustworthy(UntrustworthyRegistryReason::MalformedRegistry)
+        })?;
         if document.schema != REGISTRY_SCHEMA {
             return Err(RegistryError::Untrustworthy(
-                "unsupported registry schema".to_string(),
+                UntrustworthyRegistryReason::UnsupportedRegistrySchema,
             ));
         }
         if document.managed_root_identity != self.root.binding() {
             return Err(RegistryError::Untrustworthy(
-                "managed root identity changed".to_string(),
+                UntrustworthyRegistryReason::ManagedRootIdentityChanged,
             ));
         }
         if hex(&Sha256::digest(canonical_json(&document_payload(
             &document,
         )))) != document.integrity
         {
-            return Err(RegistryError::Integrity);
+            return Err(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::IntegrityMismatch,
+            ));
         }
         let mut durable_projects = BTreeSet::new();
         let mut targets = BTreeSet::new();
@@ -1285,7 +1331,9 @@ impl ProfileRegistry {
                 return Err(RegistryError::Conflict);
             }
             if record_integrity(record) != record.integrity {
-                return Err(RegistryError::Integrity);
+                return Err(RegistryError::Untrustworthy(
+                    UntrustworthyRegistryReason::IntegrityMismatch,
+                ));
             }
             if !record.state.legal_for(record.kind)
                 || record.kind == ProfileKind::Durable && record.deletion_pending
@@ -1300,7 +1348,7 @@ impl ProfileRegistry {
                 || (record.kind == ProfileKind::Disposable && record.profile_name.is_some())
             {
                 return Err(RegistryError::Untrustworthy(
-                    "invalid registry identity".to_string(),
+                    UntrustworthyRegistryReason::InvalidRegistryIdentity,
                 ));
             }
         }
@@ -1322,7 +1370,9 @@ impl ProfileRegistry {
         document.integrity = hex(&Sha256::digest(canonical_json(&document_payload(
             &document,
         ))));
-        let bytes = serde_json::to_vec(&document).map_err(|_| RegistryError::Integrity)?;
+        let bytes = serde_json::to_vec(&document).map_err(|_| {
+            RegistryError::Untrustworthy(UntrustworthyRegistryReason::IntegrityMismatch)
+        })?;
         let path = self.root.target_path(Path::new(REGISTRY_FILE), true)?;
         let temporary = self
             .root
@@ -1351,7 +1401,7 @@ impl ProfileRegistry {
             })
         {
             return Err(RegistryError::Untrustworthy(
-                "non-canonical target".to_string(),
+                UntrustworthyRegistryReason::NonCanonicalTarget,
             ));
         }
         Ok(self.root.target_path(path, create)?)
@@ -1417,59 +1467,43 @@ impl ProfileRegistry {
 
     pub fn resolve_durable(&self, project_id: &str) -> Result<DurableResolution, RegistryError> {
         if !self.artifact_enabled() {
-            return Ok(DurableResolution::UntrustworthyOrUnavailable {
-                reason: "artifact_disabled".to_string(),
-            });
+            return Ok(DurableResolution::Unavailable);
         }
         let _lock = self.acquire_slot_lock()?;
-        let document = match self.read_document() {
-            Ok(document) => document,
-            Err(error) => {
-                return Ok(DurableResolution::UntrustworthyOrUnavailable {
-                    reason: error.to_string(),
-                })
-            }
-        };
+        let document = self.read_document()?;
         let Some(document) = document else {
             return if self.conflicting_profile_path()? {
-                Ok(DurableResolution::UntrustworthyOrUnavailable {
-                    reason: "possibly_managed_path".to_string(),
-                })
+                Ok(DurableResolution::Untrustworthy(
+                    UntrustworthyRegistryReason::PossiblyManagedPath,
+                ))
             } else {
                 Ok(DurableResolution::AffirmativeAbsence)
             };
         };
         let Some(record) = document.records.get(project_id) else {
             return if self.conflicting_profile_path()? {
-                Ok(DurableResolution::UntrustworthyOrUnavailable {
-                    reason: "possibly_managed_path".to_string(),
-                })
+                Ok(DurableResolution::Untrustworthy(
+                    UntrustworthyRegistryReason::PossiblyManagedPath,
+                ))
             } else {
                 Ok(DurableResolution::AffirmativeAbsence)
             };
         };
         if record.kind != ProfileKind::Durable {
-            return Ok(DurableResolution::UntrustworthyOrUnavailable {
-                reason: "kind_conflict".to_string(),
-            });
+            return Ok(DurableResolution::Untrustworthy(
+                UntrustworthyRegistryReason::DurableKindConflict,
+            ));
         }
         if record.state == ProfileState::DeletionFailed || record.deletion_pending {
-            return Ok(DurableResolution::UntrustworthyOrUnavailable {
-                reason: "durable_deletion_state".to_string(),
-            });
+            return Ok(DurableResolution::Untrustworthy(
+                UntrustworthyRegistryReason::DurableDeletionState,
+            ));
         }
-        let target = match self.profile_target(&record.target, false) {
-            Ok(target) => target,
-            Err(error) => {
-                return Ok(DurableResolution::UntrustworthyOrUnavailable {
-                    reason: error.to_string(),
-                })
-            }
-        };
+        let target = self.profile_target(&record.target, false)?;
         if !target.exists() {
-            return Ok(DurableResolution::UntrustworthyOrUnavailable {
-                reason: "record_target_missing".to_string(),
-            });
+            return Ok(DurableResolution::Untrustworthy(
+                UntrustworthyRegistryReason::RecordTargetMissing,
+            ));
         }
         Ok(DurableResolution::TrustworthyExisting(record.clone()))
     }
@@ -1479,11 +1513,14 @@ impl ProfileRegistry {
         context: &StampedBindContext,
     ) -> Result<RegistryRecord, RegistryError> {
         let _lock = self.acquire_slot_lock()?;
-        if !matches!(
-            self.resolve_without_lock(context.agent_project_id())?,
-            DurableResolution::AffirmativeAbsence
-        ) {
-            return Err(RegistryError::Conflict);
+        match self.resolve_without_lock(context.agent_project_id())? {
+            DurableResolution::AffirmativeAbsence => {}
+            DurableResolution::Untrustworthy(reason) => {
+                return Err(RegistryError::Untrustworthy(reason));
+            }
+            DurableResolution::TrustworthyExisting(_) | DurableResolution::Unavailable => {
+                return Err(RegistryError::Conflict);
+            }
         }
         if !self.config.uuid_protocol_compatible {
             return Err(RegistryError::InvalidTransition);
@@ -1524,7 +1561,9 @@ impl ProfileRegistry {
         record.seal_state = SealState::Available;
         record.generation = 2;
         record.integrity = record_integrity(&record);
-        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        let mut document = self.read_document()?.ok_or(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::IntegrityMismatch,
+        ))?;
         document
             .records
             .insert(context.agent_project_id().to_string(), record.clone());
@@ -1537,9 +1576,9 @@ impl ProfileRegistry {
         let document = self.read_document()?;
         let Some(document) = document else {
             return if self.conflicting_profile_path()? {
-                Ok(DurableResolution::UntrustworthyOrUnavailable {
-                    reason: "possibly_managed_path".to_string(),
-                })
+                Ok(DurableResolution::Untrustworthy(
+                    UntrustworthyRegistryReason::PossiblyManagedPath,
+                ))
             } else {
                 Ok(DurableResolution::AffirmativeAbsence)
             };
@@ -1548,9 +1587,9 @@ impl ProfileRegistry {
             return Ok(DurableResolution::TrustworthyExisting(record.clone()));
         }
         if self.conflicting_profile_path()? {
-            Ok(DurableResolution::UntrustworthyOrUnavailable {
-                reason: "possibly_managed_path".to_string(),
-            })
+            Ok(DurableResolution::Untrustworthy(
+                UntrustworthyRegistryReason::PossiblyManagedPath,
+            ))
         } else {
             Ok(DurableResolution::AffirmativeAbsence)
         }
@@ -1623,13 +1662,15 @@ impl ProfileRegistry {
         F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
     {
         let _lock = self.acquire_slot_lock()?;
-        let mut document = self
-            .read_document()?
-            .ok_or(RegistryError::Untrustworthy("missing registry".to_string()))?;
+        let mut document = self.read_document()?.ok_or(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::MissingRegistry,
+        ))?;
         let record = document
             .records
             .get_mut(project_id)
-            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))?;
+            .ok_or(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::MissingRecord,
+            ))?;
         update(record)?;
         record.generation = record.generation.saturating_add(1);
         record.integrity = record_integrity(record);
@@ -2032,18 +2073,34 @@ impl ProfileLifecycle {
         })
     }
 
-    fn closed_untrusted_root(&self, resolution_reason: &str) -> Option<PrepareResult> {
-        let reason_code = match resolution_reason {
-            "untrustworthy profile registry: managed root identity changed" => {
+    fn closed_untrusted_root(&self, reason: UntrustworthyRegistryReason) -> PrepareResult {
+        let reason_code = match reason {
+            UntrustworthyRegistryReason::ManagedRootIdentityChanged => {
                 PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
             }
-            "possibly_managed_path" => PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
-            _ => return None,
+            UntrustworthyRegistryReason::PossiblyManagedPath => {
+                PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH
+            }
+            // These conditions require the same fail-closed caller behavior:
+            // the profile cannot be opened, but the wire contract has no more
+            // specific remedy for the caller.
+            UntrustworthyRegistryReason::LockContentionWithoutOwnerProof
+            | UntrustworthyRegistryReason::MalformedRegistry
+            | UntrustworthyRegistryReason::UnsupportedRegistrySchema
+            | UntrustworthyRegistryReason::IntegrityMismatch
+            | UntrustworthyRegistryReason::InvalidRegistryIdentity
+            | UntrustworthyRegistryReason::NonCanonicalTarget
+            | UntrustworthyRegistryReason::MissingRegistry
+            | UntrustworthyRegistryReason::MissingRecord
+            | UntrustworthyRegistryReason::MissingProfileUuid
+            | UntrustworthyRegistryReason::DurableKindConflict
+            | UntrustworthyRegistryReason::DurableDeletionState
+            | UntrustworthyRegistryReason::RecordTargetMissing => "profile_storage_unavailable",
         };
-        Some(PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+        PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
             reason_code,
             origin: FailureOrigin::RegistryOrStorage,
-        }))
+        })
     }
 
     pub fn prepare_context_open(
@@ -2146,13 +2203,13 @@ impl ProfileLifecycle {
         }
         let resolution = match self.registry.resolve_durable(context.agent_project_id()) {
             Ok(resolution) => resolution,
+            Err(RegistryError::Untrustworthy(reason)) => return self.closed_untrusted_root(reason),
             Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
         };
         let record = match resolution {
-            DurableResolution::UntrustworthyOrUnavailable { reason } => {
-                return self
-                    .closed_untrusted_root(&reason)
-                    .unwrap_or_else(|| self.closed_storage(FailureOrigin::RegistryOrStorage))
+            DurableResolution::Untrustworthy(reason) => return self.closed_untrusted_root(reason),
+            DurableResolution::Unavailable => {
+                return self.closed_storage(FailureOrigin::RegistryOrStorage)
             }
             DurableResolution::AffirmativeAbsence => {
                 if !self.registry.config.uuid_protocol_compatible {
@@ -2169,6 +2226,9 @@ impl ProfileLifecycle {
                 }
                 match self.registry.create_durable_record(context) {
                     Ok(record) => record,
+                    Err(RegistryError::Untrustworthy(reason)) => {
+                        return self.closed_untrusted_root(reason)
+                    }
                     Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
                 }
             }
@@ -2273,7 +2333,9 @@ impl ProfileLifecycle {
         let mut document = self
             .registry
             .read_document()?
-            .ok_or(RegistryError::Integrity)?;
+            .ok_or(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::IntegrityMismatch,
+            ))?;
         document
             .records
             .insert(record.transaction_id.clone(), record);
@@ -3155,16 +3217,16 @@ fn disposition_kind(disposition: ProfileDisposition) -> ProfileKind {
 
 impl ProfileRegistry {
     fn record_for_by_uuid(&self, profile_uuid: &str) -> Result<RegistryRecord, RegistryError> {
-        let document = self
-            .read_document()?
-            .ok_or(RegistryError::Untrustworthy("missing registry".to_string()))?;
+        let document = self.read_document()?.ok_or(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::MissingRegistry,
+        ))?;
         document
             .records
             .values()
             .find(|record| record.profile_uuid == profile_uuid)
             .cloned()
             .ok_or(RegistryError::Untrustworthy(
-                "missing profile UUID".to_string(),
+                UntrustworthyRegistryReason::MissingProfileUuid,
             ))
     }
     fn remove_record(&self, key: &str) -> Result<(), RegistryError> {
@@ -3173,11 +3235,15 @@ impl ProfileRegistry {
     }
 
     fn remove_record_locked(&self, key: &str) -> Result<(), RegistryError> {
-        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        let mut document = self.read_document()?.ok_or(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::IntegrityMismatch,
+        ))?;
         document
             .records
             .remove(key)
-            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))?;
+            .ok_or(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::MissingRecord,
+            ))?;
         document.generation = document.generation.saturating_add(1);
         self.write_document(document)
     }
@@ -3222,11 +3288,15 @@ impl ProfileRegistry {
     where
         F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
     {
-        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        let mut document = self.read_document()?.ok_or(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::IntegrityMismatch,
+        ))?;
         let record = document
             .records
             .get_mut(key)
-            .ok_or(RegistryError::Untrustworthy("missing record".to_string()))?;
+            .ok_or(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::MissingRecord,
+            ))?;
         update(record)?;
         record.generation = record.generation.saturating_add(1);
         record.integrity = record_integrity(record);
@@ -3245,18 +3315,22 @@ impl ProfileRegistry {
         F: FnMut(&mut RegistryRecord) -> Result<(), RegistryError>,
     {
         let _lock = self.acquire_slot_lock()?;
-        let mut document = self.read_document()?.ok_or(RegistryError::Integrity)?;
+        let mut document = self.read_document()?.ok_or(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::IntegrityMismatch,
+        ))?;
         let key = document
             .records
             .iter()
             .find_map(|(key, record)| (record.profile_uuid == uuid).then(|| key.clone()))
             .ok_or(RegistryError::Untrustworthy(
-                "missing profile UUID".to_string(),
+                UntrustworthyRegistryReason::MissingProfileUuid,
             ))?;
         let record = document
             .records
             .get_mut(&key)
-            .ok_or(RegistryError::Integrity)?;
+            .ok_or(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::IntegrityMismatch,
+            ))?;
         update(record)?;
         record.generation = record.generation.saturating_add(1);
         record.integrity = record_integrity(record);
@@ -3383,6 +3457,79 @@ mod tests {
         let root = HeldManagedRoot::open(&path).unwrap();
         assert_eq!(root.canonical_path(), fs::canonicalize(&path).unwrap());
         assert!(root.target_path(Path::new("../outside"), false).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn untrustworthy_registry_reasons_map_to_refusals_by_value() {
+        let path = root();
+        let lifecycle = ProfileLifecycle::open(&path).unwrap();
+        for (reason, reason_code) in [
+            (
+                UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+                PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED,
+            ),
+            (
+                UntrustworthyRegistryReason::PossiblyManagedPath,
+                PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
+            ),
+            (
+                UntrustworthyRegistryReason::LockContentionWithoutOwnerProof,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::MalformedRegistry,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::UnsupportedRegistrySchema,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::IntegrityMismatch,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::InvalidRegistryIdentity,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::NonCanonicalTarget,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::MissingRegistry,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::MissingRecord,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::MissingProfileUuid,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::DurableKindConflict,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::DurableDeletionState,
+                "profile_storage_unavailable",
+            ),
+            (
+                UntrustworthyRegistryReason::RecordTargetMissing,
+                "profile_storage_unavailable",
+            ),
+        ] {
+            assert_eq!(
+                lifecycle.closed_untrusted_root(reason),
+                PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+                    reason_code,
+                    origin: FailureOrigin::RegistryOrStorage,
+                })
+            );
+        }
         fs::remove_dir_all(path).unwrap();
     }
 
