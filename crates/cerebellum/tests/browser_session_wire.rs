@@ -349,6 +349,11 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
             "browser.navigate",
             "browser.snapshot",
             "browser.click",
+            // Admitted after being driven through this wire path against
+            // Chrome 151, THROUGH its authorization gate. click_point stays
+            // out: it addresses a retained screenshot and has never been
+            // driven against one this module captured.
+            "browser.screenshot",
         ]
         .map(str::to_string)
     );
@@ -410,7 +415,6 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
 
     for (corr, unavailable) in [
         (13, "browser.click_point"),
-        (15, "browser.screenshot"),
         (16, "browser.wait_for"),
         (17, "browser.type"),
     ] {
@@ -418,6 +422,15 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         let refused: Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(refused["code"], "unknown_method", "{refused}");
     }
+
+    // browser.screenshot is admitted, so it must REACH the handler rather than
+    // be refused by name. With no grant installed it is refused by its
+    // AUTHORIZATION gate, which is a different fact from "this module does not
+    // serve that" -- and asserting the reason rather than merely that it
+    // errored, because an unknown method also errors.
+    let attempted = invoke(&planes, 15, "browser.screenshot", json!({})).await;
+    let attempted: Value = serde_json::from_slice(&attempted.body).unwrap();
+    assert_ne!(attempted["code"], "unknown_method", "{attempted}");
     // EMPTY, and this is the load-bearing half of the refusal above: the
     // authorization gate runs before anything reaches the browser, so a
     // navigation refused for want of a grant leaves no effect behind. An

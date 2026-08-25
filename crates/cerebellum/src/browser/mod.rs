@@ -53,7 +53,7 @@ pub const ALL_TOOLS: [&str; 6] = [NAVIGATE, SNAPSHOT, CLICK, SCREENSHOT, CLICK_P
 /// omitted operations once returned `outcome: ok` with a fabricated `url_final`
 /// even when no browser process existed.
 pub fn has_wire_dispatch_route(name: &str) -> bool {
-    matches!(name, NAVIGATE | SNAPSHOT | CLICK)
+    matches!(name, NAVIGATE | SNAPSHOT | CLICK | SCREENSHOT)
 }
 
 pub const SETTLEMENT_MS: u64 = 30_000;

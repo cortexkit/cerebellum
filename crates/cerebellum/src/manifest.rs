@@ -725,7 +725,17 @@ mod tests {
         let ProviderRole::ToolProvider { tools, .. } = &common_only.provides[0] else {
             panic!("expected tool provider");
         };
-        assert_eq!(tools.len(), 4, "three controls plus navigate");
+        // Three controls, navigate, and screenshot. Screenshot needs no
+        // extraction evidence because it runs none of the logic that evidence
+        // attests: it captures pixels and reads viewport geometry, where
+        // snapshot and click turn a page into structured data and address a
+        // ref within it. A capture can be wrong about a rectangle; it cannot
+        // be wrong about a corpus it never consults.
+        assert_eq!(
+            tools.len(),
+            5,
+            "three controls, navigate, and the extraction-free capture"
+        );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
 
         let all = build_with_browser_plane_pins(
@@ -739,8 +749,8 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            6,
-            "three controls plus navigate, snapshot, and click"
+            7,
+            "three controls, navigate, screenshot, snapshot, and click"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
         let serialized = serialize_with_browser_plane_pins(
