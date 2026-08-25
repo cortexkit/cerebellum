@@ -15,9 +15,6 @@ use cerebellum::computer_capability::{
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::audit::ComputerCapability;
 use cerebellum_computer::capture::{EnumeratedWindow, InMemoryCaptureBackend, WindowFrame};
-use cerebellum_computer::platform::vocabulary::{
-    CapabilityResultValidationError, CapabilityResultViolation,
-};
 use cerebellum_computer::platform::TargetResolution;
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{IoDiagnostic, StorageError};
@@ -215,13 +212,9 @@ async fn waiting_reports_an_unreadable_authorized_target_as_indeterminate() {
     assert_eq!(evidence["predicate"]["kind"], "element_present");
 }
 
-/// The common serving boundary detects divergence without withholding it yet.
-///
-/// This drives the public `serve` method rather than the validator directly. If
-/// the common check is removed, the reply still looks normal but the named
-/// finding disappears and this test fails.
+/// A declared refusal passes the serving boundary without a schema finding.
 #[tokio::test]
-async fn every_served_reply_runs_result_schema_detection_before_it_escapes() {
+async fn declared_screenshot_refusal_leaves_no_result_schema_finding() {
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
     let clock = FakeClock::new();
 
@@ -239,37 +232,21 @@ async fn every_served_reply_runs_result_schema_detection_before_it_escapes() {
             |_| InMemoryCaptureBackend::default(),
         )
         .await
-        .expect("detect-only validation must not withhold the existing reply");
+        .expect("the declared refusal conforms to the frozen result schema");
 
     assert_eq!(reply["outcome"], "invalid_request");
     assert_eq!(reply["field"], "include_cursor");
-    assert_eq!(
-        plane.result_schema_findings(),
-        vec![cerebellum::computer_capability::ResultSchemaFinding {
-            error: CapabilityResultValidationError::ReplyViolations {
-                capability_id: "computer.screenshot".into(),
-                violations: vec![
-                    CapabilityResultViolation::UndeclaredProperty {
-                        path: "$.field".into(),
-                    },
-                    CapabilityResultViolation::UndeclaredProperty {
-                        path: "$.reason".into(),
-                    },
-                ],
-            },
-            occurrences: 1,
-        }]
-    );
+    assert!(plane.result_schema_findings().is_empty());
 }
 
-/// Fail-closed behavior is already wired but remains an explicit opt-in.
+/// Withholding mode must permit an actionable refusal declared by vocabulary v5.
 #[tokio::test]
-async fn withholding_mode_prevents_a_divergent_reply_from_escaping() {
+async fn withholding_mode_permits_a_declared_refusal() {
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
         ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
     let clock = FakeClock::new();
 
-    let error = plane
+    let reply = plane
         .serve(
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": true }),
@@ -283,13 +260,11 @@ async fn withholding_mode_prevents_a_divergent_reply_from_escaping() {
             |_| InMemoryCaptureBackend::default(),
         )
         .await
-        .expect_err("withholding mode must not return a divergent reply");
+        .expect("withholding mode must permit the declared refusal");
 
-    assert!(matches!(
-        error,
-        CapabilityResultValidationError::ReplyViolations { .. }
-    ));
-    assert_eq!(plane.result_schema_findings()[0].occurrences, 1);
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["reason"], "unknown_value");
+    assert!(plane.result_schema_findings().is_empty());
 }
 
 /// A capture that fails still leaves an audit record behind.
@@ -564,7 +539,7 @@ async fn a_region_request_returns_the_named_window_rows() {
     );
 }
 
-/// A present region must have the object shape declared by vocabulary v4.
+/// A present region must have the object shape declared by vocabulary v5.
 #[tokio::test]
 async fn a_null_region_request_is_rejected_as_the_wrong_type() {
     let clock = FakeClock::new();

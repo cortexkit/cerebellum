@@ -1,4 +1,4 @@
-//! Exact inventory of computer replies against the frozen v4 result schemas.
+//! Exact inventory of computer replies against the frozen v5 result schemas.
 //!
 //! Every reply recorded here is returned by `ComputerPlane::serve`. The shared
 //! fixture from `computer_screenshot` supplies fake clocks, leases, audit storage,
@@ -16,10 +16,8 @@
 //! capability before the serving boundary). They are intentionally absent rather
 //! than represented by literals that could drift away from production replies.
 //!
-//! Code-owned divergence must stay empty. The remaining entries are fields the
-//! reply deliberately preserves because they tell callers how to repair a
-//! refusal, but which the digest-pinned artifact does not yet declare. They are
-//! recorded as artifact-owned debt rather than mislabelled as reply defects.
+//! Both divergence-owner sets must stay empty. The code declares no fields the
+//! artifact omits, and the artifact declares every deliberate served reply field.
 
 mod support;
 
@@ -465,7 +463,7 @@ fn fixture_window(width: u32, height: u32) -> EnumeratedWindow {
 }
 
 #[tokio::test]
-async fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_exact() {
+async fn served_reply_divergence_inventory_is_empty() {
     let screenshot = observed_facts("computer.screenshot", served_screenshot_replies().await);
     let wait = observed_facts("computer.wait", served_wait_replies().await);
     let click = observed_facts("computer.click", served_click_replies().await);
@@ -482,87 +480,14 @@ async fn served_reply_code_divergence_inventory_is_empty_and_artifact_debt_is_ex
         "every code-owned result divergence must be removed"
     );
 
-    // `mut` is conditional: only the macOS arm below extends this, so binding it
-    // mutable unconditionally is dead on every other platform.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut expected_artifact_debt = BTreeSet::from([
-        fact(
-            "computer.screenshot",
-            "$.field",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.reason",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.remedy",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.bundle_identity",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.instances",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.bytes",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.screenshot",
-            "$.bound_bytes",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-    ]);
-
-    #[cfg(target_os = "macos")]
-    expected_artifact_debt.extend([
-        fact(
-            "computer.click",
-            "$.field",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.reason",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.bundle_identity",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.instances",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-        fact(
-            "computer.click",
-            "$.remedy",
-            DivergenceKind::UndeclaredProperty,
-            OwedBy::Artifact,
-        ),
-    ]);
-
-    assert_eq!(actual, expected_artifact_debt);
+    let artifact_owned: BTreeSet<_> = actual
+        .iter()
+        .filter(|fact| fact.owed_by == OwedBy::Artifact)
+        .cloned()
+        .collect();
+    assert_eq!(
+        artifact_owned,
+        BTreeSet::new(),
+        "every artifact-owned result divergence must be removed"
+    );
 }
