@@ -177,6 +177,7 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
             cerebellum_macos::ProcessStartTime::NoSuchProcess => ProcessGenerationReading::Gone,
             cerebellum_macos::ProcessStartTime::NotPermitted
             | cerebellum_macos::ProcessStartTime::LayoutMismatch
+            | cerebellum_macos::ProcessStartTime::Unclassified(_)
             | cerebellum_macos::ProcessStartTime::NoStartTime => {
                 ProcessGenerationReading::NotInspectable
             }

@@ -243,6 +243,11 @@ pub enum SpawnError {
     ProcessMissing,
     ProcessInspectionDenied,
     ProcessLayoutMismatch,
+    /// The kernel refused to describe the process for a reason this code does
+    /// not classify. Carries the errno, which is the only thing that can name
+    /// it: without it a reader is left comparing struct definitions against a
+    /// kernel header for a failure that never read a structure.
+    ProcessInspectionFailed(i32),
     ProcessStartTimeMissing,
 }
 
@@ -302,8 +307,13 @@ pub fn terminate_exact_generation(
         ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
             return Ok(TerminationOutcome::AlreadyGoneOrReplaced)
         }
+        // Every reading that is not an answer refuses to signal. Unclassified
+        // joins them for the reason the others are here: not knowing why the
+        // kernel refused is not evidence about which process holds this pid,
+        // and a signal sent on that basis could land on a replacement.
         ProcessStartTime::NotPermitted
         | ProcessStartTime::LayoutMismatch
+        | ProcessStartTime::Unclassified(_)
         | ProcessStartTime::NoStartTime => return Err(ProcessControlError::GenerationChanged),
     }
 
@@ -560,6 +570,13 @@ pub fn spawn_barred(
         ProcessStartTime::LayoutMismatch => {
             let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
             return Err(SpawnError::ProcessLayoutMismatch);
+        }
+        // Carries the errno rather than borrowing the layout-mismatch error,
+        // so a launch that fails this way can be diagnosed from the failure
+        // instead of from a guess about which kernel structure moved.
+        ProcessStartTime::Unclassified(errno) => {
+            let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
+            return Err(SpawnError::ProcessInspectionFailed(errno));
         }
         ProcessStartTime::NoStartTime => {
             let _ = terminate_guarded_target(guardian_pid, target_pid, death_write);
