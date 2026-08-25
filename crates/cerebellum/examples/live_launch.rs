@@ -263,6 +263,83 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
         eprintln!("[{label}] screenshot failed: {shot}");
     }
 
+    // Drive a COORDINATE click against the capture just retained, then read
+    // back where it landed. click_point is the escape hatch for pages whose
+    // accessibility tree cannot name a control, and its whole risk is the
+    // pixel-to-css mapping: a click that lands somewhere plausible is worse
+    // than one that fails, because nothing reports it.
+    if shot["outcome"] == "ok" {
+        let image_width = shot["image_width_px"].as_u64().unwrap_or_default();
+        let image_height = shot["image_height_px"].as_u64().unwrap_or_default();
+        let rect = &shot["input_rect"];
+        let x_px = image_width / 2;
+        let y_px = image_height / 2;
+        let point = invoke_tool(
+            &planes,
+            7,
+            "browser.click_point",
+            json!({
+                "snapshot_id": shot["snapshot_id"],
+                "x_px": x_px,
+                "y_px": y_px,
+                "image_width_px": image_width,
+                "image_height_px": image_height,
+                "intent": "verify the coordinate mapping against a real browser",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+        if point["outcome"] == "ok" {
+            // The same ratio the module maps with, computed here independently
+            // so a matching answer is agreement rather than an echo.
+            let expected_x = rect["x_input_css"].as_f64().unwrap_or_default()
+                + (x_px as f64 + 0.5) * rect["width_input_css"].as_f64().unwrap_or_default()
+                    / image_width as f64;
+            let expected_y = rect["y_input_css"].as_f64().unwrap_or_default()
+                + (y_px as f64 + 0.5) * rect["height_input_css"].as_f64().unwrap_or_default()
+                    / image_height as f64;
+            let after_point = invoke_tool(
+                &planes,
+                8,
+                "browser.snapshot",
+                json!({"mode": "ax", "max_bytes": 65_536}),
+            )
+            .await;
+            let content = after_point["content"].as_str().unwrap_or_default();
+            let landed = content
+                .split("point ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or("")
+                .trim_end_matches(|c: char| !c.is_ascii_digit())
+                .to_string();
+            println!(
+                "[{label}] CLICK_POINT: asked ({x_px},{y_px})px, expected css \
+                 ({expected_x:.0},{expected_y:.0}), page recorded ({landed})"
+            );
+            let recorded: Vec<f64> = landed
+                .split(',')
+                .filter_map(|part| part.trim().parse::<f64>().ok())
+                .collect();
+            if recorded.len() == 2
+                && (recorded[0] - expected_x).abs() <= 2.0
+                && (recorded[1] - expected_y).abs() <= 2.0
+            {
+                println!(
+                    "[{label}] CLICK_POINT VERDICT: the click landed where the mapping says it \
+                     should, so pixel coordinates address css points correctly"
+                );
+            } else {
+                eprintln!(
+                    "[{label}] CLICK_POINT VERDICT: the page recorded ({landed}) where the \
+                     mapping predicts ({expected_x:.0},{expected_y:.0})"
+                );
+            }
+        } else {
+            eprintln!("[{label}] click_point failed: {point}");
+        }
+    }
+
     let closed = close_browser(&planes, label, &browser_session_id, 6).await;
     if page_changed {
         println!(
@@ -495,9 +572,20 @@ impl ProbePage {
                         let body = concat!(
                             "<!doctype html><html><head><title>Cerebellum Click Probe</title></head>",
                             "<body><main><h1 id='status'>Click probe before</h1>",
+                            "<h1 id='point'>no point click</h1>",
                             "<form><input type='password' autocomplete='current-password'>",
                             "<button type='submit' onclick=\"event.preventDefault();document.getElementById('status').textContent='Click probe after'\">",
-                            "Sign in</button></form></main></body></html>"
+                            "Sign in</button></form></main>",
+                            // Records where a click LANDED, in css pixels. A
+                            // coordinate click that reports success proves only
+                            // that a click was dispatched; reading back the
+                            // landing point is what checks the pixel-to-css
+                            // mapping against a real browser and a real display
+                            // scale.
+                            "<script>document.addEventListener('click',function(e){",
+                            "document.getElementById('point').textContent=",
+                            "'point '+Math.round(e.clientX)+','+Math.round(e.clientY);});</script>",
+                            "</body></html>"
                         );
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
