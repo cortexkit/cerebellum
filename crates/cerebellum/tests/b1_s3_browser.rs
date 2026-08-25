@@ -1,15 +1,20 @@
+use std::collections::VecDeque;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity};
-use cerebellum::browser::navigation::BrowserSnapshotObservation;
+use cerebellum::browser::navigation::{
+    BrowserScreenshotObservation, BrowserSnapshotObservation, CdpNavigationDriver,
+};
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
+use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
     BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage, ClickDriveError,
     LaunchSlot, NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
     SessionCleanup,
 };
-use cerebellum::cdp::{Attachment, CdpTransport, IdentityMap};
+use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
 use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SameDocumentChange, SnapshotKind, SnapshotRef,
@@ -17,6 +22,8 @@ use cerebellum::snapshot_store::{
 use cerebellum::{BrowserConfig, RouteIdentity};
 use cerebellum_core::clock::SystemClock;
 use serde_json::{json, Value};
+
+const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 fn identity() -> RouteIdentity {
     RouteIdentity::from_bind(
@@ -42,8 +49,6 @@ fn identity() -> RouteIdentity {
 /// returned value alone.
 #[tokio::test]
 async fn a_click_addressing_a_differently_sized_image_is_refused_before_dispatch() {
-    const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
-
     let plane = BrowserPlane::new();
     let route = identity();
     plane.open_context(route.clone()).await.unwrap();
@@ -286,6 +291,75 @@ impl OwnedBrowserProcess for SnapshotProcess {
     }
 }
 
+struct ScreenshotPipe {
+    reads: VecDeque<Vec<u8>>,
+}
+
+impl ScreenshotPipe {
+    fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
+        Self {
+            reads: frames
+                .into_iter()
+                .map(|frame| {
+                    let mut bytes = serde_json::to_vec(&frame).unwrap();
+                    bytes.push(0);
+                    bytes
+                })
+                .collect(),
+        }
+    }
+}
+
+impl CdpPipeIo for ScreenshotPipe {
+    fn write_frame(&mut self, _: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+        let Some(bytes) = self.reads.pop_front() else {
+            return Ok(PipeRead::WouldBlock);
+        };
+        destination[..bytes.len()].copy_from_slice(&bytes);
+        Ok(PipeRead::Bytes(bytes.len()))
+    }
+}
+
+struct ScreenshotProcess {
+    driver: CdpNavigationDriver<ScreenshotPipe>,
+}
+
+impl OwnedBrowserProcess for ScreenshotProcess {
+    fn screenshot(
+        &mut self,
+        context_key: &str,
+        document_epoch: u64,
+        deadline_ms: u64,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        self.driver
+            .screenshot(context_key, document_epoch, deadline_ms)
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct ClickProcess {
     result: Result<BrowserClickPosition, ClickDriveError>,
@@ -349,6 +423,32 @@ impl OwnedBrowserProcess for ClickProcess {
     }
 }
 
+fn screenshot_process() -> ScreenshotProcess {
+    let viewport = json!({
+        "offsetX": 3.5,
+        "offsetY": 4.25,
+        "clientWidth": 40.0,
+        "clientHeight": 20.0,
+        "scale": 1.75
+    });
+    let frames = [
+        json!({"id":1,"result":{"targetId":"target-own"}}),
+        json!({"id":2,"result":{"sessionId":"session-own"}}),
+        json!({"id":3,"sessionId":"session-own","result":{"visualViewport":viewport.clone()}}),
+        json!({"id":4,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
+        json!({"id":5,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
+        json!({"id":6,"sessionId":"session-own","result":{"visualViewport":viewport}}),
+        json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
+    ];
+    ScreenshotProcess {
+        driver: CdpNavigationDriver::new(
+            ScreenshotPipe::with_frames(frames),
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        ),
+    }
+}
+
 fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
     let refs = records
         .iter()
@@ -390,6 +490,71 @@ async fn position_on_authorized_snapshot_page(plane: &BrowserPlane, route: &Rout
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn screenshot_retains_browser_reported_dimensions_and_enables_click_point() {
+    let route = identity();
+    let plane = plane_with_process(&route, Box::new(screenshot_process()), 100);
+    plane.open_context(route.clone()).await.unwrap();
+
+    let captured = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Screenshot,
+            &json!({"max_bytes": ONE_BY_ONE_PNG_B64.len()}),
+        )
+        .await;
+
+    assert_eq!(captured["outcome"], "ok", "{captured}");
+    assert_eq!(captured["image_width_px"], 1);
+    assert_eq!(captured["image_height_px"], 1);
+    assert_eq!(captured["device_scale_factor"], 2.25);
+    assert_eq!(captured["visual_viewport_scale"], 1.75);
+    assert_eq!(captured["input_rect"]["x_input_css"], 3.5);
+    assert_eq!(captured["input_rect"]["y_input_css"], 4.25);
+    assert_eq!(captured["input_rect"]["width_input_css"], 40.0);
+    assert_eq!(captured["input_rect"]["height_input_css"], 20.0);
+
+    let clicked = plane
+        .dispatch(
+            &route,
+            BrowserCapability::ClickPoint,
+            &json!({
+                "snapshot_id": captured["snapshot_id"],
+                "x_px": 0,
+                "y_px": 0,
+                "image_width_px": captured["image_width_px"],
+                "image_height_px": captured["image_height_px"],
+                "intent": "click the captured viewport",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+    assert_eq!(
+        clicked["outcome"], "ok",
+        "the real capture was not retained as an addressable screenshot: {clicked}"
+    );
+}
+
+#[tokio::test]
+async fn screenshot_refuses_when_browser_png_exceeds_max_bytes_and_names_both_sizes() {
+    let route = identity();
+    let plane = plane_with_process(&route, Box::new(screenshot_process()), 100);
+    plane.open_context(route.clone()).await.unwrap();
+    let bound_bytes = ONE_BY_ONE_PNG_B64.len() - 1;
+
+    let refused = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Screenshot,
+            &json!({"max_bytes": bound_bytes}),
+        )
+        .await;
+
+    assert_eq!(refused["outcome"], "image_too_large", "{refused}");
+    assert_eq!(refused["detail"]["bytes"], ONE_BY_ONE_PNG_B64.len());
+    assert_eq!(refused["detail"]["bound_bytes"], bound_bytes);
 }
 
 #[tokio::test]

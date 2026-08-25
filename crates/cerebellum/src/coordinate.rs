@@ -816,25 +816,34 @@ pub fn validate_png_base64(
     expected_width_px: u32,
     expected_height_px: u32,
 ) -> Result<ValidatedPng, CoordinateError> {
+    if expected_width_px == 0 || expected_height_px == 0 {
+        return Err(CoordinateError::invalid(
+            InvalidCoordinatesReason::NonPositiveDimensions,
+        ));
+    }
+    let png = validate_png_base64_dimensions(encoded)?;
+    if png.width_px != expected_width_px || png.height_px != expected_height_px {
+        return Err(CoordinateError::CdpFailure);
+    }
+    Ok(png)
+}
+
+/// Validate a browser-produced PNG and read its dimensions from the IHDR chunk.
+pub fn validate_png_base64_dimensions(encoded: &str) -> Result<ValidatedPng, CoordinateError> {
     if encoded.len() > MAX_ENCODED_PNG_BYTES {
         return Err(CoordinateError::ImageTooLarge {
             encoded_bytes: encoded.len(),
             bound_bytes: MAX_ENCODED_PNG_BYTES,
         });
     }
-    if expected_width_px == 0 || expected_height_px == 0 {
-        return Err(CoordinateError::invalid(
-            InvalidCoordinatesReason::NonPositiveDimensions,
-        ));
-    }
 
     let bytes = decode_canonical_base64(encoded).ok_or(CoordinateError::CdpFailure)?;
-    validate_png_bytes(&bytes, expected_width_px, expected_height_px)
-        .map_err(|_| CoordinateError::CdpFailure)?;
+    let (width_px, height_px) =
+        validate_png_bytes(&bytes).map_err(|_| CoordinateError::CdpFailure)?;
     Ok(ValidatedPng {
         bytes,
-        width_px: expected_width_px,
-        height_px: expected_height_px,
+        width_px,
+        height_px,
     })
 }
 
@@ -939,11 +948,7 @@ fn decode_base64_char(byte: u8) -> Option<u8> {
     }
 }
 
-fn validate_png_bytes(
-    bytes: &[u8],
-    expected_width_px: u32,
-    expected_height_px: u32,
-) -> Result<(), ()> {
+fn validate_png_bytes(bytes: &[u8]) -> Result<(u32, u32), ()> {
     if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
         return Err(());
     }
@@ -1025,10 +1030,10 @@ fn validate_png_bytes(
     if !seen_ihdr || !seen_idat || !seen_iend {
         return Err(());
     }
-    if width != Some(expected_width_px) || height != Some(expected_height_px) {
-        return Err(());
+    match (width, height) {
+        (Some(width), Some(height)) => Ok((width, height)),
+        _ => Err(()),
     }
-    Ok(())
 }
 
 fn valid_ihdr(data: &[u8]) -> bool {

@@ -19,8 +19,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::authorization::{AuthorizationRequest, GrantStore, HazardClass, Severity};
 use crate::coordinate::{
-    capture_screenshot, map_pixel_center, CoordinateError, InvalidCoordinatesReason,
-    ScreenshotPayload, TransformInputs, ViewportObservation,
+    capture_screenshot, map_pixel_center, validate_png_base64_dimensions, CoordinateError,
+    InvalidCoordinatesReason, ScreenshotPayload, TransformInputs, ViewportObservation,
+    MAX_ENCODED_PNG_BYTES,
 };
 use crate::journal;
 use crate::journal::reservation::{
@@ -106,7 +107,7 @@ pub enum BrowserError {
         reason: InvalidCoordinatesReason,
     },
     ImageTooLarge {
-        encoded_bytes: usize,
+        bytes: usize,
         bound_bytes: usize,
     },
     AuthorizationDenied {
@@ -208,10 +209,9 @@ impl BrowserError {
             Self::InvalidCoordinates { reason } => {
                 json!({"reason_code":reason.reason_code()})
             }
-            Self::ImageTooLarge {
-                encoded_bytes,
-                bound_bytes,
-            } => json!({"encoded_bytes":encoded_bytes,"bound_bytes":bound_bytes}),
+            Self::ImageTooLarge { bytes, bound_bytes } => {
+                json!({"bytes":bytes,"bound_bytes":bound_bytes})
+            }
             Self::AuthorizationDenied { reason } => json!({"reason":reason}),
             Self::HazardNotDisclosed { missing } => {
                 json!({"reason":"hazard_not_disclosed","missing_hazard":missing.as_str()})
@@ -1598,27 +1598,85 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         args: &Value,
     ) -> Result<Value, BrowserError> {
-        let _ = self.validate_request(args, &[]).await?;
-        let _session_operation = self
+        let object = self.validate_request(args, &["max_bytes"]).await?;
+        let max_bytes = optional_integer(object, "max_bytes", 1, MAX_ENCODED_PNG_BYTES as u64)?
+            .unwrap_or(MAX_ENCODED_PNG_BYTES as u64) as usize;
+        let document_epoch = {
+            let state = self.state.lock().await;
+            let context = state
+                .contexts
+                .get(&identity.conversation_key)
+                .filter(|context| !context.ended)
+                .ok_or(BrowserError::NoSession)?;
+            context.epoch.value()
+        };
+        let Some(mut session_operation) = self
             .reserve(identity, BrowserCapability::Screenshot)
-            .await?;
-        let mut state = self.state.lock().await;
-        let ended = state
-            .contexts
-            .get(&identity.conversation_key)
-            .map(|context| context.ended)
-            .ok_or(BrowserError::NoSession)?;
-        if ended {
+            .await?
+        else {
             return Err(BrowserError::NoSession);
+        };
+        self.commit(identity, BrowserCapability::Screenshot).await?;
+        {
+            let mut state = self.state.lock().await;
+            Self::op(
+                &mut state,
+                &identity.conversation_key,
+                Operation::CdpObserve,
+            );
         }
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpObserve,
-        );
-        Err(BrowserError::Internal {
-            reason_code: JournalReasonCode::CdpFailure,
+
+        let deadline_ms = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+            .ok_or(BrowserError::NoSession)?;
+        let route_key = identity.conversation_key.clone();
+        let driven = tokio::task::spawn_blocking(move || {
+            let result = session_operation.screenshot(&route_key, document_epoch, deadline_ms);
+            (session_operation, result)
         })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        let (session_operation, drive_result) = driven;
+        session_operation.finish();
+        let observation = drive_result.map_err(map_navigation_drive_error)?;
+        let bytes = observation.image_png_b64.len();
+        if bytes > max_bytes {
+            return Err(BrowserError::ImageTooLarge {
+                bytes,
+                bound_bytes: max_bytes,
+            });
+        }
+        let png = validate_png_base64_dimensions(&observation.image_png_b64)
+            .map_err(map_coordinate_error)?;
+        let payload =
+            ScreenshotPayload::new(observation.image_png_b64, png.width_px(), png.height_px());
+        let result = self
+            .retain_screenshot_inner(
+                identity,
+                payload,
+                observation.before,
+                observation.after,
+                observation.invalidation_observed,
+            )
+            .await?;
+        self.finalize(
+            identity,
+            BrowserCapability::Screenshot,
+            Outcome::Success,
+            json!({
+                "outcome": "ok",
+                "snapshot_id": result["snapshot_id"],
+                "bytes": bytes,
+                "image_width_px": result["image_width_px"],
+                "image_height_px": result["image_height_px"],
+            }),
+        )
+        .await?;
+        Ok(result)
     }
 
     async fn click_point(
@@ -1794,6 +1852,18 @@ impl BrowserPlane {
         invalidation_observed: bool,
     ) -> Result<Value, BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
+        self.retain_screenshot_inner(identity, payload, before, after, invalidation_observed)
+            .await
+    }
+
+    async fn retain_screenshot_inner(
+        &self,
+        identity: &RouteIdentity,
+        payload: ScreenshotPayload,
+        before: ViewportObservation,
+        after: ViewportObservation,
+        invalidation_observed: bool,
+    ) -> Result<Value, BrowserError> {
         let coherent = capture_screenshot(before, payload, after, invalidation_observed)
             .map_err(map_coordinate_error)?;
         let mut state = self.state.lock().await;
@@ -1988,8 +2058,8 @@ pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             SCREENSHOT,
-            "Capture the current visual viewport.",
-            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "Capture the current visual viewport as PNG base64; max_bytes guards context size but does not reduce vision-token cost because vision APIs may downscale independently.",
+            json!({"type":"object","properties":{"max_bytes":{"type":"integer","minimum":1,"maximum":MAX_ENCODED_PNG_BYTES}},"additionalProperties":false}),
         ),
         (
             CLICK_POINT,
@@ -2267,7 +2337,7 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
             encoded_bytes,
             bound_bytes,
         } => BrowserError::ImageTooLarge {
-            encoded_bytes,
+            bytes: encoded_bytes,
             bound_bytes,
         },
         CoordinateError::CdpFailure => BrowserError::Internal {
@@ -2441,7 +2511,7 @@ mod tests {
             (
                 "image_too_large",
                 BrowserError::ImageTooLarge {
-                    encoded_bytes: 20,
+                    bytes: 20,
                     bound_bytes: 10,
                 },
                 "image_too_large",
@@ -2550,6 +2620,17 @@ mod tests {
         assert!(tools
             .iter()
             .all(|(_, _, schema)| schema["additionalProperties"] == false));
+        let (_, description, schema) = tools
+            .iter()
+            .find(|(name, _, _)| *name == SCREENSHOT)
+            .expect("screenshot remains dispatchable even though wire advertisement filters it");
+        assert!(description.contains("PNG base64"));
+        assert_eq!(schema["properties"]["max_bytes"]["type"], "integer");
+        assert_eq!(schema["properties"]["max_bytes"]["minimum"], 1);
+        assert_eq!(
+            schema["properties"]["max_bytes"]["maximum"],
+            MAX_ENCODED_PNG_BYTES
+        );
     }
 
     /// Every capability the dispatcher accepts is also advertised.

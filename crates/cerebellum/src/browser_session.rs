@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::browser::navigation::BrowserSnapshotObservation;
+use crate::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotObservation};
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
 use crate::browser_launch::ExecutableIdentityCheckpoints;
@@ -260,6 +260,16 @@ pub trait OwnedBrowserProcess: Send {
         self.snapshot(context_key, mode, deadline_ms)
     }
 
+    /// Capture one visual viewport through the process-owned CDP driver.
+    fn screenshot(
+        &mut self,
+        _context_key: &str,
+        _document_epoch: u64,
+        _deadline_ms: u64,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Resolve and click one snapshot-backed DOM identity through the process-owned
     /// CDP driver. The callback records input only after its frame reaches the pipe.
     fn click(
@@ -446,6 +456,28 @@ impl OperationGuard {
             current_origin,
             deadline_ms,
         )
+    }
+
+    pub(crate) fn screenshot(
+        &mut self,
+        context_key: &str,
+        document_epoch: u64,
+        deadline_ms: u64,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        let mut state = self
+            .sessions
+            .inner
+            .0
+            .lock()
+            .map_err(|_| NavigationDriveError::Unavailable)?;
+        let process = state
+            .routes
+            .get_mut(&self.route_key)
+            .and_then(|route| route.active.as_mut())
+            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
+            .and_then(|session| session.process.as_mut())
+            .ok_or(NavigationDriveError::Unavailable)?;
+        process.screenshot(context_key, document_epoch, deadline_ms)
     }
 
     #[allow(clippy::too_many_arguments)]
