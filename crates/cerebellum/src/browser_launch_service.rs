@@ -369,6 +369,7 @@ impl MacOsOrphanProcessControl {
             cerebellum_macos::ProcessStartTime::NoSuchProcess => Ok(false),
             cerebellum_macos::ProcessStartTime::NotPermitted
             | cerebellum_macos::ProcessStartTime::LayoutMismatch
+            | cerebellum_macos::ProcessStartTime::Unclassified(_)
             | cerebellum_macos::ProcessStartTime::NoStartTime => Err(()),
         }
     }
@@ -384,6 +385,7 @@ impl OrphanBrowserProcessControl for MacOsOrphanProcessControl {
             cerebellum_macos::ProcessStartTime::NoSuchProcess => Ok(None),
             cerebellum_macos::ProcessStartTime::NotPermitted
             | cerebellum_macos::ProcessStartTime::LayoutMismatch
+            | cerebellum_macos::ProcessStartTime::Unclassified(_)
             | cerebellum_macos::ProcessStartTime::NoStartTime => Err(OrphanProcessControlFailure),
         }
     }

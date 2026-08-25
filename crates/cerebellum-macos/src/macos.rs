@@ -414,6 +414,18 @@ pub enum ProcessStartTime {
     /// fact about the process, and it would otherwise present as every process
     /// being gone at once.
     LayoutMismatch,
+    /// The kernel refused for a reason this code does not classify, carrying the
+    /// errno so the next reader can name it.
+    ///
+    /// Separate from [`Self::LayoutMismatch`] because that variant asserts
+    /// something specific about a structure that was READ, and an unclassified
+    /// failure read nothing. Folding the two sends whoever debugs it to compare
+    /// struct definitions against a kernel header, when the answer is an errno
+    /// that was discarded before it could be reported.
+    ///
+    /// It travels with the other unreadable outcomes: not knowing why is not
+    /// evidence that a process is gone.
+    Unclassified(i32),
     /// The process reports no start time, or one that does not fit. Two such
     /// processes would compare as the same generation, so it cannot be used as
     /// evidence.
@@ -442,15 +454,7 @@ pub fn process_start_time(pid: u32) -> ProcessStartTime {
         // process this one may not inspect, ENOMEM when the buffer is smaller
         // than the kernel's own structure.
         // SAFETY: reads a thread-local set by the call above.
-        return match unsafe { errno_location().read() } {
-            3 => ProcessStartTime::NoSuchProcess,
-            1 => ProcessStartTime::NotPermitted,
-            12 => ProcessStartTime::LayoutMismatch,
-            // An unrecognised failure is reported as a layout mismatch rather
-            // than as a missing process, because the one thing known is that
-            // this code did not understand the answer.
-            _ => ProcessStartTime::LayoutMismatch,
-        };
+        return start_time_failure(unsafe { errno_location().read() });
     }
 
     if info.pbi_start_tvsec == 0 {
@@ -464,6 +468,27 @@ pub fn process_start_time(pid: u32) -> ProcessStartTime {
     {
         Some(micros) => ProcessStartTime::Started(micros),
         None => ProcessStartTime::NoStartTime,
+    }
+}
+
+/// What a failed `proc_pidinfo` call means, by the errno it left behind.
+///
+/// Separated from the call so the mapping can be tested: the failures it
+/// distinguishes are ones no test can provoke on demand, and a mapping only
+/// reachable through a syscall that refuses on the kernel's terms is a mapping
+/// nobody checks.
+fn start_time_failure(errno: i32) -> ProcessStartTime {
+    match errno {
+        3 => ProcessStartTime::NoSuchProcess,
+        1 => ProcessStartTime::NotPermitted,
+        12 => ProcessStartTime::LayoutMismatch,
+        // Unclassified rather than a layout mismatch. Both refuse to signal, so
+        // the safety is identical -- but a layout mismatch asserts something
+        // about a structure that was READ, and nothing was read here. The errno
+        // rides along because it is the only thing that can name the cause, and
+        // discarding it is what made an unclassified refusal present as a
+        // struct-definition problem.
+        other => ProcessStartTime::Unclassified(other),
     }
 }
 
@@ -1329,6 +1354,38 @@ mod tests {
              outside the window's own coordinate space is clamped rather than refused, so this \
              is what an offset applied in the wrong space looks like"
         );
+    }
+
+    /// An errno this code does not classify is reported as unclassified,
+    /// carrying the errno, rather than borrowing a sibling's meaning.
+    ///
+    /// The distinction is diagnostic rather than behavioural — both refuse to
+    /// signal — and that is exactly why it needs a test. A wrong label here
+    /// costs nobody a process and costs whoever debugs it a day, because
+    /// `LayoutMismatch` sends a reader to compare struct definitions against a
+    /// kernel header for a call that never read a structure.
+    #[test]
+    fn an_unclassified_errno_is_not_reported_as_a_layout_mismatch() {
+        // The three this code does classify, so the catch-all is not simply
+        // swallowing everything.
+        assert_eq!(start_time_failure(3), ProcessStartTime::NoSuchProcess);
+        assert_eq!(start_time_failure(1), ProcessStartTime::NotPermitted);
+        assert_eq!(start_time_failure(12), ProcessStartTime::LayoutMismatch);
+
+        // EINTR and EFAULT are real errnos this code has no reading for. They
+        // must not arrive wearing a claim about the kernel's structure.
+        for errno in [4, 14, 22] {
+            assert_eq!(
+                start_time_failure(errno),
+                ProcessStartTime::Unclassified(errno),
+                "errno {errno} should be reported as itself"
+            );
+            assert_ne!(
+                start_time_failure(errno),
+                ProcessStartTime::LayoutMismatch,
+                "errno {errno} must not claim the kernel structure was wrong"
+            );
+        }
     }
 
     /// A captured window yields pixels matching the size it reported.

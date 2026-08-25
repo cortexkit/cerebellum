@@ -190,7 +190,8 @@ pub(crate) fn verify_grant(pid: u32, grant: &ProcessGrant) -> GrantVerification 
         cerebellum_macos::ProcessStartTime::NoSuchProcess => return GrantVerification::TargetGone,
         cerebellum_macos::ProcessStartTime::NotPermitted
         | cerebellum_macos::ProcessStartTime::NoStartTime
-        | cerebellum_macos::ProcessStartTime::LayoutMismatch => {
+        | cerebellum_macos::ProcessStartTime::LayoutMismatch
+        | cerebellum_macos::ProcessStartTime::Unclassified(_) => {
             return GrantVerification::TargetUnreadable
         }
     };
