@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -255,6 +256,20 @@ fn navigation_grants() -> GrantStore {
     .with_disclosed_hazards([HazardClass::UnverifiedFormContents])])
 }
 
+fn screenshot_grants(origins: &[&str]) -> GrantStore {
+    GrantStore::new([ActionGrant::new(
+        "b1-s3-screenshot-grant",
+        1,
+        identity().conversation_key.clone(),
+        Severity {
+            tier: 1,
+            credential: false,
+            financial: false,
+        },
+        origins.iter().copied(),
+    )])
+}
+
 #[derive(Clone)]
 struct SnapshotProcess {
     observation: BrowserSnapshotObservation,
@@ -326,6 +341,7 @@ impl CdpPipeIo for ScreenshotPipe {
 
 struct ScreenshotProcess {
     driver: CdpNavigationDriver<ScreenshotPipe>,
+    captures: Arc<AtomicUsize>,
 }
 
 impl OwnedBrowserProcess for ScreenshotProcess {
@@ -335,6 +351,7 @@ impl OwnedBrowserProcess for ScreenshotProcess {
         document_epoch: u64,
         deadline_ms: u64,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        self.captures.fetch_add(1, Ordering::SeqCst);
         self.driver
             .screenshot(context_key, document_epoch, deadline_ms)
     }
@@ -423,7 +440,7 @@ impl OwnedBrowserProcess for ClickProcess {
     }
 }
 
-fn screenshot_process() -> ScreenshotProcess {
+fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
     let viewport = json!({
         "offsetX": 3.5,
         "offsetY": 4.25,
@@ -446,6 +463,7 @@ fn screenshot_process() -> ScreenshotProcess {
             CdpTransport::new(),
             CdpFrameDecoder::default(),
         ),
+        captures,
     }
 }
 
@@ -481,7 +499,7 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
     }
 }
 
-async fn position_on_authorized_snapshot_page(plane: &BrowserPlane, route: &RouteIdentity) {
+async fn position_on_authorized_page(plane: &BrowserPlane, route: &RouteIdentity) {
     plane
         .same_document_url(
             route,
@@ -493,10 +511,98 @@ async fn position_on_authorized_snapshot_page(plane: &BrowserPlane, route: &Rout
 }
 
 #[tokio::test]
+async fn screenshot_authorization_refuses_no_grant_before_capture() {
+    let route = identity();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process(Arc::clone(&captures))),
+        100,
+    )
+    .with_grants_installed(GrantStore::default());
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let refused = plane
+        .dispatch(&route, BrowserCapability::Screenshot, &json!({}))
+        .await;
+
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "no_grant", "{refused}");
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        0,
+        "an unauthorized screenshot reached the capture backend"
+    );
+}
+
+#[tokio::test]
+async fn screenshot_with_covering_observe_grant_captures() {
+    let route = identity();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process(Arc::clone(&captures))),
+        100,
+    )
+    .with_grants_installed(screenshot_grants(&["https://requested.example"]));
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let captured = plane
+        .dispatch(&route, BrowserCapability::Screenshot, &json!({}))
+        .await;
+
+    assert_eq!(captured["outcome"], "ok", "{captured}");
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        1,
+        "the covering observe grant did not admit one capture"
+    );
+}
+
+#[tokio::test]
+async fn screenshot_origin_scope_refuses_redirect_before_capture() {
+    let route = identity();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process(Arc::clone(&captures))),
+        100,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    plane
+        .same_document_url(
+            &route,
+            "https://attacker.example/after-redirect",
+            SameDocumentChange::ReplaceState,
+        )
+        .await
+        .unwrap();
+
+    let refused = plane
+        .dispatch(&route, BrowserCapability::Screenshot, &json!({}))
+        .await;
+
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "origin_scope", "{refused}");
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        0,
+        "an off-origin screenshot reached the capture backend"
+    );
+}
+
+#[tokio::test]
 async fn screenshot_retains_browser_reported_dimensions_and_enables_click_point() {
     let route = identity();
-    let plane = plane_with_process(&route, Box::new(screenshot_process()), 100);
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process(Arc::new(AtomicUsize::new(0)))),
+        100,
+    );
     plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
 
     let captured = plane
         .dispatch(
@@ -540,8 +646,13 @@ async fn screenshot_retains_browser_reported_dimensions_and_enables_click_point(
 #[tokio::test]
 async fn screenshot_refuses_when_browser_png_exceeds_max_bytes_and_names_both_sizes() {
     let route = identity();
-    let plane = plane_with_process(&route, Box::new(screenshot_process()), 100);
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process(Arc::new(AtomicUsize::new(0)))),
+        100,
+    );
     plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
     let bound_bytes = ONE_BY_ONE_PNG_B64.len() - 1;
 
     let refused = plane
@@ -562,7 +673,7 @@ async fn snapshot_without_a_ready_session_refuses_before_transport_observation()
     let plane = BrowserPlane::with_grants(navigation_grants());
     let route = identity();
     plane.open_context(route.clone()).await.unwrap();
-    position_on_authorized_snapshot_page(&plane, &route).await;
+    position_on_authorized_page(&plane, &route).await;
 
     let result = plane
         .dispatch(
@@ -606,7 +717,7 @@ async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
     ]);
     let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
     plane.open_context(route.clone()).await.unwrap();
-    position_on_authorized_snapshot_page(&plane, &route).await;
+    position_on_authorized_page(&plane, &route).await;
 
     let result = plane
         .dispatch(
@@ -672,7 +783,7 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
         1_000,
     );
     plane.open_context(route.clone()).await.unwrap();
-    position_on_authorized_snapshot_page(&plane, &route).await;
+    position_on_authorized_page(&plane, &route).await;
     let result = plane
         .dispatch(
             &route,
@@ -701,7 +812,7 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
     observation.refs_truncated = true;
     let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
     plane.open_context(route.clone()).await.unwrap();
-    position_on_authorized_snapshot_page(&plane, &route).await;
+    position_on_authorized_page(&plane, &route).await;
     let result = plane
         .dispatch(
             &route,
