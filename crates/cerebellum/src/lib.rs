@@ -665,7 +665,7 @@ pub fn browser_wire_surface(browser_configured: bool) -> Vec<(String, bool)> {
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
     if browser_configured
         && (browser_session::CONTROL_TOOLS.contains(&name)
-            || matches!(name, browser::NAVIGATE | browser::SNAPSHOT | browser::CLICK))
+            || browser::has_wire_dispatch_route(name))
     {
         Some(name)
     } else if computer_capability::servable(name).is_some() {

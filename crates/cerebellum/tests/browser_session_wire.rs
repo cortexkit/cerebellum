@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -849,6 +850,36 @@ async fn absent_browser_config_uses_the_route_level_unknown_method_envelope() {
             std::time::SystemTime::UNIX_EPOCH,
         )["outcome"],
         "no_session"
+    );
+}
+
+/// The advertised browser tools and the browser dispatch path admit the same set.
+///
+/// Each set is read from its production path: `browser_wire_tools` constructs the
+/// advertised tools and `dispatchable_tool_for_test` calls the predicate the wire
+/// loop uses. Comparing those sets rather than a literal makes either one-sided
+/// admission change fail by capability name.
+#[test]
+fn browser_wire_advertisement_and_dispatch_are_equal() {
+    let advertised: BTreeSet<String> = cerebellum::manifest::browser_wire_tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    let dispatchable: BTreeSet<String> = cerebellum::browser::tool_definitions()
+        .into_iter()
+        .filter_map(|(name, _, _)| {
+            cerebellum::dispatchable_tool_for_test(name, true)
+                .is_some()
+                .then(|| name.to_string())
+        })
+        .collect();
+
+    assert_eq!(
+        advertised,
+        dispatchable,
+        "browser wire admission differs: advertised-only={:?}; dispatchable-only={:?}",
+        advertised.difference(&dispatchable).collect::<Vec<_>>(),
+        dispatchable.difference(&advertised).collect::<Vec<_>>(),
     );
 }
 
