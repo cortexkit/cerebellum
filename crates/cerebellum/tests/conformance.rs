@@ -863,6 +863,7 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "browser.navigate",
         "browser.snapshot",
         "browser.click",
+        "browser.screenshot",
     ] {
         assert!(
             registered.contains(&expected),
@@ -888,8 +889,8 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
     // tests measure a DIFFERENCE rather than each measuring its own world.
     assert_eq!(
         registered.len(),
-        7,
-        "expected the six browser tools plus computer.wait: {registered:?}"
+        8,
+        "expected the seven browser tools plus computer.wait: {registered:?}"
     );
 
     // Close the client before the daemon and module guards are dropped so the
