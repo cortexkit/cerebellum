@@ -120,6 +120,33 @@ impl BarredChild {
         executed_image_identity(self.generation.pid).map_err(image_error_to_control)
     }
 
+    /// Continue until the next exec stop or a deadline, reporting timeout as
+    /// an observation because a running final image has no kernel event that
+    /// proves it will never exec later.
+    pub fn continue_to_next_exec_stop_with_deadline(
+        &mut self,
+        maximum_hops: usize,
+        deadline: Instant,
+    ) -> Result<Option<ExecutedImageIdentity>, ProcessControlError> {
+        if self.exec_hops >= maximum_hops {
+            return Err(ProcessControlError::ExecChainExhausted);
+        }
+        ptrace_continue(self.generation.pid as c_int)?;
+        let Some(status) = wait_for_status_until(self.generation.pid as c_int, deadline)? else {
+            return Ok(None);
+        };
+        if !is_stopped(status) {
+            return Err(ProcessControlError::ProcessExited);
+        }
+        if !is_exec_stop(status) {
+            return Err(ProcessControlError::UnexpectedStop);
+        }
+        self.exec_hops += 1;
+        executed_image_identity(self.generation.pid)
+            .map(Some)
+            .map_err(image_error_to_control)
+    }
+
     /// Detach from the exact stopped generation and let it execute.
     pub fn release(mut self) -> Result<ReleasedChild, ProcessControlError> {
         ensure_generation(self.generation)?;
@@ -697,6 +724,31 @@ fn wait_for_status(pid: c_int) -> Result<c_int, ProcessControlError> {
     }
 }
 
+fn wait_for_status_until(
+    pid: c_int,
+    deadline: Instant,
+) -> Result<Option<c_int>, ProcessControlError> {
+    let mut status = 0;
+    loop {
+        // SAFETY: status points to owned storage and pid is passed by value.
+        let observed = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if observed == pid {
+            return Ok(Some(status));
+        }
+        if observed < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ProcessControlError::Reap(error.kind()));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn wait_for_pid(pid: c_int) -> Result<(), ProcessControlError> {
     wait_for_status(pid).map(|_| ())
 }
@@ -1101,6 +1153,22 @@ mod tests {
             blocked,
             0,
             "exec'd image retained the launcher's signal mask (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+        );
+    }
+
+    #[test]
+    fn bounded_exec_wait_reports_no_later_exec_without_releasing_the_target() {
+        let _lock = signal_state_lock();
+        let mut child = spawn_sleep();
+        let generation = child.generation();
+        let observed = child
+            .continue_to_next_exec_stop_with_deadline(1, Instant::now() + Duration::from_millis(20))
+            .expect("bounded wait must be an observation");
+        assert_eq!(observed, None);
+        child.terminate_and_reap().expect("terminate bounded probe");
+        assert_eq!(
+            process_start_time(generation.pid),
+            ProcessStartTime::NoSuchProcess
         );
     }
 

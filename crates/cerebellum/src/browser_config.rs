@@ -33,7 +33,15 @@ pub enum BrowserConfigReason {
     OutOfRange,
     PathNotAbsolute,
     ExpectedIdentityRequired,
-    BelowSettlementQuietWindow { quiet_ms: u64 },
+    ExecutableProbeFailed(String),
+    FinalImageMismatch {
+        expected: String,
+        path: PathBuf,
+        sha256: String,
+    },
+    BelowSettlementQuietWindow {
+        quiet_ms: u64,
+    },
 }
 
 impl std::fmt::Display for BrowserConfigError {
@@ -62,6 +70,18 @@ impl std::fmt::Display for BrowserConfigError {
                 f,
                 "browser.expected_identity: required when browser.executable_path is set"
             ),
+            BrowserConfigReason::ExecutableProbeFailed(reason) => {
+                write!(f, "browser.executable_path: executable identity probe failed: {reason}")
+            }
+            BrowserConfigReason::FinalImageMismatch {
+                expected,
+                path,
+                sha256,
+            } => write!(
+                f,
+                "browser.expected_identity: configured sha256={expected} is not final; pin sha256={sha256} for {}",
+                path.display()
+            ),
             BrowserConfigReason::BelowSettlementQuietWindow { quiet_ms } => write!(
                 f,
                 "{}: must exceed {quiet_ms}ms, the network-quiet window a navigation \
@@ -87,6 +107,80 @@ pub fn load_browser_config_file() -> Result<Option<BrowserConfig>, BrowserConfig
             reason: BrowserConfigReason::Malformed(format!("reading {}: {error}", path.display())),
         }),
     }
+}
+
+pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), BrowserConfigError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let Some(path) = config.executable_path.as_deref() else {
+            return Ok(());
+        };
+        // Missing paths retain the existing launch-time `executable_missing`
+        // refusal; there is no image to probe during config loading.
+        if !path.is_file() {
+            return Ok(());
+        }
+        let expected = config
+            .expected_identity
+            .as_deref()
+            .ok_or_else(|| BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason: BrowserConfigReason::ExpectedIdentityRequired,
+            })?;
+        crate::browser_executable_identity::verify_configured_executable(path, expected).map_err(
+            |refusal| BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason: BrowserConfigReason::ExecutableProbeFailed(refusal.to_string()),
+            },
+        )?;
+        let (command_child, _command_parent) =
+            UnixStream::pair().map_err(|error| BrowserConfigError {
+                field: "browser.executable_path".to_string(),
+                reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
+            })?;
+        let (_response_parent, response_child) =
+            UnixStream::pair().map_err(|error| BrowserConfigError {
+                field: "browser.executable_path".to_string(),
+                reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
+            })?;
+        let mut launcher = crate::browser_launch::LinuxProcessLauncher::new(
+            command_child.as_raw_fd(),
+            response_child.as_raw_fd(),
+        );
+        let probe_profile = std::env::temp_dir().join(format!(
+            "cerebellum-config-probe-profile-{}",
+            std::process::id()
+        ));
+        let arguments = crate::browser_launch_service::browser_launch_arguments(&probe_profile);
+        crate::browser_executable_identity::validate_configured_executable_at_load(
+            &mut launcher,
+            path,
+            &arguments,
+            &[],
+            expected,
+        )
+        .map_err(|refusal| BrowserConfigError {
+            field: "browser.expected_identity".to_string(),
+            reason: if refusal["outcome"] == "executable_identity_mismatch" {
+                BrowserConfigReason::FinalImageMismatch {
+                    expected: expected.to_string(),
+                    path: PathBuf::from(refusal["final_image_path"].as_str().unwrap_or_default()),
+                    sha256: refusal["final_image_sha256"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                }
+            } else {
+                BrowserConfigReason::ExecutableProbeFailed(refusal.to_string())
+            },
+        })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = config;
+    Ok(())
 }
 
 pub fn parse_browser_config(text: &str) -> Result<Option<BrowserConfig>, BrowserConfigError> {
@@ -334,6 +428,76 @@ mod tests {
         );
         value["browser"]["expected_identity"] = serde_json::json!("com.example.Chrome");
         assert!(parse_browser_config(&value.to_string()).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_load_refuses_a_wrapper_pin_with_the_final_image_sha256() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cerebellum-linux-config-load-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create config probe directory");
+        let wrapper = root.join("wrapper");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write wrapper");
+        let mut permissions = std::fs::metadata(&wrapper)
+            .expect("wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+        let mut config = parse_browser_config(&configured()).unwrap().unwrap();
+        config.executable_path = Some(wrapper.clone());
+        config.expected_identity = Some(sha256_file_for_test(&wrapper));
+
+        let refusal = validate_browser_config_at_load(&config).expect_err("wrapper pin refused");
+        let text = refusal.to_string();
+        assert!(text.contains("is not final"), "unexpected refusal: {text}");
+        assert!(
+            text.contains("/bin/sleep"),
+            "missing final image path: {text}"
+        );
+        assert!(
+            text.contains(&sha256_file_for_test(Path::new("/bin/sleep"))),
+            "missing final image digest: {text}"
+        );
+        std::fs::remove_dir_all(root).expect("remove config probe directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_load_accepts_a_pin_for_the_terminal_image() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cerebellum-linux-config-load-terminal-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create terminal config directory");
+        let wrapper = root.join("terminal");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
+            .expect("write terminal wrapper");
+        let mut permissions = std::fs::metadata(&wrapper)
+            .expect("terminal metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).expect("make terminal wrapper executable");
+        let mut config = parse_browser_config(&configured()).unwrap().unwrap();
+        config.executable_path = Some(wrapper);
+        config.expected_identity = Some(sha256_file_for_test(Path::new("/bin/sleep")));
+
+        validate_browser_config_at_load(&config).expect("terminal image pin accepted");
+        std::fs::remove_dir_all(root).expect("remove terminal config directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sha256_file_for_test(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(path).expect("read digest fixture"))
+        )
     }
 }
 

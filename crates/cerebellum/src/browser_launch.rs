@@ -1009,6 +1009,12 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
 const LINUX_EXEC_CHAIN_HOP_LIMIT: usize = 8;
 
 #[cfg(target_os = "linux")]
+/// A queued wrapper exec should arrive quickly; this window bounds the probe
+/// without pretending that a running image can prove it will never exec later.
+pub(crate) const LINUX_EXEC_CHAIN_PROBE_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+#[cfg(target_os = "linux")]
 pub struct LinuxProcessLauncher {
     cdp_command_read_fd: std::os::fd::RawFd,
     cdp_response_write_fd: std::os::fd::RawFd,
@@ -1025,6 +1031,96 @@ impl LinuxProcessLauncher {
             cdp_response_write_fd,
         }
     }
+
+    fn spawn_raw(
+        &self,
+        executable: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+    ) -> Result<cerebellum_linux::BarredChild, PlatformLaunchError> {
+        cerebellum_linux::spawn_barred(
+            executable,
+            arguments,
+            environment,
+            self.cdp_command_read_fd,
+            self.cdp_response_write_fd,
+        )
+        .map_err(|error| match error {
+            cerebellum_linux::SpawnError::Ptrace(_) => PlatformLaunchError::PtraceUnavailable,
+            _ => PlatformLaunchError::Spawn,
+        })
+    }
+
+    pub(crate) fn probe_configured_executable(
+        &mut self,
+        executable: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        expected: &str,
+    ) -> Result<LinuxDryRunObservation, PlatformLaunchError> {
+        // Finality cannot be proven while the tracee is stopped at an exec
+        // event. The probe therefore watches briefly for one more event after
+        // the configured digest matches; a passing probe lets that image run
+        // for the window before terminating it. This bounds only a queued
+        // wrapper exec, not browser startup or readiness.
+        let mut child = self.spawn_raw(executable, arguments, environment)?;
+        let generation = child.generation();
+        let result = (|| {
+            let mut observed = cerebellum_linux::executed_image_identity(generation.pid)
+                .map_err(map_linux_image_identity_error)?;
+            for _ in 0..=LINUX_EXEC_CHAIN_HOP_LIMIT {
+                if observed.image_sha256 == expected {
+                    let next_exec = child
+                        .continue_to_next_exec_stop_with_deadline(
+                            LINUX_EXEC_CHAIN_HOP_LIMIT + 1,
+                            std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW,
+                        )
+                        .map_err(map_linux_process_control_error)?;
+                    return Ok(LinuxDryRunObservation {
+                        generation: BrowserProcessGeneration {
+                            pid: generation.pid,
+                            start_time_micros: generation.start_time_micros,
+                        },
+                        observed,
+                        next_exec,
+                    });
+                }
+                let Some(next) = child
+                    .continue_to_next_exec_stop_with_deadline(
+                        LINUX_EXEC_CHAIN_HOP_LIMIT,
+                        std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW,
+                    )
+                    .map_err(map_linux_process_control_error)?
+                else {
+                    return Ok(LinuxDryRunObservation {
+                        generation: BrowserProcessGeneration {
+                            pid: generation.pid,
+                            start_time_micros: generation.start_time_micros,
+                        },
+                        observed,
+                        next_exec: None,
+                    });
+                };
+                observed = next;
+            }
+            Err(PlatformLaunchError::ExecChainUnresolved)
+        })();
+        let termination = child
+            .terminate_and_reap()
+            .map_err(map_linux_process_control_error);
+        match termination {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinuxDryRunObservation {
+    pub generation: BrowserProcessGeneration,
+    pub observed: cerebellum_linux::ExecutedImageIdentity,
+    pub next_exec: Option<cerebellum_linux::ExecutedImageIdentity>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1150,12 +1246,10 @@ impl BarredProcessLauncher for LinuxProcessLauncher {
         &mut self,
         request: &AttestedLaunchRequest,
     ) -> Result<Self::Process, PlatformLaunchError> {
-        cerebellum_linux::spawn_barred(
+        self.spawn_raw(
             &request.executable,
             &request.arguments,
             &request.environment,
-            self.cdp_command_read_fd,
-            self.cdp_response_write_fd,
         )
         .map(|child| {
             let expected = match &request.verified_executable_identity {
@@ -1163,10 +1257,6 @@ impl BarredProcessLauncher for LinuxProcessLauncher {
                 ExecutableIdentityClaim::CodeSigned { .. } => String::new(),
             };
             LinuxBarredProcess(RefCell::new(child), expected)
-        })
-        .map_err(|error| match error {
-            cerebellum_linux::SpawnError::Ptrace(_) => PlatformLaunchError::PtraceUnavailable,
-            _ => PlatformLaunchError::Spawn,
         })
     }
 }
