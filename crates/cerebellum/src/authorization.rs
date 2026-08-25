@@ -147,6 +147,7 @@ impl Severity {
 pub enum Action {
     Navigate,
     Snapshot,
+    Screenshot,
     Click,
     ClickPoint,
 }
@@ -156,7 +157,9 @@ pub type CapabilityAction = Action;
 impl Action {
     pub const fn floor(self) -> Severity {
         match self {
-            Self::Navigate | Self::Snapshot => Severity::new(OBSERVE, false, false),
+            Self::Navigate | Self::Snapshot | Self::Screenshot => {
+                Severity::new(OBSERVE, false, false)
+            }
             Self::Click | Self::ClickPoint => Severity::new(COMPOSE, false, false),
         }
     }
@@ -276,6 +279,21 @@ impl<'a> AuthorizationRequest<'a> {
             conversation_key,
             action: Action::Snapshot,
             requested_severity: Action::Snapshot.floor(),
+            invocation_id,
+            bind_identity,
+            classification: None,
+        }
+    }
+
+    pub fn screenshot(
+        conversation_key: &'a str,
+        invocation_id: &'a str,
+        bind_identity: &'a str,
+    ) -> Self {
+        Self {
+            conversation_key,
+            action: Action::Screenshot,
+            requested_severity: Action::Screenshot.floor(),
             invocation_id,
             bind_identity,
             classification: None,
@@ -673,7 +691,7 @@ pub fn computed_required_severity(
     classification: Option<&NonTypeClassificationRecord>,
 ) -> Result<(Severity, Option<NonTypeClassificationFingerprint>), AuthorizationError> {
     match action {
-        Action::Navigate | Action::Snapshot => Ok((action.floor(), None)),
+        Action::Navigate | Action::Snapshot | Action::Screenshot => Ok((action.floor(), None)),
         Action::Click if classification.is_none() => {
             Ok((Severity::new(MUTATE_DURABLE, true, true), None))
         }
@@ -703,9 +721,9 @@ pub fn target_hazards(
 ) -> Result<BTreeSet<HazardClass>, AuthorizationError> {
     match (action, classification) {
         (Action::Navigate, _) => Ok(BTreeSet::new()),
-        // Snapshot reads page structure but cannot activate a control, so no
-        // form-submit hazard can arise from the observation itself.
-        (Action::Snapshot, _) => Ok(BTreeSet::new()),
+        // Page captures cannot activate a control, so no form-submit hazard can
+        // arise from either structured or pixel observations.
+        (Action::Snapshot | Action::Screenshot, _) => Ok(BTreeSet::new()),
         // click_point shares this arm with click deliberately. A coordinate
         // click hit-tests to a control and can activate the same submit button
         // a ref click would, so disclosing one and not the other would let a

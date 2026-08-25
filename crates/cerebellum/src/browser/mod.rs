@@ -1611,15 +1611,40 @@ impl BrowserPlane {
         let object = self.validate_request(args, &["max_bytes"]).await?;
         let max_bytes = optional_integer(object, "max_bytes", 1, MAX_ENCODED_PNG_BYTES as u64)?
             .unwrap_or(MAX_ENCODED_PNG_BYTES as u64) as usize;
-        let document_epoch = {
+        let (document_epoch, source_origin) = {
             let state = self.state.lock().await;
             let context = state
                 .contexts
                 .get(&identity.conversation_key)
                 .filter(|context| !context.ended)
                 .ok_or(BrowserError::NoSession)?;
-            context.epoch.value()
+            (
+                context.epoch.value(),
+                context
+                    .tracker
+                    .url_final
+                    .clone()
+                    .unwrap_or_else(|| "null".into()),
+            )
         };
+        {
+            let grants = self.grants.lock().await;
+            let decision = grants
+                .authorize(AuthorizationRequest::screenshot(
+                    &identity.conversation_key,
+                    &source_origin,
+                    &identity.agent_project_id,
+                ))
+                .map_err(map_authorization_error)?;
+            decision
+                .evaluate_origin_scope(&origin_from_url(&source_origin))
+                .map_err(|_| BrowserError::AuthorizationDenied {
+                    reason: "origin_scope",
+                })?;
+            grants
+                .commit(&decision)
+                .map_err(|_| BrowserError::AuthorizationDenied { reason: "no_grant" })?;
+        }
         let Some(mut session_operation) = self
             .reserve(identity, BrowserCapability::Screenshot)
             .await?
