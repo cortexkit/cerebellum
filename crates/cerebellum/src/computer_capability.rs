@@ -148,11 +148,11 @@ fn capture_region(region: CaptureRegion) -> WindowCaptureRegion {
     }
 }
 
-/// Give every screenshot outcome the result envelope declared by vocabulary v4.
+/// Give every screenshot outcome the result envelope declared by vocabulary v5.
 ///
 /// `value` repeats the caller's request and `detail` exposes backend diagnostics;
 /// neither is part of the public refusal contract. The remaining refusal fields
-/// name actionable remedies and stay on the wire until the artifact declares them.
+/// name actionable remedies and are declared by the frozen vocabulary.
 fn screenshot_wire_reply(mut reply: Value) -> Value {
     let object = reply
         .as_object_mut()

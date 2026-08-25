@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v4.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v5.json");
 
 use cerebellum_computer::platform::{
     attributed_permission_liveness, capability_declarations, computed_vocabulary_sha256,
@@ -17,7 +17,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v4");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v5");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -40,7 +40,7 @@ fn vocabulary_requires_all_three_digest_sources() {
 }
 
 #[test]
-fn implementation_source_lock_digest_matches_the_v4_artifact() {
+fn implementation_source_lock_digest_matches_the_v5_artifact() {
     assert_eq!(
         implementation_source_lock_digest().as_deref(),
         Some(COMPUTER_ACTION_VOCABULARY_SHA256)
@@ -134,7 +134,7 @@ fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
 }
 
 #[test]
-fn click_query_and_wait_settle_markers_are_closed_to_v4_values() {
+fn click_query_and_wait_settle_markers_are_closed_to_v5_values() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows");
     let click = rows

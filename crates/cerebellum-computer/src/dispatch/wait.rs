@@ -44,7 +44,7 @@ pub enum WaitEvidence {
     },
 }
 
-/// The three terminal states exposed by the v4 wire contract.
+/// The three terminal states exposed by the v5 wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     Settled,
