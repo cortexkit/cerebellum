@@ -5,11 +5,13 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cerebellum::browser_launch::{BrowserLaunchOutcome, LaunchCleanupStage, ProfileBoundLaunch};
+use cerebellum::browser_launch::{
+    map_profile_outcome, BrowserLaunchOutcome, LaunchCleanupStage, ProfileBoundLaunch,
+};
 use cerebellum::profile::{
-    stamped_bind_context, BindFacts, DispatchCommitmentToken, DurableResolution, InvocationToken,
-    JournalReservationHandle, LaunchResult, PrepareResult, ProfileLifecycle, ProfileOutcome,
-    ProfileState, RegistryConfig,
+    stamped_bind_context, BindFacts, DispatchCommitmentToken, DurableResolution, FailureOrigin,
+    InvocationToken, JournalReservationHandle, LaunchResult, PrepareResult, ProfileLifecycle,
+    ProfileOutcome, ProfileState, RegistryConfig,
 };
 use cerebellum::profile_custody::{
     classify_supervisor_start_time, ProfileCustodyAcquisition, ProfileCustodyEvent,
@@ -17,7 +19,7 @@ use cerebellum::profile_custody::{
     ProfileCustodyLocks, ProfileCustodyRelease, SupervisorGeneration, SupervisorLiveness,
     SupervisorLivenessProbe,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 struct TestRoot(PathBuf);
 
@@ -865,6 +867,114 @@ fn assert_no_profile_uuid(value: &Value) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn registry_root_identity_refusal_is_not_reported_as_profile_storage_unavailable() {
+    let root = TestRoot::new("registry-root-rebound");
+    let durable_context = context("primary", "durable", "root-rebound-first");
+    let (first_invocation, first_reservation, _) = tokens("root-rebound-first");
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    assert!(matches!(
+        lifecycle.prepare_context_open(&first_invocation, &first_reservation, &durable_context,),
+        PrepareResult::Prepared(_)
+    ));
+    drop(lifecycle);
+
+    let previous_root = root.path().with_extension("previous-binding");
+    fs::rename(root.path(), &previous_root).unwrap();
+    fs::create_dir(root.path()).unwrap();
+    for entry in fs::read_dir(&previous_root).unwrap() {
+        let entry = entry.unwrap();
+        fs::rename(entry.path(), root.path().join(entry.file_name())).unwrap();
+    }
+
+    let rebound_context = context("primary", "durable", "root-rebound-second");
+    let (invocation, reservation, _) = tokens("root-rebound-second");
+    let mut rebound_lifecycle =
+        ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    let outcome =
+        match rebound_lifecycle.prepare_context_open(&invocation, &reservation, &rebound_context) {
+            PrepareResult::Closed(outcome) => outcome,
+            PrepareResult::Prepared(_) => panic!("rebound root must remain closed"),
+        };
+    assert_eq!(
+        outcome,
+        ProfileOutcome::StorageUnavailable {
+            reason_code: "profile_registry_managed_root_identity_changed",
+            origin: FailureOrigin::RegistryOrStorage,
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(outcome).as_json(),
+        json!({
+            "outcome": "profile_registry_untrusted_root",
+            "reason_code": "profile_registry_managed_root_identity_changed",
+        })
+    );
+
+    fs::remove_dir(previous_root).unwrap();
+}
+
+#[test]
+fn unaccounted_profile_directory_reports_why_the_root_is_untrusted() {
+    let root = TestRoot::new("possibly-managed-path");
+    fs::create_dir_all(root.path().join("profiles/unaccounted-profile")).unwrap();
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    let (invocation, reservation, _) = tokens("possibly-managed-path");
+
+    let outcome = match lifecycle.prepare_context_open(
+        &invocation,
+        &reservation,
+        &context("primary", "durable", "possibly-managed-path"),
+    ) {
+        PrepareResult::Closed(outcome) => outcome,
+        PrepareResult::Prepared(_) => panic!("unaccounted profile directory must remain closed"),
+    };
+    assert_eq!(
+        outcome,
+        ProfileOutcome::StorageUnavailable {
+            reason_code: "profile_registry_possibly_managed_path",
+            origin: FailureOrigin::RegistryOrStorage,
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(outcome).as_json(),
+        json!({
+            "outcome": "profile_registry_untrusted_root",
+            "reason_code": "profile_registry_possibly_managed_path",
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_managed_root_still_reports_profile_storage_unavailable() {
+    let root = TestRoot::new("missing-managed-root");
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    fs::remove_dir(root.path()).unwrap();
+
+    let (invocation, reservation, _) = tokens("missing-managed-root");
+    let outcome = match lifecycle.prepare_context_open(
+        &invocation,
+        &reservation,
+        &context("primary", "durable", "missing-managed-root"),
+    ) {
+        PrepareResult::Closed(outcome) => outcome,
+        PrepareResult::Prepared(_) => panic!("missing root must remain closed"),
+    };
+    assert_eq!(
+        outcome,
+        ProfileOutcome::StorageUnavailable {
+            reason_code: "profile_storage_unavailable",
+            origin: FailureOrigin::RegistryOrStorage,
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(outcome).as_json(),
+        json!({"outcome": "profile_storage_unavailable"})
+    );
+}
+
 #[test]
 fn internal_profile_busy_display_does_not_serialize_the_profile_uuid() {
     let outcome = ProfileOutcome::ProfileBusy {
@@ -890,6 +1000,9 @@ fn every_wire_outcome_is_structurally_profile_uuid_free() {
     let outcomes = [
         BrowserLaunchOutcome::ProfileBusy { holder_id: holder },
         BrowserLaunchOutcome::ProfileGrantRequired,
+        BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason_code: "profile_registry_managed_root_identity_changed",
+        },
         BrowserLaunchOutcome::ProfileStorageUnavailable,
         BrowserLaunchOutcome::InternalFailure,
         BrowserLaunchOutcome::CleanupFailure {

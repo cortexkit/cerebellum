@@ -295,6 +295,11 @@ impl FailureOrigin {
     }
 }
 
+pub(crate) const PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED: &str =
+    "profile_registry_managed_root_identity_changed";
+pub(crate) const PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH: &str =
+    "profile_registry_possibly_managed_path";
+
 /// The only authority data permitted to pass from profile lifecycle handling to
 /// credential and grant handling: the project, session kind, and profile UUID.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2027,6 +2032,20 @@ impl ProfileLifecycle {
         })
     }
 
+    fn closed_untrusted_root(&self, resolution_reason: &str) -> Option<PrepareResult> {
+        let reason_code = match resolution_reason {
+            "untrustworthy profile registry: managed root identity changed" => {
+                PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
+            }
+            "possibly_managed_path" => PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
+            _ => return None,
+        };
+        Some(PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
+            reason_code,
+            origin: FailureOrigin::RegistryOrStorage,
+        }))
+    }
+
     pub fn prepare_context_open(
         &mut self,
         invocation: &InvocationToken,
@@ -2130,8 +2149,10 @@ impl ProfileLifecycle {
             Err(_) => return self.closed_storage(FailureOrigin::RegistryOrStorage),
         };
         let record = match resolution {
-            DurableResolution::UntrustworthyOrUnavailable { .. } => {
-                return self.closed_storage(FailureOrigin::RegistryOrStorage)
+            DurableResolution::UntrustworthyOrUnavailable { reason } => {
+                return self
+                    .closed_untrusted_root(&reason)
+                    .unwrap_or_else(|| self.closed_storage(FailureOrigin::RegistryOrStorage))
             }
             DurableResolution::AffirmativeAbsence => {
                 if !self.registry.config.uuid_protocol_compatible {
