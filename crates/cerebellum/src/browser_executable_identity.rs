@@ -18,12 +18,20 @@ pub fn verify_configured_executable(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (path, expected);
-        Err(json!({
-            "outcome": "identity_unverifiable",
-            "reason": "no_verifier_for_platform",
-            "platform": std::env::consts::OS,
-        }))
+        let _ = path;
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(json!({
+                "outcome": "identity_unverifiable",
+                "reason": "configured_digest_invalid",
+                "claim_kind": "image_digest",
+            }));
+        }
+        Ok((
+            ExecutableIdentityClaim::ImageDigest {
+                sha256: expected.to_ascii_lowercase(),
+            },
+            PreSpawnIdentityVerification::Unavailable,
+        ))
     }
 }
 
@@ -138,12 +146,31 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn platform_without_a_verifier_refuses_as_unverifiable() {
+    fn platform_without_a_verifier_uses_configured_digest_for_after_exec_attestation() {
+        let (identity, checkpoint) = verify_configured_executable(
+            Path::new("/bin/sh"),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("Linux compares the configured digest after exec");
+
+        assert_eq!(
+            identity,
+            ExecutableIdentityClaim::ImageDigest {
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            }
+        );
+        assert_eq!(checkpoint, PreSpawnIdentityVerification::Unavailable);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn malformed_configured_digest_remains_unverifiable() {
         let refusal = verify_configured_executable(Path::new("/bin/sh"), "configured-identity")
-            .expect_err("a platform without a verifier must refuse");
+            .expect_err("an unusable digest must refuse");
 
         assert_eq!(refusal["outcome"], "identity_unverifiable");
-        assert_eq!(refusal["reason"], "no_verifier_for_platform");
-        assert_eq!(refusal["platform"], std::env::consts::OS);
+        assert_eq!(refusal["reason"], "configured_digest_invalid");
+        assert_eq!(refusal["claim_kind"], "image_digest");
     }
 }

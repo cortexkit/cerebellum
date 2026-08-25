@@ -3,6 +3,8 @@
 //! This module owns ordering and policy. Platform code returns process and
 //! code-signing facts; the journal decides whether release may be reached.
 
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -76,9 +78,8 @@ impl ExecutableIdentityClaim {
     /// reported as "the identity differed" when the truth is that nothing
     /// compared it. That is the collapse this module has removed three times.
     ///
-    /// Comparing a digest is not the same as producing one: no platform reads
-    /// an image to construct `ImageDigest` yet, and this says nothing about
-    /// when one will.
+    /// Comparing a digest is not the same as producing one: Linux reads the
+    /// final mapped image to construct `ImageDigest` after following execs.
     pub fn matches_configured(&self, expected: &str) -> bool {
         match self {
             Self::CodeSigned {
@@ -351,6 +352,9 @@ pub enum AttestedLaunchError {
         stage: LaunchRecordStage,
     },
     SpawnFailed,
+    PlatformRefused {
+        error: PlatformLaunchError,
+    },
     ImageAttestationFailed {
         expected_identity: String,
     },
@@ -395,6 +399,37 @@ pub enum PlatformLaunchError {
     Spawn,
     ImageIdentity,
     ProcessControl,
+    PtraceUnavailable,
+    ExecChainUnresolved,
+    GenerationUnreadable,
+}
+
+impl PlatformLaunchError {
+    pub fn refusal(self) -> serde_json::Value {
+        let (reason_code, remedy) = match self {
+            Self::PtraceUnavailable => (
+                "ptrace_unavailable",
+                "grant CAP_SYS_PTRACE or lower ptrace_scope, then retry the launch",
+            ),
+            Self::ExecChainUnresolved => (
+                "exec_chain_unresolved",
+                "configure the final executable image digest, then retry the launch",
+            ),
+            Self::GenerationUnreadable => (
+                "generation_unreadable",
+                "restore readable procfs start-time access, then retry the launch",
+            ),
+            Self::Spawn | Self::ImageIdentity | Self::ProcessControl => (
+                "platform_launch_failed",
+                "inspect the platform launch failure and retry after correcting it",
+            ),
+        };
+        serde_json::json!({
+            "outcome": "launch_refused",
+            "reason_code": reason_code,
+            "remedy": remedy,
+        })
+    }
 }
 
 /// A barred process exposes facts and terminal controls, not launch policy.
@@ -470,7 +505,14 @@ where
 
     let child = launcher
         .spawn_barred(request)
-        .map_err(|_| AttestedLaunchError::SpawnFailed)?;
+        .map_err(|error| match error {
+            PlatformLaunchError::PtraceUnavailable
+            | PlatformLaunchError::ExecChainUnresolved
+            | PlatformLaunchError::GenerationUnreadable => {
+                AttestedLaunchError::PlatformRefused { error }
+            }
+            _ => AttestedLaunchError::SpawnFailed,
+        })?;
     let generation = LaunchGenerationRecord {
         intent,
         process_generation: child.generation(),
@@ -486,6 +528,14 @@ where
 
     let observed = match child.executed_image_identity() {
         Ok(identity) => identity,
+        Err(
+            error @ (PlatformLaunchError::PtraceUnavailable
+            | PlatformLaunchError::ExecChainUnresolved
+            | PlatformLaunchError::GenerationUnreadable),
+        ) => {
+            let _ = child.terminate_and_reap();
+            return Err(AttestedLaunchError::PlatformRefused { error });
+        }
         Err(_) => {
             let expected_identity = request.verified_executable_identity.display_identity();
             return match child.terminate_and_reap() {
@@ -541,9 +591,18 @@ where
         };
     }
 
-    let process = child
-        .release()
-        .map_err(|_| AttestedLaunchError::ReleaseFailed)?;
+    let process = child.release().map_err(|error| {
+        if matches!(
+            error,
+            PlatformLaunchError::PtraceUnavailable
+                | PlatformLaunchError::ExecChainUnresolved
+                | PlatformLaunchError::GenerationUnreadable
+        ) {
+            AttestedLaunchError::PlatformRefused { error }
+        } else {
+            AttestedLaunchError::ReleaseFailed
+        }
+    })?;
     Ok(ReleasedAttestedBrowser {
         attestation,
         process,
@@ -940,6 +999,191 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
                 },
             )
             .map(|_| ())
+    }
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_EXEC_CHAIN_HOP_LIMIT: usize = 8;
+
+#[cfg(target_os = "linux")]
+pub struct LinuxProcessLauncher {
+    cdp_command_read_fd: std::os::fd::RawFd,
+    cdp_response_write_fd: std::os::fd::RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessLauncher {
+    pub fn new(
+        cdp_command_read_fd: std::os::fd::RawFd,
+        cdp_response_write_fd: std::os::fd::RawFd,
+    ) -> Self {
+        Self {
+            cdp_command_read_fd,
+            cdp_response_write_fd,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxBarredProcess(RefCell<cerebellum_linux::BarredChild>, String);
+
+#[cfg(target_os = "linux")]
+impl BarredLaunchProcess for LinuxBarredProcess {
+    type Released = cerebellum_linux::ReleasedChild;
+
+    fn generation(&self) -> BrowserProcessGeneration {
+        let generation = self.0.borrow().generation();
+        BrowserProcessGeneration {
+            pid: generation.pid,
+            start_time_micros: generation.start_time_micros,
+        }
+    }
+
+    fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError> {
+        if self.1.is_empty() {
+            return Err(PlatformLaunchError::ImageIdentity);
+        }
+        let expected = &self.1;
+        let mut child = self.0.borrow_mut();
+        let mut observed = cerebellum_linux::executed_image_identity(child.generation().pid)
+            .map_err(map_linux_image_identity_error)?;
+        for _ in 0..LINUX_EXEC_CHAIN_HOP_LIMIT {
+            if observed.image_sha256 == *expected {
+                return Ok(ExecutableIdentityClaim::ImageDigest {
+                    sha256: observed.image_sha256,
+                });
+            }
+            observed = child
+                .continue_to_next_exec_stop(LINUX_EXEC_CHAIN_HOP_LIMIT)
+                .map_err(map_linux_process_control_error)?;
+        }
+        Err(PlatformLaunchError::ExecChainUnresolved)
+    }
+
+    fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
+        self.0
+            .into_inner()
+            .terminate_and_reap()
+            .map_err(map_linux_process_control_error)
+    }
+
+    fn release(self) -> Result<Self::Released, PlatformLaunchError> {
+        self.0
+            .into_inner()
+            .release()
+            .map_err(map_linux_process_control_error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_linux_process_start_time(
+    start_time: cerebellum_linux::ProcessStartTime,
+) -> Result<(), PlatformLaunchError> {
+    match start_time {
+        cerebellum_linux::ProcessStartTime::Started(_) => Ok(()),
+        cerebellum_linux::ProcessStartTime::NoSuchProcess => {
+            Err(PlatformLaunchError::ImageIdentity)
+        }
+        cerebellum_linux::ProcessStartTime::NotPermitted
+        | cerebellum_linux::ProcessStartTime::StatReadFailed
+        | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
+        | cerebellum_linux::ProcessStartTime::LayoutMismatch
+        | cerebellum_linux::ProcessStartTime::NoStartTime => {
+            Err(PlatformLaunchError::GenerationUnreadable)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_linux_image_identity_error(
+    error: cerebellum_linux::ImageIdentityError,
+) -> PlatformLaunchError {
+    match error {
+        cerebellum_linux::ImageIdentityError::ProcessInspectionDenied
+        | cerebellum_linux::ImageIdentityError::ProcessLayoutMismatch
+        | cerebellum_linux::ImageIdentityError::ProcessStartTimeMissing => {
+            PlatformLaunchError::GenerationUnreadable
+        }
+        cerebellum_linux::ImageIdentityError::ProcessMissing
+        | cerebellum_linux::ImageIdentityError::GenerationChanged
+        | cerebellum_linux::ImageIdentityError::Executable(_)
+        | cerebellum_linux::ImageIdentityError::Read(_) => PlatformLaunchError::ImageIdentity,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_linux_process_control_error(
+    error: cerebellum_linux::ProcessControlError,
+) -> PlatformLaunchError {
+    match error {
+        cerebellum_linux::ProcessControlError::GenerationUnreadable => {
+            PlatformLaunchError::GenerationUnreadable
+        }
+        cerebellum_linux::ProcessControlError::ExecChainExhausted => {
+            PlatformLaunchError::ExecChainUnresolved
+        }
+        cerebellum_linux::ProcessControlError::Ptrace(_) => PlatformLaunchError::PtraceUnavailable,
+        cerebellum_linux::ProcessControlError::AlreadyReleased
+        | cerebellum_linux::ProcessControlError::GenerationChanged
+        | cerebellum_linux::ProcessControlError::Signal(_)
+        | cerebellum_linux::ProcessControlError::Reap(_)
+        | cerebellum_linux::ProcessControlError::UnexpectedStop
+        | cerebellum_linux::ProcessControlError::ProcessExited => {
+            PlatformLaunchError::ProcessControl
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl HandshakeProcess for cerebellum_linux::ReleasedChild {
+    fn observe_exit(&mut self) -> Option<ChildExitStatus> {
+        let generation = self.generation();
+        match cerebellum_linux::process_start_time(generation.pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time)
+                if start_time == generation.start_time_micros =>
+            {
+                None
+            }
+            _ => Some(ChildExitStatus::Unknown),
+        }
+    }
+
+    fn wait_and_reap(self) -> Result<(), PlatformLaunchError> {
+        self.wait().map_err(map_linux_process_control_error)
+    }
+
+    fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
+        self.terminate_and_reap()
+            .map_err(map_linux_process_control_error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BarredProcessLauncher for LinuxProcessLauncher {
+    type Process = LinuxBarredProcess;
+
+    fn spawn_barred(
+        &mut self,
+        request: &AttestedLaunchRequest,
+    ) -> Result<Self::Process, PlatformLaunchError> {
+        cerebellum_linux::spawn_barred(
+            &request.executable,
+            &request.arguments,
+            &request.environment,
+            self.cdp_command_read_fd,
+            self.cdp_response_write_fd,
+        )
+        .map(|child| {
+            let expected = match &request.verified_executable_identity {
+                ExecutableIdentityClaim::ImageDigest { sha256 } => sha256.clone(),
+                ExecutableIdentityClaim::CodeSigned { .. } => String::new(),
+            };
+            LinuxBarredProcess(RefCell::new(child), expected)
+        })
+        .map_err(|error| match error {
+            cerebellum_linux::SpawnError::Ptrace(_) => PlatformLaunchError::PtraceUnavailable,
+            _ => PlatformLaunchError::Spawn,
+        })
     }
 }
 
@@ -2244,6 +2488,165 @@ mod tests {
             std::io::ErrorKind::NotFound
         );
         fs::remove_dir_all(directory).expect("remove mismatch directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_identity_attestation_walks_from_a_wrapper_to_the_final_image() {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+
+        let path =
+            std::env::temp_dir().join(format!("cerebellum-linux-wrapper-{}", std::process::id()));
+        fs::write(&path, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write wrapper fixture");
+        let mut permissions = fs::metadata(&path).expect("wrapper metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("make wrapper executable");
+
+        let expected = sha256_file_for_test(Path::new("/bin/sleep"));
+        let mut launch_request = request();
+        launch_request.executable = path.clone();
+        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+            sha256: expected.clone(),
+        };
+
+        let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
+        let (_response_parent, response_child) = UnixStream::pair().expect("response pair");
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        let child = launcher
+            .spawn_barred(&launch_request)
+            .expect("spawn wrapper behind Linux barrier");
+        assert_eq!(
+            child
+                .executed_image_identity()
+                .expect("attest final image")
+                .display_identity(),
+            format!("sha256={expected}")
+        );
+        child.terminate_and_reap().expect("reap wrapper fixture");
+        fs::remove_file(path).expect("remove wrapper fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_identity_attestation_refuses_when_the_exec_chain_bound_is_exhausted() {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+
+        let root =
+            std::env::temp_dir().join(format!("cerebellum-linux-hop-bound-{}", std::process::id()));
+        fs::create_dir(&root).expect("create chain fixture directory");
+        let mut paths = Vec::new();
+        for index in 0..16 {
+            let path = root.join(format!("hop-{index}"));
+            let next = if index == 15 {
+                "/bin/sleep".to_string()
+            } else {
+                root.join(format!("hop-{}", index + 1))
+                    .display()
+                    .to_string()
+            };
+            fs::write(&path, format!("#!/bin/sh\nexec {next} 30\n")).expect("write chain fixture");
+            let mut permissions = fs::metadata(&path).expect("chain metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).expect("make chain fixture executable");
+            paths.push(path);
+        }
+
+        let mut launch_request = request();
+        launch_request.executable = paths[0].clone();
+        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+            sha256: sha256_file_for_test(Path::new("/bin/sleep")),
+        };
+        let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
+        let (_response_parent, response_child) = UnixStream::pair().expect("response pair");
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        let child = launcher
+            .spawn_barred(&launch_request)
+            .expect("spawn bounded chain fixture");
+        assert_eq!(
+            child.executed_image_identity(),
+            Err(PlatformLaunchError::ExecChainUnresolved)
+        );
+        drop(child);
+        for path in paths {
+            fs::remove_file(path).expect("remove chain fixture");
+        }
+        fs::remove_dir(root).expect("remove chain fixture directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_success_records_after_exec_only_checkpoint() {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+
+        let path = std::env::temp_dir().join(format!(
+            "cerebellum-linux-checkpoint-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write checkpoint fixture");
+        let mut permissions = fs::metadata(&path)
+            .expect("checkpoint metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("make checkpoint executable");
+
+        let mut launch_request = request();
+        launch_request.executable = path.clone();
+        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+            sha256: sha256_file_for_test(Path::new("/bin/sleep")),
+        };
+        launch_request.pre_spawn_identity_verification = PreSpawnIdentityVerification::Unavailable;
+        let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
+        let (_response_parent, response_child) = UnixStream::pair().expect("response pair");
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        let mut journal = RecordingJournal {
+            events: Events::new(),
+            fail: FailJournalAt::Never,
+        };
+        let released = launch_attested_with(&mut journal, &mut launcher, &launch_request)
+            .expect("release Linux fixture after final-image attestation");
+        assert_eq!(
+            released.attestation.executable_identity_checkpoints,
+            ExecutableIdentityCheckpoints::AfterExecOnly
+        );
+        released
+            .process
+            .terminate_and_reap()
+            .expect("reap checkpoint fixture");
+        fs::remove_file(path).expect("remove checkpoint fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unreadable_generation_is_not_an_identity_mismatch() {
+        assert_eq!(
+            map_linux_process_start_time(cerebellum_linux::ProcessStartTime::NotPermitted),
+            Err(PlatformLaunchError::GenerationUnreadable)
+        );
+        assert_ne!(
+            map_linux_process_start_time(cerebellum_linux::ProcessStartTime::NotPermitted),
+            Err(PlatformLaunchError::ImageIdentity)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sha256_file_for_test(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fs;
+
+        let digest = Sha256::digest(fs::read(path).expect("read digest fixture"));
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
 
