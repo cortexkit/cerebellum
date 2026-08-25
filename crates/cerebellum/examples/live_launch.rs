@@ -213,6 +213,56 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
         && after_content.contains("Click probe after")
         && before_content != after_content;
 
+    // Capture through the same wire path a caller uses, THROUGH the
+    // authorization gate. Checking the reply against the machine rather than
+    // against itself: a capture that reports its own numbers back is satisfied
+    // by any constant.
+    let shot = invoke_tool(
+        &planes,
+        6,
+        "browser.screenshot",
+        json!({"max_bytes": 4_194_304}),
+    )
+    .await;
+    if shot["outcome"] == "ok" {
+        let width = shot["image_width_px"].as_u64().unwrap_or_default();
+        let height = shot["image_height_px"].as_u64().unwrap_or_default();
+        let scale = shot["device_scale_factor"].as_f64().unwrap_or_default();
+        let css_width = shot["input_rect"]["width_input_css"]
+            .as_f64()
+            .unwrap_or_default();
+        let css_height = shot["input_rect"]["height_input_css"]
+            .as_f64()
+            .unwrap_or_default();
+        let png_chars = shot["image_png_b64"].as_str().unwrap_or_default().len();
+        println!(
+            "[{label}] SCREENSHOT: {width}x{height}px, scale {scale}, css {css_width}x{css_height}, {png_chars} b64 chars"
+        );
+        // The device scale factor is retained as evidence and is NOT part of the
+        // pixel-to-css mapping, which is a ratio: x_px * width_input_css /
+        // image_width_px. So the property that matters is that the image and the
+        // css rect describe the same region, which shows up as agreeing aspect
+        // ratios. An earlier version asserted pixel width == css width * scale,
+        // which is a model of Chrome rather than a property of ours, and it was
+        // wrong: this capture comes back 1:1 with css while the display scale
+        // is 2.
+        let image_aspect = width as f64 / height as f64;
+        let css_aspect = css_width / css_height;
+        if (image_aspect - css_aspect).abs() < 0.01 && scale > 0.0 && png_chars > 0 && width > 0 {
+            println!(
+                "[{label}] SCREENSHOT VERDICT: authorized, and the image and css rect describe the \
+                 same region (aspect {image_aspect:.4} vs {css_aspect:.4})"
+            );
+        } else {
+            eprintln!(
+                "[{label}] SCREENSHOT VERDICT: image aspect {image_aspect:.4} does not match css \
+                 aspect {css_aspect:.4}"
+            );
+        }
+    } else {
+        eprintln!("[{label}] screenshot failed: {shot}");
+    }
+
     let closed = close_browser(&planes, label, &browser_session_id, 6).await;
     if page_changed {
         println!(
