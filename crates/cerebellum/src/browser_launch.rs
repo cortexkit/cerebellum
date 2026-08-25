@@ -1009,8 +1009,12 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
 const LINUX_EXEC_CHAIN_HOP_LIMIT: usize = 8;
 
 #[cfg(target_os = "linux")]
-/// A queued wrapper exec should arrive quickly; this window bounds the probe
+/// A queued wrapper exec should arrive quickly; this window sizes observation,
 /// without pretending that a running image can prove it will never exec later.
+/// Measured wrapper-to-browser deltas are 0.51–0.56 ms warm and 0.73–1.78 ms
+/// cold after evicting 303.9 of 305.5 MiB with `POSIX_FADV_DONTNEED`.
+/// `execve` reports `PTRACE_EVENT_EXEC` after headers and mappings, before the
+/// whole image is paged in, so 100 ms provides about 56× cold headroom.
 pub(crate) const LINUX_EXEC_CHAIN_PROBE_WINDOW: std::time::Duration =
     std::time::Duration::from_millis(100);
 
@@ -1061,8 +1065,7 @@ impl LinuxProcessLauncher {
         // Finality cannot be proven while the tracee is stopped at an exec
         // event. The probe therefore watches briefly for one more event after
         // the configured digest matches; a passing probe lets that image run
-        // for the window before terminating it. This bounds only a queued
-        // wrapper exec, not browser startup or readiness.
+        // for the observation window before terminating it.
         let mut child = self.spawn_raw(executable, arguments, environment)?;
         let generation = child.generation();
         let result = (|| {

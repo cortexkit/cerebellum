@@ -220,7 +220,8 @@ impl ProductionLaunchService {
             return Err(json!({"outcome": "internal_failure"}));
         };
 
-        let arguments = browser_launch_arguments(&profile_directory);
+        let crash_dumps_directory = profile_directory.join("crash-dumps");
+        let arguments = browser_launch_arguments(&profile_directory, &crash_dumps_directory);
         if !crate::custody::arguments_are_quarantinable(
             &arguments
                 .iter()
@@ -351,7 +352,10 @@ fn launch_recovery_refusal() -> Value {
     })
 }
 
-pub(crate) fn browser_launch_arguments(profile_directory: &Path) -> Vec<OsString> {
+pub(crate) fn browser_launch_arguments(
+    profile_directory: &Path,
+    crash_dumps_directory: &Path,
+) -> Vec<OsString> {
     // Config-load probing uses this constructor too: wrappers may branch on
     // flags, so a probe must preserve the production argument shape exactly.
     vec![
@@ -359,6 +363,10 @@ pub(crate) fn browser_launch_arguments(profile_directory: &Path) -> Vec<OsString
         OsString::from(format!(
             "--user-data-dir={}",
             profile_directory.to_string_lossy()
+        )),
+        OsString::from(format!(
+            "--crash-dumps-dir={}",
+            crash_dumps_directory.to_string_lossy()
         )),
         OsString::from("--no-first-run"),
         OsString::from("--no-default-browser-check"),
@@ -1176,6 +1184,22 @@ fn pipe_pair() -> Result<
 mod executable_identity_launch_tests {
     use super::*;
     use cerebellum_core::identity::{RouteIdentity, RouteSurface, SessionKind};
+
+    #[test]
+    fn browser_probe_arguments_include_a_separate_throwaway_crash_dumps_path() {
+        let profile = Path::new("/tmp/probe-profile");
+        let crash_dumps = profile.join("crash");
+        assert_eq!(
+            browser_launch_arguments(profile, &crash_dumps),
+            vec![
+                OsString::from("--remote-debugging-pipe"),
+                OsString::from("--user-data-dir=/tmp/probe-profile"),
+                OsString::from("--crash-dumps-dir=/tmp/probe-profile/crash"),
+                OsString::from("--no-first-run"),
+                OsString::from("--no-default-browser-check"),
+            ]
+        );
+    }
 
     struct UnsignedExecutable(PathBuf);
 
