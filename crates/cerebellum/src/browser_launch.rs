@@ -2253,7 +2253,8 @@ use crate::profile::{
     AbortCause, AbortResult, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
     LaunchResult, OpenedContext, PrepareResult, PreparedOpen, PreparedProfileAttempt,
     ProfileDisposition, ProfileLifecycle, ProfileOutcome, ReleaseCause, ReleaseResult,
-    StampedBindContext,
+    StampedBindContext, PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
+    PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED,
 };
 use crate::profile_custody::{
     HolderId, ProfileCustodyAcquisition, ProfileCustodyClaim, ProfileCustodyJournal,
@@ -2283,6 +2284,7 @@ impl LaunchCleanupStage {
 pub enum BrowserLaunchOutcome {
     ProfileBusy { holder_id: HolderId },
     ProfileGrantRequired,
+    ProfileRegistryUntrustedRoot { reason_code: &'static str },
     ProfileStorageUnavailable,
     InternalFailure,
     CleanupFailure { stage: LaunchCleanupStage },
@@ -2295,6 +2297,10 @@ impl BrowserLaunchOutcome {
                 json!({"outcome": "profile_busy", "holder_id": holder_id.as_str()})
             }
             Self::ProfileGrantRequired => json!({"outcome": "profile_grant_required"}),
+            Self::ProfileRegistryUntrustedRoot { reason_code } => json!({
+                "outcome": "profile_registry_untrusted_root",
+                "reason_code": reason_code,
+            }),
             Self::ProfileStorageUnavailable => {
                 json!({"outcome": "profile_storage_unavailable"})
             }
@@ -2316,6 +2322,12 @@ pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
             BrowserLaunchOutcome::ProfileGrantRequired
         }
         ProfileOutcome::NoSession { reason_code: _ } => BrowserLaunchOutcome::InternalFailure,
+        ProfileOutcome::StorageUnavailable {
+            reason_code:
+                reason_code @ (PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
+                | PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH),
+            origin: _,
+        } => BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code },
         ProfileOutcome::StorageUnavailable {
             reason_code: _,
             origin: _,
@@ -2681,6 +2693,7 @@ fn cleanup_stage_after_profile_completion(attempt: &PreparedProfileAttempt) -> L
 const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
     | BrowserLaunchOutcome::ProfileGrantRequired
+    | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code: _ }
     | BrowserLaunchOutcome::ProfileStorageUnavailable
     | BrowserLaunchOutcome::InternalFailure
     | BrowserLaunchOutcome::CleanupFailure { stage: _ } => {}
