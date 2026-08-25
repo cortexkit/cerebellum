@@ -220,15 +220,7 @@ impl ProductionLaunchService {
             return Err(json!({"outcome": "internal_failure"}));
         };
 
-        let arguments = vec![
-            OsString::from("--remote-debugging-pipe"),
-            OsString::from(format!(
-                "--user-data-dir={}",
-                profile_directory.to_string_lossy()
-            )),
-            OsString::from("--no-first-run"),
-            OsString::from("--no-default-browser-check"),
-        ];
+        let arguments = browser_launch_arguments(&profile_directory);
         if !crate::custody::arguments_are_quarantinable(
             &arguments
                 .iter()
@@ -357,6 +349,20 @@ fn launch_recovery_refusal() -> Value {
         "outcome": "internal_failure",
         "reason_code": BROWSER_LAUNCH_RECOVERY_FAILED,
     })
+}
+
+pub(crate) fn browser_launch_arguments(profile_directory: &Path) -> Vec<OsString> {
+    // Config-load probing uses this constructor too: wrappers may branch on
+    // flags, so a probe must preserve the production argument shape exactly.
+    vec![
+        OsString::from("--remote-debugging-pipe"),
+        OsString::from(format!(
+            "--user-data-dir={}",
+            profile_directory.to_string_lossy()
+        )),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+    ]
 }
 
 fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {

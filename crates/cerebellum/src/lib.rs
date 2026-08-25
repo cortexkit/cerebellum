@@ -866,6 +866,10 @@ impl ModuleConfig {
         let parsed = cerebellum_core::config::load_config_file().map_err(ModuleError::Config)?;
         let browser =
             browser_config::load_browser_config_file().map_err(ModuleError::BrowserConfig)?;
+        if let Some(browser) = browser.as_ref() {
+            browser_config::validate_browser_config_at_load(browser)
+                .map_err(ModuleError::BrowserConfig)?;
+        }
         Ok(Self {
             connection_file_path,
             module_id,
