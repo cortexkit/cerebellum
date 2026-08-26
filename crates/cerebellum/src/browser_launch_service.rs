@@ -375,9 +375,16 @@ pub(crate) fn browser_launch_arguments(
 
 /// Default capacity for durable browser-launch audit records.
 ///
-/// The representative v2 launch fixture is 6,266 accounted bytes. A 1,000-launch
-/// horizon therefore needs 6,266,000 bytes; 64 MiB provides 67,108,864 bytes,
-/// or 10,710 launches at that measured size, while leaving room for larger paths.
+/// Sized from a 1,000-launch audit horizon, against entries measured on a real
+/// journal rather than a fixture. Twenty-six field-written v2 entries run 8,782
+/// to 10,963 bytes with a median of 9,018 -- about 44% larger than the 6,266-byte
+/// test fixture, because a real launch carries longer paths and fuller
+/// attestations. 64 MiB therefore buys roughly 7,400 launches at the median and
+/// 6,100 at the largest entry seen, both comfortably past the horizon.
+///
+/// Quote the field numbers when re-sizing this. The fixture is representative of
+/// shape and not of size, and sizing against it would overstate capacity by that
+/// 44% in the direction that runs out sooner than the comment promises.
 const LAUNCH_JOURNAL_RETENTION_BYTES: u64 = 64 * 1024 * 1024;
 
 fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
