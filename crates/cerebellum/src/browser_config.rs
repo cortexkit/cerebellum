@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+
 use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +36,53 @@ pub enum BrowserConfigReason {
     OutOfRange,
     PathNotAbsolute,
     ExpectedIdentityRequired,
-    BelowSettlementQuietWindow { quiet_ms: u64 },
+    ExecutableProbeFailed(String),
+    FinalImageMismatch {
+        expected: String,
+        path: PathBuf,
+        sha256: String,
+    },
+    BelowSettlementQuietWindow {
+        quiet_ms: u64,
+    },
+}
+
+impl BrowserConfigReason {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed",
+            Self::NotObject => "not_object",
+            Self::UnknownMember(_) => "unknown_member",
+            Self::MissingMember => "missing_member",
+            Self::WrongType => "wrong_type",
+            Self::NotInteger => "not_integer",
+            Self::NotPositive => "not_positive",
+            Self::OutOfRange => "out_of_range",
+            Self::PathNotAbsolute => "path_not_absolute",
+            Self::ExpectedIdentityRequired => "expected_identity_required",
+            Self::ExecutableProbeFailed(_) => "executable_probe_failed",
+            Self::FinalImageMismatch { .. } => "final_image_mismatch",
+            Self::BelowSettlementQuietWindow { .. } => "below_settlement_quiet_window",
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Malformed(detail)
+            | Self::UnknownMember(detail)
+            | Self::ExecutableProbeFailed(detail) => Some(detail),
+            Self::NotObject
+            | Self::MissingMember
+            | Self::WrongType
+            | Self::NotInteger
+            | Self::NotPositive
+            | Self::OutOfRange
+            | Self::PathNotAbsolute
+            | Self::ExpectedIdentityRequired
+            | Self::FinalImageMismatch { .. }
+            | Self::BelowSettlementQuietWindow { .. } => None,
+        }
+    }
 }
 
 impl std::fmt::Display for BrowserConfigError {
@@ -62,6 +111,18 @@ impl std::fmt::Display for BrowserConfigError {
                 f,
                 "browser.expected_identity: required when browser.executable_path is set"
             ),
+            BrowserConfigReason::ExecutableProbeFailed(reason) => {
+                write!(f, "browser.executable_path: executable identity probe failed: {reason}")
+            }
+            BrowserConfigReason::FinalImageMismatch {
+                expected,
+                path,
+                sha256,
+            } => write!(
+                f,
+                "browser.expected_identity: configured sha256={expected} is not final; pin sha256={sha256} for {}",
+                path.display()
+            ),
             BrowserConfigReason::BelowSettlementQuietWindow { quiet_ms } => write!(
                 f,
                 "{}: must exceed {quiet_ms}ms, the network-quiet window a navigation \
@@ -85,6 +146,134 @@ pub fn load_browser_config_file() -> Result<Option<BrowserConfig>, BrowserConfig
         Err(error) => Err(BrowserConfigError {
             field: "config".to_string(),
             reason: BrowserConfigReason::Malformed(format!("reading {}: {error}", path.display())),
+        }),
+    }
+}
+
+pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), BrowserConfigError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let Some(path) = config.executable_path.as_deref() else {
+            return Ok(());
+        };
+        // Missing paths retain the existing launch-time `executable_missing`
+        // refusal; there is no image to probe during config loading.
+        if !path.is_file() {
+            return Ok(());
+        }
+        let expected = config
+            .expected_identity
+            .as_deref()
+            .ok_or_else(|| BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason: BrowserConfigReason::ExpectedIdentityRequired,
+            })?;
+        crate::browser_executable_identity::verify_configured_executable(path, expected).map_err(
+            |refusal| BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason: BrowserConfigReason::ExecutableProbeFailed(refusal.to_string()),
+            },
+        )?;
+        let (command_child, _command_parent) =
+            UnixStream::pair().map_err(|error| BrowserConfigError {
+                field: "browser.executable_path".to_string(),
+                reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
+            })?;
+        let (_response_parent, response_child) =
+            UnixStream::pair().map_err(|error| BrowserConfigError {
+                field: "browser.executable_path".to_string(),
+                reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
+            })?;
+        let mut launcher = crate::browser_launch::LinuxProcessLauncher::new(
+            command_child.as_raw_fd(),
+            response_child.as_raw_fd(),
+        );
+        let probe_profile = browser_probe_profile_path();
+        // A killed browser leaves `SingletonLock` as a symlink naming
+        // `<hostname>-<pid>` without a timestamp or generation counter. The
+        // custody path cannot prove that link stale and refuses to break it,
+        // so probing the real profile would make the first real launch after
+        // every boot fail with `profile_held_externally`. Crashpad's database
+        // path does not follow `--user-data-dir`, so it needs its own
+        // throwaway path as well. `XDG_CONFIG_HOME` contains that database and
+        // any other home-derived Chromium writes without changing argv. The
+        // `--crash-dumps-dir` switch remains belt-and-braces for builds that
+        // honor it; this Chromium build (measured 2026-08-25) still derives
+        // the handler database from XDG configuration.
+        let crash_dumps_directory = probe_profile.join("crash-dumps");
+        let probe_environment = browser_probe_environment(&probe_profile);
+        let arguments = crate::browser_launch_service::browser_launch_arguments(
+            &probe_profile,
+            &crash_dumps_directory,
+        );
+        let result = crate::browser_executable_identity::validate_configured_executable_at_load(
+            &mut launcher,
+            path,
+            &arguments,
+            &probe_environment,
+            expected,
+        )
+        .map_err(|refusal| BrowserConfigError {
+            field: "browser.expected_identity".to_string(),
+            reason: if refusal["outcome"] == "executable_identity_mismatch" {
+                BrowserConfigReason::FinalImageMismatch {
+                    expected: expected.to_string(),
+                    path: PathBuf::from(refusal["final_image_path"].as_str().unwrap_or_default()),
+                    sha256: refusal["final_image_sha256"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                }
+            } else {
+                BrowserConfigReason::ExecutableProbeFailed(refusal.to_string())
+            },
+        });
+        // Probe cleanup is part of config refusal: leaving SingletonLock or
+        // XDG-derived Crashpad state behind would turn every later boot into a
+        // false `profile_held_externally` refusal. Removal is strict rather
+        // than best-effort so a cleanup failure remains visible at boot.
+        let cleanup = cleanup_browser_probe(&probe_profile);
+        match (result, cleanup) {
+            (Err(error), _) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = config;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_environment(probe_profile: &Path) -> Vec<(OsString, OsString)> {
+    vec![(
+        OsString::from("XDG_CONFIG_HOME"),
+        probe_profile.join("config").into_os_string(),
+    )]
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_profile_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cerebellum-config-probe-profile-{}",
+        std::process::id()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_browser_probe(probe_profile: &Path) -> Result<(), BrowserConfigError> {
+    match std::fs::remove_dir_all(probe_profile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(BrowserConfigError {
+            field: "browser.executable_path".to_string(),
+            reason: BrowserConfigReason::ExecutableProbeFailed(format!(
+                "cannot remove browser probe tree {}: {error}",
+                probe_profile.display()
+            )),
         }),
     }
 }
@@ -334,6 +523,96 @@ mod tests {
         );
         value["browser"]["expected_identity"] = serde_json::json!("com.example.Chrome");
         assert!(parse_browser_config(&value.to_string()).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_probe_redirects_home_derived_writes_without_changing_argv() {
+        let environment = browser_probe_environment(Path::new("/tmp/probe-profile"));
+        assert_eq!(
+            environment,
+            vec![(
+                OsString::from("XDG_CONFIG_HOME"),
+                OsString::from("/tmp/probe-profile/config"),
+            )]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_load_refuses_a_wrapper_pin_with_the_final_image_sha256() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cerebellum-linux-config-load-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create config probe directory");
+        let wrapper = root.join("wrapper");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write wrapper");
+        let mut permissions = std::fs::metadata(&wrapper)
+            .expect("wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+        let mut config = parse_browser_config(&configured()).unwrap().unwrap();
+        config.executable_path = Some(wrapper.clone());
+        config.expected_identity = Some(sha256_file_for_test(&wrapper));
+
+        let refusal = validate_browser_config_at_load(&config).expect_err("wrapper pin refused");
+        let text = refusal.to_string();
+        assert!(text.contains("is not final"), "unexpected refusal: {text}");
+        assert!(
+            text.contains("/bin/sleep"),
+            "missing final image path: {text}"
+        );
+        assert!(
+            text.contains(&sha256_file_for_test(Path::new("/bin/sleep"))),
+            "missing final image digest: {text}"
+        );
+        assert!(!probe_profile_path().exists(), "refusal leaked probe tree");
+        std::fs::remove_dir_all(root).expect("remove config probe directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_load_accepts_a_pin_for_the_terminal_image() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cerebellum-linux-config-load-terminal-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create terminal config directory");
+        let wrapper = root.join("terminal");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
+            .expect("write terminal wrapper");
+        let mut permissions = std::fs::metadata(&wrapper)
+            .expect("terminal metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).expect("make terminal wrapper executable");
+        let mut config = parse_browser_config(&configured()).unwrap().unwrap();
+        config.executable_path = Some(wrapper);
+        config.expected_identity = Some(sha256_file_for_test(Path::new("/bin/sleep")));
+
+        validate_browser_config_at_load(&config).expect("terminal image pin accepted");
+        assert!(!probe_profile_path().exists(), "success leaked probe tree");
+        std::fs::remove_dir_all(root).expect("remove terminal config directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_profile_path() -> PathBuf {
+        browser_probe_profile_path()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sha256_file_for_test(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(path).expect("read digest fixture"))
+        )
     }
 }
 
