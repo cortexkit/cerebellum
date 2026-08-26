@@ -1289,16 +1289,42 @@ mod tests {
             eprintln!("SKIPPED: the window list could not be read.");
             return;
         };
-        let Some(window) = windows
+        // Find a window that HOLDS STILL, rather than the first one large
+        // enough. Everything below compares two captures taken moments apart,
+        // so a window that repaints between them makes every comparison noise
+        // -- and noise here does not look like noise, it looks like a
+        // confident wrong row. Capturing the same thing twice is the control.
+        //
+        // Not hypothetical: taking the first big window read a live editor
+        // whose rows sit within 3% of each other, and reported a different
+        // "best match" on each run while the capture path was perfectly
+        // correct. Searching for a stable window is also what keeps this fence
+        // covering anything -- stopping at the first candidate turned it into
+        // a permanent skip on any desk with an animating window in front.
+        let mut stable = None;
+        for candidate in windows
             .iter()
-            .find(|window| window.on_screen && window.width >= 256.0 && window.height >= 256.0)
-        else {
-            eprintln!("SKIPPED: no on-screen window is at least 256x256.");
-            return;
-        };
-
-        let Ok(full) = capture_window(window.window_id, Duration::from_secs(10), None) else {
-            eprintln!("SKIPPED: the full capture failed.");
+            .filter(|w| w.on_screen && w.width >= 256.0 && w.height >= 256.0)
+            .take(12)
+        {
+            let Ok(first) = capture_window(candidate.window_id, Duration::from_secs(10), None)
+            else {
+                continue;
+            };
+            let Ok(again) = capture_window(candidate.window_id, Duration::from_secs(10), None)
+            else {
+                continue;
+            };
+            if first.bgra == again.bgra {
+                stable = Some((candidate, first));
+                break;
+            }
+        }
+        let Some((window, full)) = stable else {
+            eprintln!(
+                "SKIPPED: no on-screen window at least 256x256 held still across two identical \
+                 captures, so none can support a comparison between different ones."
+            );
             return;
         };
         let Ok(half) = capture_window(
@@ -1329,11 +1355,8 @@ mod tests {
 
         // SELF-CHECK THE INSTRUMENT BEFORE TRUSTING IT. Locating a row only
         // means something in a window whose rows differ from each other. A
-        // window with a large flat region has many near-identical rows, the
-        // winner among them turns on rendering noise, and the verdict is
-        // decided by whichever happened to win -- which is how this test
-        // produced three different wrong answers on captures that were
-        // perfectly correct.
+        // window with a large flat region has many near-identical rows, and the
+        // winner among them turns on rendering noise.
         if !rows_are_placeable(&full.bgra, full.width, full.height, expected) {
             eprintln!(
                 "SKIPPED: this window cannot be measured -- a row taken FROM the full capture \
