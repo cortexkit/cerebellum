@@ -98,7 +98,7 @@ async fn a_click_addressing_a_differently_sized_image_is_refused_before_dispatch
             &route,
             BrowserCapability::ClickPoint,
             &json!({
-                "snapshot_id": snapshot_id,
+                "snapshot_id": snapshot_id.clone(),
                 "x_px": 0,
                 "y_px": 0,
                 "image_width_px": 2,
@@ -119,6 +119,13 @@ async fn a_click_addressing_a_differently_sized_image_is_refused_before_dispatch
         input_operations(&plane.operation_log().await),
         input_before,
         "the refusal committed or actuated a click anyway"
+    );
+    assert_eq!(
+        plane
+            .snapshot_pin_count_for_test(&route, &snapshot_id)
+            .await,
+        0,
+        "the refused coordinate click leaked its screenshot pin"
     );
 }
 
@@ -356,6 +363,17 @@ impl OwnedBrowserProcess for ScreenshotProcess {
             .screenshot(context_key, document_epoch, deadline_ms)
     }
 
+    fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        self.driver
+            .click_point(context_key, position, deadline_ms, input_dispatched)
+    }
+
     fn generation_matches(&self) -> bool {
         true
     }
@@ -440,6 +458,93 @@ impl OwnedBrowserProcess for ClickProcess {
     }
 }
 
+struct RecordingClickPointPipe {
+    commands: Arc<std::sync::Mutex<Vec<Value>>>,
+    reads: VecDeque<Vec<u8>>,
+}
+
+impl RecordingClickPointPipe {
+    fn new(commands: Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
+        let reads = [
+            json!({"id":1,"result":{"targetId":"target-own"}}),
+            json!({"id":2,"result":{"sessionId":"session-own"}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+        ]
+        .into_iter()
+        .map(|frame| {
+            let mut bytes = serde_json::to_vec(&frame).unwrap();
+            bytes.push(0);
+            bytes
+        })
+        .collect();
+        Self { commands, reads }
+    }
+}
+
+impl CdpPipeIo for RecordingClickPointPipe {
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let command = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        self.commands.lock().unwrap().push(command);
+        Ok(())
+    }
+
+    fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+        let Some(bytes) = self.reads.pop_front() else {
+            return Ok(PipeRead::WouldBlock);
+        };
+        destination[..bytes.len()].copy_from_slice(&bytes);
+        Ok(PipeRead::Bytes(bytes.len()))
+    }
+}
+
+struct ClickPointProcess {
+    driver: CdpNavigationDriver<RecordingClickPointPipe>,
+}
+
+impl OwnedBrowserProcess for ClickPointProcess {
+    fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        self.driver
+            .click_point(context_key, position, deadline_ms, input_dispatched)
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+fn click_point_process(commands: Arc<std::sync::Mutex<Vec<Value>>>) -> ClickPointProcess {
+    ClickPointProcess {
+        driver: CdpNavigationDriver::new(
+            RecordingClickPointPipe::new(commands),
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        ),
+    }
+}
+
 fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
     let viewport = json!({
         "offsetX": 3.5,
@@ -472,6 +577,8 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         json!({"id":5,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
         json!({"id":6,"sessionId":"session-own","result":metrics}),
         json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
+        json!({"id":8,"sessionId":"session-own","result":{}}),
+        json!({"id":9,"sessionId":"session-own","result":{}}),
     ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
@@ -524,6 +631,128 @@ async fn position_on_authorized_page(plane: &BrowserPlane, route: &RouteIdentity
         )
         .await
         .unwrap();
+}
+
+async fn retain_click_point_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> String {
+    let viewport = ViewportObservation::new(
+        0,
+        TransformInputs::from_values(10.0, 20.0, 100.0, 50.0, 1.0, 1.0),
+    );
+    plane
+        .retain_screenshot(
+            route,
+            ScreenshotPayload::new(ONE_BY_ONE_PNG_B64, 1, 1),
+            viewport,
+            viewport,
+            false,
+        )
+        .await
+        .unwrap()["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn click_point_arguments(snapshot_id: &str) -> Value {
+    json!({
+        "snapshot_id": snapshot_id,
+        "x_px": 0,
+        "y_px": 0,
+        "image_width_px": 1,
+        "image_height_px": 1,
+        "intent": "click the retained image point",
+        "severity": {"tier": 2, "credential": false, "financial": false}
+    })
+}
+
+#[tokio::test]
+async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
+    let route = identity();
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plane = plane_with_process(
+        &route,
+        Box::new(click_point_process(Arc::clone(&commands))),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+    let snapshot_id = retain_click_point_snapshot(&plane, &route).await;
+
+    let _response = plane
+        .dispatch(
+            &route,
+            BrowserCapability::ClickPoint,
+            &click_point_arguments(&snapshot_id),
+        )
+        .await;
+
+    let commands = commands.lock().unwrap().clone();
+    let methods: Vec<&str> = commands
+        .iter()
+        .map(|command| command["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "Target.createTarget",
+            "Target.attachToTarget",
+            "Input.dispatchMouseEvent",
+            "Input.dispatchMouseEvent",
+        ]
+    );
+    assert_eq!(commands[2]["params"]["type"], "mousePressed");
+    assert_eq!(commands[2]["params"]["x"], 60.0);
+    assert_eq!(commands[2]["params"]["y"], 45.0);
+    assert_eq!(commands[3]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[3]["params"]["x"], 60.0);
+    assert_eq!(commands[3]["params"]["y"], 45.0);
+    assert_eq!(
+        plane
+            .snapshot_pin_count_for_test(&route, &snapshot_id)
+            .await,
+        0,
+        "the successful coordinate click leaked its screenshot pin"
+    );
+}
+
+#[tokio::test]
+async fn click_point_operation_log_commits_before_press_and_presses_before_release() {
+    let route = identity();
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plane = plane_with_process(&route, Box::new(click_point_process(commands)), 1_000);
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+    let snapshot_id = retain_click_point_snapshot(&plane, &route).await;
+
+    plane
+        .dispatch(
+            &route,
+            BrowserCapability::ClickPoint,
+            &click_point_arguments(&snapshot_id),
+        )
+        .await;
+
+    let operations: Vec<browser::Operation> = plane
+        .operation_log()
+        .await
+        .into_iter()
+        .map(|(_, operation)| operation)
+        .collect();
+    let position = |wanted: browser::Operation| {
+        operations
+            .iter()
+            .position(|operation| *operation == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} was never recorded: {operations:?}"))
+    };
+    assert!(
+        position(browser::Operation::CommitDispatched)
+            < position(browser::Operation::CdpInputPress),
+        "click_point input was dispatched before commitment: {operations:?}"
+    );
+    assert!(
+        position(browser::Operation::CdpInputPress) < position(browser::Operation::CdpInputRelease),
+        "click_point released before it pressed: {operations:?}"
+    );
 }
 
 #[tokio::test]
