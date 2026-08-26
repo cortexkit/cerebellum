@@ -612,6 +612,19 @@ fn serialize_manifest_with_computer_plane_configured(
         );
     }
     let mut value = serde_json::to_value(manifest).expect("module manifest serializes");
+    // WHO CAN SEE THIS: a person, not the daemon.
+    //
+    // `ModuleManifestWire` -- the type subc deserializes a HELLO manifest into
+    // -- is deliberately permissive, so a module built against a newer protocol
+    // can still register with an older daemon. The cost of that tolerance is
+    // that an unknown key is DROPPED RATHER THAN RETAINED: this field is
+    // neither rejected nor stored, and nothing in subconscious reads it.
+    //
+    // So it is real for an operator reading `--manifest` output or a wire dump,
+    // and invisible to the supervisor. Do not build a decision on the daemon
+    // having seen it. When a daemon-side consumer exists, this becomes a typed
+    // optional field in subc-protocol landed with that consumer -- which is the
+    // path `provenance` took, after spending months produced and unread.
     value
         .as_object_mut()
         .expect("module manifest is an object")
