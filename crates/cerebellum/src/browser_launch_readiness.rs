@@ -917,7 +917,7 @@ mod tests {
         LaunchAttestationRecord {
             generation: LaunchGenerationRecord {
                 intent: AuthorizedLaunchIntent {
-                    format_version: "ck-browser-launch-attestation/v1".to_string(),
+                    format_version: "ck-browser-launch-attestation/v2".to_string(),
                     launch_attempt_id: request.launch_attempt_id,
                     holder_id: request.holder_id,
                     route: request.route,

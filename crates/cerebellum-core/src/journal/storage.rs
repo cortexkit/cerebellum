@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{DurableState, StorageError};
 
-const JOURNAL_SCHEMA_VERSION: u64 = 1;
+const JOURNAL_SCHEMA_VERSION: u64 = 2;
+const LEGACY_JOURNAL_SCHEMA_VERSION: u64 = 1;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,7 +149,7 @@ impl FilesystemJournalStorage {
                 source: io_diagnostic(source),
             })?;
 
-        let value: serde_json::Value =
+        let mut value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|source| StorageError::Corrupt {
                 path: self.path.clone(),
                 source: source.to_string(),
@@ -160,20 +161,190 @@ impl FilesystemJournalStorage {
                 path: self.path.clone(),
                 source: "schema_version is missing or is not an unsigned integer".to_string(),
             })?;
-        if version != JOURNAL_SCHEMA_VERSION {
+        let migrated = version == LEGACY_JOURNAL_SCHEMA_VERSION;
+        if migrated {
+            migrate_v1_byte_arrays(&mut value).map_err(|source| StorageError::Corrupt {
+                path: self.path.clone(),
+                source,
+            })?;
+            value["schema_version"] = JOURNAL_SCHEMA_VERSION.into();
+        } else if version != JOURNAL_SCHEMA_VERSION {
             return Err(StorageError::UnknownSchemaVersion {
                 path: self.path.clone(),
                 found: version,
                 supported: JOURNAL_SCHEMA_VERSION,
             });
         }
-        serde_json::from_value::<StoredJournal>(value)
+        let mut state = serde_json::from_value::<StoredJournal>(value)
             .map(|stored| stored.state)
             .map_err(|source| StorageError::Corrupt {
                 path: self.path.clone(),
                 source: source.to_string(),
-            })
+            })?;
+        if migrated {
+            refresh_migrated_accounting(&mut state).map_err(|source| StorageError::Corrupt {
+                path: self.path.clone(),
+                source,
+            })?;
+            // Rewrite only after the complete v1 state decoded. Atomic save keeps
+            // the old audit trail intact if migration cannot be committed.
+            self.save(&state)?;
+        }
+        Ok(state)
     }
+}
+
+fn refresh_migrated_accounting(state: &mut DurableState) -> Result<(), String> {
+    for (sequence, reservation) in &mut state.reservations {
+        super::refresh_reservation_charge(reservation)
+            .map_err(|_| format!("could not account migrated reservation {sequence}"))?;
+    }
+    for (sequence, entry) in &mut state.entries {
+        super::refresh_terminal_charge(entry)
+            .map_err(|_| format!("could not account migrated entry {sequence}"))?;
+    }
+    Ok(())
+}
+
+fn migrate_v1_byte_arrays(value: &mut serde_json::Value) -> Result<(), String> {
+    let state = value
+        .get_mut("state")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "v1 state is missing or is not an object".to_string())?;
+
+    {
+        let entries = state
+            .get_mut("entries")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| "v1 state.entries is missing or is not an object".to_string())?;
+        for (sequence, entry) in entries {
+            let context = format!("v1 state.entries.{sequence}");
+            let entry = entry
+                .as_object_mut()
+                .ok_or_else(|| format!("{context} is not an object"))?;
+            migrate_byte_field(entry, "invocation_descriptor", &context, false)?;
+            migrate_byte_field(entry, "bytes", &context, false)?;
+            migrate_attachments(entry, &context)?;
+        }
+    }
+
+    {
+        let reservations = state
+            .get_mut("reservations")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| "v1 state.reservations is missing or is not an object".to_string())?;
+        for (sequence, reservation) in reservations {
+            let context = format!("v1 state.reservations.{sequence}");
+            let reservation = reservation
+                .as_object_mut()
+                .ok_or_else(|| format!("{context} is not an object"))?;
+            migrate_byte_field(reservation, "invocation_descriptor", &context, false)?;
+            let provisional = reservation
+                .get_mut("provisional")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| format!("{context}.provisional is not an object"))?;
+            migrate_byte_field(
+                provisional,
+                "durable_bytes",
+                &format!("{context}.provisional"),
+                false,
+            )?;
+
+            if let Some(marker) = reservation.get_mut("marker") {
+                if !marker.is_null() && !marker.is_string() {
+                    let marker = marker
+                        .as_object_mut()
+                        .ok_or_else(|| format!("{context}.marker has an invalid shape"))?;
+                    if let Some(rejection) = marker.get_mut("rejection") {
+                        let rejection = rejection.as_object_mut().ok_or_else(|| {
+                            format!("{context}.marker.rejection is not an object")
+                        })?;
+                        migrate_byte_field(
+                            rejection,
+                            "rejection_material",
+                            &format!("{context}.marker.rejection"),
+                            false,
+                        )?;
+                    }
+                }
+            }
+
+            if let Some(dispatch) = reservation.get_mut("dispatch") {
+                if !dispatch.is_null() {
+                    let dispatch = dispatch
+                        .as_object_mut()
+                        .ok_or_else(|| format!("{context}.dispatch is not an object"))?;
+                    migrate_byte_field(
+                        dispatch,
+                        "dispatch_material",
+                        &format!("{context}.dispatch"),
+                        false,
+                    )?;
+                    migrate_byte_field(
+                        dispatch,
+                        "grant_decision",
+                        &format!("{context}.dispatch"),
+                        false,
+                    )?;
+                    migrate_byte_field(
+                        dispatch,
+                        "governing_observation",
+                        &format!("{context}.dispatch"),
+                        true,
+                    )?;
+                }
+            }
+            migrate_attachments(reservation, &context)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_attachments(
+    record: &mut serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<(), String> {
+    let attachments = record
+        .get_mut("attachments")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("{context}.attachments is missing or is not an object"))?;
+    for (slot, attachment) in attachments {
+        let attachment_context = format!("{context}.attachments.{slot}");
+        let attachment = attachment
+            .as_object_mut()
+            .ok_or_else(|| format!("{attachment_context} is not an object"))?;
+        migrate_byte_field(attachment, "opaque_bytes", &attachment_context, false)?;
+    }
+    Ok(())
+}
+
+fn migrate_byte_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+    optional: bool,
+) -> Result<(), String> {
+    let value = object
+        .get_mut(field)
+        .ok_or_else(|| format!("{context}.{field} is missing"))?;
+    if optional && value.is_null() {
+        return Ok(());
+    }
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("{context}.{field} is not a byte array"))?;
+    let bytes = array
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_u64()
+                .and_then(|byte| u8::try_from(byte).ok())
+                .ok_or_else(|| format!("{context}.{field}[{index}] is not a byte"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    *value = serde_json::Value::String(crate::serde_base64::encode(&bytes));
+    Ok(())
 }
 
 impl JournalStorage for FilesystemJournalStorage {
@@ -289,7 +460,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{FilesystemJournalStorage, JournalStorage};
+    use super::{FilesystemJournalStorage, JournalStorage, JOURNAL_SCHEMA_VERSION};
     use crate::journal::{DurableState, StorageError};
 
     static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -413,17 +584,60 @@ mod tests {
     }
 
     #[test]
-    fn unknown_schema_version_has_its_own_error() {
+    fn frozen_v1_journal_loads_and_migrates_without_losing_audit_bytes() {
+        const V1_BYTES: &[u8] =
+            include_bytes!("../../tests/fixtures/browser-launch-journal-v1.json");
+        assert_eq!(V1_BYTES.len(), 131_428, "the frozen v1 literal changed");
+
+        let directory = TemporaryDirectory::new("v1-migration");
+        let path = directory.join("journal.json");
+        fs::write(&path, V1_BYTES).expect("write exact pre-migration journal bytes");
+
+        let state = FilesystemJournalStorage::new(&path)
+            .load()
+            .expect("load and migrate v1 journal");
+        assert_eq!(state.next_sequence, 2);
+        let entry = state.entries.get(&1).expect("migrated terminal entry");
+        let descriptor: serde_json::Value = serde_json::from_slice(&entry.invocation_descriptor)
+            .expect("decode retained launch descriptor");
+        assert_eq!(
+            descriptor["format_version"],
+            "ck-browser-launch-attestation/v1"
+        );
+        assert_eq!(entry.codec_id, "ck-browser-launch-attestation/v1");
+        assert_eq!(entry.attachments.len(), 2);
+        assert!(entry.attachments.contains_key("browser.launch.attestation"));
+        assert!(entry.attachments.contains_key("browser.launch.generation"));
+
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read atomically migrated journal"))
+                .expect("parse migrated journal");
+        assert_eq!(migrated["schema_version"], JOURNAL_SCHEMA_VERSION);
+        let migrated_entry = &migrated["state"]["entries"]["1"];
+        assert!(migrated_entry["invocation_descriptor"].is_string());
+        assert!(migrated_entry["bytes"].is_string());
+        assert!(
+            migrated_entry["attachments"]["browser.launch.attestation"]["opaque_bytes"].is_string()
+        );
+        assert_eq!(
+            migrated_entry["accounted_size"].as_u64(),
+            Some(serde_json::to_vec(migrated_entry).unwrap().len() as u64),
+            "migration must recalibrate accounting to the base64 entry"
+        );
+    }
+
+    #[test]
+    fn unrecognized_schema_version_is_typed_and_never_starts_fresh() {
         let directory = TemporaryDirectory::new("unknown-version");
         let path = directory.join("journal.json");
-        fs::write(&path, br#"{"schema_version":2,"state":{}}"#).expect("write future journal");
+        fs::write(&path, br#"{"schema_version":3,"state":{}}"#).expect("write future journal");
 
         assert_eq!(
             FilesystemJournalStorage::new(&path).load(),
             Err(StorageError::UnknownSchemaVersion {
                 path,
-                found: 2,
-                supported: 1,
+                found: 3,
+                supported: 2,
             })
         );
     }
