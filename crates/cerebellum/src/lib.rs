@@ -94,6 +94,13 @@ pub use cerebellum_core::identity::{
     AcceptedBindFacts, LogicalProfileKey, ProfileDisposition, ProfileResolution, RouteIdentity,
     SessionKind,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserSurface {
+    NotConfigured,
+    Refused(BrowserConfigError),
+    Available(BrowserConfig),
+}
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
 pub use wire::{build_error_frame, control_flags};
 
@@ -578,25 +585,30 @@ pub fn serialize_manifest_with_computer_plane(
     module_id: &str,
     context: &ComputerCapabilityAdvertisementContext,
 ) -> Value {
-    serialize_manifest_with_computer_plane_configured(module_id, context, false)
+    serialize_manifest_with_computer_plane_configured(
+        module_id,
+        context,
+        &BrowserSurface::NotConfigured,
+    )
 }
 
 pub fn serialize_manifest_with_browser_configuration(
     module_id: &str,
-    browser_configured: bool,
+    browser_surface: &BrowserSurface,
 ) -> Value {
     serialize_manifest_with_computer_plane_configured(
         module_id,
         &default_computer_context(),
-        browser_configured,
+        browser_surface,
     )
 }
 
 fn serialize_manifest_with_computer_plane_configured(
     module_id: &str,
     context: &ComputerCapabilityAdvertisementContext,
-    browser_configured: bool,
+    browser_surface: &BrowserSurface,
 ) -> Value {
+    let browser_configured = matches!(browser_surface, BrowserSurface::Available(_));
     let mut manifest = build_manifest_with_computer_plane(module_id, context);
     if browser_configured {
         let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } =
@@ -620,6 +632,22 @@ fn serialize_manifest_with_computer_plane_configured(
             serde_json::to_value(computer_release_evidence(context))
                 .expect("computer release evidence serializes"),
         );
+    if let BrowserSurface::Refused(error) = browser_surface {
+        let mut refusal = json!({
+            "field": error.field,
+            "reason_code": error.reason.reason_code(),
+        });
+        if let Some(detail) = error.reason.detail() {
+            refusal
+                .as_object_mut()
+                .expect("browser refusal disclosure is an object")
+                .insert("detail".to_string(), Value::String(detail.to_string()));
+        }
+        value
+            .as_object_mut()
+            .expect("module manifest is an object")
+            .insert("browser_surface_refused".to_string(), refusal);
+    }
     value
 }
 
@@ -848,7 +876,7 @@ struct ModuleConfig {
     connection_file_path: PathBuf,
     module_id: String,
     health: HealthConfig,
-    browser: Option<BrowserConfig>,
+    browser: BrowserSurface,
 }
 
 impl ModuleConfig {
@@ -864,12 +892,14 @@ impl ModuleConfig {
         // fractional, non-numeric, and unknown-member values are
         // configuration errors).
         let parsed = cerebellum_core::config::load_config_file().map_err(ModuleError::Config)?;
-        let browser =
-            browser_config::load_browser_config_file().map_err(ModuleError::BrowserConfig)?;
-        if let Some(browser) = browser.as_ref() {
-            browser_config::validate_browser_config_at_load(browser)
-                .map_err(ModuleError::BrowserConfig)?;
-        }
+        let browser = match browser_config::load_browser_config_file() {
+            Ok(None) => BrowserSurface::NotConfigured,
+            Ok(Some(browser)) => match browser_config::validate_browser_config_at_load(&browser) {
+                Ok(()) => BrowserSurface::Available(browser),
+                Err(error) => BrowserSurface::Refused(error),
+            },
+            Err(error) => BrowserSurface::Refused(error),
+        };
         Ok(Self {
             connection_file_path,
             module_id,
@@ -884,13 +914,17 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let (mut read_half, write_half) = tokio::io::split(stream);
 
     let health_state = Arc::new(HealthState::with_config(config.health));
+    let browser_config = match &config.browser {
+        BrowserSurface::Available(browser) => Some(browser.clone()),
+        BrowserSurface::NotConfigured | BrowserSurface::Refused(_) => None,
+    };
     #[cfg(target_os = "macos")]
-    let mut planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
+    let mut planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
     #[cfg(not(target_os = "macos"))]
-    let planes = Planes::with_browser_config(Arc::clone(&health_state), config.browser.clone());
+    let planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
     #[cfg(target_os = "macos")]
     if planes.launch_service.is_none() {
-        if let Some(browser) = config.browser.clone() {
+        if let Some(browser) = browser_config.clone() {
             // Startup recovery belongs before `module_loop`: once that loop owns
             // the transport it can serve launch requests, so publishing the
             // production service any later would let a fresh spawn race an
@@ -900,7 +934,7 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
             ));
         }
     }
-    let idle_enforcer = config.browser.clone().map(|browser| {
+    let idle_enforcer = browser_config.clone().map(|browser| {
         let sessions = planes.sessions.clone();
         let clock = Arc::clone(&planes.lease_clock);
         tokio::spawn(async move {
@@ -928,7 +962,7 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     if let Some(enforcer) = idle_enforcer {
         enforcer.abort();
     }
-    if let Some(browser) = config.browser.as_ref() {
+    if let Some(browser) = browser_config.as_ref() {
         planes.sessions.teardown_all(browser);
     }
 
@@ -1239,7 +1273,7 @@ async fn send_hello(
     body["manifest"] = serialize_manifest_with_computer_plane_configured(
         &config.module_id,
         &default_computer_context(),
-        config.browser.is_some(),
+        &config.browser,
     );
     let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
@@ -2763,7 +2797,10 @@ mod tests {
 
     #[test]
     fn configured_browser_advertisement_and_dispatch_match_in_both_directions() {
-        let manifest = serialize_manifest_with_browser_configuration("cerebellum", true);
+        let manifest = serialize_manifest_with_browser_configuration(
+            "cerebellum",
+            &BrowserSurface::Available(browser_surface_config()),
+        );
         let advertised: std::collections::BTreeSet<&str> = manifest["provides"]
             .as_array()
             .unwrap()
@@ -2798,6 +2835,101 @@ mod tests {
         }
         assert!(!dispatchable.contains(browser::CLICK_POINT));
         assert!(!dispatchable.contains("browser.type"));
+    }
+
+    fn browser_surface_config() -> BrowserConfig {
+        BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 100,
+        }
+    }
+
+    fn browser_tools(manifest: &Value) -> Vec<&str> {
+        manifest["provides"]
+            .as_array()
+            .expect("manifest provides is an array")
+            .iter()
+            .find(|role| role["role"] == "tool_provider")
+            .expect("manifest has a tool provider")["tools"]
+            .as_array()
+            .expect("tool provider tools is an array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| name.starts_with("browser."))
+            .collect()
+    }
+
+    #[test]
+    fn available_browser_surface_advertises_tools_without_refusal_disclosure() {
+        let manifest = serialize_manifest_with_browser_configuration(
+            "cerebellum",
+            &BrowserSurface::Available(browser_surface_config()),
+        );
+
+        assert!(browser_tools(&manifest).contains(&"browser.navigate"));
+        assert!(manifest.get("browser_surface_refused").is_none());
+    }
+
+    #[test]
+    fn not_configured_browser_surface_hides_tools_without_refusal_disclosure() {
+        let manifest = serialize_manifest_with_browser_configuration(
+            "cerebellum",
+            &BrowserSurface::NotConfigured,
+        );
+
+        assert!(browser_tools(&manifest).is_empty());
+        assert!(manifest.get("browser_surface_refused").is_none());
+    }
+
+    #[test]
+    fn parse_refused_browser_surface_hides_tools_and_discloses_parse_reason() {
+        let manifest = serialize_manifest_with_browser_configuration(
+            "cerebellum",
+            &BrowserSurface::Refused(BrowserConfigError {
+                field: "browser".to_string(),
+                reason: browser_config::BrowserConfigReason::Malformed(
+                    "unexpected token".to_string(),
+                ),
+            }),
+        );
+
+        assert!(browser_tools(&manifest).is_empty());
+        assert_eq!(
+            manifest["browser_surface_refused"],
+            json!({
+                "field": "browser",
+                "reason_code": "malformed",
+                "detail": "unexpected token",
+            })
+        );
+    }
+
+    #[test]
+    fn probe_refused_browser_surface_hides_tools_and_discloses_probe_reason() {
+        let manifest = serialize_manifest_with_browser_configuration(
+            "cerebellum",
+            &BrowserSurface::Refused(BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason: browser_config::BrowserConfigReason::ExecutableProbeFailed(
+                    "process exited 1".to_string(),
+                ),
+            }),
+        );
+
+        assert!(browser_tools(&manifest).is_empty());
+        assert_eq!(
+            manifest["browser_surface_refused"],
+            json!({
+                "field": "browser.expected_identity",
+                "reason_code": "executable_probe_failed",
+                "detail": "process exited 1",
+            })
+        );
     }
 
     use super::*;
@@ -3651,7 +3783,7 @@ mod connection_liveness_tests {
                 dispatch_heartbeat_stale_ms: 100,
                 action_age_stale_ms: 30_000,
             },
-            browser: None,
+            browser: BrowserSurface::NotConfigured,
         }
     }
 

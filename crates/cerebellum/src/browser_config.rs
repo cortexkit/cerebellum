@@ -47,6 +47,44 @@ pub enum BrowserConfigReason {
     },
 }
 
+impl BrowserConfigReason {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed",
+            Self::NotObject => "not_object",
+            Self::UnknownMember(_) => "unknown_member",
+            Self::MissingMember => "missing_member",
+            Self::WrongType => "wrong_type",
+            Self::NotInteger => "not_integer",
+            Self::NotPositive => "not_positive",
+            Self::OutOfRange => "out_of_range",
+            Self::PathNotAbsolute => "path_not_absolute",
+            Self::ExpectedIdentityRequired => "expected_identity_required",
+            Self::ExecutableProbeFailed(_) => "executable_probe_failed",
+            Self::FinalImageMismatch { .. } => "final_image_mismatch",
+            Self::BelowSettlementQuietWindow { .. } => "below_settlement_quiet_window",
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Malformed(detail)
+            | Self::UnknownMember(detail)
+            | Self::ExecutableProbeFailed(detail) => Some(detail),
+            Self::NotObject
+            | Self::MissingMember
+            | Self::WrongType
+            | Self::NotInteger
+            | Self::NotPositive
+            | Self::OutOfRange
+            | Self::PathNotAbsolute
+            | Self::ExpectedIdentityRequired
+            | Self::FinalImageMismatch { .. }
+            | Self::BelowSettlementQuietWindow { .. } => None,
+        }
+    }
+}
+
 impl std::fmt::Display for BrowserConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.reason {
