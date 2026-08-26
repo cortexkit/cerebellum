@@ -37,6 +37,9 @@ tokio-util = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 cerebellum-macos = { path = "../cerebellum-macos" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+cerebellum-linux = { path = "../cerebellum-linux" }
+
 [dev-dependencies]
 subc-control = { workspace = true }
 subc-core = { workspace = true }

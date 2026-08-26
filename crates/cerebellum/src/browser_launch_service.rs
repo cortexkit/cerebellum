@@ -19,12 +19,16 @@ use crate::browser_executable_identity::verify_configured_executable;
 use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
 use serde_json::{json, Value};
 
+#[cfg(target_os = "linux")]
+use crate::browser_launch::LinuxProcessLauncher;
+#[cfg(target_os = "macos")]
+use crate::browser_launch::MacOsProcessLauncher;
 use crate::browser_launch::{
     recover_browser_launches, AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome,
     BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
     ExecutableIdentityClaim, LaunchAttestationRecord, LaunchProfileIdentity, LaunchRouteIdentity,
-    MacOsProcessLauncher, OrphanBrowserProcessControl, OrphanProcessControlFailure,
-    OrphanProfileCustody, OrphanProfileCustodyFailure, ProfileBoundLaunch,
+    OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
+    OrphanProfileCustodyFailure, ProfileBoundLaunch,
 };
 use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
@@ -70,7 +74,7 @@ impl ProductionLaunchService {
             let mut startup_failure = None;
             let journal = match DurableLaunchJournal::open_filesystem(launch_journal_config()) {
                 Ok(mut journal) => {
-                    let mut process = MacOsOrphanProcessControl {
+                    let mut process = ProductionOrphanProcessControl {
                         reap_deadline: Duration::from_millis(config.termination_grace_period_ms),
                     };
                     let mut custody = ProductionOrphanProfileCustody;
@@ -216,15 +220,8 @@ impl ProductionLaunchService {
             return Err(json!({"outcome": "internal_failure"}));
         };
 
-        let arguments = vec![
-            OsString::from("--remote-debugging-pipe"),
-            OsString::from(format!(
-                "--user-data-dir={}",
-                profile_directory.to_string_lossy()
-            )),
-            OsString::from("--no-first-run"),
-            OsString::from("--no-default-browser-check"),
-        ];
+        let crash_dumps_directory = profile_directory.join("crash-dumps");
+        let arguments = browser_launch_arguments(&profile_directory, &crash_dumps_directory);
         if !crate::custody::arguments_are_quarantinable(
             &arguments
                 .iter()
@@ -279,8 +276,12 @@ impl ProductionLaunchService {
             Ok(pair) => pair,
             Err(outcome) => return Err(cleanup_before_spawn(rollback.clone(), outcome)),
         };
+        #[cfg(target_os = "macos")]
         let mut launcher =
             MacOsProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        #[cfg(target_os = "linux")]
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
         let pipe = match UnixCdpPipe::new(command_parent, response_parent) {
             Ok(pipe) => pipe,
             Err(_) => {
@@ -351,6 +352,27 @@ fn launch_recovery_refusal() -> Value {
     })
 }
 
+pub(crate) fn browser_launch_arguments(
+    profile_directory: &Path,
+    crash_dumps_directory: &Path,
+) -> Vec<OsString> {
+    // Config-load probing uses this constructor too: wrappers may branch on
+    // flags, so a probe must preserve the production argument shape exactly.
+    vec![
+        OsString::from("--remote-debugging-pipe"),
+        OsString::from(format!(
+            "--user-data-dir={}",
+            profile_directory.to_string_lossy()
+        )),
+        OsString::from(format!(
+            "--crash-dumps-dir={}",
+            crash_dumps_directory.to_string_lossy()
+        )),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+    ]
+}
+
 fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
     cerebellum_core::journal::JournalConfig {
         journal_retention_bytes: 16 * 1024 * 1024,
@@ -358,10 +380,12 @@ fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct MacOsOrphanProcessControl {
     reap_deadline: Duration,
 }
 
+#[cfg(target_os = "macos")]
 impl MacOsOrphanProcessControl {
     fn generation_still_matches(generation: BrowserProcessGeneration) -> Result<bool, ()> {
         match cerebellum_macos::process_start_time(generation.pid) {
@@ -377,6 +401,7 @@ impl MacOsOrphanProcessControl {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl OrphanBrowserProcessControl for MacOsOrphanProcessControl {
     fn observed_start_time_micros(
         &mut self,
@@ -428,6 +453,108 @@ impl OrphanBrowserProcessControl for MacOsOrphanProcessControl {
             // The surviving guardian owns `waitpid` authority. Waiting until the
             // exact generation disappears observes its reap without pretending a
             // restarted module can reap a process that is not its child.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+type ProductionOrphanProcessControl = MacOsOrphanProcessControl;
+
+#[cfg(target_os = "linux")]
+type ProductionOrphanProcessControl = LinuxOrphanProcessControl;
+
+#[cfg(target_os = "macos")]
+type PlatformReleasedChild = cerebellum_macos::ReleasedChild;
+
+#[cfg(target_os = "linux")]
+type PlatformReleasedChild = cerebellum_linux::ReleasedChild;
+
+#[cfg(target_os = "macos")]
+fn platform_generation_matches(generation: BrowserProcessGeneration) -> bool {
+    cerebellum_macos::process_start_time_micros(generation.pid)
+        == Some(generation.start_time_micros)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_generation_matches(generation: BrowserProcessGeneration) -> bool {
+    matches!(
+        cerebellum_linux::process_start_time(generation.pid),
+        cerebellum_linux::ProcessStartTime::Started(start_time)
+            if start_time == generation.start_time_micros
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn platform_generation_exited(generation: BrowserProcessGeneration) -> bool {
+    !platform_generation_matches(generation)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_generation_exited(generation: BrowserProcessGeneration) -> bool {
+    !matches!(
+        cerebellum_linux::process_start_time(generation.pid),
+        cerebellum_linux::ProcessStartTime::Started(start_time)
+            if start_time == generation.start_time_micros
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxOrphanProcessControl {
+    reap_deadline: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl OrphanBrowserProcessControl for LinuxOrphanProcessControl {
+    fn observed_start_time_micros(
+        &mut self,
+        pid: u32,
+    ) -> Result<Option<u64>, OrphanProcessControlFailure> {
+        match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => Ok(Some(start_time)),
+            cerebellum_linux::ProcessStartTime::NoSuchProcess => Ok(None),
+            cerebellum_linux::ProcessStartTime::NotPermitted
+            | cerebellum_linux::ProcessStartTime::StatReadFailed
+            | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
+            | cerebellum_linux::ProcessStartTime::LayoutMismatch
+            | cerebellum_linux::ProcessStartTime::NoStartTime => Err(OrphanProcessControlFailure),
+        }
+    }
+
+    fn terminate_and_reap(
+        &mut self,
+        generation: BrowserProcessGeneration,
+    ) -> Result<(), OrphanProcessControlFailure> {
+        match cerebellum_linux::terminate_exact_generation(
+            generation.pid,
+            generation.start_time_micros,
+            Instant::now() + self.reap_deadline,
+        ) {
+            Ok(cerebellum_linux::TerminationOutcome::AlreadyGoneOrReplaced) => return Ok(()),
+            Ok(cerebellum_linux::TerminationOutcome::Signalled) => {}
+            Err(_) => return Err(OrphanProcessControlFailure),
+        }
+        let deadline = Instant::now() + self.reap_deadline;
+        loop {
+            match cerebellum_linux::process_start_time(generation.pid) {
+                cerebellum_linux::ProcessStartTime::NoSuchProcess => return Ok(()),
+                cerebellum_linux::ProcessStartTime::Started(start_time)
+                    if start_time != generation.start_time_micros =>
+                {
+                    return Ok(())
+                }
+                cerebellum_linux::ProcessStartTime::Started(_) => {}
+                cerebellum_linux::ProcessStartTime::NotPermitted
+                | cerebellum_linux::ProcessStartTime::StatReadFailed
+                | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
+                | cerebellum_linux::ProcessStartTime::LayoutMismatch
+                | cerebellum_linux::ProcessStartTime::NoStartTime => {
+                    return Err(OrphanProcessControlFailure)
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(OrphanProcessControlFailure);
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -503,7 +630,7 @@ fn release_orphan_profile_custody_at(
 
 pub struct ReadyProductionBrowser {
     attestation: LaunchAttestationRecord,
-    process: Option<cerebellum_macos::ReleasedChild>,
+    process: Option<PlatformReleasedChild>,
     pipe: Option<UnixCdpPipe>,
     transport: Option<CdpTransport>,
     decoder: Option<CdpFrameDecoder>,
@@ -534,7 +661,7 @@ impl ReadyProductionBrowser {
 }
 
 struct ProductionProcess {
-    process: Option<cerebellum_macos::ReleasedChild>,
+    process: Option<PlatformReleasedChild>,
     driver: Option<CdpNavigationDriver<UnixCdpPipe>>,
     reaped: bool,
 }
@@ -627,8 +754,10 @@ impl OwnedBrowserProcess for ProductionProcess {
     fn generation_matches(&self) -> bool {
         self.process.as_ref().is_some_and(|process| {
             let generation = process.generation();
-            cerebellum_macos::process_start_time_micros(generation.pid)
-                == Some(generation.start_time_micros)
+            platform_generation_matches(BrowserProcessGeneration {
+                pid: generation.pid,
+                start_time_micros: generation.start_time_micros,
+            })
         })
     }
 
@@ -647,9 +776,10 @@ impl OwnedBrowserProcess for ProductionProcess {
         let generation = process.generation();
         let deadline = Instant::now() + grace_period;
         while Instant::now() < deadline {
-            if cerebellum_macos::process_start_time_micros(generation.pid)
-                != Some(generation.start_time_micros)
-            {
+            if platform_generation_exited(BrowserProcessGeneration {
+                pid: generation.pid,
+                start_time_micros: generation.start_time_micros,
+            }) {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -978,6 +1108,9 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
             "expected_identity": expected_identity,
             "observed_identity": observed_identity,
         }),
+        AttestedReadinessError::AttestedLaunch(AttestedLaunchError::PlatformRefused { error }) => {
+            error.refusal()
+        }
         AttestedReadinessError::Readiness(
             crate::browser_launch_readiness::LaunchReadinessError::ProfileStartupIndeterminate(
                 failure,
@@ -1052,6 +1185,22 @@ mod executable_identity_launch_tests {
     use super::*;
     use cerebellum_core::identity::{RouteIdentity, RouteSurface, SessionKind};
 
+    #[test]
+    fn browser_probe_arguments_include_a_separate_throwaway_crash_dumps_path() {
+        let profile = Path::new("/tmp/probe-profile");
+        let crash_dumps = profile.join("crash");
+        assert_eq!(
+            browser_launch_arguments(profile, &crash_dumps),
+            vec![
+                OsString::from("--remote-debugging-pipe"),
+                OsString::from("--user-data-dir=/tmp/probe-profile"),
+                OsString::from("--crash-dumps-dir=/tmp/probe-profile/crash"),
+                OsString::from("--no-first-run"),
+                OsString::from("--no-default-browser-check"),
+            ]
+        );
+    }
+
     struct UnsignedExecutable(PathBuf);
 
     impl UnsignedExecutable {
@@ -1114,7 +1263,10 @@ mod executable_identity_launch_tests {
 
         assert_eq!(refusal["outcome"], "identity_unverifiable");
         assert_ne!(refusal["outcome"], "executable_identity_mismatch");
+        #[cfg(target_os = "macos")]
         assert_eq!(refusal["reason"], "verifier_failed");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(refusal["reason"], "configured_digest_invalid");
     }
 }
 
@@ -1135,6 +1287,7 @@ mod cleanup_ordering_tests {
     /// step failed left a `.lock` file behind, and the next launch was refused
     /// `profile_busy` naming a holder that no longer existed.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_journal_failure_still_releases_the_profile_lock() {
         let root = std::env::temp_dir().join(format!(
             "ck-cleanup-order-{}-{}",
@@ -1438,7 +1591,7 @@ mod profile_persistence_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod orphan_recovery_tests {
     use super::*;
     use crate::browser_launch::{
@@ -1624,5 +1777,71 @@ mod orphan_recovery_tests {
                 "reason_code": "browser_launch_recovery_failed",
             }))
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_orphan_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn linux_orphan_control_observes_and_reaps_the_exact_generation() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn orphan-control fixture");
+        let pid = child.id();
+        let start_time = match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
+            other => panic!("unexpected fixture generation reading: {other:?}"),
+        };
+        let mut control = LinuxOrphanProcessControl {
+            reap_deadline: Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            control.observed_start_time_micros(pid),
+            Ok(Some(start_time))
+        );
+        control
+            .terminate_and_reap(BrowserProcessGeneration {
+                pid,
+                start_time_micros: start_time,
+            })
+            .expect("terminate exact orphan generation");
+        assert_eq!(
+            cerebellum_linux::process_start_time(pid),
+            cerebellum_linux::ProcessStartTime::NoSuchProcess
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn linux_orphan_control_does_not_signal_a_different_generation() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn generation-mismatch fixture");
+        let pid = child.id();
+        let start_time = match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
+            other => panic!("unexpected fixture generation reading: {other:?}"),
+        };
+        let mut control = LinuxOrphanProcessControl {
+            reap_deadline: Duration::from_secs(1),
+        };
+
+        control
+            .terminate_and_reap(BrowserProcessGeneration {
+                pid,
+                start_time_micros: start_time.saturating_sub(1),
+            })
+            .expect("mismatched generation is already gone-or-replaced");
+        assert_eq!(
+            cerebellum_linux::process_start_time(pid),
+            cerebellum_linux::ProcessStartTime::Started(start_time)
+        );
+        child.kill().expect("clean up mismatch fixture");
+        let _ = child.wait();
     }
 }

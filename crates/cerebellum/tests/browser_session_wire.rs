@@ -18,7 +18,7 @@ use cerebellum::classification::{
 use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
 };
-use cerebellum::{BrowserConfig, Planes};
+use cerebellum::{BrowserConfig, BrowserSurface, Planes};
 use cerebellum_core::health::HealthState;
 use cerebellum_core::identity::RouteIdentity;
 use serde_json::{json, Value};
@@ -324,8 +324,13 @@ async fn launch_at(planes: &Planes, origin: &str) {
 #[test]
 fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
     fn names(configured: bool) -> Vec<String> {
+        let surface = if configured {
+            BrowserSurface::Available(config())
+        } else {
+            BrowserSurface::NotConfigured
+        };
         let manifest =
-            cerebellum::serialize_manifest_with_browser_configuration("cerebellum", configured);
+            cerebellum::serialize_manifest_with_browser_configuration("cerebellum", &surface);
         manifest["provides"]
             .as_array()
             .unwrap()
