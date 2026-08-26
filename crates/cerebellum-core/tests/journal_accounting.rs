@@ -1,3 +1,7 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::codec::{
     CompletionInput, DispatchedInput, EncodedJournalState, PlaneJournalCodec, ProvisionalInput,
@@ -5,8 +9,8 @@ use cerebellum_core::journal::codec::{
 };
 use cerebellum_core::journal::store::JournalStore;
 use cerebellum_core::journal::{
-    CompletedResult, DispatchMaterial, FinalContextAssociation, InMemoryJournalStorage,
-    JournalConfig, JournalError, JournalIdentity, RejectionMaterial,
+    CompletedResult, DispatchMaterial, FilesystemJournalStorage, FinalContextAssociation,
+    InMemoryJournalStorage, JournalConfig, JournalError, JournalIdentity, RejectionMaterial,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -76,43 +80,98 @@ fn identity() -> JournalIdentity {
     }
 }
 
+fn config(retention_bytes: u64) -> JournalConfig {
+    JournalConfig {
+        journal_retention_bytes: retention_bytes,
+        journal_max_entry_bytes: retention_bytes,
+    }
+}
+
 fn store(retention_bytes: u64) -> JournalStore<AccountingCodec> {
     JournalStore::new(
         AccountingCodec,
         None,
         None,
-        JournalConfig {
-            journal_retention_bytes: retention_bytes,
-            journal_max_entry_bytes: retention_bytes,
-        },
+        config(retention_bytes),
         InMemoryJournalStorage::new(),
     )
     .unwrap()
 }
 
+static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new(test_name: &str) -> Self {
+        let sequence = DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cerebellum-accounting-{test_name}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("temporary accounting directory");
+        Self(path)
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.0.join("journal.json")
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn filesystem_store(
+    retention_bytes: u64,
+    path: &Path,
+) -> JournalStore<AccountingCodec, (), (), FilesystemJournalStorage> {
+    JournalStore::new(
+        AccountingCodec,
+        None,
+        None,
+        config(retention_bytes),
+        FilesystemJournalStorage::new(path),
+    )
+    .unwrap()
+}
+
+fn compact_record_size(path: &Path, collection: &str, sequence: u64) -> u64 {
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).expect("read journal file"))
+            .expect("parse journal file");
+    serde_json::to_vec(&stored["state"][collection][sequence.to_string()])
+        .expect("serialize stored record")
+        .len() as u64
+}
+
 #[test]
-fn active_reservation_has_exact_provisional_charge() {
-    let mut journal = store(100);
+fn active_reservation_charge_matches_the_full_serialized_record() {
+    let directory = TemporaryDirectory::new("active");
+    let path = directory.journal_path();
+    let mut journal = filesystem_store(10_000, &path);
     let handle = journal.reserve(identity(), b"invoke-1".to_vec()).unwrap();
 
-    // The provisional fixture is `p:1`, so its three serialized bytes are
-    // charged while the obligation is still active.
-    assert_eq!(journal.active_reserved_bytes(), 3);
-    assert_eq!(journal.retained_bytes(), 3);
-    assert_eq!(journal.status().active_reserved_bytes, 3);
-    assert_eq!(journal.status().retained_bytes, 3);
+    let actual = compact_record_size(&path, "reservations", 1);
+    assert_eq!(journal.active_reserved_bytes(), actual);
+    assert_eq!(journal.retained_bytes(), actual);
+    assert_eq!(journal.status().active_reserved_bytes, actual);
+    assert_eq!(journal.status().retained_bytes, actual);
     assert_eq!(handle.action_obligation_id(), 1);
 }
 
 #[test]
-fn retention_counts_active_reservation_bytes_absolutely() {
-    let mut journal = store(5);
-    journal.reserve(identity(), b"invoke-1".to_vec()).unwrap();
+fn retention_counts_active_reservation_records_absolutely() {
+    let mut probe = store(10_000);
+    probe.reserve(identity(), b"invoke-1".to_vec()).unwrap();
+    let one_record = probe.active_reserved_bytes();
 
-    // Retention must include in-flight reservations, leaving only two of the
-    // five configured bytes unavailable for another three-byte reservation.
-    assert_eq!(journal.active_reserved_bytes(), 3);
-    assert_eq!(journal.retained_bytes(), 3);
+    let mut journal = store(one_record * 2 - 1);
+    journal.reserve(identity(), b"invoke-1".to_vec()).unwrap();
+    assert_eq!(journal.active_reserved_bytes(), one_record);
+    assert_eq!(journal.retained_bytes(), one_record);
     assert_eq!(
         journal.reserve(identity(), b"invoke-2".to_vec()),
         Err(JournalError::ReservationFailed)
@@ -120,11 +179,15 @@ fn retention_counts_active_reservation_bytes_absolutely() {
 }
 
 #[test]
-fn dispatch_and_finalization_keep_exact_active_and_retained_bytes() {
-    let mut journal = store(100);
+fn dispatch_and_finalization_reaccount_each_full_record() {
+    let directory = TemporaryDirectory::new("lifecycle");
+    let path = directory.journal_path();
+    let mut journal = filesystem_store(10_000, &path);
     let handle = journal.reserve(identity(), b"invoke-1".to_vec()).unwrap();
-    assert_eq!(journal.active_reserved_bytes(), 3);
-    assert_eq!(journal.retained_bytes(), 3);
+    assert_eq!(
+        journal.active_reserved_bytes(),
+        compact_record_size(&path, "reservations", 1)
+    );
 
     let token = journal
         .commit_dispatched(
@@ -137,10 +200,11 @@ fn dispatch_and_finalization_keep_exact_active_and_retained_bytes() {
             },
         )
         .unwrap();
-    // The dispatched fixture is `dispatch:1`, exactly ten bytes, replacing
-    // rather than adding to the provisional reservation charge.
-    assert_eq!(journal.active_reserved_bytes(), 10);
-    assert_eq!(journal.retained_bytes(), 10);
+    assert_eq!(
+        journal.active_reserved_bytes(),
+        compact_record_size(&path, "reservations", 1)
+    );
+    assert_eq!(journal.retained_bytes(), journal.active_reserved_bytes());
 
     journal
         .finalize_dispatched(
@@ -153,18 +217,20 @@ fn dispatch_and_finalization_keep_exact_active_and_retained_bytes() {
             },
         )
         .unwrap();
-    // Finalization releases active capacity and retains the `done:1` terminal,
-    // whose exact serialized size is six bytes.
     assert_eq!(journal.active_reserved_bytes(), 0);
-    assert_eq!(journal.retained_bytes(), 6);
+    assert_eq!(
+        journal.retained_bytes(),
+        compact_record_size(&path, "entries", 1)
+    );
     assert_eq!(journal.status().entry_count, 1);
 }
 
 #[test]
-fn rejected_terminal_retains_exact_encoded_size() {
-    let mut journal = store(100);
+fn terminal_accounting_matches_serialized_record_not_payload() {
+    let directory = TemporaryDirectory::new("terminal");
+    let path = directory.journal_path();
+    let mut journal = filesystem_store(10_000, &path);
     let handle = journal.reserve(identity(), b"invoke-1".to_vec()).unwrap();
-    assert_eq!(journal.active_reserved_bytes(), 3);
 
     journal
         .finalize_rejected(
@@ -175,9 +241,8 @@ fn rejected_terminal_retains_exact_encoded_size() {
         )
         .unwrap();
 
-    // A rejected terminal is retained as the `reject:1` fixture, exactly eight
-    // bytes, after its active reservation is released.
+    let actual = compact_record_size(&path, "entries", 1);
     assert_eq!(journal.active_reserved_bytes(), 0);
-    assert_eq!(journal.retained_bytes(), 8);
-    assert_eq!(journal.purge().purged_bytes, 8);
+    assert_eq!(journal.retained_bytes(), actual);
+    assert_eq!(journal.purge().purged_bytes, actual);
 }

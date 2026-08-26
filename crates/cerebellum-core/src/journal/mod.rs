@@ -338,9 +338,12 @@ pub struct Committed;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchMaterial {
+    #[serde(with = "crate::serde_base64::bytes")]
     pub dispatch_material: Vec<u8>,
     pub severity_inputs: Option<SeverityInputs>,
+    #[serde(with = "crate::serde_base64::bytes")]
     pub grant_decision: Vec<u8>,
+    #[serde(with = "crate::serde_base64::optional_bytes")]
     pub governing_observation: Option<Vec<u8>>,
 }
 
@@ -360,6 +363,7 @@ pub struct FinalContextAssociation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RejectionMaterial {
+    #[serde(with = "crate::serde_base64::bytes")]
     pub rejection_material: Vec<u8>,
 }
 
@@ -375,6 +379,7 @@ enum ReservationMarker {
 #[serde(deny_unknown_fields)]
 struct AttachmentState {
     revision: u64,
+    #[serde(with = "crate::serde_base64::bytes")]
     opaque_bytes: Vec<u8>,
 }
 
@@ -382,6 +387,7 @@ struct AttachmentState {
 #[serde(deny_unknown_fields)]
 struct ReservationRecord {
     identity: JournalIdentity,
+    #[serde(with = "crate::serde_base64::bytes")]
     invocation_descriptor: Vec<u8>,
     provisional: EncodedJournalState,
     codec_id: String,
@@ -396,7 +402,9 @@ struct ReservationRecord {
 #[serde(deny_unknown_fields)]
 struct TerminalRecord {
     identity: JournalIdentity,
+    #[serde(with = "crate::serde_base64::bytes")]
     invocation_descriptor: Vec<u8>,
+    #[serde(with = "crate::serde_base64::bytes")]
     bytes: Vec<u8>,
     accounted_size: u64,
     codec_id: String,
@@ -609,28 +617,25 @@ where
                 return Err(error);
             }
         };
-        if !make_room(
-            &mut candidate,
-            provisional.accounted_serialized_size,
-            self.config,
-        ) {
+        let mut reservation = ReservationRecord {
+            identity,
+            invocation_descriptor,
+            codec_id: provisional.codec_version.clone(),
+            charge: 0,
+            provisional,
+            state: LifecycleState::Active,
+            marker: None,
+            dispatch: None,
+            attachments: BTreeMap::new(),
+        };
+        let charge = refresh_reservation_charge(&mut reservation)?;
+        if !make_room(&mut candidate, charge, self.config) {
             let _ = self.commit_state(candidate);
             return Err(JournalError::ReservationFailed);
         }
-        candidate.reservations.insert(
-            action_obligation_id,
-            ReservationRecord {
-                identity,
-                invocation_descriptor,
-                codec_id: provisional.codec_version.clone(),
-                charge: provisional.accounted_serialized_size,
-                provisional,
-                state: LifecycleState::Active,
-                marker: None,
-                dispatch: None,
-                attachments: BTreeMap::new(),
-            },
-        );
+        candidate
+            .reservations
+            .insert(action_obligation_id, reservation);
         self.commit_state(candidate)?;
         Ok(ReservationHandle {
             action_obligation_id,
@@ -672,11 +677,17 @@ where
         if take_fault(&mut marked, "establish_marker") {
             return Err(JournalError::ReservationFailed);
         }
-        marked
+        let mut marked_record = marked
             .reservations
-            .get_mut(&sequence)
-            .ok_or(JournalError::ObligationUnknown)?
-            .marker = Some(ReservationMarker::DispatchCommitment);
+            .get(&sequence)
+            .cloned()
+            .ok_or(JournalError::ObligationUnknown)?;
+        marked_record.marker = Some(ReservationMarker::DispatchCommitment);
+        let marked_charge = refresh_reservation_charge(&mut marked_record)?;
+        if !make_room_delta(&mut marked, record.charge, marked_charge, self.config) {
+            return Err(JournalError::ReservationFailed);
+        }
+        marked.reservations.insert(sequence, marked_record);
         self.commit_state(marked)?;
 
         let mut committed = self.state.clone();
@@ -684,23 +695,21 @@ where
             self.commit_state(committed)?;
             return Err(JournalError::ReservationFailed);
         }
-        if !make_room_delta(
-            &mut committed,
-            record.charge,
-            encoded.accounted_serialized_size,
-            self.config,
-        ) {
+        let mut dispatched_record = committed
+            .reservations
+            .get(&sequence)
+            .cloned()
+            .ok_or(JournalError::ObligationUnknown)?;
+        let old_charge = dispatched_record.charge;
+        dispatched_record.state = LifecycleState::Dispatched;
+        dispatched_record.marker = None;
+        dispatched_record.provisional = encoded;
+        dispatched_record.dispatch = Some(material);
+        let dispatched_charge = refresh_reservation_charge(&mut dispatched_record)?;
+        if !make_room_delta(&mut committed, old_charge, dispatched_charge, self.config) {
             return Err(JournalError::ReservationFailed);
         }
-        let current = committed
-            .reservations
-            .get_mut(&sequence)
-            .ok_or(JournalError::ObligationUnknown)?;
-        current.state = LifecycleState::Dispatched;
-        current.marker = None;
-        current.charge = encoded.accounted_serialized_size;
-        current.provisional = encoded;
-        current.dispatch = Some(material);
+        committed.reservations.insert(sequence, dispatched_record);
         self.commit_state(committed)?;
         Ok(DispatchCommitmentToken {
             action_obligation_id: sequence,
@@ -734,11 +743,17 @@ where
         if take_fault(&mut marked, "establish_marker") {
             return Err(JournalError::ReservationFailed);
         }
-        marked
+        let mut marked_record = marked
             .reservations
-            .get_mut(&sequence)
-            .ok_or(JournalError::ObligationUnknown)?
-            .marker = Some(ReservationMarker::Rejection(material));
+            .get(&sequence)
+            .cloned()
+            .ok_or(JournalError::ObligationUnknown)?;
+        marked_record.marker = Some(ReservationMarker::Rejection(material));
+        let marked_charge = refresh_reservation_charge(&mut marked_record)?;
+        if !make_room_delta(&mut marked, record.charge, marked_charge, self.config) {
+            return Err(JournalError::ReservationFailed);
+        }
+        marked.reservations.insert(sequence, marked_record);
         self.commit_state(marked)?;
         let mut committed = self.state.clone();
         if take_fault(&mut committed, "commit_rejection") {
@@ -790,11 +805,17 @@ where
         if take_fault(&mut marked, "establish_marker") {
             return Err(JournalError::ReservationFailed);
         }
-        marked
+        let mut marked_record = marked
             .reservations
-            .get_mut(&sequence)
-            .ok_or(JournalError::ObligationUnknown)?
-            .marker = Some(ReservationMarker::Reduced(reason));
+            .get(&sequence)
+            .cloned()
+            .ok_or(JournalError::ObligationUnknown)?;
+        marked_record.marker = Some(ReservationMarker::Reduced(reason));
+        let marked_charge = refresh_reservation_charge(&mut marked_record)?;
+        if !make_room_delta(&mut marked, record.charge, marked_charge, self.config) {
+            return Err(JournalError::ReservationFailed);
+        }
+        marked.reservations.insert(sequence, marked_record);
         self.commit_state(marked)?;
         let mut committed = self.state.clone();
         if take_fault(&mut committed, "commit_rejection") {
@@ -882,9 +903,10 @@ where
         }
         let slot = slot.into();
         let mut candidate = self.state.clone();
-        let record = candidate
+        let mut record = candidate
             .reservations
-            .get_mut(&handle.action_obligation_id)
+            .get(&handle.action_obligation_id)
+            .cloned()
             .ok_or(JournalError::ObligationUnknown)?;
         let current = record
             .attachments
@@ -895,6 +917,7 @@ where
             return Err(JournalError::AttachmentFailed);
         }
         let revision = expected_revision.saturating_add(1);
+        let old_charge = record.charge;
         record.attachments.insert(
             slot,
             AttachmentState {
@@ -902,6 +925,14 @@ where
                 opaque_bytes,
             },
         );
+        let new_charge =
+            refresh_reservation_charge(&mut record).map_err(|_| JournalError::AttachmentFailed)?;
+        if !make_room_delta(&mut candidate, old_charge, new_charge, self.config) {
+            return Err(JournalError::AttachmentFailed);
+        }
+        candidate
+            .reservations
+            .insert(handle.action_obligation_id, record);
         self.commit_state(candidate)?;
         Ok(revision)
     }
@@ -1277,36 +1308,31 @@ where
             reason,
             recovered,
         } = commit;
-        if !make_room_delta(
-            candidate,
-            record.charge,
-            encoded.accounted_serialized_size,
-            self.config,
-        ) {
-            return Err(JournalError::ReservationFailed);
-        }
         let severity_inputs = record
             .dispatch
             .as_ref()
             .and_then(|material| material.severity_inputs);
         let severity = severity_inputs.and_then(|inputs| self.resolve_severity(inputs));
+        let old_charge = record.charge;
+        let mut terminal = TerminalRecord {
+            identity: record.identity,
+            invocation_descriptor: record.invocation_descriptor,
+            bytes: encoded.durable_bytes,
+            accounted_size: 0,
+            codec_id: encoded.codec_version,
+            kind,
+            reason,
+            severity_inputs,
+            severity,
+            attachments: record.attachments,
+            recovered,
+        };
+        let terminal_charge = refresh_terminal_charge(&mut terminal)?;
+        if !make_room_delta(candidate, old_charge, terminal_charge, self.config) {
+            return Err(JournalError::ReservationFailed);
+        }
         candidate.reservations.remove(&sequence);
-        candidate.entries.insert(
-            sequence,
-            TerminalRecord {
-                identity: record.identity,
-                invocation_descriptor: record.invocation_descriptor,
-                bytes: encoded.durable_bytes,
-                accounted_size: encoded.accounted_serialized_size,
-                codec_id: encoded.codec_version,
-                kind,
-                reason,
-                severity_inputs,
-                severity,
-                attachments: record.attachments,
-                recovered,
-            },
-        );
+        candidate.entries.insert(sequence, terminal);
         publish_transition(candidate, sequence, kind);
         Ok(())
     }
@@ -1352,6 +1378,36 @@ fn take_fault(state: &mut DurableState, point: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn refresh_reservation_charge(record: &mut ReservationRecord) -> Result<u64, JournalError> {
+    // The charge itself is serialized, so setting it can change the number of
+    // decimal digits in the record. Iterate to the stable serialized length.
+    let codec_minimum = record.provisional.accounted_serialized_size;
+    for _ in 0..4 {
+        let serialized = serde_json::to_vec(record).map_err(|_| JournalError::CodecFailed)?;
+        let serialized = u64::try_from(serialized.len()).map_err(|_| JournalError::CodecFailed)?;
+        let charge = serialized.max(codec_minimum);
+        if record.charge == charge {
+            return Ok(charge);
+        }
+        record.charge = charge;
+    }
+    Err(JournalError::CodecFailed)
+}
+
+fn refresh_terminal_charge(record: &mut TerminalRecord) -> Result<u64, JournalError> {
+    // Terminal accounting is the compact JSON representation persisted for this
+    // entry, including its metadata and attachments rather than only payload bytes.
+    for _ in 0..4 {
+        let serialized = serde_json::to_vec(record).map_err(|_| JournalError::CodecFailed)?;
+        let charge = u64::try_from(serialized.len()).map_err(|_| JournalError::CodecFailed)?;
+        if record.accounted_size == charge {
+            return Ok(charge);
+        }
+        record.accounted_size = charge;
+    }
+    Err(JournalError::CodecFailed)
 }
 
 fn retained_bytes(state: &DurableState) -> u64 {

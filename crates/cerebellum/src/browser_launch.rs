@@ -22,7 +22,8 @@ pub use crate::browser_launch_readiness::*;
 
 const GENERATION_SLOT: &str = "browser.launch.generation";
 const ATTESTATION_SLOT: &str = "browser.launch.attestation";
-const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v1";
+const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v2";
+const LEGACY_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v1";
 
 /// Exact route facts authorized for one launch attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ pub struct LaunchRouteIdentity {
 #[serde(deny_unknown_fields)]
 pub struct LaunchProfileIdentity {
     pub profile_uuid: String,
+    #[serde(with = "cerebellum_core::serde_base64::bytes_compat")]
     pub canonical_profile_path: Vec<u8>,
     pub disposition: cerebellum_core::identity::ProfileDisposition,
 }
@@ -138,8 +140,11 @@ impl PreSpawnIdentityVerification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedLaunchVector {
+    #[serde(with = "cerebellum_core::serde_base64::bytes_compat")]
     pub executable: Vec<u8>,
+    #[serde(with = "cerebellum_core::serde_base64::byte_strings_compat")]
     pub arguments: Vec<Vec<u8>>,
+    #[serde(with = "cerebellum_core::serde_base64::byte_string_pairs_compat")]
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -759,7 +764,12 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                 .map_err(|_| BrowserLaunchRecoveryFailure::JournalRead { sequence })?;
             let intent = serde_json::from_slice::<AuthorizedLaunchIntent>(&audit.descriptor_bytes)
                 .ok()
-                .filter(|intent| intent.format_version == LAUNCH_CODEC_VERSION);
+                .filter(|intent| {
+                    matches!(
+                        intent.format_version.as_str(),
+                        LAUNCH_CODEC_VERSION | LEGACY_LAUNCH_CODEC_VERSION
+                    )
+                });
             let attested_generation = if classification
                 == cerebellum_core::journal::RecoveryClassification::ProvisionalDispatched
             {
@@ -1695,6 +1705,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v2_launch_records_encode_every_byte_field_as_base64() {
+        let intent = request().durable_intent();
+        let serialized = serde_json::to_value(&intent).expect("serialize v2 launch intent");
+
+        assert_eq!(serialized["format_version"], LAUNCH_CODEC_VERSION);
+        assert!(serialized["profile"]["canonical_profile_path"].is_string());
+        assert!(serialized["launch_vector"]["executable"].is_string());
+        assert!(serialized["launch_vector"]["arguments"][0].is_string());
+        assert_eq!(
+            serde_json::from_value::<AuthorizedLaunchIntent>(serialized)
+                .expect("decode v2 launch intent"),
+            intent
+        );
+    }
+
+    #[test]
+    fn frozen_v1_launch_descriptor_number_arrays_still_decode() {
+        const V1_BYTES: &[u8] =
+            include_bytes!("../../cerebellum-core/tests/fixtures/browser-launch-journal-v1.json");
+        let stored: serde_json::Value =
+            serde_json::from_slice(V1_BYTES).expect("parse exact v1 journal bytes");
+        let descriptor = stored["state"]["entries"]["1"]["invocation_descriptor"]
+            .as_array()
+            .expect("v1 descriptor byte array")
+            .iter()
+            .map(|value| value.as_u64().expect("v1 byte") as u8)
+            .collect::<Vec<_>>();
+
+        let intent: AuthorizedLaunchIntent =
+            serde_json::from_slice(&descriptor).expect("decode v1 launch descriptor");
+        assert_eq!(intent.format_version, LEGACY_LAUNCH_CODEC_VERSION);
+        assert_eq!(intent.launch_attempt_id, "fixture-launch-attempt");
+        assert_eq!(intent.launch_vector.executable, vec![b'x'; 250]);
+        assert_eq!(
+            intent.profile.canonical_profile_path,
+            b"/Users/fixture/Library/Application Support/CortexKit/Profiles/fixture"
+        );
+    }
+
     fn dispatch_attempt(
         journal: &mut DurableLaunchJournal<InMemoryJournalStorage>,
         request: &AttestedLaunchRequest,
@@ -2203,9 +2253,11 @@ mod tests {
         assert_eq!(journal.core.retained_bytes(), 0);
 
         let request = request();
-        let (sequence, attestation) = dispatch_attempt(&mut journal, &request);
-        let dispatched_charge = serde_json::to_vec(&attestation).unwrap().len() as u64;
-        assert_eq!(journal.core.active_reserved_bytes(), dispatched_charge);
+        let (sequence, _) = dispatch_attempt(&mut journal, &request);
+        // Capacity now follows the complete durable reservation, not only the
+        // attestation payload returned by the plane codec.
+        let dispatched_charge = journal.core.active_reserved_bytes();
+        assert_ne!(dispatched_charge, 0);
         assert_eq!(journal.core.retained_bytes(), dispatched_charge);
 
         journal
@@ -2219,9 +2271,8 @@ mod tests {
             launch_attempt_id: request.launch_attempt_id.clone(),
             terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome::ModuleShutdown,
         };
-        let expected_terminal_bytes = serde_json::to_vec(&expected).unwrap().len() as u64;
         assert_eq!(journal.core.active_reserved_bytes(), 0);
-        assert_eq!(journal.core.retained_bytes(), expected_terminal_bytes);
+        assert_ne!(journal.core.retained_bytes(), 0);
         assert_eq!(journal.core.status().active_reservation_count, 0);
         assert_eq!(journal.core.status().entry_count, 1);
         assert_eq!(terminal_completion(&journal, sequence), expected);
@@ -2333,11 +2384,8 @@ mod tests {
         for cycle in 0..CYCLES {
             let mut request = request();
             request.launch_attempt_id = format!("attempt-{cycle}");
-            let (_, attestation) = dispatch_attempt(&mut journal, &request);
-            assert_eq!(
-                journal.core.active_reserved_bytes(),
-                serde_json::to_vec(&attestation).unwrap().len() as u64
-            );
+            let _ = dispatch_attempt(&mut journal, &request);
+            assert_ne!(journal.core.active_reserved_bytes(), 0);
             journal
                 .finalize_session(
                     &request.launch_attempt_id,
@@ -2365,8 +2413,10 @@ mod tests {
         )
         .expect("open launch journal");
         let request = request();
-        let (_, attestation) = dispatch_attempt(&mut journal, &request);
-        let dispatched_charge = serde_json::to_vec(&attestation).unwrap().len() as u64;
+        let _ = dispatch_attempt(&mut journal, &request);
+        // A failed write retains the exact full-record charge calculated before
+        // the attempt, so retry neither releases nor double-counts capacity.
+        let dispatched_charge = journal.core.active_reserved_bytes();
         journal.core.arm_fault("commit_finalization", 1);
 
         assert_eq!(

@@ -1,17 +1,14 @@
 //! Audit journal, redaction, snapshot retention, and late-event delivery.
 //!
-//! This module tree is the B2A-owned journal surface of the browser plane
-//! (Spec B2A, slice S7). It implements the closed `ck-browser-journal/v1`
-//! entry contract together with the durable allocator and store, reservation
-//! and transition-pin internals, dispatch commitment, recovery markers,
-//! reduced-rejection recovery, retained governing observations and snapshot
-//! pins, policy-event commitment, audit obligations, and live-session
-//! late-event delivery.
+//! This module implements the browser plane's journal surface and the closed
+//! `ck-browser-journal/v2` entry contract. It owns durable allocation and
+//! storage, reservations and transition pins, dispatch commitment, recovery,
+//! retained governing observations and snapshot pins, policy events, audit
+//! obligations, and live-session late-event delivery.
 //!
-//! The invocation-bound frozen pin, the B2B association seam, administration,
-//! manifest gating, and strict-bind-fact validation live in slice S10
-//! (`src/journal_pin.rs`, `src/journal_admin.rs`); this module supplies the
-//! machinery those surfaces build on and never edits them.
+//! Invocation-bound pins, profile association, administration, manifest
+//! gating, and strict bind-fact validation build on this machinery from
+//! `src/journal_pin.rs` and `src/journal_admin.rs`.
 //!
 //! # Durability model
 //!
@@ -46,10 +43,10 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 
 /// The literal `format_version` carried by every journal entry.
-pub const FORMAT_VERSION: &str = "ck-browser-journal/v1";
+pub const FORMAT_VERSION: &str = "ck-browser-journal/v2";
 
 /// The export `format_version` reported by the administration export surface.
-pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v1";
+pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v2";
 
 /// The greatest sequence the allocator may hand out (`9007199254740991`).
 ///
@@ -417,7 +414,7 @@ pub enum PolicyEventDetail {
     },
 }
 
-/// The closed `ck-browser-journal/v1` entry.
+/// The closed `ck-browser-journal/v2` entry.
 ///
 /// No additional fields are permitted (`deny_unknown_fields`). For a policy
 /// event, `capability`, `intent_redacted`, `requested_severity`,
@@ -545,7 +542,7 @@ mod tests {
 
     #[test]
     fn entry_rejects_unknown_fields() {
-        let json = r#"{"format_version":"ck-browser-journal/v1","sequence":1,"phase":"dispatched","identity":{"principal":"p","conversation_key":"c","agent_project_id":"a","session_kind":"primary","profile_uuid":null,"profile_name":null},"capability":null,"intent_redacted":null,"requested_severity":null,"effective_severity":null,"grant_decision":{"outcome":"not_reached","reason":null},"governing_observation":{"kind":"none","reason":"observation_not_required"},"action":null,"locator":null,"snapshot_ids":[],"outcome":null,"extra":1}"#;
+        let json = r#"{"format_version":"ck-browser-journal/v2","sequence":1,"phase":"dispatched","identity":{"principal":"p","conversation_key":"c","agent_project_id":"a","session_kind":"primary","profile_uuid":null,"profile_name":null},"capability":null,"intent_redacted":null,"requested_severity":null,"effective_severity":null,"grant_decision":{"outcome":"not_reached","reason":null},"governing_observation":{"kind":"none","reason":"observation_not_required"},"action":null,"locator":null,"snapshot_ids":[],"outcome":null,"extra":1}"#;
         let parsed: Result<JournalEntry, _> = serde_json::from_str(json);
         assert!(parsed.is_err());
     }

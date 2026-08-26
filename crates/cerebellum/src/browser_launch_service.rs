@@ -373,9 +373,16 @@ pub(crate) fn browser_launch_arguments(
     ]
 }
 
+/// Default capacity for durable browser-launch audit records.
+///
+/// The representative v2 launch fixture is 6,266 accounted bytes. A 1,000-launch
+/// horizon therefore needs 6,266,000 bytes; 64 MiB provides 67,108,864 bytes,
+/// or 10,710 launches at that measured size, while leaving room for larger paths.
+const LAUNCH_JOURNAL_RETENTION_BYTES: u64 = 64 * 1024 * 1024;
+
 fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
     cerebellum_core::journal::JournalConfig {
-        journal_retention_bytes: 16 * 1024 * 1024,
+        journal_retention_bytes: LAUNCH_JOURNAL_RETENTION_BYTES,
         journal_max_entry_bytes: 1024 * 1024,
     }
 }
@@ -1651,7 +1658,7 @@ mod orphan_recovery_tests {
             ProfileCustodyAcquisition::ProfileBusy { .. } => panic!("empty root was busy"),
         };
         AuthorizedLaunchIntent {
-            format_version: "ck-browser-launch-attestation/v1".to_string(),
+            format_version: "ck-browser-launch-attestation/v2".to_string(),
             launch_attempt_id: "attempt-1".to_string(),
             holder_id: claim.holder_id().as_str().to_string(),
             route: LaunchRouteIdentity {
