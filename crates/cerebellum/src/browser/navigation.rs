@@ -576,8 +576,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
+        // cssVisualViewport, not visualViewport. CDP's undecorated
+        // `visualViewport` is deprecated and reports DEVICE pixels, so on any
+        // display with a scale factor above 1 it returns the same numbers as
+        // the captured image -- which makes a pixel-to-css mapping that is a
+        // ratio of those two look correct while it is the identity. A click
+        // then lands at twice its intended offset, outside the viewport on a
+        // Retina display, and the caller is told `outcome: ok`.
         let visual_viewport = metrics
-            .get("visualViewport")
+            .get("cssVisualViewport")
             .and_then(Value::as_object)
             .ok_or(NavigationDriveError::CdpFailure)?;
         let x_input_css = required_result_number(visual_viewport, "offsetX")?;
@@ -1955,18 +1962,35 @@ mod tests {
     #[test]
     fn screenshot_reads_device_and_visual_scales_from_cdp_responses() {
         const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
-        let viewport = json!({
+        let css_viewport = json!({
             "offsetX": 10.5,
             "offsetY": 20.25,
             "clientWidth": 320.0,
             "clientHeight": 180.0,
             "scale": 1.75
         });
+        // The deprecated sibling, carrying DEVICE pixels as a real browser does
+        // on a scaled display. Present and different on purpose: reading it
+        // instead yields numbers that look like a plausible viewport, so a
+        // fixture offering only one field cannot tell the two apart -- and the
+        // wrong one produces a pixel-to-css mapping that is the identity, which
+        // is exactly what a caller cannot see.
+        let device_viewport = json!({
+            "offsetX": 21.0,
+            "offsetY": 40.5,
+            "clientWidth": 640.0,
+            "clientHeight": 360.0,
+            "scale": 1.75
+        });
+        let metrics = json!({
+            "cssVisualViewport": css_viewport,
+            "visualViewport": device_viewport,
+        });
         let frames = [
-            json!({"id":1,"sessionId":"session-own","result":{"visualViewport":viewport.clone()}}),
+            json!({"id":1,"sessionId":"session-own","result":metrics.clone()}),
             json!({"id":2,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
             json!({"id":3,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
-            json!({"id":4,"sessionId":"session-own","result":{"visualViewport":viewport}}),
+            json!({"id":4,"sessionId":"session-own","result":metrics}),
             json!({"id":5,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
         ];
         let mut driver = attached_driver(frames);
