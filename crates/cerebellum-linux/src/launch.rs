@@ -419,6 +419,8 @@ pub fn spawn_barred(
 }
 
 #[cfg(test)]
+// The checkpoint names mirror the lifecycle stages and all intentionally use the same prefix.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy)]
 enum ParentDeathCheckpoint {
     AfterInitialStop,
@@ -533,6 +535,8 @@ fn terminate_exact_generation_with(
     Ok(TerminationOutcome::Signalled)
 }
 
+// Each argument is a distinct fork-safe syscall input or execution parameter.
+#[allow(clippy::too_many_arguments)]
 fn child_exec(
     command_source: RawFd,
     response_source: RawFd,
