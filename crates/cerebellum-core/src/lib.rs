@@ -35,3 +35,4 @@ pub mod health;
 pub mod identity;
 pub mod journal;
 pub mod principal;
+pub mod serde_base64;

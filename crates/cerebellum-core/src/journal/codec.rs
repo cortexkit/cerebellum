@@ -13,6 +13,7 @@ use super::{JournalIdentity, SeverityInputs};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EncodedJournalState {
+    #[serde(with = "crate::serde_base64::bytes")]
     pub durable_bytes: Vec<u8>,
     pub accounted_serialized_size: u64,
     pub codec_version: String,
