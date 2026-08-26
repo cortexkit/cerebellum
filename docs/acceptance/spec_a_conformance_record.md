@@ -1,7 +1,7 @@
 # Spec A conformance acceptance record
 
 - **Slice:** `spec_a_conformance_record`
-- **Spec source:** `/Users/ufukaltinok/Work/Projects/CortexKit/cerebellum/.cortexkit/alfonso/drafts/2026-07-22-browser-plane-spec-a-the-subc-seam-register-health-identity-default-deny.md`
+- **Spec source:** `.cortexkit/alfonso/drafts/2026-07-22-browser-plane-spec-a-the-subc-seam-register-health-identity-default-deny.md`
 - **Spec source SHA-256:** `48415efd687443f635d1ae287d048f70b5ae05a358784f82aafa9250a798dd41`
 - **Dependency record:** [`resolve_spec_a_dependencies.md`](resolve_spec_a_dependencies.md)
 - **Dependency-record SHA-256 at execution:** `4b98e2a2291968ee176288eb94b7e92c1dbf4e28c693a5f961e797a77dc2f902`
@@ -23,7 +23,7 @@ All checks below passed in this worktree after the final edit set:
 - `cargo build -p cerebellum --release --no-default-features` — passed.
 - `nm -gU target/release/ck-cerebellum` symbol check — passed; `test_observer` and `take_test_observations` were absent.
 - `bash scripts/rust-test-gate.sh` — passed (format check, clippy, and workspace tests).
-- `cargo test --manifest-path /Users/ufukaltinok/Work/Projects/CortexKit/subconscious/Cargo.toml -p subc-mcp --test phase1_integration mcp_facade_default_deny_requires_global_enable` — passed (1 test).
+- `cargo test --manifest-path ../subconscious/Cargo.toml -p subc-mcp --test phase1_integration mcp_facade_default_deny_requires_global_enable` — passed (1 test).
 
 ## Numbered acceptance criteria
 

@@ -1,7 +1,7 @@
 # S1 type revalidation and evidence-gate closure
 
 - **Slice:** `S1-type-revalidation-and-evidence-gate-closure`
-- **Spec source:** `/Users/ufukaltinok/Work/Projects/CortexKit/cerebellum/.cortexkit/alfonso/drafts/2026-07-23-browser-plane-spec-b1-drive-and-safety-surface.md`
+- **Spec source:** `.cortexkit/alfonso/drafts/2026-07-23-browser-plane-spec-b1-drive-and-safety-surface.md`
 - **Scope:** ordered `browser.type` verification and immutable eligibility evidence.
 
 ## Implementation record
