@@ -341,6 +341,7 @@ where
 {
     let ReleasedAttestedBrowser {
         attestation,
+        observed_executable_identity_chain: _,
         mut process,
         released_at,
     } = released;
@@ -944,8 +945,12 @@ mod tests {
         exit: Option<ChildExitStatus>,
         events: EventLog,
     ) -> ReleasedAttestedBrowser<FakeProcess> {
+        let attestation = attestation();
+        let observed_executable_identity_chain =
+            vec![attestation.observed_executable_identity.clone()];
         ReleasedAttestedBrowser {
-            attestation: attestation(),
+            attestation,
+            observed_executable_identity_chain,
             process: FakeProcess { exit, events },
             released_at: clock.now,
         }
@@ -1152,8 +1157,10 @@ mod tests {
             }
         }
 
-        fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError> {
-            Ok(executable_identity())
+        fn executed_image_identity(
+            &self,
+        ) -> Result<Vec<ExecutableIdentityClaim>, PlatformLaunchError> {
+            Ok(vec![executable_identity()])
         }
 
         fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
