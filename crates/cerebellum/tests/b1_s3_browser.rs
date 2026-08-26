@@ -448,13 +448,29 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         "clientHeight": 20.0,
         "scale": 1.75
     });
+    // Both viewport fields, carrying DIFFERENT numbers, as a real browser does
+    // on a scaled display: the undecorated `visualViewport` is deprecated and
+    // reports device pixels. A fixture supplying only one cannot tell which is
+    // read, and reading the deprecated one produces a plausible-looking
+    // viewport whose pixel-to-css mapping is the identity.
+    let device_viewport = json!({
+        "offsetX": 7.0,
+        "offsetY": 8.5,
+        "clientWidth": 80.0,
+        "clientHeight": 40.0,
+        "scale": 1.75
+    });
+    let metrics = json!({
+        "cssVisualViewport": viewport,
+        "visualViewport": device_viewport,
+    });
     let frames = [
         json!({"id":1,"result":{"targetId":"target-own"}}),
         json!({"id":2,"result":{"sessionId":"session-own"}}),
-        json!({"id":3,"sessionId":"session-own","result":{"visualViewport":viewport.clone()}}),
+        json!({"id":3,"sessionId":"session-own","result":metrics.clone()}),
         json!({"id":4,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
         json!({"id":5,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
-        json!({"id":6,"sessionId":"session-own","result":{"visualViewport":viewport}}),
+        json!({"id":6,"sessionId":"session-own","result":metrics}),
         json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
     ];
     ScreenshotProcess {
