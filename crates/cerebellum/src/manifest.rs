@@ -33,6 +33,7 @@ use crate::browser_type::{
 };
 use crate::journal::JournalConfig;
 use subc_protocol::manifest::CapabilityDeclarations;
+use subc_protocol::manifest::ManifestProvenance;
 use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
     ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
@@ -155,12 +156,56 @@ pub fn build(module_id: &str) -> ModuleManifest {
     build_with_browser_config(module_id, false)
 }
 
+/// What this binary can honestly say about where it came from.
+///
+/// The commit is reported only when the tree was CLEAN at build time. A dirty
+/// tree produces bytes that no commit describes, so naming one would attest a
+/// commit that does not contain what is running -- worse than saying nothing,
+/// because the daemon has no way to tell a precise answer from a wrong one. The
+/// same reasoning governs staging, which refuses to publish a dirty artifact.
+///
+/// `unknown` is the build script's answer when there is no git directory at all
+/// -- a source tarball is a legitimate way to build this -- and it is not a
+/// commit, so it is reported as absence rather than passed through as a value.
+///
+/// The remaining fields stay absent until they can be filled from the build
+/// rather than from a caller. A lock digest and a wire crate version are
+/// knowable, but not from here: reading them at manifest-construction time
+/// would describe the source tree beside the running binary, which is the claim
+/// this field exists to avoid.
+fn build_provenance() -> Option<ManifestProvenance> {
+    Some(ManifestProvenance {
+        build_git_sha: attestable_commit(
+            env!("CEREBELLUM_BUILD_REV"),
+            env!("CEREBELLUM_BUILD_TREE"),
+        ),
+        build_lock_digest: None,
+        wire_crate_version: None,
+        store_schema_version: None,
+    })
+}
+
+/// The commit a binary may attest, given what the build observed.
+///
+/// Separated from its inputs because those arrive through `env!` and are fixed
+/// when this file compiles: a test cannot produce a dirty build without
+/// rebuilding, so the rule would be exercised in exactly one configuration --
+/// whichever one the developer happened to be in -- and the refusing branch
+/// would never run.
+fn attestable_commit(rev: &str, tree: &str) -> Option<String> {
+    if tree != "clean" || rev == "unknown" || rev.is_empty() {
+        return None;
+    }
+    Some(rev.to_string())
+}
+
 pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
+        provenance: build_provenance(),
         provides: vec![
             ProviderRole::ToolProvider {
                 tools: if browser_configured {
@@ -541,6 +586,33 @@ pub fn browser_evidence_eligibility_sha256() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// A dirty tree names no commit.
+    ///
+    /// The rule this fences is that a sha is a claim about WHICH BYTES are
+    /// running. A dirty build produces bytes no commit contains, so reporting
+    /// the checked-out sha would attest a commit that does not describe them --
+    /// and a consumer cannot tell a precise answer from a confidently wrong one,
+    /// which makes it worse than absence rather than merely imprecise.
+    #[test]
+    fn a_commit_is_attested_only_when_the_build_tree_was_clean() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            super::attestable_commit(sha, "clean"),
+            Some(sha.to_string()),
+            "a clean build knows which commit produced it"
+        );
+        assert_eq!(
+            super::attestable_commit(sha, "dirty"),
+            None,
+            "a dirty build must not name a commit that does not contain its bytes"
+        );
+        // The build script's answer when there is no git directory. It is not a
+        // commit, and passing it through would put the literal string "unknown"
+        // in a field a reader parses as a sha.
+        assert_eq!(super::attestable_commit("unknown", "clean"), None);
+        assert_eq!(super::attestable_commit("", "clean"), None);
+    }
+
     use super::*;
 
     #[test]
