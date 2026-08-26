@@ -632,6 +632,20 @@ fn serialize_manifest_with_computer_plane_configured(
             serde_json::to_value(computer_release_evidence(context))
                 .expect("computer release evidence serializes"),
         );
+    // Separates a refused browser surface from one that was never configured. Both
+    // advertise no browser tools, so the absence of those tools cannot on its own
+    // tell a broken pin from a build that has no browser support.
+    //
+    // The audience for this key is whoever reads the serialized manifest: an operator,
+    // a wire dump, `--manifest` output. It is NOT the daemon. `ModuleManifestWire`
+    // declares no matching field and no `deny_unknown_fields`, so an extra top-level
+    // key is dropped at the parse boundary -- neither rejected nor retained. The
+    // adjacent `computer_plane_release` key has the same property.
+    //
+    // Routing does not depend on it either way: no advertised browser tools already
+    // means do not route, which is the correct outcome for both states. Anything that
+    // needs this distinction daemon-side needs a typed field in subc-protocol, not
+    // another key here.
     if let BrowserSurface::Refused(error) = browser_surface {
         let mut refusal = json!({
             "field": error.field,
