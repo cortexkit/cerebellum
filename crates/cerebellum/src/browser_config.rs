@@ -1,9 +1,9 @@
 //! Browser-plane configuration parsing kept out of the shared substrate.
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 
 use serde_json::{Map, Value};
 

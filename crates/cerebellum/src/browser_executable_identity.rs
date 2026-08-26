@@ -1,5 +1,6 @@
 //! Platform dispatch for claims about a configured browser executable.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -152,6 +153,8 @@ fn identity_unverifiable(reason: &'static str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
     use std::ffi::OsString;
 
     #[cfg(target_os = "linux")]
