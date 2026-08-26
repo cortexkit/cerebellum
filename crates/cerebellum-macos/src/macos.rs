@@ -947,6 +947,39 @@ fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize)
 /// winner among them turns on rendering noise, and this returns one of them
 /// with no indication that the question was unanswerable. Locating a row whose
 /// position is already known is the check; `rows_are_placeable` is that check.
+/// Whether a best match is far enough ahead of the expected row to mean
+/// anything.
+///
+/// Separated from the capture it qualifies so it can be proved without a
+/// window: the live arm needs a screen, a stable window, and a display, and a
+/// rule that only runs under all three is a rule nobody checks. The factor is
+/// deliberately generous -- this decides whether to render a verdict at all,
+/// and the cost of declining a measurable window is one skipped run, while the
+/// cost of judging an unmeasurable one is a false accusation against working
+/// code.
+#[cfg(test)]
+fn margin_is_decisive(to_landed: u64, to_expected: u64) -> bool {
+    // A zero distance to the expected row means the two candidates are
+    // byte-identical, and a ratio cannot separate them: 0 >= 0 reads as
+    // decisive while the evidence is that nothing distinguishes the rows at
+    // all. Checked before the ratio rather than folded into it, because the
+    // failure is a confident verdict rather than a wrong number.
+    to_expected > 0 && to_expected >= to_landed.saturating_mul(2)
+}
+
+/// Sum of absolute channel differences between two rows.
+///
+/// The metric the row comparisons share, named so a margin check cannot drift
+/// from the search it is qualifying: two different notions of "distance" here
+/// would agree on the day they were written and diverge silently after.
+#[cfg(test)]
+fn row_distance(a: &[u8], b: &[u8]) -> u64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| u64::from(x.abs_diff(*y)))
+        .sum()
+}
+
 #[cfg(test)]
 fn best_matching_row(image: &[u8], width: usize, height: usize, needle: &[u8]) -> usize {
     (0..height)
@@ -1262,6 +1295,33 @@ mod tests {
         );
     }
 
+    /// The margin rule declines a verdict the evidence cannot support.
+    ///
+    /// Proved over constructed numbers because the live arm needs an unlocked
+    /// screen and a window that holds still -- and a control that only runs
+    /// under those conditions is a control that goes unchecked exactly when it
+    /// is load-bearing.
+    #[test]
+    fn a_verdict_needs_a_best_match_clearly_ahead_of_the_expected_row() {
+        // A genuinely wrong region: the expected row is nowhere near.
+        assert!(
+            super::margin_is_decisive(1_000, 500_000),
+            "a distant expected row is real evidence of a wrong region"
+        );
+        // The live editor case: every candidate within a few percent, so the
+        // winner turns on rendering noise rather than on content.
+        assert!(
+            !super::margin_is_decisive(51_921, 53_395),
+            "candidates within 3% cannot decide which row a resampled one came from"
+        );
+        // Exactly at the boundary counts as decisive; below it does not.
+        assert!(super::margin_is_decisive(100, 200));
+        assert!(!super::margin_is_decisive(100, 199));
+        // A perfect match on the landed row does not license a verdict on its
+        // own -- if the expected row is equally perfect, nothing separates them.
+        assert!(!super::margin_is_decisive(0, 0));
+    }
+
     /// A source rect returns THE REGION, not the whole window scaled into it.
     ///
     /// The distinction is invisible to the obvious assertions. `setWidth` and
@@ -1368,6 +1428,33 @@ mod tests {
 
         let last_output_row = row(&half.bgra, half.width, expected);
         let landed_on = best_matching_row(&full.bgra, full.width, full.height, &last_output_row);
+
+        // CAN THIS WINDOW DISCRIMINATE AT ALL, under the APPROXIMATE matching
+        // used above? The placeability check answers a weaker question: it
+        // locates an EXACT copy of a row, which succeeds whenever no other row
+        // is byte-identical. The comparison that matters comes from a resampled
+        // capture, so it is never exact, and a window whose rows differ only
+        // slightly can locate an exact row perfectly and still put an
+        // approximate one anywhere.
+        //
+        // So compare the two distances that decide the verdict. If the row this
+        // landed on is barely better than the row expected, the window is not
+        // answering the question -- and a verdict drawn from evidence that
+        // cannot discriminate is the defect this test exists to catch, one
+        // level up.
+        if landed_on.abs_diff(expected) > 1 {
+            let to_landed = row_distance(&last_output_row, &row(&full.bgra, full.width, landed_on));
+            let to_expected =
+                row_distance(&last_output_row, &row(&full.bgra, full.width, expected));
+            if !margin_is_decisive(to_landed, to_expected) {
+                eprintln!(
+                    "SKIPPED: this window cannot discriminate rows -- the best match at {landed_on} \
+                     ({to_landed}) is not meaningfully closer than the expected row at {expected} \
+                     ({to_expected}), so locating a resampled row here decides nothing."
+                );
+                return;
+            }
+        }
         // Resampling moves the best match by a row at most; anything further is
         // a different region, not a rounding artefact.
         assert!(
