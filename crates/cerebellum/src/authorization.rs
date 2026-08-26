@@ -349,6 +349,22 @@ impl<'a> AuthorizationRequest<'a> {
             classification: Some(classification),
         }
     }
+
+    pub fn click_point_unverified(
+        conversation_key: &'a str,
+        requested_severity: Severity,
+        invocation_id: &'a str,
+        bind_identity: &'a str,
+    ) -> Self {
+        Self {
+            conversation_key,
+            action: Action::ClickPoint,
+            requested_severity,
+            invocation_id,
+            bind_identity,
+            classification: None,
+        }
+    }
 }
 
 /// The process-local decision object retained across all transition checks.
@@ -692,7 +708,7 @@ pub fn computed_required_severity(
 ) -> Result<(Severity, Option<NonTypeClassificationFingerprint>), AuthorizationError> {
     match action {
         Action::Navigate | Action::Snapshot | Action::Screenshot => Ok((action.floor(), None)),
-        Action::Click if classification.is_none() => {
+        Action::Click | Action::ClickPoint if classification.is_none() => {
             Ok((Severity::new(MUTATE_DURABLE, true, true), None))
         }
         Action::Click | Action::ClickPoint => {
