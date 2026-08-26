@@ -18,10 +18,8 @@ use super::recovery::{
     RecoveryAction as BrowserRecoveryAction,
     RecoveryClassification as BrowserRecoveryClassification,
 };
-use super::JournalEntry;
-
 /// The browser-owned codec version used for compatibility bytes.
-pub const BROWSER_CODEC_VERSION: &str = "ck-browser-journal/v1";
+pub const BROWSER_CODEC_VERSION: &str = "ck-browser-journal/v2";
 
 /// Codec that transports pre-encoded browser bytes without inspecting them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,16 +35,6 @@ impl BrowserJournalCodec {
             accounted_serialized_size: bytes.len() as u64,
             codec_version: BROWSER_CODEC_VERSION.to_string(),
         })
-    }
-
-    /// Produce the exact frozen export bytes and accounted size for an entry.
-    pub fn encode_entry(entry: &JournalEntry) -> EncodedJournalState {
-        let bytes = entry.export_line().into_bytes();
-        EncodedJournalState {
-            accounted_serialized_size: bytes.len() as u64,
-            durable_bytes: bytes,
-            codec_version: BROWSER_CODEC_VERSION.to_string(),
-        }
     }
 }
 
@@ -124,11 +112,6 @@ pub fn open_browser_core_journal<S: JournalStorage>(
         config,
         storage,
     )
-}
-
-/// Convert an existing browser entry into the codec result used by core.
-pub fn encode_browser_entry(entry: &JournalEntry) -> EncodedJournalState {
-    BrowserJournalCodec::encode_entry(entry)
 }
 
 /// Map every neutral recovery classification to its frozen browser value.
