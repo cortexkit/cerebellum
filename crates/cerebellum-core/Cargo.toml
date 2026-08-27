@@ -2,6 +2,7 @@
 name = "cerebellum-core"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 description = "The plane-agnostic substrate for ck-cerebellum: three-fact bind identity, insulated health-v2, dispatch timing atomics, the monotonic clock, principal default-deny, and config parsing. Vendored one-way by each plane's module crate."
 
