@@ -2881,7 +2881,19 @@ impl BrowserLaunchOutcome {
     pub fn as_json(&self) -> Value {
         match self {
             Self::ProfileBusy { holder_id } => {
-                json!({"outcome": "profile_busy", "holder_id": holder_id.as_str()})
+                // Says WHY the profile is held, because the common cause looks
+                // like a defect from the caller's seat. Two live sessions on one
+                // project resolve to the SAME durable profile -- that is the
+                // point, since a login set up once must survive -- and the
+                // exclusive lock serializes them rather than letting both write.
+                // A caller told only "busy" reasonably reports a bug; a caller
+                // told another session holds it can wait or close the other one.
+                json!({
+                    "outcome": "profile_busy",
+                    "holder_id": holder_id.as_str(),
+                    "remedy": "another session holds this project's browser profile; \
+                               close that session's browser or retry once it releases",
+                })
             }
             Self::ProfileGrantRequired => json!({"outcome": "profile_grant_required"}),
             Self::ProfileRegistryUntrustedRoot { reason_code } => json!({
