@@ -60,7 +60,10 @@ fn main() {
             }
         };
         let plane: cerebellum::computer_capability::RunningComputerPlane =
-            ComputerPlane::new(audit);
+            ComputerPlane::with_synthetic_driver(audit, || {
+                cerebellum_computer::platform::MacOs26PlatformDriver::default()
+                    .without_expected_post_condition()
+            });
         let management = Arc::new(ManagementPlane::new(Arc::new(PlatformResolver::new())));
         let clock = SystemClock::new();
         let grantee = "pj-live-probe";

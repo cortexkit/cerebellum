@@ -977,6 +977,110 @@ pub trait PlatformDriver {
     }
 }
 
+/// A driver that performs nothing, for constructions that never legitimately
+/// reach one.
+///
+/// This is the default synthetic driver a serving plane holds: capabilities
+/// whose path never touches a driver (a screenshot, a wait) work with it, and
+/// any construction that CAN dispatch synthetic input must name a real driver
+/// instead. Every operation refuses by name rather than panicking, so an
+/// accidental reach is an ordinary refusal instead of a crash.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnsupportedPlatformDriver;
+
+impl UnsupportedPlatformDriver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PlatformDriver for UnsupportedPlatformDriver {
+    fn capability_declarations(
+        &self,
+        _context: &CapabilityAdvertisementContext,
+    ) -> Vec<CapabilityDeclaration> {
+        Vec::new()
+    }
+
+    fn read_accessibility_tree(
+        &mut self,
+        _request: AccessibilityTreeRequest,
+    ) -> Result<AccessibilityTreeResult, DriverError> {
+        Err(DriverError::Unsupported("accessibility tree read"))
+    }
+
+    fn resolve_element(
+        &mut self,
+        _request: ElementResolutionRequest,
+    ) -> Result<ElementResolutionResult, DriverError> {
+        Err(DriverError::Unsupported("element resolution"))
+    }
+
+    fn dispatch_semantic(
+        &mut self,
+        _request: SemanticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        Err(DriverError::Unsupported("semantic dispatch"))
+    }
+
+    fn dispatch_per_pid(
+        &mut self,
+        _request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        Err(DriverError::Unsupported("per-process synthetic dispatch"))
+    }
+
+    fn dispatch_global(
+        &mut self,
+        _request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        Err(DriverError::Unsupported("global synthetic dispatch"))
+    }
+
+    fn query_focus(
+        &mut self,
+        _request: FocusQueryRequest,
+    ) -> Result<FocusQueryResult, DriverError> {
+        Err(DriverError::Unsupported("focus query"))
+    }
+
+    fn fronting_snapshot(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<FrontingSnapshot, DriverError> {
+        Err(DriverError::Unsupported("fronting snapshot"))
+    }
+
+    fn input_observer_liveness(&self) -> InputObserverLiveness {
+        InputObserverLiveness {
+            session_tap_live: false,
+            raw_hid_live: false,
+            self_echo_filter_live: false,
+        }
+    }
+
+    fn observe_input(
+        &mut self,
+        _request: InputObservationRequest,
+    ) -> Result<InputObservationResult, DriverError> {
+        Err(DriverError::Unsupported("input observation"))
+    }
+
+    fn observe_effect(
+        &mut self,
+        _request: EffectObservationRequest,
+    ) -> Result<EffectObservationResult, DriverError> {
+        Err(DriverError::Unsupported("effect observation"))
+    }
+
+    fn verify_attendance(
+        &mut self,
+        _request: AttendancePreconditionRequest,
+    ) -> Result<AttendancePreconditionResult, DriverError> {
+        Err(DriverError::Unsupported("attendance verification"))
+    }
+}
+
 /// Names used by plane-boundary tell-tests. Keep this list in sync when adding
 /// another type whose name would couple the core substrate to this plane.
 pub const COMPUTER_PLANE_TYPE_IDENTIFIERS: &[&str] = &[

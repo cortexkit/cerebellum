@@ -134,11 +134,15 @@ fn audit_with_storage<S: JournalStorage>(
     .unwrap()
 }
 
+// Shared by every test binary that includes this module; any one binary uses
+// only part of it, so the parts are allowed to be unused per binary.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct FailAfterInitialization {
     saves: Arc<AtomicUsize>,
 }
 
+#[allow(dead_code)]
 impl FailAfterInitialization {
     pub fn new() -> Self {
         Self {
@@ -147,6 +151,7 @@ impl FailAfterInitialization {
     }
 }
 
+#[allow(dead_code)]
 pub fn failing_audit(
 ) -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, FailAfterInitialization> {
     audit_with_storage(FailAfterInitialization::new())
@@ -223,6 +228,7 @@ impl TargetResolver for MutableTargetResolver {
 /// reach the code that builds a result from pixels: every test ends at the
 /// failure branch. That gap let an artifact built with no bytes and zero
 /// dimensions ship, which custody refused on the first real capture.
+#[allow(dead_code)]
 pub struct CapturingBackend {
     pub windows: Vec<EnumeratedWindow>,
     pub png: Vec<u8>,
@@ -309,6 +315,7 @@ impl CaptureBackend for CapturingBackend {
 }
 
 /// A backend that refuses every capture, to prove what survives a failure.
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct RefusingBackend {
     pub windows: Vec<EnumeratedWindow>,
@@ -377,6 +384,7 @@ pub fn management_with(resolver: Arc<dyn TargetResolver>) -> Arc<ManagementPlane
     Arc::new(ManagementPlane::new(resolver))
 }
 
+#[allow(dead_code)]
 pub fn request() -> Value {
     json!({ "scope": "target_windows", "include_cursor": false })
 }
@@ -406,6 +414,7 @@ pub async fn grant_lease<C: MonotonicClock>(
 }
 
 /// A management plane holding a live observing lease for the fixture target.
+#[allow(dead_code)]
 pub async fn leased_management<C: MonotonicClock>(clock: &C) -> Arc<ManagementPlane> {
     let management = management();
     grant_lease(&management, ActionKind::Observe, clock).await;

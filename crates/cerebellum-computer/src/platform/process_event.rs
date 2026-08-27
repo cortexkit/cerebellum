@@ -8,6 +8,8 @@
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// The process generation an event was authorized for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessEventTarget {
@@ -56,7 +58,7 @@ impl PostCallMade {
 }
 
 /// Why the selected transport could not complete its post call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostCallFailure {
     pub reason: String,
 }
@@ -70,7 +72,12 @@ impl PostCallFailure {
 }
 
 /// A refusal to call, or a failure reported by, the per-process transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized into dispatch refusals, which are audit material: a failure that
+/// stopped a sequence mid-flight is recorded with the same fidelity it is
+/// answered with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum ProcessEventRefusal {
     ProcessGone,
     ProcessReplaced {
@@ -290,7 +297,12 @@ pub struct SequencePostReport {
 }
 
 /// What a failed sequence did about input state its posted events left held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized into dispatch refusals for the same reason
+/// [`ProcessEventRefusal`] is: `Unknown` in an audit record is the difference
+/// between a target that may still have a key down and one that does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case")]
 pub enum HeldStateDisposition {
     /// No posted event could have left a key or button held.
     NoneHeld,
@@ -857,5 +869,46 @@ mod tests {
             }
         );
         assert_eq!(transport.post_count(), 2);
+    }
+
+    /// The recovery release can itself fail to post, and that must be the end
+    /// of it: the sequence is already failing, so a recovery path that wedged
+    /// would take down the path taken when things are going wrong.
+    #[test]
+    fn a_failed_post_followed_by_a_failed_recovery_release_reports_unknown_and_returns() {
+        let first_failure = PostCallFailure::new("framework call failed");
+        let second_failure = PostCallFailure::new("framework call failed again");
+        let mut transport = posting_transport(
+            [
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+            ],
+            [
+                Ok(PostCallMade::public_core_graphics()),
+                Err(first_failure.clone()),
+                Err(second_failure),
+            ],
+        );
+
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect_err("the failed drag move stops the sequence");
+
+        // The press posted, the move's post failed, and the recovery release's
+        // own post failed too. Nothing may claim the button came back up, and
+        // the report must still arrive: this is the answer a caller gets when
+        // the target may be wedged, so producing it cannot itself wedge.
+        assert_eq!(
+            failure,
+            SequencePostFailure {
+                posts_returned: 1,
+                refusal: ProcessEventRefusal::PostCallFailed(first_failure),
+                held_state: HeldStateDisposition::Unknown,
+            }
+        );
+        assert_eq!(transport.post_count(), 3);
     }
 }
