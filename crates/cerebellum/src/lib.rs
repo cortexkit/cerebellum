@@ -717,6 +717,80 @@ pub fn browser_wire_surface(browser_configured: bool) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// Why a capability this module knows about cannot be served here.
+///
+/// A caller who names a capability we withhold and a caller who names something
+/// invented get the same `unknown_method` today, and those need different next
+/// actions: one should stop asking, the other should change something. Naming
+/// which is the same rule the browser refusals already follow -- a refusal that
+/// does not say what to do next costs a caller a support round trip to learn
+/// something this module already knew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityWithheld {
+    /// This build has no such capability. Nothing the caller changes helps.
+    Unknown,
+    /// A browser capability on a host with no browser configured.
+    BrowserNotConfigured,
+    /// Implemented, deliberately not admitted to the wire in this version.
+    ///
+    /// Distinct from [`Self::Unknown`] because the capability exists and its
+    /// absence is a decision rather than a gap -- a caller who hears "unknown"
+    /// may reasonably file a bug asking for something we built on purpose and
+    /// withheld on purpose.
+    NotAdmitted,
+}
+
+impl CapabilityWithheld {
+    /// The wire reason code. Stable strings: callers branch on these.
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown_method",
+            Self::BrowserNotConfigured => "browser_not_configured",
+            Self::NotAdmitted => "capability_not_admitted",
+        }
+    }
+
+    /// What the caller should do, in the caller's own terms.
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::Unknown => "this module does not provide that capability",
+            Self::BrowserNotConfigured => {
+                "configure browser.executable_path and browser.expected_identity in \
+                 cerebellum.jsonc, then restart this module"
+            }
+            Self::NotAdmitted => {
+                "this capability exists but is not served in this version; do not retry"
+            }
+        }
+    }
+}
+
+/// Why a named capability is not dispatchable, for a caller that named one.
+///
+/// Returns `None` for a capability that IS dispatchable. Reads through the same
+/// predicate dispatch uses rather than a second list, so the two cannot disagree
+/// about what is served.
+pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<CapabilityWithheld> {
+    if dispatchable_tool_with_browser(name, browser_configured).is_some() {
+        return None;
+    }
+    let known_browser_name = browser_session::CONTROL_TOOLS.contains(&name)
+        || browser::ALL_TOOLS.contains(&name)
+        || name == crate::browser_type::BROWSER_TYPE_TOOL;
+    if !known_browser_name {
+        return Some(CapabilityWithheld::Unknown);
+    }
+    // A known browser name that would be dispatchable with a browser configured
+    // is withheld by the HOST; one that would still be refused is withheld by
+    // this VERSION. Asking the predicate rather than listing the admitted names
+    // keeps this from becoming a third copy of that list.
+    if !browser_configured && dispatchable_tool_with_browser(name, true).is_some() {
+        Some(CapabilityWithheld::BrowserNotConfigured)
+    } else {
+        Some(CapabilityWithheld::NotAdmitted)
+    }
+}
+
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
     if browser_configured
         && (browser_session::CONTROL_TOOLS.contains(&name)
@@ -2078,14 +2152,19 @@ async fn handle_tool_request(
     // reservation, context lookup, grant lookup, or CDP work.
     let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some());
     let Some(capability_name) = known_capability else {
+        // Say WHICH kind of unavailable. A caller who named something this build
+        // withholds and a caller who named something invented both arrive here,
+        // and only one of them can do anything about it.
+        let withheld = capability_withheld(name, planes.browser_config.is_some())
+            .unwrap_or(CapabilityWithheld::Unknown);
         return send_route_error(
             writer,
             ver,
             channel,
             epoch,
             corr,
-            "unknown_method",
-            &format!("unknown method '{name}'"),
+            withheld.reason_code(),
+            &format!("'{name}' is not served here: {}", withheld.remedy()),
         )
         .await;
     };
