@@ -2,6 +2,7 @@
 name = "cerebellum"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 description = "The ck-cerebellum subc module: Spec A — wire-v2 registration, insulated health-v2, three-fact identity, profile-boundary disposition, principal default-deny, and the browser.status capability."
 

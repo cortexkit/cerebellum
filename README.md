@@ -67,3 +67,7 @@ to contain `unsafe`, so everything above them holds `#![forbid(unsafe_code)]`.
 
 `docs/` holds the charter and acceptance records. `scripts/` holds the
 verification gate, the release build, and the mutation-testing harness.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
