@@ -785,17 +785,34 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
 
     let route = open_live_route(&mut client, 2).await;
-    let invalid_response =
+
+    // Both requests name browser.status on a host with NO browser configured, so
+    // both are refused at capability admission -- which happens before arguments
+    // are decoded. The first therefore never reaches argument validation despite
+    // carrying an unexpected field; it is kept because it proves admission runs
+    // FIRST, which is the property that keeps a rejected caller from touching
+    // any handler.
+    //
+    // browser_not_configured rather than unknown_method: this daemon would serve
+    // browser.status if the host had a browser, and an operator four lines of
+    // config away from working should be told that rather than told the
+    // capability does not exist.
+    let admission_precedes_arguments =
         send_live_tool_request(&mut client, route, 3, json!({"unexpected": true})).await;
-    assert_eq!(invalid_response.header.ty, FrameType::Error);
+    assert_eq!(admission_precedes_arguments.header.ty, FrameType::Error);
     let invalid_body: subc_protocol::ErrorBody =
-        serde_json::from_slice(&invalid_response.body).unwrap();
-    assert_eq!(invalid_body.code, "unknown_method");
+        serde_json::from_slice(&admission_precedes_arguments.body).unwrap();
+    assert_eq!(invalid_body.code, "browser_not_configured");
 
     let response = send_live_tool_request(&mut client, route, 4, json!({})).await;
     assert_eq!(response.header.ty, FrameType::Error);
     let body: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body.code, "unknown_method");
+    assert_eq!(body.code, "browser_not_configured");
+    assert!(
+        body.message.contains("browser.executable_path"),
+        "a live caller must be told what to configure: {}",
+        body.message
+    );
 
     // Close the client before the daemon and module guards are dropped so the
     // daemon can release the route deterministically.
