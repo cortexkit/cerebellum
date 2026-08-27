@@ -168,11 +168,15 @@ pub fn build(module_id: &str) -> ModuleManifest {
 /// -- a source tarball is a legitimate way to build this -- and it is not a
 /// commit, so it is reported as absence rather than passed through as a value.
 ///
-/// The remaining fields stay absent until they can be filled from the build
-/// rather than from a caller. A lock digest and a wire crate version are
-/// knowable, but not from here: reading them at manifest-construction time
-/// would describe the source tree beside the running binary, which is the claim
-/// this field exists to avoid.
+/// `wire_crate_version` is the linked crate's own compile-time constant, so it
+/// describes the code in THIS binary rather than a manifest sitting beside it.
+/// That distinction is why it is filled while `build_lock_digest` is not: a lock
+/// digest read here would describe the source tree next to the running binary,
+/// which is the claim provenance exists to avoid.
+///
+/// The block is therefore never absent. Absence on the wire reads as
+/// `unverifiable` -- the module made no claim at all -- and this module always
+/// has at least one honest fact to state.
 fn build_provenance() -> Option<ManifestProvenance> {
     Some(ManifestProvenance {
         build_git_sha: attestable_commit(
@@ -180,7 +184,7 @@ fn build_provenance() -> Option<ManifestProvenance> {
             env!("CEREBELLUM_BUILD_TREE"),
         ),
         build_lock_digest: None,
-        wire_crate_version: None,
+        wire_crate_version: Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
         store_schema_version: None,
     })
 }
@@ -193,7 +197,14 @@ fn build_provenance() -> Option<ManifestProvenance> {
 /// whichever one the developer happened to be in -- and the refusing branch
 /// would never run.
 fn attestable_commit(rev: &str, tree: &str) -> Option<String> {
-    if tree != "clean" || rev == "unknown" || rev.is_empty() {
+    // Every builder sentinel, in any casing, not just the one our own build.rs
+    // happens to emit. Matching only "unknown" would be adequate today and
+    // silently inadequate the moment that script changes its stand-in -- and a
+    // sentinel published as a fact is the failure this check exists to prevent,
+    // because a present well-formed field stops the reader asking.
+    const SENTINELS: [&str; 3] = ["unknown", "unavailable", "none"];
+    let lowered = rev.to_ascii_lowercase();
+    if tree != "clean" || rev.is_empty() || SENTINELS.contains(&lowered.as_str()) {
         return None;
     }
     Some(rev.to_string())
@@ -611,6 +622,36 @@ mod tests {
         // in a field a reader parses as a sha.
         assert_eq!(super::attestable_commit("unknown", "clean"), None);
         assert_eq!(super::attestable_commit("", "clean"), None);
+
+        // Every builder sentinel in the fleet contract, in casings a script
+        // might emit. Only "unknown" is reachable from our own build.rs today;
+        // the others are refused so that changing that stand-in cannot quietly
+        // start publishing one as a fact.
+        for sentinel in ["unavailable", "none", "UNKNOWN", "Unavailable", "NONE"] {
+            assert_eq!(
+                super::attestable_commit(sentinel, "clean"),
+                None,
+                "{sentinel} is a stand-in for a missing commit, not a commit"
+            );
+        }
+    }
+
+    /// The linked crate's version is a compile-time constant of the code in this
+    /// binary, so it is knowable honestly here and the block is never absent.
+    /// Absence would read as `unverifiable` -- a module that made no claim --
+    /// which is untrue of a module that can state this much.
+    #[test]
+    fn provenance_states_the_wire_crate_version_it_was_built_against() {
+        let provenance = super::build_provenance().expect("provenance block is always present");
+        assert_eq!(
+            provenance.wire_crate_version.as_deref(),
+            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION),
+            "the reported wire crate version must be the linked crate's own constant"
+        );
+        assert!(
+            provenance.build_lock_digest.is_none(),
+            "a lock digest read here would describe the tree beside the binary, not the binary"
+        );
     }
 
     use super::*;
