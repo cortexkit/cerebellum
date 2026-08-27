@@ -418,6 +418,9 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     assert_eq!(navigated["outcome"], "authorization_denied", "{navigated}");
     assert_eq!(navigated["detail"]["reason"], "no_grant", "{navigated}");
 
+    // Implemented and deliberately not admitted. These are NOT unknown: naming
+    // them that way tells a caller to stop asking for something we built and
+    // withheld on purpose, and invites a bug report for a decision.
     for (corr, unavailable) in [
         (13, "browser.click_point"),
         (16, "browser.wait_for"),
@@ -425,8 +428,14 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     ] {
         let refused = invoke(&planes, corr, unavailable, json!({})).await;
         let refused: Value = serde_json::from_slice(&refused.body).unwrap();
-        assert_eq!(refused["code"], "unknown_method", "{refused}");
+        assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
     }
+
+    // A name this build genuinely does not have stays unknown_method, which is
+    // the contrast that makes the distinction worth drawing at all.
+    let invented = invoke(&planes, 18, "browser.teleport", json!({})).await;
+    let invented: Value = serde_json::from_slice(&invented.body).unwrap();
+    assert_eq!(invented["code"], "unknown_method", "{invented}");
 
     // browser.screenshot is admitted, so it must REACH the handler rather than
     // be refused by name. With no grant installed it is refused by its
@@ -860,7 +869,16 @@ async fn absent_browser_config_uses_the_route_level_unknown_method_envelope() {
     let response = invoke(&planes, 1, "browser.launch", json!({})).await;
     assert_eq!(response.header.ty, FrameType::Error);
     let error: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(error.code, "unknown_method");
+    // A route-level error frame rather than a tool response carrying a refusal:
+    // that is what this test guards, and it is unchanged. The code now names the
+    // REASON, because an operator whose browser is simply unconfigured can act on
+    // that and cannot act on "unknown method".
+    assert_eq!(error.code, "browser_not_configured");
+    assert!(
+        error.message.contains("browser.executable_path"),
+        "the refusal must name what to configure: {}",
+        error.message
+    );
     assert_eq!(
         planes.sessions.status(
             "test-session",
