@@ -143,6 +143,8 @@ fn readback_failure_reason(error: &DriverError) -> &'static str {
         DriverError::Unsupported(_) => "scoped_read_unsupported",
         DriverError::InvalidRequest(_) => "invalid_scoped_read",
         DriverError::StartupRefused(_) => "platform_startup_refused",
+        DriverError::EventConstructionFailed(_) => "event_construction_failed",
+        DriverError::SyntheticDispatchFailed(_) => "synthetic_dispatch_failed",
         DriverError::Semantic(_) => "semantic_read_failed",
     }
 }

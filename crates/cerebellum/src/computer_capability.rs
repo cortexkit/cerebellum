@@ -1566,7 +1566,9 @@ fn click_driver_refusal(
         DriverError::ElementNotFound => DispatchError::ElementNotFound { key_form },
         DriverError::Unsupported(_)
         | DriverError::InvalidRequest(_)
-        | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
+        | DriverError::StartupRefused(_)
+        | DriverError::EventConstructionFailed(_)
+        | DriverError::SyntheticDispatchFailed(_) => DispatchError::SemanticPathUnavailable,
     };
     dispatch_refusal(refusal, unreadable_subtrees)
 }

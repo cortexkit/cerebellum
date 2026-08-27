@@ -12,10 +12,14 @@ use std::time::Duration;
 pub mod containment;
 pub mod process_event;
 pub mod severity;
+pub mod synthetic;
 pub use containment::*;
 pub use process_event::*;
+pub use synthetic::*;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+mod macos_synthetic;
 
 /// Converts raw operating-system permission readings into the
 /// [`PermissionProbeResult`] values the startup probe consumes.
@@ -680,11 +684,17 @@ pub struct SemanticDispatchRequest {
     pub action: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A request to deliver one synthetic input action to the granted process.
+///
+/// `PartialEq` but not `Eq`: the action's pointer variants carry
+/// floating-point coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyntheticDispatchRequest {
     pub target: ProcessGrant,
-    pub event_count: u8,
-    pub coordinate_addressed: bool,
+    /// What to type, press, scroll, or point at. The event count and the
+    /// coordinate-addressed flag are derived from this payload, never stated
+    /// alongside it where they could disagree with it.
+    pub action: SyntheticAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -857,11 +867,17 @@ pub enum TargetDisposition {
     Replaced,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DriverError {
     Unsupported(&'static str),
     InvalidRequest(&'static str),
     StartupRefused(&'static str),
+    /// A synthetic event could not be constructed by the platform at all.
+    EventConstructionFailed(&'static str),
+    /// A synthetic input sequence stopped partway through. The payload says
+    /// how many post calls returned before the stop and what was done about
+    /// input state the posted events may have left held.
+    SyntheticDispatchFailed(SequencePostFailure),
     /// The accessibility tree could not be read.
     AccessibilityUnreadable(AccessibilityReadFailure),
     /// The tree was read and the named element is not in it.
@@ -882,6 +898,14 @@ impl fmt::Display for DriverError {
             Self::Unsupported(op) => write!(f, "unsupported platform operation: {op}"),
             Self::InvalidRequest(reason) => write!(f, "invalid platform request: {reason}"),
             Self::StartupRefused(reason) => write!(f, "platform startup refused: {reason}"),
+            Self::EventConstructionFailed(reason) => {
+                write!(f, "synthetic event construction failed: {reason}")
+            }
+            Self::SyntheticDispatchFailed(failure) => write!(
+                f,
+                "synthetic dispatch stopped after {} post call(s) returned: {:?}",
+                failure.posts_returned, failure.refusal
+            ),
             Self::AccessibilityUnreadable(failure) => {
                 write!(f, "accessibility tree unreadable: {failure}")
             }

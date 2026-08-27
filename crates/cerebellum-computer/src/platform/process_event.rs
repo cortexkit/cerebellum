@@ -132,6 +132,114 @@ pub fn route_event_to_process<T: PerProcessEventTransport>(
         .map_err(ProcessEventRefusal::PostCallFailed)
 }
 
+/// Post a sequence of events to one process generation.
+///
+/// Every event goes through `route_event_to_process` on its own, so the
+/// generation is re-verified immediately before EVERY post. A check at the
+/// top of a five-event drag would not cover the fifth event: the process can
+/// be replaced while the sequence is in flight, and only a post-time reading
+/// separates the granted process from whoever inherited its pid.
+///
+/// On a mid-sequence failure the sequence does not silently stop. Posted
+/// presses whose paired release is still in hand are released best-effort
+/// through the same routing (a replaced target refuses the release rather
+/// than receiving it), and the outcome is reported as `Released` or
+/// `Unknown`. The release paired with a press is never substituted: posting
+/// a later release for an earlier press would inject an event the action did
+/// not mean. A failed step's own event is consumed by the routing even on a
+/// refusal, so when the failed step IS the release, the held state can only
+/// be reported as unknown.
+pub fn post_event_sequence<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    steps: Vec<SyntheticStep<T::Event>>,
+    transport: &mut T,
+) -> Result<SequencePostReport, SequencePostFailure> {
+    let mut release_for_press: Vec<Option<usize>> = vec![None; steps.len()];
+    let mut unmatched_presses: Vec<usize> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        match step.role {
+            SyntheticStepRole::Press => unmatched_presses.push(index),
+            SyntheticStepRole::Release => {
+                if let Some(press) = unmatched_presses.pop() {
+                    release_for_press[press] = Some(index);
+                }
+            }
+            SyntheticStepRole::SelfContained => {}
+        }
+    }
+
+    let mut steps: Vec<Option<SyntheticStep<T::Event>>> = steps.into_iter().map(Some).collect();
+    let mut posts_returned = 0_u64;
+    for index in 0..steps.len() {
+        let step = match steps[index].take() {
+            Some(step) => step,
+            None => continue,
+        };
+        if let Err(refusal) = route_event_to_process(target, step.event, transport) {
+            let held_state =
+                recover_held_state(target, &release_for_press, &mut steps, index, transport);
+            return Err(SequencePostFailure {
+                posts_returned,
+                refusal,
+                held_state,
+            });
+        }
+        posts_returned += 1;
+    }
+    Ok(SequencePostReport { posts_returned })
+}
+
+/// Release whatever the posted steps left held, and say how that went.
+///
+/// A press posted before the failure is still held when its paired release
+/// never posted: the release either comes after the failed step or was the
+/// failed step itself. Only a release AFTER the failed step is still in hand;
+/// the failed step's own event was consumed by its routing attempt.
+fn recover_held_state<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    release_for_press: &[Option<usize>],
+    steps: &mut [Option<SyntheticStep<T::Event>>],
+    failed_index: usize,
+    transport: &mut T,
+) -> HeldStateDisposition {
+    let mut release_indices: Vec<usize> = Vec::new();
+    let mut unrecoverable = false;
+    for (_press, release) in release_for_press.iter().enumerate().take(failed_index) {
+        let still_held = match release {
+            Some(release) => *release >= failed_index,
+            None => true,
+        };
+        if !still_held {
+            continue;
+        }
+        match release {
+            Some(release) if *release > failed_index => release_indices.push(*release),
+            _ => unrecoverable = true,
+        }
+    }
+    if release_indices.is_empty() && !unrecoverable {
+        return HeldStateDisposition::NoneHeld;
+    }
+    let mut released_posts = 0_u64;
+    for index in release_indices {
+        let step = match steps[index].take() {
+            Some(step) => step,
+            None => continue,
+        };
+        match route_event_to_process(target, step.event, transport) {
+            Ok(_) => released_posts += 1,
+            Err(_) => unrecoverable = true,
+        }
+    }
+    if unrecoverable {
+        HeldStateDisposition::Unknown
+    } else {
+        HeldStateDisposition::Released {
+            posts_returned: released_posts,
+        }
+    }
+}
+
 fn require_exact_generation(
     target: ProcessEventTarget,
     reading: ProcessGenerationReading,
@@ -147,6 +255,66 @@ fn require_exact_generation(
         ProcessGenerationReading::Gone => Err(ProcessEventRefusal::ProcessGone),
         ProcessGenerationReading::NotInspectable => Err(ProcessEventRefusal::ProcessNotInspectable),
     }
+}
+
+/// What one step of a synthetic input sequence does to held input state.
+///
+/// The role decides what a mid-sequence failure must do: a posted press whose
+/// paired release never posted has left a key or button down, and pretending
+/// otherwise would return an error that implies nothing happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticStepRole {
+    /// Nothing is held after this event's post call returns.
+    SelfContained,
+    /// This event holds state (a key or mouse button down) until the paired
+    /// release posts.
+    Press,
+    /// This event releases the most recent unmatched press.
+    Release,
+}
+
+/// One event in a synthetic input sequence, in posting order.
+#[derive(Debug)]
+pub struct SyntheticStep<E> {
+    pub role: SyntheticStepRole,
+    pub event: E,
+}
+
+/// What a completed sequence can truthfully say.
+///
+/// `posts_returned` counts post calls that RETURNED. CoreGraphics reports
+/// nothing about receipt, so this is evidence of calls made and nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequencePostReport {
+    pub posts_returned: u64,
+}
+
+/// What a failed sequence did about input state its posted events left held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldStateDisposition {
+    /// No posted event could have left a key or button held.
+    NoneHeld,
+    /// Every held press had its paired releasing event posted; those post
+    /// calls returned. Their receipt is not claimed any more than the main
+    /// sequence's was.
+    Released { posts_returned: u64 },
+    /// At least one held press could not be released: its releasing event was
+    /// lost in the failure that stopped the sequence, or its own routing or
+    /// post failed. The target may still have a key or button down.
+    Unknown,
+}
+
+/// Why a synthetic input sequence stopped, and what followed.
+///
+/// This is never a bare error: `posts_returned` says how far the sequence got
+/// and `held_state` says what was done about what that may have left held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequencePostFailure {
+    /// Post calls that returned before the sequence stopped.
+    pub posts_returned: u64,
+    /// The routing refusal or post failure that stopped the sequence.
+    pub refusal: ProcessEventRefusal,
+    pub held_state: HeldStateDisposition,
 }
 
 /// Public CoreGraphics transport readings for production macOS callers.
@@ -436,5 +604,258 @@ mod tests {
         for (mut transport, expected) in cases {
             assert_eq!(route(&mut transport), Err(expected));
         }
+    }
+
+    fn step(role: SyntheticStepRole, id: u8) -> SyntheticStep<FakeEvent> {
+        SyntheticStep {
+            role,
+            event: FakeEvent(id),
+        }
+    }
+
+    /// Press, drag, release — the shape of a drag, which is the sequence whose
+    /// mid-flight failure can leave a mouse button held.
+    fn drag_steps() -> Vec<SyntheticStep<FakeEvent>> {
+        vec![
+            step(SyntheticStepRole::Press, 1),
+            step(SyntheticStepRole::SelfContained, 2),
+            step(SyntheticStepRole::Release, 3),
+        ]
+    }
+
+    fn posting_transport(
+        generations: impl IntoIterator<Item = ProcessGenerationReading>,
+        post_results: impl IntoIterator<Item = Result<PostCallMade, PostCallFailure>>,
+    ) -> FakeTransport {
+        FakeTransport::new(generations, WindowServerVisibility::Visible, post_results)
+    }
+
+    fn posted_events(transport: &FakeTransport) -> Vec<FakeEvent> {
+        transport
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::Post { event, .. } => Some(*event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_sequence_event_is_posted_only_after_its_own_generation_reads() {
+        let mut transport = posting_transport(
+            [
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+            ],
+            [
+                Ok(PostCallMade::public_core_graphics()),
+                Ok(PostCallMade::public_core_graphics()),
+                Ok(PostCallMade::public_core_graphics()),
+            ],
+        );
+
+        let report = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect("a fully routed sequence completes");
+
+        assert_eq!(report.posts_returned, 3);
+        // The generation is read once before the visibility read and again
+        // immediately before EVERY post — the check covering the first event
+        // of a drag says nothing about the process at the fifth.
+        assert_eq!(
+            transport.calls,
+            vec![
+                Call::ReadGeneration,
+                Call::ReadVisibility,
+                Call::ReadGeneration,
+                Call::Post {
+                    pid: PID,
+                    event: FakeEvent(1),
+                },
+                Call::ReadGeneration,
+                Call::ReadVisibility,
+                Call::ReadGeneration,
+                Call::Post {
+                    pid: PID,
+                    event: FakeEvent(2),
+                },
+                Call::ReadGeneration,
+                Call::ReadVisibility,
+                Call::ReadGeneration,
+                Call::Post {
+                    pid: PID,
+                    event: FakeEvent(3),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_generation_change_at_the_late_recheck_stops_the_sequence_before_that_post() {
+        let mut transport = posting_transport(
+            [
+                current(),
+                current(),
+                current(),
+                ProcessGenerationReading::Started(START_TIME + 1),
+                // The recovery release is routed to the still-current process.
+                current(),
+                current(),
+            ],
+            [
+                Ok(PostCallMade::public_core_graphics()),
+                Ok(PostCallMade::public_core_graphics()),
+            ],
+        );
+
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect_err("a replaced target stops the sequence");
+
+        assert_eq!(
+            failure,
+            SequencePostFailure {
+                posts_returned: 1,
+                refusal: ProcessEventRefusal::ProcessReplaced {
+                    expected_start_time_micros: START_TIME,
+                    observed_start_time_micros: START_TIME + 1,
+                },
+                held_state: HeldStateDisposition::Released { posts_returned: 1 },
+            }
+        );
+        // The middle event was never posted, and the press that WAS posted
+        // had its paired release posted rather than leaving the button down.
+        assert_eq!(posted_events(&transport), vec![FakeEvent(1), FakeEvent(3)]);
+    }
+
+    #[test]
+    fn a_mid_sequence_failure_releases_what_the_posted_events_left_held() {
+        let post_failure = PostCallFailure::new("framework call failed");
+        let mut transport = posting_transport(
+            [
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+            ],
+            [
+                Ok(PostCallMade::public_core_graphics()),
+                Err(post_failure.clone()),
+                Ok(PostCallMade::public_core_graphics()),
+            ],
+        );
+
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect_err("a failed post stops the sequence");
+
+        assert_eq!(
+            failure,
+            SequencePostFailure {
+                posts_returned: 1,
+                refusal: ProcessEventRefusal::PostCallFailed(post_failure),
+                held_state: HeldStateDisposition::Released { posts_returned: 1 },
+            }
+        );
+        // Post ATTEMPTS, in order: the press, the move that failed, and then
+        // the release — attempted after the failure rather than abandoning
+        // the held button.
+        assert_eq!(
+            posted_events(&transport),
+            vec![FakeEvent(1), FakeEvent(2), FakeEvent(3)]
+        );
+    }
+
+    #[test]
+    fn a_failure_before_anything_is_held_posts_no_recovery_events() {
+        let post_failure = PostCallFailure::new("framework call failed");
+        let mut transport = posting_transport([current(), current()], [Err(post_failure.clone())]);
+
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect_err("the failed first post stops the sequence");
+
+        assert_eq!(
+            failure,
+            SequencePostFailure {
+                posts_returned: 0,
+                refusal: ProcessEventRefusal::PostCallFailed(post_failure),
+                held_state: HeldStateDisposition::NoneHeld,
+            }
+        );
+        assert_eq!(transport.post_count(), 1);
+    }
+
+    #[test]
+    fn a_failed_release_reports_the_held_state_as_unknown() {
+        let post_failure = PostCallFailure::new("framework call failed");
+        let mut transport = posting_transport(
+            [
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+                current(),
+            ],
+            [
+                Ok(PostCallMade::public_core_graphics()),
+                Ok(PostCallMade::public_core_graphics()),
+                Err(post_failure.clone()),
+            ],
+        );
+
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect_err("the failed release stops the sequence");
+
+        // The press posted and its release may not have landed; nothing may
+        // claim the button came back up.
+        assert_eq!(
+            failure,
+            SequencePostFailure {
+                posts_returned: 2,
+                refusal: ProcessEventRefusal::PostCallFailed(post_failure),
+                held_state: HeldStateDisposition::Unknown,
+            }
+        );
+        assert_eq!(transport.post_count(), 3);
+    }
+
+    #[test]
+    fn a_recovery_release_the_routing_refuses_is_reported_as_unknown() {
+        let post_failure = PostCallFailure::new("framework call failed");
+        let mut transport = posting_transport(
+            [
+                current(),
+                current(),
+                current(),
+                current(),
+                // The process is gone by the time the release is attempted.
+                ProcessGenerationReading::Gone,
+            ],
+            [
+                Ok(PostCallMade::public_core_graphics()),
+                Err(post_failure.clone()),
+            ],
+        );
+
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+            .expect_err("the failed drag move stops the sequence");
+
+        // The release was attempted but refused before posting — correctly,
+        // since the granted process no longer holds the pid — so the button
+        // state is unknown rather than released.
+        assert_eq!(
+            failure,
+            SequencePostFailure {
+                posts_returned: 1,
+                refusal: ProcessEventRefusal::PostCallFailed(post_failure),
+                held_state: HeldStateDisposition::Unknown,
+            }
+        );
+        assert_eq!(transport.post_count(), 2);
     }
 }

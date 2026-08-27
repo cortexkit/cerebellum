@@ -33,7 +33,7 @@ use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
     DriverError, ElementResolutionResult, FocusQueryRequest, InputObservationRequest,
     PermissionLiveness, PlatformDriver, ProcessGrant, SemanticDispatchRequest, SemanticDriverError,
-    SyntheticDispatchRequest, TargetDisposition,
+    SyntheticAction, SyntheticDispatchRequest, TargetDisposition,
 };
 use cerebellum_core::journal::redaction::Redactor;
 use cerebellum_core::journal::severity::SeverityTaxonomy;
@@ -142,7 +142,7 @@ impl FocusCheckPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DispatchRequest {
     pub row: FrozenDispatchRow,
     pub mode: DispatchMode,
@@ -193,13 +193,12 @@ impl DispatchRequest {
         self
     }
 
-    pub fn with_synthetic(mut self, event_count: u8, coordinate_addressed: bool) -> Self {
+    pub fn with_synthetic(mut self, action: SyntheticAction) -> Self {
+        self.row.coordinate_addressed = action.is_coordinate_addressed();
         self.synthetic = Some(SyntheticDispatchRequest {
             target: self.target.clone(),
-            event_count,
-            coordinate_addressed,
+            action,
         });
-        self.row.coordinate_addressed = coordinate_addressed;
         self
     }
 
@@ -965,8 +964,8 @@ impl<D: PlatformDriver> Dispatcher<D> {
             .clone()
             .ok_or(DispatchError::SyntheticUnavailable)?;
         if synthetic.target != request.target
-            || synthetic.event_count == 0
-            || synthetic.coordinate_addressed != request.row.coordinate_addressed
+            || synthetic.action.planned_event_count() == 0
+            || synthetic.action.is_coordinate_addressed() != request.row.coordinate_addressed
         {
             return Err(DispatchError::InvalidRequest);
         }
@@ -1178,7 +1177,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
             },
             DriverError::Unsupported(_)
             | DriverError::InvalidRequest(_)
-            | DriverError::StartupRefused(_) => DispatchError::SemanticPathUnavailable,
+            | DriverError::StartupRefused(_)
+            | DriverError::EventConstructionFailed(_)
+            | DriverError::SyntheticDispatchFailed(_) => DispatchError::SemanticPathUnavailable,
         }
     }
 

@@ -137,6 +137,48 @@ fn accessibility_read_timeout(settle_interval_ms: u32) -> Result<Duration, Drive
     <MacOs26PlatformDriver as PlatformDriver>::bounded_duration(u64::from(settle_interval_ms))
 }
 
+/// Bound on the window-server read each per-event routing decision makes.
+const WINDOW_LIST_READ_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// Deliver one neutral synthetic action to the granted process generation.
+///
+/// Split from `dispatch_per_pid` so a test can drive it against a recording
+/// transport: grant parsing, translation, routing, and mid-sequence recovery
+/// are identical either way, and the transport is the only part that touches
+/// the window server.
+fn dispatch_synthetic_to_pid(
+    request: &SyntheticDispatchRequest,
+    transport: &mut impl PerProcessEventTransport<Event = cerebellum_macos::OwnedCgEvent>,
+) -> Result<DispatchResult, DriverError> {
+    // The grant records the kernel start time of the process it was made
+    // for. That reading is what separates the granted process from a
+    // replacement holding the same pid; it is re-read immediately before
+    // every post by the routing, not trusted from here.
+    let start_time_micros = request
+        .target
+        .process_generation_evidence
+        .parse::<u64>()
+        .map_err(|_| {
+            DriverError::InvalidRequest("process generation evidence is not a kernel start time")
+        })?;
+    let steps = super::macos_synthetic::synthetic_event_steps(&request.action)?;
+    let target = ProcessEventTarget {
+        pid: request.target.pid,
+        start_time_micros,
+    };
+    let report = post_event_sequence(target, steps, transport)
+        .map_err(DriverError::SyntheticDispatchFailed)?;
+    Ok(DispatchResult {
+        // The post calls returned, and that is ALL this says: the post call
+        // is void, so receipt — let alone effect — is for effect observation
+        // to establish separately.
+        accepted_by_platform: report.posts_returned > 0,
+        effect_status: EffectStatus::EffectIndeterminate,
+        // No accessibility tree is read on this path.
+        unreadable_subtrees: 0,
+    })
+}
+
 /// What a platform acceptance means for the caller's dispatch result.
 ///
 /// ACCEPTED IS NOT PERFORMED. The accessibility API returns once the
@@ -722,18 +764,22 @@ impl PlatformDriver for MacOs26PlatformDriver {
     }
     fn dispatch_per_pid(
         &mut self,
-        _request: SyntheticDispatchRequest,
+        request: SyntheticDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
-        Err(DriverError::StartupRefused(
-            "private envelope is skeleton-only",
-        ))
+        request.target.validate()?;
+        let mut transport = MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT);
+        dispatch_synthetic_to_pid(&request, &mut transport)
     }
     fn dispatch_global(
         &mut self,
         _request: SyntheticDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
+        // Global posting reaches whatever has focus anywhere in the session.
+        // That is a strictly larger authority than per-process delivery, and
+        // it has not been approved — so this refuses by naming the authority
+        // rather than any implementation detail.
         Err(DriverError::StartupRefused(
-            "global dispatch is skeleton-only",
+            "global event posting is a larger authority than per-process delivery and has not been approved",
         ))
     }
     fn query_focus(
@@ -1679,5 +1725,377 @@ mod cached_element_tests {
             }
         );
         assert_eq!(AccessibilityElementName::from(ax_name), name);
+    }
+
+    mod synthetic_dispatch {
+        use super::*;
+        use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags, CGEventType};
+        use std::collections::VecDeque;
+
+        const PID: u32 = 41;
+        const START_TIME_MICROS: u64 = 8_000_123;
+
+        /// A transport that records what it was asked to post instead of
+        /// calling the window server.
+        ///
+        /// The events it stores are the real constructed CoreGraphics events,
+        /// so a test reads back exactly what the platform would have received
+        /// — an `Ok` from dispatch alone would also pass against a driver
+        /// that posted nothing at all.
+        struct RecordingTransport {
+            generations: VecDeque<ProcessGenerationReading>,
+            post_results: VecDeque<Result<PostCallMade, PostCallFailure>>,
+            calls: Vec<&'static str>,
+            posted: Vec<cerebellum_macos::OwnedCgEvent>,
+        }
+
+        impl RecordingTransport {
+            fn new(
+                generation_readings: usize,
+                post_results: impl IntoIterator<Item = Result<PostCallMade, PostCallFailure>>,
+            ) -> Self {
+                Self {
+                    generations: (0..generation_readings)
+                        .map(|_| ProcessGenerationReading::Started(START_TIME_MICROS))
+                        .collect(),
+                    post_results: post_results.into_iter().collect(),
+                    calls: Vec::new(),
+                    posted: Vec::new(),
+                }
+            }
+
+            fn succeeding(event_count: usize) -> Self {
+                Self::new(
+                    event_count * 2,
+                    (0..event_count).map(|_| Ok(PostCallMade::public_core_graphics())),
+                )
+            }
+
+            /// The calls made per event, in order: a generation read before
+            /// the visibility read, another immediately before the post.
+            fn calls_per_event(&self) -> Vec<&[&'static str]> {
+                self.calls.chunks(4).collect()
+            }
+        }
+
+        impl PerProcessEventTransport for RecordingTransport {
+            type Event = cerebellum_macos::OwnedCgEvent;
+
+            fn process_generation(&mut self, _pid: u32) -> ProcessGenerationReading {
+                self.calls.push("generation");
+                self.generations
+                    .pop_front()
+                    .expect("the test supplied every expected generation reading")
+            }
+
+            fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
+                self.calls.push("visibility");
+                WindowServerVisibility::Visible
+            }
+
+            fn post_to_pid(
+                &mut self,
+                _pid: u32,
+                event: Self::Event,
+            ) -> Result<PostCallMade, PostCallFailure> {
+                self.calls.push("post");
+                self.posted.push(event);
+                self.post_results
+                    .pop_front()
+                    .expect("the test supplied every expected post result")
+            }
+        }
+
+        fn grant() -> ProcessGrant {
+            ProcessGrant {
+                pid: PID,
+                bundle_identity: "com.example.target".to_string(),
+                process_generation_evidence: START_TIME_MICROS.to_string(),
+            }
+        }
+
+        fn request(action: SyntheticAction) -> SyntheticDispatchRequest {
+            SyntheticDispatchRequest {
+                target: grant(),
+                action,
+            }
+        }
+
+        fn dispatch(
+            action: SyntheticAction,
+            transport: &mut RecordingTransport,
+        ) -> Result<DispatchResult, DriverError> {
+            dispatch_synthetic_to_pid(&request(action), transport)
+        }
+
+        #[test]
+        fn each_action_posts_the_events_that_tell_it_apart_from_the_others() {
+            // Text: a down/up pair per character on the Unicode path —
+            // keycode zero with no modifiers, so no keyboard layout or
+            // shortcut table is involved. (The characters themselves are
+            // asserted by the constructor's own tests in cerebellum-macos;
+            // reading them back requires unsafe, which this crate forbids.)
+            let mut transport = RecordingTransport::succeeding(4);
+            let result = dispatch(SyntheticAction::type_text("hi"), &mut transport)
+                .expect("text dispatch posts");
+            assert!(result.accepted_by_platform);
+            assert_eq!(result.effect_status, EffectStatus::EffectIndeterminate);
+            assert_eq!(transport.posted.len(), 4);
+            for (index, event) in transport.posted.iter().enumerate() {
+                assert_eq!(
+                    CGEvent::r#type(Some(event)),
+                    if index % 2 == 0 {
+                        CGEventType::KeyDown
+                    } else {
+                        CGEventType::KeyUp
+                    }
+                );
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode,),
+                    0
+                );
+                assert_eq!(CGEvent::flags(Some(event)), CGEventFlags::empty());
+            }
+
+            // Combination: one down/up pair with the keycode and the modifier.
+            let mut transport = RecordingTransport::succeeding(2);
+            dispatch(
+                SyntheticAction::key_combination(
+                    SyntheticKey::K,
+                    SyntheticKeyModifiers {
+                        command: true,
+                        ..SyntheticKeyModifiers::NONE
+                    },
+                ),
+                &mut transport,
+            )
+            .expect("combination dispatch posts");
+            assert_eq!(transport.posted.len(), 2);
+            for event in &transport.posted {
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode,),
+                    0x28
+                );
+                assert!(CGEvent::flags(Some(event)).contains(CGEventFlags::MaskCommand));
+            }
+
+            // Scroll: one wheel event with the delta.
+            let mut transport = RecordingTransport::succeeding(1);
+            dispatch(
+                SyntheticAction::scroll(SyntheticScrollUnit::Line, -3),
+                &mut transport,
+            )
+            .expect("scroll dispatch posts");
+            assert_eq!(transport.posted.len(), 1);
+            let event = &transport.posted[0];
+            assert_eq!(CGEvent::r#type(Some(event)), CGEventType::ScrollWheel);
+            assert_eq!(
+                CGEvent::integer_value_field(Some(event), CGEventField::ScrollWheelEventDeltaAxis1,),
+                -3
+            );
+
+            // Move: one move event at the point.
+            let mut transport = RecordingTransport::succeeding(1);
+            dispatch(
+                SyntheticAction::move_pointer(SyntheticPoint { x: 10.0, y: 20.0 }),
+                &mut transport,
+            )
+            .expect("move dispatch posts");
+            assert_eq!(transport.posted.len(), 1);
+            let event = &transport.posted[0];
+            assert_eq!(CGEvent::r#type(Some(event)), CGEventType::MouseMoved);
+            assert_eq!(CGEvent::location(Some(event)).x, 10.0);
+            assert_eq!(CGEvent::location(Some(event)).y, 20.0);
+
+            // Drag: press, drag, release, in that order.
+            let mut transport = RecordingTransport::succeeding(3);
+            dispatch(
+                SyntheticAction::drag_pointer(
+                    SyntheticPoint { x: 10.0, y: 20.0 },
+                    SyntheticPoint { x: 90.0, y: 120.0 },
+                ),
+                &mut transport,
+            )
+            .expect("drag dispatch posts");
+            assert_eq!(transport.posted.len(), 3);
+            let types: Vec<_> = transport
+                .posted
+                .iter()
+                .map(|event| CGEvent::r#type(Some(event)))
+                .collect();
+            assert_eq!(
+                types,
+                vec![
+                    CGEventType::LeftMouseDown,
+                    CGEventType::LeftMouseDragged,
+                    CGEventType::LeftMouseUp,
+                ]
+            );
+        }
+
+        #[test]
+        fn the_generation_is_re_read_immediately_before_every_post() {
+            let mut transport = RecordingTransport::succeeding(3);
+            dispatch(
+                SyntheticAction::drag_pointer(
+                    SyntheticPoint { x: 0.0, y: 0.0 },
+                    SyntheticPoint { x: 1.0, y: 1.0 },
+                ),
+                &mut transport,
+            )
+            .expect("drag dispatch posts");
+
+            for per_event in transport.calls_per_event() {
+                assert_eq!(
+                    per_event,
+                    &["generation", "visibility", "generation", "post"],
+                    "an event was posted without a fresh generation read before it"
+                );
+            }
+        }
+
+        #[test]
+        fn a_recycled_pid_stops_the_sequence_and_leaves_no_claim_of_release() {
+            // The late generation read before the SECOND text event observes
+            // a replacement. The first event was a key-down whose paired
+            // key-up is the step that failed, so its event is gone and the
+            // held state can only be reported as unknown.
+            let mut transport = RecordingTransport::new(
+                3,
+                [
+                    Ok(PostCallMade::public_core_graphics()),
+                    Ok(PostCallMade::public_core_graphics()),
+                ],
+            );
+            transport.generations = VecDeque::from([
+                ProcessGenerationReading::Started(START_TIME_MICROS),
+                ProcessGenerationReading::Started(START_TIME_MICROS),
+                ProcessGenerationReading::Started(START_TIME_MICROS),
+                ProcessGenerationReading::Started(START_TIME_MICROS + 1),
+            ]);
+
+            let error = dispatch(SyntheticAction::type_text("hi"), &mut transport)
+                .expect_err("a replaced target stops the sequence");
+
+            let DriverError::SyntheticDispatchFailed(failure) = error else {
+                panic!("a mid-sequence replacement is a synthetic dispatch failure: {error:?}")
+            };
+            assert_eq!(failure.posts_returned, 1);
+            assert_eq!(
+                failure.refusal,
+                ProcessEventRefusal::ProcessReplaced {
+                    expected_start_time_micros: START_TIME_MICROS,
+                    observed_start_time_micros: START_TIME_MICROS + 1,
+                }
+            );
+            assert_eq!(failure.held_state, HeldStateDisposition::Unknown);
+            assert_eq!(transport.posted.len(), 1);
+        }
+
+        #[test]
+        fn a_mid_sequence_failure_releases_the_held_button_and_says_so() {
+            // The drag move fails after the press posted; the release is
+            // still in hand and is posted rather than leaving the button down.
+            let mut transport = RecordingTransport::new(
+                6,
+                [
+                    Ok(PostCallMade::public_core_graphics()),
+                    Err(PostCallFailure::new("framework call failed")),
+                    Ok(PostCallMade::public_core_graphics()),
+                ],
+            );
+
+            let error = dispatch(
+                SyntheticAction::drag_pointer(
+                    SyntheticPoint { x: 0.0, y: 0.0 },
+                    SyntheticPoint { x: 1.0, y: 1.0 },
+                ),
+                &mut transport,
+            )
+            .expect_err("a failed drag move stops the sequence");
+
+            let DriverError::SyntheticDispatchFailed(failure) = error else {
+                panic!("a mid-sequence failure is a synthetic dispatch failure: {error:?}")
+            };
+            assert_eq!(failure.posts_returned, 1);
+            assert_eq!(
+                failure.held_state,
+                HeldStateDisposition::Released { posts_returned: 1 }
+            );
+            // Three post attempts: the press, the move that failed, and then
+            // the release — attempted after the failure rather than
+            // abandoning the held button.
+            assert_eq!(transport.posted.len(), 3);
+            assert_eq!(
+                CGEvent::r#type(Some(&transport.posted[2])),
+                CGEventType::LeftMouseUp
+            );
+        }
+
+        #[test]
+        fn a_failed_release_reports_the_button_state_as_unknown() {
+            let mut transport = RecordingTransport::new(
+                6,
+                [
+                    Ok(PostCallMade::public_core_graphics()),
+                    Ok(PostCallMade::public_core_graphics()),
+                    Err(PostCallFailure::new("framework call failed")),
+                ],
+            );
+
+            let error = dispatch(
+                SyntheticAction::drag_pointer(
+                    SyntheticPoint { x: 0.0, y: 0.0 },
+                    SyntheticPoint { x: 1.0, y: 1.0 },
+                ),
+                &mut transport,
+            )
+            .expect_err("a failed release stops the sequence");
+
+            let DriverError::SyntheticDispatchFailed(failure) = error else {
+                panic!("a failed release is a synthetic dispatch failure: {error:?}")
+            };
+            assert_eq!(failure.posts_returned, 2);
+            assert_eq!(failure.held_state, HeldStateDisposition::Unknown);
+            assert_eq!(transport.posted.len(), 3);
+        }
+
+        #[test]
+        fn a_grant_without_kernel_generation_evidence_is_refused_before_any_post() {
+            let mut request = request(SyntheticAction::type_text("hi"));
+            request.target.process_generation_evidence = "generation-1".to_string();
+            let mut transport = RecordingTransport::succeeding(4);
+
+            assert_eq!(
+                dispatch_synthetic_to_pid(&request, &mut transport),
+                Err(DriverError::InvalidRequest(
+                    "process generation evidence is not a kernel start time"
+                ))
+            );
+            assert!(transport.posted.is_empty());
+        }
+
+        #[test]
+        fn dispatch_global_is_refused_as_an_unapproved_larger_authority() {
+            let mut driver = MacOs26PlatformDriver::default();
+            let refusal = driver
+                .dispatch_global(request(SyntheticAction::move_pointer(SyntheticPoint {
+                    x: 0.0,
+                    y: 0.0,
+                })))
+                .expect_err("global dispatch stays refused");
+
+            let DriverError::StartupRefused(reason) = refusal else {
+                panic!("the refusal names the unapproved authority: {refusal:?}")
+            };
+            assert!(
+                reason.contains("larger authority"),
+                "the refusal must name the authority, not a skeleton: {reason}"
+            );
+            assert!(
+                reason.contains("not been approved"),
+                "the refusal must say the authority was not approved: {reason}"
+            );
+        }
     }
 }
