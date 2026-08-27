@@ -68,6 +68,7 @@ version = "0.1.0"
 dependencies = [
  "cerebellum-core",
  "cerebellum-macos",
+ "objc2-core-graphics",
  "serde",
  "serde_json",
  "sha2",

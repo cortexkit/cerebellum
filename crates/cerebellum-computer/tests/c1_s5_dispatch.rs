@@ -633,7 +633,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         background_attendance(),
         0,
     )
-    .with_synthetic(1, false);
+    .with_synthetic(SyntheticAction::type_text("x"));
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
         dispatcher.dispatch(&mut audit(), audit_identity(), request),
@@ -660,7 +660,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(1, false)
+    .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
@@ -695,7 +695,7 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(1, false)
+    .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let mut dispatcher = Dispatcher::new(driver);
     let mut audit = audit();
@@ -746,7 +746,10 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
         background_attendance(),
         0,
     )
-    .with_synthetic(1, true);
+    .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+        x: 10.0,
+        y: 20.0,
+    }));
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     let report = dispatcher
         .dispatch(&mut audit(), audit_identity(), request)
@@ -762,6 +765,71 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
     assert_eq!(
         report.containment.forfeiture_reason,
         Some(cerebellum_computer::platform::containment::ContainmentForfeitureReason::CoordinateAddressed)
+    );
+}
+
+/// A per-pid synthetic dispatch earns the structural containment rung, not
+/// the semantic one.
+///
+/// Semantic actuation asks an application to invoke its own control; a
+/// synthetic post types into whatever has focus inside the process. Awarding
+/// the semantic containment rung to it would under-report severity in the
+/// audit journal, so the rung is awarded from the delivery primitive, and the
+/// reply and the durable journal must agree on it.
+#[test]
+fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one() {
+    let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
+    let request = DispatchRequest::new(
+        row,
+        DispatchMode::Background,
+        target(),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element: AccessibilityElementName::identifier("element-1"),
+                expected: true,
+            },
+        ),
+        background_attendance(),
+        0,
+    )
+    .with_synthetic(SyntheticAction::type_text("x"))
+    .with_identity(identity());
+    let mut audit = audit();
+    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let report = dispatcher
+        .dispatch(&mut audit, audit_identity(), request)
+        .expect("per-pid delivery succeeds against the recording driver");
+
+    assert_eq!(dispatcher.driver().per_pid_calls, 1);
+    assert_eq!(dispatcher.driver().semantic_calls, 0);
+    assert_eq!(
+        report.delivery_primitive,
+        cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+    );
+    let reply_rung = serde_json::to_value(
+        report
+            .containment
+            .rung()
+            .expect("an input delivery reports one containment rung"),
+    )
+    .unwrap();
+    let journal_rung = serde_json::to_value(
+        audit
+            .read_computer_audit_record(1)
+            .unwrap()
+            .descriptor
+            .containment_rung,
+    )
+    .unwrap();
+    assert_eq!(
+        reply_rung,
+        json!("pid_structural"),
+        "per-pid synthetic delivery reported a rung it did not earn"
+    );
+    assert_eq!(
+        reply_rung, journal_rung,
+        "the reply and durable journal recorded different containment rungs"
     );
 }
 
@@ -802,7 +870,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         ),
         0,
     )
-    .with_synthetic(1, false);
+    .with_synthetic(SyntheticAction::type_text("x"));
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     assert!(dispatcher
         .dispatch(&mut audit(), audit_identity(), valid_request)
@@ -833,7 +901,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         ),
         0,
     )
-    .with_synthetic(1, false);
+    .with_synthetic(SyntheticAction::type_text("x"));
     assert_eq!(
         dispatcher.dispatch(&mut audit(), audit_identity(), expired_request),
         Err(DispatchError::AttendanceUnavailable)
@@ -1010,7 +1078,7 @@ fn seize_latency_must_fit_between_observed_posts() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(1, false)
+    .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let second = DispatchRequest::new(
         row,
@@ -1026,7 +1094,7 @@ fn seize_latency_must_fit_between_observed_posts() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 1, 1, true),
         1,
     )
-    .with_synthetic(1, false)
+    .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(1));
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     let result = dispatcher
@@ -1047,7 +1115,7 @@ fn unsupported_semantic_path_reaches_the_caller_without_a_synthetic_retry() {
         ..RecordingDriver::default()
     };
     let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
-        .with_synthetic(1, false);
+        .with_synthetic(SyntheticAction::type_text("x"));
     let mut dispatcher = Dispatcher::new(driver);
     let mut audit = audit();
 
@@ -1099,7 +1167,7 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(1, false)
+    .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0));
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
@@ -1182,7 +1250,7 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
             },
             "AXPress",
         )
-        .with_synthetic(1, false);
+        .with_synthetic(SyntheticAction::type_text("x"));
 
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     let report = dispatcher
@@ -1219,7 +1287,7 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
             },
             "AXCancel",
         )
-        .with_synthetic(1, false);
+        .with_synthetic(SyntheticAction::type_text("x"));
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     let mut audit = audit();
 
