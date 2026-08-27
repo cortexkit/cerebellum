@@ -10,12 +10,12 @@ See [docs/charter.md](docs/charter.md).
 ## Building
 
 This workspace has **path dependencies on a sibling checkout** of
-`cortexkit/subconscious`, which provides the wire protocol and transport.
-That repository is not public yet, so building requires access to it; the
-dependency is a path rather than a registry version, and no published crate
+[cortexkit/subconscious](https://github.com/cortexkit/subconscious), which
+provides the wire protocol and transport. It is a path dependency rather than a
+registry version, so the sibling has to be on disk: no published crate
 substitutes for it.
 
-With access, clone the two beside each other:
+Clone the two beside each other:
 
     git clone https://github.com/cortexkit/subconscious.git
     git clone https://github.com/cortexkit/cerebellum.git
