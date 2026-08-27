@@ -1,10 +1,10 @@
 //! Mechanical enforcement of the thin-seam rule.
 //!
 //! This crate is the only one permitted to contain `unsafe`, which is what lets
-//! `cerebellum-computer` keep `#![forbid(unsafe_code)]` on the crate that will
-//! eventually synthesize input events. That bargain holds only while this crate
-//! stays a set of raw readings: it reports what the system says and decides
-//! nothing.
+//! `cerebellum-computer` keep `#![forbid(unsafe_code)]` on the crate that owns
+//! input policy and dispatch. That bargain holds only while this crate stays a
+//! set of raw framework operations: it constructs or reports what the system
+//! provides and decides nothing.
 //!
 //! The rule is also load-bearing for a second reason that is easy to miss.
 //! Continuous integration runs on Linux, where the framework dependencies are
