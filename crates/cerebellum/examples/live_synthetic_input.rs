@@ -164,6 +164,12 @@ mod macos_probe {
         DeliveredAndObserved,
         DeliveredButNotObserved,
         Refused,
+        /// The target for this action never became addressable, so nothing was
+        /// sent. Distinct from Refused, which means production declined a real
+        /// attempt, and from DeliveredButNotObserved, which means it was sent.
+        /// Neither of those is true here and claiming either would be a
+        /// statement about the input path rather than about the window.
+        Unmeasurable,
     }
 
     impl Verdict {
@@ -171,6 +177,7 @@ mod macos_probe {
             match self {
                 Self::DeliveredAndObserved => "delivered and observed",
                 Self::DeliveredButNotObserved => "delivered but not observed",
+                Self::Unmeasurable => "unmeasurable: target never addressable",
                 Self::Refused => "refused",
             }
         }
@@ -380,87 +387,110 @@ mod macos_probe {
         println!("SCROLL VERDICT: {}", scroll_verdict.label());
         verdicts.push(("scroll", scroll_verdict));
 
-        let (move_frame, drag_frame) = wait_for_pointer_frames(compose_target.pid).await?;
-        let move_point = frame_point(move_frame, 0.5, 0.5);
-        let move_reply = invoke_tool(
-            planes,
-            33,
-            "computer.move",
-            json!({"to": wire_point(move_point)}),
-        )
-        .await?;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let move_report =
-            report_after_snapshot(planes, &mut snapshot_corr, MOVE_REPORT_PREFIX).await;
-        let move_agrees = parse_pair(&move_report).is_some_and(|reported| {
-            (reported.0 - move_point.0).abs() <= 3.0 && (reported.1 - move_point.1).abs() <= 3.0
-        });
-        let move_verdict = verdict(&move_reply, move_agrees);
-        println!(
-            "\nMOVE sent: global point ({:.1}, {:.1}) over {MOVE_LABEL:?}",
-            move_point.0, move_point.1
-        );
-        println!("MOVE production reply: {move_reply}");
-        println!("MOVE page reported over CDP (screenX,screenY): {move_report:?}");
-        println!("MOVE agrees: {move_agrees}");
-        println!("MOVE VERDICT: {}", move_verdict.label());
-        verdicts.push(("move", move_verdict));
+        // A pointer target that never becomes addressable costs the MOVE and
+        // DRAG verdicts and nothing else. Propagating here would discard the
+        // three verdicts already measured and fail the whole probe, which reads
+        // as "synthetic input does not work" when what happened is that a window
+        // never realised -- the exact misreading the locked-screen note exists
+        // to prevent.
+        let pointer_frames = match wait_for_pointer_frames(compose_target.pid).await {
+            Ok(frames) => Some(frames),
+            Err(reason) => {
+                println!(
+                    "\nMOVE VERDICT: {} ({reason})",
+                    Verdict::Unmeasurable.label()
+                );
+                println!(
+                    "DRAG VERDICT: {} (same pointer target)",
+                    Verdict::Unmeasurable.label()
+                );
+                verdicts.push(("move", Verdict::Unmeasurable));
+                verdicts.push(("drag", Verdict::Unmeasurable));
+                None
+            }
+        };
+        if let Some((move_frame, drag_frame)) = pointer_frames {
+            let move_point = frame_point(move_frame, 0.5, 0.5);
+            let move_reply = invoke_tool(
+                planes,
+                33,
+                "computer.move",
+                json!({"to": wire_point(move_point)}),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let move_report =
+                report_after_snapshot(planes, &mut snapshot_corr, MOVE_REPORT_PREFIX).await;
+            let move_agrees = parse_pair(&move_report).is_some_and(|reported| {
+                (reported.0 - move_point.0).abs() <= 3.0 && (reported.1 - move_point.1).abs() <= 3.0
+            });
+            let move_verdict = verdict(&move_reply, move_agrees);
+            println!(
+                "\nMOVE sent: global point ({:.1}, {:.1}) over {MOVE_LABEL:?}",
+                move_point.0, move_point.1
+            );
+            println!("MOVE production reply: {move_reply}");
+            println!("MOVE page reported over CDP (screenX,screenY): {move_report:?}");
+            println!("MOVE agrees: {move_agrees}");
+            println!("MOVE VERDICT: {}", move_verdict.label());
+            verdicts.push(("move", move_verdict));
 
-        // Drag is classified mutate_durable because the same gesture could drag a file to the
-        // trash. This fixture only records press/move/release and has no durable effect, so this
-        // stronger lease is exceptional probe authority rather than a routine way to mint one.
-        let durable_target = mint_target_lease(
-            planes,
-            bundle_identity,
-            ActionKind::MutateDurable,
-            21,
-            "drag mutate_durable target lease",
-        )
-        .await?;
-        if durable_target.pid != compose_target.pid
-            || durable_target.bundle_identity != compose_target.bundle_identity
-            || durable_target.process_generation_evidence
-                != compose_target.process_generation_evidence
-        {
-            return Err(format!(
+            // Drag is classified mutate_durable because the same gesture could drag a file to the
+            // trash. This fixture only records press/move/release and has no durable effect, so this
+            // stronger lease is exceptional probe authority rather than a routine way to mint one.
+            let durable_target = mint_target_lease(
+                planes,
+                bundle_identity,
+                ActionKind::MutateDurable,
+                21,
+                "drag mutate_durable target lease",
+            )
+            .await?;
+            if durable_target.pid != compose_target.pid
+                || durable_target.bundle_identity != compose_target.bundle_identity
+                || durable_target.process_generation_evidence
+                    != compose_target.process_generation_evidence
+            {
+                return Err(format!(
                 "drag lease widened or changed target: compose={compose_target:?} durable={durable_target:?}"
             ));
-        }
+            }
 
-        let drag_from = frame_point(drag_frame, 0.25, 0.5);
-        let drag_to = frame_point(drag_frame, 0.75, 0.5);
-        let drag_reply = invoke_tool(
-            planes,
-            34,
-            "computer.drag",
-            json!({
-                "from": wire_point(drag_from),
-                "to": wire_point(drag_to),
-                "button": "left",
-                "modifiers": []
-            }),
-        )
-        .await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let drag_report =
-            report_after_snapshot(planes, &mut snapshot_corr, DRAG_REPORT_PREFIX).await;
-        let drag_agrees = drag_report == "press>move>release";
-        let drag_verdict = verdict(&drag_reply, drag_agrees);
-        println!(
-            "\nDRAG sent: ({:.1}, {:.1}) -> ({:.1}, {:.1}) over {DRAG_LABEL:?}",
-            drag_from.0, drag_from.1, drag_to.0, drag_to.1
-        );
-        println!("DRAG production reply: {drag_reply}");
-        println!("DRAG page reported over CDP: {drag_report:?}");
-        println!("DRAG agrees: {drag_agrees}");
-        println!(
+            let drag_from = frame_point(drag_frame, 0.25, 0.5);
+            let drag_to = frame_point(drag_frame, 0.75, 0.5);
+            let drag_reply = invoke_tool(
+                planes,
+                34,
+                "computer.drag",
+                json!({
+                    "from": wire_point(drag_from),
+                    "to": wire_point(drag_to),
+                    "button": "left",
+                    "modifiers": []
+                }),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let drag_report =
+                report_after_snapshot(planes, &mut snapshot_corr, DRAG_REPORT_PREFIX).await;
+            let drag_agrees = drag_report == "press>move>release";
+            let drag_verdict = verdict(&drag_reply, drag_agrees);
+            println!(
+                "\nDRAG sent: ({:.1}, {:.1}) -> ({:.1}, {:.1}) over {DRAG_LABEL:?}",
+                drag_from.0, drag_from.1, drag_to.0, drag_to.1
+            );
+            println!("DRAG production reply: {drag_reply}");
+            println!("DRAG page reported over CDP: {drag_report:?}");
+            println!("DRAG agrees: {drag_agrees}");
+            println!(
             "DRAG VERDICT: {} (minted lease: pid={} bundle_identity={} generation={} action_kind=mutate_durable)",
             drag_verdict.label(),
             durable_target.pid,
             durable_target.bundle_identity,
             durable_target.process_generation_evidence
         );
-        verdicts.push(("drag", drag_verdict));
+            verdicts.push(("drag", drag_verdict));
+        }
 
         println!("\nSUMMARY");
         for (action, action_verdict) in &verdicts {
@@ -475,6 +505,24 @@ mod macos_probe {
                  CGEventPostToPid returning void does not establish browser receipt; this result \
                  means the production path may work for native applications without working for this browser."
             );
+        }
+
+        // A probe that measured nothing has not passed. Exiting zero here would
+        // tell a reader, or a future CI step, that synthetic input was verified
+        // when the only thing established is that a window never appeared. The
+        // whole point of the unmeasurable verdict is to keep that distinct from
+        // a refusal, so it must stay distinct in the exit code too.
+        let unmeasured: Vec<&str> = verdicts
+            .iter()
+            .filter(|(_, item)| *item == Verdict::Unmeasurable)
+            .map(|(action, _)| *action)
+            .collect();
+        if !unmeasured.is_empty() {
+            return Err(format!(
+                "nothing was measured for: {}. This is not a delivery result -- re-run with the \
+                 screen unlocked before drawing any conclusion about the input path.",
+                unmeasured.join(", ")
+            ));
         }
         Ok(())
     }
