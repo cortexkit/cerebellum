@@ -183,6 +183,11 @@ fi
 
 DRIFTED=""
 while read -r declared_hash crate; do
+  # Skip blanks and comments, so the declaration can explain what it holds.
+  # A bare list of hashes reads as commit shas to everyone, which is exactly
+  # the mistake that made this check compare a tree against a commit and
+  # refuse every release build it was asked to approve.
+  case "$declared_hash" in ""|\#*) continue ;; esac
   [ -z "$crate" ] && continue
   actual_hash="$(git -C "$SIBLING_DIR" rev-parse "HEAD:crates/$crate")"
   if [ "$actual_hash" != "$declared_hash" ]; then
