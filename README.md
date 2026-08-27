@@ -10,16 +10,19 @@ See [docs/charter.md](docs/charter.md).
 ## Building
 
 This workspace has **path dependencies on a sibling checkout** of
-[cortexkit/subconscious](https://github.com/cortexkit/subconscious), which
-provides the wire protocol and transport. Clone them beside each other:
+`cortexkit/subconscious`, which provides the wire protocol and transport.
+That repository is not public yet, so building requires access to it; the
+dependency is a path rather than a registry version, and no published crate
+substitutes for it.
+
+With access, clone the two beside each other:
 
     git clone https://github.com/cortexkit/subconscious.git
     git clone https://github.com/cortexkit/cerebellum.git
     cd cerebellum && cargo build
 
-The paths are relative, so any layout with the two repositories as siblings
-works. `subconscious-source.txt` pins the revisions this workspace is built
-against.
+The paths are relative, so any sibling layout works. `subconscious-source.txt`
+pins the revisions this workspace is built against.
 
 Verification runs through one script rather than a set of remembered commands:
 
