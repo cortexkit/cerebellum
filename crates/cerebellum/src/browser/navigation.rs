@@ -198,6 +198,24 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )
     }
 
+    /// Dispatch a coordinate click through this driver's owned CDP session.
+    pub fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.click_point_with_clock(
+            context_key,
+            position,
+            deadline_ms,
+            input_dispatched,
+            &mut clock,
+        )
+    }
+
     #[cfg(test)]
     fn click_for_test<C: NavigationClock>(
         &mut self,
@@ -473,46 +491,83 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
+        self.actuate_click(
+            &attachment.session_id,
+            position,
+            deadline,
+            input_dispatched,
+            clock,
+        )
+        .map_err(ClickDriveError::Navigation)
+    }
+
+    fn click_point_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+        clock: &mut C,
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .filter(|attachment| attachment.context_key == context_key)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.actuate_click(
+            &attachment.session_id,
+            position,
+            deadline,
+            input_dispatched,
+            clock,
+        )
+    }
+
+    fn actuate_click<C: NavigationClock>(
+        &mut self,
+        session_id: &str,
+        position: BrowserClickPosition,
+        deadline: Instant,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+        clock: &mut C,
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
         let mut press_params = mouse_event_params("mousePressed", position);
         press_params.insert("button".into(), Value::String("left".into()));
         press_params.insert("clickCount".into(), Value::Number(1.into()));
         let mut press_dispatched = || input_dispatched(BrowserInputEvent::Press(position));
-        let press = self
-            .command_response(
-                "Input.dispatchMouseEvent",
-                Some(press_params),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                Some(&mut press_dispatched),
-                clock,
-            )
-            .map_err(ClickDriveError::Navigation)?;
+        let press = self.command_response(
+            "Input.dispatchMouseEvent",
+            Some(press_params),
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            Some(&mut press_dispatched),
+            clock,
+        )?;
         if press.error.is_some() {
-            return Err(ClickDriveError::Navigation(
-                NavigationDriveError::CdpFailure,
-            ));
+            return Err(NavigationDriveError::CdpFailure);
         }
 
         let mut release_params = mouse_event_params("mouseReleased", position);
         release_params.insert("button".into(), Value::String("left".into()));
         release_params.insert("clickCount".into(), Value::Number(1.into()));
         let mut release_dispatched = || input_dispatched(BrowserInputEvent::Release(position));
-        let release = self
-            .command_response(
-                "Input.dispatchMouseEvent",
-                Some(release_params),
-                Some(attachment.session_id),
-                deadline,
-                None,
-                Some(&mut release_dispatched),
-                clock,
-            )
-            .map_err(ClickDriveError::Navigation)?;
+        let release = self.command_response(
+            "Input.dispatchMouseEvent",
+            Some(release_params),
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            Some(&mut release_dispatched),
+            clock,
+        )?;
         if release.error.is_some() {
-            return Err(ClickDriveError::Navigation(
-                NavigationDriveError::CdpFailure,
-            ));
+            return Err(NavigationDriveError::CdpFailure);
         }
         Ok(position)
     }

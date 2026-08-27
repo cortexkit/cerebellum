@@ -284,6 +284,17 @@ pub trait OwnedBrowserProcess: Send {
         ))
     }
 
+    /// Dispatch a screenshot-backed coordinate through the process-owned CDP driver.
+    fn click_point(
+        &mut self,
+        _context_key: &str,
+        _position: BrowserClickPosition,
+        _deadline_ms: u64,
+        _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Reclassify immediately before input and require the pinned classification
     /// to still describe the target. A process adapter that cannot perform that
     /// check must refuse rather than inherit the earlier authorization.
@@ -478,6 +489,29 @@ impl OperationGuard {
             .and_then(|session| session.process.as_mut())
             .ok_or(NavigationDriveError::Unavailable)?;
         process.screenshot(context_key, document_epoch, deadline_ms)
+    }
+
+    pub(crate) fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        let mut state = self
+            .sessions
+            .inner
+            .0
+            .lock()
+            .map_err(|_| NavigationDriveError::Unavailable)?;
+        let process = state
+            .routes
+            .get_mut(&self.route_key)
+            .and_then(|route| route.active.as_mut())
+            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
+            .and_then(|session| session.process.as_mut())
+            .ok_or(NavigationDriveError::Unavailable)?;
+        process.click_point(context_key, position, deadline_ms, input_dispatched)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -739,6 +739,19 @@ impl OwnedBrowserProcess for ProductionProcess {
             .screenshot(context_key, document_epoch, deadline_ms)
     }
 
+    fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .click_point(context_key, position, deadline_ms, input_dispatched)
+    }
+
     fn click_classified(
         &mut self,
         context_key: &str,

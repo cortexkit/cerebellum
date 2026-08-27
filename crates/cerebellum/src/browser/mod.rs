@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::authorization::{AuthorizationRequest, GrantStore, HazardClass, Severity};
 use crate::coordinate::{
-    capture_screenshot, map_pixel_center, validate_png_base64_dimensions, CoordinateError,
+    capture_screenshot, map_pixel_to_css, validate_png_base64_dimensions, CoordinateError,
     InvalidCoordinatesReason, ScreenshotPayload, TransformInputs, ViewportObservation,
     MAX_ENCODED_PNG_BYTES,
 };
@@ -1347,39 +1347,14 @@ impl BrowserPlane {
         )
     }
 
-    /// Keep the coordinate click's existing operation record and pin cleanup.
-    /// Structured clicks use the session driver because their DOM identity can be
-    /// resolved by the browser; coordinate clicks require a separate input-space pass.
-    async fn actuate_click_point(&self, identity: &RouteIdentity, snapshot_id: &str) {
-        let mut state = self.state.lock().await;
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpObserve,
-        );
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpInputPress,
-        );
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpInputRelease,
-        );
-        if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
-            context.snapshots.unpin(snapshot_id);
-        }
-    }
-
-    async fn unpin_text_snapshot(&self, identity: &RouteIdentity, snapshot_id: &str) {
+    async fn unpin_snapshot(&self, identity: &RouteIdentity, snapshot_id: &str) {
         let mut state = self.state.lock().await;
         if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
             context.snapshots.unpin(snapshot_id);
         }
     }
 
-    pub async fn text_snapshot_pin_count_for_test(
+    pub async fn snapshot_pin_count_for_test(
         &self,
         identity: &RouteIdentity,
         snapshot_id: &str,
@@ -1391,6 +1366,15 @@ impl BrowserPlane {
             .get(&identity.conversation_key)
             .map(|context| context.snapshots.pin_count(snapshot_id))
             .unwrap_or_default()
+    }
+
+    pub async fn text_snapshot_pin_count_for_test(
+        &self,
+        identity: &RouteIdentity,
+        snapshot_id: &str,
+    ) -> usize {
+        self.snapshot_pin_count_for_test(identity, snapshot_id)
+            .await
     }
 
     async fn click(&self, identity: &RouteIdentity, args: &Value) -> Result<Value, BrowserError> {
@@ -1491,7 +1475,7 @@ impl BrowserPlane {
             })
         };
         if let Err(error) = authorization {
-            self.unpin_text_snapshot(identity, snapshot_id).await;
+            self.unpin_snapshot(identity, snapshot_id).await;
             return Err(map_authorization_error(error));
         }
 
@@ -1499,17 +1483,17 @@ impl BrowserPlane {
         let mut session_operation = match reservation {
             Ok(Some(operation)) => operation,
             Ok(None) => {
-                self.unpin_text_snapshot(identity, snapshot_id).await;
+                self.unpin_snapshot(identity, snapshot_id).await;
                 return Err(BrowserError::NoSession);
             }
             Err(error) => {
-                self.unpin_text_snapshot(identity, snapshot_id).await;
+                self.unpin_snapshot(identity, snapshot_id).await;
                 return Err(error);
             }
         };
         if let Err(error) = self.commit(identity, BrowserCapability::Click).await {
             session_operation.finish();
-            self.unpin_text_snapshot(identity, snapshot_id).await;
+            self.unpin_snapshot(identity, snapshot_id).await;
             return Err(error);
         }
         {
@@ -1523,7 +1507,7 @@ impl BrowserPlane {
 
         let Some(deadline_ms) = deadline_ms else {
             session_operation.finish();
-            self.unpin_text_snapshot(identity, snapshot_id).await;
+            self.unpin_snapshot(identity, snapshot_id).await;
             return Err(BrowserError::NoSession);
         };
         let state = Arc::clone(&self.state);
@@ -1556,14 +1540,14 @@ impl BrowserPlane {
         let (session_operation, drive_result) = match driven {
             Ok(result) => result,
             Err(_) => {
-                self.unpin_text_snapshot(identity, snapshot_id).await;
+                self.unpin_snapshot(identity, snapshot_id).await;
                 return Err(BrowserError::Internal {
                     reason_code: JournalReasonCode::InternalFailure,
                 });
             }
         };
         session_operation.finish();
-        self.unpin_text_snapshot(identity, snapshot_id).await;
+        self.unpin_snapshot(identity, snapshot_id).await;
 
         match drive_result {
             Ok(_) => {}
@@ -1756,7 +1740,7 @@ impl BrowserPlane {
                 reason_code: "severity_below_floor",
             });
         }
-        {
+        let (position, source_origin) = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
@@ -1770,15 +1754,13 @@ impl BrowserPlane {
                 .pin(snapshot_id, SnapshotKind::Screenshot, context.epoch.value())
                 .map_err(map_snapshot_error)?;
             // `pin` refuses a kind mismatch, so a non-screenshot should not reach
-            // here.  Return the typed refusal anyway rather than panicking: this
-            // runs on the shared dispatch path, the claim depends on `pin`
-            // staying correct through every future change, and the cost of
-            // handling it is one arm mapping to the refusal `pin` itself would
-            // have produced.
+            // here. Return the typed refusal anyway rather than panicking, and
+            // balance the pin if that invariant ever changes.
             let screenshot = match screenshot {
                 snapshot_store::StoredSnapshot::Screenshot(snapshot) => snapshot,
                 snapshot_store::StoredSnapshot::Text(_) => {
-                    return Err(map_snapshot_error(SnapshotError::WrongKind))
+                    context.snapshots.unpin(snapshot_id);
+                    return Err(map_snapshot_error(SnapshotError::WrongKind));
                 }
             };
             // Checked before the coordinate is mapped and before anything is
@@ -1788,6 +1770,7 @@ impl BrowserPlane {
             if i128::from(screenshot.image_width_px) != addressed_width
                 || i128::from(screenshot.image_height_px) != addressed_height
             {
+                context.snapshots.unpin(snapshot_id);
                 return Err(BrowserError::InvalidCoordinates {
                     reason: InvalidCoordinatesReason::ImageSizeMismatch,
                 });
@@ -1798,27 +1781,121 @@ impl BrowserPlane {
                 screenshot.device_scale_factor,
                 screenshot.visual_viewport_scale,
             );
-            map_pixel_center(
+            let mapped = map_pixel_to_css(
                 transform,
                 screenshot.image_width_px,
                 screenshot.image_height_px,
                 x,
                 y,
+            );
+            let (x_css, y_css) = match mapped {
+                Ok(point) => point,
+                Err(error) => {
+                    context.snapshots.unpin(snapshot_id);
+                    return Err(map_coordinate_error(error));
+                }
+            };
+            (
+                crate::browser_session::BrowserClickPosition { x_css, y_css },
+                screenshot.source_origin,
             )
-            .map_err(map_coordinate_error)?;
+        };
+
+        // A screenshot does not identify or classify the DOM element under the
+        // point, so its grant must cover unverified form targets on that page.
+        let authorization = {
+            let grants = self.grants.lock().await;
+            let request = AuthorizationRequest::click_point_unverified(
+                &identity.conversation_key,
+                requested_severity,
+                snapshot_id,
+                &identity.agent_project_id,
+            );
+            grants.authorize(request).and_then(|decision| {
+                decision
+                    .evaluate_origin_scope(&origin_from_url(&source_origin))
+                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+                grants
+                    .commit(&decision)
+                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+                Ok(decision)
+            })
+        };
+        if let Err(error) = authorization {
+            self.unpin_snapshot(identity, snapshot_id).await;
+            return Err(map_authorization_error(error));
         }
-        let _session_operation = self
-            .reserve(identity, BrowserCapability::ClickPoint)
-            .await?;
-        let mut state = self.state.lock().await;
-        Self::op(
-            &mut state,
-            &identity.conversation_key,
-            Operation::CdpObserve,
-        );
-        drop(state);
-        self.commit(identity, BrowserCapability::ClickPoint).await?;
-        self.actuate_click_point(identity, snapshot_id).await;
+
+        let reservation = self.reserve(identity, BrowserCapability::ClickPoint).await;
+        let mut session_operation = match reservation {
+            Ok(Some(operation)) => operation,
+            Ok(None) => {
+                self.unpin_snapshot(identity, snapshot_id).await;
+                return Err(BrowserError::NoSession);
+            }
+            Err(error) => {
+                self.unpin_snapshot(identity, snapshot_id).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.commit(identity, BrowserCapability::ClickPoint).await {
+            session_operation.finish();
+            self.unpin_snapshot(identity, snapshot_id).await;
+            return Err(error);
+        }
+        {
+            let mut state = self.state.lock().await;
+            Self::op(
+                &mut state,
+                &identity.conversation_key,
+                Operation::CdpObserve,
+            );
+        }
+
+        let Some(deadline_ms) = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+        else {
+            session_operation.finish();
+            self.unpin_snapshot(identity, snapshot_id).await;
+            return Err(BrowserError::NoSession);
+        };
+        let state = Arc::clone(&self.state);
+        let route_key = identity.conversation_key.clone();
+        let driven = tokio::task::spawn_blocking(move || {
+            let mut input_dispatched = |event| {
+                let operation = match event {
+                    crate::browser_session::BrowserInputEvent::Press(_) => Operation::CdpInputPress,
+                    crate::browser_session::BrowserInputEvent::Release(_) => {
+                        Operation::CdpInputRelease
+                    }
+                };
+                let mut state = state.blocking_lock();
+                Self::op(&mut state, &route_key, operation);
+            };
+            let result = session_operation.click_point(
+                &route_key,
+                position,
+                deadline_ms,
+                &mut input_dispatched,
+            );
+            (session_operation, result)
+        })
+        .await;
+        let (session_operation, drive_result) = match driven {
+            Ok(result) => result,
+            Err(_) => {
+                self.unpin_snapshot(identity, snapshot_id).await;
+                return Err(BrowserError::Internal {
+                    reason_code: JournalReasonCode::InternalFailure,
+                });
+            }
+        };
+        session_operation.finish();
+        self.unpin_snapshot(identity, snapshot_id).await;
+        drive_result.map_err(map_navigation_drive_error)?;
+
         self.finalize(
             identity,
             BrowserCapability::ClickPoint,
