@@ -22,7 +22,15 @@ Clone the two beside each other:
     cd cerebellum && cargo build
 
 The paths are relative, so any sibling layout works. `subconscious-source.txt`
-pins the revisions this workspace is built against.
+pins the sibling crate contents this workspace is built against.
+
+**Keep `Cargo.lock` in step with the sibling.** While the committed lock
+disagrees with what the sibling supplies, every `cargo check` rewrites it —
+including the one `rust-analyzer` runs on its own, which produces a dirty
+`Cargo.lock` with no command to blame it on. Nothing has actually moved, but a
+dirty tree is indistinguishable from a real change at a glance. If the lock
+keeps reappearing as modified, commit it once against the current sibling and
+it stops.
 
 Verification runs through one script rather than a set of remembered commands:
 
