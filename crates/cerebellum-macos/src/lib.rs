@@ -2,10 +2,10 @@
 //!
 //! This crate exists so that `cerebellum-computer` can keep
 //! `#![forbid(unsafe_code)]`. That is not a style preference there: it is the
-//! crate that will eventually synthesize input events, and `forbid` cannot be
-//! overridden from inside a crate, so the guarantee holds for every module in
-//! it without anyone having to enforce it. Calling into a C API requires
-//! `unsafe`, so the calls live here instead and the guarantee stays exact.
+//! crate that owns input policy and dispatch, and `forbid` cannot be overridden
+//! from inside a crate, so the guarantee holds for every module in it without
+//! anyone having to enforce it. Calling into a C API requires `unsafe`, so raw
+//! framework construction and delivery live here and the guarantee stays exact.
 //!
 //! The bargain only works if this crate stays small and stays dumb. It returns
 //! plain framework values, exposes one typed accessibility action request, and
@@ -15,9 +15,10 @@
 //! code, which is built and tested on every host rather than only on this one.
 //!
 //! The action request asks an application to invoke one control action that the
-//! application itself advertised. The event-post request only forwards an event
-//! the caller already built; event synthesis, direct focus changes, and
-//! window-raising actions remain outside this seam.
+//! application itself advertised. Input construction produces owned framework
+//! events without targeting them, and the event-post request only forwards one
+//! such event. Direct focus changes and window-raising actions remain outside
+//! this seam.
 //!
 //! Read anything added here as code that no continuous build can check.
 
@@ -25,6 +26,8 @@
 // input-bound checks run even where the macOS framework APIs are unavailable.
 #[cfg(any(target_os = "macos", test))]
 mod accessibility;
+#[cfg(any(target_os = "macos", test))]
+mod input;
 #[cfg(target_os = "macos")]
 mod launch;
 #[cfg(target_os = "macos")]
@@ -51,6 +54,13 @@ pub use accessibility::{
     accessibility_is_permitted, read_accessibility_element, read_accessibility_tree,
     request_accessibility_action,
 };
+#[cfg(target_os = "macos")]
+pub use input::{
+    key_combination_events, mouse_drag_events, mouse_move_event, scroll_wheel_event,
+    text_input_events,
+};
+#[cfg(any(target_os = "macos", test))]
+pub use input::{EventPoint, InputEventConstructionError, KeyModifiers, ScrollUnit, VirtualKey};
 #[cfg(target_os = "macos")]
 pub use launch::{
     executed_image_identity, process_descriptors, spawn_barred, terminate_exact_generation,
