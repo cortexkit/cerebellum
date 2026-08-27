@@ -23,6 +23,10 @@ use cerebellum_computer::capture::{
 };
 use cerebellum_computer::capture_custody::{CaptureScope, PixelArtifact};
 use cerebellum_computer::dispatch::post_condition::PostCondition;
+use cerebellum_computer::dispatch::{
+    AttendanceContext, AttendanceLease, DispatchError, DispatchRequest, Dispatcher,
+    ExpectedPostCondition, FrozenDispatchRow,
+};
 // Evidence is shaped on every platform: the indeterminate reply is not gated.
 use cerebellum_computer::dispatch::WaitEvidence;
 // The outcome and result types belong to a completed poll, which only the macOS
@@ -33,24 +37,22 @@ use cerebellum_computer::dispatch::{WaitOutcome, WaitResult};
 #[cfg(target_os = "macos")]
 use cerebellum_computer::dispatch::{wait_until_predicate, PlatformPredicatePoller};
 use cerebellum_computer::grounding::ContainmentRung;
+use cerebellum_computer::platform::containment::ContainmentRung as DispatchContainmentRung;
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
 };
-#[cfg(any(target_os = "macos", test))]
 use cerebellum_computer::platform::AccessibilityElementName;
 #[cfg(target_os = "macos")]
-use cerebellum_computer::{
-    dispatch::{
-        AttendanceContext, AttendanceLease, DispatchError, DispatchRequest, Dispatcher,
-        ExpectedPostCondition, FrozenDispatchRow,
-    },
-    platform::{
-        containment::ContainmentRung as DispatchContainmentRung, AccessibilityKeyForm,
-        AccessibilityReadFailure, AccessibilityTreeRequest, DispatchMode, DriverError,
-        EffectStatus, ElementResolutionRequest, ElementResolutionResult, MacOs26PlatformDriver,
-        PlatformDriver, SemanticDispatchRequest, SemanticDriverError, TargetDisposition,
-        SEMANTIC_CANCEL_ACTION, SEMANTIC_PRESS_ACTION,
-    },
+use cerebellum_computer::platform::{
+    AccessibilityKeyForm, AccessibilityReadFailure, AccessibilityTreeRequest, DriverError,
+    ElementResolutionRequest, ElementResolutionResult, MacOs26PlatformDriver,
+    SemanticDispatchRequest, SemanticDriverError, TargetDisposition, SEMANTIC_CANCEL_ACTION,
+    SEMANTIC_PRESS_ACTION,
+};
+use cerebellum_computer::platform::{
+    DispatchMode, EffectStatus, HeldStateDisposition, PlatformDriver, SyntheticAction,
+    SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit,
+    UnsupportedPlatformDriver,
 };
 use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::consent::ActionKind;
@@ -218,6 +220,7 @@ pub type RunningComputerPlane = ComputerPlane<
     cerebellum_computer::audit::redaction::ExcludeApplicationText,
     cerebellum_core::journal::ValidatedSeverityTaxonomy,
     cerebellum_core::journal::FilesystemJournalStorage,
+    MacOs26PlatformDriver,
 >;
 
 /// Why the computer plane cannot be assembled at boot.
@@ -391,25 +394,22 @@ impl Servable {
 /// name and act on another. A capability absent here is one the manifest must
 /// not advertise: advertising what cannot be served tells a caller it has a
 /// facility that does not exist, and it discovers otherwise only by using it.
+///
+/// Every frozen row is listed by name rather than covered by a wildcard, so
+/// adding a capability to the vocabulary does not silently make it servable
+/// here: the match stops compiling until the new row is admitted or refused by
+/// name.
 pub fn servable(name: &str) -> Option<Servable> {
-    match ComputerCapability::parse(name) {
-        Some(
-            capability @ (ComputerCapability::Click
-            | ComputerCapability::Screenshot
-            | ComputerCapability::Wait),
-        ) => Some(Servable(capability)),
-        // These rows still have no reviewed wire input path. Listed by name
-        // rather than caught by a wildcard so adding a capability to the
-        // vocabulary does not silently make it servable here.
-        Some(
-            ComputerCapability::Type
-            | ComputerCapability::Keys
-            | ComputerCapability::Scroll
-            | ComputerCapability::Move
-            | ComputerCapability::Drag,
-        ) => None,
-        None => None,
-    }
+    ComputerCapability::parse(name).map(
+        |capability @ (ComputerCapability::Click
+         | ComputerCapability::Type
+         | ComputerCapability::Keys
+         | ComputerCapability::Scroll
+         | ComputerCapability::Move
+         | ComputerCapability::Drag
+         | ComputerCapability::Screenshot
+         | ComputerCapability::Wait)| { Servable(capability) },
+    )
 }
 
 /// Who is asking, and what this module needs to answer them.
@@ -454,7 +454,15 @@ pub struct ResultSchemaFinding {
 }
 
 /// What a served capability needs beyond the request itself.
-pub struct ComputerPlane<B, R, T, S>
+///
+/// The synthetic driver is the platform object that translates and posts input
+/// events. It is a factory rather than an instance because a driver is
+/// stateful -- the macOS one caches accessibility trees -- so each dispatch
+/// builds a fresh one, the same discipline the click handler applies. The
+/// default refuses every operation: a plane that was never given a real driver
+/// can still serve observations, and an input action reaching it gets an
+/// ordinary refusal rather than a panic.
+pub struct ComputerPlane<B, R, T, S, D = UnsupportedPlatformDriver>
 where
     R: Redactor,
     T: SeverityTaxonomy,
@@ -464,24 +472,16 @@ where
     capture: Mutex<Option<ScopedCaptureController<B>>>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
+    make_synthetic_driver: Arc<dyn Fn() -> D + Send + Sync>,
 }
 
-impl<B, R, T, S> ComputerPlane<B, R, T, S>
+impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
 where
     B: CaptureBackend + Send,
     R: Redactor + Send,
     T: SeverityTaxonomy + Send,
     S: JournalStorage + Send,
 {
-    /// How many journal sequences have been allocated.
-    ///
-    /// Exposed so a test can establish that an action was recorded WITHOUT
-    /// reading the entries themselves, which would put a test in the position of
-    /// interpreting the journal's contents to decide whether it was written to.
-    pub async fn journal_entry_count(&self) -> u64 {
-        self.audit.lock().await.journal().next_sequence()
-    }
-
     pub fn new(audit: ComputerAudit<R, T, S>) -> Self {
         Self::with_result_schema_enforcement(audit, ResultSchemaEnforcement::DetectOnly)
     }
@@ -496,12 +496,77 @@ where
         audit: ComputerAudit<R, T, S>,
         result_schema_enforcement: ResultSchemaEnforcement,
     ) -> Self {
+        Self::assemble(
+            audit,
+            result_schema_enforcement,
+            Arc::new(UnsupportedPlatformDriver::new),
+        )
+    }
+}
+
+impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
+where
+    B: CaptureBackend + Send,
+    R: Redactor + Send,
+    T: SeverityTaxonomy + Send,
+    S: JournalStorage + Send,
+    D: PlatformDriver,
+{
+    /// Construct a plane whose input actions dispatch through the driver this
+    /// factory builds.
+    ///
+    /// This is the only construction under which the five input capabilities
+    /// can post an event; [`ComputerPlane::new`] answers them with the
+    /// refusing default driver instead.
+    pub fn with_synthetic_driver(
+        audit: ComputerAudit<R, T, S>,
+        make_synthetic_driver: impl Fn() -> D + Send + Sync + 'static,
+    ) -> Self {
+        Self::assemble(
+            audit,
+            ResultSchemaEnforcement::DetectOnly,
+            Arc::new(make_synthetic_driver),
+        )
+    }
+
+    fn assemble(
+        audit: ComputerAudit<R, T, S>,
+        result_schema_enforcement: ResultSchemaEnforcement,
+        make_synthetic_driver: Arc<dyn Fn() -> D + Send + Sync>,
+    ) -> Self {
         Self {
             audit: Mutex::new(audit),
             capture: Mutex::new(None),
             result_schema_enforcement,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
+            make_synthetic_driver,
         }
+    }
+
+    /// How many journal sequences have been allocated.
+    ///
+    /// Exposed so a test can establish that an action was recorded WITHOUT
+    /// reading the entries themselves, which would put a test in the position of
+    /// interpreting the journal's contents to decide whether it was written to.
+    pub async fn journal_entry_count(&self) -> u64 {
+        self.audit.lock().await.journal().next_sequence()
+    }
+
+    /// The lifecycle state one journal obligation settled into, if it exists.
+    ///
+    /// Exposed so a test can establish that a dispatch outcome was FINALISED
+    /// before the caller was answered -- a count of entries cannot distinguish
+    /// a completed record from one left open mid-flight.
+    pub async fn obligation_lifecycle(
+        &self,
+        action_obligation_id: u64,
+    ) -> Option<cerebellum_core::journal::LifecycleState> {
+        self.audit
+            .lock()
+            .await
+            .read_obligation_audit(action_obligation_id)
+            .ok()
+            .map(|record| record.lifecycle)
     }
 
     /// Distinct result-schema violations detected so far, with occurrence counts.
@@ -566,10 +631,19 @@ where
             }
             #[cfg(target_os = "macos")]
             ComputerCapability::Click => self.serve_click(arguments, context).await,
+            ComputerCapability::Type
+            | ComputerCapability::Keys
+            | ComputerCapability::Scroll
+            | ComputerCapability::Move
+            | ComputerCapability::Drag => {
+                self.serve_synthetic(served_capability, arguments, context)
+                    .await
+            }
             // Unreachable through `servable`, which is the only way a capability
             // arrives here. Answered rather than panicked: a dispatch table and
             // this match disagreeing is a bug to report, not a reason to take
             // the module down.
+            #[cfg(not(target_os = "macos"))]
             other => json!({
                 "outcome": "not_servable",
                 "capability": other.capability_id(),
@@ -580,7 +654,17 @@ where
             ComputerCapability::Screenshot => screenshot_wire_reply(reply),
             #[cfg(target_os = "macos")]
             ComputerCapability::Click => click_wire_envelope(reply),
-            _ => reply,
+            ComputerCapability::Type | ComputerCapability::Keys | ComputerCapability::Scroll => {
+                synthetic_wire_envelope(reply, true)
+            }
+            ComputerCapability::Move | ComputerCapability::Drag => {
+                synthetic_wire_envelope(reply, false)
+            }
+            ComputerCapability::Wait => reply,
+            // The click reply above was already the not_servable answer on this
+            // platform; it needs no envelope.
+            #[cfg(not(target_os = "macos"))]
+            ComputerCapability::Click => reply,
         };
         self.finish_reply(served_capability, reply)
     }
@@ -1065,6 +1149,141 @@ where
             "windows": windows,
         })
     }
+
+    /// Post one synthetic input action into the application this conversation
+    /// may act on.
+    ///
+    /// Shared by the five input capabilities, which differ in three ways and
+    /// nowhere else: the request they parse, the action kind their lease must
+    /// cover, and whether they deliver to the leased process (background) or
+    /// to the pointer's location while a human watches (observed, which only
+    /// `computer.move` is frozen as).
+    ///
+    /// The ordering is the click handler's and is not stylistic: authority is
+    /// established before anything is journaled, the dispatcher reserves and
+    /// commits the intent before the platform can receive an event, and the
+    /// terminal state is finalised before this returns -- so a failing
+    /// dispatch still leaves a completed audit record, never an open one.
+    async fn serve_synthetic<C: MonotonicClock>(
+        &self,
+        capability: ComputerCapability,
+        arguments: &Value,
+        context: ServeContext<'_, C>,
+    ) -> Value {
+        let parsed = match parse_synthetic_request(capability, arguments) {
+            Ok(parsed) => parsed,
+            Err(refusal) => return refusal,
+        };
+
+        let ServeContext {
+            grantee,
+            identity,
+            management,
+            clock,
+            now_ms: _,
+        } = context;
+        // The lease is keyed on the action kind: an observe-only lease admits
+        // none of these, and a compose lease does not admit a durable chord or
+        // a drag. The kind comes from the request just parsed, never from a
+        // field the caller can set.
+        let grant = match management
+            .authority_for(grantee, parsed.action_kind, clock)
+            .await
+        {
+            ActionAuthority::Admitted(grant) => grant,
+            ActionAuthority::Refused(refusal) => return refusal,
+        };
+
+        let capability_id = capability.capability_id();
+        let mut row = FrozenDispatchRow::for_capability(capability_id)
+            .expect("the frozen vocabulary contains every servable capability");
+        if parsed.action_kind == ActionKind::MutateDurable {
+            // The vocabulary's durable escalation is a property of the request,
+            // not of the row: the dispatch runs under the escalated kind so
+            // containment and audit evidence record what this action could do
+            // rather than what an ordinary compose action could.
+            row.action_kind = cerebellum_computer::platform::ActionKind::MutateDurable;
+        }
+        // computer.move is frozen observed-only: it has no per-process path,
+        // so it dispatches globally with the observer guard active. The other
+        // four deliver to the leased process generation in the background.
+        let mode = match capability {
+            ComputerCapability::Move => DispatchMode::Observed,
+            _ => DispatchMode::Background,
+        };
+        let dispatch_at_ms = clock.now().as_nanos() / 1_000_000;
+        let attendance = match mode {
+            DispatchMode::Background => {
+                let expires_at_ms =
+                    dispatch_at_ms.saturating_add(row.maximum_attendance_lease_age_ms);
+                let lease = match AttendanceLease::new(
+                    identity.conversation_key.clone(),
+                    grant.clone(),
+                    grantee,
+                    dispatch_at_ms,
+                    expires_at_ms,
+                    grant.process_generation_evidence.clone(),
+                    "cerebellum-serve-context-v1",
+                ) {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        return synthetic_dispatch_refusal(&DispatchError::AttendanceUnavailable)
+                    }
+                };
+                AttendanceContext::background(
+                    identity.conversation_key.clone(),
+                    grant.clone(),
+                    grantee,
+                    lease,
+                    dispatch_at_ms,
+                    dispatch_at_ms,
+                    row.maximum_attendance_lease_age_ms,
+                    row.maximum_attendance_check_to_dispatch_interval_ms,
+                    true,
+                )
+            }
+            DispatchMode::Observed => AttendanceContext::observed(
+                identity.conversation_key.clone(),
+                grant.clone(),
+                grantee,
+                dispatch_at_ms,
+                dispatch_at_ms,
+                true,
+            ),
+        };
+
+        // None of the five request schemas declares a post-condition, so there
+        // is no effect claim to evaluate. The placeholder exists because the
+        // dispatcher serializes a predicate before dispatch; the production
+        // driver is built with post-condition evaluation disabled, which
+        // records the effect as indeterminate rather than claiming one a post
+        // call cannot evidence.
+        let expected = ExpectedPostCondition::new(
+            "computer-synthetic-wire-no-effect-claim-v1",
+            PostCondition::ElementPresent {
+                element: parsed.placeholder_element,
+            },
+        );
+        let request = DispatchRequest::new(row, mode, grant, expected, attendance, dispatch_at_ms)
+            .with_synthetic(parsed.action);
+
+        let mut audit = self.audit.lock().await;
+        match Dispatcher::new((self.make_synthetic_driver)())
+            .dispatch(&mut audit, identity, request)
+        {
+            Ok(report) => {
+                let Some(containment_rung) = report.containment.rung() else {
+                    return synthetic_dispatch_refusal(&DispatchError::AuditUnavailable);
+                };
+                json!({
+                    "outcome": "completed",
+                    "containment_rung": DispatchContainmentRung::as_str(containment_rung),
+                    "effect_status": effect_status_name(report.effect.status),
+                })
+            }
+            Err(refusal) => synthetic_dispatch_refusal(&refusal),
+        }
+    }
 }
 
 const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
@@ -1474,7 +1693,6 @@ fn click_wire_reply(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn effect_status_name(status: EffectStatus) -> &'static str {
     match status {
         EffectStatus::EffectObserved => "effect_observed",
@@ -1571,6 +1789,496 @@ fn click_driver_refusal(
         | DriverError::SyntheticDispatchFailed(_) => DispatchError::SemanticPathUnavailable,
     };
     dispatch_refusal(refusal, unreadable_subtrees)
+}
+
+/// What one parsed synthetic-input request carries into the dispatch seam.
+#[derive(Debug)]
+struct ParsedSynthetic {
+    action: SyntheticAction,
+    /// The consent action kind the lease must cover. Usually the row's own
+    /// kind; a durable chord or a drag takes the escalated kind the frozen
+    /// vocabulary assigns to it.
+    action_kind: ActionKind,
+    /// The element the placeholder post-condition names. It is never
+    /// evaluated -- the five schemas declare no post-condition -- so it labels
+    /// the serialized predicate rather than naming a resolved target.
+    placeholder_element: AccessibilityElementName,
+}
+
+fn invalid_synthetic_request(field: &str, reason: &str) -> Value {
+    // `field` and `reason` are stripped by the wire envelope before this
+    // reaches the caller: the five result schemas declare no diagnostic
+    // fields. They stay in the value this returns so in-module tests can
+    // assert which check refused, and so the shape matches the other
+    // capabilities' refusals up to the boundary that must drop them.
+    json!({
+        "outcome": "invalid_request",
+        "field": field,
+        "reason": reason,
+    })
+}
+
+fn synthetic_field_reason(value: Option<&Value>) -> &'static str {
+    if value.is_some() {
+        "wrong_type"
+    } else {
+        "missing_field"
+    }
+}
+
+/// A required non-empty string field, in the shape every `target` takes.
+fn required_text(object: &serde_json::Map<String, Value>, field: &str) -> Result<String, Value> {
+    match object.get(field) {
+        Some(Value::String(text)) if !text.is_empty() => Ok(text.clone()),
+        Some(Value::String(_)) => Err(invalid_synthetic_request(field, "empty_value")),
+        other => Err(invalid_synthetic_request(
+            field,
+            synthetic_field_reason(other),
+        )),
+    }
+}
+
+/// The fields each input capability's frozen request schema declares, so an
+/// undeclared field is refused as unknown rather than silently dropped.
+fn synthetic_request_fields(capability: ComputerCapability) -> Option<&'static [&'static str]> {
+    match capability {
+        ComputerCapability::Type => Some(&["target", "text", "replace_selection"]),
+        ComputerCapability::Keys => Some(&["keys", "target"]),
+        ComputerCapability::Scroll => Some(&["target", "axis", "amount_lines"]),
+        ComputerCapability::Move => Some(&["to"]),
+        ComputerCapability::Drag => Some(&["from", "to", "button", "modifiers"]),
+        _ => None,
+    }
+}
+
+fn parse_synthetic_request(
+    capability: ComputerCapability,
+    arguments: &Value,
+) -> Result<ParsedSynthetic, Value> {
+    // serve() routes only the five input capabilities here. Anything else is
+    // a dispatch-table disagreement, which is answered rather than panicked
+    // on, for the same reason the top-level match answers it.
+    let Some(allowed) = synthetic_request_fields(capability) else {
+        return Err(json!({"outcome": "invalid_request"}));
+    };
+    let Some(object) = arguments.as_object() else {
+        return Err(invalid_synthetic_request("$", "wrong_type"));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !allowed.contains(&field.as_str()))
+        .min()
+    {
+        return Err(invalid_synthetic_request(field, "unknown_field"));
+    }
+    match capability {
+        ComputerCapability::Type => parse_type_request(object),
+        ComputerCapability::Keys => parse_keys_request(object),
+        ComputerCapability::Scroll => parse_scroll_request(object),
+        ComputerCapability::Move => parse_move_request(object),
+        ComputerCapability::Drag => parse_drag_request(object),
+        _ => Err(json!({"outcome": "invalid_request"})),
+    }
+}
+
+fn parse_type_request(object: &serde_json::Map<String, Value>) -> Result<ParsedSynthetic, Value> {
+    let target = required_text(object, "target")?;
+    let text = match object.get("text") {
+        Some(Value::String(text)) => text.clone(),
+        other => {
+            return Err(invalid_synthetic_request(
+                "text",
+                synthetic_field_reason(other),
+            ))
+        }
+    };
+    if text.is_empty() {
+        // An empty type plans zero events, so returning success for it would
+        // be a handler reporting an action it never performed.
+        return Err(invalid_synthetic_request("text", "empty_value"));
+    }
+    // The frozen request schema bounds the text at 4096 characters.
+    if text.chars().count() > 4_096 {
+        return Err(invalid_synthetic_request("text", "exceeds_maximum"));
+    }
+    match object.get("replace_selection") {
+        Some(Value::Bool(_)) => {}
+        other => {
+            return Err(invalid_synthetic_request(
+                "replace_selection",
+                synthetic_field_reason(other),
+            ))
+        }
+    }
+    // `replace_selection` is validated but not acted on: Unicode typing
+    // follows the target's own insertion-point convention, which replaces an
+    // active selection as ordinary typing does. The synthetic path has that
+    // one behavior, and the field states the caller's expectation of it.
+    Ok(ParsedSynthetic {
+        action: SyntheticAction::type_text(text),
+        action_kind: ActionKind::Compose,
+        placeholder_element: AccessibilityElementName::Identifier(target),
+    })
+}
+
+fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedSynthetic, Value> {
+    let target = required_text(object, "target")?;
+    let keys = match object.get("keys") {
+        // The frozen request schema bounds the chord at 8 entries.
+        Some(Value::Array(keys)) if !keys.is_empty() && keys.len() <= 8 => keys,
+        Some(Value::Array(_)) => return Err(invalid_synthetic_request("keys", "invalid_length")),
+        other => {
+            return Err(invalid_synthetic_request(
+                "keys",
+                synthetic_field_reason(other),
+            ))
+        }
+    };
+    let mut modifiers = SyntheticKeyModifiers::NONE;
+    let mut chord_key: Option<SyntheticKey> = None;
+    for name in keys {
+        let Some(name) = name.as_str() else {
+            return Err(invalid_synthetic_request("keys", "wrong_type"));
+        };
+        match name {
+            "command" => modifiers.command = true,
+            "shift" => modifiers.shift = true,
+            "option" => modifiers.option = true,
+            "control" => modifiers.control = true,
+            _ => {
+                let Some(key) = synthetic_key_from_wire(name) else {
+                    return Err(invalid_synthetic_request("keys", "unknown_key"));
+                };
+                if chord_key.replace(key).is_some() {
+                    // A chord is modifiers around ONE key. Two named keys are
+                    // two actions, and serving them as one performs neither
+                    // chord the caller asked for.
+                    return Err(invalid_synthetic_request("keys", "multiple_keys"));
+                }
+            }
+        }
+    }
+    let Some(key) = chord_key else {
+        return Err(invalid_synthetic_request("keys", "missing_chord_key"));
+    };
+    Ok(ParsedSynthetic {
+        action: SyntheticAction::key_combination(key, modifiers),
+        action_kind: chord_action_kind(modifiers),
+        placeholder_element: AccessibilityElementName::Identifier(target),
+    })
+}
+
+/// The action kind a key combination runs under: the vocabulary's
+/// `durable_chord` override applied to the chord just parsed.
+///
+/// A Command chord asks the target application to run one of the
+/// application's OWN commands, and what those do is not enumerable from here:
+/// Command-S saves, Command-Q quits, Command-W closes -- state that outlives
+/// the session -- while Command-C copies. Because the plane cannot show any Command chord to be
+/// session-scoped, every Command chord takes the durable side and requires a
+/// `mutate_durable` lease. A chord without Command is an editing or
+/// navigation keystroke, which is what `compose` covers.
+fn chord_action_kind(modifiers: SyntheticKeyModifiers) -> ActionKind {
+    if modifiers.command {
+        ActionKind::MutateDurable
+    } else {
+        ActionKind::Compose
+    }
+}
+
+fn parse_scroll_request(object: &serde_json::Map<String, Value>) -> Result<ParsedSynthetic, Value> {
+    let target = required_text(object, "target")?;
+    match object.get("axis") {
+        Some(Value::String(axis)) if axis == "vertical" => {}
+        Some(Value::String(axis)) if axis == "horizontal" => {
+            // The frozen schema names both axes, but the event construction
+            // this path serves builds a vertical wheel event only. Refused
+            // rather than substituted: answering a horizontal scroll with a
+            // vertical one scrolls somewhere the caller did not ask.
+            return Err(invalid_synthetic_request("axis", "unsupported_value"));
+        }
+        Some(Value::String(_)) => return Err(invalid_synthetic_request("axis", "unknown_value")),
+        other => {
+            return Err(invalid_synthetic_request(
+                "axis",
+                synthetic_field_reason(other),
+            ))
+        }
+    }
+    let amount = match object.get("amount_lines") {
+        // The frozen request schema bounds the amount to -100..=100 lines.
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .filter(|amount| (-100..=100).contains(amount))
+            .ok_or_else(|| invalid_synthetic_request("amount_lines", "invalid_value")),
+        other => Err(invalid_synthetic_request(
+            "amount_lines",
+            synthetic_field_reason(other),
+        )),
+    }?;
+    let delta = i32::try_from(amount)
+        .map_err(|_| invalid_synthetic_request("amount_lines", "invalid_value"))?;
+    Ok(ParsedSynthetic {
+        action: SyntheticAction::scroll(SyntheticScrollUnit::Line, delta),
+        action_kind: ActionKind::Compose,
+        placeholder_element: AccessibilityElementName::Identifier(target),
+    })
+}
+
+fn parse_move_request(object: &serde_json::Map<String, Value>) -> Result<ParsedSynthetic, Value> {
+    let to = synthetic_point_from_wire(object, "to")?;
+    Ok(ParsedSynthetic {
+        action: SyntheticAction::move_pointer(to),
+        action_kind: ActionKind::Compose,
+        // No element is named or resolved on this path; the label identifies
+        // the capability in the serialized placeholder predicate.
+        placeholder_element: AccessibilityElementName::Identifier("computer.move".to_string()),
+    })
+}
+
+fn parse_drag_request(object: &serde_json::Map<String, Value>) -> Result<ParsedSynthetic, Value> {
+    let from = synthetic_point_from_wire(object, "from")?;
+    let to = synthetic_point_from_wire(object, "to")?;
+    match object.get("button") {
+        Some(Value::String(button)) if button == "left" => {}
+        Some(Value::String(_)) => return Err(invalid_synthetic_request("button", "unknown_value")),
+        other => {
+            return Err(invalid_synthetic_request(
+                "button",
+                synthetic_field_reason(other),
+            ))
+        }
+    }
+    match object.get("modifiers") {
+        Some(Value::Array(modifiers)) if modifiers.is_empty() => {}
+        Some(Value::Array(_)) => {
+            // The neutral drag action carries no modifiers, so a non-empty
+            // list asks for an action this path cannot construct. Refused
+            // rather than dropped: performing the drag without them is a
+            // different action than the one requested.
+            return Err(invalid_synthetic_request(
+                "modifiers",
+                "synthetic_path_requires_empty",
+            ));
+        }
+        other => {
+            return Err(invalid_synthetic_request(
+                "modifiers",
+                synthetic_field_reason(other),
+            ))
+        }
+    }
+    Ok(ParsedSynthetic {
+        action: SyntheticAction::drag_pointer(from, to),
+        // The frozen row is mutate_durable outright: a drag moves or drops
+        // whatever is under the pointer, which is not session-scoped state.
+        action_kind: ActionKind::MutateDurable,
+        placeholder_element: AccessibilityElementName::Identifier("computer.drag".to_string()),
+    })
+}
+
+/// Read a point from its wire spelling, `"x,y"` in global display coordinates.
+///
+/// The frozen schemas carry points as strings rather than as objects. The two
+/// components are split here and nowhere else, and anything that is not two
+/// finite numbers is a request error rather than a point at the origin.
+fn synthetic_point_from_wire(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<SyntheticPoint, Value> {
+    let text = match object.get(field) {
+        Some(Value::String(text)) => text,
+        other => {
+            return Err(invalid_synthetic_request(
+                field,
+                synthetic_field_reason(other),
+            ))
+        }
+    };
+    let mut components = text.split(',');
+    let parse_component = |component: Option<&str>| {
+        component
+            .and_then(|component| component.trim().parse::<f64>().ok())
+            // `f64::from_str` accepts "NaN" and "inf", and a non-finite
+            // coordinate names no point on any display.
+            .filter(|value| value.is_finite())
+    };
+    match (
+        parse_component(components.next()),
+        parse_component(components.next()),
+        components.next(),
+    ) {
+        (Some(x), Some(y), None) => Ok(SyntheticPoint { x, y }),
+        _ => Err(invalid_synthetic_request(field, "invalid_value")),
+    }
+}
+
+/// Name a synthetic dispatch failure by what the caller must know about it.
+///
+/// A sequence that stopped mid-flight is split from every other refusal
+/// because its posted events may have left a key or button held in the
+/// target: a caller answered a generic "refused" would send its next action
+/// into an application whose held state it does not know. `held_state_unknown`
+/// is that report; the typed detail -- how far the sequence got and why it
+/// stopped -- is in the audit record the dispatcher finalised before this
+/// answer.
+fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
+    let outcome = match refusal {
+        DispatchError::SyntheticSequenceFailed {
+            held_state: HeldStateDisposition::Unknown,
+            ..
+        } => "held_state_unknown",
+        DispatchError::SyntheticSequenceFailed { .. } => "dispatch_failed",
+        other => other.reason_code(),
+    };
+    json!({"outcome": outcome})
+}
+
+/// Give every synthetic-input outcome the result envelope its vocabulary row
+/// declares.
+///
+/// The three focus-delivered rows declare `outcome`, `containment_rung` and
+/// `effect_status`. `computer.move` and `computer.drag` declare no rung:
+/// their delivery is coordinate-addressed and always records the weakest one,
+/// so carrying the field would assert a distinction the row does not make.
+/// Diagnostic fields no row declares (`field`, `reason`, `remedy`, `detail`)
+/// are stripped here rather than shipped: the response contract checker
+/// rejects them, and the audit record is where the typed refusal already
+/// lives.
+fn synthetic_wire_envelope(mut reply: Value, carries_containment_rung: bool) -> Value {
+    let object = reply
+        .as_object_mut()
+        .expect("synthetic input replies are objects");
+    object
+        .entry("outcome")
+        .or_insert_with(|| Value::String("refused".to_string()));
+    object
+        .entry("effect_status")
+        .or_insert_with(|| Value::String("effect_indeterminate".to_string()));
+    if carries_containment_rung {
+        object
+            .entry("containment_rung")
+            .or_insert_with(|| Value::String("global_none".to_string()));
+    } else {
+        object.remove("containment_rung");
+    }
+    for field in ["field", "reason", "remedy", "detail"] {
+        object.remove(field);
+    }
+    reply
+}
+
+/// Map a wire key name onto the neutral key it names.
+///
+/// Total on purpose: a name added to the neutral vocabulary stops the build
+/// here rather than being pressed under a catch-all's guess. The spellings
+/// are snake_case keyboard names, matching the modifier spellings the same
+/// request carries, rather than any platform's keycode table.
+fn synthetic_key_from_wire(name: &str) -> Option<SyntheticKey> {
+    Some(match name {
+        "a" => SyntheticKey::A,
+        "s" => SyntheticKey::S,
+        "d" => SyntheticKey::D,
+        "f" => SyntheticKey::F,
+        "h" => SyntheticKey::H,
+        "g" => SyntheticKey::G,
+        "z" => SyntheticKey::Z,
+        "x" => SyntheticKey::X,
+        "c" => SyntheticKey::C,
+        "v" => SyntheticKey::V,
+        "section" => SyntheticKey::Section,
+        "b" => SyntheticKey::B,
+        "q" => SyntheticKey::Q,
+        "w" => SyntheticKey::W,
+        "e" => SyntheticKey::E,
+        "r" => SyntheticKey::R,
+        "y" => SyntheticKey::Y,
+        "t" => SyntheticKey::T,
+        "digit1" => SyntheticKey::Digit1,
+        "digit2" => SyntheticKey::Digit2,
+        "digit3" => SyntheticKey::Digit3,
+        "digit4" => SyntheticKey::Digit4,
+        "digit5" => SyntheticKey::Digit5,
+        "digit6" => SyntheticKey::Digit6,
+        "digit7" => SyntheticKey::Digit7,
+        "digit8" => SyntheticKey::Digit8,
+        "digit9" => SyntheticKey::Digit9,
+        "digit0" => SyntheticKey::Digit0,
+        "equal" => SyntheticKey::Equal,
+        "minus" => SyntheticKey::Minus,
+        "right_bracket" => SyntheticKey::RightBracket,
+        "o" => SyntheticKey::O,
+        "u" => SyntheticKey::U,
+        "left_bracket" => SyntheticKey::LeftBracket,
+        "i" => SyntheticKey::I,
+        "p" => SyntheticKey::P,
+        "return" => SyntheticKey::Return,
+        "l" => SyntheticKey::L,
+        "j" => SyntheticKey::J,
+        "quote" => SyntheticKey::Quote,
+        "k" => SyntheticKey::K,
+        "semicolon" => SyntheticKey::Semicolon,
+        "backslash" => SyntheticKey::Backslash,
+        "comma" => SyntheticKey::Comma,
+        "slash" => SyntheticKey::Slash,
+        "n" => SyntheticKey::N,
+        "m" => SyntheticKey::M,
+        "period" => SyntheticKey::Period,
+        "tab" => SyntheticKey::Tab,
+        "space" => SyntheticKey::Space,
+        "grave" => SyntheticKey::Grave,
+        "backspace" => SyntheticKey::Backspace,
+        "escape" => SyntheticKey::Escape,
+        "f1" => SyntheticKey::F1,
+        "f2" => SyntheticKey::F2,
+        "f3" => SyntheticKey::F3,
+        "f4" => SyntheticKey::F4,
+        "f5" => SyntheticKey::F5,
+        "f6" => SyntheticKey::F6,
+        "f7" => SyntheticKey::F7,
+        "f8" => SyntheticKey::F8,
+        "f9" => SyntheticKey::F9,
+        "f10" => SyntheticKey::F10,
+        "f11" => SyntheticKey::F11,
+        "f12" => SyntheticKey::F12,
+        "f13" => SyntheticKey::F13,
+        "f14" => SyntheticKey::F14,
+        "f15" => SyntheticKey::F15,
+        "f16" => SyntheticKey::F16,
+        "f17" => SyntheticKey::F17,
+        "f18" => SyntheticKey::F18,
+        "f19" => SyntheticKey::F19,
+        "f20" => SyntheticKey::F20,
+        "keypad_decimal" => SyntheticKey::KeypadDecimal,
+        "keypad_multiply" => SyntheticKey::KeypadMultiply,
+        "keypad_plus" => SyntheticKey::KeypadPlus,
+        "keypad_clear" => SyntheticKey::KeypadClear,
+        "keypad_divide" => SyntheticKey::KeypadDivide,
+        "keypad_enter" => SyntheticKey::KeypadEnter,
+        "keypad_minus" => SyntheticKey::KeypadMinus,
+        "keypad_equal" => SyntheticKey::KeypadEqual,
+        "keypad0" => SyntheticKey::Keypad0,
+        "keypad1" => SyntheticKey::Keypad1,
+        "keypad2" => SyntheticKey::Keypad2,
+        "keypad3" => SyntheticKey::Keypad3,
+        "keypad4" => SyntheticKey::Keypad4,
+        "keypad5" => SyntheticKey::Keypad5,
+        "keypad6" => SyntheticKey::Keypad6,
+        "keypad7" => SyntheticKey::Keypad7,
+        "keypad8" => SyntheticKey::Keypad8,
+        "keypad9" => SyntheticKey::Keypad9,
+        "help" => SyntheticKey::Help,
+        "home" => SyntheticKey::Home,
+        "page_up" => SyntheticKey::PageUp,
+        "forward_delete" => SyntheticKey::ForwardDelete,
+        "end" => SyntheticKey::End,
+        "page_down" => SyntheticKey::PageDown,
+        "left_arrow" => SyntheticKey::LeftArrow,
+        "right_arrow" => SyntheticKey::RightArrow,
+        "down_arrow" => SyntheticKey::DownArrow,
+        "up_arrow" => SyntheticKey::UpArrow,
+        _ => return None,
+    })
 }
 
 /// Encode bytes as base64, the form the wire carries an image in.
@@ -2116,6 +2824,323 @@ mod click_vocabulary_v3_tests {
             production.contains("parsed.expect.is_some()"),
             "observation must be gated on the caller having named a condition"
         );
+    }
+}
+
+#[cfg(test)]
+mod synthetic_parse_tests {
+    use super::*;
+
+    fn parse(capability: ComputerCapability, arguments: Value) -> Result<ParsedSynthetic, Value> {
+        parse_synthetic_request(capability, &arguments)
+    }
+
+    /// Every name in the wire table maps back to a distinct key, and the
+    /// table itself has no duplicates: two names for one key would be a
+    /// request either spelling could make with no way to tell them apart.
+    #[test]
+    fn the_wire_key_table_is_total_and_duplicate_free() {
+        let names = [
+            "a",
+            "s",
+            "d",
+            "f",
+            "h",
+            "g",
+            "z",
+            "x",
+            "c",
+            "v",
+            "section",
+            "b",
+            "q",
+            "w",
+            "e",
+            "r",
+            "y",
+            "t",
+            "digit1",
+            "digit2",
+            "digit3",
+            "digit4",
+            "digit5",
+            "digit6",
+            "digit7",
+            "digit8",
+            "digit9",
+            "digit0",
+            "equal",
+            "minus",
+            "right_bracket",
+            "o",
+            "u",
+            "left_bracket",
+            "i",
+            "p",
+            "return",
+            "l",
+            "j",
+            "quote",
+            "k",
+            "semicolon",
+            "backslash",
+            "comma",
+            "slash",
+            "n",
+            "m",
+            "period",
+            "tab",
+            "space",
+            "grave",
+            "backspace",
+            "escape",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "f5",
+            "f6",
+            "f7",
+            "f8",
+            "f9",
+            "f10",
+            "f11",
+            "f12",
+            "f13",
+            "f14",
+            "f15",
+            "f16",
+            "f17",
+            "f18",
+            "f19",
+            "f20",
+            "keypad_decimal",
+            "keypad_multiply",
+            "keypad_plus",
+            "keypad_clear",
+            "keypad_divide",
+            "keypad_enter",
+            "keypad_minus",
+            "keypad_equal",
+            "keypad0",
+            "keypad1",
+            "keypad2",
+            "keypad3",
+            "keypad4",
+            "keypad5",
+            "keypad6",
+            "keypad7",
+            "keypad8",
+            "keypad9",
+            "help",
+            "home",
+            "page_up",
+            "forward_delete",
+            "end",
+            "page_down",
+            "left_arrow",
+            "right_arrow",
+            "down_arrow",
+            "up_arrow",
+        ];
+        let keys: Vec<SyntheticKey> = names
+            .iter()
+            .map(|name| synthetic_key_from_wire(name).expect("every listed name maps"))
+            .collect();
+        let mut deduped = keys.clone();
+        deduped.sort_by_key(|key| format!("{key:?}"));
+        deduped.dedup();
+        assert_eq!(keys.len(), deduped.len(), "the table has a duplicate");
+        assert_eq!(synthetic_key_from_wire("cmd"), None);
+        assert_eq!(synthetic_key_from_wire("S"), None);
+    }
+
+    /// The durable_chord override, asserted at the classification itself:
+    /// Command escalates, everything else stays compose.
+    #[test]
+    fn only_a_command_chord_escalates_to_mutate_durable() {
+        let command = SyntheticKeyModifiers {
+            command: true,
+            ..SyntheticKeyModifiers::NONE
+        };
+        assert_eq!(chord_action_kind(command), ActionKind::MutateDurable);
+        for modifiers in [
+            SyntheticKeyModifiers::NONE,
+            SyntheticKeyModifiers {
+                shift: true,
+                ..SyntheticKeyModifiers::NONE
+            },
+            SyntheticKeyModifiers {
+                option: true,
+                ..SyntheticKeyModifiers::NONE
+            },
+            SyntheticKeyModifiers {
+                control: true,
+                ..SyntheticKeyModifiers::NONE
+            },
+            SyntheticKeyModifiers {
+                shift: true,
+                option: true,
+                control: true,
+                command: false,
+            },
+        ] {
+            assert_eq!(
+                chord_action_kind(modifiers),
+                ActionKind::Compose,
+                "{modifiers:?} must not escalate"
+            );
+        }
+    }
+
+    /// A well-formed chord parses into the one key and its modifiers; two
+    /// named keys are refused rather than served as one chord.
+    #[test]
+    fn a_chord_is_modifiers_around_exactly_one_key() {
+        let parsed = parse(
+            ComputerCapability::Keys,
+            json!({"keys": ["command", "shift", "z"], "target": "editor"}),
+        )
+        .expect("a well-formed chord parses");
+        assert_eq!(
+            parsed.action,
+            SyntheticAction::key_combination(
+                SyntheticKey::Z,
+                SyntheticKeyModifiers {
+                    command: true,
+                    shift: true,
+                    ..SyntheticKeyModifiers::NONE
+                },
+            )
+        );
+
+        for keys in [
+            json!(["a", "b"]),
+            json!(["command"]),
+            json!([]),
+            json!(["not-a-key"]),
+        ] {
+            assert!(
+                parse(
+                    ComputerCapability::Keys,
+                    json!({"keys": keys, "target": "editor"})
+                )
+                .is_err(),
+                "{keys} parsed as a chord"
+            );
+        }
+    }
+
+    /// The frozen bounds are enforced at parse: 4096 characters of text, an
+    /// amount inside -100..=100, and a vertical axis only.
+    #[test]
+    fn the_frozen_request_bounds_are_enforced() {
+        let long = "a".repeat(4_097);
+        assert!(parse(
+            ComputerCapability::Type,
+            json!({"target": "editor", "text": long, "replace_selection": false}),
+        )
+        .is_err());
+        assert!(
+            parse(
+                ComputerCapability::Type,
+                json!({"target": "editor", "text": "", "replace_selection": false}),
+            )
+            .is_err(),
+            "an empty type plans no events and must not report success"
+        );
+        for amount in [101, -101] {
+            assert!(
+                parse(
+                    ComputerCapability::Scroll,
+                    json!({"target": "editor", "axis": "vertical", "amount_lines": amount}),
+                )
+                .is_err(),
+                "{amount} lines exceeded the frozen bound"
+            );
+        }
+        assert!(
+            parse(
+                ComputerCapability::Scroll,
+                json!({"target": "editor", "axis": "horizontal", "amount_lines": 3}),
+            )
+            .is_err(),
+            "horizontal construction does not exist; it must refuse rather than substitute"
+        );
+    }
+
+    /// Points parse from their `"x,y"` spelling; anything else is a request
+    /// error, including the non-finite values `f64` parsing would accept.
+    #[test]
+    fn points_require_two_finite_components() {
+        let parsed = parse(ComputerCapability::Move, json!({"to": "-12.5, 40"}))
+            .expect("a well-formed point parses");
+        assert_eq!(
+            parsed.action,
+            SyntheticAction::move_pointer(SyntheticPoint { x: -12.5, y: 40.0 })
+        );
+        for point in ["", "1", "1,2,3", "a,b", "NaN,2", "inf,2", "1,"] {
+            assert!(
+                parse(ComputerCapability::Move, json!({"to": point})).is_err(),
+                "{point:?} parsed as a point"
+            );
+        }
+    }
+
+    /// A drag is mutate_durable outright, and its modifiers list must be
+    /// empty because the neutral action carries none.
+    #[test]
+    fn a_drag_is_durable_and_carries_no_modifiers() {
+        let parsed = parse(
+            ComputerCapability::Drag,
+            json!({"from": "1,2", "to": "3,4", "button": "left", "modifiers": []}),
+        )
+        .expect("a well-formed drag parses");
+        assert_eq!(parsed.action_kind, ActionKind::MutateDurable);
+
+        assert!(
+            parse(
+                ComputerCapability::Drag,
+                json!({"from": "1,2", "to": "3,4", "button": "left", "modifiers": ["shift"]}),
+            )
+            .is_err(),
+            "a drag with modifiers asks for an action this path cannot construct"
+        );
+        assert!(parse(
+            ComputerCapability::Drag,
+            json!({"from": "1,2", "to": "3,4", "button": "right", "modifiers": []}),
+        )
+        .is_err());
+    }
+
+    /// An undeclared field is refused as unknown rather than silently
+    /// dropped: the frozen schemas are closed.
+    #[test]
+    fn an_undeclared_field_is_refused_for_each_of_the_five() {
+        for (capability, mut request) in [
+            (
+                ComputerCapability::Type,
+                json!({"target": "editor", "text": "hi", "replace_selection": false}),
+            ),
+            (
+                ComputerCapability::Keys,
+                json!({"keys": ["s"], "target": "editor"}),
+            ),
+            (
+                ComputerCapability::Scroll,
+                json!({"target": "editor", "axis": "vertical", "amount_lines": 1}),
+            ),
+            (ComputerCapability::Move, json!({"to": "1,2"})),
+            (
+                ComputerCapability::Drag,
+                json!({"from": "1,2", "to": "3,4", "button": "left", "modifiers": []}),
+            ),
+        ] {
+            request["speed"] = json!("fast");
+            let refusal = parse(capability, request).expect_err("an unknown field must refuse");
+            assert_eq!(refusal["field"], "speed");
+            assert_eq!(refusal["reason"], "unknown_field");
+        }
     }
 }
 

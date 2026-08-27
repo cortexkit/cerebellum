@@ -45,35 +45,28 @@ fn journal_boot_failure_message_names_its_path_and_typed_cause() {
     assert!(message.contains("PermissionDenied"));
 }
 
-/// The reviewed semantic click path joins the two observing handlers.
+/// Every capability the vocabulary freezes is servable over the wire.
 ///
-/// Listed by name rather than matched by a wildcard, so the five unreviewed
-/// actuating capabilities cannot become servable by default.
+/// Listed by name rather than matched by a wildcard, so a capability added to
+/// the vocabulary cannot become servable by default: the match in `servable`
+/// stops compiling until the new row is admitted or refused by name, and this
+/// list forces the same decision in the test.
 #[test]
-fn only_reviewed_or_observing_capabilities_are_servable() {
-    assert_eq!(
-        servable("computer.click").map(|s| s.capability()),
-        Some(ComputerCapability::Click)
-    );
-    assert_eq!(
-        servable("computer.screenshot").map(|s| s.capability()),
-        Some(ComputerCapability::Screenshot)
-    );
-    assert_eq!(
-        servable("computer.wait").map(|s| s.capability()),
-        Some(ComputerCapability::Wait)
-    );
-
-    for actuating in [
-        "computer.type",
-        "computer.keys",
-        "computer.scroll",
-        "computer.move",
-        "computer.drag",
+fn every_frozen_capability_is_servable() {
+    for (name, capability) in [
+        ("computer.click", ComputerCapability::Click),
+        ("computer.type", ComputerCapability::Type),
+        ("computer.keys", ComputerCapability::Keys),
+        ("computer.scroll", ComputerCapability::Scroll),
+        ("computer.move", ComputerCapability::Move),
+        ("computer.drag", ComputerCapability::Drag),
+        ("computer.screenshot", ComputerCapability::Screenshot),
+        ("computer.wait", ComputerCapability::Wait),
     ] {
-        assert!(
-            servable(actuating).is_none(),
-            "{actuating} has no reviewed wire path and must not be servable"
+        assert_eq!(
+            servable(name).map(|s| s.capability()),
+            Some(capability),
+            "{name} has a reviewed wire path and must be servable"
         );
     }
     assert!(servable("computer.not-a-capability").is_none());

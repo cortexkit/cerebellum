@@ -31,9 +31,10 @@ use crate::platform::containment::{
 };
 use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
-    DriverError, ElementResolutionResult, FocusQueryRequest, InputObservationRequest,
-    PermissionLiveness, PlatformDriver, ProcessGrant, SemanticDispatchRequest, SemanticDriverError,
-    SyntheticAction, SyntheticDispatchRequest, TargetDisposition,
+    DriverError, ElementResolutionResult, FocusQueryRequest, HeldStateDisposition,
+    InputObservationRequest, PermissionLiveness, PlatformDriver, ProcessEventRefusal, ProcessGrant,
+    SemanticDispatchRequest, SemanticDriverError, SyntheticAction, SyntheticDispatchRequest,
+    TargetDisposition,
 };
 use cerebellum_core::journal::redaction::Redactor;
 use cerebellum_core::journal::severity::SeverityTaxonomy;
@@ -284,6 +285,19 @@ pub enum DispatchError {
     },
     SemanticPathUnavailable,
     SyntheticUnavailable,
+    /// A per-process synthetic sequence stopped mid-flight.
+    ///
+    /// Not folded into `SyntheticUnavailable`: a sequence that stopped after
+    /// some of its events posted is a different fact from one that never
+    /// started. `posts_returned` says how far it got, and `held_state` says
+    /// what was done about input state the posted events left held -- a caller
+    /// told only "unavailable" would send its next action not knowing a key
+    /// or button may still be down in the target.
+    SyntheticSequenceFailed {
+        posts_returned: u64,
+        refusal: ProcessEventRefusal,
+        held_state: HeldStateDisposition,
+    },
     EnvelopeUnrecognized,
     UnsupportedMode,
     ObserverUnavailable,
@@ -324,6 +338,11 @@ mod reason_code_tests {
         let all = [
             DispatchError::InvalidRequest,
             DispatchError::SyntheticUnavailable,
+            DispatchError::SyntheticSequenceFailed {
+                posts_returned: 1,
+                refusal: ProcessEventRefusal::ProcessGone,
+                held_state: HeldStateDisposition::Unknown,
+            },
             DispatchError::EnvelopeUnrecognized,
             DispatchError::UnsupportedMode,
             DispatchError::ObserverUnavailable,
@@ -376,6 +395,7 @@ impl DispatchError {
             Self::SemanticDispatchTransient { .. } => "semantic_dispatch_transient",
             Self::SemanticPathUnavailable => "semantic_path_unavailable",
             Self::SyntheticUnavailable => "synthetic_unavailable",
+            Self::SyntheticSequenceFailed { .. } => "synthetic_sequence_failed",
             Self::EnvelopeUnrecognized => "envelope_unrecognized",
             Self::UnsupportedMode => "unsupported_mode",
             Self::ObserverUnavailable => "observer_unavailable",
@@ -807,7 +827,19 @@ impl<D: PlatformDriver> Dispatcher<D> {
         {
             return Err(DispatchError::ObserverUnavailable);
         }
-        if request.row.coordinate_addressed && !request.row.pixel_fallback_eligible {
+        // A coordinate-addressed action needs a row that authorizes naming a
+        // target by coordinate at all. That is either pixel-fallback
+        // eligibility -- the row may ground an element by pixels -- or the
+        // frozen grounding policy declaring the capability coordinate-
+        // addressable in its own right, which is how computer.move and
+        // computer.drag are frozen. Without one of those, a coordinate is an
+        // assertion nothing has grounded.
+        if request.row.coordinate_addressed
+            && !request.row.pixel_fallback_eligible
+            && crate::grounding::GroundingPolicy::coordinate_addressable_for_capability(
+                &request.row.capability_id,
+            ) != Some(true)
+        {
             return Err(DispatchError::GroundingUntrusted);
         }
         if request.mode == DispatchMode::Background && !request.row.synthetic_background_supported {
@@ -1014,8 +1046,23 @@ impl<D: PlatformDriver> Dispatcher<D> {
                         )?;
                         result
                     }
-                    Err(_) => {
-                        let refusal = DispatchError::SyntheticUnavailable;
+                    Err(error) => {
+                        // A sequence that stopped mid-flight keeps its whole
+                        // report: how many post calls returned, why it stopped,
+                        // and what became of input state its posted events left
+                        // held. Collapsing that into the transport-level
+                        // refusal would tell the caller nothing happened when a
+                        // key or button may still be down in the target.
+                        let refusal = match error {
+                            DriverError::SyntheticDispatchFailed(failure) => {
+                                DispatchError::SyntheticSequenceFailed {
+                                    posts_returned: failure.posts_returned,
+                                    refusal: failure.refusal,
+                                    held_state: failure.held_state,
+                                }
+                            }
+                            _ => DispatchError::SyntheticUnavailable,
+                        };
                         Self::finalize_audit_outcome(
                             audit,
                             state,

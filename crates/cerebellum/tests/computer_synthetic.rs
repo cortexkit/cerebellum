@@ -1,0 +1,587 @@
+//! Serving the five synthetic input capabilities over the wire.
+//!
+//! Every test here drives `ComputerPlane::serve` -- the boundary the wire
+//! route calls -- and asserts on the events the platform driver was asked to
+//! post, not on the returned outcome. A handler that answers "completed"
+//! while posting nothing has shipped from this repository twice, and an
+//! outcome assertion cannot see it.
+
+mod support;
+
+use std::sync::{Arc, Mutex};
+
+use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
+use cerebellum::management::ManagementPlane;
+use cerebellum_computer::capture::InMemoryCaptureBackend;
+use cerebellum_computer::platform::{
+    AccessibilityTreeRequest, AccessibilityTreeResult, AttendancePreconditionRequest,
+    AttendancePreconditionResult, CapabilityAdvertisementContext, CapabilityDeclaration,
+    DispatchResult, DriverError, EffectObservationRequest, EffectObservationResult, EffectStatus,
+    ElementResolutionRequest, ElementResolutionResult, FocusQueryRequest, FocusQueryResult,
+    FrontingSnapshot, HeldStateDisposition, InputObservationRequest, InputObservationResult,
+    InputObserverLiveness, PlatformDriver, PostCallFailure, ProcessEventRefusal, ProcessGrant,
+    SemanticDispatchRequest, SequencePostFailure, SyntheticAction, SyntheticDispatchRequest,
+    SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit,
+};
+use cerebellum_core::clock::FakeClock;
+use cerebellum_core::consent::ActionKind;
+use cerebellum_core::journal::{InMemoryJournalStorage, LifecycleState, ValidatedSeverityTaxonomy};
+use serde_json::{json, Value};
+use support::computer::{audit, grant, grant_lease, identity, management, TestRedactor, GRANTEE};
+
+/// One synthetic dispatch the platform driver was asked to perform.
+#[derive(Debug, Clone, PartialEq)]
+enum DispatchedCall {
+    PerPid(SyntheticDispatchRequest),
+    Global(SyntheticDispatchRequest),
+}
+
+/// What every driver instance built for one test shares: the calls made, and
+/// the answers to give. A test flips the answers between serves to exercise
+/// failure paths through the same plane.
+#[derive(Debug)]
+struct Shared {
+    calls: Vec<DispatchedCall>,
+    per_pid: Result<DispatchResult, DriverError>,
+    global: Result<DispatchResult, DriverError>,
+}
+
+impl Shared {
+    fn handle() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            calls: Vec::new(),
+            per_pid: Ok(DispatchResult {
+                accepted_by_platform: true,
+                effect_status: EffectStatus::EffectIndeterminate,
+                unreadable_subtrees: 0,
+            }),
+            global: Ok(DispatchResult {
+                accepted_by_platform: true,
+                effect_status: EffectStatus::EffectIndeterminate,
+                unreadable_subtrees: 0,
+            }),
+        }))
+    }
+}
+
+/// A platform driver that records the synthetic dispatches it is asked for
+/// and answers every observation the dispatch seam makes.
+struct SyntheticDriver(Arc<Mutex<Shared>>);
+
+impl SyntheticDriver {
+    fn factory(shared: Arc<Mutex<Shared>>) -> impl Fn() -> SyntheticDriver {
+        move || SyntheticDriver(Arc::clone(&shared))
+    }
+}
+
+impl PlatformDriver for SyntheticDriver {
+    fn capability_declarations(
+        &self,
+        _context: &CapabilityAdvertisementContext,
+    ) -> Vec<CapabilityDeclaration> {
+        Vec::new()
+    }
+
+    fn read_accessibility_tree(
+        &mut self,
+        _request: AccessibilityTreeRequest,
+    ) -> Result<AccessibilityTreeResult, DriverError> {
+        Err(DriverError::Unsupported("test reads no tree"))
+    }
+
+    fn resolve_element(
+        &mut self,
+        _request: ElementResolutionRequest,
+    ) -> Result<ElementResolutionResult, DriverError> {
+        Err(DriverError::Unsupported("test resolves no element"))
+    }
+
+    fn dispatch_semantic(
+        &mut self,
+        _request: SemanticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        Err(DriverError::Unsupported(
+            "test dispatches nothing semantically",
+        ))
+    }
+
+    fn dispatch_per_pid(
+        &mut self,
+        request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        let mut shared = self.0.lock().unwrap();
+        shared.calls.push(DispatchedCall::PerPid(request));
+        shared.per_pid.clone()
+    }
+
+    fn dispatch_global(
+        &mut self,
+        request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        let mut shared = self.0.lock().unwrap();
+        shared.calls.push(DispatchedCall::Global(request));
+        shared.global.clone()
+    }
+
+    fn query_focus(
+        &mut self,
+        _request: FocusQueryRequest,
+    ) -> Result<FocusQueryResult, DriverError> {
+        Ok(FocusQueryResult {
+            matches_target: true,
+        })
+    }
+
+    fn fronting_snapshot(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<FrontingSnapshot, DriverError> {
+        Err(DriverError::Unsupported("test captures no fronting state"))
+    }
+
+    fn input_observer_liveness(&self) -> InputObserverLiveness {
+        InputObserverLiveness {
+            session_tap_live: true,
+            raw_hid_live: true,
+            self_echo_filter_live: true,
+        }
+    }
+
+    fn observe_input(
+        &mut self,
+        _request: InputObservationRequest,
+    ) -> Result<InputObservationResult, DriverError> {
+        Ok(InputObservationResult {
+            human_or_ambiguous_input: false,
+            detection_latency_ms: 1,
+        })
+    }
+
+    fn observe_effect(
+        &mut self,
+        _request: EffectObservationRequest,
+    ) -> Result<EffectObservationResult, DriverError> {
+        Ok(EffectObservationResult {
+            // A post call returning is not an effect, and the five request
+            // schemas declare no post-condition to check: indeterminate is
+            // the only honest answer this driver can give.
+            status: EffectStatus::EffectIndeterminate,
+            failure_reason: Some("post_condition_undeclarable".to_string()),
+        })
+    }
+
+    fn verify_attendance(
+        &mut self,
+        _request: AttendancePreconditionRequest,
+    ) -> Result<AttendancePreconditionResult, DriverError> {
+        Ok(AttendancePreconditionResult {
+            valid: true,
+            lease_generation: Some("lease-1".to_string()),
+            age_ms: Some(1),
+        })
+    }
+}
+
+type TestPlane = ComputerPlane<
+    InMemoryCaptureBackend,
+    TestRedactor,
+    ValidatedSeverityTaxonomy,
+    InMemoryJournalStorage,
+    SyntheticDriver,
+>;
+
+fn plane_with(shared: &Arc<Mutex<Shared>>) -> TestPlane {
+    ComputerPlane::with_synthetic_driver(audit(), SyntheticDriver::factory(Arc::clone(shared)))
+}
+
+/// Snapshot the dispatch calls made so far, without holding the lock into an
+/// await point.
+fn dispatched_calls(shared: &Arc<Mutex<Shared>>) -> Vec<DispatchedCall> {
+    shared.lock().unwrap().calls.clone()
+}
+
+async fn serve(
+    plane: &TestPlane,
+    name: &str,
+    arguments: Value,
+    management: &Arc<ManagementPlane>,
+    clock: &FakeClock,
+) -> Value {
+    plane
+        .serve(
+            servable(name).expect("the capability is servable"),
+            &arguments,
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management,
+                clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("detect-only validation preserves the reply")
+}
+
+async fn management_leased(kind: ActionKind, clock: &FakeClock) -> Arc<ManagementPlane> {
+    let management = management();
+    grant_lease(&management, kind, clock).await;
+    management
+}
+
+fn type_request() -> Value {
+    json!({"target": "editor", "text": "hi", "replace_selection": false})
+}
+
+fn keys_request(keys: &[&str]) -> Value {
+    json!({"keys": keys, "target": "editor"})
+}
+
+fn scroll_request() -> Value {
+    json!({"target": "editor", "axis": "vertical", "amount_lines": -3})
+}
+
+fn move_request() -> Value {
+    json!({"to": "812,460"})
+}
+
+fn drag_request() -> Value {
+    json!({"from": "1,2", "to": "3.5,4", "button": "left", "modifiers": []})
+}
+
+/// Typing reaches the leased process generation as the exact text requested.
+#[tokio::test]
+async fn computer_type_dispatches_its_text_events_to_the_leased_process() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+    let before = plane.journal_entry_count().await;
+
+    let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
+
+    assert_eq!(
+        reply,
+        json!({
+            "outcome": "completed",
+            "containment_rung": "global_none",
+            "effect_status": "effect_indeterminate",
+        })
+    );
+    let calls = dispatched_calls(&shared);
+    let [DispatchedCall::PerPid(request)] = &calls[..] else {
+        panic!("type must deliver per-process exactly once: {calls:?}");
+    };
+    assert_eq!(request.target, grant());
+    assert_eq!(request.action, SyntheticAction::type_text("hi"));
+    assert!(
+        plane.journal_entry_count().await > before,
+        "a completed type left no audit record"
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A chord without Command is an editing keystroke and runs under compose.
+#[tokio::test]
+async fn computer_keys_dispatches_a_plain_chord_as_compose() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+
+    let reply = serve(
+        &plane,
+        "computer.keys",
+        keys_request(&["shift", "a"]),
+        &management,
+        &clock,
+    )
+    .await;
+
+    assert_eq!(reply["outcome"], "completed");
+    let calls = dispatched_calls(&shared);
+    let [DispatchedCall::PerPid(request)] = &calls[..] else {
+        panic!("keys must deliver per-process exactly once: {calls:?}");
+    };
+    assert_eq!(request.target, grant());
+    assert_eq!(
+        request.action,
+        SyntheticAction::key_combination(
+            SyntheticKey::A,
+            SyntheticKeyModifiers {
+                shift: true,
+                ..SyntheticKeyModifiers::NONE
+            },
+        )
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// Scrolling reaches the leased process as the wheel delta requested.
+#[tokio::test]
+async fn computer_scroll_dispatches_its_wheel_event_to_the_leased_process() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+
+    let reply = serve(
+        &plane,
+        "computer.scroll",
+        scroll_request(),
+        &management,
+        &clock,
+    )
+    .await;
+
+    assert_eq!(reply["outcome"], "completed");
+    let calls = dispatched_calls(&shared);
+    let [DispatchedCall::PerPid(request)] = &calls[..] else {
+        panic!("scroll must deliver per-process exactly once: {calls:?}");
+    };
+    assert_eq!(request.target, grant());
+    assert_eq!(
+        request.action,
+        SyntheticAction::scroll(SyntheticScrollUnit::Line, -3)
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// computer.move is frozen observed-only: it goes through the global path,
+/// never the per-process one, and its reply carries no containment rung.
+#[tokio::test]
+async fn computer_move_dispatches_through_the_global_path_while_observed() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+
+    let reply = serve(&plane, "computer.move", move_request(), &management, &clock).await;
+
+    assert_eq!(
+        reply,
+        json!({
+            "outcome": "completed",
+            "effect_status": "effect_indeterminate",
+        }),
+        "the move row declares no containment rung, so the reply carries none"
+    );
+    let calls = dispatched_calls(&shared);
+    let [DispatchedCall::Global(request)] = &calls[..] else {
+        panic!("move must deliver through the global path exactly once: {calls:?}");
+    };
+    assert_eq!(request.target, grant());
+    assert_eq!(
+        request.action,
+        SyntheticAction::move_pointer(SyntheticPoint { x: 812.0, y: 460.0 })
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// Dragging is mutate_durable outright and delivers its three events
+/// per-process: press, move, release at the requested points.
+#[tokio::test]
+async fn computer_drag_dispatches_its_drag_events_to_the_leased_process() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+
+    let reply = serve(&plane, "computer.drag", drag_request(), &management, &clock).await;
+
+    assert_eq!(
+        reply,
+        json!({
+            "outcome": "completed",
+            "effect_status": "effect_indeterminate",
+        }),
+        "the drag row declares no containment rung, so the reply carries none"
+    );
+    let calls = dispatched_calls(&shared);
+    let [DispatchedCall::PerPid(request)] = &calls[..] else {
+        panic!("drag must deliver per-process exactly once: {calls:?}");
+    };
+    assert_eq!(request.target, grant());
+    assert_eq!(
+        request.action,
+        SyntheticAction::drag_pointer(
+            SyntheticPoint { x: 1.0, y: 2.0 },
+            SyntheticPoint { x: 3.5, y: 4.0 },
+        )
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A lease that authorised observing an application authorises no input into
+/// it. Asserted for each of the five, and by the ABSENCE of a dispatched
+/// event and of a journal entry: a handler that asked the wrong action kind
+/// would pass the lease check and post.
+#[tokio::test]
+async fn an_observe_only_lease_is_refused_for_each_of_the_five() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Observe, &clock).await;
+
+    let cases = [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["s"])),
+        ("computer.scroll", scroll_request()),
+        ("computer.move", move_request()),
+        ("computer.drag", drag_request()),
+    ];
+    for (name, request) in cases {
+        let before = plane.journal_entry_count().await;
+        let reply = serve(&plane, name, request, &management, &clock).await;
+        assert_eq!(
+            reply["outcome"], "no_lease",
+            "{name} ran under an observe-only lease"
+        );
+        assert_eq!(
+            plane.journal_entry_count().await,
+            before,
+            "{name} journaled an action it was not authorised for"
+        );
+    }
+    assert!(
+        dispatched_calls(&shared).is_empty(),
+        "a refused action still posted events"
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// The vocabulary's durable_chord override: a Command chord escalates to
+/// mutate_durable, so a compose lease does not cover it and a durable one
+/// does. If every chord were treated as compose, the first half of this test
+/// would dispatch under the compose lease and fail by name.
+#[tokio::test]
+async fn a_command_chord_demands_a_mutate_durable_lease() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+
+    let compose_only = management_leased(ActionKind::Compose, &clock).await;
+    let before = plane.journal_entry_count().await;
+    let reply = serve(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "s"]),
+        &compose_only,
+        &clock,
+    )
+    .await;
+    assert_eq!(
+        reply["outcome"], "no_lease",
+        "a durable chord ran under a compose-only lease"
+    );
+    assert_eq!(plane.journal_entry_count().await, before);
+    assert!(dispatched_calls(&shared).is_empty());
+
+    let durable = management_leased(ActionKind::MutateDurable, &clock).await;
+    let reply = serve(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "s"]),
+        &durable,
+        &clock,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed");
+    let calls = dispatched_calls(&shared);
+    let [DispatchedCall::PerPid(request)] = &calls[..] else {
+        panic!("the durable chord did not dispatch: {calls:?}");
+    };
+    assert_eq!(
+        request.action,
+        SyntheticAction::key_combination(
+            SyntheticKey::S,
+            SyntheticKeyModifiers {
+                command: true,
+                ..SyntheticKeyModifiers::NONE
+            },
+        )
+    );
+}
+
+/// A mid-sequence failure whose held state is unknown must reach the caller
+/// as itself. A caller answered a generic failure would send its next action
+/// into a target that may still have a key or button down.
+#[tokio::test]
+async fn an_unknown_held_state_reaches_the_caller_unflattened() {
+    let shared = Shared::handle();
+    shared.lock().unwrap().per_pid =
+        Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: 2,
+            refusal: ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
+                "framework call failed",
+            )),
+            held_state: HeldStateDisposition::Unknown,
+        }));
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+
+    let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
+
+    assert_eq!(
+        reply,
+        json!({
+            "outcome": "held_state_unknown",
+            "containment_rung": "global_none",
+            "effect_status": "effect_indeterminate",
+        })
+    );
+    assert!(plane.result_schema_findings().is_empty());
+
+    // The distinction is the held state, not the failure: a failure that
+    // provably released everything is a dispatch failure and nothing more.
+    shared.lock().unwrap().per_pid =
+        Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: 1,
+            refusal: ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
+                "framework call failed",
+            )),
+            held_state: HeldStateDisposition::Released { posts_returned: 1 },
+        }));
+    let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
+    assert_eq!(reply["outcome"], "dispatch_failed");
+}
+
+/// Intent is journaled before dispatch and finalised before the caller is
+/// answered, so a failing dispatch still leaves a COMPLETED audit record --
+/// never an open one that a crash would leave indeterminate. Asserted on the
+/// obligation's lifecycle, because a count of entries cannot tell a finalised
+/// record from one left open mid-flight.
+#[tokio::test]
+async fn a_failing_dispatch_still_finalises_its_audit_entry() {
+    let shared = Shared::handle();
+    shared.lock().unwrap().per_pid =
+        Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: 1,
+            refusal: ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
+                "framework call failed",
+            )),
+            held_state: HeldStateDisposition::Unknown,
+        }));
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+
+    let before = plane.journal_entry_count().await;
+    let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
+    assert_eq!(reply["outcome"], "held_state_unknown");
+    let after = plane.journal_entry_count().await;
+    assert!(
+        after > before,
+        "a dispatch that failed left no audit record at all"
+    );
+
+    for sequence in before..after {
+        assert_eq!(
+            plane.obligation_lifecycle(sequence).await,
+            Some(LifecycleState::Finalized),
+            "obligation {sequence} was left open when the caller was answered"
+        );
+    }
+}

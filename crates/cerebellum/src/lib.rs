@@ -1508,8 +1508,22 @@ impl Planes {
             launch_service,
             management,
             #[cfg(target_os = "macos")]
-            computer: computer_capability::production_audit()
-                .map(|audit| Arc::new(computer_capability::ComputerPlane::new(audit))),
+            computer: computer_capability::production_audit().map(|audit| {
+                Arc::new(computer_capability::ComputerPlane::with_synthetic_driver(
+                    audit,
+                    // Built fresh per dispatch, as the click handler builds
+                    // its own: the driver caches accessibility trees, and a
+                    // stale cache is a resolved element in a process that may
+                    // be gone. Post-condition evaluation is disabled because
+                    // none of the synthetic request schemas declares one; the
+                    // effect of a post call is recorded as indeterminate
+                    // rather than claimed.
+                    || {
+                        cerebellum_computer::platform::MacOs26PlatformDriver::default()
+                            .without_expected_post_condition()
+                    },
+                ))
+            }),
             #[cfg(target_os = "macos")]
             computer_admitted: Arc::new(
                 computer_release_evidence(&default_computer_context())
