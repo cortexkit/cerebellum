@@ -25,7 +25,9 @@ use cerebellum_computer::platform::{
 };
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::consent::ActionKind;
-use cerebellum_core::journal::{InMemoryJournalStorage, LifecycleState, ValidatedSeverityTaxonomy};
+use cerebellum_core::journal::{
+    InMemoryJournalStorage, JournalStorage, LifecycleState, ValidatedSeverityTaxonomy,
+};
 use serde_json::{json, Value};
 use support::computer::{audit, grant, grant_lease, identity, management, TestRedactor, GRANTEE};
 
@@ -584,4 +586,136 @@ async fn a_failing_dispatch_still_finalises_its_audit_entry() {
             "obligation {sequence} was left open when the caller was answered"
         );
     }
+}
+
+/// Typed text must not reach the durable journal.
+///
+/// `computer.type` carries whatever a caller sends, which on a login form is a
+/// password. The journal is durable AND enrolled for fleet backup in
+/// engram-catalog.json, so text landing there is text that gets backed up.
+///
+/// Today the actuation descriptor carries capability, containment and
+/// observation and nothing else, so this holds by construction rather than by a
+/// filter. That is exactly why it needs a fence: the property is invisible in
+/// the code that provides it, and adding the action to the record "for
+/// diagnostics" would read as an improvement.
+///
+/// The scan decodes base64 as well as reading the raw JSON, because journal byte
+/// fields ARE base64 since the v2 encoding change. A plain substring search over
+/// the serialized state would silently stop catching leaks the moment a secret
+/// travelled inside a byte field -- passing for the wrong reason, which is worse
+/// than failing.
+#[tokio::test]
+async fn typed_text_never_reaches_the_journal() {
+    const SECRET: &str = "hunter2-Sw0rdf1sh-correct-horse";
+
+    let shared = Shared::handle();
+    let storage = InMemoryJournalStorage::new();
+    let plane = ComputerPlane::with_synthetic_driver(
+        support::computer::audit_with_storage(storage.clone()),
+        SyntheticDriver::factory(Arc::clone(&shared)),
+    );
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+
+    let reply = serve(
+        &plane,
+        "computer.type",
+        json!({"target": "field", "text": SECRET, "replace_selection": false}),
+        &management,
+        &clock,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(
+        plane.journal_entry_count().await > 0,
+        "the action must be journaled, or this test proves nothing"
+    );
+
+    // Prove the scanner can find a secret before trusting it to report none.
+    // A base64 decoder that silently returns nothing would make every assertion
+    // below pass for the wrong reason -- and it is the failure mode with no
+    // symptom, since a leak and a broken detector look identical from here.
+    let planted = format!("{{\"bytes\":\"{}\"}}", base64_of(SECRET.as_bytes()));
+    assert!(
+        base64_decoded_strings(&planted)
+            .iter()
+            .any(|text| text.contains(SECRET)),
+        "the scanner cannot find a secret it was handed, so it cannot report their absence"
+    );
+
+    let state = storage.load().expect("journal state loads");
+    let serialized = serde_json::to_string(&state).expect("journal state serializes");
+    assert!(
+        !serialized.contains(SECRET),
+        "the typed text is in the journal verbatim"
+    );
+
+    // Every string in the record, decoded as base64 where it decodes. A byte
+    // field holding the secret would not match the raw scan above.
+    let decoded_hits = base64_decoded_strings(&serialized)
+        .into_iter()
+        .filter(|text| text.contains(SECRET))
+        .count();
+    assert_eq!(
+        decoded_hits, 0,
+        "the typed text is in the journal inside an encoded field"
+    );
+}
+
+/// Decode every base64-looking token in the text, keeping what decodes to UTF-8.
+fn base64_decoded_strings(text: &str) -> Vec<String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    for token in
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='))
+    {
+        if token.len() < 8 {
+            continue;
+        }
+        let mut buffer = Vec::new();
+        let mut accumulator = 0u32;
+        let mut bits = 0u32;
+        let mut usable = true;
+        for byte in token.bytes().take_while(|b| *b != b'=') {
+            let Some(index) = ALPHABET.iter().position(|c| *c == byte) else {
+                usable = false;
+                break;
+            };
+            accumulator = (accumulator << 6) | index as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                buffer.push((accumulator >> bits) as u8);
+            }
+        }
+        if usable {
+            if let Ok(text) = String::from_utf8(buffer) {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
+/// Encode bytes as base64, for planting a known positive in the scan self-check.
+fn base64_of(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let triple = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((triple >> (18 - i * 6)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

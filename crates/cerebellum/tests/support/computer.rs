@@ -118,7 +118,12 @@ pub fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemor
     audit_with_storage(InMemoryJournalStorage::new())
 }
 
-fn audit_with_storage<S: JournalStorage>(
+/// The same audit, over storage the caller keeps a handle to.
+///
+/// Exposed so a test can read the journal BACK -- cloning
+/// `InMemoryJournalStorage` shares its state -- which is the only way to assert
+/// what a record does NOT contain.
+pub fn audit_with_storage<S: JournalStorage>(
     storage: S,
 ) -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, S> {
     ComputerAudit::new(
