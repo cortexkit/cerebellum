@@ -1027,7 +1027,18 @@ mod tests {
         );
     }
 
-    /// Binding every release input does not activate another actuating row.
+    /// Binding every release input does not, by itself, activate an actuating row.
+    ///
+    /// The context below binds all six attestations and supplies NO permission
+    /// readings. Both are required, and this fixes the direction that matters:
+    /// a build carrying every review is still refused on a machine that has not
+    /// granted the services the vocabulary names. A reviewer approving the code
+    /// does not thereby approve access to a stranger's desktop.
+    ///
+    /// The suppression reason changed when the wire handlers landed -- it was
+    /// "no wire serving handler", which stopped being true -- and the reason is
+    /// asserted rather than only the refusal, because a row refused for a reason
+    /// nobody checks can start being refused for a reason that is wrong.
     #[test]
     fn other_actuating_rows_remain_suppressed_for_fully_bound_release_inputs() {
         let driver = MacOs26PlatformDriver::default();
@@ -1062,7 +1073,7 @@ mod tests {
                 .suppression_reason
                 .expect("a suppressed capability states why");
             assert!(
-                reason.contains("no wire serving handler"),
+                reason.contains("permission is not established"),
                 "{id} is suppressed for an unexpected reason: {reason}"
             );
         }

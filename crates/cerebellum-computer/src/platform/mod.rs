@@ -355,12 +355,50 @@ fn capability_declaration(
             }
         };
         advertised = suppression_reason.is_none();
+    } else if matches!(
+        id,
+        "computer.type" | "computer.keys" | "computer.scroll" | "computer.move" | "computer.drag"
+    ) {
+        // The synthetic rows. Their wire handlers exist now, so the gate that
+        // was computed and discarded here is the one that decides them.
+        //
+        // Each condition names itself rather than collapsing into one reason:
+        // an unbound review is a build-time omission an operator cannot fix on
+        // the machine, while a missing permission is the opposite. A reader
+        // given one message for both has to rule out the other by hand.
+        suppression_reason = if !context.inputs.vocabulary_ready() {
+            Some("computer action vocabulary input unresolved".to_string())
+        } else if context.inputs.input_review_revision.is_none() {
+            Some("synthetic input review revision is not bound".to_string())
+        } else if context.inputs.attendance_contract_owner.is_none()
+            || context.inputs.attendance_contract_revision.is_none()
+        {
+            Some("attendance contract inputs are not bound".to_string())
+        } else if !context.inputs.input_dispatch_ready() {
+            Some("release signing topology revision is not bound".to_string())
+        } else {
+            // Every permission the frozen vocabulary names for THIS row, not a
+            // fixed set: computer.move needs only input monitoring, while
+            // computer.type needs accessibility and post-event as well. Applying
+            // one set to all five would either withhold a row whose permissions
+            // are satisfied or advertise one whose are not.
+            permissions
+                .iter()
+                .find_map(|service| match context.startup.permissions.state(*service) {
+                    PermissionLiveness::Live => None,
+                    PermissionLiveness::Unavailable => {
+                        Some(format!("{service:?} permission is not granted"))
+                    }
+                    PermissionLiveness::GrantedPendingRelaunch => Some(format!(
+                        "{service:?} permission is granted but not usable until this process restarts"
+                    )),
+                    PermissionLiveness::Unresolved => {
+                        Some(format!("{service:?} permission is not established"))
+                    }
+                })
+        };
+        advertised = suppression_reason.is_none();
     }
-    // Evaluate the synthetic-input gate for reporting and review, but do not
-    // let it advertise any capability here. Semantic actuation is governed
-    // separately, so the five remaining actuating rows retain the unconditional
-    // suppression set above.
-    let _synthetic_inputs_resolved = context.inputs.input_dispatch_ready();
     CapabilityDeclaration {
         capability_id: id.to_string(),
         action_kind,
@@ -376,7 +414,12 @@ fn capability_declaration(
         } else {
             SupportState::Unsupported
         },
-        synthetic_background: if private_envelope_recognized {
+        // Supported on the platform itself rather than on a private envelope:
+        // the per-process path is public CGEventPostToPid, which needs no symbol
+        // resolution. The private-envelope flag is still carried for the
+        // OBSERVED path and for callers that ask about it, but it does not
+        // decide whether background delivery exists.
+        synthetic_background: if platform_available {
             SupportState::Supported
         } else {
             SupportState::Unsupported
