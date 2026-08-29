@@ -112,6 +112,20 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
             // the deciding measurement -- whether CGEventPostToPid refuses when
             // accessibility is denied -- has never been taken: every live run so
             // far had it granted.
+            //
+            // Two cheap lines were tried and neither answers it, so do not spend
+            // them again. CGEvent.h documents an accessibility requirement for
+            // event TAPS ("may only receive key up and down events if access for
+            // assistive devices is enabled") and says nothing at all about
+            // posting. And computer.move cannot be argued into needing
+            // accessibility by its own dispatch path: it carries a placeholder
+            // element name and a coordinate, resolving no accessibility element.
+            //
+            // What remains is an experiment, not a reading: post to a target
+            // from a process whose accessibility grant is denied, and see
+            // whether the event lands. It needs a machine where that grant can
+            // be revoked and restored, which on this desk would disturb the TCC
+            // binding the signed daemon depends on.
             liveness: match cerebellum_macos::event_post_access() {
                 cerebellum_macos::InputMonitoringAccess::Granted => PermissionLiveness::Live,
                 cerebellum_macos::InputMonitoringAccess::Denied
