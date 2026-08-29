@@ -51,7 +51,7 @@ fn valid_context() -> ComputerCapabilityAdvertisementContext {
 }
 
 fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> Vec<String> {
-    capability_declarations(context, true, true)
+    capability_declarations(context, true)
         .into_iter()
         .filter(|declaration| declaration.advertised)
         .map(|declaration| declaration.capability_id)
@@ -222,7 +222,7 @@ fn caller_manifest_requires_the_semantic_review_to_advertise_computer_click() {
 #[test]
 fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     let declaration_reason = |context: &ComputerCapabilityAdvertisementContext| {
-        capability_declarations(context, true, true)
+        capability_declarations(context, true)
             .into_iter()
             .find(|declaration| declaration.capability_id == "computer.screenshot")
             .expect("the frozen rows always include screenshot")

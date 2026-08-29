@@ -326,7 +326,7 @@ fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
         permissions: PermissionLivenessReport::default(),
         startup: StartupCapabilityProbe::default(),
     };
-    let declarations = capability_declarations(&context, false, true);
+    let declarations = capability_declarations(&context, true);
     let move_declaration = declarations
         .iter()
         .find(|item| item.capability_id == "computer.move")

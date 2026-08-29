@@ -546,7 +546,7 @@ impl MacOs26PlatformDriver {
         &self,
         context: &CapabilityAdvertisementContext,
     ) -> Vec<CapabilityDeclaration> {
-        capability_declarations(context, self.startup.private_envelope_recognized, true)
+        capability_declarations(context, true)
     }
 
     #[cfg(test)]
@@ -555,7 +555,7 @@ impl MacOs26PlatformDriver {
         id: &str,
         context: &CapabilityAdvertisementContext,
     ) -> CapabilityDeclaration {
-        capability_declaration(id, context, self.startup.private_envelope_recognized, true)
+        capability_declaration(id, context, true)
     }
 }
 
