@@ -54,11 +54,12 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
 
     let off_main = cerebellum_macos::is_off_main_thread();
 
-    // Both services are read, because the action vocabulary requires different
-    // ones per capability: capture needs screen recording, and every capability
-    // that acts on an application needs accessibility. Reading only one leaves
-    // the other's absence to surface as a runtime failure at the moment an
-    // action is attempted, rather than as a capability that was never offered.
+    // All three services the vocabulary names are read, because it requires
+    // different ones per capability: capture needs screen recording, everything
+    // acting on an application needs accessibility, and the synthetic input rows
+    // additionally name input monitoring. Leaving one unread is not neutral --
+    // an unresolvable requirement suppresses its capability, so a service nobody
+    // probes silently withholds every row that depends on it.
     vec![
         PermissionProbeResult {
             service: PermissionService::ScreenRecording,
@@ -82,6 +83,43 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
                 PermissionLiveness::Live
             } else {
                 PermissionLiveness::Unavailable
+            },
+            responsible_process: attributed_to.clone(),
+            off_main,
+        },
+        PermissionProbeResult {
+            service: PermissionService::PostEvent,
+            // The posting half of the same IOKit TCC pair, read separately
+            // because the vocabulary requires them separately: computer.move
+            // names only monitoring while typing names posting too.
+            liveness: match cerebellum_macos::event_post_access() {
+                cerebellum_macos::InputMonitoringAccess::Granted => PermissionLiveness::Live,
+                cerebellum_macos::InputMonitoringAccess::Denied
+                | cerebellum_macos::InputMonitoringAccess::Undetermined
+                | cerebellum_macos::InputMonitoringAccess::Unrecognised(_) => {
+                    PermissionLiveness::Unavailable
+                }
+            },
+            responsible_process: attributed_to.clone(),
+            off_main,
+        },
+        PermissionProbeResult {
+            service: PermissionService::InputMonitoring,
+            // Non-prompting, like the accessibility read beside it:
+            // IOHIDCheckAccess asks, IOHIDRequestAccess prompts, and only the
+            // asking one belongs at startup.
+            //
+            // Undetermined maps to Unavailable rather than to Live. It means no
+            // decision has been recorded, which is not a grant -- and treating
+            // an absent decision as permission is how a capability starts
+            // claiming an authority nobody gave it.
+            liveness: match cerebellum_macos::input_monitoring_access() {
+                cerebellum_macos::InputMonitoringAccess::Granted => PermissionLiveness::Live,
+                cerebellum_macos::InputMonitoringAccess::Denied
+                | cerebellum_macos::InputMonitoringAccess::Undetermined
+                | cerebellum_macos::InputMonitoringAccess::Unrecognised(_) => {
+                    PermissionLiveness::Unavailable
+                }
             },
             responsible_process: attributed_to,
             off_main,
@@ -602,15 +640,16 @@ mod tests {
             required.extend(services);
         }
 
-        // Required by capabilities that actuate through synthetic input. No code
-        // in this driver posts an event or observes input, so probing for these
-        // would ask about a facility that does not exist.
-        let unimplemented: BTreeSet<_> = [
-            PermissionService::PostEvent,
-            PermissionService::InputMonitoring,
-        ]
-        .into_iter()
-        .collect();
+        // Empty, and that is the assertion. Every service the frozen vocabulary
+        // names is now probed: post-event and input monitoring joined the report
+        // when the synthetic input path was built, and until they did, the rows
+        // requiring them were suppressed as unresolvable rather than refused --
+        // a capability withheld because nobody asked the system about it.
+        //
+        // Kept as a set rather than inlined as `required == probed` so that a
+        // service deliberately left unprobed in future has somewhere to be
+        // declared, with this comment demanding a reason.
+        let unimplemented: BTreeSet<PermissionService> = BTreeSet::new();
 
         let unprobed: BTreeSet<_> = required.difference(&probed).copied().collect();
         assert_eq!(

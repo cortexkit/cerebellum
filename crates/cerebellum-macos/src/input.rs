@@ -208,6 +208,66 @@ impl std::error::Error for InputEventConstructionError {}
 #[cfg(target_os = "macos")]
 mod framework {
     use objc2_core_foundation::{CFRetained, CGPoint};
+
+    // The Input Monitoring TCC service, read through IOKit's non-prompting
+    // query. There is no objc2 binding for it, so it is declared here in the
+    // one crate permitted to hold unsafe rather than reaching for it from a
+    // caller that forbids it.
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOHIDCheckAccess(request: u32) -> u32;
+    }
+
+    /// What macOS says about this process's Input Monitoring grant.
+    ///
+    /// Three states rather than a bool, because "not yet decided" is a real
+    /// answer distinct from a refusal: an undetermined grant becomes granted the
+    /// moment a user approves a prompt, while a denial stands until they change
+    /// it in System Settings. Collapsing them would tell an operator to go
+    /// change a setting that does not yet have a row.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum InputMonitoringAccess {
+        Granted,
+        Denied,
+        Undetermined,
+        /// IOKit answered with a value this build does not recognise. Carried
+        /// rather than folded into Denied so an OS change is visible as itself.
+        Unrecognised(u32),
+    }
+
+    /// Read the Input Monitoring grant without prompting.
+    ///
+    /// `kIOHIDRequestTypeListenEvent` (1) is the listening grant, which is what
+    /// System Settings calls Input Monitoring. This does NOT request access:
+    /// `IOHIDRequestAccess` is the prompting call and is deliberately not used,
+    /// matching how the accessibility probe avoids its prompting variant.
+    pub fn input_monitoring_access() -> InputMonitoringAccess {
+        const LISTEN_EVENT: u32 = 1;
+        hid_access(LISTEN_EVENT)
+    }
+
+    /// Read the event-posting grant without prompting.
+    ///
+    /// `kIOHIDRequestTypePostEvent` (0) is the posting side of the same TCC
+    /// pair. Read separately from the listening grant because the frozen
+    /// vocabulary names them as separate requirements: `computer.move` needs
+    /// only monitoring, while typing needs posting too, and one reading
+    /// substituted for the other would answer a question nobody asked.
+    pub fn event_post_access() -> InputMonitoringAccess {
+        const POST_EVENT: u32 = 0;
+        hid_access(POST_EVENT)
+    }
+
+    fn hid_access(request: u32) -> InputMonitoringAccess {
+        // SAFETY: takes an integer request kind, returns an integer status, and
+        // presents no prompt. It performs no input action.
+        match unsafe { IOHIDCheckAccess(request) } {
+            0 => InputMonitoringAccess::Granted,
+            1 => InputMonitoringAccess::Denied,
+            2 => InputMonitoringAccess::Undetermined,
+            other => InputMonitoringAccess::Unrecognised(other),
+        }
+    }
     use objc2_core_graphics::{
         CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventType, CGMouseButton,
         CGScrollEventUnit,
@@ -393,8 +453,8 @@ mod framework {
 
 #[cfg(target_os = "macos")]
 pub use framework::{
-    key_combination_events, mouse_drag_events, mouse_move_event, scroll_wheel_event,
-    text_input_events,
+    event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
+    mouse_move_event, scroll_wheel_event, text_input_events, InputMonitoringAccess,
 };
 
 #[cfg(test)]

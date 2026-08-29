@@ -56,8 +56,8 @@ pub use accessibility::{
 };
 #[cfg(target_os = "macos")]
 pub use input::{
-    key_combination_events, mouse_drag_events, mouse_move_event, scroll_wheel_event,
-    text_input_events,
+    event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
+    mouse_move_event, scroll_wheel_event, text_input_events, InputMonitoringAccess,
 };
 #[cfg(any(target_os = "macos", test))]
 pub use input::{EventPoint, InputEventConstructionError, KeyModifiers, ScrollUnit, VirtualKey};

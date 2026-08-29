@@ -413,7 +413,18 @@ fn declaration_gate_passes(
         ]
         .iter()
         .all(|gate| gate_passes(outcomes, gate))
-            && context.startup.private_envelope_recognized
+        // Deliberately NOT gated on private_envelope_recognized. That flag
+        // asks whether this build resolved private SkyLight symbols, which
+        // is evidence for a design this module does not use: per-process
+        // delivery goes through the PUBLIC CGEventPostToPid, measured on
+        // macOS 26 to reach an unfocused application with no focus change
+        // and no private symbol involved.
+        //
+        // Requiring it would withhold every synthetic row forever, since
+        // production supplies no envelope revision and no resolved symbols
+        // by construction. The permissions the vocabulary names are what
+        // actually gate these rows, and they are checked where every
+        // declaration's permissions are checked.
     } else {
         declaration.capability_id == "computer.wait"
     }
