@@ -33,11 +33,14 @@ use crate::browser_type::{
 };
 use crate::journal::JournalConfig;
 use subc_protocol::manifest::CapabilityDeclarations;
-use subc_protocol::manifest::ManifestProvenance;
 use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
     ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
     StorageScope, Tool, TrustTier,
+};
+use subc_protocol::manifest::{
+    ManifestProvenance, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+    SignalCadence,
 };
 use subc_protocol::PROTOCOL_VERSION;
 
@@ -210,6 +213,64 @@ fn attestable_commit(rev: &str, tree: &str) -> Option<String> {
     Some(rev.to_string())
 }
 
+/// The recurring work this module starts on its own.
+///
+/// An empty list would be an affirmative claim of none, and it would be false:
+/// two timers run without a request behind them, and one of them can end a
+/// browser session a caller believes is still open.
+///
+/// Both cadences are `Derived` rather than `Literal`. Neither interval is a
+/// compile-time constant -- each is computed from configuration this operator
+/// supplied -- and copying a configured value in as a literal would state a
+/// number that a different `cerebellum.jsonc` makes wrong.
+fn self_signals() -> Vec<SelfSignalDeclaration> {
+    vec![
+        SelfSignalDeclaration {
+            name: "dispatch_heartbeat_restamp".to_string(),
+            kind: SelfSignalKind::Heartbeat,
+            // Observe: it re-stamps an atomic so an idle module does not read as
+            // degraded. Nothing outside this process changes.
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: Some(SignalCadence::Derived {
+                source: "half of health.dispatch_heartbeat_stale_ms".to_string(),
+            }),
+            // No external surface: the effect is confined to this process's own
+            // health reading, so naming a domain would invent a reach it has not.
+            domain: None,
+            note: Some(
+                "Re-stamps the dispatch heartbeat on a bounded idle wake so an \
+                 idle module does not report degraded. It wakes only the input \
+                 wait, so a wedged handler still ages into degraded."
+                    .to_string(),
+            ),
+        },
+        SelfSignalDeclaration {
+            name: "browser_session_idle_sweep".to_string(),
+            kind: SelfSignalKind::Sweep,
+            // Mutate, and the honest label: this observes browser exits and
+            // expires idle sessions, which tears a browser down and writes its
+            // profile to disk. Declaring it Observe because it usually finds
+            // nothing would describe the common case rather than the authority.
+            effect: SelfSignalEffect::Mutate,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: Some(SignalCadence::Derived {
+                source: "minimum of browser.browser_idle_timeout_ms, \
+                         browser.browser_exit_observation_deadline_ms, and 50ms"
+                    .to_string(),
+            }),
+            domain: Some("browser-session".to_string()),
+            note: Some(
+                "Observes browser process exits and expires idle sessions. \
+                 Expiry runs the full graceful teardown, so a browser is asked \
+                 to close and flush its profile before any force-kill. Present \
+                 only when a browser is configured."
+                    .to_string(),
+            ),
+        },
+    ]
+}
+
 pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
@@ -217,6 +278,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
         provenance: build_provenance(),
+        self_signals: Some(self_signals()),
         provides: vec![
             ProviderRole::ToolProvider {
                 tools: if browser_configured {
@@ -634,6 +696,47 @@ mod tests {
                 "{sentinel} is a stand-in for a missing commit, not a commit"
             );
         }
+    }
+
+    /// The idle sweep declares that it MUTATES.
+    ///
+    /// It expires idle browser sessions, which tears a browser down and writes
+    /// its profile to disk -- a caller's live session ending without a caller
+    /// asking. Declaring it Observe would be defensible on frequency, since it
+    /// usually finds nothing, and wrong on authority: the declaration states
+    /// what the signal MAY do, and an analyst reading it is asking what can
+    /// happen without a request behind it.
+    ///
+    /// Asserted by name rather than over the list, so a second mutating signal
+    /// added later cannot satisfy this by standing in for the sweep.
+    #[test]
+    fn the_browser_idle_sweep_declares_itself_mutating() {
+        let signals = super::self_signals();
+        let sweep = signals
+            .iter()
+            .find(|signal| signal.name == "browser_session_idle_sweep")
+            .expect("the idle sweep is declared");
+        assert_eq!(sweep.effect, SelfSignalEffect::Mutate);
+        assert!(
+            sweep
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("teardown")),
+            "the note must say the expiry runs a graceful teardown: {:?}",
+            sweep.note
+        );
+
+        // The heartbeat is the contrast. Both are periodic and unrequested; only
+        // one can end something, and a reader must be able to tell them apart.
+        let heartbeat = signals
+            .iter()
+            .find(|signal| signal.name == "dispatch_heartbeat_restamp")
+            .expect("the heartbeat is declared");
+        assert_eq!(heartbeat.effect, SelfSignalEffect::Observe);
+        assert!(
+            heartbeat.domain.is_none(),
+            "the heartbeat touches no external surface, so it must name no domain"
+        );
     }
 
     /// The linked crate's version is a compile-time constant of the code in this
