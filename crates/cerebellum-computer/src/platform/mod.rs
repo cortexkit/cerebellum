@@ -233,7 +233,6 @@ impl ImmutableReleaseInputs {
 /// because waiting has no platform operation to perform.
 pub fn capability_declarations(
     context: &CapabilityAdvertisementContext,
-    private_envelope_recognized: bool,
     platform_available: bool,
 ) -> Vec<CapabilityDeclaration> {
     [
@@ -247,14 +246,19 @@ pub fn capability_declarations(
         "computer.wait",
     ]
     .into_iter()
-    .map(|id| capability_declaration(id, context, private_envelope_recognized, platform_available))
+    .map(|id| capability_declaration(id, context, platform_available))
     .collect()
 }
 
+/// One row's declaration.
+///
+/// The private-envelope flag was a parameter here and is gone: it gated
+/// synthetic support on evidence that this build resolved private SkyLight
+/// symbols, which no path uses. The flag still exists on the startup probe as a
+/// reported fact; it decides nothing.
 fn capability_declaration(
     id: &str,
     context: &CapabilityAdvertisementContext,
-    private_envelope_recognized: bool,
     platform_available: bool,
 ) -> CapabilityDeclaration {
     let action_kind = if id == "computer.drag" {
@@ -1386,7 +1390,7 @@ mod tests {
             permissions: PermissionLivenessReport::default(),
             startup: StartupCapabilityProbe::default(),
         };
-        let advertised: Vec<_> = capability_declarations(&context, false, false)
+        let advertised: Vec<_> = capability_declarations(&context, false)
             .into_iter()
             .filter(|declaration| declaration.advertised)
             .map(|declaration| declaration.capability_id)

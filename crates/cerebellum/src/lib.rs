@@ -489,11 +489,8 @@ fn gate_admitted_computer_declarations<'a>(
 fn canonical_computer_declarations(
     context: &ComputerCapabilityAdvertisementContext,
 ) -> (Vec<ComputerCapabilityDeclaration>, ComputerGateOutcomes) {
-    let declarations = computer::platform::capability_declarations(
-        context,
-        context.startup.private_envelope_recognized,
-        cfg!(target_os = "macos"),
-    );
+    let declarations =
+        computer::platform::capability_declarations(context, cfg!(target_os = "macos"));
     let outcomes = computer_gate_outcomes(context);
     (declarations, outcomes)
 }
