@@ -108,6 +108,49 @@ impl ExecutableIdentityClaim {
     }
 }
 
+/// One executable image observed during an identity walk.
+///
+/// The path is diagnostic context for a human reading a refusal; it is never
+/// part of identity and must not participate in any comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableIdentityRecord {
+    pub claim: ExecutableIdentityClaim,
+    pub path: Option<PathBuf>,
+}
+
+impl PartialEq for ExecutableIdentityRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.claim == other.claim
+    }
+}
+
+impl Eq for ExecutableIdentityRecord {}
+
+/// Completeness of an executable identity walk, independent of vector length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "completeness", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutableIdentityChain {
+    /// The walk ended at an image matching the configured identity.
+    WalkedToMatch { hops: Vec<ExecutableIdentityRecord> },
+    /// The walk stopped at its hop bound before finding a matching image.
+    StoppedAtHopLimit { hops: Vec<ExecutableIdentityRecord> },
+    /// No walk was performed; the platform supplied one post-exec attestation.
+    NoWalkPerformed {
+        attestation: ExecutableIdentityRecord,
+    },
+}
+
+impl ExecutableIdentityChain {
+    fn matched_claim(&self) -> Option<&ExecutableIdentityClaim> {
+        match self {
+            Self::WalkedToMatch { hops } => hops.last().map(|hop| &hop.claim),
+            Self::StoppedAtHopLimit { .. } => None,
+            Self::NoWalkPerformed { attestation } => Some(&attestation.claim),
+        }
+    }
+}
+
 /// Executable identity checks completed before returning a successful browser launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +252,7 @@ pub struct LaunchGenerationRecord {
 pub struct LaunchAttestationRecord {
     pub generation: LaunchGenerationRecord,
     pub observed_executable_identity: ExecutableIdentityClaim,
+    pub executable_identity_chain: ExecutableIdentityChain,
     pub executable_identity_checkpoints: ExecutableIdentityCheckpoints,
 }
 
@@ -408,7 +452,7 @@ pub enum PlatformLaunchError {
     ImageIdentity,
     ProcessControl,
     PtraceUnavailable,
-    ExecChainUnresolved(Vec<ExecutableIdentityClaim>),
+    ExecChainUnresolved { chain: ExecutableIdentityChain },
     GenerationUnreadable,
 }
 
@@ -419,7 +463,7 @@ impl PlatformLaunchError {
                 "ptrace_unavailable",
                 "grant CAP_SYS_PTRACE or lower ptrace_scope, then retry the launch",
             ),
-            Self::ExecChainUnresolved(..) => (
+            Self::ExecChainUnresolved { .. } => (
                 "exec_chain_unresolved",
                 "configure the final executable image digest, then retry the launch",
             ),
@@ -445,7 +489,7 @@ pub trait BarredLaunchProcess: Sized {
     type Released;
 
     fn generation(&self) -> BrowserProcessGeneration;
-    fn executed_image_identity(&self) -> Result<Vec<ExecutableIdentityClaim>, PlatformLaunchError>;
+    fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError>;
     fn terminate_and_reap(self) -> Result<(), PlatformLaunchError>;
     fn release(self) -> Result<Self::Released, PlatformLaunchError>;
 }
@@ -462,7 +506,7 @@ pub trait BarredProcessLauncher {
 /// A released process paired with the exact durable attestation that authorized it.
 pub struct ReleasedAttestedBrowser<P> {
     pub attestation: LaunchAttestationRecord,
-    pub observed_executable_identity_chain: Vec<ExecutableIdentityClaim>,
+    pub observed_executable_identity_chain: ExecutableIdentityChain,
     pub process: P,
     /// Monotonic instant sampled immediately after the barrier release returns.
     pub released_at: std::time::Instant,
@@ -516,7 +560,7 @@ where
         .spawn_barred(request)
         .map_err(|error| match error {
             PlatformLaunchError::PtraceUnavailable
-            | PlatformLaunchError::ExecChainUnresolved(..)
+            | PlatformLaunchError::ExecChainUnresolved { .. }
             | PlatformLaunchError::GenerationUnreadable => {
                 AttestedLaunchError::PlatformRefused { error }
             }
@@ -539,7 +583,7 @@ where
         Ok(chain) => chain,
         Err(
             error @ (PlatformLaunchError::PtraceUnavailable
-            | PlatformLaunchError::ExecChainUnresolved(..)
+            | PlatformLaunchError::ExecChainUnresolved { .. }
             | PlatformLaunchError::GenerationUnreadable),
         ) => {
             let _ = child.terminate_and_reap();
@@ -554,7 +598,7 @@ where
         }
     };
 
-    let Some(observed) = observed_chain.last().cloned() else {
+    let Some(observed) = observed_chain.matched_claim().cloned() else {
         let expected_identity = request.verified_executable_identity.display_identity();
         return match child.terminate_and_reap() {
             Ok(()) => Err(AttestedLaunchError::ImageAttestationFailed { expected_identity }),
@@ -592,6 +636,7 @@ where
     let attestation = LaunchAttestationRecord {
         generation,
         observed_executable_identity: observed,
+        executable_identity_chain: observed_chain.clone(),
         executable_identity_checkpoints: request
             .pre_spawn_identity_verification
             .completed_by_after_exec(),
@@ -612,7 +657,7 @@ where
         if matches!(
             error,
             PlatformLaunchError::PtraceUnavailable
-                | PlatformLaunchError::ExecChainUnresolved(..)
+                | PlatformLaunchError::ExecChainUnresolved { .. }
                 | PlatformLaunchError::GenerationUnreadable
         ) {
             AttestedLaunchError::PlatformRefused { error }
@@ -1091,7 +1136,7 @@ impl LinuxProcessLauncher {
         let result = (|| {
             let mut observed = cerebellum_linux::executed_image_identity(generation.pid)
                 .map_err(map_linux_image_identity_error)?;
-            let mut identity_chain = vec![linux_identity_claim(&observed)];
+            let mut identity_chain = vec![linux_identity_record(&observed)];
             for _ in 0..=LINUX_EXEC_CHAIN_HOP_LIMIT {
                 if observed.image_sha256 == expected {
                     let next_exec = child
@@ -1103,7 +1148,7 @@ impl LinuxProcessLauncher {
                             map_linux_process_control_error_with_chain(error, &identity_chain)
                         })?;
                     if let Some(next_exec) = next_exec.as_ref() {
-                        identity_chain.push(linux_identity_claim(next_exec));
+                        identity_chain.push(linux_identity_record(next_exec));
                     }
                     return Ok(LinuxDryRunObservation {
                         generation: BrowserProcessGeneration {
@@ -1134,10 +1179,14 @@ impl LinuxProcessLauncher {
                         identity_chain,
                     });
                 };
-                identity_chain.push(linux_identity_claim(&next));
+                identity_chain.push(linux_identity_record(&next));
                 observed = next;
             }
-            Err(PlatformLaunchError::ExecChainUnresolved(identity_chain))
+            Err(PlatformLaunchError::ExecChainUnresolved {
+                chain: ExecutableIdentityChain::StoppedAtHopLimit {
+                    hops: identity_chain,
+                },
+            })
         })();
         let termination = child
             .terminate_and_reap()
@@ -1155,7 +1204,7 @@ pub(crate) struct LinuxDryRunObservation {
     pub generation: BrowserProcessGeneration,
     pub observed: cerebellum_linux::ExecutedImageIdentity,
     pub next_exec: Option<cerebellum_linux::ExecutedImageIdentity>,
-    pub identity_chain: Vec<ExecutableIdentityClaim>,
+    pub identity_chain: Vec<ExecutableIdentityRecord>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1173,7 +1222,7 @@ impl BarredLaunchProcess for LinuxBarredProcess {
         }
     }
 
-    fn executed_image_identity(&self) -> Result<Vec<ExecutableIdentityClaim>, PlatformLaunchError> {
+    fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError> {
         if self.1.is_empty() {
             return Err(PlatformLaunchError::ImageIdentity);
         }
@@ -1181,20 +1230,26 @@ impl BarredLaunchProcess for LinuxBarredProcess {
         let mut child = self.0.borrow_mut();
         let mut observed = cerebellum_linux::executed_image_identity(child.generation().pid)
             .map_err(map_linux_image_identity_error)?;
-        let mut identity_chain = vec![linux_identity_claim(&observed)];
+        let mut identity_chain = vec![linux_identity_record(&observed)];
         for _ in 0..=LINUX_EXEC_CHAIN_HOP_LIMIT {
             if observed.image_sha256 == *expected {
-                return Ok(identity_chain);
+                return Ok(ExecutableIdentityChain::WalkedToMatch {
+                    hops: identity_chain,
+                });
             }
             let next = child
                 .continue_to_next_exec_stop(LINUX_EXEC_CHAIN_HOP_LIMIT)
                 .map_err(|error| {
                     map_linux_process_control_error_with_chain(error, &identity_chain)
                 })?;
-            identity_chain.push(linux_identity_claim(&next));
+            identity_chain.push(linux_identity_record(&next));
             observed = next;
         }
-        Err(PlatformLaunchError::ExecChainUnresolved(identity_chain))
+        Err(PlatformLaunchError::ExecChainUnresolved {
+            chain: ExecutableIdentityChain::StoppedAtHopLimit {
+                hops: identity_chain,
+            },
+        })
     }
 
     fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
@@ -1213,11 +1268,14 @@ impl BarredLaunchProcess for LinuxBarredProcess {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_identity_claim(
+fn linux_identity_record(
     identity: &cerebellum_linux::ExecutedImageIdentity,
-) -> ExecutableIdentityClaim {
-    ExecutableIdentityClaim::ImageDigest {
-        sha256: identity.image_sha256.clone(),
+) -> ExecutableIdentityRecord {
+    ExecutableIdentityRecord {
+        claim: ExecutableIdentityClaim::ImageDigest {
+            sha256: identity.image_sha256.clone(),
+        },
+        path: Some(identity.resolved_path.clone()),
     }
 }
 
@@ -1241,13 +1299,17 @@ fn map_linux_image_identity_error(
 #[cfg(target_os = "linux")]
 fn map_linux_process_control_error_with_chain(
     error: cerebellum_linux::ProcessControlError,
-    identity_chain: &[ExecutableIdentityClaim],
+    identity_chain: &[ExecutableIdentityRecord],
 ) -> PlatformLaunchError {
     if matches!(
         error,
         cerebellum_linux::ProcessControlError::ExecChainExhausted
     ) {
-        PlatformLaunchError::ExecChainUnresolved(identity_chain.to_vec())
+        PlatformLaunchError::ExecChainUnresolved {
+            chain: ExecutableIdentityChain::StoppedAtHopLimit {
+                hops: identity_chain.to_vec(),
+            },
+        }
     } else {
         map_linux_process_control_error(error)
     }
@@ -1262,7 +1324,9 @@ fn map_linux_process_control_error(
             PlatformLaunchError::GenerationUnreadable
         }
         cerebellum_linux::ProcessControlError::ExecChainExhausted => {
-            PlatformLaunchError::ExecChainUnresolved(Vec::new())
+            PlatformLaunchError::ExecChainUnresolved {
+                chain: ExecutableIdentityChain::StoppedAtHopLimit { hops: Vec::new() },
+            }
         }
         cerebellum_linux::ProcessControlError::Ptrace(_) => PlatformLaunchError::PtraceUnavailable,
         cerebellum_linux::ProcessControlError::AlreadyReleased
@@ -1343,7 +1407,7 @@ impl MacOsProcessLauncher {
 }
 
 #[cfg(target_os = "macos")]
-pub struct MacOsBarredProcess(cerebellum_macos::BarredChild);
+pub struct MacOsBarredProcess(cerebellum_macos::BarredChild, PathBuf);
 
 #[cfg(target_os = "macos")]
 impl BarredLaunchProcess for MacOsBarredProcess {
@@ -1357,7 +1421,7 @@ impl BarredLaunchProcess for MacOsBarredProcess {
         }
     }
 
-    fn executed_image_identity(&self) -> Result<Vec<ExecutableIdentityClaim>, PlatformLaunchError> {
+    fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError> {
         let generation = self.0.generation();
         let observed = cerebellum_macos::executed_image_identity(generation.pid)
             .map_err(|_| PlatformLaunchError::ImageIdentity)?;
@@ -1366,10 +1430,15 @@ impl BarredLaunchProcess for MacOsBarredProcess {
         {
             return Err(PlatformLaunchError::ImageIdentity);
         }
-        Ok(vec![ExecutableIdentityClaim::CodeSigned {
-            signing_identifier: observed.signing_identifier,
-            unique_code_hash: observed.unique_code_hash,
-        }])
+        Ok(ExecutableIdentityChain::NoWalkPerformed {
+            attestation: ExecutableIdentityRecord {
+                claim: ExecutableIdentityClaim::CodeSigned {
+                    signing_identifier: observed.signing_identifier,
+                    unique_code_hash: observed.unique_code_hash,
+                },
+                path: Some(self.1.clone()),
+            },
+        })
     }
 
     fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
@@ -1423,7 +1492,7 @@ impl BarredProcessLauncher for MacOsProcessLauncher {
             self.cdp_command_read_fd,
             self.cdp_response_write_fd,
         )
-        .map(MacOsBarredProcess)
+        .map(|child| MacOsBarredProcess(child, request.executable.clone()))
         .map_err(|_| PlatformLaunchError::Spawn)
     }
 }
@@ -1540,6 +1609,7 @@ mod tests {
     struct RecordingJournal {
         events: Events,
         fail: FailJournalAt,
+        attestation: Arc<Mutex<Option<LaunchAttestationRecord>>>,
     }
 
     impl LaunchJournalPort for RecordingJournal {
@@ -1576,6 +1646,7 @@ mod tests {
             _record: &LaunchAttestationRecord,
         ) -> Result<(), CoreJournalError> {
             self.events.push("attestation_committed");
+            *self.attestation.lock().expect("attestation recording") = Some(_record.clone());
             if self.fail == FailJournalAt::Attestation {
                 Err(CoreJournalError::StorageUnavailable)
             } else {
@@ -1682,11 +1753,16 @@ mod tests {
             self.generation
         }
 
-        fn executed_image_identity(
-            &self,
-        ) -> Result<Vec<ExecutableIdentityClaim>, PlatformLaunchError> {
+        fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError> {
             self.events.push("image_attested");
-            self.observed.clone().map(|identity| vec![identity])
+            self.observed
+                .clone()
+                .map(|identity| ExecutableIdentityChain::WalkedToMatch {
+                    hops: vec![ExecutableIdentityRecord {
+                        claim: identity,
+                        path: None,
+                    }],
+                })
         }
 
         fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
@@ -1731,6 +1807,37 @@ mod tests {
             signing_identifier: "com.example.browser".to_string(),
             unique_code_hash: "a1b2c3".to_string(),
         }
+    }
+
+    #[test]
+    fn executable_identity_chain_completeness_states_are_distinct() {
+        let hop = ExecutableIdentityRecord {
+            claim: identity(),
+            path: Some(PathBuf::from("/Applications/Browser.app")),
+        };
+        let matched = ExecutableIdentityChain::WalkedToMatch {
+            hops: vec![hop.clone()],
+        };
+        let bounded = ExecutableIdentityChain::StoppedAtHopLimit {
+            hops: vec![hop.clone()],
+        };
+        let not_walked = ExecutableIdentityChain::NoWalkPerformed {
+            attestation: hop.clone(),
+        };
+
+        assert_eq!(
+            ExecutableIdentityRecord {
+                claim: identity(),
+                path: Some(PathBuf::from("/one")),
+            },
+            ExecutableIdentityRecord {
+                claim: identity(),
+                path: Some(PathBuf::from("/two")),
+            }
+        );
+        assert_ne!(matched, bounded);
+        assert_ne!(bounded, not_walked);
+        assert_ne!(matched, not_walked);
     }
 
     fn request() -> AttestedLaunchRequest {
@@ -1816,6 +1923,12 @@ mod tests {
         let attestation = LaunchAttestationRecord {
             generation,
             observed_executable_identity: identity(),
+            executable_identity_chain: ExecutableIdentityChain::NoWalkPerformed {
+                attestation: ExecutableIdentityRecord {
+                    claim: identity(),
+                    path: None,
+                },
+            },
             executable_identity_checkpoints: ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
         };
         journal
@@ -1841,6 +1954,7 @@ mod tests {
             RecordingJournal {
                 events: events.clone(),
                 fail,
+                attestation: Arc::new(Mutex::new(None)),
             },
             FakeLauncher {
                 events: events.clone(),
@@ -2030,6 +2144,12 @@ mod tests {
         let attestation = LaunchAttestationRecord {
             generation,
             observed_executable_identity: identity(),
+            executable_identity_chain: ExecutableIdentityChain::NoWalkPerformed {
+                attestation: ExecutableIdentityRecord {
+                    claim: identity(),
+                    path: None,
+                },
+            },
             executable_identity_checkpoints: ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
         };
         journal
@@ -2567,6 +2687,7 @@ mod tests {
         let mut journal = RecordingJournal {
             events: Events::new(),
             fail: FailJournalAt::Never,
+            attestation: Arc::new(Mutex::new(None)),
         };
 
         let released = launch_attested_with(&mut journal, &mut launcher, &launch_request)
@@ -2634,6 +2755,7 @@ mod tests {
         let mut journal = RecordingJournal {
             events,
             fail: FailJournalAt::Never,
+            attestation: Arc::new(Mutex::new(None)),
         };
 
         let outcome = launch_attested_with(&mut journal, &mut launcher, &launch_request);
@@ -2701,8 +2823,8 @@ mod tests {
             child
                 .executed_image_identity()
                 .expect("attest final image")
-                .last()
-                .expect("identity chain is non-empty")
+                .matched_claim()
+                .expect("identity chain is matched")
                 .display_identity(),
             format!("sha256={expected}")
         );
@@ -2756,12 +2878,16 @@ mod tests {
         let child = launcher
             .spawn_barred(&launch_request)
             .expect("spawn beyond-bound chain fixture");
-        let Err(PlatformLaunchError::ExecChainUnresolved(identity_chain)) =
+        let Err(PlatformLaunchError::ExecChainUnresolved { chain }) =
             child.executed_image_identity()
         else {
             panic!("beyond-bound chain must be refused with its traversed identities");
         };
-        assert_eq!(identity_chain.len(), 9);
+        let ExecutableIdentityChain::StoppedAtHopLimit { hops } = chain else {
+            panic!("beyond-bound chain must report the hop limit state");
+        };
+        assert_eq!(hops.len(), 9);
+        assert!(hops.iter().all(|hop| hop.path.is_some()));
         drop(child);
         remove_linux_exec_chain_fixture(root, paths);
     }
@@ -2838,7 +2964,9 @@ mod tests {
         let mut journal = RecordingJournal {
             events: Events::new(),
             fail: FailJournalAt::Never,
+            attestation: Arc::new(Mutex::new(None)),
         };
+        let attestation = journal.attestation.clone();
         let released = launch_attested_with(&mut journal, &mut launcher, &launch_request)
             .expect("release Linux fixture after final-image attestation");
         assert_eq!(
@@ -2851,6 +2979,18 @@ mod tests {
                 sha256: sha256_file_for_test(Path::new("/bin/sleep")),
             }
         );
+        let recorded = attestation
+            .lock()
+            .expect("recorded attestation")
+            .clone()
+            .expect("success path attestation");
+        let ExecutableIdentityChain::WalkedToMatch { hops } = recorded.executable_identity_chain
+        else {
+            panic!("successful launch must record a completed identity chain");
+        };
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].path, Some(PathBuf::from("/usr/bin/bash")));
+        assert_eq!(hops[1].path, Some(PathBuf::from("/usr/bin/sleep")));
         released
             .process
             .terminate_and_reap()
