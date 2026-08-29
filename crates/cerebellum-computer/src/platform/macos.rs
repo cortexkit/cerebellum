@@ -1027,6 +1027,106 @@ mod tests {
         );
     }
 
+    /// computer.move is withheld when accessibility is denied.
+    ///
+    /// Its frozen vocabulary row names only input monitoring, so on a machine
+    /// granting that and denying accessibility it would advertise and then fail
+    /// at dispatch -- a capability offered that cannot work, which is the defect
+    /// the permission gate exists to prevent.
+    ///
+    /// This asserts the CONSERVATIVE direction of a deliberate disagreement with
+    /// the vocabulary: the code requires more than the row declares, because
+    /// whether CGEventPostToPid needs the accessibility grant is unestablished.
+    /// If a future measurement shows posting does not need it, this test is the
+    /// thing that should fail and be deleted, rather than the requirement being
+    /// dropped quietly.
+    #[test]
+    fn computer_move_is_withheld_without_accessibility_despite_its_row() {
+        let driver = MacOs26PlatformDriver::default();
+        let vocabulary_row =
+            crate::platform::vocabulary::required_permission_services("computer.move")
+                .expect("the vocabulary lists computer.move");
+        assert!(
+            !vocabulary_row.contains(&PermissionService::Accessibility),
+            "this test is about a row that does NOT name accessibility; if the vocabulary \
+             gained it, the extra requirement in the gate is now redundant and should go"
+        );
+
+        let inputs = ImmutableReleaseInputs {
+            attendance_contract_owner: Some("fixture-owner".to_string()),
+            attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
+            input_review_revision: Some("fixture-input-review-v1".to_string()),
+            capture_review_revision: Some("fixture-capture-review-v1".to_string()),
+            semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+            release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
+            vocabulary_digests: VocabularyDigestInputs {
+                manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+            },
+        };
+
+        // Granted exactly what the row asks for, and nothing else.
+        let row_only = PermissionLivenessReport::from_results(vec![PermissionProbeResult {
+            service: PermissionService::InputMonitoring,
+            liveness: PermissionLiveness::Live,
+            responsible_process: String::new(),
+            off_main: true,
+        }]);
+        let declaration = driver.declaration(
+            "computer.move",
+            &CapabilityAdvertisementContext {
+                inputs: inputs.clone(),
+                permissions: row_only.clone(),
+                // The gate reads startup.permissions, so the readings must be
+                // installed THERE. Setting the sibling field alone produced a
+                // fixture that granted nothing while appearing to grant a lot.
+                startup: StartupCapabilityProbe {
+                    permissions: row_only,
+                    ..driver.startup_probe().clone()
+                },
+            },
+        );
+        assert!(
+            !declaration.advertised,
+            "computer.move advertised with accessibility denied: {:?}",
+            declaration.suppression_reason
+        );
+
+        // The same context plus accessibility advertises, so the refusal above
+        // is the accessibility check and not some unrelated gate.
+        let with_accessibility = PermissionLivenessReport::from_results(vec![
+            PermissionProbeResult {
+                service: PermissionService::InputMonitoring,
+                liveness: PermissionLiveness::Live,
+                responsible_process: String::new(),
+                off_main: true,
+            },
+            PermissionProbeResult {
+                service: PermissionService::Accessibility,
+                liveness: PermissionLiveness::Live,
+                responsible_process: String::new(),
+                off_main: true,
+            },
+        ]);
+        let declaration = driver.declaration(
+            "computer.move",
+            &CapabilityAdvertisementContext {
+                inputs,
+                permissions: with_accessibility.clone(),
+                startup: StartupCapabilityProbe {
+                    permissions: with_accessibility,
+                    ..driver.startup_probe().clone()
+                },
+            },
+        );
+        assert!(
+            declaration.advertised,
+            "computer.move stayed withheld with both grants: {:?}",
+            declaration.suppression_reason
+        );
+    }
+
     /// Binding every release input does not, by itself, activate an actuating row.
     ///
     /// The context below binds all six attestations and supplies NO permission

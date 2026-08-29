@@ -381,13 +381,27 @@ fn capability_declaration(
         } else if !context.inputs.input_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
         } else {
-            // Every permission the frozen vocabulary names for THIS row, not a
-            // fixed set: computer.move needs only input monitoring, while
-            // computer.type needs accessibility and post-event as well. Applying
-            // one set to all five would either withhold a row whose permissions
-            // are satisfied or advertise one whose are not.
+            // Every permission the frozen vocabulary names for THIS row, PLUS
+            // accessibility for all five.
+            //
+            // The extra requirement is deliberate and conservative. Per-process
+            // delivery is CGEventPostToPid, and whether that call needs the
+            // accessibility grant is not established: CGEvent.h documents the
+            // requirement for event taps and says nothing about posting, and the
+            // deciding experiment needs a machine whose grant can be revoked.
+            // Four rows name accessibility anyway; computer.move names only
+            // input monitoring, so without this it could advertise on a machine
+            // that denies accessibility and then fail at dispatch.
+            //
+            // Requiring MORE than the vocabulary declares is the safe direction
+            // of disagreement: a capability withheld from a machine that could
+            // have served it is a smaller fault than one offered to a machine
+            // that cannot. Requiring less would be the hazard. When the
+            // experiment settles it, either this extra requirement comes out or
+            // the vocabulary row gains what it always needed.
             permissions
                 .iter()
+                .chain(std::iter::once(&PermissionService::Accessibility))
                 .find_map(|service| match context.startup.permissions.state(*service) {
                     PermissionLiveness::Live => None,
                     PermissionLiveness::Unavailable => {
