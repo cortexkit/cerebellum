@@ -2781,14 +2781,28 @@ async fn a_browser_that_dies_mid_dispatch_finalizes_its_journal_entry() {
         !click_records.is_empty(),
         "a failed click left no journal record: {export}"
     );
-    // The export CANNOT answer whether this was finalized: it merges finalized
-    // entries with reservations still in `dispatched` state, so a record
-    // appearing above proves the dispatch was committed and not that it was
-    // closed out. The accounting is what separates them.
+    // WHAT THIS ASSERTION DOES AND DOES NOT PROVE, measured rather than assumed.
+    //
+    // It holds, and the observable behaviour is right: a failed dispatch leaves
+    // a record with the failure's own outcome and no bytes held in reservation.
+    //
+    // But it is INSENSITIVE to the mechanism. There are three finalization call
+    // sites on this path, and breaking the invocation lookup at each of them in
+    // turn -- so finalization silently does nothing -- leaves this test green
+    // every time. So it pins the outcome and pins nothing about what achieves
+    // it, and a regression that stopped finalizing would not be caught here.
+    //
+    // Left asserting the weaker true thing rather than deleted, because the
+    // outcome is worth pinning and a test that overstates its reach is worse
+    // than one that states its limit. The stronger assertion needs a way to
+    // distinguish a finalized entry from a committed-but-open reservation, and
+    // neither the export nor this accounting can currently do it -- the export
+    // merges both, and the byte count reads zero in both cases.
+    //
+    // That gap is recorded as its own work rather than left in a comment.
     assert_eq!(
         plane.active_reserved_bytes_for_test().await,
         0,
-        "a failed click left its reservation open, which startup recovery reads \
-         as a process that died mid-dispatch: {export}"
+        "a failed click left bytes held in reservation: {export}"
     );
 }
