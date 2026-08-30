@@ -2662,6 +2662,80 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
 
 #[cfg(test)]
 mod tests {
+
+    /// Each browser capability maps to its OWN journal capability.
+    ///
+    /// Asserting the mapping rather than the enum, which is the mistake I made
+    /// first: a test over `Capability::as_str` checks that the names differ
+    /// from each other and never calls the function that decides which name a
+    /// dispatch gets. Restoring the old fold -- Snapshot onto Navigate -- left
+    /// that test green, because the enum was still correct and the mapping was
+    /// not what it examined.
+    ///
+    /// The pairs are literals so a mapping change cannot satisfy this by moving
+    /// both sides at once, and the injectivity check is what actually catches a
+    /// fold, since a fold produces a duplicate rather than a wrong name.
+    #[test]
+    fn every_browser_capability_journals_under_its_own_name() {
+        use std::collections::BTreeSet;
+
+        let pairs = [
+            (BrowserCapability::Navigate, JournalCapability::Navigate),
+            (BrowserCapability::Click, JournalCapability::Click),
+            (BrowserCapability::ClickPoint, JournalCapability::ClickPoint),
+            (BrowserCapability::Snapshot, JournalCapability::Snapshot),
+            (BrowserCapability::Screenshot, JournalCapability::Screenshot),
+            (BrowserCapability::WaitFor, JournalCapability::WaitFor),
+        ];
+
+        let mut journaled = BTreeSet::new();
+        for (browser, expected) in pairs {
+            let actual = journal_capability(browser);
+            assert_eq!(
+                actual, expected,
+                "{browser:?} journals as {actual:?}, not as itself"
+            );
+            assert!(
+                journaled.insert(actual.as_str()),
+                "{browser:?} shares a journal name with another capability"
+            );
+        }
+        assert_eq!(
+            journaled.len(),
+            6,
+            "a browser capability was added without a journal name of its own"
+        );
+    }
+
+    /// An observation records no action, and an actuation records one.
+    ///
+    /// Both directions, because asserting only the None side passes if every
+    /// capability returns None, which would empty the record of every action
+    /// this journal exists to hold.
+    #[test]
+    fn only_actuating_capabilities_record_an_action() {
+        for capability in [
+            JournalCapability::Snapshot,
+            JournalCapability::Screenshot,
+            JournalCapability::WaitFor,
+        ] {
+            assert!(
+                journal_action(capability).is_none(),
+                "{capability:?} is an observation and performs no action"
+            );
+        }
+        for capability in [
+            JournalCapability::Navigate,
+            JournalCapability::Click,
+            JournalCapability::ClickPoint,
+            JournalCapability::Type,
+        ] {
+            assert!(
+                journal_action(capability).is_some(),
+                "{capability:?} actuates and must record what it did"
+            );
+        }
+    }
     use super::*;
     use serde_json::json;
 
