@@ -431,6 +431,38 @@ fn capability_declaration(
         };
         advertised = suppression_reason.is_none();
     }
+
+    // Claimed only where an AxAction actually implements the path the frozen row
+    // names, rather than wherever the row names one.
+    //
+    // The vocabulary declares three: click -> ax_press, type -> ax_value,
+    // scroll -> ax_scroll_position. AxAction has eight members -- Press,
+    // Increment, Decrement, Confirm, Cancel, ShowMenu, ShowAlternateUi,
+    // ShowDefaultUi -- so only ax_press exists. Nothing here sets a value or
+    // scrolls through the accessibility API, and dispatch has no semantic route
+    // for either capability.
+    let semantic_support = if id == "computer.click" {
+        SupportState::Supported
+    } else {
+        SupportState::Unsupported
+    };
+
+    // Background delivery is claimed per SYNTHETIC EVENT CLASS, because the
+    // per-process path carries one and not the other. Measured on macOS 26
+    // against a native application, target backgrounded, focus sampled
+    // throughout: a keystroke posted to the pid lands; a drag posted to the same
+    // pid has no effect even with the target frontmost, while the SAME
+    // constructed events posted globally do select. The events are right and the
+    // per-process path does not carry pointer events.
+    //
+    // Two independent reasons, one answer: no platform driver to post with, or a
+    // row whose events that path does not carry.
+    let background_support = if platform_available && !synthetic_path_is_pointer(id) {
+        SupportState::Supported
+    } else {
+        SupportState::Unsupported
+    };
+
     CapabilityDeclaration {
         capability_id: id.to_string(),
         action_kind,
@@ -454,11 +486,7 @@ fn capability_declaration(
         // Mirroring the artifact made this declaration restate what the row
         // WANTS instead of what the driver can do, which is the same shape as a
         // frozen column nothing verifies: the claim and its subject never meet.
-        semantic_path: if id == "computer.click" {
-            SupportState::Supported
-        } else {
-            SupportState::Unsupported
-        },
+        semantic_path: semantic_support,
         // Supported on the platform itself rather than on a private envelope:
         // the per-process path is public CGEventPostToPid, which needs no symbol
         // resolution. The private-envelope flag is still carried for the
@@ -485,11 +513,7 @@ fn capability_declaration(
         // claim here is Unsupported rather than a mode we do not offer.
         // Two independent reasons, one answer: no platform driver to post with,
         // or a row whose events the per-process path does not carry.
-        synthetic_background: if platform_available && !synthetic_path_is_pointer(id) {
-            SupportState::Supported
-        } else {
-            SupportState::Unsupported
-        },
+        synthetic_background: background_support,
         synthetic_observed: SupportState::ConsentGated,
         required_permissions: permissions,
         retry_class,
@@ -497,9 +521,32 @@ fn capability_declaration(
         // never advertised, whatever the rest of the gate concluded: a
         // permission that is not known cannot be checked, and offering the
         // capability would promise a check nobody performs.
+        // An ACTUATING row must additionally have a delivery path that works.
+        //
+        // Every gate above answers whether we are ALLOWED to serve the row. None
+        // of them asks whether anything can carry it. Those came apart tonight:
+        // the per-process path does not deliver pointer events, so scroll, move
+        // and drag have no semantic action, no working background path, and an
+        // observed path whose driver refuses unconditionally because global
+        // posting was never approved. Binding the input review key would have
+        // advertised three capabilities that cannot deliver -- which is the
+        // defect this module already refuses one field over, where a permission
+        // that cannot be read withholds its capability.
+        //
+        // ConsentGated deliberately does not count. It describes what the design
+        // intends to offer once observed mode exists, and intent is not a path.
+        //
+        // The two observing rows declare no delivery paths in the frozen
+        // vocabulary at all -- they read rather than actuate -- so the
+        // requirement does not apply to them. Keyed on action_kind rather than a
+        // list of names, because the vocabulary already draws that line and a
+        // second copy of it would be one more thing to keep in step.
         advertised: (platform_available || id == "computer.wait")
             && advertised
-            && permission_lookup_failure.is_none(),
+            && permission_lookup_failure.is_none()
+            && (action_kind == ActionKind::Observe
+                || semantic_support == SupportState::Supported
+                || background_support == SupportState::Supported),
         suppression_reason,
     }
 }

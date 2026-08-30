@@ -556,3 +556,65 @@ fn semantic_support_is_claimed_only_where_an_action_implements_it() {
         "exactly one row should claim an implemented semantic path"
     );
 }
+
+/// An actuating row is advertised only if something can deliver it.
+///
+/// Every other gate answers whether we are ALLOWED to serve a row. None asks
+/// whether anything can carry it, and those came apart when the per-process
+/// path turned out not to deliver pointer events: scroll, move and drag have no
+/// semantic action, no working background path, and an observed path whose
+/// driver refuses because global posting was never approved. Binding the input
+/// review key would have advertised three capabilities that cannot deliver.
+///
+/// The two observing rows declare no delivery paths in the frozen vocabulary --
+/// they read rather than actuate -- so the requirement does not apply to them,
+/// and this asserts that exemption rather than leaving it implied.
+#[test]
+fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
+    let context = CapabilityAdvertisementContext {
+        inputs: ImmutableReleaseInputs::default(),
+        permissions: PermissionLivenessReport::default(),
+        startup: StartupCapabilityProbe::default(),
+    };
+    let declarations = capability_declarations(&context, true);
+
+    let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
+        "../resources/computer_action_vocabulary-v5.json"
+    ))
+    .expect("the frozen vocabulary parses");
+    let rows = vocabulary["rows"].as_array().expect("rows is an array");
+
+    let mut actuating = 0;
+    let mut observing = 0;
+    for declaration in &declarations {
+        let row = rows
+            .iter()
+            .find(|row| row["capability_id"] == declaration.capability_id.as_str())
+            .expect("every declaration has a frozen row");
+        let declares_paths = row["semantic_path"].as_str().unwrap_or("none") != "none"
+            || !row["synthetic_paths"]
+                .as_array()
+                .map(Vec::is_empty)
+                .unwrap_or(true);
+
+        if !declares_paths {
+            observing += 1;
+            continue;
+        }
+        actuating += 1;
+
+        let deliverable = declaration.semantic_path == SupportState::Supported
+            || declaration.synthetic_background == SupportState::Supported;
+        if !deliverable {
+            assert!(
+                !declaration.advertised,
+                "{} has no deliverable path yet is advertised",
+                declaration.capability_id
+            );
+        }
+    }
+
+    // Both populations must be non-empty, or the loop above asserts nothing.
+    assert_eq!(actuating, 6, "the actuating rows are not all present");
+    assert_eq!(observing, 2, "the observing rows are not all present");
+}
