@@ -17,7 +17,11 @@ use cerebellum_computer::{
         ContainmentRung, GroundingPath, GroundingPolicy, GroundingRequirement,
         GroundingResolutionPath,
     },
-    platform::{vocabulary::required_permission_services, PermissionService},
+    platform::{
+        capability_declarations, vocabulary::required_permission_services,
+        CapabilityAdvertisementContext, ImmutableReleaseInputs, PermissionLivenessReport,
+        PermissionService, StartupCapabilityProbe, SupportState,
+    },
 };
 use serde_json::Value;
 
@@ -419,4 +423,74 @@ fn scroll_declares_a_semantic_path_that_no_action_implements() {
         "an AxAction now implements scrolling, so the declared semantic path is \
          no longer a gap: delete this test rather than adjusting it"
     );
+}
+
+/// Background support is claimed per synthetic event class, not per platform.
+///
+/// Measured on macOS 26 against a native application with the target
+/// backgrounded and focus sampled throughout: a keystroke posted to the pid
+/// lands, and a drag posted to the same pid has no effect even with the target
+/// frontmost, while the SAME constructed events posted globally do select. The
+/// events are right; the per-process path does not carry pointer events.
+///
+/// So a pointer row must not claim background support. It is not broken -- it is
+/// deliverable through the global path, which seizes the shared cursor and is
+/// the authority this module calls observed mode, deliberately unbuilt. Claiming
+/// Supported would offer a caller a background capability that cannot deliver.
+///
+/// Asserted because the claim is invisible from the code that makes it: the
+/// field is a constant expression, and every test that reads a declaration
+/// would pass whichever value it held.
+#[test]
+fn only_keyboard_rows_claim_background_synthetic_support() {
+    // Release inputs and permissions are irrelevant here: the claim under test
+    // is a property of the ROW, and gating it behind a bound context would make
+    // the test fail for reasons that have nothing to do with event classes.
+    let context = CapabilityAdvertisementContext {
+        inputs: ImmutableReleaseInputs::default(),
+        permissions: PermissionLivenessReport::default(),
+        startup: StartupCapabilityProbe::default(),
+    };
+    let declarations = capability_declarations(&context, true);
+
+    for declaration in &declarations {
+        let id = declaration.capability_id.as_str();
+        let pointer = matches!(
+            id,
+            "computer.click" | "computer.move" | "computer.scroll" | "computer.drag"
+        );
+        let keyboard = matches!(id, "computer.type" | "computer.keys");
+        if pointer {
+            assert_eq!(
+                declaration.synthetic_background,
+                SupportState::Unsupported,
+                "{id} claims background synthetic support, but per-process delivery does not \
+                 carry pointer events"
+            );
+        } else if keyboard {
+            assert_eq!(
+                declaration.synthetic_background,
+                SupportState::Supported,
+                "{id} is keyboard-delivered and was measured to land in a backgrounded target"
+            );
+        }
+    }
+
+    // Both arms must have had something to check. A rename that emptied either
+    // set would leave every assertion above unexecuted and the test green.
+    let pointer_rows = declarations
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.capability_id.as_str(),
+                "computer.click" | "computer.move" | "computer.scroll" | "computer.drag"
+            )
+        })
+        .count();
+    let keyboard_rows = declarations
+        .iter()
+        .filter(|d| matches!(d.capability_id.as_str(), "computer.type" | "computer.keys"))
+        .count();
+    assert_eq!(pointer_rows, 4, "the pointer rows are not all present");
+    assert_eq!(keyboard_rows, 2, "the keyboard rows are not all present");
 }
