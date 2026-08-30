@@ -17,6 +17,7 @@ use cerebellum::browser_session::{
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
+use cerebellum::journal::Outcome;
 use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SameDocumentChange, SnapshotKind, SnapshotRef,
 };
@@ -283,6 +284,21 @@ struct SnapshotProcess {
 }
 
 impl OwnedBrowserProcess for SnapshotProcess {
+    fn navigate(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: NavigationWait,
+        _: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        let now = Instant::now();
+        tracker.url_final = Some("https://requested.example/landed".into());
+        tracker.load(now);
+        tracker.poll_settlement(now + Duration::from_millis(browser::QUIET_MS));
+        Ok(())
+    }
+
     fn snapshot(
         &mut self,
         _: &str,
@@ -290,6 +306,39 @@ impl OwnedBrowserProcess for SnapshotProcess {
         _: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         Ok(self.observation.clone())
+    }
+
+    fn click(
+        &mut self,
+        _: &str,
+        _: &BackendNodeIdentity,
+        _: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let position = BrowserClickPosition {
+            x_css: 1.0,
+            y_css: 1.0,
+        };
+        input_dispatched(BrowserInputEvent::Press(position));
+        input_dispatched(BrowserInputEvent::Release(position));
+        Ok(position)
+    }
+
+    fn click_classified(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        _: u64,
+        _: &str,
+        expected: Option<&cerebellum::classification::NonTypeClassificationRecord>,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        assert!(
+            expected.is_none(),
+            "this fixture represents an unverified target"
+        );
+        self.click(context_key, identity, deadline_ms, input_dispatched)
     }
 
     fn generation_matches(&self) -> bool {
@@ -1069,6 +1118,177 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
     assert_eq!(result["refs_truncated"], true);
 }
 
+#[tokio::test]
+async fn read_page_false_preserves_the_navigation_reply() {
+    let route = identity();
+    let observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "heading".into(),
+        name: "Unused page text".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    let without_read = plane_with_process(
+        &route,
+        Box::new(SnapshotProcess {
+            observation: observation.clone(),
+        }),
+        1_000,
+    );
+    without_read.open_context(route.clone()).await.unwrap();
+    let without_read = without_read
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "navigate without reading",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+
+    let explicit_false =
+        plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
+    explicit_false.open_context(route.clone()).await.unwrap();
+    let explicit_false = explicit_false
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "navigate without reading",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": false
+            }),
+        )
+        .await;
+
+    assert_eq!(without_read, explicit_false);
+    assert!(without_read.get("read_page").is_none(), "{without_read}");
+}
+
+#[tokio::test]
+async fn read_page_returns_a_bounded_clickable_snapshot_in_the_navigation_reply() {
+    let route = identity();
+    let observation = snapshot_observation(vec![
+        AxRecord {
+            depth: 0,
+            role: "RootWebArea".into(),
+            name: "Structured fixture".into(),
+            value: None,
+            reference: Some("e1".into()),
+        },
+        AxRecord {
+            depth: 1,
+            role: "button".into(),
+            name: "Save profile".into(),
+            value: None,
+            reference: Some("e2".into()),
+        },
+    ]);
+    let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000);
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "open and read the page",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": true,
+                "max_bytes": 4096
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "ok", "{result}");
+    let page = &result["read_page"];
+    assert_eq!(page["outcome"], "ok", "{result}");
+    assert!(page["content"].as_str().unwrap().contains("Save profile"));
+    assert_eq!(page["truncated"], false);
+    assert_eq!(page["refs_truncated"], false);
+    let snapshot_id = page["snapshot_id"].as_str().unwrap();
+    assert_eq!(snapshot_id.len(), 32, "{result}");
+
+    assert_eq!(
+        plane.invocation_outcomes_for_test(&route).await,
+        vec![
+            (BrowserCapability::Navigate, Some(Outcome::Success)),
+            (BrowserCapability::Snapshot, Some(Outcome::Success)),
+        ],
+        "the navigation and read must retain distinct browser invocations"
+    );
+
+    let click = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &json!({
+                "ref": "e2",
+                "snapshot_id": snapshot_id,
+                "intent": "use the reference returned by read_page",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+    assert_eq!(click["outcome"], "ok", "{click}");
+}
+
+#[tokio::test]
+async fn read_page_marks_content_truncated_at_its_requested_bound() {
+    let route = identity();
+    let records = vec![
+        AxRecord {
+            depth: 0,
+            role: "RootWebArea".into(),
+            name: "Large fixture".into(),
+            value: None,
+            reference: Some("e1".into()),
+        },
+        AxRecord {
+            depth: 1,
+            role: "heading".into(),
+            name: "This record exceeds the remaining output budget".into(),
+            value: None,
+            reference: Some("e2".into()),
+        },
+    ];
+    let first_line = records[0].canonical_line().unwrap();
+    let plane = plane_with_process(
+        &route,
+        Box::new(SnapshotProcess {
+            observation: snapshot_observation(records),
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "open and read a bounded page",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": true,
+                "max_bytes": first_line.len()
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "ok", "{result}");
+    assert_eq!(result["read_page"]["truncated"], true, "{result}");
+    assert_eq!(result["read_page"]["content"], first_line, "{result}");
+}
+
 struct RedirectingNavigationProcess;
 
 impl OwnedBrowserProcess for RedirectingNavigationProcess {
@@ -1718,5 +1938,58 @@ async fn a_redirect_off_the_authorized_origin_refuses_the_next_snapshot() {
     assert!(
         snapshot.get("records").is_none() && snapshot.get("refs").is_none(),
         "a refused snapshot returns no page content: {snapshot}"
+    );
+}
+
+/// A read bundled into navigation must authorize the page where the browser lands.
+#[tokio::test]
+async fn a_redirect_off_the_authorized_origin_withholds_read_page_content() {
+    let route = identity();
+    let observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "heading".into(),
+        name: "Private page".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    let plane = plane_with_process(
+        &route,
+        Box::new(OffOriginRedirectProcess { observation }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "open the authorized origin and read it",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": true
+            }),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "ok", "{result}");
+    assert_eq!(
+        result["url_final"], "https://attacker.example/landed",
+        "the navigation must have succeeded and reported its landing page: {result}"
+    );
+    assert_eq!(
+        result["read_page"]["outcome"], "authorization_denied",
+        "{result}"
+    );
+    assert_eq!(result["read_page"]["detail"]["reason"], "origin_scope");
+    let reply = result.to_string();
+    assert!(
+        result.get("content").is_none()
+            && result.get("refs").is_none()
+            && result.pointer("/read_page/content").is_none()
+            && result.pointer("/read_page/refs").is_none()
+            && !reply.contains("Private page"),
+        "a refused read must not return page content: {result}"
     );
 }
