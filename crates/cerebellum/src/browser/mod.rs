@@ -388,11 +388,11 @@ pub enum Operation {
     CloseContext,
 }
 
-/// One invocation-bound journal adapter. The handle and commitment token are
-/// kept together so a caller cannot finalize a different invocation's journal entry.
-pub struct JournalInvocation {
-    store: JournalStore,
-    identity: JournalIdentity,
+/// One invocation-bound handle into the plane's journal store.
+///
+/// The reservation and commitment stay together so finalization cannot address
+/// another invocation's entry. The journal store itself belongs to the plane.
+struct JournalInvocation {
     browser_capability: BrowserCapability,
     capability: JournalCapability,
     handle: Option<ReservationHandle>,
@@ -401,87 +401,63 @@ pub struct JournalInvocation {
 }
 
 impl JournalInvocation {
-    /// Bind an invocation to the DURABLE journal on disk.
-    ///
-    /// `JournalStore::new` opens the production path. A fixture that wants a
-    /// journal must use [`Self::new_in_memory`] instead, or it writes into the
-    /// operator's real audit data and reads back everything every earlier run
-    /// left there -- which is exactly how a lifecycle test of mine reported a
-    /// per-call cost that was really a running total, growing on each run.
-    pub fn new(
-        config: journal::JournalConfig,
-        identity: JournalIdentity,
-        browser_capability: BrowserCapability,
-    ) -> Result<Self, JournalError> {
-        Self::open(JournalStore::new(config)?, identity, browser_capability)
-    }
-
-    /// Bind an invocation to an isolated in-memory journal.
-    pub fn new_in_memory(
-        config: journal::JournalConfig,
-        identity: JournalIdentity,
-        browser_capability: BrowserCapability,
-    ) -> Result<Self, JournalError> {
-        Self::open(
-            JournalStore::new_in_memory(config)?,
-            identity,
-            browser_capability,
-        )
-    }
-
-    fn open(
-        store: JournalStore,
-        identity: JournalIdentity,
-        browser_capability: BrowserCapability,
-    ) -> Result<Self, JournalError> {
-        Ok(Self {
-            store,
-            identity,
+    fn new(browser_capability: BrowserCapability) -> Self {
+        Self {
             browser_capability,
             capability: journal_capability(browser_capability),
             handle: None,
             token: None,
             terminal: false,
-        })
+        }
     }
 
-    pub fn reserve(&mut self) -> Result<ReservationHandle, JournalError> {
+    fn reserve(
+        &mut self,
+        store: &mut JournalStore,
+        identity: JournalIdentity,
+    ) -> Result<ReservationHandle, JournalError> {
         if self.terminal {
             return Err(JournalError::internal_failure());
         }
         if let Some(handle) = self.handle {
             return Ok(handle);
         }
-        let handle = self.store.reserve(self.identity.clone(), self.capability)?;
+        let handle = store.reserve(identity, self.capability)?;
         self.handle = Some(handle);
         Ok(handle)
     }
 
-    pub fn commit_dispatched(
+    fn commit_dispatched(
         &mut self,
+        store: &mut JournalStore,
         material: DispatchMaterial,
     ) -> Result<DispatchCommitmentToken, JournalError> {
         let handle = self.handle.ok_or_else(JournalError::internal_failure)?;
         if self.terminal {
             return Err(JournalError::internal_failure());
         }
-        let token = self.store.commit_dispatched(handle, &material)?;
+        let token = store.commit_dispatched(handle, &material)?;
         self.token = Some(token);
         Ok(token)
     }
 
-    pub fn finalize_rejected(&mut self, material: RejectionMaterial) -> Result<(), JournalError> {
+    fn finalize_rejected(
+        &mut self,
+        store: &mut JournalStore,
+        material: RejectionMaterial,
+    ) -> Result<(), JournalError> {
         if self.terminal {
             return Err(JournalError::internal_failure());
         }
         let handle = self.handle.ok_or_else(JournalError::internal_failure)?;
-        self.store.finalize_rejected(handle, &material).map(|_| {
+        store.finalize_rejected(handle, &material).map(|_| {
             self.terminal = true;
         })
     }
 
-    pub fn finalize_dispatched(
+    fn finalize_dispatched(
         &mut self,
+        store: &mut JournalStore,
         context: FinalContextAssociation,
         result: CompletedResult,
     ) -> Result<(), JournalError> {
@@ -489,24 +465,11 @@ impl JournalInvocation {
             return Err(JournalError::internal_failure());
         }
         let token = self.token.ok_or_else(JournalError::internal_failure)?;
-        self.store
+        store
             .finalize_dispatched(token, &context, &result)
             .map(|_| {
                 self.terminal = true;
             })
-    }
-
-    pub fn journal(&self) -> &JournalStore {
-        &self.store
-    }
-    pub fn journal_mut(&mut self) -> &mut JournalStore {
-        &mut self.store
-    }
-    pub fn reservation(&self) -> Option<ReservationHandle> {
-        self.handle
-    }
-    pub fn commitment(&self) -> Option<DispatchCommitmentToken> {
-        self.token
     }
 }
 
@@ -632,18 +595,70 @@ enum BrowserRefusalRing {
     InMemory(RefusalRing<SnapshotRefusalReason>),
 }
 
+#[derive(Clone, Copy, Default)]
+enum BrowserJournalMode {
+    #[default]
+    Disabled,
+    Durable(journal::JournalConfig),
+    InMemory(journal::JournalConfig),
+}
+
+impl BrowserJournalMode {
+    fn open_store(self) -> Result<Option<JournalStore>, JournalError> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::Durable(config) => JournalStore::new(config).map(Some),
+            Self::InMemory(config) => JournalStore::new_in_memory(config).map(Some),
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Default)]
+struct BrowserJournalState {
+    store: Option<JournalStore>,
+    invocations: HashMap<String, Vec<JournalInvocation>>,
+}
+
+impl BrowserJournalState {
+    fn active_invocation_mut(
+        &mut self,
+        key: &str,
+        capability: BrowserCapability,
+    ) -> Option<(&mut JournalStore, &mut JournalInvocation)> {
+        let store = self.store.as_mut()?;
+        let invocation = self
+            .invocations
+            .get_mut(key)?
+            .iter_mut()
+            .rev()
+            .find(|invocation| {
+                invocation.browser_capability == capability && !invocation.terminal
+            })?;
+        Some((store, invocation))
+    }
+
+    fn release_terminal_invocations(&mut self, key: &str) {
+        if let Some(invocations) = self.invocations.get_mut(key) {
+            invocations.retain(|invocation| !invocation.terminal);
+            if invocations.is_empty() {
+                self.invocations.remove(key);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct BrowserPlane {
     state: Arc<Mutex<BrowserState>>,
     lanes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     grants: Arc<Mutex<GrantStore>>,
-    journal_config: Option<journal::JournalConfig>,
-    /// Whether journal invocations bind to memory instead of the durable path.
-    journal_in_memory: bool,
+    journal_mode: BrowserJournalMode,
     refusal_ring: Arc<Mutex<BrowserRefusalRing>>,
-    // A conversation can perform many browser operations. Each journal
-    // invocation is tied to exactly one of them, so they cannot share a slot.
-    journals: Arc<Mutex<HashMap<String, Vec<JournalInvocation>>>>,
+    journal: Arc<Mutex<BrowserJournalState>>,
     session_gate: Option<(
         crate::browser_session::BrowserSessions,
         Arc<cerebellum_core::clock::SystemClock>,
@@ -660,10 +675,9 @@ impl BrowserPlane {
             state: Arc::new(Mutex::new(BrowserState::default())),
             lanes: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(Mutex::new(grants)),
-            journal_config: None,
-            journal_in_memory: false,
+            journal_mode: BrowserJournalMode::Disabled,
             refusal_ring: Arc::new(Mutex::new(BrowserRefusalRing::Disabled)),
-            journals: Arc::new(Mutex::new(HashMap::new())),
+            journal: Arc::new(Mutex::new(BrowserJournalState::default())),
             session_gate: None,
         }
     }
@@ -694,29 +708,20 @@ impl BrowserPlane {
         self
     }
 
-    /// How many journal invocations this plane is retaining, per conversation.
-    ///
-    /// Each invocation owns a `JournalStore`, and a durable store holds a loaded
-    /// copy of the journal state -- so this count is also a count of retained
-    /// copies, and it is what decides whether a long session's memory grows with
-    /// the number of dispatches it has made.
-    pub async fn retained_invocations_for_test(&self) -> usize {
-        self.journals.lock().await.values().map(Vec::len).sum()
+    /// How many loaded journal stores this plane retains.
+    pub async fn retained_journal_store_count_for_test(&self) -> usize {
+        usize::from(self.journal.lock().await.store.is_some())
     }
 
     /// The journal as a reader sees it, for tests that drive the lifecycle.
     pub async fn journal_export_for_test(&self) -> String {
-        let journals = self.journals.lock().await;
-        journals
-            .values()
-            .flatten()
-            .map(|invocation| invocation.store.export())
-            .flat_map(|export| export.lines().map(str::to_string).collect::<Vec<_>>())
-            .filter(|line| !line.is_empty())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.journal
+            .lock()
+            .await
+            .store
+            .as_ref()
+            .map(JournalStore::export)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -736,8 +741,8 @@ impl BrowserPlane {
     /// behind a flag nothing set. That is why the lifecycle test below is the
     /// first execution any of it has had.
     pub fn with_journal_installed(mut self, config: journal::JournalConfig) -> Self {
-        self.journal_config = Some(config);
-        self.journal_in_memory = false;
+        self.journal_mode = BrowserJournalMode::Durable(config);
+        self.journal = Arc::new(Mutex::new(BrowserJournalState::default()));
         self.refusal_ring = Arc::new(Mutex::new(BrowserRefusalRing::Durable(None)));
         self
     }
@@ -748,8 +753,8 @@ impl BrowserPlane {
     /// fixture cannot reach the production path by leaving an argument at its
     /// default. The durable path is what a caller gets by asking for it.
     pub fn with_in_memory_journal(mut self, config: journal::JournalConfig) -> Self {
-        self.journal_config = Some(config);
-        self.journal_in_memory = true;
+        self.journal_mode = BrowserJournalMode::InMemory(config);
+        self.journal = Arc::new(Mutex::new(BrowserJournalState::default()));
         let ring = RefusalRing::new_in_memory(refusal_ring_config())
             .expect("the fixed browser refusal-ring capacity is valid");
         self.refusal_ring = Arc::new(Mutex::new(BrowserRefusalRing::InMemory(ring)));
@@ -819,13 +824,20 @@ impl BrowserPlane {
     }
     pub async fn end_context(&self, identity: &RouteIdentity, crashed: bool) {
         let _lane = self.lane(&identity.conversation_key).await;
-        let mut state = self.state.lock().await;
-        if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
-            context.ended = true;
-            context.crashed = crashed;
-            context.snapshots.begin_teardown();
-            let _ = context.snapshots.complete_teardown();
+        {
+            let mut state = self.state.lock().await;
+            if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
+                context.ended = true;
+                context.crashed = crashed;
+                context.snapshots.begin_teardown();
+                let _ = context.snapshots.complete_teardown();
+            }
         }
+        self.journal
+            .lock()
+            .await
+            .invocations
+            .remove(&identity.conversation_key);
     }
     pub async fn queue_event(&self, identity: &RouteIdentity, event: LateEvent) {
         let mut state = self.state.lock().await;
@@ -948,15 +960,12 @@ impl BrowserPlane {
                 Operation::FinalizeDispatched,
             );
             drop(state);
-            if let Some(entry) = self
-                .journals
-                .lock()
-                .await
-                .get_mut(&identity.conversation_key)
-                .and_then(|invocations| invocations.last_mut())
-                .filter(|entry| entry.browser_capability == capability)
+            let mut journal = self.journal.lock().await;
+            if let Some((store, invocation)) =
+                journal.active_invocation_mut(&identity.conversation_key, capability)
             {
-                let _ = entry.finalize_dispatched(
+                let _ = invocation.finalize_dispatched(
+                    store,
                     FinalContextAssociation {
                         profile_uuid: None,
                         profile_name: None,
@@ -969,6 +978,7 @@ impl BrowserPlane {
                     },
                 );
             }
+            journal.release_terminal_invocations(&identity.conversation_key);
         } else {
             let outcome = journal_outcome(error);
             let mut state = self.state.lock().await;
@@ -984,21 +994,21 @@ impl BrowserPlane {
                 Operation::FinalizeRejected,
             );
             drop(state);
-            if let Some(entry) = self
-                .journals
-                .lock()
-                .await
-                .get_mut(&identity.conversation_key)
-                .and_then(|invocations| invocations.last_mut())
-                .filter(|entry| entry.browser_capability == capability)
+            let mut journal = self.journal.lock().await;
+            if let Some((store, invocation)) =
+                journal.active_invocation_mut(&identity.conversation_key, capability)
             {
-                let _ = entry.finalize_rejected(rejection_material(
-                    outcome,
-                    error
-                        .detail()
-                        .unwrap_or_else(|| json!({"reason_code":"internal_failure"})),
-                ));
+                let _ = invocation.finalize_rejected(
+                    store,
+                    rejection_material(
+                        outcome,
+                        error
+                            .detail()
+                            .unwrap_or_else(|| json!({"reason_code":"internal_failure"})),
+                    ),
+                );
             }
+            journal.release_terminal_invocations(&identity.conversation_key);
         }
     }
 
@@ -1092,25 +1102,26 @@ impl BrowserPlane {
         } else {
             None
         };
-        if persist_journal {
-            if let Some(config) = self.journal_config {
-                let invocation = if self.journal_in_memory {
-                    JournalInvocation::new_in_memory(config, journal_identity(identity), capability)
-                } else {
-                    JournalInvocation::new(config, journal_identity(identity), capability)
-                }
-                .map_err(map_journal_error)?;
-                let mut journals = self.journals.lock().await;
-                let invocations = journals
-                    .entry(identity.conversation_key.clone())
-                    .or_default();
-                invocations.push(invocation);
-                invocations
-                    .last_mut()
-                    .expect("journal invocation was just added")
-                    .reserve()
-                    .map_err(map_journal_error)?;
+        if persist_journal && self.journal_mode.is_enabled() {
+            let mut journal = self.journal.lock().await;
+            if journal.store.is_none() {
+                journal.store = self.journal_mode.open_store().map_err(map_journal_error)?;
             }
+            let mut invocation = JournalInvocation::new(capability);
+            invocation
+                .reserve(
+                    journal
+                        .store
+                        .as_mut()
+                        .expect("an enabled journal mode opens one store"),
+                    journal_identity(identity),
+                )
+                .map_err(map_journal_error)?;
+            journal
+                .invocations
+                .entry(identity.conversation_key.clone())
+                .or_default()
+                .push(invocation);
         }
         let mut state = self.state.lock().await;
         state
@@ -1129,24 +1140,25 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         capability: BrowserCapability,
     ) -> Result<(), BrowserError> {
-        if self.journal_config.is_some() {
-            let mut journals = self.journals.lock().await;
-            if let Some(entry) = journals
-                .get_mut(&identity.conversation_key)
-                .and_then(|invocations| invocations.last_mut())
-                .filter(|entry| entry.browser_capability == capability)
+        if self.journal_mode.is_enabled() {
+            let mut journal = self.journal.lock().await;
+            if let Some((store, invocation)) =
+                journal.active_invocation_mut(&identity.conversation_key, capability)
             {
-                entry
-                    .commit_dispatched(DispatchMaterial {
-                        intent_redacted: None,
-                        requested_severity: None,
-                        effective_severity: None,
-                        grant_decision: GrantDecision::not_reached(),
-                        action: journal_action(entry.capability),
-                        locator: None,
-                        snapshot_ids: Vec::new(),
-                        governing_observation: GoverningObservation::observation_not_required(),
-                    })
+                invocation
+                    .commit_dispatched(
+                        store,
+                        DispatchMaterial {
+                            intent_redacted: None,
+                            requested_severity: None,
+                            effective_severity: None,
+                            grant_decision: GrantDecision::not_reached(),
+                            action: journal_action(invocation.capability),
+                            locator: None,
+                            snapshot_ids: Vec::new(),
+                            governing_observation: GoverningObservation::observation_not_required(),
+                        },
+                    )
                     .map_err(map_journal_error)?;
             }
         }
@@ -1178,15 +1190,14 @@ impl BrowserPlane {
             Operation::FinalizeDispatched,
         );
         drop(state);
-        if self.journal_config.is_some() {
-            let mut journals = self.journals.lock().await;
-            if let Some(entry) = journals
-                .get_mut(&identity.conversation_key)
-                .and_then(|invocations| invocations.last_mut())
-                .filter(|entry| entry.browser_capability == capability)
+        if self.journal_mode.is_enabled() {
+            let mut journal = self.journal.lock().await;
+            if let Some((store, invocation)) =
+                journal.active_invocation_mut(&identity.conversation_key, capability)
             {
-                entry
+                invocation
                     .finalize_dispatched(
+                        store,
                         FinalContextAssociation {
                             profile_uuid: None,
                             profile_name: (identity.session_kind != SessionKind::Ephemeral)
@@ -1196,6 +1207,7 @@ impl BrowserPlane {
                     )
                     .map_err(map_journal_error)?;
             }
+            journal.release_terminal_invocations(&identity.conversation_key);
         }
         Ok(())
     }

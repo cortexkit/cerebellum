@@ -1994,22 +1994,11 @@ async fn a_redirect_off_the_authorized_origin_withholds_read_page_content() {
     );
 }
 
-/// The browser journal lifecycle runs at all, and a read records as a read.
+/// A navigation and its embedded read produce separate journal records.
 ///
-/// This is the FIRST execution this path has ever had. `journal_config` is set
-/// only by a builder that had zero callers -- not one test -- so every reserve,
-/// commit and finalize in the plane was unreachable code behind a flag nothing
-/// set. The per-dispatch invocation refactor, the capability mapping and the
-/// action rule were all written against a path that never ran.
-///
-/// It asserts the two properties that the vocabulary work exists for: a navigate
-/// with an embedded read produces entries under BOTH names rather than two
-/// navigations, and the observation carries no action while the navigation does.
-///
-/// It also prints the serialized entry size, because the open question for
-/// wiring this in production is whether observation entries are launch-shaped:
-/// reads are the chatty path, and an entry sized to a launch would let a
-/// read-heavy session evict its own actuation records.
+/// Both records must survive in the plane's shared journal and retain their own
+/// capability names. The serialized sizes are printed because frequent reads
+/// should not crowd actuation records out of the journal.
 #[tokio::test]
 async fn the_journal_lifecycle_runs_and_separates_a_read_from_a_navigation() {
     let route = identity();
@@ -2262,23 +2251,13 @@ async fn a_refused_read_never_reaches_the_journal() {
     );
 }
 
-/// Journal invocations accumulate for the life of the plane.
+/// Every dispatch uses the plane's single loaded journal store.
 ///
-/// Each dispatch mints a `JournalInvocation`, each invocation owns a
-/// `JournalStore`, and a durable store holds a loaded copy of the journal
-/// state. Nothing removes them: not finalization, not `end_context`, not a
-/// crash. So a long-lived module retains one loaded journal copy per dispatch
-/// it has ever served, and the cost of each new one grows as the journal file
-/// grows.
-///
-/// Latent today because production never sets `journal_config` -- which is
-/// exactly why it is worth measuring BEFORE wiring, rather than discovering it
-/// as memory growth in a running module afterwards.
-///
-/// Bounded rather than asserted equal: the point is the trend, and a bound is
-/// what will still fail if someone makes it worse.
+/// The record delta samples one dispatch at a time. Comparing two identical
+/// deltas prevents an accumulated export count from masquerading as a
+/// per-dispatch measurement.
 #[tokio::test]
-async fn journal_invocations_are_retained_for_every_dispatch() {
+async fn journal_dispatches_share_one_store() {
     let route = identity();
     let observation = snapshot_observation(vec![AxRecord {
         depth: 0,
@@ -2294,7 +2273,15 @@ async fn journal_invocations_are_retained_for_every_dispatch() {
         });
     plane.open_context(route.clone()).await.unwrap();
 
+    let mut retained_store_counts = Vec::new();
+    let mut records_per_dispatch = Vec::new();
     for _ in 0..3 {
+        let records_before = plane
+            .journal_export_for_test()
+            .await
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
         let result = plane
             .dispatch(
                 &route,
@@ -2308,24 +2295,33 @@ async fn journal_invocations_are_retained_for_every_dispatch() {
             )
             .await;
         assert_eq!(result["outcome"], "ok", "{result}");
+
+        let records_after = plane
+            .journal_export_for_test()
+            .await
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        records_per_dispatch.push(records_after - records_before);
+        retained_store_counts.push(plane.retained_journal_store_count_for_test().await);
     }
-    let after_dispatches = plane.retained_invocations_for_test().await;
 
-    // Ending the context does not release them either, which is the part that
-    // matters: a session that closes cleanly still leaves its journal copies
-    // behind for the life of the module.
-    plane.end_context(&route, false).await;
-    let after_teardown = plane.retained_invocations_for_test().await;
-
-    println!("retained after 3 dispatches: {after_dispatches}, after teardown: {after_teardown}");
     assert_eq!(
-        after_dispatches, after_teardown,
-        "teardown released journal invocations, so this test no longer describes \
-         the behaviour it exists to bound"
+        retained_store_counts,
+        vec![1, 1, 1],
+        "dispatches must reuse the plane's loaded journal store"
     );
-    assert!(
-        after_dispatches <= 3,
-        "three dispatches retained {after_dispatches} journal invocations, more \
-         than one each; the per-dispatch retention cost has grown"
+    assert_eq!(
+        records_per_dispatch,
+        vec![1, 1, 1],
+        "identical dispatches must each contribute one record; a growing count \
+         means the measurement is integrating journal history"
+    );
+
+    plane.end_context(&route, false).await;
+    assert_eq!(
+        plane.retained_journal_store_count_for_test().await,
+        1,
+        "the journal belongs to the plane rather than the ended context"
     );
 }
