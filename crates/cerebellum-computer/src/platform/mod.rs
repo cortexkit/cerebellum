@@ -470,12 +470,12 @@ fn capability_declaration(
         // path, which seizes the shared cursor and is the authority this module
         // calls observed mode. That path is deliberately unbuilt, so the honest
         // claim here is Unsupported rather than a mode we do not offer.
-        synthetic_background: if !platform_available {
-            SupportState::Unsupported
-        } else if synthetic_path_is_pointer(id) {
-            SupportState::Unsupported
-        } else {
+        // Two independent reasons, one answer: no platform driver to post with,
+        // or a row whose events the per-process path does not carry.
+        synthetic_background: if platform_available && !synthetic_path_is_pointer(id) {
             SupportState::Supported
+        } else {
+            SupportState::Unsupported
         },
         synthetic_observed: SupportState::ConsentGated,
         required_permissions: permissions,
