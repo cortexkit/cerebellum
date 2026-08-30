@@ -670,6 +670,16 @@ impl BrowserPlane {
         self
     }
 
+    /// How many journal invocations this plane is retaining, per conversation.
+    ///
+    /// Each invocation owns a `JournalStore`, and a durable store holds a loaded
+    /// copy of the journal state -- so this count is also a count of retained
+    /// copies, and it is what decides whether a long session's memory grows with
+    /// the number of dispatches it has made.
+    pub async fn retained_invocations_for_test(&self) -> usize {
+        self.journals.lock().await.values().map(Vec::len).sum()
+    }
+
     /// The journal as a reader sees it, for tests that drive the lifecycle.
     pub async fn journal_export_for_test(&self) -> String {
         let journals = self.journals.lock().await;
