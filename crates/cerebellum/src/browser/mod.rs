@@ -797,6 +797,21 @@ impl BrowserPlane {
             .map_or(0, |store| store.active_reserved_bytes())
     }
 
+    /// Dispatches this plane committed and never closed out.
+    ///
+    /// Zero is the property crash coverage needs and neither the export nor the
+    /// byte count can express: both read identically whether a dispatch was
+    /// finalized or left open, and an open one is what startup recovery treats
+    /// as a process that died mid-dispatch.
+    pub async fn unfinalized_dispatch_count_for_test(&self) -> usize {
+        self.journal
+            .lock()
+            .await
+            .store
+            .as_ref()
+            .map_or(0, |store| store.unfinalized_dispatch_count())
+    }
+
     /// The journal as a reader sees it, for tests that drive the lifecycle.
     pub async fn journal_export_for_test(&self) -> String {
         self.journal

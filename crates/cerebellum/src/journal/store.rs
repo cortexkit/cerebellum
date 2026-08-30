@@ -167,6 +167,12 @@ impl JournalStore {
         self.core.active_reserved_bytes()
     }
 
+    /// Dispatches committed and never closed out. See the core method for why
+    /// this cannot be read off the export or the byte accounting.
+    pub fn unfinalized_dispatch_count(&self) -> usize {
+        self.core.unfinalized_dispatch_count()
+    }
+
     pub fn active_pre_dispatch_count(&self) -> u64 {
         self.core.active_pre_dispatch_count() as u64
     }

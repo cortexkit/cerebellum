@@ -553,6 +553,27 @@ where
             .count()
     }
 
+    /// Reservations that were committed and never closed out.
+    ///
+    /// This is the state startup recovery reads as a process that died between
+    /// dispatching and finalizing, so it must be observable independently of
+    /// the export -- which merges finalized entries with `Dispatched`
+    /// reservations and therefore cannot tell the two apart. Byte accounting
+    /// cannot either: a committed reservation and a finalized entry both leave
+    /// nothing held.
+    ///
+    /// Without this, a regression that stopped finalizing would produce phantom
+    /// recovery cases with no test able to notice. Measured: breaking all three
+    /// finalization call sites in the browser plane left its crash-path test
+    /// green.
+    pub fn unfinalized_dispatch_count(&self) -> usize {
+        self.state
+            .reservations
+            .values()
+            .filter(|record| record.state == LifecycleState::Dispatched)
+            .count()
+    }
+
     pub fn set_oversize_flag(&mut self) {
         self.state.oversize_flag = true;
         let candidate = self.state.clone();
