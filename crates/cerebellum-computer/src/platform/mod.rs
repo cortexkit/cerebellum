@@ -432,6 +432,18 @@ fn capability_declaration(
         advertised = suppression_reason.is_none();
     }
 
+    // Which modes could carry this row at all, before asking whether any of them
+    // is available in this build. move is observed-only: the frozen vocabulary
+    // gives it synthetic_paths ["global"] and no per_pid, which is the same
+    // conclusion tonight's measurement reached from the other direction.
+    let dispatch_modes = if id == "computer.move" {
+        vec![DispatchMode::Observed]
+    } else if id == "computer.screenshot" || id == "computer.wait" {
+        vec![]
+    } else {
+        vec![DispatchMode::Background, DispatchMode::Observed]
+    };
+
     // Claimed only where an AxAction actually implements the path the frozen row
     // names, rather than wherever the row names one.
     //
@@ -466,13 +478,7 @@ fn capability_declaration(
     CapabilityDeclaration {
         capability_id: id.to_string(),
         action_kind,
-        dispatch_modes: if id == "computer.move" {
-            vec![DispatchMode::Observed]
-        } else if id == "computer.screenshot" || id == "computer.wait" {
-            vec![]
-        } else {
-            vec![DispatchMode::Background, DispatchMode::Observed]
-        },
+        dispatch_modes: dispatch_modes.clone(),
         // Claimed only where an AxAction actually implements the path the
         // frozen row names, rather than wherever the row names one.
         //
@@ -514,7 +520,19 @@ fn capability_declaration(
         // Two independent reasons, one answer: no platform driver to post with,
         // or a row whose events the per-process path does not carry.
         synthetic_background: background_support,
-        synthetic_observed: SupportState::ConsentGated,
+        // Derived from the dispatch modes rather than asserted beside them, so
+        // the two cannot disagree about whether a row has an observed path.
+        //
+        // They did: screenshot and wait carry no dispatch modes because they
+        // read rather than actuate, and this field claimed ConsentGated for them
+        // anyway -- an observed synthetic path, pending consent, for capabilities
+        // that dispatch nothing. Third claim in this struct that described the
+        // design rather than the driver.
+        synthetic_observed: if dispatch_modes.contains(&DispatchMode::Observed) {
+            SupportState::ConsentGated
+        } else {
+            SupportState::Unsupported
+        },
         required_permissions: permissions,
         retry_class,
         // A capability whose permission requirements could not be read is

@@ -19,7 +19,7 @@ use cerebellum_computer::{
     },
     platform::{
         capability_declarations, vocabulary::required_permission_services,
-        CapabilityAdvertisementContext, ImmutableReleaseInputs, PermissionLiveness,
+        CapabilityAdvertisementContext, DispatchMode, ImmutableReleaseInputs, PermissionLiveness,
         PermissionLivenessReport, PermissionProbeResult, PermissionService, StartupCapabilityProbe,
         SupportState, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
     },
@@ -675,4 +675,44 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
     // Both populations must be non-empty, or the loop above asserts nothing.
     assert_eq!(actuating, 6, "the actuating rows are not all present");
     assert_eq!(observing, 2, "the observing rows are not all present");
+}
+
+/// A row's observed-path claim agrees with the dispatch modes beside it.
+///
+/// These are two statements about the same question -- can this row be carried
+/// in observed mode -- sitting in one struct, and they disagreed: screenshot and
+/// wait carry no dispatch modes because they read rather than actuate, and the
+/// observed field claimed ConsentGated for them anyway. A consent-gated path for
+/// a capability that dispatches nothing.
+///
+/// Fixed by deriving one from the other rather than by correcting the value, so
+/// a future row cannot reintroduce the disagreement. This asserts the property
+/// that derivation is supposed to guarantee, because a derivation is only as
+/// durable as something checking it stayed one.
+#[test]
+fn the_observed_claim_and_the_dispatch_modes_agree() {
+    let context = fully_bound_context();
+    let declarations = capability_declarations(&context, true);
+
+    let mut with_observed = 0;
+    let mut without = 0;
+    for declaration in &declarations {
+        let claims_observed = declaration.synthetic_observed != SupportState::Unsupported;
+        let has_observed_mode = declaration.dispatch_modes.contains(&DispatchMode::Observed);
+        assert_eq!(
+            claims_observed, has_observed_mode,
+            "{} claims observed support {:?} while its dispatch modes are {:?}",
+            declaration.capability_id, declaration.synthetic_observed, declaration.dispatch_modes
+        );
+        if has_observed_mode {
+            with_observed += 1;
+        } else {
+            without += 1;
+        }
+    }
+
+    // Both sides must occur, or the equality above is satisfied by one uniform
+    // answer and proves nothing about the agreement.
+    assert_eq!(with_observed, 6, "the rows with an observed mode changed");
+    assert_eq!(without, 2, "the rows without one changed");
 }
