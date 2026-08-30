@@ -2805,3 +2805,27 @@ async fn a_browser_that_dies_mid_dispatch_finalizes_its_journal_entry() {
          recovery reads as a process that died mid-dispatch: {export}"
     );
 }
+
+/// The plane a running module builds has a journal installed.
+///
+/// Every audit call in this plane sits behind `journal_config.is_some()`, and
+/// production left it None from the day the plane shipped until now — so
+/// reserve, commit and finalize were all no-ops on the path that actually
+/// serves callers, while a full lifecycle test suite passed against fixtures
+/// that installed one by hand.
+///
+/// This asserts the wiring at the PRODUCTION constructor rather than at a
+/// fixture, because a fixture proves the mechanism works and says nothing about
+/// whether anything reaches it. That distinction is the whole defect: the
+/// mechanism was never broken, it was never called.
+#[tokio::test]
+async fn the_plane_a_running_module_builds_journals() {
+    let health = Arc::new(cerebellum_core::health::HealthState::new());
+    let planes = cerebellum::Planes::new(health);
+
+    assert!(
+        planes.browser.journal_is_installed_for_test().await,
+        "the production browser plane has no journal, so every audit call on \
+         the serving path is a no-op"
+    );
+}

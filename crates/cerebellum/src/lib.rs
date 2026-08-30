@@ -1420,6 +1420,24 @@ where
 /// everywhere: the loop, the frame dispatcher, and each surface's handler all
 /// need the same set, and threading them one by one meant every new one touched
 /// every signature in the chain.
+/// Retention for the browser DRIVE journal: navigate, snapshot, click,
+/// screenshot and their refusals.
+///
+/// Separate from the launch journal's 64 MiB because the entries are a
+/// different size and the traffic is a different shape. A drive record measured
+/// ~730 bytes against a launch record's 8.7-11 KB, and a navigate with an
+/// embedded read writes two of them -- so 8 MiB buys roughly 11,000 records,
+/// about 5,500 navigate-and-read pairs.
+///
+/// Quote measured field numbers when re-sizing this rather than fixture
+/// numbers. Sizing the launch journal against its fixture would have overstated
+/// capacity by 44% in the direction that runs out sooner than the comment
+/// promised, and the same trap applies here.
+const BROWSER_DRIVE_JOURNAL: journal::JournalConfig = journal::JournalConfig {
+    journal_retention_bytes: 8 * 1024 * 1024,
+    journal_max_entry_bytes: 64 * 1024,
+};
+
 pub struct Planes {
     pub health: Arc<HealthState>,
     pub routes: Arc<RouteBindings>,
@@ -1501,9 +1519,14 @@ impl Planes {
                     Arc::clone(&lease_clock),
                     config.navigation_settle_deadline_ms,
                 )
-                .with_shared_grants(browser_grants),
+                .with_shared_grants(browser_grants)
+                .with_journal_installed(BROWSER_DRIVE_JOURNAL),
             )
         } else {
+            // No journal on the unconfigured branch. This plane serves nothing
+            // -- every capability refuses for want of a browser -- so opening a
+            // durable journal would create a file on disk for a surface that
+            // cannot produce a record to put in it.
             Arc::new(BrowserPlane::new().with_shared_grants(browser_grants))
         };
         Self {
