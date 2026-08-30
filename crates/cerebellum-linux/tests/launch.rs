@@ -43,6 +43,30 @@ fn cdp_descriptors() -> (OwnedFd, OwnedFd, OwnedFd, OwnedFd) {
     (command_read, command_write, response_read, response_write)
 }
 
+/// Spawn a script under a shell that supports `exec -a`.
+///
+/// `exec -a` is a bashism. Ubuntu and Debian make /bin/sh dash, which has no
+/// `-a`, so the shell dies before reaching the exec the test is waiting for and
+/// the failure surfaces as ProcessExited -- a real capability gap wearing the
+/// costume of a launcher defect. Naming bash explicitly keeps the test about
+/// argv[0] rewriting rather than about which shell the distribution installs.
+fn spawn_bash(script: &str) -> BarredChild {
+    assert!(
+        Path::new("/bin/bash").exists(),
+        "this test rewrites argv[0] with `exec -a`, which requires bash; /bin/sh is dash on \
+         Debian and Ubuntu and cannot express it"
+    );
+    let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
+    spawn_barred(
+        Path::new("/bin/bash"),
+        &[OsString::from("-c"), OsString::from(script)],
+        &[],
+        command_read.as_raw_fd(),
+        response_write.as_raw_fd(),
+    )
+    .expect("spawn barred bash")
+}
+
 fn spawn_shell(script: &str) -> BarredChild {
     let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
     spawn_barred(
@@ -223,7 +247,7 @@ fn an_exec_chain_reports_the_next_mapped_image_and_honors_its_bound() {
 #[test]
 fn exec_chain_attestation_ignores_rewritten_argv_zero() {
     let _lock = launch_lock();
-    let mut child = spawn_shell("exec -a somethingelse /bin/sleep 30");
+    let mut child = spawn_bash("exec -a somethingelse /bin/sleep 30");
     let identity = child.continue_to_next_exec_stop(1).expect("next exec stop");
 
     assert_eq!(
