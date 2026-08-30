@@ -62,10 +62,10 @@ fn dispatch() -> DispatchMaterial {
             outcome: GrantOutcome::Allowed,
             reason: None,
         },
-        action: Action::Navigate {
+        action: Some(Action::Navigate {
             url_redacted: "https://example.com".to_string(),
             wait: NavigateWait::Settle,
-        },
+        }),
         locator: None,
         snapshot_ids: vec![],
         governing_observation: GoverningObservation::no_prior_observation(),
@@ -520,4 +520,41 @@ fn purge_clears_oversize_flag_and_reports_only_finalized_entries() {
     assert!(store.export().is_empty());
     // The allocator is not reset by purge.
     assert_eq!(store.next_sequence(), 2);
+}
+
+/// Every browser capability records under its own name, and no two collapse.
+///
+/// Three observations used to fold onto Navigate, so a snapshot of a page in a
+/// durable profile persisted as `browser.navigate` — a read recorded as a page
+/// load. That is worse than not recording it at all: an absent entry is honest
+/// about being absent, while a wrong one is read as authoritative, and this
+/// journal directory is enrolled for fleet backup, so a wrong record is
+/// permanent.
+///
+/// The expected names are literals rather than derived from the enum, because
+/// deriving them would let a mapping change satisfy the test by moving both
+/// sides at once.
+#[test]
+fn no_two_browser_capabilities_share_a_journal_name() {
+    use cerebellum::journal::Capability;
+
+    let expected = [
+        (Capability::Navigate, "browser.navigate"),
+        (Capability::Click, "browser.click"),
+        (Capability::Type, "browser.type"),
+        (Capability::ClickPoint, "browser.click_point"),
+        (Capability::Snapshot, "browser.snapshot"),
+        (Capability::Screenshot, "browser.screenshot"),
+        (Capability::WaitFor, "browser.wait_for"),
+    ];
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (capability, name) in expected {
+        assert_eq!(capability.as_str(), name);
+        assert!(
+            seen.insert(name),
+            "{name} is claimed by more than one capability"
+        );
+    }
+    assert_eq!(seen.len(), 7, "a capability was added without a name here");
 }

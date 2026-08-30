@@ -58,7 +58,14 @@ pub struct DispatchMaterial {
     pub requested_severity: Option<Severity>,
     pub effective_severity: Option<Severity>,
     pub grant_decision: GrantDecision,
-    pub action: Action,
+    /// Absent for an observation, which performs no action.
+    ///
+    /// The record's own `action` field has always been optional; this was the
+    /// layer that could not express the absence, so every dispatch had to name
+    /// an action whether or not one happened. That was tolerable while only
+    /// actuating capabilities were journaled and became a lie the moment reads
+    /// were.
+    pub action: Option<Action>,
     pub locator: Option<Locator>,
     pub snapshot_ids: Vec<String>,
     pub governing_observation: GoverningObservation,
@@ -153,7 +160,7 @@ fn provisional_entry(
         capability,
         Phase::Dispatched,
         EntryMaterial {
-            action: Some(material.action.clone()),
+            action: material.action.clone(),
             locator: material.locator.clone(),
             grant_decision: material.grant_decision.clone(),
             governing_observation: material.governing_observation.clone(),

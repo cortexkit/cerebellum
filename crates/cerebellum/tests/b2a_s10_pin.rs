@@ -77,10 +77,10 @@ fn dispatch() -> DispatchMaterial {
             outcome: GrantOutcome::Allowed,
             reason: None,
         },
-        action: Action::Navigate {
+        action: Some(Action::Navigate {
             url_redacted: "https://example.com".to_string(),
             wait: NavigateWait::Settle,
-        },
+        }),
         locator: None,
         snapshot_ids: vec![],
         governing_observation: GoverningObservation::no_prior_observation(),
