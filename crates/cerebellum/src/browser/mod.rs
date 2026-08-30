@@ -780,6 +780,23 @@ impl BrowserPlane {
         usize::from(self.journal.lock().await.store.is_some())
     }
 
+    /// Bytes still held by reservations that have not reached a terminal state.
+    ///
+    /// The export cannot answer this: it merges finalized entries with
+    /// reservations in `dispatched` state, so a record appearing there proves
+    /// the dispatch was committed and NOT that it was finalized. Zero here is
+    /// what distinguishes "the journal closed this out" from "the journal is
+    /// still holding it open" -- and an entry held open is what startup
+    /// recovery reads as a process that died mid-dispatch.
+    pub async fn active_reserved_bytes_for_test(&self) -> u64 {
+        self.journal
+            .lock()
+            .await
+            .store
+            .as_ref()
+            .map_or(0, |store| store.active_reserved_bytes())
+    }
+
     /// The journal as a reader sees it, for tests that drive the lifecycle.
     pub async fn journal_export_for_test(&self) -> String {
         self.journal

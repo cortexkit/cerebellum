@@ -1,20 +1,20 @@
 # SUBTREE hashes, not commit shas.
-#
+# 
 # Each line is `git rev-parse <rev>:crates/<crate>` -- the hash of the crate's
 # CONTENT. scripts/release-build.sh compares these against the sibling checkout
 # at HEAD and refuses to build when they differ, so a release cannot link
 # sibling code no gate has verified.
-#
+# 
 # Content-addressed on purpose, and it matters twice. A sibling commit that
 # touches only documentation moves no subtree, so it does not fail a release
 # build for a change this binary cannot link. And a history rewrite that
 # preserves content leaves these untouched, where commit shas would be orphaned
 # by it -- which is what happened on 2026-08-27 and is why these are not shas.
-#
+# 
 # Re-derive rather than edit:
-#   for c in subc-protocol subc-transport subc-jsonc; do
-#     echo "$(git -C ../subconscious rev-parse HEAD:crates/$c) $c"
-#   done > subconscious-source.txt
-bf8dcfcd4c7e28e37c3bf652f49f0cfaef7050a9 subc-protocol
-b16a6748a1087ca9d067be46a7d4f5f15eaee060 subc-transport
+# for c in subc-protocol subc-transport subc-jsonc; do
+# echo "$(git -C ../subconscious rev-parse HEAD:crates/$c) $c"
+# done > subconscious-source.txt
+a8819f0244703234cd89d66a38c33fb4dde238c7 subc-protocol
+19673f636c57557c7ccc63a93d9146cb7c90b829 subc-transport
 7dfaa2e71972626a6235b9513e1dfe93c4df504b subc-jsonc
