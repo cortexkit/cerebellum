@@ -215,6 +215,34 @@ pub enum BrowserInputEvent {
     Release(BrowserClickPosition),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JavaScriptDialogResponse {
+    Dismissed,
+}
+
+impl JavaScriptDialogResponse {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserJavaScriptDialog {
+    pub dialog_type: String,
+    pub response: JavaScriptDialogResponse,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserClickOutcome {
+    Clicked(BrowserClickPosition),
+    JavaScriptDialogDismissed {
+        position: BrowserClickPosition,
+        dialogs: Vec<BrowserJavaScriptDialog>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportRefusal {
     pub position: BrowserClickPosition,
@@ -298,7 +326,7 @@ pub trait OwnedBrowserProcess: Send {
         _identity: &BackendNodeIdentity,
         _deadline_ms: u64,
         _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         Err(ClickDriveError::Navigation(
             NavigationDriveError::Unavailable,
         ))
@@ -311,7 +339,7 @@ pub trait OwnedBrowserProcess: Send {
         _position: BrowserClickPosition,
         _deadline_ms: u64,
         _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         Err(ClickPointDriveError::Navigation(
             NavigationDriveError::Unavailable,
         ))
@@ -330,7 +358,7 @@ pub trait OwnedBrowserProcess: Send {
         _expected: Option<&crate::classification::NonTypeClassificationRecord>,
         _deadline_ms: u64,
         _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         Err(ClickDriveError::ClassificationChanged)
     }
 
@@ -519,7 +547,7 @@ impl OperationGuard {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         let mut state = self
             .sessions
             .inner
@@ -548,7 +576,7 @@ impl OperationGuard {
         expected: Option<&crate::classification::NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         let mut state = self
             .sessions
             .inner

@@ -281,6 +281,33 @@ impl BrowserError {
     }
 }
 
+fn browser_click_result(outcome: crate::browser_session::BrowserClickOutcome) -> Value {
+    match outcome {
+        crate::browser_session::BrowserClickOutcome::Clicked(_) => {
+            json!({"outcome":"ok","url_final":Value::Null,"lifecycle":[]})
+        }
+        crate::browser_session::BrowserClickOutcome::JavaScriptDialogDismissed {
+            dialogs, ..
+        } => {
+            let dialogs = dialogs
+                .into_iter()
+                .map(|dialog| {
+                    json!({
+                        "dialog_type": dialog.dialog_type,
+                        "response": dialog.response.as_str(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "outcome":"javascript_dialog_dismissed",
+                "url_final":Value::Null,
+                "lifecycle":["javascript_dialog_opened","javascript_dialog_dismissed"],
+                "dialogs":dialogs,
+            })
+        }
+    }
+}
+
 fn viewport_refusal_detail(
     reason_code: &'static str,
     refusal: crate::browser_session::ViewportRefusal,
@@ -1987,8 +2014,8 @@ impl BrowserPlane {
         session_operation.finish();
         self.unpin_snapshot(identity, snapshot_id).await;
 
-        match drive_result {
-            Ok(_) => {}
+        let response = match drive_result {
+            Ok(outcome) => browser_click_result(outcome),
             Err(crate::browser_session::ClickDriveError::NoPosition) => {
                 self.finalize(
                     identity,
@@ -2025,15 +2052,15 @@ impl BrowserPlane {
             Err(crate::browser_session::ClickDriveError::Navigation(error)) => {
                 return Err(map_navigation_drive_error(error));
             }
-        }
+        };
         self.finalize(
             identity,
             BrowserCapability::Click,
             Outcome::Success,
-            json!({"outcome":"ok","url_final":Value::Null,"lifecycle":[]}),
+            response.clone(),
         )
         .await?;
-        Ok(json!({"outcome":"ok","url_final":Value::Null,"lifecycle":[]}))
+        Ok(response)
     }
 
     async fn screenshot(
@@ -2343,8 +2370,8 @@ impl BrowserPlane {
         };
         session_operation.finish();
         self.unpin_snapshot(identity, snapshot_id).await;
-        match drive_result {
-            Ok(_) => {}
+        let response = match drive_result {
+            Ok(outcome) => browser_click_result(outcome),
             Err(crate::browser_session::ClickPointDriveError::OutsideViewport(refusal)) => {
                 let detail = viewport_refusal_detail("point_outside_viewport", refusal);
                 self.finalize(
@@ -2359,16 +2386,16 @@ impl BrowserPlane {
             Err(crate::browser_session::ClickPointDriveError::Navigation(error)) => {
                 return Err(map_navigation_drive_error(error));
             }
-        }
+        };
 
         self.finalize(
             identity,
             BrowserCapability::ClickPoint,
             Outcome::Success,
-            json!({"outcome":"ok","url_final":Value::Null,"lifecycle":[]}),
+            response.clone(),
         )
         .await?;
-        Ok(json!({"outcome":"ok","url_final":Value::Null,"lifecycle":[]}))
+        Ok(response)
     }
 
     async fn wait_for(
