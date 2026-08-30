@@ -1993,3 +1993,90 @@ async fn a_redirect_off_the_authorized_origin_withholds_read_page_content() {
         "a refused read must not return page content: {result}"
     );
 }
+
+/// The browser journal lifecycle runs at all, and a read records as a read.
+///
+/// This is the FIRST execution this path has ever had. `journal_config` is set
+/// only by a builder that had zero callers -- not one test -- so every reserve,
+/// commit and finalize in the plane was unreachable code behind a flag nothing
+/// set. The per-dispatch invocation refactor, the capability mapping and the
+/// action rule were all written against a path that never ran.
+///
+/// It asserts the two properties that the vocabulary work exists for: a navigate
+/// with an embedded read produces entries under BOTH names rather than two
+/// navigations, and the observation carries no action while the navigation does.
+///
+/// It also prints the serialized entry size, because the open question for
+/// wiring this in production is whether observation entries are launch-shaped:
+/// reads are the chatty path, and an entry sized to a launch would let a
+/// read-heavy session evict its own actuation records.
+#[tokio::test]
+async fn the_journal_lifecycle_runs_and_separates_a_read_from_a_navigation() {
+    let route = identity();
+    let observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "heading".into(),
+        name: "Journalled page".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000)
+        .with_in_memory_journal(cerebellum::journal::JournalConfig {
+            journal_retention_bytes: 1_000_000,
+            journal_max_entry_bytes: 100_000,
+        });
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "drive the journal lifecycle",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": true
+            }),
+        )
+        .await;
+    assert_eq!(result["outcome"], "ok", "{result}");
+    assert_eq!(result["read_page"]["outcome"], "ok", "{result}");
+
+    // Read back through the export, which is the shape a reader actually sees.
+    let export = plane.journal_export_for_test().await;
+    for line in export.lines() {
+        println!("journal line ({} bytes): {line}", line.len());
+    }
+    assert!(
+        export.contains("\"capability\":\"browser.navigate\""),
+        "the navigation is missing from the journal: {export}"
+    );
+    assert!(
+        export.contains("\"capability\":\"browser.snapshot\""),
+        "the read recorded as something other than a read: {export}"
+    );
+
+    // Two records per call -- the navigation and the read -- at ~730 bytes each.
+    //
+    // Getting that number cost three wrong ones, and the reason is worth keeping:
+    // JournalStore::new opens the OPERATOR'S journal on disk, so this test was
+    // writing into real audit data and reading back everything every earlier run
+    // had left. It reported 11, then 17, then 21 for the same single call,
+    // because it was measuring a running total. A count that GROWS across
+    // identical runs is the tell, and it is only visible if you run the thing
+    // twice -- which is not something a passing test asks you to do.
+    //
+    // The isolated binding fixed both problems at once: the measurement became
+    // meaningful and the test stopped polluting durable data.
+    //
+    // Bounded rather than asserted equal so a third record cannot appear
+    // unnoticed, since the per-call cost is what decides whether reads can be
+    // journaled in production without evicting the actions beside them.
+    let records = export.lines().filter(|line| !line.is_empty()).count();
+    assert!(
+        records <= 2,
+        "a navigate with one read now writes {records} journal records, up from the \
+         two measured when this was written; the per-call cost has grown"
+    );
+}

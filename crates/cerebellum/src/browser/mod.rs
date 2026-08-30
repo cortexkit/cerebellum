@@ -387,13 +387,41 @@ pub struct JournalInvocation {
 }
 
 impl JournalInvocation {
+    /// Bind an invocation to the DURABLE journal on disk.
+    ///
+    /// `JournalStore::new` opens the production path. A fixture that wants a
+    /// journal must use [`Self::new_in_memory`] instead, or it writes into the
+    /// operator's real audit data and reads back everything every earlier run
+    /// left there -- which is exactly how a lifecycle test of mine reported a
+    /// per-call cost that was really a running total, growing on each run.
     pub fn new(
         config: journal::JournalConfig,
         identity: JournalIdentity,
         browser_capability: BrowserCapability,
     ) -> Result<Self, JournalError> {
+        Self::open(JournalStore::new(config)?, identity, browser_capability)
+    }
+
+    /// Bind an invocation to an isolated in-memory journal.
+    pub fn new_in_memory(
+        config: journal::JournalConfig,
+        identity: JournalIdentity,
+        browser_capability: BrowserCapability,
+    ) -> Result<Self, JournalError> {
+        Self::open(
+            JournalStore::new_in_memory(config)?,
+            identity,
+            browser_capability,
+        )
+    }
+
+    fn open(
+        store: JournalStore,
+        identity: JournalIdentity,
+        browser_capability: BrowserCapability,
+    ) -> Result<Self, JournalError> {
         Ok(Self {
-            store: JournalStore::new(config)?,
+            store,
             identity,
             browser_capability,
             capability: journal_capability(browser_capability),
@@ -588,6 +616,8 @@ pub struct BrowserPlane {
     lanes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     grants: Arc<Mutex<GrantStore>>,
     journal_config: Option<journal::JournalConfig>,
+    /// Whether journal invocations bind to memory instead of the durable path.
+    journal_in_memory: bool,
     // A conversation can perform many browser operations. Each journal
     // invocation is tied to exactly one of them, so they cannot share a slot.
     journals: Arc<Mutex<HashMap<String, Vec<JournalInvocation>>>>,
@@ -608,6 +638,7 @@ impl BrowserPlane {
             lanes: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(Mutex::new(grants)),
             journal_config: None,
+            journal_in_memory: false,
             journals: Arc::new(Mutex::new(HashMap::new())),
             session_gate: None,
         }
@@ -639,16 +670,51 @@ impl BrowserPlane {
         self
     }
 
+    /// The journal as a reader sees it, for tests that drive the lifecycle.
+    pub async fn journal_export_for_test(&self) -> String {
+        let journals = self.journals.lock().await;
+        journals
+            .values()
+            .flatten()
+            .map(|invocation| invocation.store.export())
+            .flat_map(|export| export.lines().map(str::to_string).collect::<Vec<_>>())
+            .filter(|line| !line.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[cfg(test)]
     pub async fn grant_count_for_test(&self) -> usize {
         self.grants.lock().await.current_grants().count()
     }
 
-    pub fn with_journal(config: journal::JournalConfig) -> Self {
-        Self {
-            journal_config: Some(config),
-            ..Self::default()
-        }
+    /// Install a journal on a plane that already has a session gate.
+    ///
+    /// Chainable for the reason `with_grants_installed` is: a driving capability
+    /// needs the session gate too, and a constructor reaching `Self::default()`
+    /// would discard it.
+    ///
+    /// It replaces a `with_journal` constructor that built a plane with NO
+    /// session gate, which could not drive anything and had zero callers -- so
+    /// every reserve, commit and finalize on this path was unreachable code
+    /// behind a flag nothing set. That is why the lifecycle test below is the
+    /// first execution any of it has had.
+    pub fn with_journal_installed(mut self, config: journal::JournalConfig) -> Self {
+        self.journal_config = Some(config);
+        self
+    }
+
+    /// Install a journal that never touches the operator's durable audit data.
+    ///
+    /// Separate constructor rather than a parameter on the one above, so a
+    /// fixture cannot reach the production path by leaving an argument at its
+    /// default. The durable path is what a caller gets by asking for it.
+    pub fn with_in_memory_journal(mut self, config: journal::JournalConfig) -> Self {
+        self.journal_config = Some(config);
+        self.journal_in_memory = true;
+        self
     }
     /// Test seam for the per-context dispatch lane.
     ///
@@ -957,9 +1023,12 @@ impl BrowserPlane {
         };
         if persist_journal {
             if let Some(config) = self.journal_config {
-                let invocation =
+                let invocation = if self.journal_in_memory {
+                    JournalInvocation::new_in_memory(config, journal_identity(identity), capability)
+                } else {
                     JournalInvocation::new(config, journal_identity(identity), capability)
-                        .map_err(map_journal_error)?;
+                }
+                .map_err(map_journal_error)?;
                 let mut journals = self.journals.lock().await;
                 let invocations = journals
                     .entry(identity.conversation_key.clone())
@@ -1274,12 +1343,13 @@ impl BrowserPlane {
         // authorization against the landing URL because redirects can change origin.
         // If grants become action-scoped, this path must not inherit navigate authority.
         //
-        // The frozen journal vocabulary cannot name Snapshot. Recording this read as
-        // Navigate would forge the audit trail, so the nested snapshot stays out of
-        // that durable journal until its vocabulary can represent the observation.
+        // The read journals under its own capability. It did not when this landed
+        // -- the vocabulary had no Snapshot member, so recording the read would
+        // have written it as a navigation -- and that hole closed when the
+        // members were added rather than by anything here changing.
         let read_start = self.state.lock().await.operations.len();
         let page = match self
-            .capture_snapshot(identity, SnapshotKind::Ax, read_max_bytes, false)
+            .capture_snapshot(identity, SnapshotKind::Ax, read_max_bytes, true)
             .await
         {
             Ok(snapshot) => snapshot,
