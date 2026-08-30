@@ -139,6 +139,49 @@ check_no_mutation_in_progress() {
 run_phase "no mutation left in the working tree" \
   check_no_mutation_in_progress
 
+# Phase 0b: refuse to certify against a sibling that is not the one this commit
+# declares. The workspace takes subc-* by PATH, so the crates compiled here come
+# from whatever ../subconscious currently holds -- and if that disagrees with the
+# committed Cargo.lock, cargo silently RESOLVES rather than failing: it rewrites
+# the lock to match what the sibling supplies and carries on.
+#
+# The rewrite can PRUNE as easily as it can bump. A contributor whose sibling was
+# behind saw entries removed (ahash, base64, cc) and got a full green run with an
+# identical test count -- a true number obtained against a downgraded dependency
+# graph. That is the shape worth refusing: an alarming rewrite gets investigated,
+# a pruning one reads as tidying.
+#
+# Checked against the same content-addressed subtree hashes scripts/release-build.sh
+# pins, so a gate run and a release build cannot disagree about which sibling is
+# the right one.
+check_sibling_matches_declaration() {
+  local declaration sibling drift=0
+  declaration="$(dirname "$0")/../subconscious-source.txt"
+  sibling="$(dirname "$0")/../../subconscious"
+  [ -f "$declaration" ] || { echo "    no sibling declaration to check against" >&2; return 1; }
+  [ -d "$sibling" ] || { echo "    sibling checkout missing at $sibling" >&2; return 1; }
+  while read -r declared crate; do
+    case "$declared" in ""|\#*) continue ;; esac
+    [ -z "$crate" ] && continue
+    local actual
+    actual="$(git -C "$sibling" rev-parse "HEAD:crates/$crate" 2>/dev/null || echo missing)"
+    if [ "$actual" != "$declared" ]; then
+      echo "    $crate: declared $declared, sibling has $actual" >&2
+      drift=1
+    fi
+  done < "$declaration"
+  if [ "$drift" -ne 0 ]; then
+    echo "    move ../subconscious to the declared revisions, or repin" >&2
+    echo "    subconscious-source.txt if the move is intended. Building against" >&2
+    echo "    a different sibling silently rewrites Cargo.lock and reports a" >&2
+    echo "    true test count for a dependency graph nobody chose." >&2
+    return 1
+  fi
+}
+
+run_phase "sibling matches the declared revisions" \
+  check_sibling_matches_declaration
+
 # Phase 1: formatting check. `cargo fmt --all` must be run before committing;
 # this check fails the gate on an unformatted commit.
 run_phase "cargo fmt --all -- --check" \
