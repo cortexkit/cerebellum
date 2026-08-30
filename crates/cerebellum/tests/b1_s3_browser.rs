@@ -12,11 +12,11 @@ use cerebellum::browser::{self, BrowserCapability, BrowserPlane, SnapshotRefusal
 use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
     BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage, ClickDriveError,
-    LaunchSlot, NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
-    SessionCleanup,
+    ClickPointDriveError, LaunchSlot, NavigationDriveError, NavigationWait, OwnedBrowserProcess,
+    ProcessControlFailure, SessionCleanup, ViewportRefusal,
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
-use cerebellum::coordinate::{ScreenshotPayload, TransformInputs, ViewportObservation};
+use cerebellum::coordinate::{InputRect, ScreenshotPayload, TransformInputs, ViewportObservation};
 use cerebellum::journal::Outcome;
 use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SameDocumentChange, SnapshotKind, SnapshotRef,
@@ -418,7 +418,7 @@ impl OwnedBrowserProcess for ScreenshotProcess {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
         self.driver
             .click_point(context_key, position, deadline_ms, input_dispatched)
     }
@@ -517,8 +517,24 @@ impl RecordingClickPointPipe {
         let reads = [
             json!({"id":1,"result":{"targetId":"target-own"}}),
             json!({"id":2,"result":{"sessionId":"session-own"}}),
-            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{
+                "cssVisualViewport": {
+                    "offsetX": 10.0,
+                    "offsetY": 20.0,
+                    "clientWidth": 100.0,
+                    "clientHeight": 50.0,
+                    "scale": 1.0
+                },
+                "visualViewport": {
+                    "offsetX": 0.0,
+                    "offsetY": 0.0,
+                    "clientWidth": 40.0,
+                    "clientHeight": 20.0,
+                    "scale": 1.0
+                }
+            }}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{}}),
         ]
         .into_iter()
         .map(|frame| {
@@ -558,9 +574,45 @@ impl OwnedBrowserProcess for ClickPointProcess {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
         self.driver
             .click_point(context_key, position, deadline_ms, input_dispatched)
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+struct RefusingClickPointProcess {
+    refusal: ViewportRefusal,
+}
+
+impl OwnedBrowserProcess for RefusingClickPointProcess {
+    fn click_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        _: u64,
+        _: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+        Err(ClickPointDriveError::OutsideViewport(self.refusal))
     }
 
     fn generation_matches(&self) -> bool {
@@ -624,10 +676,11 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         json!({"id":3,"sessionId":"session-own","result":metrics.clone()}),
         json!({"id":4,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
         json!({"id":5,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
-        json!({"id":6,"sessionId":"session-own","result":metrics}),
+        json!({"id":6,"sessionId":"session-own","result":metrics.clone()}),
         json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
-        json!({"id":8,"sessionId":"session-own","result":{}}),
+        json!({"id":8,"sessionId":"session-own","result":metrics}),
         json!({"id":9,"sessionId":"session-own","result":{}}),
+        json!({"id":10,"sessionId":"session-own","result":{}}),
     ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
@@ -745,16 +798,17 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
         [
             "Target.createTarget",
             "Target.attachToTarget",
+            "Page.getLayoutMetrics",
             "Input.dispatchMouseEvent",
             "Input.dispatchMouseEvent",
         ]
     );
-    assert_eq!(commands[2]["params"]["type"], "mousePressed");
-    assert_eq!(commands[2]["params"]["x"], 60.0);
-    assert_eq!(commands[2]["params"]["y"], 45.0);
-    assert_eq!(commands[3]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[3]["params"]["type"], "mousePressed");
     assert_eq!(commands[3]["params"]["x"], 60.0);
     assert_eq!(commands[3]["params"]["y"], 45.0);
+    assert_eq!(commands[4]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[4]["params"]["x"], 60.0);
+    assert_eq!(commands[4]["params"]["y"], 45.0);
     assert_eq!(
         plane
             .snapshot_pin_count_for_test(&route, &snapshot_id)
@@ -762,6 +816,48 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
         0,
         "the successful coordinate click leaked its screenshot pin"
     );
+}
+
+#[tokio::test]
+async fn click_point_outside_the_current_viewport_is_typed_and_dispatches_nothing() {
+    let route = identity();
+    let position = BrowserClickPosition {
+        x_css: 60.0,
+        y_css: 45.0,
+    };
+    let viewport = InputRect::new(0.0, 0.0, 40.0, 20.0);
+    let plane = plane_with_process(
+        &route,
+        Box::new(RefusingClickPointProcess {
+            refusal: ViewportRefusal { position, viewport },
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+    let snapshot_id = retain_click_point_snapshot(&plane, &route).await;
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::ClickPoint,
+            &click_point_arguments(&snapshot_id),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "point_outside_viewport");
+    assert_eq!(result["detail"]["reason_code"], "point_outside_viewport");
+    assert_eq!(result["detail"]["point"]["x_css"], 60.0);
+    assert_eq!(result["detail"]["viewport"]["width_css"], 40.0);
+    assert!(result["remedy"]
+        .as_str()
+        .is_some_and(|remedy| remedy.contains("browser.screenshot")));
+    assert!(plane.operation_log().await.iter().all(|(_, operation)| {
+        !matches!(
+            operation,
+            browser::Operation::CdpInputPress | browser::Operation::CdpInputRelease
+        )
+    }));
 }
 
 #[tokio::test]
@@ -1675,6 +1771,61 @@ async fn a_click_presses_before_it_releases_and_only_after_commitment() {
             < position(browser::Operation::CdpInputPress),
         "no input is dispatched before the journal commits to it: {operations:?}"
     );
+    assert_eq!(
+        plane
+            .text_snapshot_pin_count_for_test(&route, &snapshot_id)
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_unscrollable_click_names_the_viewport_and_refuses_without_input() {
+    let route = identity();
+    let input_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let position = BrowserClickPosition {
+        x_css: 150.0,
+        y_css: 5020.0,
+    };
+    let viewport = InputRect::new(0.0, 0.0, 1280.0, 713.0);
+    let plane = plane_with_process(
+        &route,
+        Box::new(ClickProcess {
+            result: Err(ClickDriveError::OutsideViewportAfterScroll(
+                ViewportRefusal { position, viewport },
+            )),
+            input_events: Arc::clone(&input_events),
+        }),
+        1_000,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    let snapshot_id = retain_click_snapshot(&plane, &route).await;
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &click_arguments(&snapshot_id),
+        )
+        .await;
+
+    assert_eq!(result["outcome"], "outside_viewport_after_scroll");
+    assert_eq!(
+        result["detail"]["reason_code"],
+        "outside_viewport_after_scroll"
+    );
+    assert_eq!(result["detail"]["point"]["y_css"], 5020.0);
+    assert_eq!(result["detail"]["viewport"]["height_css"], 713.0);
+    assert!(result["remedy"]
+        .as_str()
+        .is_some_and(|remedy| remedy.contains("fresh browser.snapshot")));
+    assert!(input_events.lock().unwrap().is_empty());
+    assert!(plane.operation_log().await.iter().all(|(_, operation)| {
+        !matches!(
+            operation,
+            browser::Operation::CdpInputPress | browser::Operation::CdpInputRelease
+        )
+    }));
     assert_eq!(
         plane
             .text_snapshot_pin_count_for_test(&route, &snapshot_id)

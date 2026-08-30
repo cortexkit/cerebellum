@@ -110,7 +110,7 @@ pub enum SnapshotRefusalReason {
     OriginScope,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BrowserError {
     InvalidRequest {
         field: String,
@@ -128,6 +128,12 @@ pub enum BrowserError {
         candidate_count: usize,
     },
     ElementIntercepted,
+    OutsideViewportAfterScroll {
+        refusal: crate::browser_session::ViewportRefusal,
+    },
+    PointOutsideViewport {
+        refusal: crate::browser_session::ViewportRefusal,
+    },
     InvalidCoordinates {
         reason: InvalidCoordinatesReason,
     },
@@ -166,6 +172,8 @@ impl BrowserError {
             Self::RefNotFound { .. } => "ref_not_found",
             Self::RefAmbiguous { .. } => "ref_ambiguous",
             Self::ElementIntercepted => "element_intercepted",
+            Self::OutsideViewportAfterScroll { .. } => "outside_viewport_after_scroll",
+            Self::PointOutsideViewport { .. } => "point_outside_viewport",
             Self::InvalidCoordinates { .. } => "invalid_coordinates",
             Self::ImageTooLarge { .. } => "image_too_large",
             Self::AuthorizationDenied { .. } => "authorization_denied",
@@ -197,6 +205,12 @@ impl BrowserError {
             }
             Self::ElementIntercepted => {
                 "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position"
+            }
+            Self::OutsideViewportAfterScroll { .. } => {
+                "take a fresh browser.snapshot and choose a ref whose resolved point can enter the visual viewport"
+            }
+            Self::PointOutsideViewport { .. } => {
+                "call browser.screenshot again and choose a point inside its current visual viewport"
             }
             Self::InvalidCoordinates { reason } => reason.remedy(),
             Self::ImageTooLarge { .. } => {
@@ -256,10 +270,36 @@ impl BrowserError {
             }
             Self::BrowserLaunchPending => json!({"reason_code":"browser_launch_pending"}),
             Self::ElementIntercepted => json!({}),
+            Self::OutsideViewportAfterScroll { refusal } => {
+                viewport_refusal_detail("outside_viewport_after_scroll", *refusal)
+            }
+            Self::PointOutsideViewport { refusal } => {
+                viewport_refusal_detail("point_outside_viewport", *refusal)
+            }
             Self::BrowserCrashed => json!({"reason_code":"browser_crashed"}),
         })
     }
 }
+
+fn viewport_refusal_detail(
+    reason_code: &'static str,
+    refusal: crate::browser_session::ViewportRefusal,
+) -> Value {
+    json!({
+        "reason_code": reason_code,
+        "point": {
+            "x_css": refusal.position.x_css,
+            "y_css": refusal.position.y_css,
+        },
+        "viewport": {
+            "x_css": refusal.viewport.x_input_css,
+            "y_css": refusal.viewport.y_input_css,
+            "width_css": refusal.viewport.width_input_css,
+            "height_css": refusal.viewport.height_input_css,
+        },
+    })
+}
+
 impl fmt::Display for BrowserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.outcome())
@@ -1971,6 +2011,17 @@ impl BrowserPlane {
                     reason_code: "classification_changed",
                 });
             }
+            Err(crate::browser_session::ClickDriveError::OutsideViewportAfterScroll(refusal)) => {
+                let detail = viewport_refusal_detail("outside_viewport_after_scroll", refusal);
+                self.finalize(
+                    identity,
+                    BrowserCapability::Click,
+                    Outcome::StaleSnapshot,
+                    detail,
+                )
+                .await?;
+                return Err(BrowserError::OutsideViewportAfterScroll { refusal });
+            }
             Err(crate::browser_session::ClickDriveError::Navigation(error)) => {
                 return Err(map_navigation_drive_error(error));
             }
@@ -2292,7 +2343,23 @@ impl BrowserPlane {
         };
         session_operation.finish();
         self.unpin_snapshot(identity, snapshot_id).await;
-        drive_result.map_err(map_navigation_drive_error)?;
+        match drive_result {
+            Ok(_) => {}
+            Err(crate::browser_session::ClickPointDriveError::OutsideViewport(refusal)) => {
+                let detail = viewport_refusal_detail("point_outside_viewport", refusal);
+                self.finalize(
+                    identity,
+                    BrowserCapability::ClickPoint,
+                    Outcome::StaleSnapshot,
+                    detail,
+                )
+                .await?;
+                return Err(BrowserError::PointOutsideViewport { refusal });
+            }
+            Err(crate::browser_session::ClickPointDriveError::Navigation(error)) => {
+                return Err(map_navigation_drive_error(error));
+            }
+        }
 
         self.finalize(
             identity,
@@ -2788,7 +2855,9 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         BrowserError::StaleSnapshot { .. }
         | BrowserError::RefNotFound { .. }
         | BrowserError::RefAmbiguous { .. }
-        | BrowserError::ElementIntercepted => Outcome::StaleSnapshot,
+        | BrowserError::ElementIntercepted
+        | BrowserError::OutsideViewportAfterScroll { .. }
+        | BrowserError::PointOutsideViewport { .. } => Outcome::StaleSnapshot,
         BrowserError::NoSession
         | BrowserError::BrowserLaunchPending
         | BrowserError::Internal { .. }

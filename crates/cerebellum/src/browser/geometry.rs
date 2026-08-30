@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use crate::coordinate::InputRect;
+
 pub const SUBDIVISIONS: f64 = 64.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +86,7 @@ pub struct GeometryProjection {
 pub enum GeometryError {
     NoEligibleQuad,
     NonFinite,
+    OutsideViewport,
 }
 impl fmt::Display for GeometryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,6 +111,41 @@ pub fn select_first_eligible(quads: &[Quad]) -> Result<GeometryProjection, Geome
         x_css,
         y_css,
     })
+}
+
+pub fn require_point_in_viewport(
+    x_css: f64,
+    y_css: f64,
+    viewport: InputRect,
+) -> Result<(), GeometryError> {
+    let right = viewport.x_input_css + viewport.width_input_css;
+    let bottom = viewport.y_input_css + viewport.height_input_css;
+    if ![
+        x_css,
+        y_css,
+        viewport.x_input_css,
+        viewport.y_input_css,
+        viewport.width_input_css,
+        viewport.height_input_css,
+        right,
+        bottom,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+    {
+        return Err(GeometryError::NonFinite);
+    }
+    if viewport.width_input_css <= 0.0 || viewport.height_input_css <= 0.0 {
+        return Err(GeometryError::NonFinite);
+    }
+    if x_css < viewport.x_input_css
+        || x_css >= right
+        || y_css < viewport.y_input_css
+        || y_css >= bottom
+    {
+        return Err(GeometryError::OutsideViewport);
+    }
+    Ok(())
 }
 
 pub fn round_css(value: f64) -> Result<f64, GeometryError> {

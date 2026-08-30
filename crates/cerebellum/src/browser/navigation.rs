@@ -8,14 +8,15 @@ use crate::browser::geometry::{self, Quad};
 use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use crate::browser_session::{
-    BrowserClickPosition, BrowserInputEvent, ClickDriveError, NavigationDriveError, NavigationWait,
+    BrowserClickPosition, BrowserInputEvent, ClickDriveError, ClickPointDriveError,
+    NavigationDriveError, NavigationWait, ViewportRefusal,
 };
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
 use crate::classification::{
     self, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
     NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
 };
-use crate::coordinate::{TransformInputs, ViewportObservation};
+use crate::coordinate::{InputRect, TransformInputs, ViewportObservation};
 use crate::snapshot_store::{
     truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
     MAX_NAME_BYTES, MAX_REFS, MAX_ROLE_BYTES, MAX_VALUE_BYTES,
@@ -205,7 +206,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
         let mut clock = SystemNavigationClock;
         self.click_point_with_clock(
             context_key,
@@ -373,15 +374,25 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             })
             .ok_or(ClickDriveError::NoPosition)?;
 
-        let mut params = Map::new();
-        params.insert(
+        // Resolve once before scrolling so a detached or geometry-less ref keeps
+        // the existing no-position refusal. The post-scroll fetch below is the
+        // only coordinate that may reach hit testing or input dispatch.
+        self.content_quad_position(
+            identity.backend_node_id,
+            &attachment.session_id,
+            deadline,
+            clock,
+        )?;
+
+        let mut scroll_params = Map::new();
+        scroll_params.insert(
             "backendNodeId".into(),
             Value::Number(identity.backend_node_id.into()),
         );
-        let quads_response = self
+        let scroll = self
             .command_response(
-                "DOM.getContentQuads",
-                Some(params),
+                "DOM.scrollIntoViewIfNeeded",
+                Some(scroll_params),
                 Some(attachment.session_id.clone()),
                 deadline,
                 None,
@@ -389,19 +400,33 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 clock,
             )
             .map_err(ClickDriveError::Navigation)?;
-        if quads_response.error.is_some() {
+        if scroll.error.is_some() {
             return Err(ClickDriveError::NoPosition);
         }
-        let quads = required_content_quads(&quads_response.result.ok_or(
-            ClickDriveError::Navigation(NavigationDriveError::CdpFailure),
-        )?)
-        .map_err(ClickDriveError::Navigation)?;
-        let projection =
-            geometry::select_first_eligible(&quads).map_err(|_| ClickDriveError::NoPosition)?;
-        let position = BrowserClickPosition {
-            x_css: projection.x_css,
-            y_css: projection.y_css,
-        };
+
+        let position = self.content_quad_position(
+            identity.backend_node_id,
+            &attachment.session_id,
+            deadline,
+            clock,
+        )?;
+        let viewport = self
+            .read_css_visual_viewport(&attachment.session_id, deadline, clock)
+            .map(|(viewport, _)| viewport)
+            .map_err(ClickDriveError::Navigation)?;
+        match geometry::require_point_in_viewport(position.x_css, position.y_css, viewport) {
+            Ok(()) => {}
+            Err(geometry::GeometryError::OutsideViewport) => {
+                return Err(ClickDriveError::OutsideViewportAfterScroll(
+                    ViewportRefusal { position, viewport },
+                ));
+            }
+            Err(_) => {
+                return Err(ClickDriveError::Navigation(
+                    NavigationDriveError::CdpFailure,
+                ));
+            }
+        }
 
         let hit_x = hit_test_coordinate(position.x_css)?;
         let hit_y = hit_test_coordinate(position.y_css)?;
@@ -508,17 +533,40 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
-            .ok_or(NavigationDriveError::CdpFailure)?;
-        self.ensure_attached(context_key, deadline, clock)?;
+            .ok_or(ClickPointDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ))?;
+        self.ensure_attached(context_key, deadline, clock)
+            .map_err(ClickPointDriveError::Navigation)?;
         let attachment = self
             .attachment
             .clone()
             .filter(|attachment| attachment.context_key == context_key)
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or(ClickPointDriveError::Navigation(
+                NavigationDriveError::CdpFailure,
+            ))?;
+        let viewport = self
+            .read_css_visual_viewport(&attachment.session_id, deadline, clock)
+            .map(|(viewport, _)| viewport)
+            .map_err(ClickPointDriveError::Navigation)?;
+        match geometry::require_point_in_viewport(position.x_css, position.y_css, viewport) {
+            Ok(()) => {}
+            Err(geometry::GeometryError::OutsideViewport) => {
+                return Err(ClickPointDriveError::OutsideViewport(ViewportRefusal {
+                    position,
+                    viewport,
+                }));
+            }
+            Err(_) => {
+                return Err(ClickPointDriveError::Navigation(
+                    NavigationDriveError::CdpFailure,
+                ));
+            }
+        }
         self.actuate_click(
             &attachment.session_id,
             position,
@@ -526,6 +574,85 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             input_dispatched,
             clock,
         )
+        .map_err(ClickPointDriveError::Navigation)
+    }
+
+    fn content_quad_position<C: NavigationClock>(
+        &mut self,
+        backend_node_id: u64,
+        session_id: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<BrowserClickPosition, ClickDriveError> {
+        let mut params = Map::new();
+        params.insert(
+            "backendNodeId".into(),
+            Value::Number(backend_node_id.into()),
+        );
+        let response = self
+            .command_response(
+                "DOM.getContentQuads",
+                Some(params),
+                Some(session_id.to_string()),
+                deadline,
+                None,
+                None,
+                clock,
+            )
+            .map_err(ClickDriveError::Navigation)?;
+        if response.error.is_some() {
+            return Err(ClickDriveError::NoPosition);
+        }
+        let quads = required_content_quads(&response.result.ok_or(ClickDriveError::Navigation(
+            NavigationDriveError::CdpFailure,
+        ))?)
+        .map_err(ClickDriveError::Navigation)?;
+        let projection =
+            geometry::select_first_eligible(&quads).map_err(|_| ClickDriveError::NoPosition)?;
+        Ok(BrowserClickPosition {
+            x_css: projection.x_css,
+            y_css: projection.y_css,
+        })
+    }
+
+    fn read_css_visual_viewport<C: NavigationClock>(
+        &mut self,
+        session_id: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<(InputRect, f64), NavigationDriveError> {
+        let metrics = self.command(
+            "Page.getLayoutMetrics",
+            None,
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
+        // The undecorated visualViewport field is deprecated and reports device
+        // pixels. Input dispatch uses CSS coordinates, so mixing the two makes
+        // an offscreen point appear to be inside on scaled displays.
+        let visual_viewport = metrics
+            .get("cssVisualViewport")
+            .and_then(Value::as_object)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let viewport = InputRect::new(
+            required_result_number(visual_viewport, "offsetX")?,
+            required_result_number(visual_viewport, "offsetY")?,
+            required_result_number(visual_viewport, "clientWidth")?,
+            required_result_number(visual_viewport, "clientHeight")?,
+        );
+        let scale = required_result_number(visual_viewport, "scale")?;
+        let right = viewport.x_input_css + viewport.width_input_css;
+        let bottom = viewport.y_input_css + viewport.height_input_css;
+        if viewport.width_input_css <= 0.0
+            || viewport.height_input_css <= 0.0
+            || !right.is_finite()
+            || !bottom.is_finite()
+        {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        Ok((viewport, scale))
     }
 
     fn actuate_click<C: NavigationClock>(
@@ -623,30 +750,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline: Instant,
         clock: &mut C,
     ) -> Result<ViewportObservation, NavigationDriveError> {
-        let metrics = self.command(
-            "Page.getLayoutMetrics",
-            None,
-            Some(session_id.to_string()),
-            deadline,
-            None,
-            clock,
-        )?;
-        // cssVisualViewport, not visualViewport. CDP's undecorated
-        // `visualViewport` is deprecated and reports DEVICE pixels, so on any
-        // display with a scale factor above 1 it returns the same numbers as
-        // the captured image -- which makes a pixel-to-css mapping that is a
-        // ratio of those two look correct while it is the identity. A click
-        // then lands at twice its intended offset, outside the viewport on a
-        // Retina display, and the caller is told `outcome: ok`.
-        let visual_viewport = metrics
-            .get("cssVisualViewport")
-            .and_then(Value::as_object)
-            .ok_or(NavigationDriveError::CdpFailure)?;
-        let x_input_css = required_result_number(visual_viewport, "offsetX")?;
-        let y_input_css = required_result_number(visual_viewport, "offsetY")?;
-        let width_input_css = required_result_number(visual_viewport, "clientWidth")?;
-        let height_input_css = required_result_number(visual_viewport, "clientHeight")?;
-        let visual_viewport_scale = required_result_number(visual_viewport, "scale")?;
+        let (viewport, visual_viewport_scale) =
+            self.read_css_visual_viewport(session_id, deadline, clock)?;
 
         let mut params = Map::new();
         params.insert(
@@ -671,10 +776,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         Ok(ViewportObservation::new(
             document_epoch,
             TransformInputs::from_values(
-                x_input_css,
-                y_input_css,
-                width_input_css,
-                height_input_css,
+                viewport.x_input_css,
+                viewport.y_input_css,
+                viewport.width_input_css,
+                viewport.height_input_css,
                 device_scale_factor,
                 visual_viewport_scale,
             ),
@@ -2014,6 +2119,25 @@ mod tests {
         node
     }
 
+    fn layout_metrics(x: f64, y: f64, width: f64, height: f64) -> Value {
+        json!({
+            "cssVisualViewport": {
+                "offsetX": x,
+                "offsetY": y,
+                "clientWidth": width,
+                "clientHeight": height,
+                "scale": 1.0
+            },
+            "visualViewport": {
+                "offsetX": x * 2.0,
+                "offsetY": y * 2.0,
+                "clientWidth": width * 2.0,
+                "clientHeight": height * 2.0,
+                "scale": 1.0
+            }
+        })
+    }
+
     #[test]
     fn screenshot_reads_device_and_visual_scales_from_cdp_responses() {
         const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -2223,9 +2347,12 @@ mod tests {
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":initial_nodes}),
             json!({"id":3,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
-            json!({"id":4,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
-            json!({"id":5,"sessionId":"session-own","result":{}}),
-            json!({"id":6,"sessionId":"session-own","result":revalidated_nodes}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
+            json!({"id":6,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
+            json!({"id":7,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":revalidated_nodes}),
         ]);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
         let mut clock = FakeClock::new();
@@ -2262,11 +2389,15 @@ mod tests {
 
     #[test]
     fn click_dispatches_mouse_input_at_the_resolved_content_quad_center() {
+        let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
         let frames = [
-            json!({"id":1,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
-            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
-            json!({"id":3,"sessionId":"session-own","result":{}}),
-            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":1,"sessionId":"session-own","result":{"quads":quad.clone()}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
+            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
+            json!({"id":7,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
@@ -2298,20 +2429,60 @@ mod tests {
             ]
         );
         let writes = &driver.pipe.writes;
-        assert_eq!(writes.len(), 4);
+        assert_eq!(writes.len(), 7);
         assert_eq!(writes[0]["method"], "DOM.getContentQuads");
-        assert_eq!(writes[0]["params"]["backendNodeId"], 42);
-        assert_eq!(writes[1]["method"], "DOM.getNodeForLocation");
-        assert_eq!(writes[1]["params"]["x"], 22);
-        assert_eq!(writes[1]["params"]["y"], 36);
-        assert_eq!(writes[2]["method"], "Input.dispatchMouseEvent");
-        assert_eq!(writes[2]["params"]["type"], "mousePressed");
-        assert_eq!(writes[2]["params"]["x"], 22.0);
-        assert_eq!(writes[2]["params"]["y"], 36.0);
-        assert_eq!(writes[3]["method"], "Input.dispatchMouseEvent");
-        assert_eq!(writes[3]["params"]["type"], "mouseReleased");
-        assert_eq!(writes[3]["params"]["x"], 22.0);
-        assert_eq!(writes[3]["params"]["y"], 36.0);
+        assert_eq!(writes[1]["method"], "DOM.scrollIntoViewIfNeeded");
+        assert_eq!(writes[1]["params"]["backendNodeId"], 42);
+        assert_eq!(writes[2]["method"], "DOM.getContentQuads");
+        assert_eq!(writes[3]["method"], "Page.getLayoutMetrics");
+        assert_eq!(writes[4]["method"], "DOM.getNodeForLocation");
+        assert_eq!(writes[4]["params"]["x"], 22);
+        assert_eq!(writes[4]["params"]["y"], 36);
+        assert_eq!(writes[5]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(writes[5]["params"]["type"], "mousePressed");
+        assert_eq!(writes[6]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(writes[6]["params"]["type"], "mouseReleased");
+    }
+
+    #[test]
+    fn below_fold_click_refetches_after_scroll_and_lands() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{"quads":[[130.0,5000.0,170.0,5000.0,170.0,5040.0,130.0,5040.0]]}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":[[130.0,50.0,170.0,50.0,170.0,90.0,130.0,90.0]]}}),
+            json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
+            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
+            json!({"id":7,"sessionId":"session-own","result":{}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut input_events = Vec::new();
+
+        let position = driver
+            .click_for_test(
+                "route-own",
+                &identity,
+                1_000,
+                &mut |event| input_events.push(event),
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            position,
+            BrowserClickPosition {
+                x_css: 150.0,
+                y_css: 70.0,
+            }
+        );
+        assert_eq!(input_events.len(), 2);
+        assert_eq!(
+            driver.pipe.writes[1]["method"],
+            "DOM.scrollIntoViewIfNeeded"
+        );
+        assert_eq!(driver.pipe.writes[2]["method"], "DOM.getContentQuads");
+        assert_eq!(driver.pipe.writes[5]["params"]["y"], 70.0);
     }
 
     #[test]
@@ -2347,28 +2518,43 @@ mod tests {
     }
 
     #[test]
-    fn click_with_an_offscreen_content_quad_refuses_without_input_dispatch() {
+    fn click_still_outside_after_successful_scroll_refuses_without_input_dispatch() {
+        let below_fold = json!([[130.0, 5000.0, 170.0, 5000.0, 170.0, 5040.0, 130.0, 5040.0]]);
         let frames = [
-            json!({"id":1,"sessionId":"session-own","result":{"quads":[[-30.0,20.0,-10.0,20.0,-10.0,40.0,-30.0,40.0]]}}),
-            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
-            json!({"id":3,"sessionId":"session-own","result":{}}),
-            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":1,"sessionId":"session-own","result":{"quads":below_fold.clone()}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":below_fold}}),
+            json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
         let mut input_events = Vec::new();
-        let mut clock = FakeClock::new();
+        let viewport = InputRect::new(0.0, 0.0, 1280.0, 713.0);
+        let position = BrowserClickPosition {
+            x_css: 150.0,
+            y_css: 5020.0,
+        };
 
         let result = driver.click_for_test(
             "route-own",
             &identity,
             1_000,
             &mut |event| input_events.push(event),
-            &mut clock,
+            &mut FakeClock::new(),
         );
 
-        assert_eq!(result, Err(ClickDriveError::NoPosition));
+        assert_eq!(
+            result,
+            Err(ClickDriveError::OutsideViewportAfterScroll(
+                ViewportRefusal { position, viewport }
+            ))
+        );
         assert!(input_events.is_empty());
+        assert_eq!(
+            driver.pipe.writes[1]["method"],
+            "DOM.scrollIntoViewIfNeeded"
+        );
+        assert_eq!(driver.pipe.writes[3]["method"], "Page.getLayoutMetrics");
         assert!(driver
             .pipe
             .writes
@@ -2377,12 +2563,49 @@ mod tests {
     }
 
     #[test]
+    fn click_point_outside_viewport_refuses_without_scrolling_or_input() {
+        let mut driver = attached_driver([json!({
+            "id":1,
+            "sessionId":"session-own",
+            "result":layout_metrics(0.0, 0.0, 1280.0, 713.0)
+        })]);
+        let position = BrowserClickPosition {
+            x_css: 150.0,
+            y_css: 5020.0,
+        };
+        let viewport = InputRect::new(0.0, 0.0, 1280.0, 713.0);
+        let mut input_events = Vec::new();
+
+        let result = driver.click_point_with_clock(
+            "route-own",
+            position,
+            1_000,
+            &mut |event| input_events.push(event),
+            &mut FakeClock::new(),
+        );
+
+        assert_eq!(
+            result,
+            Err(ClickPointDriveError::OutsideViewport(ViewportRefusal {
+                position,
+                viewport,
+            }))
+        );
+        assert!(input_events.is_empty());
+        assert_eq!(driver.pipe.writes.len(), 1);
+        assert_eq!(driver.pipe.writes[0]["method"], "Page.getLayoutMetrics");
+    }
+
+    #[test]
     fn click_with_an_occluded_center_refuses_without_input_dispatch() {
+        let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
         let frames = [
-            json!({"id":1,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
-            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":99,"frameId":"frame-main"}}),
-            json!({"id":3,"sessionId":"session-own","result":{"node":{"backendNodeId":42}}}),
-            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":1,"sessionId":"session-own","result":{"quads":quad.clone()}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
+            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":99,"frameId":"frame-main"}}),
+            json!({"id":6,"sessionId":"session-own","result":{"node":{"backendNodeId":42}}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
@@ -2399,7 +2622,7 @@ mod tests {
 
         assert_eq!(result, Err(ClickDriveError::NoPosition));
         assert!(input_events.is_empty());
-        assert_eq!(driver.pipe.writes[2]["method"], "DOM.describeNode");
+        assert_eq!(driver.pipe.writes[5]["method"], "DOM.describeNode");
         assert!(driver
             .pipe
             .writes
