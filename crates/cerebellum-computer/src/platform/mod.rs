@@ -225,6 +225,20 @@ impl ImmutableReleaseInputs {
     }
 }
 
+/// Whether a row's synthetic path moves the pointer rather than the keyboard.
+///
+/// The distinction is not cosmetic: per-process delivery carries keyboard events
+/// and not pointer events, so this decides whether a row can be served in
+/// background mode at all. `computer.click` is included because its SYNTHETIC
+/// fallback is a pointer click -- its semantic path is unaffected and remains
+/// the route it actually takes.
+fn synthetic_path_is_pointer(id: &str) -> bool {
+    matches!(
+        id,
+        "computer.click" | "computer.move" | "computer.scroll" | "computer.drag"
+    )
+}
+
 /// Builds the fixed declaration set from release inputs and startup evidence.
 ///
 /// `platform_available` distinguishes a host that can serve the platform driver
@@ -437,10 +451,31 @@ fn capability_declaration(
         // resolution. The private-envelope flag is still carried for the
         // OBSERVED path and for callers that ask about it, but it does not
         // decide whether background delivery exists.
-        synthetic_background: if platform_available {
-            SupportState::Supported
-        } else {
+        // Background delivery is claimed per SYNTHETIC EVENT CLASS, because the
+        // per-process path carries one and not the other. Measured on macOS 26
+        // against a native application, with the target backgrounded and focus
+        // sampled throughout:
+        //
+        //   keystroke posted to the pid    lands
+        //   drag posted to the pid         no effect, even with the target
+        //                                  frontmost, while the SAME constructed
+        //                                  events posted globally do select
+        //
+        // So the events are right and the per-process path does not carry
+        // pointer events. Claiming Supported for a pointer row would offer a
+        // caller a background capability that cannot deliver -- the defect the
+        // permission gate exists to prevent, one field over.
+        //
+        // Those rows are not broken: they are deliverable through the GLOBAL
+        // path, which seizes the shared cursor and is the authority this module
+        // calls observed mode. That path is deliberately unbuilt, so the honest
+        // claim here is Unsupported rather than a mode we do not offer.
+        synthetic_background: if !platform_available {
             SupportState::Unsupported
+        } else if synthetic_path_is_pointer(id) {
+            SupportState::Unsupported
+        } else {
+            SupportState::Supported
         },
         synthetic_observed: SupportState::ConsentGated,
         required_permissions: permissions,
