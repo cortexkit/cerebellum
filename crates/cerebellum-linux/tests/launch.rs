@@ -221,6 +221,19 @@ fn an_exec_chain_reports_the_next_mapped_image_and_honors_its_bound() {
 }
 
 #[test]
+fn exec_chain_attestation_ignores_rewritten_argv_zero() {
+    let _lock = launch_lock();
+    let mut child = spawn_shell("exec -a somethingelse /bin/sleep 30");
+    let identity = child.continue_to_next_exec_stop(1).expect("next exec stop");
+
+    assert_eq!(
+        identity.resolved_path,
+        fs::canonicalize("/bin/sleep").expect("sleep path")
+    );
+    child.terminate_and_reap().expect("reap argv zero fixture");
+}
+
+#[test]
 fn a_pid_whose_start_time_differs_is_never_signalled() {
     let _lock = launch_lock();
     let mut victim = Command::new("/bin/sleep")

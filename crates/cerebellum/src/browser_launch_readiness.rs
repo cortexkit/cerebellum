@@ -341,6 +341,7 @@ where
 {
     let ReleasedAttestedBrowser {
         attestation,
+        observed_executable_identity_chain: _,
         mut process,
         released_at,
     } = released;
@@ -537,9 +538,10 @@ mod tests {
 
     use super::*;
     use crate::browser_launch::{
-        AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentityCheckpoints,
-        ExecutableIdentityClaim, LaunchGenerationRecord, LaunchIdentityMismatchRecord,
-        LaunchProfileIdentity, LaunchRouteIdentity, PreSpawnIdentityVerification,
+        AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentityChain,
+        ExecutableIdentityCheckpoints, ExecutableIdentityClaim, ExecutableIdentityRecord,
+        LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
+        LaunchRouteIdentity, PreSpawnIdentityVerification,
     };
 
     fn instant() -> Instant {
@@ -934,7 +936,14 @@ mod tests {
                     start_time_micros: 77,
                 },
             },
-            observed_executable_identity: request.verified_executable_identity,
+            observed_executable_identity: request.verified_executable_identity.clone(),
+            executable_identity_chain:
+                crate::browser_launch::ExecutableIdentityChain::NoWalkPerformed {
+                    attestation: crate::browser_launch::ExecutableIdentityRecord {
+                        claim: request.verified_executable_identity,
+                        path: Some(request.executable),
+                    },
+                },
             executable_identity_checkpoints: ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
         }
     }
@@ -944,8 +953,11 @@ mod tests {
         exit: Option<ChildExitStatus>,
         events: EventLog,
     ) -> ReleasedAttestedBrowser<FakeProcess> {
+        let attestation = attestation();
+        let observed_executable_identity_chain = attestation.executable_identity_chain.clone();
         ReleasedAttestedBrowser {
-            attestation: attestation(),
+            attestation,
+            observed_executable_identity_chain,
             process: FakeProcess { exit, events },
             released_at: clock.now,
         }
@@ -1152,8 +1164,13 @@ mod tests {
             }
         }
 
-        fn executed_image_identity(&self) -> Result<ExecutableIdentityClaim, PlatformLaunchError> {
-            Ok(executable_identity())
+        fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError> {
+            Ok(ExecutableIdentityChain::WalkedToMatch {
+                hops: vec![ExecutableIdentityRecord {
+                    claim: executable_identity(),
+                    path: None,
+                }],
+            })
         }
 
         fn terminate_and_reap(self) -> Result<(), PlatformLaunchError> {
