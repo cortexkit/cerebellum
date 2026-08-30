@@ -1499,6 +1499,66 @@ impl BarredProcessLauncher for MacOsProcessLauncher {
 
 #[cfg(test)]
 mod tests {
+
+    /// A walk that stopped at its hop bound attests nothing.
+    ///
+    /// `matched_claim` returning None is what makes `attested_launch` terminate
+    /// and reap the child with ImageAttestationFailed. If a truncated walk
+    /// returned its LAST WALKED image instead, that image would be compared
+    /// against the expected identity, and a chain longer than the bound whose
+    /// last-walked hop happens to match would be attested -- a launch approved
+    /// on a walk that never reached the image it was supposed to check. Measured
+    /// wrapper chains run to four hops on Ubuntu, so "longer than the bound" is
+    /// a real shape rather than a hypothetical one.
+    ///
+    /// Platform-neutral by construction: the enum is built directly rather than
+    /// by launching anything, so Linux CI runs it too. The existing coverage is
+    /// a Linux-gated live spawn that only exercises the matching case.
+    #[test]
+    fn a_truncated_identity_walk_yields_no_matched_claim() {
+        fn record(sha: &str) -> ExecutableIdentityRecord {
+            ExecutableIdentityRecord {
+                claim: ExecutableIdentityClaim::ImageDigest {
+                    sha256: sha.to_string(),
+                },
+                path: None,
+            }
+        }
+
+        // Non-empty, and its last hop is a perfectly good claim -- which is the
+        // point. The refusal must come from the walk being incomplete, not from
+        // there being nothing to return.
+        let truncated = ExecutableIdentityChain::StoppedAtHopLimit {
+            hops: vec![record("aa"), record("bb")],
+        };
+        assert!(
+            truncated.matched_claim().is_none(),
+            "a walk that hit its hop bound reported a match"
+        );
+
+        let matched = ExecutableIdentityChain::WalkedToMatch {
+            hops: vec![record("aa"), record("bb")],
+        };
+        assert_eq!(
+            matched.matched_claim(),
+            Some(&ExecutableIdentityClaim::ImageDigest {
+                sha256: "bb".to_string()
+            }),
+            "a completed walk must attest the image it ended on"
+        );
+
+        // macOS supplies one post-exec attestation and no walk. It attests that
+        // image: declining here would refuse every launch on that platform.
+        let no_walk = ExecutableIdentityChain::NoWalkPerformed {
+            attestation: record("cc"),
+        };
+        assert_eq!(
+            no_walk.matched_claim(),
+            Some(&ExecutableIdentityClaim::ImageDigest {
+                sha256: "cc".to_string()
+            }),
+        );
+    }
     use std::sync::{Arc, Mutex};
 
     use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
