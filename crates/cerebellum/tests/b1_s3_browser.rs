@@ -2720,3 +2720,75 @@ async fn journal_dispatches_share_one_store() {
         "the journal belongs to the plane rather than the ended context"
     );
 }
+
+/// A browser that dies mid-dispatch leaves a finalized record, not an open one.
+///
+/// This is the last uncovered path before the journal can be wired to write
+/// durably, and it is the one where getting it wrong corrupts rather than
+/// loses. An open reservation is indistinguishable from a process that died
+/// between reserving and finalizing — which is exactly what the recovery
+/// machinery looks for on startup. So a dispatch that fails without finalizing
+/// does not merely omit a record: it manufactures a recovery case, and the
+/// recovery would act on it.
+///
+/// Drives a real CDP failure through the dispatch path rather than injecting a
+/// journal state, so the finalization is exercised where it actually runs.
+#[tokio::test]
+async fn a_browser_that_dies_mid_dispatch_finalizes_its_journal_entry() {
+    let route = identity();
+    let input_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plane = plane_with_process(
+        &route,
+        Box::new(ClickProcess {
+            result: Err(ClickDriveError::Navigation(
+                NavigationDriveError::Unavailable,
+            )),
+            input_events: Arc::clone(&input_events),
+        }),
+        1_000,
+    )
+    .with_in_memory_journal(cerebellum::journal::JournalConfig {
+        journal_retention_bytes: 1_000_000,
+        journal_max_entry_bytes: 100_000,
+    });
+    plane.open_context(route.clone()).await.unwrap();
+
+    let snapshot_id = retain_click_snapshot(&plane, &route).await;
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &json!({
+                "snapshot_id": snapshot_id,
+                "ref": "e1",
+                "intent": "drive a dispatch whose browser dies under it",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+    assert_ne!(result["outcome"], "ok", "{result}");
+
+    let export = plane.journal_export_for_test().await;
+
+    // The click must appear AND be terminal. Asserting only that a record
+    // exists would pass on an open reservation, which is the state this test
+    // exists to rule out.
+    let click_records: Vec<&str> = export
+        .lines()
+        .filter(|line| line.contains("\"capability\":\"browser.click\""))
+        .collect();
+    assert!(
+        !click_records.is_empty(),
+        "a failed click left no journal record: {export}"
+    );
+    // The export CANNOT answer whether this was finalized: it merges finalized
+    // entries with reservations still in `dispatched` state, so a record
+    // appearing above proves the dispatch was committed and not that it was
+    // closed out. The accounting is what separates them.
+    assert_eq!(
+        plane.active_reserved_bytes_for_test().await,
+        0,
+        "a failed click left its reservation open, which startup recovery reads \
+         as a process that died mid-dispatch: {export}"
+    );
+}
