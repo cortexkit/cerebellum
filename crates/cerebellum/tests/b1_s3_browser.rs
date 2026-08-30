@@ -2781,28 +2781,27 @@ async fn a_browser_that_dies_mid_dispatch_finalizes_its_journal_entry() {
         !click_records.is_empty(),
         "a failed click left no journal record: {export}"
     );
-    // WHAT THIS ASSERTION DOES AND DOES NOT PROVE, measured rather than assumed.
+    // Nothing may be left holding bytes, and nothing may be left committed but
+    // unclosed. The second is the one that matters and the one the export
+    // cannot answer: it merges finalized entries with dispatched reservations,
+    // so a record appearing above proves commitment rather than closure. Byte
+    // accounting cannot separate them either -- both read zero.
     //
-    // It holds, and the observable behaviour is right: a failed dispatch leaves
-    // a record with the failure's own outcome and no bytes held in reservation.
+    // An unclosed dispatch is what startup recovery reads as a process that
+    // died mid-dispatch, so a finalization regression would manufacture
+    // recovery cases rather than merely losing records.
     //
-    // But it is INSENSITIVE to the mechanism. There are three finalization call
-    // sites on this path, and breaking the invocation lookup at each of them in
-    // turn -- so finalization silently does nothing -- leaves this test green
-    // every time. So it pins the outcome and pins nothing about what achieves
-    // it, and a regression that stopped finalizing would not be caught here.
-    //
-    // Left asserting the weaker true thing rather than deleted, because the
-    // outcome is worth pinning and a test that overstates its reach is worse
-    // than one that states its limit. The stronger assertion needs a way to
-    // distinguish a finalized entry from a committed-but-open reservation, and
-    // neither the export nor this accounting can currently do it -- the export
-    // merges both, and the byte count reads zero in both cases.
-    //
-    // That gap is recorded as its own work rather than left in a comment.
+    // This replaced an assertion on byte accounting alone, which stayed green
+    // with the invocation lookup broken at all three finalization call sites.
     assert_eq!(
         plane.active_reserved_bytes_for_test().await,
         0,
         "a failed click left bytes held in reservation: {export}"
+    );
+    assert_eq!(
+        plane.unfinalized_dispatch_count_for_test().await,
+        0,
+        "a failed click was committed and never closed out, which startup \
+         recovery reads as a process that died mid-dispatch: {export}"
     );
 }
