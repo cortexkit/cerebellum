@@ -3049,8 +3049,32 @@ mod tests {
             panic!("successful launch must record a completed identity chain");
         };
         assert_eq!(hops.len(), 2);
-        assert_eq!(hops[0].path, Some(PathBuf::from("/usr/bin/bash")));
-        assert_eq!(hops[1].path, Some(PathBuf::from("/usr/bin/sleep")));
+        // The interpreter and the final image are resolved from the filesystem
+        // rather than named, because both are distribution details: /bin/sh is
+        // dash on Debian and Ubuntu and bash on Fedora and Arch, and the split
+        // between /bin and /usr/bin differs across usrmerge states. Naming
+        // either one asserts which distribution the test is running on, which
+        // is not the property under test.
+        //
+        // What IS under test survives that: the walk followed the script to its
+        // interpreter and on to the image actually executed, rather than
+        // reporting the script it was handed. Deriving the expectation from
+        // canonicalize is not circular -- it is a filesystem fact, read by a
+        // different mechanism than the exec-chain walk that produced the hops.
+        let expected_interpreter =
+            fs::canonicalize("/bin/sh").expect("the system shell resolves to a real image");
+        let expected_final =
+            fs::canonicalize("/bin/sleep").expect("the sleep binary resolves to a real image");
+        assert_eq!(
+            hops[0].path,
+            Some(expected_interpreter),
+            "the first hop must be the interpreter the script names"
+        );
+        assert_eq!(
+            hops[1].path,
+            Some(expected_final),
+            "the last hop must be the image actually executed"
+        );
         released
             .process
             .terminate_and_reap()
