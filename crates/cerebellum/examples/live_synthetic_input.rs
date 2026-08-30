@@ -33,11 +33,12 @@ async fn main() {
 #[cfg(target_os = "macos")]
 mod macos_probe {
     use std::collections::BTreeSet;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
@@ -110,6 +111,14 @@ mod macos_probe {
 </main>
 </div>
 <script>
+  // Report to the SERVER as well as into the DOM. Every DOM readback in this
+  // probe travels through the CDP accessibility tree, and Chromium may decline
+  // to populate that tree for a window that is not frontmost -- which is
+  // exactly the state this probe must measure in. A server report does not
+  // depend on the tree, on focus, or on CDP, so it can tell "the event never
+  // arrived" apart from "the page could not be read".
+  const tell = (what) => { try { navigator.sendBeacon('/report?' + encodeURIComponent(what)); } catch (e) {} };
+
   const input = document.getElementById('probe-input');
   const scrollbox = document.getElementById('scrollbox');
   const keyReport = document.getElementById('key-report');
@@ -120,22 +129,27 @@ mod macos_probe {
   const dragZone = document.getElementById('drag-zone');
 
   input.focus({preventScroll: true});
+  input.addEventListener('input', () => tell('type=' + input.value));
   document.addEventListener('keydown', event => {
     if (event.ctrlKey && event.shiftKey && !event.metaKey && event.key.toLowerCase() === 'k') {
       keyReport.textContent = 'KEY_REPORT=control+shift+k';
+      tell('keys=control+shift+k');
       event.preventDefault();
     }
   }, true);
   scrollbox.addEventListener('scroll', () => {
     scrollReport.textContent = `SCROLL_REPORT=${scrollbox.scrollTop}`;
+    tell('scroll=' + scrollbox.scrollTop);
   });
   moveZone.addEventListener('mousemove', event => {
     moveReport.textContent = `MOVE_REPORT=${event.screenX},${event.screenY}`;
+    tell('move=' + event.screenX + ',' + event.screenY);
   });
 
   let dragEvents = [];
   const showDragEvents = () => {
     dragReport.textContent = `DRAG_REPORT=${dragEvents.join('>')}`;
+    tell('drag=' + dragEvents.join('>'));
   };
   dragZone.addEventListener('mousedown', event => {
     dragEvents = ['press'];
@@ -310,6 +324,52 @@ mod macos_probe {
         let ready = snapshot_lines(planes, &mut snapshot_corr).await?;
         let initial_value = input_value(&ready).unwrap_or_else(|| "<missing textbox>".to_string());
         println!("CDP readiness: input value={initial_value:?}");
+
+        // Every post from here on must reach a target the user is NOT looking at.
+        // A freshly launched browser is frontmost, and delivery to a focused
+        // application is what an ordinary global post achieves too -- so a run
+        // taken in that state cannot tell the two mechanisms apart, whatever it
+        // observes.
+        // The control run keeps the target frontmost ON PURPOSE. Its result is
+        // not a delivery measurement -- it establishes that the page's report
+        // path works at all, so that zero reports in the real run means the
+        // events did not arrive rather than that nothing could ever be heard.
+        let control_run = std::env::var("CEREBELLUM_PROBE_KEEP_FOCUS").is_ok();
+        if control_run {
+            println!(
+                "CONTROL RUN: target left frontmost; this measures the INSTRUMENT, not delivery"
+            );
+        } else {
+            push_target_to_the_background();
+        }
+        let target_pid = compose_target.pid as i32;
+        let front_before = frontmost_process_id();
+        println!("frontmost before posting: {front_before:?} (target is {target_pid})");
+        if !control_run && front_before == Some(target_pid) {
+            return Err(format!(
+                "the target is still frontmost (pid {target_pid}), so this run cannot measure \
+                 UNFOCUSED delivery. Nothing is wrong with the input path; the probe could not \
+                 establish the condition its claim depends on."
+            ));
+        }
+
+        // Sampled THROUGHOUT rather than at the ends. A check only before and
+        // after cannot see the target coming forward in between, which is how
+        // two earlier runs on this desk were invalidated by an ordinary click.
+        let focus_watch = {
+            let flag = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                for _ in 0..600 {
+                    if frontmost_process_id() == Some(target_pid) {
+                        seen.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+            flag
+        };
 
         let mut verdicts = Vec::new();
 
@@ -492,6 +552,30 @@ mod macos_probe {
             verdicts.push(("drag", drag_verdict));
         }
 
+        // A run the target led at any point proves nothing about targeting.
+        if !control_run && focus_watch.load(Ordering::SeqCst) {
+            return Err(
+                "the target became frontmost while the sequence was posting, so these \
+                 observations cannot distinguish per-process delivery from an ordinary \
+                 focused post. Re-run without touching the target application."
+                    .to_string(),
+            );
+        }
+        println!(
+            "\nfrontmost after posting: {:?} (target {target_pid} never led)",
+            frontmost_process_id()
+        );
+
+        // Ground truth, independent of focus and of the accessibility tree.
+        // If this is empty while posts returned, the events did not arrive; if
+        // it is populated while the CDP readbacks came back missing, the page
+        // received them and only the READING failed.
+        let reports = page.reports();
+        println!("\npage reported to the server ({} events):", reports.len());
+        for report in &reports {
+            println!("  {report}");
+        }
+
         println!("\nSUMMARY");
         for (action, action_verdict) in &verdicts {
             println!("  {action}: {}", action_verdict.label());
@@ -592,6 +676,32 @@ mod macos_probe {
         Some((x.parse().ok()?, y.parse().ok()?))
     }
 
+    /// The pid macOS currently considers frontmost, or None if it cannot say.
+    fn frontmost_process_id() -> Option<i32> {
+        let out = std::process::Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "tell application \"System Events\" to get unix id of first process whose frontmost is true",
+            ])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    /// Put something else in front, so the target is genuinely not frontmost.
+    ///
+    /// Without this the probe measures delivery to a FOCUSED application, which
+    /// an ordinary global post achieves too. The whole claim of the per-process
+    /// path is that it reaches a process the user is not looking at, so a run
+    /// with the target in front cannot distinguish the two mechanisms and must
+    /// not be reported as if it could.
+    fn push_target_to_the_background() {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .args(["-a", "Finder"])
+            .status();
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+
     async fn wait_for_pointer_frames(
         pid: u32,
     ) -> Result<(cerebellum_macos::AxFrame, cerebellum_macos::AxFrame), String> {
@@ -609,8 +719,28 @@ mod macos_probe {
             };
             match cerebellum_macos::read_accessibility_tree(pid, options) {
                 Ok(tree) => {
-                    let move_frame = find_button_frame(&tree.root, MOVE_LABEL);
-                    let drag_frame = find_button_frame(&tree.root, DRAG_LABEL);
+                    // Web element frames first, then the WINDOW as a fallback.
+                    //
+                    // Chromium does not publish its web content in the macOS
+                    // accessibility tree, so the page's own buttons are usually
+                    // absent there however long we wait -- measured across live
+                    // apps in August: native interfaces reach 72-95% element
+                    // addressability, web-rendered ones 33-39%, and web CONTENT
+                    // specifically is largely missing. Waiting longer for an
+                    // element the platform never publishes is the shape of the
+                    // locked-screen misdiagnosis: a real absence read as a
+                    // delivery defect.
+                    //
+                    // The WINDOW is published, and it is enough for what this
+                    // probe measures. The claim is that a pointer sequence is
+                    // delivered to the target process in press-move-release
+                    // order and that the page sees it -- the page reports the
+                    // coordinates it received over CDP, so the browser's own
+                    // hit-testing supplies the precision the frame does not.
+                    let move_frame = find_button_frame(&tree.root, MOVE_LABEL)
+                        .or_else(|| page_area_frame(&tree.root));
+                    let drag_frame = find_button_frame(&tree.root, DRAG_LABEL)
+                        .or_else(|| page_area_frame(&tree.root));
                     last = format!(
                         "completeness={:?} move_frame={move_frame:?} drag_frame={drag_frame:?}",
                         tree.completeness
@@ -629,6 +759,31 @@ mod macos_probe {
             "pointer targets did not become addressable after {}ms: {last}",
             started.elapsed().as_millis()
         ))
+    }
+
+    /// The target window's content area, in screen coordinates.
+    ///
+    /// Used when the page's own elements are not published to the macOS
+    /// accessibility tree. The top 15% is skipped so a point lands in rendered
+    /// content rather than in the tab strip or address bar, where a click would
+    /// measure the browser's chrome instead of the page.
+    fn page_area_frame(root: &cerebellum_macos::AxElement) -> Option<cerebellum_macos::AxFrame> {
+        fn first_window(
+            element: &cerebellum_macos::AxElement,
+        ) -> Option<cerebellum_macos::AxFrame> {
+            if element.role.as_deref() == Some("AXWindow") {
+                return element.frame;
+            }
+            element.children.iter().find_map(first_window)
+        }
+        let frame = first_window(root)?;
+        let chrome = frame.height * 0.15;
+        Some(cerebellum_macos::AxFrame {
+            x: frame.x,
+            y: frame.y + chrome,
+            width: frame.width,
+            height: frame.height - chrome,
+        })
     }
 
     fn find_button_frame(
@@ -954,6 +1109,29 @@ mod macos_probe {
         url: String,
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
+        /// What the page reported receiving, recorded server-side.
+        reports: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Decode the percent-escapes a beacon URL carries. Only the few this page
+    /// can produce; anything else passes through, since a garbled report is
+    /// still evidence that SOMETHING arrived.
+    fn percent_decode(raw: &str) -> String {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                if let Ok(byte) = u8::from_str_radix(&raw[index + 1..index + 3], 16) {
+                    out.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[index]);
+            index += 1;
+        }
+        String::from_utf8_lossy(&out).to_string()
     }
 
     impl ProbePage {
@@ -963,10 +1141,36 @@ mod macos_probe {
             let address = listener.local_addr()?;
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = Arc::clone(&stop);
+            let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let worker_reports = Arc::clone(&reports);
             let worker = std::thread::spawn(move || {
                 while !worker_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // Read only the request line: enough to tell a page
+                            // fetch from a report, and it never blocks waiting
+                            // for a body the beacon may not flush promptly.
+                            // The listener is non-blocking and the accepted
+                            // stream inherits that, so a read would return
+                            // WouldBlock before the request line arrives and
+                            // every report would be silently lost.
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                            let mut head = [0_u8; 1024];
+                            let read = stream.read(&mut head).unwrap_or(0);
+                            let request = String::from_utf8_lossy(&head[..read]).to_string();
+                            let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                            if let Some(query) = path.strip_prefix("/report?") {
+                                let decoded = percent_decode(query);
+                                if let Ok(mut held) = worker_reports.lock() {
+                                    held.push(decoded);
+                                }
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}",
                                 PAGE.len()
@@ -986,7 +1190,16 @@ mod macos_probe {
                 url: format!("http://{address}/"),
                 stop,
                 worker: Some(worker),
+                reports,
             })
+        }
+
+        /// What the PAGE says it received, independent of focus and of CDP.
+        fn reports(&self) -> Vec<String> {
+            self.reports
+                .lock()
+                .map(|held| held.clone())
+                .unwrap_or_default()
         }
 
         fn url(&self) -> &str {
