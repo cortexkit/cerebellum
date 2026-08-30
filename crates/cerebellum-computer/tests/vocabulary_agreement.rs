@@ -19,8 +19,9 @@ use cerebellum_computer::{
     },
     platform::{
         capability_declarations, vocabulary::required_permission_services,
-        CapabilityAdvertisementContext, ImmutableReleaseInputs, PermissionLivenessReport,
-        PermissionService, StartupCapabilityProbe, SupportState,
+        CapabilityAdvertisementContext, ImmutableReleaseInputs, PermissionLiveness,
+        PermissionLivenessReport, PermissionProbeResult, PermissionService, StartupCapabilityProbe,
+        SupportState, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
     },
 };
 use serde_json::Value;
@@ -557,6 +558,51 @@ fn semantic_support_is_claimed_only_where_an_action_implements_it() {
     );
 }
 
+/// Every release input bound and every permission live.
+///
+/// Named because two tests need it and because the reason it exists is easy to
+/// lose: a default context refuses almost everything, so a test built on one
+/// cannot distinguish its own subject from the refusal that was already there.
+fn fully_bound_context() -> CapabilityAdvertisementContext {
+    let inputs = ImmutableReleaseInputs {
+        attendance_contract_owner: Some("fixture-owner".to_string()),
+        attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
+        input_review_revision: Some("fixture-input-review-v1".to_string()),
+        capture_review_revision: Some("fixture-capture-review-v1".to_string()),
+        semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+        release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
+        vocabulary_digests: VocabularyDigestInputs {
+            manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+            source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+            computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+        },
+    };
+    let permissions = PermissionLivenessReport::from_results(
+        [
+            PermissionService::Accessibility,
+            PermissionService::InputMonitoring,
+            PermissionService::ScreenRecording,
+            PermissionService::PostEvent,
+        ]
+        .into_iter()
+        .map(|service| PermissionProbeResult {
+            service,
+            liveness: PermissionLiveness::Live,
+            responsible_process: String::new(),
+            off_main: true,
+        })
+        .collect::<Vec<_>>(),
+    );
+    CapabilityAdvertisementContext {
+        startup: StartupCapabilityProbe {
+            permissions: permissions.clone(),
+            ..StartupCapabilityProbe::default()
+        },
+        inputs,
+        permissions,
+    }
+}
+
 /// An actuating row is advertised only if something can deliver it.
 ///
 /// Every other gate answers whether we are ALLOWED to serve a row. None asks
@@ -571,12 +617,24 @@ fn semantic_support_is_claimed_only_where_an_action_implements_it() {
 /// and this asserts that exemption rather than leaving it implied.
 #[test]
 fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
-    let context = CapabilityAdvertisementContext {
-        inputs: ImmutableReleaseInputs::default(),
-        permissions: PermissionLivenessReport::default(),
-        startup: StartupCapabilityProbe::default(),
-    };
+    // EVERY release input bound and every permission live, so the delivery-path
+    // rule is the ONLY thing that can withhold a row.
+    //
+    // A default context withholds scroll, move and drag anyway -- the input
+    // review key is unbound -- so the assertions below would hold whether or not
+    // the rule existed. Measured: with a default context, deleting the rule from
+    // production leaves this test green. The fixture has to make the refusal come
+    // from the property under test rather than from a state that refuses
+    // everything.
+    let context = fully_bound_context();
     let declarations = capability_declarations(&context, true);
+    assert!(
+        declarations
+            .iter()
+            .any(|declaration| declaration.advertised),
+        "the fixture withholds every row, so it cannot show that any particular \
+         one is withheld for the reason under test"
+    );
 
     let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
         "../resources/computer_action_vocabulary-v5.json"
