@@ -8,6 +8,7 @@ use crate::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotOb
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
 use crate::browser_launch::ExecutableIdentityCheckpoints;
+use crate::coordinate::InputRect;
 use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 use cerebellum_core::clock::{MonoInstant, MonotonicClock};
 use serde_json::{json, Value};
@@ -214,11 +215,30 @@ pub enum BrowserInputEvent {
     Release(BrowserClickPosition),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewportRefusal {
+    pub position: BrowserClickPosition,
+    pub viewport: InputRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClickDriveError {
     NoPosition,
     ClassificationChanged,
+    OutsideViewportAfterScroll(ViewportRefusal),
     Navigation(NavigationDriveError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClickPointDriveError {
+    OutsideViewport(ViewportRefusal),
+    Navigation(NavigationDriveError),
+}
+
+impl From<NavigationDriveError> for ClickPointDriveError {
+    fn from(error: NavigationDriveError) -> Self {
+        Self::Navigation(error)
+    }
 }
 
 pub trait OwnedBrowserProcess: Send {
@@ -291,8 +311,10 @@ pub trait OwnedBrowserProcess: Send {
         _position: BrowserClickPosition,
         _deadline_ms: u64,
         _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
-        Err(NavigationDriveError::Unavailable)
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+        Err(ClickPointDriveError::Navigation(
+            NavigationDriveError::Unavailable,
+        ))
     }
 
     /// Reclassify immediately before input and require the pinned classification
@@ -497,20 +519,22 @@ impl OperationGuard {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
         let mut state = self
             .sessions
             .inner
             .0
             .lock()
-            .map_err(|_| NavigationDriveError::Unavailable)?;
+            .map_err(|_| ClickPointDriveError::Navigation(NavigationDriveError::Unavailable))?;
         let process = state
             .routes
             .get_mut(&self.route_key)
             .and_then(|route| route.active.as_mut())
             .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
             .and_then(|session| session.process.as_mut())
-            .ok_or(NavigationDriveError::Unavailable)?;
+            .ok_or(ClickPointDriveError::Navigation(
+                NavigationDriveError::Unavailable,
+            ))?;
         process.click_point(context_key, position, deadline_ms, input_dispatched)
     }
 
