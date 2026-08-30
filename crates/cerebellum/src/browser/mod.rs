@@ -14,6 +14,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cerebellum_core::journal::{
+    journal_data_path, CallerRefusalHistory, RefusalRing, RefusalRingConfig,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -59,6 +63,8 @@ pub fn has_wire_dispatch_route(name: &str) -> bool {
 pub const SETTLEMENT_MS: u64 = 30_000;
 pub const QUIET_MS: u64 = 500;
 const DEFAULT_READ_PAGE_MAX_BYTES: u64 = 5_000;
+const DEFAULT_REFUSAL_RECORDS_PER_CALLER: usize = 64;
+const BROWSER_REFUSAL_RING_FILE: &str = "browser-refusals.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserCapability {
@@ -94,6 +100,14 @@ impl BrowserCapability {
             _ => return None,
         })
     }
+}
+
+/// Typed authorization decisions retained by the browser refusal ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRefusalReason {
+    NoGrant,
+    OriginScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,6 +624,14 @@ struct BrowserInvocation {
     outcome: Option<Outcome>,
 }
 
+#[derive(Debug, Default)]
+enum BrowserRefusalRing {
+    #[default]
+    Disabled,
+    Durable(Option<RefusalRing<SnapshotRefusalReason>>),
+    InMemory(RefusalRing<SnapshotRefusalReason>),
+}
+
 #[derive(Default)]
 pub struct BrowserPlane {
     state: Arc<Mutex<BrowserState>>,
@@ -618,6 +640,7 @@ pub struct BrowserPlane {
     journal_config: Option<journal::JournalConfig>,
     /// Whether journal invocations bind to memory instead of the durable path.
     journal_in_memory: bool,
+    refusal_ring: Arc<Mutex<BrowserRefusalRing>>,
     // A conversation can perform many browser operations. Each journal
     // invocation is tied to exactly one of them, so they cannot share a slot.
     journals: Arc<Mutex<HashMap<String, Vec<JournalInvocation>>>>,
@@ -639,6 +662,7 @@ impl BrowserPlane {
             grants: Arc::new(Mutex::new(grants)),
             journal_config: None,
             journal_in_memory: false,
+            refusal_ring: Arc::new(Mutex::new(BrowserRefusalRing::Disabled)),
             journals: Arc::new(Mutex::new(HashMap::new())),
             session_gate: None,
         }
@@ -703,6 +727,8 @@ impl BrowserPlane {
     /// first execution any of it has had.
     pub fn with_journal_installed(mut self, config: journal::JournalConfig) -> Self {
         self.journal_config = Some(config);
+        self.journal_in_memory = false;
+        self.refusal_ring = Arc::new(Mutex::new(BrowserRefusalRing::Durable(None)));
         self
     }
 
@@ -714,8 +740,43 @@ impl BrowserPlane {
     pub fn with_in_memory_journal(mut self, config: journal::JournalConfig) -> Self {
         self.journal_config = Some(config);
         self.journal_in_memory = true;
+        let ring = RefusalRing::new_in_memory(refusal_ring_config())
+            .expect("the fixed browser refusal-ring capacity is valid");
+        self.refusal_ring = Arc::new(Mutex::new(BrowserRefusalRing::InMemory(ring)));
         self
     }
+
+    /// Serialize refusal state as JSON for test inspection.
+    #[doc(hidden)]
+    pub async fn refusal_ring_export_for_test(&self) -> String {
+        let ring = self.refusal_ring.lock().await;
+        let bytes = match &*ring {
+            BrowserRefusalRing::Disabled | BrowserRefusalRing::Durable(None) => {
+                return String::new()
+            }
+            BrowserRefusalRing::Durable(Some(ring)) | BrowserRefusalRing::InMemory(ring) => {
+                ring.export_bytes()
+            }
+        }
+        .expect("an in-process refusal state serializes");
+        String::from_utf8(bytes).expect("JSON refusal state is UTF-8")
+    }
+
+    /// Typed refusal history for one caller.
+    #[doc(hidden)]
+    pub async fn refusal_history_for_test(
+        &self,
+        caller: &str,
+    ) -> Option<CallerRefusalHistory<SnapshotRefusalReason>> {
+        let ring = self.refusal_ring.lock().await;
+        match &*ring {
+            BrowserRefusalRing::Disabled | BrowserRefusalRing::Durable(None) => None,
+            BrowserRefusalRing::Durable(Some(ring)) | BrowserRefusalRing::InMemory(ring) => {
+                ring.history(caller).cloned()
+            }
+        }
+    }
+
     /// Test seam for the per-context dispatch lane.
     ///
     /// The lane's mutual exclusion is an ordering property with no observable
@@ -1394,6 +1455,38 @@ impl BrowserPlane {
         self.capture_snapshot(identity, kind, max_bytes, true).await
     }
 
+    async fn record_snapshot_refusal(
+        &self,
+        identity: &RouteIdentity,
+        claimed_addressing: &str,
+        reason: SnapshotRefusalReason,
+    ) -> Result<(), BrowserError> {
+        let mut binding = self.refusal_ring.lock().await;
+        let ring = match &mut *binding {
+            BrowserRefusalRing::Disabled => return Ok(()),
+            BrowserRefusalRing::InMemory(ring) => ring,
+            BrowserRefusalRing::Durable(slot) => {
+                if slot.is_none() {
+                    let path = journal_data_path(BROWSER_REFUSAL_RING_FILE).map_err(|_| {
+                        BrowserError::Internal {
+                            reason_code: JournalReasonCode::InternalFailure,
+                        }
+                    })?;
+                    *slot = Some(RefusalRing::new(path, refusal_ring_config()).map_err(|_| {
+                        BrowserError::Internal {
+                            reason_code: JournalReasonCode::InternalFailure,
+                        }
+                    })?);
+                }
+                slot.as_mut().expect("initialized above")
+            }
+        };
+        ring.record_refusal(&identity.agent_project_id, claimed_addressing, reason)
+            .map_err(|_| BrowserError::Internal {
+                reason_code: JournalReasonCode::InternalFailure,
+            })
+    }
+
     async fn capture_snapshot(
         &self,
         identity: &RouteIdentity,
@@ -1419,21 +1512,49 @@ impl BrowserPlane {
         };
         {
             let grants = self.grants.lock().await;
-            let decision = grants
-                .authorize(AuthorizationRequest::snapshot(
-                    &identity.conversation_key,
-                    &source_origin,
-                    &identity.agent_project_id,
-                ))
-                .map_err(map_authorization_error)?;
-            decision
+            let decision = match grants.authorize(AuthorizationRequest::snapshot(
+                &identity.conversation_key,
+                &source_origin,
+                &identity.agent_project_id,
+            )) {
+                Ok(decision) => decision,
+                Err(crate::authorization::AuthorizationError::NoGrant) => {
+                    drop(grants);
+                    self.record_snapshot_refusal(
+                        identity,
+                        &source_origin,
+                        SnapshotRefusalReason::NoGrant,
+                    )
+                    .await?;
+                    return Err(BrowserError::AuthorizationDenied { reason: "no_grant" });
+                }
+                Err(error) => return Err(map_authorization_error(error)),
+            };
+            if decision
                 .evaluate_origin_scope(&origin_from_url(&source_origin))
-                .map_err(|_| BrowserError::AuthorizationDenied {
+                .is_err()
+            {
+                drop(grants);
+                self.record_snapshot_refusal(
+                    identity,
+                    &source_origin,
+                    SnapshotRefusalReason::OriginScope,
+                )
+                .await?;
+                return Err(BrowserError::AuthorizationDenied {
                     reason: "origin_scope",
-                })?;
-            grants
-                .commit(&decision)
-                .map_err(|_| BrowserError::AuthorizationDenied { reason: "no_grant" })?;
+                });
+            }
+            if grants.commit(&decision).is_err() {
+                drop(grants);
+                self.record_snapshot_refusal(
+                    identity,
+                    &source_origin,
+                    SnapshotRefusalReason::NoGrant,
+                )
+                .await?;
+                return Err(BrowserError::AuthorizationDenied { reason: "no_grant" });
+            }
         }
         let reservation = if persist_journal {
             self.reserve(identity, BrowserCapability::Snapshot).await?
@@ -2591,6 +2712,12 @@ fn required_signed_integer(object: &Map<String, Value>, field: &str) -> Result<i
     }
     Ok(value as i128)
 }
+fn refusal_ring_config() -> RefusalRingConfig {
+    RefusalRingConfig {
+        records_per_caller: DEFAULT_REFUSAL_RECORDS_PER_CALLER,
+    }
+}
+
 fn map_authorization_error(error: crate::authorization::AuthorizationError) -> BrowserError {
     match error {
         crate::authorization::AuthorizationError::NoGrant => {
