@@ -494,3 +494,65 @@ fn only_keyboard_rows_claim_background_synthetic_support() {
     assert_eq!(pointer_rows, 4, "the pointer rows are not all present");
     assert_eq!(keyboard_rows, 2, "the keyboard rows are not all present");
 }
+
+/// A row claims semantic support only where an AxAction implements its path.
+///
+/// The frozen vocabulary names three semantic paths: click -> ax_press,
+/// type -> ax_value, scroll -> ax_scroll_position. Only the first exists.
+/// AxAction has eight members and none of them sets a value or scrolls, and
+/// dispatch has no semantic route for either capability, so those two rows
+/// were claiming a delivery path that cannot be taken.
+///
+/// The declaration used to mirror the artifact -- Supported wherever the row
+/// named anything other than none -- which made it restate what the row WANTS
+/// rather than what the driver can do. That is the same shape as a frozen
+/// column nothing verifies: the claim and its subject never meet.
+///
+/// The implemented set is a literal here rather than read from AxAction,
+/// because deriving it from the enum would let a member's removal satisfy this
+/// test by shrinking what it compares against.
+#[test]
+fn semantic_support_is_claimed_only_where_an_action_implements_it() {
+    const IMPLEMENTED_SEMANTIC_PATHS: [&str; 1] = ["ax_press"];
+
+    let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
+        "../resources/computer_action_vocabulary-v5.json"
+    ))
+    .expect("the frozen vocabulary parses");
+    let rows = vocabulary["rows"].as_array().expect("rows is an array");
+
+    let context = CapabilityAdvertisementContext {
+        inputs: ImmutableReleaseInputs::default(),
+        permissions: PermissionLivenessReport::default(),
+        startup: StartupCapabilityProbe::default(),
+    };
+    let declarations = capability_declarations(&context, true);
+
+    let mut claimed = 0;
+    for declaration in &declarations {
+        let row = rows
+            .iter()
+            .find(|row| row["capability_id"] == declaration.capability_id.as_str())
+            .expect("every declaration has a frozen row");
+        let declared_path = row["semantic_path"].as_str().unwrap_or("none");
+        let implemented = IMPLEMENTED_SEMANTIC_PATHS.contains(&declared_path);
+        if implemented {
+            claimed += 1;
+        }
+        assert_eq!(
+            declaration.semantic_path == SupportState::Supported,
+            implemented,
+            "{} declares semantic path {declared_path:?}, which is {}implemented, but claims {:?}",
+            declaration.capability_id,
+            if implemented { "" } else { "NOT " },
+            declaration.semantic_path
+        );
+    }
+
+    // At least one row must genuinely claim it, or the assertion above is
+    // satisfied by everything being Unsupported and proves nothing.
+    assert_eq!(
+        claimed, 1,
+        "exactly one row should claim an implemented semantic path"
+    );
+}

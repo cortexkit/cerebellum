@@ -441,7 +441,20 @@ fn capability_declaration(
         } else {
             vec![DispatchMode::Background, DispatchMode::Observed]
         },
-        semantic_path: if matches!(id, "computer.click" | "computer.type" | "computer.scroll") {
+        // Claimed only where an AxAction actually implements the path the
+        // frozen row names, rather than wherever the row names one.
+        //
+        // The vocabulary declares three: click -> ax_press, type -> ax_value,
+        // scroll -> ax_scroll_position. AxAction has eight members -- Press,
+        // Increment, Decrement, Confirm, Cancel, ShowMenu, ShowAlternateUi,
+        // ShowDefaultUi -- so only ax_press exists. Nothing in this workspace
+        // sets a value or scrolls through the accessibility API, and dispatch
+        // has no semantic route for either capability.
+        //
+        // Mirroring the artifact made this declaration restate what the row
+        // WANTS instead of what the driver can do, which is the same shape as a
+        // frozen column nothing verifies: the claim and its subject never meet.
+        semantic_path: if id == "computer.click" {
             SupportState::Supported
         } else {
             SupportState::Unsupported
