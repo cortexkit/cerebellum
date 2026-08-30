@@ -163,7 +163,18 @@ run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
 # Skipped rather than failed when the target is absent, because a developer
 # without it installed should not be blocked; CI has it, and CI is where the
 # verdict binds.
+#
+# Two dependencies in our tree compile C -- ring and libsqlite3-sys, both via
+# subc-core -- so this needs a C compiler that emits Linux objects, not just the
+# Rust target. zig ships one, and using it means no separate toolchain to
+# install or keep in step. An operator who already has a real cross-gcc
+# configured keeps it: these are only set when unset.
 if rustc --print target-libdir --target x86_64-unknown-linux-gnu >/dev/null 2>&1; then
+  if [ -z "${CC_x86_64_unknown_linux_gnu:-}" ] && command -v zig >/dev/null 2>&1; then
+    CC_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-cc.sh"
+    AR_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-ar.sh"
+    export CC_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
+  fi
   run_phase "cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
     cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
 else
@@ -221,3 +232,15 @@ run_phase "the build rewrote no generated file" \
 # all. A phase that fails never reaches this line, so its ABSENCE is as
 # meaningful as its presence.
 echo "GATE PASSED: all phases green"
+
+# WHAT THIS GATE DID NOT DO, printed on success because that is when it is
+# forgotten. It runs TESTS on this host only, and lints the Linux target without
+# executing anything there. So a test behind #[cfg(target_os = "linux")] is
+# compiled here at best and never run, and its result is unknown to every green
+# run of this script.
+#
+# That is not hypothetical: main stayed red on Linux CI for seven commits while
+# this line printed each time. Two fixtures assumed /bin/sh was bash, which is
+# true on Fedora and Arch and false on Debian and Ubuntu, and no local run could
+# have seen either one.
+echo "        (host tests + cross-lint only; Linux-gated tests run in CI, not here)"
