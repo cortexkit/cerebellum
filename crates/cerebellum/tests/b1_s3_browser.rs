@@ -2080,3 +2080,80 @@ async fn the_journal_lifecycle_runs_and_separates_a_read_from_a_navigation() {
          two measured when this was written; the per-call cost has grown"
     );
 }
+
+/// A refused read never reaches the journal, because authorization precedes
+/// reservation.
+///
+/// I wrote this expecting the opposite -- that a refusal reserved and then
+/// failed to finalize, leaving an open reservation indistinguishable from a
+/// process that died mid-dispatch. It does not: `capture_snapshot` authorizes,
+/// and only then reserves, so a refused read touches no journal state at all.
+/// That ordering is the fail-closed one and it is what this pins.
+///
+/// It also means an unauthorized caller cannot write journal entries, which is
+/// why the ordering is worth a test rather than a comment: reversing it would
+/// hand a refused caller a way to fill an operator's audit storage.
+///
+/// SEPARATELY AND NOT ASSERTED HERE: whether a refusal SHOULD be recorded is an
+/// open question. "Which origins did this agent try to read and get refused" is
+/// close to the first thing a compromise investigation asks, and today the
+/// journal cannot answer it. Recording it without re-introducing the write
+/// primitive above is the design problem.
+#[tokio::test]
+async fn a_refused_read_never_reaches_the_journal() {
+    let route = identity();
+    let observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "heading".into(),
+        name: "Private page".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    let plane = plane_with_process(
+        &route,
+        Box::new(OffOriginRedirectProcess { observation }),
+        1_000,
+    )
+    .with_in_memory_journal(cerebellum::journal::JournalConfig {
+        journal_retention_bytes: 1_000_000,
+        journal_max_entry_bytes: 100_000,
+    });
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "drive a refused read through the journal",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": true
+            }),
+        )
+        .await;
+    assert_eq!(result["outcome"], "ok", "{result}");
+    assert_eq!(
+        result["read_page"]["outcome"], "authorization_denied",
+        "{result}"
+    );
+
+    let export = plane.journal_export_for_test().await;
+
+    // The navigation happened and is recorded.
+    assert!(
+        export.contains("\"capability\":\"browser.navigate\""),
+        "the navigation is missing from the journal: {export}"
+    );
+
+    // The refused read reserved nothing. Asserted as the ABSENCE of any
+    // snapshot record rather than as the absence of a reservation, because a
+    // reservation that was taken and then finalized would also leave no open
+    // reservation while having written -- and that is the state this rules out.
+    assert!(
+        !export.contains("\"capability\":\"browser.snapshot\""),
+        "a refused read wrote a journal record, so it reserved before \
+         authorizing: {export}"
+    );
+}
