@@ -357,3 +357,66 @@ fn the_two_required_audit_obligations_are_not_interchangeable() {
         "only the observing row may account for its record after the fact"
     );
 }
+
+/// computer.scroll declares a semantic path that nothing implements.
+///
+/// The frozen row says `semantic_path: ax_scroll_position`, and `AxAction` has
+/// eight members with no scroll among them. So scroll can be GROUNDED on an
+/// accessibility element but never DISPATCHED semantically: it always goes out
+/// as synthetic input and can never claim the strongest containment rung.
+///
+/// Asserted rather than fixed, and asserted rather than left silent. The
+/// vocabulary is a published artifact, so a caller reading that column would
+/// conclude scroll can be actuated semantically -- and the honest place to
+/// correct that is here, where the divergence is stated and the reason is next
+/// to it.
+///
+/// WHY NOT JUST ADD THE ACTION. Real applications do advertise
+/// AXScrollUpByPage and friends, so the member could exist. Two arguments
+/// against, and neither is settled by wanting the better containment rung:
+/// every member added to a closed action vocabulary widens what a caller may
+/// ask any application to perform, and a page-scroll moves the viewport by an
+/// amount the APPLICATION chooses, so the post-condition cannot be stated the
+/// way a press's can. Deciding that is a vocabulary revision with a review
+/// behind it, not a patch.
+///
+/// If a future revision adds scroll to AxAction, this test fails and should be
+/// deleted rather than adjusted -- its whole purpose is to mark a gap that is
+/// currently deliberate.
+#[test]
+fn scroll_declares_a_semantic_path_that_no_action_implements() {
+    let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
+        "../resources/computer_action_vocabulary-v5.json"
+    ))
+    .expect("the frozen vocabulary parses");
+    let scroll = vocabulary["rows"]
+        .as_array()
+        .expect("rows is an array")
+        .iter()
+        .find(|row| row["capability_id"] == "computer.scroll")
+        .expect("computer.scroll is a frozen row");
+    assert_eq!(
+        scroll["semantic_path"], "ax_scroll_position",
+        "this test exists because the row CLAIMS a semantic path; if that claim \
+         changed, the divergence it documents is gone"
+    );
+
+    // The claim's counterpart. Named as literals rather than read from the enum,
+    // so removing a member cannot quietly satisfy this by shrinking the set it
+    // is compared against.
+    let implemented = [
+        "AXPress",
+        "AXIncrement",
+        "AXDecrement",
+        "AXConfirm",
+        "AXCancel",
+        "AXShowMenu",
+        "AXShowAlternateUI",
+        "AXShowDefaultUI",
+    ];
+    assert!(
+        !implemented.iter().any(|name| name.contains("Scroll")),
+        "an AxAction now implements scrolling, so the declared semantic path is \
+         no longer a gap: delete this test rather than adjusting it"
+    );
+}
