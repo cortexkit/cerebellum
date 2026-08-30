@@ -58,6 +58,7 @@ pub fn has_wire_dispatch_route(name: &str) -> bool {
 
 pub const SETTLEMENT_MS: u64 = 30_000;
 pub const QUIET_MS: u64 = 500;
+const DEFAULT_READ_PAGE_MAX_BYTES: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserCapability {
@@ -378,6 +379,7 @@ pub enum Operation {
 pub struct JournalInvocation {
     store: JournalStore,
     identity: JournalIdentity,
+    browser_capability: BrowserCapability,
     capability: JournalCapability,
     handle: Option<ReservationHandle>,
     token: Option<DispatchCommitmentToken>,
@@ -388,12 +390,13 @@ impl JournalInvocation {
     pub fn new(
         config: journal::JournalConfig,
         identity: JournalIdentity,
-        capability: JournalCapability,
+        browser_capability: BrowserCapability,
     ) -> Result<Self, JournalError> {
         Ok(Self {
             store: JournalStore::new(config)?,
             identity,
-            capability,
+            browser_capability,
+            capability: journal_capability(browser_capability),
             handle: None,
             token: None,
             terminal: false,
@@ -560,6 +563,13 @@ struct BrowserState {
     contexts: HashMap<String, ContextState>,
     late_events: HashMap<String, VecDeque<LateEvent>>,
     operations: Vec<(String, Operation)>,
+    invocations: HashMap<String, Vec<BrowserInvocation>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BrowserInvocation {
+    capability: BrowserCapability,
+    outcome: Option<Outcome>,
 }
 
 #[derive(Default)]
@@ -568,7 +578,9 @@ pub struct BrowserPlane {
     lanes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     grants: Arc<Mutex<GrantStore>>,
     journal_config: Option<journal::JournalConfig>,
-    journals: Arc<Mutex<HashMap<String, JournalInvocation>>>,
+    // A conversation can perform many browser operations. Each journal
+    // invocation is tied to exactly one of them, so they cannot share a slot.
+    journals: Arc<Mutex<HashMap<String, Vec<JournalInvocation>>>>,
     session_gate: Option<(
         crate::browser_session::BrowserSessions,
         Arc<cerebellum_core::clock::SystemClock>,
@@ -679,8 +691,41 @@ impl BrowserPlane {
     pub async fn operation_log(&self) -> Vec<(String, Operation)> {
         self.state.lock().await.operations.clone()
     }
+
+    /// Test seam for checking that nested browser operations retain distinct
+    /// capability outcomes even when the durable journal cannot name one.
+    pub async fn invocation_outcomes_for_test(
+        &self,
+        identity: &RouteIdentity,
+    ) -> Vec<(BrowserCapability, Option<Outcome>)> {
+        self.state
+            .lock()
+            .await
+            .invocations
+            .get(&identity.conversation_key)
+            .into_iter()
+            .flatten()
+            .map(|invocation| (invocation.capability, invocation.outcome))
+            .collect()
+    }
+
     fn op(state: &mut BrowserState, key: &str, operation: Operation) {
         state.operations.push((key.to_string(), operation));
+    }
+
+    fn record_invocation_outcome(
+        state: &mut BrowserState,
+        key: &str,
+        capability: BrowserCapability,
+        outcome: Outcome,
+    ) {
+        if let Some(invocation) = state.invocations.get_mut(key).and_then(|invocations| {
+            invocations.iter_mut().rev().find(|invocation| {
+                invocation.capability == capability && invocation.outcome.is_none()
+            })
+        }) {
+            invocation.outcome = Some(outcome);
+        }
     }
 
     pub async fn dispatch(
@@ -744,6 +789,12 @@ impl BrowserPlane {
         }
         if committed {
             let mut state = self.state.lock().await;
+            Self::record_invocation_outcome(
+                &mut state,
+                &identity.conversation_key,
+                capability,
+                Outcome::InternalError,
+            );
             Self::op(
                 &mut state,
                 &identity.conversation_key,
@@ -755,6 +806,8 @@ impl BrowserPlane {
                 .lock()
                 .await
                 .get_mut(&identity.conversation_key)
+                .and_then(|invocations| invocations.last_mut())
+                .filter(|entry| entry.browser_capability == capability)
             {
                 let _ = entry.finalize_dispatched(
                     FinalContextAssociation {
@@ -770,7 +823,14 @@ impl BrowserPlane {
                 );
             }
         } else {
+            let outcome = journal_outcome(error);
             let mut state = self.state.lock().await;
+            Self::record_invocation_outcome(
+                &mut state,
+                &identity.conversation_key,
+                capability,
+                outcome,
+            );
             Self::op(
                 &mut state,
                 &identity.conversation_key,
@@ -782,16 +842,17 @@ impl BrowserPlane {
                 .lock()
                 .await
                 .get_mut(&identity.conversation_key)
+                .and_then(|invocations| invocations.last_mut())
+                .filter(|entry| entry.browser_capability == capability)
             {
                 let _ = entry.finalize_rejected(rejection_material(
-                    journal_outcome(error),
+                    outcome,
                     error
                         .detail()
                         .unwrap_or_else(|| json!({"reason_code":"internal_failure"})),
                 ));
             }
         }
-        let _ = capability;
     }
 
     async fn result(&self, identity: &RouteIdentity, result: Result<Value, BrowserError>) -> Value {
@@ -845,6 +906,23 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         capability: BrowserCapability,
     ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
+        self.reserve_inner(identity, capability, true).await
+    }
+
+    async fn reserve_without_journal(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+    ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
+        self.reserve_inner(identity, capability, false).await
+    }
+
+    async fn reserve_inner(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+        persist_journal: bool,
+    ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
         let operation = if let Some((sessions, clock, _)) = &self.session_gate {
             match sessions.accept_dispatch(&identity.conversation_key, clock.as_ref()) {
                 crate::browser_session::DispatchAdmission::Accepted(guard) => Some(guard),
@@ -867,21 +945,32 @@ impl BrowserPlane {
         } else {
             None
         };
-        if let Some(config) = self.journal_config {
-            let mut journals = self.journals.lock().await;
-            let entry = journals
-                .entry(identity.conversation_key.clone())
-                .or_insert_with(|| {
-                    JournalInvocation::new(
-                        config,
-                        journal_identity(identity),
-                        journal_capability(capability),
-                    )
-                    .expect("validated journal configuration")
-                });
-            entry.reserve().map_err(map_journal_error)?;
+        if persist_journal {
+            if let Some(config) = self.journal_config {
+                let invocation =
+                    JournalInvocation::new(config, journal_identity(identity), capability)
+                        .map_err(map_journal_error)?;
+                let mut journals = self.journals.lock().await;
+                let invocations = journals
+                    .entry(identity.conversation_key.clone())
+                    .or_default();
+                invocations.push(invocation);
+                invocations
+                    .last_mut()
+                    .expect("journal invocation was just added")
+                    .reserve()
+                    .map_err(map_journal_error)?;
+            }
         }
         let mut state = self.state.lock().await;
+        state
+            .invocations
+            .entry(identity.conversation_key.clone())
+            .or_default()
+            .push(BrowserInvocation {
+                capability,
+                outcome: None,
+            });
         Self::op(&mut state, &identity.conversation_key, Operation::Reserve);
         Ok(operation)
     }
@@ -892,14 +981,18 @@ impl BrowserPlane {
     ) -> Result<(), BrowserError> {
         if self.journal_config.is_some() {
             let mut journals = self.journals.lock().await;
-            if let Some(entry) = journals.get_mut(&identity.conversation_key) {
+            if let Some(entry) = journals
+                .get_mut(&identity.conversation_key)
+                .and_then(|invocations| invocations.last_mut())
+                .filter(|entry| entry.browser_capability == capability)
+            {
                 entry
                     .commit_dispatched(DispatchMaterial {
                         intent_redacted: None,
                         requested_severity: None,
                         effective_severity: None,
                         grant_decision: GrantDecision::not_reached(),
-                        action: journal_action(journal_capability(capability)),
+                        action: journal_action(entry.capability),
                         locator: None,
                         snapshot_ids: Vec::new(),
                         governing_observation: GoverningObservation::observation_not_required(),
@@ -918,11 +1011,17 @@ impl BrowserPlane {
     async fn finalize(
         &self,
         identity: &RouteIdentity,
-        _capability: BrowserCapability,
+        capability: BrowserCapability,
         outcome: Outcome,
         detail: Value,
     ) -> Result<(), BrowserError> {
         let mut state = self.state.lock().await;
+        Self::record_invocation_outcome(
+            &mut state,
+            &identity.conversation_key,
+            capability,
+            outcome,
+        );
         Self::op(
             &mut state,
             &identity.conversation_key,
@@ -931,7 +1030,11 @@ impl BrowserPlane {
         drop(state);
         if self.journal_config.is_some() {
             let mut journals = self.journals.lock().await;
-            if let Some(entry) = journals.get_mut(&identity.conversation_key) {
+            if let Some(entry) = journals
+                .get_mut(&identity.conversation_key)
+                .and_then(|invocations| invocations.last_mut())
+                .filter(|entry| entry.browser_capability == capability)
+            {
                 entry
                     .finalize_dispatched(
                         FinalContextAssociation {
@@ -953,10 +1056,32 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, BrowserError> {
         let object = self
-            .validate_request(args, &["url", "intent", "wait", "severity"])
+            .validate_request(
+                args,
+                &[
+                    "url",
+                    "intent",
+                    "wait",
+                    "severity",
+                    "read_page",
+                    "max_bytes",
+                ],
+            )
             .await?;
         let url = required_string(object, "url", 1, 4096)?;
         let _intent = bounded_string(object, "intent", 0, 512)?;
+        let read_page = match object.get("read_page") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(BrowserError::InvalidRequest {
+                    field: "read_page".into(),
+                    reason_code: "wrong_type",
+                })
+            }
+        };
+        let read_max_bytes = optional_integer(object, "max_bytes", 1, 262_144)?
+            .unwrap_or(DEFAULT_READ_PAGE_MAX_BYTES) as usize;
         let wait = match object.get("wait") {
             None => crate::browser_session::NavigationWait::Settle,
             Some(Value::String(value)) if value == "settle" => {
@@ -1113,16 +1238,52 @@ impl BrowserPlane {
         } else {
             Outcome::Success
         };
-        self.finalize(identity, BrowserCapability::Navigate, outcome, json!({"outcome":if should_settle && !tracker.settled {"not_settled"} else {"ok"},"url_final":tracker.url_final,"lifecycle":tracker.lifecycle})).await?;
-        if should_settle && !tracker.settled {
-            return Ok(json!({
+        self.finalize(
+            identity,
+            BrowserCapability::Navigate,
+            outcome,
+            json!({"outcome":if should_settle && !tracker.settled {"not_settled"} else {"ok"},"url_final":tracker.url_final,"lifecycle":tracker.lifecycle}),
+        )
+        .await?;
+        let mut response = if should_settle && !tracker.settled {
+            json!({
                 "outcome":"not_settled",
                 "remedy":"call browser.snapshot to re-observe the page before depending on its current state",
                 "url_final":tracker.url_final,
                 "lifecycle":tracker.lifecycle,
-            }));
+            })
+        } else {
+            json!({"outcome":"ok","url_final":tracker.url_final,"lifecycle":tracker.lifecycle})
+        };
+        if !read_page {
+            return Ok(response);
         }
-        Ok(json!({"outcome":"ok","url_final":tracker.url_final,"lifecycle":tracker.lifecycle}))
+
+        // Action grants are not capability-scoped today, so a same-origin navigation
+        // grant also admits a snapshot. The read still goes through snapshot
+        // authorization against the landing URL because redirects can change origin.
+        // If grants become action-scoped, this path must not inherit navigate authority.
+        //
+        // The frozen journal vocabulary cannot name Snapshot. Recording this read as
+        // Navigate would forge the audit trail, so the nested snapshot stays out of
+        // that durable journal until its vocabulary can represent the observation.
+        let read_start = self.state.lock().await.operations.len();
+        let page = match self
+            .capture_snapshot(identity, SnapshotKind::Ax, read_max_bytes, false)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.terminal_on_error(identity, BrowserCapability::Snapshot, read_start, &error)
+                    .await;
+                partial_error_result(&error)
+            }
+        };
+        response
+            .as_object_mut()
+            .expect("navigation response is an object")
+            .insert("read_page".into(), page);
+        Ok(response)
     }
 
     async fn snapshot(
@@ -1150,6 +1311,16 @@ impl BrowserPlane {
         };
         let max_bytes =
             optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
+        self.capture_snapshot(identity, kind, max_bytes, true).await
+    }
+
+    async fn capture_snapshot(
+        &self,
+        identity: &RouteIdentity,
+        kind: SnapshotKind,
+        max_bytes: usize,
+        persist_journal: bool,
+    ) -> Result<Value, BrowserError> {
         let (document_epoch, source_origin) = {
             let state = self.state.lock().await;
             let context = state
@@ -1184,9 +1355,13 @@ impl BrowserPlane {
                 .commit(&decision)
                 .map_err(|_| BrowserError::AuthorizationDenied { reason: "no_grant" })?;
         }
-        let Some(mut session_operation) =
+        let reservation = if persist_journal {
             self.reserve(identity, BrowserCapability::Snapshot).await?
-        else {
+        } else {
+            self.reserve_without_journal(identity, BrowserCapability::Snapshot)
+                .await?
+        };
+        let Some(mut session_operation) = reservation else {
             return Err(BrowserError::NoSession);
         };
         self.commit(identity, BrowserCapability::Snapshot).await?;
@@ -2155,8 +2330,8 @@ pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         (
             NAVIGATE,
-            "Navigate managed Chromium through the enforcing connector.",
-            json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"enum":["settle","none"]},"severity":severity_schema()},"required":["url","intent","severity"],"additionalProperties":false}),
+            "Navigate managed Chromium through the enforcing connector. Set read_page to return a bounded snapshot of the landing page.",
+            json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return an accessibility snapshot of the landing page."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
         ),
         (
             SNAPSHOT,
@@ -2307,6 +2482,16 @@ fn optional_integer(
     }
     Ok(Some(value))
 }
+fn partial_error_result(error: &BrowserError) -> Value {
+    let mut result = Map::new();
+    result.insert("outcome".into(), Value::String(error.outcome().into()));
+    result.insert("remedy".into(), Value::String(error.remedy().into()));
+    if let Some(detail) = error.detail() {
+        result.insert("detail".into(), detail);
+    }
+    Value::Object(result)
+}
+
 fn required_signed_integer(object: &Map<String, Value>, field: &str) -> Result<i128, BrowserError> {
     let value = object
         .get(field)
