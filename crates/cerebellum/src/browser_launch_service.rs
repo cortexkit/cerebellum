@@ -34,10 +34,10 @@ use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
 };
 use crate::browser_session::{
-    BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher, BrowserSessionTerminalOutcome,
-    CleanupStage, ClickDriveError, ClickPointDriveError, LaunchedBrowser, NavigationDriveError,
-    NavigationWait, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
-    SessionCleanupOutcome,
+    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher,
+    BrowserSessionTerminalOutcome, CleanupStage, ClickDriveError, ClickPointDriveError,
+    LaunchedBrowser, NavigationDriveError, NavigationWait, OwnedBrowserProcess,
+    ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
 };
 use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
@@ -746,7 +746,7 @@ impl OwnedBrowserProcess for ProductionProcess {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         self.driver
             .as_mut()
             .ok_or(ClickPointDriveError::Navigation(
@@ -764,7 +764,7 @@ impl OwnedBrowserProcess for ProductionProcess {
         expected: Option<&crate::classification::NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         self.driver
             .as_mut()
             .ok_or(ClickDriveError::Navigation(

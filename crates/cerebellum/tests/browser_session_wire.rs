@@ -7,9 +7,9 @@ use cerebellum::browser::navigation::BrowserSnapshotObservation;
 use cerebellum::browser::{BrowserPlane, Tracker};
 use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
 use cerebellum::browser_session::{
-    BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher, CleanupStage, ClickDriveError,
-    LaunchedBrowser, NavigationDriveError, NavigationWait, OwnedBrowserProcess,
-    ProcessControlFailure, SessionCleanup,
+    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher,
+    CleanupStage, ClickDriveError, LaunchedBrowser, NavigationDriveError, NavigationWait,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
 };
 use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
@@ -255,7 +255,7 @@ impl OwnedBrowserProcess for RecordingProcess {
         _: Option<&cerebellum::classification::NonTypeClassificationRecord>,
         _: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         let position = BrowserClickPosition {
             x_css: 12.0,
             y_css: 24.0,
@@ -265,7 +265,7 @@ impl OwnedBrowserProcess for RecordingProcess {
         self.effects.lock().unwrap().push("input_release");
         input_dispatched(BrowserInputEvent::Release(position));
         self.clicked = true;
-        Ok(position)
+        Ok(BrowserClickOutcome::Clicked(position))
     }
 
     fn generation_matches(&self) -> bool {

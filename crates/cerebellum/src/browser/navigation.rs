@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -8,8 +8,9 @@ use crate::browser::geometry::{self, Quad};
 use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use crate::browser_session::{
-    BrowserClickPosition, BrowserInputEvent, ClickDriveError, ClickPointDriveError,
-    NavigationDriveError, NavigationWait, ViewportRefusal,
+    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserJavaScriptDialog,
+    ClickDriveError, ClickPointDriveError, JavaScriptDialogResponse, NavigationDriveError,
+    NavigationWait, ViewportRefusal,
 };
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
 use crate::classification::{
@@ -86,6 +87,12 @@ struct AttachedTarget {
     context_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingJavaScriptDialog {
+    session_id: String,
+    dialog_type: String,
+}
+
 /// Owns every CDP write, frame decoder, and request correlator for one browser.
 /// Keeping these together prevents a lifecycle command and a navigation command
 /// from assigning competing request ids or interleaving frames on the pipe.
@@ -95,6 +102,8 @@ pub struct CdpNavigationDriver<IO> {
     decoder: CdpFrameDecoder,
     identities: IdentityMap,
     attachment: Option<AttachedTarget>,
+    pending_responses: HashMap<u64, CdpResponse>,
+    pending_javascript_dialogs: VecDeque<PendingJavaScriptDialog>,
     read_buffer: Vec<u8>,
 }
 
@@ -110,6 +119,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             decoder,
             identities: IdentityMap::new(),
             attachment: None,
+            pending_responses: HashMap::new(),
+            pending_javascript_dialogs: VecDeque::new(),
             read_buffer: vec![0; READ_CHUNK_BYTES],
         }
     }
@@ -187,7 +198,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         expected: Option<&NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         let mut clock = SystemNavigationClock;
         self.click_with_clock(
             context_key,
@@ -206,7 +217,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         let mut clock = SystemNavigationClock;
         self.click_point_with_clock(
             context_key,
@@ -225,7 +236,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         self.click_with_clock(
             context_key,
             identity,
@@ -357,7 +368,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         revalidation: Option<(u64, &str, Option<&NonTypeClassificationRecord>)>,
         clock: &mut C,
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
@@ -533,7 +544,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
@@ -662,18 +673,30 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline: Instant,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
-    ) -> Result<BrowserClickPosition, NavigationDriveError> {
+    ) -> Result<BrowserClickOutcome, NavigationDriveError> {
+        // Page events must be enabled before either input dispatch. Arming after a
+        // blocked release would leave the first dialog waiting for an answer.
+        self.command(
+            "Page.enable",
+            None,
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
+
+        let mut dialogs = Vec::new();
         let mut press_params = mouse_event_params("mousePressed", position);
         press_params.insert("button".into(), Value::String("left".into()));
         press_params.insert("clickCount".into(), Value::Number(1.into()));
         let mut press_dispatched = || input_dispatched(BrowserInputEvent::Press(position));
-        let press = self.command_response(
+        let press = self.command_response_handling_javascript_dialogs(
             "Input.dispatchMouseEvent",
             Some(press_params),
             Some(session_id.to_string()),
             deadline,
-            None,
             Some(&mut press_dispatched),
+            &mut dialogs,
             clock,
         )?;
         if press.error.is_some() {
@@ -684,19 +707,24 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         release_params.insert("button".into(), Value::String("left".into()));
         release_params.insert("clickCount".into(), Value::Number(1.into()));
         let mut release_dispatched = || input_dispatched(BrowserInputEvent::Release(position));
-        let release = self.command_response(
+        let release = self.command_response_handling_javascript_dialogs(
             "Input.dispatchMouseEvent",
             Some(release_params),
             Some(session_id.to_string()),
             deadline,
-            None,
             Some(&mut release_dispatched),
+            &mut dialogs,
             clock,
         )?;
         if release.error.is_some() {
             return Err(NavigationDriveError::CdpFailure);
         }
-        Ok(position)
+
+        if dialogs.is_empty() {
+            Ok(BrowserClickOutcome::Clicked(position))
+        } else {
+            Ok(BrowserClickOutcome::JavaScriptDialogDismissed { position, dialogs })
+        }
     }
 
     fn screenshot_with_clock<C: NavigationClock>(
@@ -1067,10 +1095,54 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         params: Option<Map<String, Value>>,
         session_id: Option<String>,
         deadline: Instant,
-        mut tracking: Option<(&str, &mut Tracker)>,
-        mut dispatched: Option<&mut dyn FnMut()>,
+        tracking: Option<(&str, &mut Tracker)>,
+        dispatched: Option<&mut dyn FnMut()>,
         clock: &mut C,
     ) -> Result<CdpResponse, NavigationDriveError> {
+        self.command_response_inner(
+            method, params, session_id, deadline, tracking, dispatched, None, clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn command_response_handling_javascript_dialogs<C: NavigationClock>(
+        &mut self,
+        method: &str,
+        params: Option<Map<String, Value>>,
+        session_id: Option<String>,
+        deadline: Instant,
+        dispatched: Option<&mut dyn FnMut()>,
+        dialogs: &mut Vec<BrowserJavaScriptDialog>,
+        clock: &mut C,
+    ) -> Result<CdpResponse, NavigationDriveError> {
+        self.command_response_inner(
+            method,
+            params,
+            session_id,
+            deadline,
+            None,
+            dispatched,
+            Some(dialogs),
+            clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn command_response_inner<C: NavigationClock>(
+        &mut self,
+        method: &str,
+        params: Option<Map<String, Value>>,
+        session_id: Option<String>,
+        deadline: Instant,
+        mut tracking: Option<(&str, &mut Tracker)>,
+        mut dispatched: Option<&mut dyn FnMut()>,
+        mut handled_dialogs: Option<&mut Vec<BrowserJavaScriptDialog>>,
+        clock: &mut C,
+    ) -> Result<CdpResponse, NavigationDriveError> {
+        if let Some(dialogs) = handled_dialogs.as_deref_mut() {
+            self.dismiss_pending_javascript_dialogs(deadline, dialogs, clock)?;
+        }
+
         let command = self
             .transport
             .issue_command(method, params, session_id, clock.now())
@@ -1088,6 +1160,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
 
         loop {
+            if let Some(response) = self.pending_responses.remove(&command_id) {
+                return Ok(response);
+            }
             if clock.now() >= deadline {
                 return Err(NavigationDriveError::CdpFailure);
             }
@@ -1099,12 +1174,44 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 )?,
                 None => self.read_turn(Some(command_id), None, clock.now())?,
             };
+            if let Some(dialogs) = handled_dialogs.as_deref_mut() {
+                self.dismiss_pending_javascript_dialogs(deadline, dialogs, clock)?;
+            }
             if let Some(response) = response {
                 return Ok(response);
             }
             let remaining = deadline.saturating_duration_since(clock.now());
             clock.sleep(cmp::min(POLL_INTERVAL, remaining));
         }
+    }
+
+    fn dismiss_pending_javascript_dialogs<C: NavigationClock>(
+        &mut self,
+        deadline: Instant,
+        handled: &mut Vec<BrowserJavaScriptDialog>,
+        clock: &mut C,
+    ) -> Result<(), NavigationDriveError> {
+        while let Some(dialog) = self.pending_javascript_dialogs.pop_front() {
+            let mut params = Map::new();
+            params.insert("accept".into(), Value::Bool(false));
+            let response = self.command_response(
+                "Page.handleJavaScriptDialog",
+                Some(params),
+                Some(dialog.session_id),
+                deadline,
+                None,
+                None,
+                clock,
+            )?;
+            if response.error.is_some() {
+                return Err(NavigationDriveError::CdpFailure);
+            }
+            handled.push(BrowserJavaScriptDialog {
+                dialog_type: dialog.dialog_type,
+                response: JavaScriptDialogResponse::Dismissed,
+            });
+        }
+        Ok(())
     }
 
     fn read_turn(
@@ -1133,6 +1240,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .map_err(|_| NavigationDriveError::CdpFailure)?;
                 if Some(response.id) == expected_response_id {
                     matched = Some(response);
+                } else {
+                    self.pending_responses.insert(response.id, response);
                 }
                 continue;
             }
@@ -1142,6 +1251,27 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .accept_event(&frame)
                 .map_err(|_| NavigationDriveError::CdpFailure)?;
             let _ = self.transport.pop_event();
+            if event.method == "Page.javascriptDialogOpening" {
+                if let (Some(attachment), Some(session_id)) =
+                    (self.attachment.as_ref(), event.session_id.as_deref())
+                {
+                    if session_id == attachment.session_id {
+                        let dialog_type = event
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("type"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        self.pending_javascript_dialogs
+                            .push_back(PendingJavaScriptDialog {
+                                session_id: session_id.to_string(),
+                                dialog_type,
+                            });
+                    }
+                }
+            }
             if let Some((context_key, tracker)) = tracking.as_mut() {
                 self.apply_event(context_key, tracker, &event, observed_at);
             }
@@ -2398,13 +2528,14 @@ mod tests {
             json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
             json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"id":7,"sessionId":"session-own","result":{}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
         let mut input_events = Vec::new();
         let mut clock = FakeClock::new();
 
-        let position = driver
+        let outcome = driver
             .click_for_test(
                 "route-own",
                 &identity,
@@ -2414,13 +2545,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            position,
-            BrowserClickPosition {
-                x_css: 22.0,
-                y_css: 36.0,
-            }
-        );
+        let position = BrowserClickPosition {
+            x_css: 22.0,
+            y_css: 36.0,
+        };
+        assert_eq!(outcome, BrowserClickOutcome::Clicked(position));
         assert_eq!(
             input_events,
             vec![
@@ -2429,7 +2558,7 @@ mod tests {
             ]
         );
         let writes = &driver.pipe.writes;
-        assert_eq!(writes.len(), 7);
+        assert_eq!(writes.len(), 8);
         assert_eq!(writes[0]["method"], "DOM.getContentQuads");
         assert_eq!(writes[1]["method"], "DOM.scrollIntoViewIfNeeded");
         assert_eq!(writes[1]["params"]["backendNodeId"], 42);
@@ -2438,10 +2567,11 @@ mod tests {
         assert_eq!(writes[4]["method"], "DOM.getNodeForLocation");
         assert_eq!(writes[4]["params"]["x"], 22);
         assert_eq!(writes[4]["params"]["y"], 36);
-        assert_eq!(writes[5]["method"], "Input.dispatchMouseEvent");
-        assert_eq!(writes[5]["params"]["type"], "mousePressed");
+        assert_eq!(writes[5]["method"], "Page.enable");
         assert_eq!(writes[6]["method"], "Input.dispatchMouseEvent");
-        assert_eq!(writes[6]["params"]["type"], "mouseReleased");
+        assert_eq!(writes[6]["params"]["type"], "mousePressed");
+        assert_eq!(writes[7]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(writes[7]["params"]["type"], "mouseReleased");
     }
 
     #[test]
@@ -2454,12 +2584,13 @@ mod tests {
             json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
             json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"id":7,"sessionId":"session-own","result":{}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
         let mut input_events = Vec::new();
 
-        let position = driver
+        let outcome = driver
             .click_for_test(
                 "route-own",
                 &identity,
@@ -2470,11 +2601,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            position,
-            BrowserClickPosition {
+            outcome,
+            BrowserClickOutcome::Clicked(BrowserClickPosition {
                 x_css: 150.0,
                 y_css: 70.0,
-            }
+            })
         );
         assert_eq!(input_events.len(), 2);
         assert_eq!(
@@ -2482,7 +2613,8 @@ mod tests {
             "DOM.scrollIntoViewIfNeeded"
         );
         assert_eq!(driver.pipe.writes[2]["method"], "DOM.getContentQuads");
-        assert_eq!(driver.pipe.writes[5]["params"]["y"], 70.0);
+        assert_eq!(driver.pipe.writes[5]["method"], "Page.enable");
+        assert_eq!(driver.pipe.writes[6]["params"]["y"], 70.0);
     }
 
     #[test]

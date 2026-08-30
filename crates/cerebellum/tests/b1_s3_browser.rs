@@ -11,9 +11,9 @@ use cerebellum::browser::navigation::{
 use cerebellum::browser::{self, BrowserCapability, BrowserPlane, SnapshotRefusalReason, Tracker};
 use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
-    BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage, ClickDriveError,
-    ClickPointDriveError, LaunchSlot, NavigationDriveError, NavigationWait, OwnedBrowserProcess,
-    ProcessControlFailure, SessionCleanup, ViewportRefusal,
+    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage,
+    ClickDriveError, ClickPointDriveError, LaunchSlot, NavigationDriveError, NavigationWait,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, ViewportRefusal,
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
 use cerebellum::coordinate::{InputRect, ScreenshotPayload, TransformInputs, ViewportObservation};
@@ -314,14 +314,14 @@ impl OwnedBrowserProcess for SnapshotProcess {
         _: &BackendNodeIdentity,
         _: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         let position = BrowserClickPosition {
             x_css: 1.0,
             y_css: 1.0,
         };
         input_dispatched(BrowserInputEvent::Press(position));
         input_dispatched(BrowserInputEvent::Release(position));
-        Ok(position)
+        Ok(BrowserClickOutcome::Clicked(position))
     }
 
     fn click_classified(
@@ -333,7 +333,7 @@ impl OwnedBrowserProcess for SnapshotProcess {
         expected: Option<&cerebellum::classification::NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         assert!(
             expected.is_none(),
             "this fixture represents an unverified target"
@@ -418,7 +418,7 @@ impl OwnedBrowserProcess for ScreenshotProcess {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         self.driver
             .click_point(context_key, position, deadline_ms, input_dispatched)
     }
@@ -457,7 +457,7 @@ impl OwnedBrowserProcess for ClickProcess {
         _: &BackendNodeIdentity,
         _: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         let position = self.result?;
         for event in [
             BrowserInputEvent::Press(position),
@@ -466,7 +466,7 @@ impl OwnedBrowserProcess for ClickProcess {
             self.input_events.lock().unwrap().push(event);
             input_dispatched(event);
         }
-        Ok(position)
+        Ok(BrowserClickOutcome::Clicked(position))
     }
 
     fn click_classified(
@@ -478,7 +478,7 @@ impl OwnedBrowserProcess for ClickProcess {
         expected: Option<&cerebellum::classification::NonTypeClassificationRecord>,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
         assert!(
             expected.is_none(),
             "this fixture represents an unverified target"
@@ -535,6 +535,7 @@ impl RecordingClickPointPipe {
             }}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
         ]
         .into_iter()
         .map(|frame| {
@@ -574,7 +575,149 @@ impl OwnedBrowserProcess for ClickPointProcess {
         position: BrowserClickPosition,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
+        self.driver
+            .click_point(context_key, position, deadline_ms, input_dispatched)
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+struct DialogClickPointPipe {
+    commands: Arc<std::sync::Mutex<Vec<Value>>>,
+    reads: VecDeque<Vec<u8>>,
+    blocked_release_id: Option<u64>,
+}
+
+impl DialogClickPointPipe {
+    fn new(commands: Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
+        Self {
+            commands,
+            reads: VecDeque::new(),
+            blocked_release_id: None,
+        }
+    }
+
+    fn queue(&mut self, frame: Value) {
+        let mut bytes = serde_json::to_vec(&frame).unwrap();
+        bytes.push(0);
+        self.reads.push_back(bytes);
+    }
+}
+
+impl CdpPipeIo for DialogClickPointPipe {
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        self.commands.lock().unwrap().push(command.clone());
+        let id = command["id"].as_u64().unwrap();
+        let method = command["method"].as_str().unwrap();
+        match method {
+            "Target.createTarget" => {
+                self.queue(json!({"id":id,"result":{"targetId":"target-own"}}));
+            }
+            "Target.attachToTarget" => {
+                self.queue(json!({"id":id,"result":{"sessionId":"session-own"}}));
+            }
+            "Page.getLayoutMetrics" => self.queue(json!({
+                "id":id,
+                "sessionId":"session-own",
+                "result":{"cssVisualViewport":{
+                    "offsetX":10.0,
+                    "offsetY":20.0,
+                    "clientWidth":100.0,
+                    "clientHeight":50.0,
+                    "scale":1.0
+                }}
+            })),
+            "Input.dispatchMouseEvent"
+                if command["params"]["type"] == Value::String("mousePressed".into()) =>
+            {
+                self.queue(json!({"id":id,"sessionId":"session-own","result":{}}));
+            }
+            "Input.dispatchMouseEvent" => {
+                self.blocked_release_id = Some(id);
+                self.queue(json!({
+                    "method":"Page.javascriptDialogOpening",
+                    "sessionId":"session-own",
+                    "params":{
+                        "type":"confirm",
+                        "message":"continue?",
+                        "url":"https://requested.example/page",
+                        "hasBrowserHandler":false
+                    }
+                }));
+            }
+            "Page.handleJavaScriptDialog" => {
+                assert_eq!(command["params"]["accept"], false);
+                assert!(command["params"].get("promptText").is_none());
+                let release_id = self
+                    .blocked_release_id
+                    .take()
+                    .expect("the dialog handler follows a blocked release");
+                // Chromium may acknowledge the release before the nested dialog
+                // command. Preserve that response for the outer correlator.
+                self.queue(json!({"id":release_id,"sessionId":"session-own","result":{}}));
+                self.queue(json!({"id":id,"sessionId":"session-own","result":{}}));
+            }
+            "Page.enable" | "Network.enable" | "Page.navigate" => {
+                self.queue(json!({"id":id,"sessionId":"session-own","result":{}}));
+            }
+            other => panic!("unexpected CDP command {other}: {command}"),
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+        let Some(bytes) = self.reads.pop_front() else {
+            return Ok(PipeRead::WouldBlock);
+        };
+        destination[..bytes.len()].copy_from_slice(&bytes);
+        Ok(PipeRead::Bytes(bytes.len()))
+    }
+}
+
+struct DialogClickPointProcess {
+    driver: CdpNavigationDriver<DialogClickPointPipe>,
+}
+
+impl OwnedBrowserProcess for DialogClickPointProcess {
+    fn navigate(
+        &mut self,
+        context_key: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline_ms: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver
+            .navigate(context_key, url, wait, deadline_ms, tracker)
+    }
+
+    fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         self.driver
             .click_point(context_key, position, deadline_ms, input_dispatched)
     }
@@ -611,7 +754,7 @@ impl OwnedBrowserProcess for RefusingClickPointProcess {
         _: BrowserClickPosition,
         _: u64,
         _: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickPosition, ClickPointDriveError> {
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         Err(ClickPointDriveError::OutsideViewport(self.refusal))
     }
 
@@ -640,6 +783,18 @@ fn click_point_process(commands: Arc<std::sync::Mutex<Vec<Value>>>) -> ClickPoin
     ClickPointProcess {
         driver: CdpNavigationDriver::new(
             RecordingClickPointPipe::new(commands),
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        ),
+    }
+}
+
+fn dialog_click_point_process(
+    commands: Arc<std::sync::Mutex<Vec<Value>>>,
+) -> DialogClickPointProcess {
+    DialogClickPointProcess {
+        driver: CdpNavigationDriver::new(
+            DialogClickPointPipe::new(commands),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
         ),
@@ -681,6 +836,7 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         json!({"id":8,"sessionId":"session-own","result":metrics}),
         json!({"id":9,"sessionId":"session-own","result":{}}),
         json!({"id":10,"sessionId":"session-own","result":{}}),
+        json!({"id":11,"sessionId":"session-own","result":{}}),
     ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
@@ -799,22 +955,110 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
             "Target.createTarget",
             "Target.attachToTarget",
             "Page.getLayoutMetrics",
+            "Page.enable",
             "Input.dispatchMouseEvent",
             "Input.dispatchMouseEvent",
         ]
     );
-    assert_eq!(commands[3]["params"]["type"], "mousePressed");
-    assert_eq!(commands[3]["params"]["x"], 60.0);
-    assert_eq!(commands[3]["params"]["y"], 45.0);
-    assert_eq!(commands[4]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[4]["params"]["type"], "mousePressed");
     assert_eq!(commands[4]["params"]["x"], 60.0);
     assert_eq!(commands[4]["params"]["y"], 45.0);
+    assert_eq!(commands[5]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[5]["params"]["x"], 60.0);
+    assert_eq!(commands[5]["params"]["y"], 45.0);
     assert_eq!(
         plane
             .snapshot_pin_count_for_test(&route, &snapshot_id)
             .await,
         0,
         "the successful coordinate click leaked its screenshot pin"
+    );
+}
+
+#[tokio::test]
+async fn a_confirming_click_is_dismissed_reported_journaled_and_leaves_the_session_usable() {
+    let route = identity();
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plane = plane_with_process(
+        &route,
+        Box::new(dialog_click_point_process(Arc::clone(&commands))),
+        1_000,
+    )
+    .with_in_memory_journal(cerebellum::journal::JournalConfig {
+        journal_retention_bytes: 1_000_000,
+        journal_max_entry_bytes: 100_000,
+    });
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+    let snapshot_id = retain_click_point_snapshot(&plane, &route).await;
+
+    let click = plane
+        .dispatch(
+            &route,
+            BrowserCapability::ClickPoint,
+            &click_point_arguments(&snapshot_id),
+        )
+        .await;
+
+    assert_eq!(click["outcome"], "javascript_dialog_dismissed", "{click}");
+    assert_eq!(click["dialogs"][0]["dialog_type"], "confirm", "{click}");
+    assert_eq!(click["dialogs"][0]["response"], "dismissed", "{click}");
+
+    let navigation = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/after-dialog",
+                "intent": "prove the same browser session remains usable",
+                "wait": "none",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await;
+    assert_eq!(navigation["outcome"], "ok", "{navigation}");
+
+    let commands = commands.lock().unwrap().clone();
+    let methods = commands
+        .iter()
+        .map(|command| command["method"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let page_enable = methods
+        .iter()
+        .position(|method| *method == "Page.enable")
+        .unwrap();
+    let first_input = methods
+        .iter()
+        .position(|method| *method == "Input.dispatchMouseEvent")
+        .unwrap();
+    assert!(
+        page_enable < first_input,
+        "dialog events were armed too late: {methods:?}"
+    );
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| **method == "Page.handleJavaScriptDialog")
+            .count(),
+        1,
+        "the confirm was not answered exactly once: {methods:?}"
+    );
+
+    let export = plane.journal_export_for_test().await;
+    let click_record = export
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| entry["capability"] == "browser.click_point")
+        .unwrap_or_else(|| panic!("the click record is missing from the journal: {export}"));
+    assert_eq!(click_record["outcome"], "success", "{click_record}");
+    assert_eq!(
+        click_record["detail"]["outcome"], "javascript_dialog_dismissed",
+        "{click_record}"
+    );
+    assert_eq!(
+        click_record["detail"]["dialogs"][0],
+        json!({"dialog_type":"confirm","response":"dismissed"}),
+        "{click_record}"
     );
 }
 
