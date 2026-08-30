@@ -101,6 +101,26 @@ fn activation_target_derivation_covers_composed_descendants_labels_and_disabled_
             .with_composed_ancestor(submit),
     )
     .unwrap();
+    // The exact target, not merely a different one. A derivation that picked the
+    // wrong ancestor -- the form owner rather than the composed submit control --
+    // satisfies assert_ne and is wrong, and this classifier decides whether a
+    // click counts as submitting a form, so WHICH control it resolves to is the
+    // whole question.
+    //
+    // The expectation comes from classifying a click on the submit control
+    // itself rather than from recomputing the fingerprint here: a test that
+    // derives its expected value with the code under test agrees with that code
+    // by construction, including when both are wrong.
+    let direct = classify_click(&NonTypeClassificationInput::new(
+        2,
+        ElementClassificationInput::new(identity(10), TargetKind::Button).form_owner(identity(11)),
+        "https://example.test",
+    ))
+    .unwrap();
+    assert_eq!(
+        record.activation_target_identity, direct.node_identity,
+        "a click on a descendant must resolve to the same control a direct click addresses"
+    );
     assert_ne!(record.node_identity, record.activation_target_identity);
     assert!(record.activation_invokes_form_submit);
 
