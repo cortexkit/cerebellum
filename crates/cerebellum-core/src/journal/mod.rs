@@ -15,6 +15,7 @@ use crate::identity::SessionKind;
 pub mod codec;
 pub mod late_events;
 pub mod redaction;
+pub mod refusal_ring;
 pub mod recovery {
     pub use super::{CoreRecoveryOutcome, RecoveryAction, RecoveryClassification, TerminalKind};
 }
@@ -44,6 +45,10 @@ pub use late_events::{
     LateEventQueue, LateEventSequence,
 };
 pub use redaction::{redact_then_truncate, RedactionUnavailable, Redactor};
+pub use refusal_ring::{
+    CallerRefusalHistory, RefusalRecord, RefusalRing, RefusalRingConfig, RefusalRingError,
+    RefusalRingState,
+};
 pub use severity::{
     taxonomy_digest, EffectClass, IsolationClass, ObservabilityClass, SeverityInputs,
     SeverityRecord, SeverityTaxonomy, TaxonomyError, ValidatedSeverityTaxonomy,

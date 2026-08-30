@@ -8,7 +8,7 @@ use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity};
 use cerebellum::browser::navigation::{
     BrowserScreenshotObservation, BrowserSnapshotObservation, CdpNavigationDriver,
 };
-use cerebellum::browser::{self, BrowserCapability, BrowserPlane, Tracker};
+use cerebellum::browser::{self, BrowserCapability, BrowserPlane, SnapshotRefusalReason, Tracker};
 use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
     BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage, ClickDriveError,
@@ -2079,6 +2079,110 @@ async fn the_journal_lifecycle_runs_and_separates_a_read_from_a_navigation() {
         "a navigate with one read now writes {records} journal records, up from the \
          two measured when this was written; the per-call cost has grown"
     );
+}
+
+/// A snapshot authorization denial is recorded without reading its target.
+#[tokio::test]
+async fn a_refusal_records_only_claimed_addressing_and_typed_reason() {
+    const SECRET: &str = "private-page-secret-7be680b9";
+
+    let route = identity();
+    let observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "heading".into(),
+        name: SECRET.into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    let plane = plane_with_process(
+        &route,
+        Box::new(OffOriginRedirectProcess { observation }),
+        1_000,
+    )
+    .with_in_memory_journal(cerebellum::journal::JournalConfig {
+        journal_retention_bytes: 1_000_000,
+        journal_max_entry_bytes: 100_000,
+    });
+    plane.open_context(route.clone()).await.unwrap();
+
+    let result = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Navigate,
+            &json!({
+                "url": "https://requested.example/",
+                "intent": "drive a refused read into its separate audit ring",
+                "wait": "settle",
+                "severity": {"tier": 2, "credential": false, "financial": false},
+                "read_page": true
+            }),
+        )
+        .await;
+    assert_eq!(result["outcome"], "ok", "{result}");
+    assert_eq!(
+        result["read_page"]["outcome"], "authorization_denied",
+        "{result}"
+    );
+
+    let history = plane
+        .refusal_history_for_test(&route.agent_project_id)
+        .await
+        .expect("the refusing module records its decision");
+    assert_eq!(history.total_count, 1);
+    assert_eq!(history.evicted_count, 0);
+    assert!(!history.trimmed);
+    assert_eq!(history.records.len(), 1);
+    assert_eq!(
+        history.records[0].claimed_addressing,
+        "https://attacker.example/landed"
+    );
+    assert_eq!(
+        history.records[0].reason,
+        SnapshotRefusalReason::OriginScope
+    );
+
+    let journal = plane.journal_export_for_test().await;
+    assert!(journal.contains("\"capability\":\"browser.navigate\""));
+    assert!(
+        !journal.contains("\"capability\":\"browser.snapshot\""),
+        "a refusal entered the untrimmable actuation journal: {journal}"
+    );
+
+    let serialized = plane.refusal_ring_export_for_test().await;
+    let planted = format!(
+        "{{\"bytes\":\"{}\"}}",
+        cerebellum_core::serde_base64::encode(SECRET.as_bytes())
+    );
+    assert!(
+        base64_decoded_strings(&planted)
+            .iter()
+            .any(|text| text.contains(SECRET)),
+        "the scanner cannot find a planted secret, so an absence would prove nothing"
+    );
+    assert!(
+        !serialized.contains(SECRET),
+        "target content appears verbatim in the refusal ring: {serialized}"
+    );
+    assert!(
+        !base64_decoded_strings(&serialized)
+            .iter()
+            .any(|text| text.contains(SECRET)),
+        "target content appears in an encoded refusal-ring field: {serialized}"
+    );
+}
+
+/// Decode every base64-looking serialized token that contains UTF-8 text.
+fn base64_decoded_strings(text: &str) -> Vec<String> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric()
+            || character == '+'
+            || character == '/'
+            || character == '=')
+    })
+    .filter(|token| token.len() >= 8)
+    .filter_map(|token| cerebellum_core::serde_base64::decode(token).ok())
+    .filter_map(|bytes| String::from_utf8(bytes).ok())
+    .collect()
 }
 
 /// A refused read never reaches the journal, because authorization precedes
