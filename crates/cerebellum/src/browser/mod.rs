@@ -797,17 +797,6 @@ impl BrowserPlane {
             .map_or(0, |store| store.active_reserved_bytes())
     }
 
-    /// Whether this plane will write audit records at all.
-    ///
-    /// Asserted against the PRODUCTION constructor rather than a fixture: every
-    /// audit call sits behind this, so a plane without it runs the whole
-    /// lifecycle as no-ops while a fixture-installed journal makes the suite
-    /// pass. The mechanism being correct and the mechanism being reached are
-    /// different claims.
-    pub async fn journal_is_installed_for_test(&self) -> bool {
-        self.journal_mode.is_enabled()
-    }
-
     /// Dispatches this plane committed and never closed out.
     ///
     /// Zero is the property crash coverage needs and neither the export nor the
