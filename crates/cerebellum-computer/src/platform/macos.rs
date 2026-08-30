@@ -1093,8 +1093,16 @@ mod tests {
             declaration.suppression_reason
         );
 
-        // The same context plus accessibility advertises, so the refusal above
-        // is the accessibility check and not some unrelated gate.
+        // The same context plus accessibility clears the PERMISSION refusal, so
+        // the one above is the accessibility check and not some unrelated gate.
+        //
+        // It does not advertise even then, and that is correct rather than a
+        // second bug: move has no semantic action, the per-process path does not
+        // carry pointer events, and global posting is unbuilt -- so nothing can
+        // deliver it. Asserting advertisement here would demand that a row with
+        // no working path be offered to callers, which is what this module now
+        // refuses on purpose. The discriminating check is that the REASON
+        // changes: permissions stop being what withholds it.
         let with_accessibility = PermissionLivenessReport::from_results(vec![
             PermissionProbeResult {
                 service: PermissionService::InputMonitoring,
@@ -1121,9 +1129,17 @@ mod tests {
             },
         );
         assert!(
-            declaration.advertised,
-            "computer.move stayed withheld with both grants: {:?}",
+            !declaration
+                .suppression_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permission"),
+            "granting accessibility must clear the permission refusal, but the reason is {:?}",
             declaration.suppression_reason
+        );
+        assert!(
+            !declaration.advertised,
+            "computer.move has no deliverable path, so no permission grant should advertise it"
         );
     }
 
