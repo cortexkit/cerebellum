@@ -486,8 +486,15 @@ pub fn journal_identity(identity: &RouteIdentity) -> JournalIdentity {
     }
 }
 
-pub fn journal_action(capability: JournalCapability) -> JournalAction {
-    match capability {
+/// The action a dispatch performed, or None for an observation.
+///
+/// Observations return None rather than a placeholder: a snapshot performs no
+/// navigation, and naming one would put a page load in the record of a read.
+/// What a read is worth recording -- which page, when, under whose grant -- is
+/// carried by the capability and identity beside this, not by an invented
+/// action.
+pub fn journal_action(capability: JournalCapability) -> Option<JournalAction> {
+    Some(match capability {
         JournalCapability::Navigate => JournalAction::Navigate {
             url_redacted: "https://redacted.invalid".to_string(),
             wait: journal::NavigateWait::None,
@@ -507,7 +514,10 @@ pub fn journal_action(capability: JournalCapability) -> JournalAction {
             text_bytes_utf8: 0,
             replace: false,
         },
-    }
+        JournalCapability::Snapshot
+        | JournalCapability::Screenshot
+        | JournalCapability::WaitFor => return None,
+    })
 }
 
 pub fn rejection_material(outcome: Outcome, detail: Value) -> RejectionMaterial {
@@ -2570,14 +2580,21 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::ImageTooLarge { .. } => Outcome::InternalError,
     }
 }
+/// One journal capability per browser capability, with no collapsing.
+///
+/// The three observations used to fold onto Navigate, so a read of a page in a
+/// durable profile persisted as a page load. That is worse than not recording
+/// it: an absent entry is honest about being absent, and a wrong one is read as
+/// authoritative -- permanently, since the journal directory is enrolled for
+/// fleet backup.
 fn journal_capability(capability: BrowserCapability) -> JournalCapability {
     match capability {
         BrowserCapability::Navigate => JournalCapability::Navigate,
         BrowserCapability::Click => JournalCapability::Click,
         BrowserCapability::ClickPoint => JournalCapability::ClickPoint,
-        BrowserCapability::Snapshot => JournalCapability::Navigate,
-        BrowserCapability::Screenshot => JournalCapability::Navigate,
-        BrowserCapability::WaitFor => JournalCapability::Navigate,
+        BrowserCapability::Snapshot => JournalCapability::Snapshot,
+        BrowserCapability::Screenshot => JournalCapability::Screenshot,
+        BrowserCapability::WaitFor => JournalCapability::WaitFor,
     }
 }
 fn map_journal_error(error: JournalError) -> BrowserError {
