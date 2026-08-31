@@ -972,11 +972,40 @@ pub enum ContainmentForfeitureReason {
     FrontingUnavailable,
 }
 
+impl ContainmentForfeitureReason {
+    /// The stable wire spelling. Callers branch on these, so they are written
+    /// out rather than derived from the variant name -- a rename should be a
+    /// deliberate wire change rather than a side effect of tidying an enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CoordinateAddressed => "coordinate_addressed",
+            Self::NonStructuralDelivery => "non_structural_delivery",
+            Self::IdentityUnavailable => "identity_unavailable",
+            Self::IdentityStale => "identity_stale",
+            Self::IdentityIndeterminate => "identity_indeterminate",
+            Self::IdentityInadequate => "identity_inadequate",
+            Self::IdentityBoundExceeded => "identity_bound_exceeded",
+            Self::FrontingDowngradeDetected => "fronting_downgrade_detected",
+            Self::FrontingIndeterminate => "fronting_indeterminate",
+            Self::FrontingBoundExceeded => "fronting_bound_exceeded",
+            Self::FrontingUnavailable => "fronting_unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainmentFinalization {
     /// `Some` is required for every input row and `None` is required for every
     /// non-input row.
     pub containment_rung: Option<ContainmentRung>,
+    /// Whether the target was verifiably fronted across the dispatch bracket.
+    ///
+    /// Its own fact rather than a containment input. False here does not mean
+    /// the action escaped its process -- per-pid delivery cannot -- it means the
+    /// window that received the input inside that process is not pinned down.
+    /// Recording it separately is what lets an auditor read "delivered per-pid,
+    /// target not fronted" without either half being implied by the other.
+    pub fronting_stable: bool,
     pub input_action: bool,
     pub dispatch_permitted: bool,
     pub forfeiture_reason: Option<ContainmentForfeitureReason>,
@@ -1038,6 +1067,7 @@ pub fn finalize_containment(
     if !evidence.input_action || evidence.action_kind == ActionKind::Observe {
         return Ok(ContainmentFinalization {
             containment_rung: None,
+            fronting_stable: false,
             input_action: false,
             dispatch_permitted: true,
             forfeiture_reason: None,
@@ -1071,9 +1101,14 @@ pub fn finalize_containment(
         } else {
             ContainmentForfeitureReason::NonStructuralDelivery
         };
+        let fronting_stable = evidence
+            .fronting
+            .as_ref()
+            .is_some_and(FrontingComparisonEvidence::unchanged);
         if evidence.global_none_authorized {
             return Ok(ContainmentFinalization {
                 containment_rung: Some(ContainmentRung::GlobalNone),
+                fronting_stable,
                 input_action: true,
                 dispatch_permitted: true,
                 forfeiture_reason: Some(forfeiture_reason),
@@ -1149,67 +1184,68 @@ pub fn finalize_containment(
         }
     };
 
-    let structural_fronting_ok = match evidence.fronting.as_ref() {
-        Some(fronting) if fronting.comparison == FrontingComparison::Unchanged => {
-            if fronting.unchanged() {
-                true
-            } else {
+    // Fronting is measured and RECORDED, never charged against containment.
+    //
+    // `unchanged()` is a composite judgement -- comparison unchanged, no
+    // reasons raised, and the measured bracket inside its bound -- so keeping it
+    // as a stored fact saves every reader recomputing it, and saves them
+    // disagreeing about it.
+    //
+    // Absent evidence records as not-stable rather than as unknown, which is the
+    // conservative reading of a fact and costs nothing now that it cannot lower
+    // a rung. What it must never become again is a forfeiture: see below.
+    let fronting_stable = evidence
+        .fronting
+        .as_ref()
+        .is_some_and(FrontingComparisonEvidence::unchanged);
+
+    // Fronting does NOT gate a structural rung, deliberately.
+    //
+    // The rung claims containment TO a process. Per-pid delivery guarantees that
+    // by mechanism: the events are posted to a pid and cannot arrive anywhere
+    // else, whatever holds focus. Semantic actuation likewise invokes a named
+    // element through the accessibility API rather than through whatever is
+    // frontmost.
+    //
+    // Requiring fronting here was a rule written for GLOBAL dispatch, where
+    // fronting verification IS the containment argument because events go to
+    // whoever holds focus. Applied to the modes that exist to make fronting
+    // irrelevant it inverts: it penalised exactly the case per-pid was built
+    // for, and reported global_none -- "this action was uncontained" -- for an
+    // action measured not to steal focus. That is an untrue statement about
+    // mechanism used to express a true concern about visibility.
+    //
+    // The concern is real and keeps an honest home: fronting is recorded as its
+    // own fact on this finalization, so a caller and an auditor can both see
+    // "delivered per-pid, target not fronted". What fronting genuinely bears on
+    // is precision WITHIN the process -- which window received a keystroke --
+    // and that is not what the rung asserts.
+    let structural_rung = if !evidence.coordinate_addressed && structural_identity_ok {
+        match evidence.delivery_primitive {
+            DeliveryPrimitive::SemanticAccessibility => Some(ContainmentRung::SemanticElement),
+            DeliveryPrimitive::PerPidSynthetic => Some(ContainmentRung::PidStructural),
+            DeliveryPrimitive::GlobalSynthetic | DeliveryPrimitive::None => {
                 set_forfeiture_reason(
                     &mut forfeiture_reason,
-                    ContainmentForfeitureReason::FrontingBoundExceeded,
+                    ContainmentForfeitureReason::NonStructuralDelivery,
                 );
-                false
+                None
             }
         }
-        Some(fronting) if fronting.comparison == FrontingComparison::DowngradeDetected => {
-            set_forfeiture_reason(
-                &mut forfeiture_reason,
-                ContainmentForfeitureReason::FrontingDowngradeDetected,
-            );
-            false
-        }
-        Some(_) => {
-            set_forfeiture_reason(
-                &mut forfeiture_reason,
-                ContainmentForfeitureReason::FrontingIndeterminate,
-            );
-            false
-        }
-        None => {
-            set_forfeiture_reason(
-                &mut forfeiture_reason,
-                ContainmentForfeitureReason::FrontingUnavailable,
-            );
-            false
-        }
+    } else if evidence.coordinate_addressed {
+        set_forfeiture_reason(
+            &mut forfeiture_reason,
+            ContainmentForfeitureReason::CoordinateAddressed,
+        );
+        None
+    } else {
+        None
     };
-
-    let structural_rung =
-        if !evidence.coordinate_addressed && structural_identity_ok && structural_fronting_ok {
-            match evidence.delivery_primitive {
-                DeliveryPrimitive::SemanticAccessibility => Some(ContainmentRung::SemanticElement),
-                DeliveryPrimitive::PerPidSynthetic => Some(ContainmentRung::PidStructural),
-                DeliveryPrimitive::GlobalSynthetic | DeliveryPrimitive::None => {
-                    set_forfeiture_reason(
-                        &mut forfeiture_reason,
-                        ContainmentForfeitureReason::NonStructuralDelivery,
-                    );
-                    None
-                }
-            }
-        } else if evidence.coordinate_addressed {
-            set_forfeiture_reason(
-                &mut forfeiture_reason,
-                ContainmentForfeitureReason::CoordinateAddressed,
-            );
-            None
-        } else {
-            None
-        };
 
     if let Some(rung) = structural_rung {
         return Ok(ContainmentFinalization {
             containment_rung: Some(rung),
+            fronting_stable,
             input_action: true,
             dispatch_permitted: true,
             forfeiture_reason: None,
@@ -1222,6 +1258,7 @@ pub fn finalize_containment(
     if evidence.global_none_authorized {
         Ok(ContainmentFinalization {
             containment_rung: Some(ContainmentRung::GlobalNone),
+            fronting_stable,
             input_action: true,
             dispatch_permitted: true,
             forfeiture_reason,

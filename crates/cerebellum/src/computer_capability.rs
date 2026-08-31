@@ -1275,6 +1275,18 @@ where
                 let Some(containment_rung) = report.containment.rung() else {
                     return synthetic_dispatch_refusal(&DispatchError::AuditUnavailable);
                 };
+                // NOTE: the forfeiture reason and the fronting fact are both
+                // computed and both withheld here, deliberately.
+                //
+                // Four situations reduce to global_none -- coordinate
+                // addressing, non-structural delivery, unusable identity
+                // evidence, an unauthorised global post -- and a caller's next
+                // move differs for each, so collapsing them into one word is
+                // the defect this surface removes everywhere else. Surfacing
+                // them needs a vocabulary revision declaring both fields, since
+                // result_schema is frozen and the conformance checker refuses
+                // undeclared keys. That revision is its own deliberate change
+                // with three digest mirrors, not a rider on this one.
                 json!({
                     "outcome": "completed",
                     "containment_rung": DispatchContainmentRung::as_str(containment_rung),
