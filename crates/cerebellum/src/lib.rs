@@ -3020,7 +3020,14 @@ mod tests {
                 "{name} is dispatchable but unadvertised"
             );
         }
-        assert!(!dispatchable.contains(browser::CLICK_POINT));
+        // click_point is admitted: its mapping is verified against a live
+        // browser, which is what it was held back for. A page click listener
+        // recorded (600,476) css where the module's mapping predicts 476.75 --
+        // page truncation against probe rounding, not a mapping error, and a
+        // scale error would have shown as a factor rather than a fraction.
+        assert!(dispatchable.contains(browser::CLICK_POINT));
+        // browser.type stays out on the credential-surface policy, which no
+        // measurement changes.
         assert!(!dispatchable.contains("browser.type"));
     }
 

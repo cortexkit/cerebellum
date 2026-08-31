@@ -952,8 +952,9 @@ mod tests {
         // be wrong about a corpus it never consults.
         assert_eq!(
             tools.len(),
-            5,
-            "three controls, navigate, and the extraction-free capture"
+            6,
+            "three controls, navigate, the extraction-free capture, and the \
+             coordinate click whose mapping is verified against a live browser"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
 
@@ -968,8 +969,9 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            7,
-            "three controls, navigate, screenshot, snapshot, and click"
+            8,
+            "three controls, navigate, screenshot, snapshot, click, and the \
+             coordinate click"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
         let serialized = serialize_with_browser_plane_pins(

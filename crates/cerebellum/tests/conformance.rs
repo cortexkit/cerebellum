@@ -881,6 +881,7 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "browser.snapshot",
         "browser.click",
         "browser.screenshot",
+        "browser.click_point",
     ] {
         assert!(
             registered.contains(&expected),
@@ -890,24 +891,27 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
 
     // These two are intentionally absent rather than accidentally omitted.
     // browser.type refuses any target it classifies as credential- or
-    // payment-bearing, and it has no dispatch route at all; browser.click_point
-    // has never been exercised over the wire. Registering either would advertise
-    // a capability that answers unknown_method, which is worse than not offering
-    // it, because the caller was told otherwise.
-    for withheld in ["browser.type", "browser.click_point"] {
-        assert!(
-            !registered.contains(&withheld),
-            "the daemon's catalogue offers {withheld}, which has no dispatch route: {registered:?}"
-        );
-    }
+    // payment-bearing and has no dispatch route at all. Registering it would
+    // advertise a capability that answers unknown_method, which is worse than
+    // not offering it, because the caller was told otherwise.
+    //
+    // browser.click_point left this list once its mapping was verified against
+    // a live browser: a page listener recorded (600,476) css where the module
+    // predicts 476.75. It is asserted as REGISTERED below rather than dropped
+    // from the test, so its admission is pinned rather than merely permitted.
+    let withheld = "browser.type";
+    assert!(
+        !registered.contains(&withheld),
+        "the daemon's catalogue offers {withheld}, which has no dispatch route: {registered:?}"
+    );
 
     // The sibling test asserts this catalogue carries exactly one tool when no
     // browser is configured. Asserting the count here too is what makes the two
     // tests measure a DIFFERENCE rather than each measuring its own world.
     assert_eq!(
         registered.len(),
-        8,
-        "expected the seven browser tools plus computer.wait: {registered:?}"
+        9,
+        "expected the eight browser tools plus computer.wait: {registered:?}"
     );
 
     // Close the client before the daemon and module guards are dropped so the

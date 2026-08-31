@@ -354,11 +354,16 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
             "browser.navigate",
             "browser.snapshot",
             "browser.click",
-            // Admitted after being driven through this wire path against
-            // Chrome 151, THROUGH its authorization gate. click_point stays
-            // out: it addresses a retained screenshot and has never been
-            // driven against one this module captured.
+            // Both admitted after being driven through this wire path against
+            // Chrome 151, THROUGH their authorization gates.
             "browser.screenshot",
+            // click_point addresses a retained screenshot, so its risk is the
+            // pixel-to-css mapping rather than the dispatch: a click that lands
+            // somewhere plausible is worse than one that fails, because nothing
+            // reports it. A page listener recorded (600,476) css where the
+            // mapping predicts 476.75 -- truncation against rounding. A scale
+            // error, the failure this guards, would have shown as a factor.
+            "browser.click_point",
         ]
         .map(str::to_string)
     );
@@ -425,11 +430,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     // Implemented and deliberately not admitted. These are NOT unknown: naming
     // them that way tells a caller to stop asking for something we built and
     // withheld on purpose, and invites a bug report for a decision.
-    for (corr, unavailable) in [
-        (13, "browser.click_point"),
-        (16, "browser.wait_for"),
-        (17, "browser.type"),
-    ] {
+    for (corr, unavailable) in [(16, "browser.wait_for"), (17, "browser.type")] {
         let refused = invoke(&planes, corr, unavailable, json!({})).await;
         let refused: Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
