@@ -56,11 +56,15 @@ impl Shared {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectIndeterminate,
                 unreadable_subtrees: 0,
+                delivery_posts_returned: 1,
+                delivery_generation_verifications: 2,
             }),
             global: Ok(DispatchResult {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectIndeterminate,
                 unreadable_subtrees: 0,
+                delivery_posts_returned: 0,
+                delivery_generation_verifications: 0,
             }),
         }))
     }
@@ -252,9 +256,10 @@ fn drag_request() -> Value {
     json!({"from": "1,2", "to": "3.5,4", "button": "left", "modifiers": []})
 }
 
-/// Typing reaches the leased process generation as the exact text requested.
+/// Typing reaches the target's leased process generation and reports structural
+/// containment even when the target process is not frontmost.
 #[tokio::test]
-async fn computer_type_dispatches_its_text_events_to_the_leased_process() {
+async fn computer_type_reports_pid_structural_for_an_unfocused_target() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
@@ -267,13 +272,7 @@ async fn computer_type_dispatches_its_text_events_to_the_leased_process() {
         reply,
         json!({
             "outcome": "completed",
-            "containment_rung": "global_none",
-            // Named, not merely present. This fixture supplies no identity
-            // evidence, so the forfeit is on IDENTITY -- an assertion that some
-            // reason exists would pass whatever the cause, which is how a
-            // fronting forfeit stayed invisible here while production reported
-            // one on every unfocused dispatch.
-            "containment_forfeited_because": "identity_unavailable",
+            "containment_rung": "pid_structural",
             "target_fronted": false,
             "effect_status": "effect_indeterminate",
         })

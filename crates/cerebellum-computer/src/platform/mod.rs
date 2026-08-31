@@ -877,6 +877,26 @@ pub struct DispatchResult {
     pub effect_status: EffectStatus,
     /// Subtrees omitted from the fresh accessibility tree used for this dispatch.
     pub unreadable_subtrees: u64,
+    /// Number of post calls that returned successfully from the delivery transport.
+    #[serde(default)]
+    pub delivery_posts_returned: u64,
+    /// Number of target-generation checks that passed during delivery.
+    /// Per-pid routing expects two checks for each returned post.
+    #[serde(default)]
+    pub delivery_generation_verifications: u64,
+}
+
+impl DispatchResult {
+    /// Classify the binding as atomic only when every returned post has both
+    /// target-generation checks; any other ratio is non-atomic.
+    pub fn identity_to_delivery_binding(&self) -> containment::IdentityAtomicBinding {
+        match self.delivery_posts_returned.checked_mul(2) {
+            Some(expected) if expected == self.delivery_generation_verifications => {
+                containment::IdentityAtomicBinding::Atomic
+            }
+            _ => containment::IdentityAtomicBinding::NonAtomic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

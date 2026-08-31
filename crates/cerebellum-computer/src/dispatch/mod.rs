@@ -27,7 +27,8 @@ use crate::grounding::ContainmentRung;
 use crate::platform::containment::{
     finalize_containment, ContainmentEvidence, ContainmentFinalization, ContainmentRefusal,
     ContainmentRung as FinalizedContainmentRung, DeliveryPrimitive, FrontingComparisonEvidence,
-    IdentityCheckEvidence, IdentityVerificationStatus,
+    IdentityCheckEvidence, IdentityDiscriminationRequirement, IdentityVerificationStatus,
+    ProcessExitWatcherHint, ProcessIdentityEvidence, ProcessIdentityPrimitive,
 };
 use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
@@ -200,11 +201,6 @@ impl DispatchRequest {
             target: self.target.clone(),
             action,
         });
-        self
-    }
-
-    pub fn with_identity(mut self, identity: IdentityCheckEvidence) -> Self {
-        self.identity = Some(identity);
         self
     }
 
@@ -607,11 +603,19 @@ impl<D: PlatformDriver> Dispatcher<D> {
             None
         };
 
+        let identity = if delivery_primitive == DeliveryPrimitive::PerPidSynthetic {
+            Some(Self::per_pid_delivery_identity(
+                &request.target,
+                &platform_result,
+            ))
+        } else {
+            request.identity
+        };
         let containment = Self::finalize_delivery_containment(
             request.row.action_kind,
             delivery_primitive,
             request.row.coordinate_addressed,
-            request.identity,
+            identity,
             fronting.clone(),
             request.row.global_none_authorized,
         )?;
@@ -628,6 +632,38 @@ impl<D: PlatformDriver> Dispatcher<D> {
             fronting,
             focus,
         })
+    }
+
+    fn per_pid_delivery_identity(
+        target: &ProcessGrant,
+        result: &PlatformDispatchResult,
+    ) -> IdentityCheckEvidence {
+        let identity_to_delivery_binding = result.identity_to_delivery_binding();
+        let primitive = ProcessIdentityPrimitive::pinned_v1()
+            .with_identity_to_delivery_binding(identity_to_delivery_binding);
+        let evidence =
+            ProcessIdentityEvidence::kernel_vouched(target.process_generation_evidence.clone());
+        let requirement = IdentityDiscriminationRequirement::GenerationDiscriminating;
+        let verification_succeeded = result.delivery_generation_verifications > 0;
+
+        IdentityCheckEvidence {
+            status: if verification_succeeded {
+                IdentityVerificationStatus::Matched
+            } else {
+                IdentityVerificationStatus::Unavailable
+            },
+            grant_tuple_matches: verification_succeeded.then_some(true),
+            compatibility: primitive.compatibility(requirement, &evidence),
+            primitive_kind: primitive.evidence_kind,
+            declared_discrimination: primitive.declared_discrimination,
+            identity_discrimination_requirement: requirement,
+            check_time_ms: None,
+            dispatch_time_ms: None,
+            measured_check_to_dispatch_interval_ms: None,
+            maximum_identity_check_to_dispatch_interval_ms: None,
+            identity_to_delivery_binding,
+            process_exit_watcher_hint: ProcessExitWatcherHint::Unavailable,
+        }
     }
 
     fn finalize_delivery_containment(
