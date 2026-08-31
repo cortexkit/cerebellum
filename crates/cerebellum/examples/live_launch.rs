@@ -309,10 +309,17 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
             let landed = content
                 .split("point ")
                 .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .unwrap_or("")
-                .trim_end_matches(|c: char| !c.is_ascii_digit())
-                .to_string();
+                .map(|rest| {
+                    // Take only the coordinate itself. The page text is
+                    // followed by snapshot JSON with no separating space, so
+                    // splitting on whitespace swallows the next field and the
+                    // parse below then fails -- which is honest, but it reports
+                    // a broken reading as a failed mapping.
+                    rest.chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
             println!(
                 "[{label}] CLICK_POINT: asked ({x_px},{y_px})px, expected css \
                  ({expected_x:.0},{expected_y:.0}), page recorded ({landed})"
