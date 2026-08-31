@@ -890,6 +890,17 @@ impl DispatchResult {
     /// Classify the binding as atomic only when every returned post has both
     /// target-generation checks; any other ratio is non-atomic.
     pub fn identity_to_delivery_binding(&self) -> containment::IdentityAtomicBinding {
+        // A delivery that posted nothing has nothing to bind identity TO.
+        //
+        // Zero posts and zero checks satisfy the ratio below arithmetically,
+        // so without this an empty delivery would earn the strongest binding
+        // for having done nothing -- and `computer.type` accepts an empty
+        // string, so that is reachable rather than theoretical. The ratio is
+        // the right test for a delivery that happened; it says nothing about
+        // one that did not.
+        if self.delivery_posts_returned == 0 {
+            return containment::IdentityAtomicBinding::NonAtomic;
+        }
         match self.delivery_posts_returned.checked_mul(2) {
             Some(expected) if expected == self.delivery_generation_verifications => {
                 containment::IdentityAtomicBinding::Atomic

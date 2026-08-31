@@ -757,6 +757,45 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
 /// audit journal, so the rung is awarded from the delivery primitive, and the
 /// reply and the durable journal must agree on it.
 #[test]
+fn a_delivery_that_posted_nothing_cannot_earn_an_atomic_binding() {
+    // The ratio test is arithmetic: zero checks for zero posts satisfies it,
+    // so an empty delivery would earn the STRONGEST binding for having done
+    // nothing. `computer.type` accepts an empty string, so this is a request a
+    // caller can send rather than a hypothetical.
+    //
+    // The wrong implementation and the right one agree on every non-empty
+    // delivery, which is exactly why this case needs its own test: a fixture
+    // that always posts cannot tell them apart.
+    let result = DispatchResult {
+        accepted_by_platform: true,
+        effect_status: EffectStatus::EffectIndeterminate,
+        unreadable_subtrees: 0,
+        delivery_posts_returned: 0,
+        delivery_generation_verifications: 0,
+    };
+    assert_eq!(
+        result.identity_to_delivery_binding(),
+        IdentityAtomicBinding::NonAtomic,
+        "a delivery with no posts has nothing to bind identity to"
+    );
+
+    // Contrast, so the test above cannot pass by the binding being NonAtomic
+    // for everything: a real delivery with a check before every post earns it.
+    let delivered = DispatchResult {
+        accepted_by_platform: true,
+        effect_status: EffectStatus::EffectIndeterminate,
+        unreadable_subtrees: 0,
+        delivery_posts_returned: 2,
+        delivery_generation_verifications: 4,
+    };
+    assert_eq!(
+        delivered.identity_to_delivery_binding(),
+        IdentityAtomicBinding::Atomic,
+        "two checks per post is the atomic shape"
+    );
+}
+
+#[test]
 fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one() {
     let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
     let request = DispatchRequest::new(
