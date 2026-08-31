@@ -48,6 +48,30 @@ export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
 # fail by name when their guard is removed.
 export CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION="semantic-actuation-review/v2@928cf90"
 
+# Synthetic input: manufacturing input events rather than asking an element to
+# invoke its own action. Reviewed against measurements rather than intentions --
+# the review required a live end-to-end run on the served wire path as a
+# prerequisite, and that run corrected the claim twice before it was granted.
+#
+# What it admits is type and keys. Scroll, move and drag stay withheld and this
+# key is not what withholds them: per-process posting carries keyboard events
+# and not pointer events, measured with a control arm, so advertisement refuses
+# them for want of a delivery path. Pointer capabilities need a v2 when a path
+# exists, because a new mechanism is a new containment story.
+#
+# The rung those rows serve is pid_structural, backed by kernel start-time
+# re-verification before every post and atomically bound to each delivery. That
+# claim is derived from counted witnesses rather than asserted: hoisting a check
+# out of the per-post loop, or posting nothing at all, both fail it by name.
+export CEREBELLUM_INPUT_REVIEW_REVISION="synthetic-input-review/v1@a39a2373"
+
+# Attendance: who owns the schema the dispatch gate reads, and which revision.
+# Bound in the same ceremony as the input review deliberately -- both are
+# consumed only by the input dispatch gate, so minting them apart would leave
+# one gate standing unbacked with nothing serving in the window.
+export CEREBELLUM_ATTENDANCE_CONTRACT_OWNER="subc"
+export CEREBELLUM_ATTENDANCE_CONTRACT_REVISION="v1"
+
 # The fleet's stage-sign doctrine: sign at build or stage with pinned
 # per-deployment identifiers, place with a plain copy, keep environments on
 # distinct identities. Held in the subconscious repository at
@@ -81,30 +105,7 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 # absence -- but the reason to leave them unset is not that a stand-in would be
 # caught. It is that absence is TRUE.
 #
-#   CEREBELLUM_INPUT_REVIEW_REVISION
-#     Synthetic input review. The path IS implemented now -- type, keys, scroll,
-#     move and drag are built, and typing into an unfocused application is
-#     measured rather than assumed. What is missing is the review artifact
-#     itself: the semantic actuation review above does not cover manufacturing
-#     input events, and no equivalent has been minted for the ones that do.
-#
-#     Binding this ships type and keys and withholds scroll, move and drag --
-#     measured, not predicted: a build with every attestation bound advertises
-#     click, type, keys, screenshot and wait. The three that stay behind have no
-#     delivery path at all, since per-process posting carries keyboard events
-#     and not pointer events, so advertisement refuses them on their own merits
-#     rather than on this key.
-#
-#   CEREBELLUM_ATTENDANCE_CONTRACT_OWNER
-#   CEREBELLUM_ATTENDANCE_CONTRACT_REVISION
-#     Ownership defaults to this module, which authored the attendance schema
-#     and is its only consumer. Left unbound anyway: both are consumed only by
-#     the input dispatch gate, which also requires the input review that does
-#     not exist, so binding them today would change nothing about what ships
-#     while making the gate report look closer to ready than it is.
-#
-#     Bind them alongside the input review, and renegotiate ownership if a
-#     second module ever reads the contract.
+#   (none)
 
 # ---------------------------------------------------------------------------
 
