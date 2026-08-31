@@ -1275,23 +1275,36 @@ where
                 let Some(containment_rung) = report.containment.rung() else {
                     return synthetic_dispatch_refusal(&DispatchError::AuditUnavailable);
                 };
-                // NOTE: the forfeiture reason and the fronting fact are both
-                // computed and both withheld here, deliberately.
+                // The rung alone cannot be acted on. Nine typed conditions
+                // reduce to global_none -- coordinate addressing, a
+                // non-structural delivery primitive, five identity states and
+                // four fronting states -- and a caller's remedy differs between
+                // them. Naming which one applied is the same typed-refusal
+                // discipline the rest of this surface follows, and it is the
+                // instrument this module needed to diagnose its own rung.
                 //
-                // Four situations reduce to global_none -- coordinate
-                // addressing, non-structural delivery, unusable identity
-                // evidence, an unauthorised global post -- and a caller's next
-                // move differs for each, so collapsing them into one word is
-                // the defect this surface removes everywhere else. Surfacing
-                // them needs a vocabulary revision declaring both fields, since
-                // result_schema is frozen and the conformance checker refuses
-                // undeclared keys. That revision is its own deliberate change
-                // with three digest mirrors, not a rider on this one.
-                json!({
+                // target_fronted rides alongside rather than inside the rung
+                // because it is a different claim: the rung says the input was
+                // contained to a process, this says whether the window that
+                // received it was pinned down. An action can be fully contained
+                // and land in a window nobody was looking at, and a caller that
+                // cannot see both halves cannot tell that from an uncontained
+                // one.
+                //
+                // The reason key is omitted rather than sent as null when no
+                // condition denied the rung: absence is unambiguous here because
+                // target_fronted is always present, so a caller can tell a build
+                // that reports these from one that does not.
+                let mut reply = json!({
                     "outcome": "completed",
                     "containment_rung": DispatchContainmentRung::as_str(containment_rung),
+                    "target_fronted": report.containment.fronting_stable,
                     "effect_status": effect_status_name(report.effect.status),
-                })
+                });
+                if let Some(reason) = report.containment.forfeiture_reason {
+                    reply["containment_forfeited_because"] = json!(reason.as_str());
+                }
+                reply
             }
             Err(refusal) => synthetic_dispatch_refusal(&refusal),
         }
@@ -2167,6 +2180,14 @@ fn synthetic_wire_envelope(mut reply: Value, carries_containment_rung: bool) -> 
     object
         .entry("effect_status")
         .or_insert_with(|| Value::String("effect_indeterminate".to_string()));
+    // A refusal reaches here without having measured a fronting bracket, so the
+    // honest default is false: not "the target was elsewhere" but "nothing
+    // established that it was fronted". The field is declared required by every
+    // synthetic row precisely so a caller never has to tell an absent claim from
+    // a false one.
+    object
+        .entry("target_fronted")
+        .or_insert_with(|| Value::Bool(false));
     if carries_containment_rung {
         object
             .entry("containment_rung")

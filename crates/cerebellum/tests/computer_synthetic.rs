@@ -268,6 +268,13 @@ async fn computer_type_dispatches_its_text_events_to_the_leased_process() {
         json!({
             "outcome": "completed",
             "containment_rung": "global_none",
+            // Named, not merely present. This fixture supplies no identity
+            // evidence, so the forfeit is on IDENTITY -- an assertion that some
+            // reason exists would pass whatever the cause, which is how a
+            // fronting forfeit stayed invisible here while production reported
+            // one on every unfocused dispatch.
+            "containment_forfeited_because": "identity_unavailable",
+            "target_fronted": false,
             "effect_status": "effect_indeterminate",
         })
     );
@@ -281,7 +288,11 @@ async fn computer_type_dispatches_its_text_events_to_the_leased_process() {
         plane.journal_entry_count().await > before,
         "a completed type left no audit record"
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 }
 
 /// A chord without Command is an editing keystroke and runs under compose.
@@ -317,7 +328,11 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
             },
         )
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 }
 
 /// Scrolling reaches the leased process as the wheel delta requested.
@@ -347,7 +362,11 @@ async fn computer_scroll_dispatches_its_wheel_event_to_the_leased_process() {
         request.action,
         SyntheticAction::scroll(SyntheticScrollUnit::Line, -3)
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 }
 
 /// computer.move is frozen observed-only: it goes through the global path,
@@ -365,9 +384,13 @@ async fn computer_move_dispatches_through_the_global_path_while_observed() {
         reply,
         json!({
             "outcome": "completed",
+            "containment_forfeited_because": "coordinate_addressed",
+            "target_fronted": false,
             "effect_status": "effect_indeterminate",
         }),
-        "the move row declares no containment rung, so the reply carries none"
+        "the move row declares no containment rung, so the reply still says WHY \
+         -- a caller reading an absent rung cannot otherwise tell a \
+         coordinate-addressed row from a failed one"
     );
     let calls = dispatched_calls(&shared);
     let [DispatchedCall::Global(request)] = &calls[..] else {
@@ -378,7 +401,11 @@ async fn computer_move_dispatches_through_the_global_path_while_observed() {
         request.action,
         SyntheticAction::move_pointer(SyntheticPoint { x: 812.0, y: 460.0 })
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 }
 
 /// Dragging is mutate_durable outright and delivers its three events
@@ -396,9 +423,13 @@ async fn computer_drag_dispatches_its_drag_events_to_the_leased_process() {
         reply,
         json!({
             "outcome": "completed",
+            "containment_forfeited_because": "coordinate_addressed",
+            "target_fronted": false,
             "effect_status": "effect_indeterminate",
         }),
-        "the drag row declares no containment rung, so the reply carries none"
+        "the drag row declares no containment rung, so the reply still says WHY \
+         -- a caller reading an absent rung cannot otherwise tell a \
+         coordinate-addressed row from a failed one"
     );
     let calls = dispatched_calls(&shared);
     let [DispatchedCall::PerPid(request)] = &calls[..] else {
@@ -412,7 +443,11 @@ async fn computer_drag_dispatches_its_drag_events_to_the_leased_process() {
             SyntheticPoint { x: 3.5, y: 4.0 },
         )
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 }
 
 /// A lease that authorised observing an application authorises no input into
@@ -450,7 +485,11 @@ async fn an_observe_only_lease_is_refused_for_each_of_the_five() {
         dispatched_calls(&shared).is_empty(),
         "a refused action still posted events"
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 }
 
 /// The vocabulary's durable_chord override: a Command chord escalates to
@@ -531,10 +570,19 @@ async fn an_unknown_held_state_reaches_the_caller_unflattened() {
         json!({
             "outcome": "held_state_unknown",
             "containment_rung": "global_none",
+            // Present even on a refusal: false here means nothing established
+            // that the target was fronted, which is not the same claim as the
+            // target being elsewhere. Declaring it required is what spares a
+            // caller from telling an absent claim from a false one.
+            "target_fronted": false,
             "effect_status": "effect_indeterminate",
         })
     );
-    assert!(plane.result_schema_findings().is_empty());
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "{:?}",
+        plane.result_schema_findings()
+    );
 
     // The distinction is the held state, not the failure: a failure that
     // provably released everything is a dispatch failure and nothing more.
