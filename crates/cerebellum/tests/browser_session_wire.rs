@@ -368,7 +368,11 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
 #[tokio::test]
 async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
 
     let launched = invoke(&planes, 1, "browser.launch", json!({})).await;
@@ -535,7 +539,11 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
 #[tokio::test]
 async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     launch_at(&planes, "https://page.example").await;
 
@@ -566,7 +574,11 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
 #[tokio::test]
 async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     grant_browser(
         &planes,
@@ -620,7 +632,11 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
 #[tokio::test]
 async fn wire_click_without_a_covering_grant_dispatches_no_input() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     planes.browser = Arc::new(
         BrowserPlane::with_session_gate(
@@ -669,7 +685,11 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
         hazardous_target: true,
         ..RecordingLauncher::default()
     });
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     planes.browser = Arc::new(
         BrowserPlane::with_session_gate(
@@ -723,7 +743,11 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
 
 #[tokio::test]
 async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() {
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(Arc::new(RecoveryFailedLauncher));
 
     let response = invoke(&planes, 1, "browser.launch", json!({})).await;
@@ -745,7 +769,11 @@ async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() 
 #[tokio::test]
 async fn route_unbind_runs_the_same_reap_then_cleanup_ladder() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     let launched = invoke(&planes, 1, "browser.launch", json!({})).await;
     assert_eq!(
@@ -775,7 +803,11 @@ async fn route_unbind_runs_the_same_reap_then_cleanup_ladder() {
 
 #[tokio::test]
 async fn all_browser_controls_share_the_existing_invalid_request_shape() {
-    let planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     for (corr, operation) in [
         (1, "browser.launch"),
         (2, "browser.status"),
@@ -809,7 +841,11 @@ async fn all_browser_controls_share_the_existing_invalid_request_shape() {
 #[tokio::test]
 async fn operation_authority_refusal_precedes_parameter_validation_and_effects() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     cerebellum::install_browser_test_bind(&planes.routes, 9, 3, &[]);
 
@@ -837,7 +873,11 @@ async fn operation_authority_refusal_precedes_parameter_validation_and_effects()
 #[tokio::test]
 async fn missing_operation_authority_has_no_launch_effects() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     cerebellum::install_browser_test_bind(&planes.routes, 9, 3, &[]);
 
@@ -853,7 +893,11 @@ async fn missing_operation_authority_has_no_launch_effects() {
 #[tokio::test]
 async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
     planes.launch_service = Some(launcher.clone());
     cerebellum::install_browser_compatibility_test_bind(&planes.routes, 9, 3);
 
@@ -865,7 +909,11 @@ async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
 
 #[tokio::test]
 async fn absent_browser_config_uses_the_route_level_unknown_method_envelope() {
-    let planes = Planes::with_browser_config(Arc::new(HealthState::new()), None);
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        None,
+        cerebellum::JournalPersistence::Isolated,
+    );
     let response = invoke(&planes, 1, "browser.launch", json!({})).await;
     assert_eq!(response.header.ty, FrameType::Error);
     let error: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();

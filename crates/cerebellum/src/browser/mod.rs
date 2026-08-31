@@ -846,6 +846,20 @@ impl BrowserPlane {
         self
     }
 
+    /// Install a journal, durable or isolated as the caller states.
+    ///
+    /// One entry point taking a boolean rather than two constructors, because
+    /// the two differ only in where bytes land and a caller choosing between
+    /// them should see the choice at the call site rather than in a method
+    /// name it might not read.
+    pub fn with_journal_persistence(self, durable: bool, config: journal::JournalConfig) -> Self {
+        if durable {
+            self.with_journal_installed(config)
+        } else {
+            self.with_in_memory_journal(config)
+        }
+    }
+
     /// Install a journal that never touches the operator's durable audit data.
     ///
     /// Separate constructor rather than a parameter on the one above, so a

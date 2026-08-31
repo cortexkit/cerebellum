@@ -182,6 +182,41 @@ check_sibling_matches_declaration() {
 run_phase "sibling matches the declared revisions" \
   check_sibling_matches_declaration
 
+# Phase 0c: no test may build a plane that journals to the operator's disk.
+#
+# The journal path derives from HOME, which is process-global, so a test cannot
+# be isolated by pointing it somewhere else without affecting every test running
+# beside it. Isolation is therefore opt-in at construction -- and an opt-in that
+# a test can forget is one that will be forgotten.
+#
+# This is not hypothetical. Wiring the journal with a durable DEFAULT sent the
+# wire tests at real audit data: a gate run left three genuine records in a
+# directory enrolled for fleet backup, and every test passed. Nothing in the
+# suite could notice, because the suite does not look outside the repository.
+#
+# The allowlist carries its reason per entry rather than a bare filename, so an
+# entry that stops being justified reads as wrong rather than as precedent.
+check_tests_do_not_journal_durably() {
+  local offenders
+  # Deliberate: b1_s3_browser.rs asserts that the PRODUCTION constructor
+  # installs a journal, which is the defect that started this -- production had
+  # none from the day the plane shipped. It builds the plane and never
+  # dispatches, and the store opens lazily on first reservation, so it observes
+  # the setting without opening anything.
+  offenders="$(grep -rln "Planes::new(\|Planes::with_browser_config(" \
+    crates/*/tests/ 2>/dev/null | grep -v "tests/b1_s3_browser.rs" || true)"
+  if [ -n "$offenders" ]; then
+    echo "    these tests build a durably-journaling plane:" >&2
+    echo "$offenders" | sed 's/^/      /' >&2
+    echo "    use Planes::with_browser_config_journaling(.., JournalPersistence::Isolated)" >&2
+    echo "    or add the file here with the reason it must be durable." >&2
+    return 1
+  fi
+}
+
+run_phase "no test journals to the operator's disk" \
+  check_tests_do_not_journal_durably
+
 # Phase 1: formatting check. `cargo fmt --all` must be run before committing;
 # this check fails the gate on an unformatted commit.
 run_phase "cargo fmt --all -- --check" \

@@ -1451,6 +1451,40 @@ pub struct Planes {
     pub elicitor: SharedElicitor,
 }
 
+/// Retention for the browser DRIVE journal: navigate, snapshot, click,
+/// screenshot and their refusals.
+///
+/// Separate from the launch journal's 64 MiB because the entries are a
+/// different size and the traffic a different shape. A drive record measured
+/// ~730 bytes against a launch record's 8.7-11 KB, and a navigate with an
+/// embedded read writes two of them -- so 8 MiB buys roughly 11,000 records,
+/// about 5,500 navigate-and-read pairs.
+///
+/// Quote measured field numbers when re-sizing rather than fixture numbers. The
+/// launch journal records that sizing against its fixture would have overstated
+/// capacity by 44%, in the direction that runs out sooner than the comment
+/// promises.
+const BROWSER_DRIVE_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
+const BROWSER_DRIVE_JOURNAL_MAX_ENTRY_BYTES: u64 = 64 * 1024;
+
+/// Where a plane's audit journal is written.
+///
+/// Stated at every construction site rather than defaulted. Wiring the journal
+/// with a durable default silently pointed the wire tests at the OPERATOR'S
+/// audit data -- a gate run left three real records in a directory enrolled for
+/// fleet backup, and every test passed. A default that is right for production
+/// and wrong for tests fails in the direction nobody inspects.
+///
+/// Live probes take `Durable` deliberately: they drive real browsers against
+/// real profiles, so their records describe real activity and belong on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalPersistence {
+    /// The operator's journal under the data home.
+    Durable,
+    /// Held in memory and discarded with the plane. For tests.
+    Isolated,
+}
+
 impl Planes {
     /// The set a running module uses.
     pub fn new(health: Arc<HealthState>) -> Self {
@@ -1468,9 +1502,23 @@ impl Planes {
         )
     }
 
+    /// Build with a durable journal. What a running module uses.
     pub fn with_browser_config(
         health: Arc<HealthState>,
         browser_config: Option<BrowserConfig>,
+    ) -> Self {
+        Self::with_browser_config_journaling(health, browser_config, JournalPersistence::Durable)
+    }
+
+    /// Build with the journal written wherever the caller says.
+    ///
+    /// Tests take [`JournalPersistence::Isolated`]. A test that takes `Durable`
+    /// writes into the operator's real audit data, which is what happened when
+    /// this was a default rather than an argument.
+    pub fn with_browser_config_journaling(
+        health: Arc<HealthState>,
+        browser_config: Option<BrowserConfig>,
+        journal: JournalPersistence,
     ) -> Self {
         #[cfg(target_os = "macos")]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
@@ -1501,9 +1549,20 @@ impl Planes {
                     Arc::clone(&lease_clock),
                     config.navigation_settle_deadline_ms,
                 )
-                .with_shared_grants(browser_grants),
+                .with_shared_grants(browser_grants)
+                .with_journal_persistence(
+                    matches!(journal, JournalPersistence::Durable),
+                    journal::JournalConfig {
+                        journal_retention_bytes: BROWSER_DRIVE_JOURNAL_BYTES,
+                        journal_max_entry_bytes: BROWSER_DRIVE_JOURNAL_MAX_ENTRY_BYTES,
+                    },
+                ),
             )
         } else {
+            // No journal on the unconfigured branch. This plane serves nothing
+            // -- every capability refuses for want of a browser -- so opening a
+            // file on disk for a surface that cannot produce a record would be
+            // a claim about audit coverage that does not exist.
             Arc::new(BrowserPlane::new().with_shared_grants(browser_grants))
         };
         Self {
