@@ -1132,7 +1132,22 @@ pub fn finalize_containment(
                 && identity.compatibility.compatible
                 && identity.grant_tuple_matches == Some(true) =>
         {
-            if let Some(maximum) = identity.maximum_identity_check_to_dispatch_interval_ms {
+            // An atomic binding has no interval to bound.
+            //
+            // The bound exists to limit staleness between a check and the
+            // delivery it authorises. When the check runs inside the delivery
+            // itself -- re-verified immediately before every post, with no code
+            // between -- there is no window for the target to change in, so the
+            // bound cannot be violated and skipping it is honest. The
+            // alternative was reporting a measured interval of zero, which
+            // satisfies the bound by asserting a number nobody took.
+            //
+            // Note the polarity below stays forfeit-by-default for NON-atomic
+            // bindings: an absent measurement forfeits, because there the
+            // window is real and unmeasured staleness is exactly the hazard.
+            if identity.identity_to_delivery_binding.is_atomic() {
+                true
+            } else if let Some(maximum) = identity.maximum_identity_check_to_dispatch_interval_ms {
                 if identity
                     .measured_check_to_dispatch_interval_ms
                     .is_none_or(|interval| interval > maximum)

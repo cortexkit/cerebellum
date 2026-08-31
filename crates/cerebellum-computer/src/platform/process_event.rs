@@ -117,8 +117,10 @@ pub fn route_event_to_process<T: PerProcessEventTransport>(
     target: ProcessEventTarget,
     event: T::Event,
     transport: &mut T,
-) -> Result<PostCallMade, ProcessEventRefusal> {
+) -> Result<(PostCallMade, u64), ProcessEventRefusal> {
+    let mut verifications = 0_u64;
     require_exact_generation(target, transport.process_generation(target.pid))?;
+    verifications += 1;
 
     match transport.window_server_visibility(target.pid) {
         WindowServerVisibility::Visible => {}
@@ -133,9 +135,11 @@ pub fn route_event_to_process<T: PerProcessEventTransport>(
     // This is the post-time identity check. Nothing that can block or inspect
     // another subsystem occurs between this reading and the selected post call.
     require_exact_generation(target, transport.process_generation(target.pid))?;
+    verifications += 1;
 
     transport
         .post_to_pid(target.pid, event)
+        .map(|made| (made, verifications))
         .map_err(ProcessEventRefusal::PostCallFailed)
 }
 
@@ -177,12 +181,17 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
 
     let mut steps: Vec<Option<SyntheticStep<T::Event>>> = steps.into_iter().map(Some).collect();
     let mut posts_returned = 0_u64;
+    let mut generation_verifications = 0_u64;
     for index in 0..steps.len() {
         let step = match steps[index].take() {
             Some(step) => step,
             None => continue,
         };
-        if let Err(refusal) = route_event_to_process(target, step.event, transport) {
+        let routed = route_event_to_process(target, step.event, transport);
+        if let Ok((_, verifications)) = &routed {
+            generation_verifications += verifications;
+        }
+        if let Err(refusal) = routed {
             let held_state =
                 recover_held_state(target, &release_for_press, &mut steps, index, transport);
             return Err(SequencePostFailure {
@@ -193,7 +202,10 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
         }
         posts_returned += 1;
     }
-    Ok(SequencePostReport { posts_returned })
+    Ok(SequencePostReport {
+        posts_returned,
+        generation_verifications,
+    })
 }
 
 /// Release whatever the posted steps left held, and say how that went.
@@ -247,13 +259,24 @@ fn recover_held_state<T: PerProcessEventTransport>(
     }
 }
 
+/// Proof that one post-time identity check happened.
+///
+/// Returned rather than discarded so a caller can COUNT the checks it actually
+/// performed. The containment rung claims events reached the process it
+/// verified, and it earns that claim from atomic binding -- the check running
+/// inside the delivery with no window between. A claim asserted beside the code
+/// would survive someone hoisting the check out of the per-post loop; a claim
+/// counted from these witnesses cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationVerified;
+
 fn require_exact_generation(
     target: ProcessEventTarget,
     reading: ProcessGenerationReading,
-) -> Result<(), ProcessEventRefusal> {
+) -> Result<GenerationVerified, ProcessEventRefusal> {
     match reading {
         ProcessGenerationReading::Started(observed) if observed == target.start_time_micros => {
-            Ok(())
+            Ok(GenerationVerified)
         }
         ProcessGenerationReading::Started(observed) => Err(ProcessEventRefusal::ProcessReplaced {
             expected_start_time_micros: target.start_time_micros,
@@ -294,6 +317,15 @@ pub struct SyntheticStep<E> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SequencePostReport {
     pub posts_returned: u64,
+    /// How many post-time identity checks this sequence actually performed.
+    ///
+    /// Counted from witnesses the checks themselves return rather than from the
+    /// number of steps, so it measures what ran instead of what was intended.
+    /// The containment rung reads this to decide whether its identity evidence
+    /// is ATOMICALLY bound to the delivery: two checks per post means every post
+    /// was preceded by one, with no window in between. Hoisting a check out of
+    /// the per-post loop lowers this count and the atomic claim fails with it.
+    pub generation_verifications: u64,
 }
 
 /// What a failed sequence did about input state its posted events left held.
@@ -483,7 +515,7 @@ mod tests {
     }
 
     fn route(transport: &mut FakeTransport) -> Result<PostCallMade, ProcessEventRefusal> {
-        route_event_to_process(target(), FakeEvent(7), transport)
+        route_event_to_process(target(), FakeEvent(7), transport).map(|(made, _)| made)
     }
 
     #[test]
