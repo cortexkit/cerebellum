@@ -9,10 +9,7 @@ use cerebellum_computer::dispatch::{
     ExpectedPostCondition, FocusCheckPlan, FrozenDispatchRow, ReconciliationResult, RetryDecision,
     SeizeWatcher,
 };
-use cerebellum_computer::platform::containment::{
-    IdentityAtomicBinding, IdentityDiscriminationRequirement, ProcessIdentityEvidence,
-    ProcessIdentityObservation, ProcessIdentityPrimitive,
-};
+use cerebellum_computer::platform::containment::IdentityAtomicBinding;
 use cerebellum_computer::platform::*;
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::storage::JournalStorage;
@@ -132,30 +129,6 @@ fn target() -> ProcessGrant {
     }
 }
 
-fn identity() -> cerebellum_computer::platform::containment::IdentityCheckEvidence {
-    let primitive = ProcessIdentityPrimitive::pinned_v1()
-        .with_identity_to_delivery_binding(IdentityAtomicBinding::Atomic);
-    let grant = primitive
-        .capture_grant(
-            target(),
-            ProcessIdentityEvidence::kernel_vouched("generation-1"),
-            0,
-        )
-        .unwrap();
-    primitive.verify_for_dispatch(
-        &grant,
-        &ProcessIdentityObservation::new(
-            42,
-            "com.example.target",
-            ProcessIdentityEvidence::kernel_vouched("generation-1"),
-        ),
-        10,
-        Some(12),
-        Some(5),
-        IdentityDiscriminationRequirement::GenerationDiscriminating,
-    )
-}
-
 fn fronting(at: u64) -> FrontingSnapshot {
     FrontingSnapshot {
         captured_at_ms: at,
@@ -226,6 +199,7 @@ fn decode_embedded_json(value: &Value) -> Value {
 #[derive(Debug)]
 struct RecordingDriver {
     semantic_result: Result<cerebellum_computer::platform::DispatchResult, DriverError>,
+    per_pid_result: cerebellum_computer::platform::DispatchResult,
     effect: Result<EffectObservationResult, DriverError>,
     liveness: InputObserverLiveness,
     input: Result<InputObservationResult, DriverError>,
@@ -254,7 +228,16 @@ impl Default for RecordingDriver {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectObserved,
                 unreadable_subtrees: 0,
+                delivery_posts_returned: 0,
+                delivery_generation_verifications: 0,
             }),
+            per_pid_result: cerebellum_computer::platform::DispatchResult {
+                accepted_by_platform: true,
+                effect_status: EffectStatus::EffectIndeterminate,
+                unreadable_subtrees: 0,
+                delivery_posts_returned: 2,
+                delivery_generation_verifications: 4,
+            },
             effect: Ok(EffectObservationResult {
                 status: EffectStatus::EffectObserved,
                 failure_reason: None,
@@ -329,11 +312,7 @@ impl PlatformDriver for RecordingDriver {
         _request: SyntheticDispatchRequest,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         self.per_pid_calls += 1;
-        Ok(cerebellum_computer::platform::DispatchResult {
-            accepted_by_platform: true,
-            effect_status: EffectStatus::EffectIndeterminate,
-            unreadable_subtrees: 0,
-        })
+        Ok(self.per_pid_result.clone())
     }
     fn dispatch_global(
         &mut self,
@@ -344,6 +323,8 @@ impl PlatformDriver for RecordingDriver {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
             unreadable_subtrees: 0,
+            delivery_posts_returned: 0,
+            delivery_generation_verifications: 0,
         })
     }
     fn query_focus(
@@ -467,7 +448,6 @@ fn semantic_request_for_action(row: FrozenDispatchRow, action: &str) -> Dispatch
         0,
     )
     .with_semantic(element, action)
-    .with_identity(identity())
 }
 
 #[test]
@@ -793,8 +773,7 @@ fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one()
         background_attendance(),
         0,
     )
-    .with_synthetic(SyntheticAction::type_text("x"))
-    .with_identity(identity());
+    .with_synthetic(SyntheticAction::type_text("x"));
     let mut audit = audit();
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     let report = dispatcher
@@ -806,6 +785,19 @@ fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one()
     assert_eq!(
         report.delivery_primitive,
         cerebellum_computer::platform::containment::DeliveryPrimitive::PerPidSynthetic
+    );
+    let delivery_identity = report
+        .containment
+        .identity
+        .as_ref()
+        .expect("per-pid delivery reports its generation checks");
+    assert_eq!(
+        delivery_identity.identity_to_delivery_binding,
+        IdentityAtomicBinding::Atomic
+    );
+    assert_eq!(
+        delivery_identity.status,
+        cerebellum_computer::platform::containment::IdentityVerificationStatus::Matched
     );
     let reply_rung = serde_json::to_value(
         report
@@ -830,6 +822,52 @@ fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one()
     assert_eq!(
         reply_rung, journal_rung,
         "the reply and durable journal recorded different containment rungs"
+    );
+}
+
+#[test]
+fn a_hoisted_generation_check_cannot_earn_atomic_per_pid_binding() {
+    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
+    let request = DispatchRequest::new(
+        row,
+        DispatchMode::Background,
+        target(),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element: AccessibilityElementName::identifier("element-1"),
+                expected: true,
+            },
+        ),
+        background_attendance(),
+        0,
+    )
+    .with_synthetic(SyntheticAction::type_text("x"));
+    let mut driver = RecordingDriver::default();
+    driver.per_pid_result.delivery_generation_verifications = 3;
+
+    let report = Dispatcher::new(driver)
+        .dispatch(&mut audit(), audit_identity(), request)
+        .expect("global-none authorization records a non-atomic delivery honestly");
+    let delivery_identity = report
+        .containment
+        .identity
+        .expect("the delivery counts produce identity evidence");
+
+    assert_eq!(
+        delivery_identity.identity_to_delivery_binding,
+        IdentityAtomicBinding::NonAtomic,
+        "three checks for two posts must not claim an atomic binding"
+    );
+    assert_eq!(
+        report.containment.containment_rung,
+        Some(cerebellum_computer::platform::containment::ContainmentRung::GlobalNone)
+    );
+    assert_eq!(
+        report.containment.forfeiture_reason,
+        Some(
+            cerebellum_computer::platform::containment::ContainmentForfeitureReason::IdentityUnavailable
+        )
     );
 }
 
@@ -1572,6 +1610,8 @@ fn partial_action_tree_disclosure_reaches_caller_and_decoded_audit_entry() {
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
             unreadable_subtrees: 2,
+            delivery_posts_returned: 0,
+            delivery_generation_verifications: 0,
         }),
         ..RecordingDriver::default()
     };

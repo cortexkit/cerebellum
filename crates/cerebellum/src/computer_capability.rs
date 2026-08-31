@@ -2598,6 +2598,8 @@ mod click_vocabulary_v3_tests {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectIndeterminate,
                 unreadable_subtrees: 0,
+                delivery_posts_returned: 0,
+                delivery_generation_verifications: 0,
             })
         }
 

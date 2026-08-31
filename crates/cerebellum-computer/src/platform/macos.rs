@@ -176,6 +176,8 @@ fn dispatch_synthetic_to_pid(
         effect_status: EffectStatus::EffectIndeterminate,
         // No accessibility tree is read on this path.
         unreadable_subtrees: 0,
+        delivery_posts_returned: report.posts_returned,
+        delivery_generation_verifications: report.generation_verifications,
     })
 }
 
@@ -204,6 +206,8 @@ fn dispatch_result_for_accepted_action(
             accepted_by_platform: true,
             effect_status: EffectStatus::EffectIndeterminate,
             unreadable_subtrees: u64::try_from(unreadable_subtrees).unwrap_or(u64::MAX),
+            delivery_posts_returned: 0,
+            delivery_generation_verifications: 0,
         },
     }
 }
@@ -1967,6 +1971,12 @@ mod cached_element_tests {
                 .expect("text dispatch posts");
             assert!(result.accepted_by_platform);
             assert_eq!(result.effect_status, EffectStatus::EffectIndeterminate);
+            assert_eq!(result.delivery_posts_returned, 4);
+            assert_eq!(result.delivery_generation_verifications, 8);
+            assert_eq!(
+                result.identity_to_delivery_binding(),
+                crate::platform::containment::IdentityAtomicBinding::Atomic
+            );
             assert_eq!(transport.posted.len(), 4);
             for (index, event) in transport.posted.iter().enumerate() {
                 assert_eq!(
@@ -2063,7 +2073,7 @@ mod cached_element_tests {
         #[test]
         fn the_generation_is_re_read_immediately_before_every_post() {
             let mut transport = RecordingTransport::succeeding(3);
-            dispatch(
+            let result = dispatch(
                 SyntheticAction::drag_pointer(
                     SyntheticPoint { x: 0.0, y: 0.0 },
                     SyntheticPoint { x: 1.0, y: 1.0 },
@@ -2072,6 +2082,13 @@ mod cached_element_tests {
             )
             .expect("drag dispatch posts");
 
+            assert_eq!(result.delivery_posts_returned, 3);
+            assert_eq!(result.delivery_generation_verifications, 6);
+            assert_eq!(
+                result.identity_to_delivery_binding(),
+                crate::platform::containment::IdentityAtomicBinding::Atomic,
+                "every returned post needs both generation checks"
+            );
             for per_event in transport.calls_per_event() {
                 assert_eq!(
                     per_event,
