@@ -82,8 +82,18 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 # caught. It is that absence is TRUE.
 #
 #   CEREBELLUM_INPUT_REVIEW_REVISION
-#     Synthetic input review. No synthetic input path is implemented, and the
-#     semantic actuation review above does not cover manufacturing input events.
+#     Synthetic input review. The path IS implemented now -- type, keys, scroll,
+#     move and drag are built, and typing into an unfocused application is
+#     measured rather than assumed. What is missing is the review artifact
+#     itself: the semantic actuation review above does not cover manufacturing
+#     input events, and no equivalent has been minted for the ones that do.
+#
+#     Binding this ships type and keys and withholds scroll, move and drag --
+#     measured, not predicted: a build with every attestation bound advertises
+#     click, type, keys, screenshot and wait. The three that stay behind have no
+#     delivery path at all, since per-process posting carries keyboard events
+#     and not pointer events, so advertisement refuses them on their own merits
+#     rather than on this key.
 #
 #   CEREBELLUM_ATTENDANCE_CONTRACT_OWNER
 #   CEREBELLUM_ATTENDANCE_CONTRACT_REVISION
