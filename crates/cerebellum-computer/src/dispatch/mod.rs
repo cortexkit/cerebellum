@@ -644,6 +644,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
         if delivery_primitive == DeliveryPrimitive::SemanticAccessibility {
             return Ok(ContainmentFinalization {
                 containment_rung: Some(FinalizedContainmentRung::SemanticElement),
+                fronting_stable: fronting
+                    .as_ref()
+                    .is_some_and(FrontingComparisonEvidence::unchanged),
                 input_action: true,
                 dispatch_permitted: true,
                 forfeiture_reason: None,
@@ -1329,6 +1332,7 @@ mod delivery_containment_validation_tests {
     ) -> ContainmentFinalization {
         ContainmentFinalization {
             containment_rung,
+            fronting_stable: false,
             input_action: true,
             dispatch_permitted: true,
             forfeiture_reason: None,

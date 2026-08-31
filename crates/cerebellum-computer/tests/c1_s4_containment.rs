@@ -175,7 +175,7 @@ fn identity_within_bound_finalizes_pid_structural_without_forfeiture() {
 }
 
 #[test]
-fn fronting_bound_exceeded_finalizes_global_none_with_exact_reason() {
+fn a_stale_fronting_bracket_records_the_fact_without_lowering_the_rung() {
     let mut identity = identity_check_with_maximum(
         ProcessIdentityEvidence::kernel_vouched("generation-1"),
         12,
@@ -200,10 +200,33 @@ fn fronting_bound_exceeded_finalizes_global_none_with_exact_reason() {
         true,
     ))
     .unwrap();
-    assert_eq!(result.containment_rung, Some(ContainmentRung::GlobalNone));
+    // This test asserted the opposite until the live run showed what it cost:
+    // every unfocused per-pid dispatch reported global_none, which reads as
+    // "this action was uncontained" for events that provably reached one
+    // process and stole no focus.
+    //
+    // Per-pid delivery is contained BY MECHANISM -- the events are posted to a
+    // pid and cannot arrive elsewhere, whatever holds focus. A stale fronting
+    // bracket says the window inside that process is not pinned down, which is
+    // a claim about precision, not about containment. Charging it against the
+    // rung stated something false about mechanism to express something true
+    // about visibility.
     assert_eq!(
-        result.forfeiture_reason,
-        Some(ContainmentForfeitureReason::FrontingBoundExceeded)
+        result.containment_rung,
+        Some(ContainmentRung::PidStructural),
+        "a stale fronting bracket must not turn a per-pid post into an \
+         uncontained one"
+    );
+    assert_eq!(
+        result.forfeiture_reason, None,
+        "fronting must not appear as a containment forfeit"
+    );
+    // The concern keeps an honest home: recorded as its own fact, so an auditor
+    // reads "delivered per-pid, target not fronted" with neither half implying
+    // the other.
+    assert!(
+        !result.fronting_stable,
+        "the stale bracket must still be recorded as unstable"
     );
 }
 
