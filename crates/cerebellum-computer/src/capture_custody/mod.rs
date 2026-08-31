@@ -272,6 +272,8 @@ impl CaptureAdmissionToken {
 #[serde(rename_all = "snake_case")]
 pub enum CapturePrepareRefusalCause {
     ObligationNotDurable,
+    ObligationAlreadyTerminal,
+    ObligationUnknown,
     ObligationNotActive,
     ArtifactAlreadyAdmitted,
     PreparationAlreadyActive,
@@ -323,6 +325,8 @@ pub enum CapturePinRefusalCause {
     ArtifactBytesBoundReached,
     VerificationWindowClosed,
     ArtifactUnavailable,
+    ObligationAlreadyTerminal,
+    ObligationUnknown,
     BoundUnavailable,
     JournalAttachmentFailed,
     CustodyUnavailable,
