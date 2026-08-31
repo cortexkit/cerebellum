@@ -17,8 +17,8 @@ use cerebellum_core::journal::codec::{
     ProvisionalInput, RecoveryTerminalInput, ReducedTerminalInput, RejectionInput,
 };
 use cerebellum_core::journal::{
-    ActionObligationId, EffectClass, IsolationClass, JournalIdentity, ObservabilityClass,
-    RecoveryClassification, SeverityInputs, SeverityRecord, TerminalKind,
+    ActionObligationId, EffectClass, IsolationClass, JournalIdentity, LifecycleState,
+    ObservabilityClass, RecoveryClassification, SeverityInputs, SeverityRecord, TerminalKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -919,6 +919,83 @@ mod gate_tests {
         assert!(!gate.advertised(ComputerCapability::Screenshot));
         assert!(gate.advertised(ComputerCapability::Wait));
     }
+
+    /// Finalized actions retain their journal record but not their local metadata.
+    #[test]
+    fn finalized_actions_release_reservation_metadata() {
+        let mut audit = audit_with(UnavailablePolicy);
+        let baseline = audit.reservations.len();
+
+        for action in 0..3 {
+            let handle = audit
+                .reserve(
+                    journal_identity(
+                        "principal",
+                        format!("conversation-{action}"),
+                        "project",
+                        SessionKind::Primary,
+                    ),
+                    ComputerPlaneDescriptor::new(
+                        ComputerCapability::Wait,
+                        ContainmentRung::SemanticElement,
+                        ObservationState::HumanObserved,
+                    ),
+                )
+                .expect("the reservation succeeds");
+            assert_eq!(audit.reservations.len(), baseline + 1);
+
+            audit
+                .finalize_rejected(handle, b"refused".to_vec())
+                .expect("the action finalizes");
+            assert_eq!(audit.reservations.len(), baseline);
+        }
+    }
+
+    /// The terminal feed closes custody even after finalization releases metadata.
+    #[test]
+    fn terminal_feed_consumes_and_applies_custody_after_metadata_release() {
+        let mut audit = audit_with(UnavailablePolicy);
+        let handle = audit
+            .reserve(
+                journal_identity("principal", "conversation", "project", SessionKind::Primary),
+                ComputerPlaneDescriptor::new(
+                    ComputerCapability::Screenshot,
+                    ContainmentRung::SemanticElement,
+                    ObservationState::HumanObserved,
+                ),
+            )
+            .expect("the reservation succeeds");
+        let token = audit
+            .prepare_capture(handle, CaptureScope::PerWindow, None, 10)
+            .expect("the active reservation prepares capture");
+        let artifact_id = audit
+            .admit_capture(
+                token,
+                PixelArtifact::per_window(vec![1, 2, 3], 10, "window", 42, 3, 1),
+                10,
+            )
+            .expect("the capture is admitted");
+
+        audit
+            .journal_mut()
+            .finalize_rejected(
+                handle,
+                RejectionMaterial {
+                    rejection_material: b"refused".to_vec(),
+                },
+            )
+            .expect("the journal emits a terminal transition");
+        assert!(
+            audit
+                .reservations
+                .remove(&handle.action_obligation_id())
+                .is_some(),
+            "the test must remove metadata before consuming the terminal feed"
+        );
+
+        assert_eq!(audit.consume_terminal_transitions(), 1);
+        assert_eq!(audit.custody().read_artifact(&artifact_id), None);
+    }
 }
 
 /// Recovery separates captures, whose dispatch proves the read happened, from
@@ -1090,6 +1167,14 @@ struct ReservationMetadata {
     handle: ReservationHandle,
     identity: JournalIdentity,
     active: bool,
+}
+
+/// What the durable journal says when local reservation metadata is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationMetadataAbsence {
+    AlreadyTerminal,
+    Unknown,
+    Unavailable,
 }
 
 impl<R, T, S> ComputerAudit<R, T, S>
@@ -1337,9 +1422,7 @@ where
             CompletedResult { completed_result },
             FinalContextAssociation { final_context },
         )?;
-        if let Some(record) = self.reservations.get_mut(&token.action_obligation_id()) {
-            record.active = false;
-        }
+        self.reservations.remove(&token.action_obligation_id());
         self.consume_terminal_transitions();
         Ok(result)
     }
@@ -1352,9 +1435,7 @@ where
         let result = self
             .journal
             .finalize_rejected(handle, RejectionMaterial { rejection_material })?;
-        if let Some(record) = self.reservations.get_mut(&handle.action_obligation_id()) {
-            record.active = false;
-        }
+        self.reservations.remove(&handle.action_obligation_id());
         self.consume_terminal_transitions();
         Ok(result)
     }
@@ -1367,11 +1448,30 @@ where
             handle,
             cerebellum_core::journal::JournalReason::RedactionUnavailable,
         )?;
-        if let Some(record) = self.reservations.get_mut(&handle.action_obligation_id()) {
-            record.active = false;
-        }
+        self.reservations.remove(&handle.action_obligation_id());
         self.consume_terminal_transitions();
         Ok(result)
+    }
+
+    /// Consult the journal when the local metadata needed to drive capture is gone.
+    fn reservation_metadata_absence(
+        &self,
+        action_obligation_id: ActionObligationId,
+    ) -> ReservationMetadataAbsence {
+        match self.journal.read_obligation_audit(action_obligation_id) {
+            Ok(record)
+                if matches!(
+                    record.lifecycle,
+                    LifecycleState::Finalized
+                        | LifecycleState::Rejected
+                        | LifecycleState::Cancelled
+                ) =>
+            {
+                ReservationMetadataAbsence::AlreadyTerminal
+            }
+            Err(JournalError::ObligationUnknown) => ReservationMetadataAbsence::Unknown,
+            Ok(_) | Err(_) => ReservationMetadataAbsence::Unavailable,
+        }
     }
 
     /// Establish a reservation-bound preparation token. The handle is the only
@@ -1389,7 +1489,17 @@ where
     > {
         let Some(record) = self.reservations.get(&handle.action_obligation_id()) else {
             return Err(crate::capture_custody::CapturePrepareRefused {
-                cause: CapturePrepareRefusalCause::ObligationNotDurable,
+                cause: match self.reservation_metadata_absence(handle.action_obligation_id()) {
+                    ReservationMetadataAbsence::AlreadyTerminal => {
+                        CapturePrepareRefusalCause::ObligationAlreadyTerminal
+                    }
+                    ReservationMetadataAbsence::Unknown => {
+                        CapturePrepareRefusalCause::ObligationUnknown
+                    }
+                    ReservationMetadataAbsence::Unavailable => {
+                        CapturePrepareRefusalCause::ObligationNotDurable
+                    }
+                },
             });
         };
         let durable = self
@@ -1498,7 +1608,17 @@ where
         };
         let Some(metadata) = self.reservations.get(&obligation_id).cloned() else {
             return Err(crate::capture_custody::CapturePinRefused {
-                cause: CapturePinRefusalCause::ArtifactUnavailable,
+                cause: match self.reservation_metadata_absence(obligation_id) {
+                    ReservationMetadataAbsence::AlreadyTerminal => {
+                        CapturePinRefusalCause::ObligationAlreadyTerminal
+                    }
+                    ReservationMetadataAbsence::Unknown => {
+                        CapturePinRefusalCause::ObligationUnknown
+                    }
+                    ReservationMetadataAbsence::Unavailable => {
+                        CapturePinRefusalCause::ArtifactUnavailable
+                    }
+                },
             });
         };
         self.pin_capture_for_handle(metadata.handle, artifact_id, grant_id, expires_at, now)

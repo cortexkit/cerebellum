@@ -10,8 +10,8 @@ use cerebellum_computer::audit::{
 use cerebellum_computer::capture_custody::{
     redact_accessibility_snapshot, AccessibilityRedactionOutcome, AccessibilityRedactionPath,
     AccessibilitySchema, AccessibilitySnapshot, CaptureCustody, CaptureGrant,
-    CapturePrepareRefusalCause, CaptureScope, CustodyBounds, InMemoryCustodyStorage,
-    InMemoryGrantAuthority, PixelArtifact,
+    CapturePinRefusalCause, CapturePrepareRefusalCause, CaptureScope, CustodyBounds,
+    InMemoryCustodyStorage, InMemoryGrantAuthority, PixelArtifact,
 };
 use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
@@ -508,14 +508,9 @@ fn successful_dispatch_lifecycle_records_material_and_rejects_recommitment() {
 /// action whose audit record is already closed and describes a different set of
 /// pixels than the ones retained.
 ///
-/// Asserted through the refusal a caller would actually receive, and by its
-/// exact cause: a preparation that failed for some other reason would refuse
-/// too, and would prove nothing about the obligation's state.
-///
-/// TWO PLACES END THE OBLIGATION -- the finalizing call itself, and the
-/// journal's terminal feed a line later -- so removing either alone changes
-/// nothing observable and this test stays green. That is the redundancy working
-/// rather than the test failing to look; it takes removing both to make it red.
+/// The journal is consulted after finalization removes the local reservation
+/// metadata. The resulting refusal must name the durable terminal state rather
+/// than reporting the obligation as missing from the journal.
 #[test]
 fn a_finalized_action_admits_no_further_capture() {
     let mut audit = audit();
@@ -566,7 +561,68 @@ fn a_finalized_action_admits_no_further_capture() {
         .expect_err("a finalized action must not admit capture");
     assert_eq!(
         refusal.cause,
-        CapturePrepareRefusalCause::ObligationNotActive
+        CapturePrepareRefusalCause::ObligationAlreadyTerminal
+    );
+}
+
+/// A handle from a different audit has no corresponding durable journal entry.
+#[test]
+fn an_unknown_obligation_is_distinguished_from_a_terminal_obligation() {
+    let mut source = audit();
+    let unknown_handle = source
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::SemanticElement,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+    let mut audit = audit();
+
+    let refusal = audit
+        .prepare_capture(unknown_handle, CaptureScope::PerWindow, None, 10)
+        .expect_err("an unknown obligation must not admit capture");
+
+    assert_eq!(refusal.cause, CapturePrepareRefusalCause::ObligationUnknown);
+}
+
+/// A terminal journal record also explains why an existing artifact cannot be pinned.
+#[test]
+fn a_terminal_obligation_cannot_acquire_a_later_capture_pin() {
+    let mut audit = audit();
+    let handle = audit
+        .reserve(
+            identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::Screenshot,
+                ContainmentRung::SemanticElement,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+    let token = audit
+        .prepare_capture(handle, CaptureScope::PerWindow, None, 10)
+        .unwrap();
+    let artifact_id = audit
+        .admit_capture(
+            token,
+            PixelArtifact::per_window(vec![1, 2, 3], 10, "window-1", 42, 3, 1),
+            10,
+        )
+        .unwrap();
+    audit
+        .finalize_rejected(handle, b"complete".to_vec())
+        .unwrap();
+
+    let refusal = audit
+        .pin_capture(&artifact_id, None, 20, 10)
+        .expect_err("a terminal obligation cannot acquire a new pin");
+
+    assert_eq!(
+        refusal.cause,
+        CapturePinRefusalCause::ObligationAlreadyTerminal
     );
 }
 
