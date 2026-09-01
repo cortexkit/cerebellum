@@ -6,6 +6,7 @@ members = [
     "crates/cerebellum-computer",
     "crates/cerebellum-linux",
     "crates/cerebellum-macos",
+    "crates/cerebellum-windows",
 ]
 
 # ck-cerebellum — the browser/computer-use motor-execution organ for the
