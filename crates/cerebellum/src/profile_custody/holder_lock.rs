@@ -70,7 +70,7 @@ impl ProfileCustodyKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProfileCustodyLockRecord {
+pub struct ProfileCustodyLockRecord {
     format_version: String,
     holder_id: HolderId,
     supervisor_pid: u32,
@@ -89,7 +89,7 @@ impl ProfileCustodyLockRecord {
         }
     }
 
-    fn supervisor(&self) -> SupervisorGeneration {
+    pub fn supervisor(&self) -> SupervisorGeneration {
         SupervisorGeneration {
             pid: self.supervisor_pid,
             start_time: self.supervisor_start_time,
@@ -602,7 +602,7 @@ fn require_exact_holder(
     Ok(())
 }
 
-fn read_record_if_present(
+pub fn read_record_if_present(
     path: &Path,
 ) -> Result<Option<ProfileCustodyLockRecord>, ProfileCustodyLockError> {
     match fs::read(path) {

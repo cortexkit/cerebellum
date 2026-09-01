@@ -31,11 +31,13 @@ use cerebellum::browser_config::BrowserConfig;
 #[cfg(target_os = "linux")]
 use cerebellum::browser_launch::{LINUX_EXEC_CHAIN_HOP_LIMIT, LINUX_EXEC_CHAIN_PROBE_WINDOW};
 use cerebellum::management;
+use cerebellum::profile_custody::{
+    classify_supervisor_start_time, read_record_if_present, SupervisorLiveness,
+};
 use cerebellum::Planes;
 use cerebellum_core::health::HealthState;
 #[cfg(target_os = "linux")]
 use cerebellum_linux::{executed_image_identity, spawn_barred};
-use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
@@ -54,7 +56,6 @@ const LINUX_CHROME_CANDIDATES: [&str; 3] = [
     "/usr/bin/google-chrome",
 ];
 const CUSTODY_LOCK_DIRECTORY: &str = ".ck-browser-profile-custody";
-const CUSTODY_LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v1";
 const TOOL_CHANNEL: u16 = 9;
 const TOOL_EPOCH: u32 = 3;
 const MANAGEMENT_CHANNEL: u16 = 4;
@@ -864,18 +865,6 @@ fn signing_identifier(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CustodyLockRecord {
-    format_version: String,
-    #[serde(rename = "holder_id")]
-    _holder_id: String,
-    supervisor_pid: u32,
-    supervisor_start_time: u64,
-    #[serde(rename = "profile_directory")]
-    _profile_directory: Option<PathBuf>,
-}
-
 fn precheck_custody_residue() -> Result<(), String> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| "refusing: could not determine HOME for custody inspection. Next step: set HOME and rerun the probe.".to_string())?;
@@ -911,44 +900,56 @@ fn check_custody_residue(
         if !is_holder_lock_path(&lock_path) {
             continue;
         }
-        let record = read_custody_lock(&lock_path)?;
-        let observed = observe(record.supervisor_pid).map_err(|error| {
+        let Some(record) = read_record_if_present(&lock_path).map_err(|error| {
+            format!(
+                "refusing: could not read custody lock {}: {error:?}. Next step: repair access or inspect the lock manually before rerunning the probe.",
+                lock_path.display()
+            )
+        })? else {
+            continue;
+        };
+        let supervisor = record.supervisor();
+        let observed = observe(supervisor.pid).map_err(|error| {
             format!(
                 "refusing: could not read custody supervisor for {}: recorded pid {} start time {}; {error}. Next step: inspect the lock and supervisor before rerunning the probe.",
                 lock_path.display(),
-                record.supervisor_pid,
-                record.supervisor_start_time,
+                supervisor.pid,
+                supervisor.start_time,
             )
         })?;
-        match observed {
-            None => {
+        match (
+            observed,
+            classify_supervisor_start_time(supervisor, observed),
+        ) {
+            (None, SupervisorLiveness::NotLive) => {
                 return Err(format!(
                     "refusing: stale custody residue at {}: recorded pid {} start time {}; live reading: pid is gone. Next step: inspect the stale lock, then remove or move it aside only after confirming no live holder before rerunning the probe.",
                     lock_path.display(),
-                    record.supervisor_pid,
-                    record.supervisor_start_time,
+                    supervisor.pid,
+                    supervisor.start_time,
                 ));
             }
-            Some(start_time) if start_time == record.supervisor_start_time => {
+            (Some(start_time), SupervisorLiveness::Live) => {
                 return Err(format!(
                     "refusing: another cerebellum holds this profile at {}: recorded pid {} start time {}; live reading: pid {} start time {}. Next step: wait for that supervisor to exit, then rerun the probe.",
                     lock_path.display(),
-                    record.supervisor_pid,
-                    record.supervisor_start_time,
-                    record.supervisor_pid,
+                    supervisor.pid,
+                    supervisor.start_time,
+                    supervisor.pid,
                     start_time,
                 ));
             }
-            Some(start_time) => {
+            (Some(start_time), SupervisorLiveness::NotLive) => {
                 return Err(format!(
                     "refusing: stale custody residue at {}: recorded pid {} start time {}; live reading: pid {} start time {} (PID reuse). Next step: inspect the stale lock, then remove or move it aside only after confirming no live holder before rerunning the probe.",
                     lock_path.display(),
-                    record.supervisor_pid,
-                    record.supervisor_start_time,
-                    record.supervisor_pid,
+                    supervisor.pid,
+                    supervisor.start_time,
+                    supervisor.pid,
                     start_time,
                 ));
             }
+            _ => unreachable!("supervisor liveness classification matches its observation"),
         }
     }
     Ok(())
@@ -962,32 +963,6 @@ fn is_holder_lock_path(path: &Path) -> bool {
         return false;
     };
     stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn read_custody_lock(path: &Path) -> Result<CustodyLockRecord, String> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        format!(
-            "refusing: could not read custody lock {}: {error}. Next step: repair access or inspect the lock manually before rerunning the probe.",
-            path.display()
-        )
-    })?;
-    let record: CustodyLockRecord = serde_json::from_slice(&bytes).map_err(|_| {
-        format!(
-            "refusing: could not read custody lock {}: invalid record. Next step: inspect the lock manually before rerunning the probe.",
-            path.display()
-        )
-    })?;
-    if record.format_version != CUSTODY_LOCK_FORMAT_VERSION
-        || record._holder_id.is_empty()
-        || record.supervisor_pid == 0
-        || record.supervisor_start_time == 0
-    {
-        return Err(format!(
-            "refusing: could not read custody lock {}: invalid record. Next step: inspect the lock manually before rerunning the probe.",
-            path.display()
-        ));
-    }
-    Ok(record)
 }
 
 fn observed_supervisor_start_time(pid: u32) -> Result<Option<u64>, String> {
