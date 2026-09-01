@@ -1,0 +1,21 @@
+[package]
+name = "cerebellum-windows"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Raw Windows process and window readings for ck-cerebellum. A thin FFI seam permitted to contain unsafe code."
+
+[lib]
+name = "cerebellum_windows"
+path = "src/lib.rs"
+
+# Windows bindings are needed only where their APIs exist. On every other host
+# this crate compiles to an empty library, so the workspace stays portable.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
