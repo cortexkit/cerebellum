@@ -17,9 +17,10 @@ mod windows;
 
 #[cfg(target_os = "windows")]
 pub use accessibility::{
-    read_accessibility_tree, AccessibilityReadBounds, AccessibilityReadFailure,
-    UiaAccessibilityTree, UiaControlTypeAndName, UiaElement, UiaElementIdentity, UiaRectangle,
-    UiaTreeCompleteness,
+    invoke_accessibility_element, read_accessibility_tree, AccessibilityInvokeBounds,
+    AccessibilityInvokeError, AccessibilityInvokeOutcome, AccessibilityReadBounds,
+    AccessibilityReadFailure, UiaAccessibilityTree, UiaControlTypeAndName, UiaElement,
+    UiaElementIdentity, UiaElementName, UiaRectangle, UiaTreeCompleteness,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{

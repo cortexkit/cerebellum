@@ -133,20 +133,41 @@ fn no_function_here_claims_to_judge() {
 }
 
 #[test]
-fn accessibility_reader_exposes_no_control_actuation() {
+fn accessibility_actuator_is_single_pattern_and_has_no_semantic_mapping() {
     let source = std::fs::read_to_string(crate_root().join("src/accessibility.rs"))
-        .expect("the accessibility reader source is readable");
-    for actuator in [
-        "InvokePattern",
-        "GetCurrentPattern",
-        "PerformAction",
+        .expect("the accessibility source is readable");
+    let invoke_pattern_id = source
+        .find("method(element.as_raw(), UIA_InvokePatternId, &mut raw)")
+        .expect("the actuator requests the fixed UIA Invoke pattern ID");
+    let invoke_slot = source
+        .find("const INVOKE_PATTERN_INVOKE: usize = 3;")
+        .expect("the actuator calls IUIAutomationInvokePattern::Invoke");
+    let entry_point = source
+        .find("pub fn invoke_accessibility_element(")
+        .expect("the actuator has one fixed-pattern entry point");
+
+    assert!(
+        invoke_slot < entry_point && invoke_pattern_id > entry_point,
+        "the public entry point must use the fixed Invoke-pattern ABI in its implementation"
+    );
+    assert!(
+        source.contains(".query_interface(&IID_IUI_AUTOMATION_INVOKE_PATTERN)"),
+        "the returned IUnknown must become an IUIAutomationInvokePattern before Invoke"
+    );
+    for unsupported_surface in [
+        "SemanticActionIntent",
+        "SemanticActionPlatform",
+        "UnsupportedSemanticAction",
         "request_accessibility_action",
+        "action: &str",
+        "action: String",
+        "Cancel",
         "ELEMENT_SET_FOCUS",
         "IUIAutomationElement::SetFocus",
     ] {
         assert!(
-            !source.contains(actuator),
-            "the read-only UIA seam contains the actuation entry point `{actuator}`"
+            !source.contains(unsupported_surface),
+            "the Windows seam must not expose `{unsupported_surface}` as another action path"
         );
     }
 }

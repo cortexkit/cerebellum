@@ -22,6 +22,26 @@ impl Default for AccessibilityReadBounds {
     }
 }
 
+/// Resource bounds applied while re-finding an element for one UI Automation invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessibilityInvokeBounds {
+    pub timeout: Duration,
+    /// A root has depth zero.
+    pub max_depth: usize,
+    /// Shared by all roots and descendants inspected for one exact match.
+    pub max_elements: usize,
+}
+
+impl Default for AccessibilityInvokeBounds {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(3),
+            max_depth: MAX_RECURSIVE_TREE_DEPTH,
+            max_elements: 10_000,
+        }
+    }
+}
+
 /// A rectangle reported in Windows desktop coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiaRectangle {
@@ -46,6 +66,48 @@ pub struct UiaElementIdentity {
     /// UIA commonly reports an empty automation ID; that is represented as absent.
     pub automation_id: Option<String>,
     pub control_type_and_name: UiaControlTypeAndName,
+}
+
+/// One exact UI Automation key used to re-find a current element.
+///
+/// Each form is matched independently. In particular, naming an automation ID
+/// never permits a fallback to a control type and name pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UiaElementName {
+    AutomationId(String),
+    ControlTypeAndName(UiaControlTypeAndName),
+}
+
+impl UiaElementName {
+    pub fn automation_id(automation_id: impl Into<String>) -> Self {
+        Self::AutomationId(automation_id.into())
+    }
+
+    pub fn control_type_and_name(control_type: i32, name: impl Into<String>) -> Self {
+        Self::ControlTypeAndName(UiaControlTypeAndName {
+            control_type,
+            name: name.into(),
+        })
+    }
+
+    fn matches(&self, identity: &UiaElementIdentity) -> bool {
+        match self {
+            Self::AutomationId(expected) => identity.automation_id.as_deref() == Some(expected),
+            Self::ControlTypeAndName(expected) => &identity.control_type_and_name == expected,
+        }
+    }
+
+    fn alternate_name(&self, identity: &UiaElementIdentity) -> Option<Self> {
+        match self {
+            Self::AutomationId(_) => Some(Self::ControlTypeAndName(
+                identity.control_type_and_name.clone(),
+            )),
+            Self::ControlTypeAndName(_) => identity
+                .automation_id
+                .as_ref()
+                .map(|automation_id| Self::AutomationId(automation_id.clone())),
+        }
+    }
 }
 
 /// One readable control-view element and the descendants reported beneath it.
@@ -98,6 +160,43 @@ pub enum AccessibilityReadFailure {
     TreeExceedsBound,
     IncompatiblePlatformValue,
     PlatformReadFailed,
+}
+
+/// What a UI Automation invocation establishes when its provider returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessibilityInvokeOutcome {
+    /// The target's invoke-pattern handler returned success. This does not
+    /// establish that the handler changed application or screen state.
+    HandlerReturned {
+        /// The exact key supplied by the caller and used for the unique match.
+        matched_by: UiaElementName,
+        /// The other supported key, when the matched element reported one.
+        alternate_name: Option<UiaElementName>,
+        /// Scopes omitted from the fresh element search before the invocation.
+        unreadable_subtrees: usize,
+        /// Whether the foreground window differed immediately after the provider
+        /// handler returned from the window observed immediately before it ran.
+        foreground_window_changed: bool,
+    },
+}
+
+/// Why one UI Automation invocation could not be completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessibilityInvokeError {
+    /// Re-finding the current element could not finish.
+    Resolution(AccessibilityReadFailure),
+    ElementNotFound {
+        element_name: UiaElementName,
+    },
+    ElementNameAmbiguous {
+        element_name: UiaElementName,
+        match_count: usize,
+    },
+    InvokePatternUnavailable {
+        element_name: UiaElementName,
+    },
+    /// The provider did not return successfully from its invoke-pattern call.
+    Invocation(AccessibilityReadFailure),
 }
 
 const MAX_RECURSIVE_TREE_DEPTH: usize = 32;
@@ -179,6 +278,23 @@ trait ElementSource {
         element: &Self::Handle,
         deadline: &Deadline,
     ) -> Result<Option<Self::Handle>, AccessibilityReadFailure>;
+}
+
+trait InvokeSource: ElementSource {
+    type InvokePattern;
+    type ForegroundWindow: PartialEq;
+
+    fn current_invoke_pattern(
+        &mut self,
+        element: &Self::Handle,
+        deadline: &Deadline,
+    ) -> Result<Option<Self::InvokePattern>, AccessibilityReadFailure>;
+    fn invoke_pattern(
+        &mut self,
+        pattern: &Self::InvokePattern,
+        deadline: &Deadline,
+    ) -> Result<(), AccessibilityReadFailure>;
+    fn foreground_window(&mut self) -> Option<Self::ForegroundWindow>;
 }
 
 enum ElementRead {
@@ -412,6 +528,187 @@ fn read_element<Source: ElementSource>(
     })))
 }
 
+struct InvokeTarget<Handle> {
+    handle: Handle,
+    alternate_name: Option<UiaElementName>,
+}
+
+struct InvokeSearchState<'a, Handle> {
+    element_name: &'a UiaElementName,
+    count: usize,
+    match_count: usize,
+    found: Option<InvokeTarget<Handle>>,
+    unreadable_subtrees: usize,
+    bounds: AccessibilityInvokeBounds,
+    deadline: &'a Deadline,
+}
+
+/// Walk every currently readable control-view scope to establish whether the
+/// exact element key is unique. A read failure in one descendant is retained as
+/// a count rather than silently turning a partial search into a complete one.
+fn find_invoke_target<Source: ElementSource>(
+    source: &mut Source,
+    handle: &Source::Handle,
+    depth: usize,
+    ancestors: &mut Vec<Source::Handle>,
+    state: &mut InvokeSearchState<'_, Source::Handle>,
+) -> Result<(), AccessibilityReadFailure> {
+    for ancestor in ancestors.iter() {
+        match source.same_element(handle, ancestor, state.deadline) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(failure) if requires_whole_read_stop(failure) => return Err(failure),
+            Err(_) => {
+                state.unreadable_subtrees = state.unreadable_subtrees.saturating_add(1);
+                return Ok(());
+            }
+        }
+    }
+
+    if depth > state.bounds.max_depth || state.count >= state.bounds.max_elements {
+        state.unreadable_subtrees = state.unreadable_subtrees.saturating_add(1);
+        return Ok(());
+    }
+    state.count = state.count.saturating_add(1);
+    state.deadline.remaining()?;
+
+    let snapshot = match source.snapshot(handle, state.deadline) {
+        Ok(snapshot) => snapshot,
+        Err(failure) if requires_whole_read_stop(failure) => return Err(failure),
+        Err(_) => {
+            state.unreadable_subtrees = state.unreadable_subtrees.saturating_add(1);
+            return Ok(());
+        }
+    };
+    if state.element_name.matches(&snapshot.identity) {
+        state.match_count = state.match_count.saturating_add(1);
+        if state.found.is_none() {
+            state.found = Some(InvokeTarget {
+                handle: handle.clone(),
+                alternate_name: state.element_name.alternate_name(&snapshot.identity),
+            });
+        }
+    }
+
+    ancestors.push(handle.clone());
+    let mut current = match source.first_child(handle, state.deadline) {
+        Ok(child) => child,
+        Err(failure) if requires_whole_read_stop(failure) => return Err(failure),
+        Err(_) => {
+            state.unreadable_subtrees = state.unreadable_subtrees.saturating_add(1);
+            None
+        }
+    };
+    while let Some(child) = current {
+        find_invoke_target(source, &child, depth.saturating_add(1), ancestors, state)?;
+        current = match source.next_sibling(handle, &child, state.deadline) {
+            Ok(next) => next,
+            Err(failure) if requires_whole_read_stop(failure) => return Err(failure),
+            Err(_) => {
+                state.unreadable_subtrees = state.unreadable_subtrees.saturating_add(1);
+                None
+            }
+        };
+    }
+    ancestors.pop();
+    Ok(())
+}
+
+fn re_find_invoke_target<Source: ElementSource>(
+    source: &mut Source,
+    pid: u32,
+    element_name: &UiaElementName,
+    bounds: AccessibilityInvokeBounds,
+    deadline: &Deadline,
+) -> Result<(InvokeTarget<Source::Handle>, usize), AccessibilityInvokeError> {
+    deadline
+        .remaining()
+        .map_err(AccessibilityInvokeError::Resolution)?;
+    let roots = source
+        .roots(pid, bounds.max_elements, deadline)
+        .map_err(AccessibilityInvokeError::Resolution)?;
+    if roots.roots.is_empty() {
+        return Err(AccessibilityInvokeError::Resolution(
+            roots
+                .unreadable_roots
+                .first()
+                .copied()
+                .unwrap_or(AccessibilityReadFailure::TargetNotInspectable),
+        ));
+    }
+
+    let mut state = InvokeSearchState {
+        element_name,
+        count: 0,
+        match_count: 0,
+        found: None,
+        unreadable_subtrees: roots.unreadable_roots.len(),
+        bounds,
+        deadline,
+    };
+    for root in &roots.roots {
+        find_invoke_target(source, root, 0, &mut Vec::new(), &mut state)
+            .map_err(AccessibilityInvokeError::Resolution)?;
+    }
+    if state.match_count > 1 {
+        return Err(AccessibilityInvokeError::ElementNameAmbiguous {
+            element_name: element_name.clone(),
+            match_count: state.match_count,
+        });
+    }
+    let target = state
+        .found
+        .ok_or_else(|| AccessibilityInvokeError::ElementNotFound {
+            element_name: element_name.clone(),
+        })?;
+    Ok((target, state.unreadable_subtrees))
+}
+
+fn invoke_accessibility_from<Source: InvokeSource>(
+    source: &mut Source,
+    pid: u32,
+    element_name: &UiaElementName,
+    bounds: AccessibilityInvokeBounds,
+) -> Result<AccessibilityInvokeOutcome, AccessibilityInvokeError> {
+    let bounds = AccessibilityInvokeBounds {
+        max_depth: supported_depth(bounds.max_depth),
+        ..bounds
+    };
+    let deadline = Deadline::new(bounds.timeout);
+    let (target, unreadable_subtrees) =
+        re_find_invoke_target(source, pid, element_name, bounds, &deadline)?;
+
+    let pattern = source
+        .current_invoke_pattern(&target.handle, &deadline)
+        .map_err(AccessibilityInvokeError::Invocation)?
+        .ok_or_else(|| AccessibilityInvokeError::InvokePatternUnavailable {
+            element_name: element_name.clone(),
+        })?;
+
+    // The uniqueness traversal is complete before this point. The two foreground
+    // reads directly surround the only provider invocation, so the outcome reports
+    // the window-server change that occurred across that call rather than assuming
+    // that disabling UIA's automatic focus kept every provider from changing focus.
+    let foreground_before = source.foreground_window();
+    deadline
+        .remaining()
+        .map_err(AccessibilityInvokeError::Invocation)?;
+    source
+        .invoke_pattern(&pattern, &deadline)
+        .map_err(AccessibilityInvokeError::Invocation)?;
+    let foreground_after = source.foreground_window();
+    deadline
+        .remaining()
+        .map_err(AccessibilityInvokeError::Invocation)?;
+
+    Ok(AccessibilityInvokeOutcome::HandlerReturned {
+        matched_by: element_name.clone(),
+        alternate_name: target.alternate_name,
+        unreadable_subtrees,
+        foreground_window_changed: foreground_before != foreground_after,
+    })
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use std::ffi::c_void;
@@ -427,23 +724,33 @@ mod platform {
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
     };
-    use windows_sys::Win32::UI::Accessibility::CUIAutomation8;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+    use windows_sys::Win32::UI::Accessibility::{CUIAutomation8, UIA_InvokePatternId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetForegroundWindow, GetWindowThreadProcessId,
+    };
 
     use super::{
-        failure_for_hresult, read_tree_before_deadline, AccessibilityReadBounds,
-        AccessibilityReadFailure, Deadline, ElementSnapshot, ElementSource, RootSnapshot,
-        TargetState, UiaAccessibilityTree, UiaControlTypeAndName, UiaElementIdentity, UiaRectangle,
+        failure_for_hresult, invoke_accessibility_from, read_tree_before_deadline,
+        AccessibilityInvokeBounds, AccessibilityInvokeError, AccessibilityInvokeOutcome,
+        AccessibilityReadBounds, AccessibilityReadFailure, Deadline, ElementSnapshot,
+        ElementSource, InvokeSource, RootSnapshot, TargetState, UiaAccessibilityTree,
+        UiaControlTypeAndName, UiaElementIdentity, UiaElementName, UiaRectangle,
     };
     use crate::windows::{process_start_time, ProcessStartTime};
 
     const IID_IUI_AUTOMATION2: GUID = GUID::from_u128(0x34723aff_0c9d_49d0_9896_7ab52df8cd8a);
 
+    const IUNKNOWN_QUERY_INTERFACE: usize = 0;
     const IUNKNOWN_ADD_REF: usize = 1;
     const IUNKNOWN_RELEASE: usize = 2;
     const UIA_COMPARE_ELEMENTS: usize = 3;
     const UIA_ELEMENT_FROM_HANDLE: usize = 6;
     const UIA_CONTROL_VIEW_WALKER: usize = 14;
+
+    const ELEMENT_GET_CURRENT_PATTERN: usize = 16;
+    const INVOKE_PATTERN_INVOKE: usize = 3;
+    const IID_IUI_AUTOMATION_INVOKE_PATTERN: GUID =
+        GUID::from_u128(0xfb377fbe_8ea6_46d5_9c73_6499642d3059);
     // IUIAutomation contributes 55 methods after IUnknown. These are the
     // IUIAutomation2 property setters in the inherited COM vtable.
     const UIA2_PUT_AUTO_SET_FOCUS: usize = 59;
@@ -484,6 +791,30 @@ mod platform {
             .map_err(|_| AccessibilityReadFailure::PlatformReadFailed)?
     }
 
+    /// Re-find one uniquely named current element and invoke its Invoke pattern.
+    ///
+    /// A result means only that the provider handler returned. It does not prove
+    /// that the provider produced an application-visible effect.
+    pub fn invoke_accessibility_element(
+        pid: u32,
+        element_name: &UiaElementName,
+        bounds: AccessibilityInvokeBounds,
+    ) -> Result<AccessibilityInvokeOutcome, AccessibilityInvokeError> {
+        std::thread::Builder::new()
+            .name("cerebellum-uia-invoker".to_owned())
+            .spawn({
+                let element_name = element_name.clone();
+                move || invoke_on_mta(pid, &element_name, bounds)
+            })
+            .map_err(|_| {
+                AccessibilityInvokeError::Invocation(AccessibilityReadFailure::PlatformReadFailed)
+            })?
+            .join()
+            .map_err(|_| {
+                AccessibilityInvokeError::Invocation(AccessibilityReadFailure::PlatformReadFailed)
+            })?
+    }
+
     fn read_on_mta(
         pid: u32,
         bounds: AccessibilityReadBounds,
@@ -496,6 +827,24 @@ mod platform {
         let tree = read_tree_before_deadline(&mut source, pid, bounds, &deadline)?;
         source.confirm_target()?;
         Ok(tree)
+    }
+
+    fn invoke_on_mta(
+        pid: u32,
+        element_name: &UiaElementName,
+        bounds: AccessibilityInvokeBounds,
+    ) -> Result<AccessibilityInvokeOutcome, AccessibilityInvokeError> {
+        let _apartment =
+            ComApartment::initialize().map_err(AccessibilityInvokeError::Invocation)?;
+        let initial_start =
+            initial_process_start(pid).map_err(AccessibilityInvokeError::Resolution)?;
+        let deadline = Deadline::new(bounds.timeout);
+        let remaining = deadline
+            .remaining()
+            .map_err(AccessibilityInvokeError::Resolution)?;
+        let mut source = UiaSource::new(pid, initial_start, remaining)
+            .map_err(AccessibilityInvokeError::Resolution)?;
+        invoke_accessibility_from(&mut source, pid, element_name, bounds)
     }
 
     fn initial_process_start(pid: u32) -> Result<u64, AccessibilityReadFailure> {
@@ -544,6 +893,20 @@ mod platform {
 
         fn as_raw(&self) -> *mut c_void {
             self.0.as_ptr()
+        }
+
+        fn query_interface(&self, iid: &GUID) -> Result<Option<Self>, HRESULT> {
+            type QueryInterface =
+                unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+            // SAFETY: this is IUnknown::QueryInterface at the fixed inherited
+            // vtable slot, and `iid` and `raw` remain valid throughout the call.
+            let query_interface: QueryInterface =
+                unsafe { mem::transmute(self.slot(IUNKNOWN_QUERY_INTERFACE)) };
+            let mut raw = ptr::null_mut();
+            // SAFETY: `self` is a live COM interface pointer and `raw` is writable.
+            hresult(unsafe { query_interface(self.as_raw(), iid, &mut raw) })?;
+            // SAFETY: a non-null successful COM out pointer carries one owned reference.
+            Ok(unsafe { Self::from_raw(raw) })
         }
 
         unsafe fn slot(&self, index: usize) -> *const c_void {
@@ -781,6 +1144,43 @@ mod platform {
             Ok(unsafe { ComPtr::from_raw(raw) })
         }
 
+        fn current_invoke_pattern(
+            &self,
+            element: &ComPtr,
+        ) -> Result<Option<ComPtr>, AccessibilityReadFailure> {
+            type Method = unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> HRESULT;
+            // SAFETY: this is IUIAutomationElement::GetCurrentPattern in the
+            // documented inherited vtable, requesting UIA_InvokePatternId.
+            let method: Method =
+                unsafe { mem::transmute(element.slot(ELEMENT_GET_CURRENT_PATTERN)) };
+            let mut raw = ptr::null_mut();
+            // SAFETY: the element is live, the pattern ID is passed by value, and
+            // `raw` is a writable interface out pointer for this synchronous call.
+            let result = unsafe { method(element.as_raw(), UIA_InvokePatternId, &mut raw) };
+            hresult(result).map_err(|code| self.map_hresult(code))?;
+            // GetCurrentPattern returns IUnknown. Query it for the Invoke-pattern
+            // interface before using the pattern-specific vtable slot below.
+            // SAFETY: a non-null successful COM out pointer carries one owned reference.
+            let current = unsafe { ComPtr::from_raw(raw) };
+            Ok(current
+                .map(|current| {
+                    current
+                        .query_interface(&IID_IUI_AUTOMATION_INVOKE_PATTERN)
+                        .map_err(|code| self.map_hresult(code))
+                })
+                .transpose()?
+                .flatten())
+        }
+
+        fn invoke_pattern_handler(&self, pattern: &ComPtr) -> Result<(), AccessibilityReadFailure> {
+            type Method = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+            // SAFETY: Invoke is the first IUIAutomationInvokePattern method after
+            // IUnknown in the documented pattern vtable.
+            let method: Method = unsafe { mem::transmute(pattern.slot(INVOKE_PATTERN_INVOKE)) };
+            // SAFETY: `pattern` owns a live IUIAutomationInvokePattern reference.
+            hresult(unsafe { method(pattern.as_raw()) }).map_err(|code| self.map_hresult(code))
+        }
+
         fn element_i32(
             &self,
             element: &ComPtr,
@@ -964,6 +1364,36 @@ mod platform {
         }
     }
 
+    impl InvokeSource for UiaSource {
+        type InvokePattern = ComPtr;
+        type ForegroundWindow = HWND;
+
+        fn current_invoke_pattern(
+            &mut self,
+            element: &Self::Handle,
+            deadline: &Deadline,
+        ) -> Result<Option<Self::InvokePattern>, AccessibilityReadFailure> {
+            self.confirm_target()?;
+            self.prepare_call(deadline)?;
+            UiaSource::current_invoke_pattern(self, element)
+        }
+
+        fn invoke_pattern(
+            &mut self,
+            pattern: &Self::InvokePattern,
+            _deadline: &Deadline,
+        ) -> Result<(), AccessibilityReadFailure> {
+            UiaSource::invoke_pattern_handler(self, pattern)
+        }
+
+        fn foreground_window(&mut self) -> Option<Self::ForegroundWindow> {
+            // SAFETY: GetForegroundWindow takes no pointers and returns the current
+            // thread-safe HWND value without transferring ownership.
+            let window = unsafe { GetForegroundWindow() };
+            (!window.is_null()).then_some(window)
+        }
+    }
+
     fn nonempty(value: String) -> Option<String> {
         if value.is_empty() {
             None
@@ -1052,7 +1482,7 @@ mod platform {
 }
 
 #[cfg(target_os = "windows")]
-pub use platform::read_accessibility_tree;
+pub use platform::{invoke_accessibility_element, read_accessibility_tree};
 
 #[cfg(test)]
 mod tests {
@@ -1071,6 +1501,13 @@ mod tests {
         nodes: HashMap<usize, FakeNode>,
         snapshot_failure: Option<(usize, AccessibilityReadFailure)>,
         children_failure: Option<(usize, AccessibilityReadFailure)>,
+        current_pattern_failure: Option<(usize, AccessibilityReadFailure)>,
+        invoke_failure: Option<AccessibilityReadFailure>,
+        unavailable_patterns: Vec<usize>,
+        foreground_windows: Vec<Option<usize>>,
+        foreground_reads: usize,
+        current_pattern_calls: Vec<usize>,
+        invoke_pattern_calls: Vec<usize>,
         calls: usize,
     }
 
@@ -1081,6 +1518,13 @@ mod tests {
                 nodes: nodes.into_iter().collect(),
                 snapshot_failure: None,
                 children_failure: None,
+                current_pattern_failure: None,
+                invoke_failure: None,
+                unavailable_patterns: Vec::new(),
+                foreground_windows: vec![None],
+                foreground_reads: 0,
+                current_pattern_calls: Vec::new(),
+                invoke_pattern_calls: Vec::new(),
                 calls: 0,
             }
         }
@@ -1171,6 +1615,48 @@ mod tests {
         }
     }
 
+    impl InvokeSource for FakeSource {
+        type InvokePattern = usize;
+        type ForegroundWindow = usize;
+
+        fn current_invoke_pattern(
+            &mut self,
+            element: &Self::Handle,
+            _deadline: &Deadline,
+        ) -> Result<Option<Self::InvokePattern>, AccessibilityReadFailure> {
+            self.current_pattern_calls.push(*element);
+            if self
+                .current_pattern_failure
+                .is_some_and(|(failed, _)| failed == *element)
+            {
+                return Err(self
+                    .current_pattern_failure
+                    .expect("the failure was present")
+                    .1);
+            }
+            Ok((!self.unavailable_patterns.contains(element)).then_some(*element))
+        }
+
+        fn invoke_pattern(
+            &mut self,
+            pattern: &Self::InvokePattern,
+            _deadline: &Deadline,
+        ) -> Result<(), AccessibilityReadFailure> {
+            self.invoke_pattern_calls.push(*pattern);
+            self.invoke_failure.map_or(Ok(()), Err)
+        }
+
+        fn foreground_window(&mut self) -> Option<Self::ForegroundWindow> {
+            let index = self.foreground_reads;
+            self.foreground_reads = self.foreground_reads.saturating_add(1);
+            self.foreground_windows
+                .get(index)
+                .copied()
+                .or_else(|| self.foreground_windows.last().copied())
+                .flatten()
+        }
+    }
+
     fn node(
         automation_id: Option<&str>,
         control_type: i32,
@@ -1211,6 +1697,137 @@ mod tests {
             max_depth,
             max_elements,
         }
+    }
+
+    fn invoke_bounds(max_depth: usize, max_elements: usize) -> AccessibilityInvokeBounds {
+        AccessibilityInvokeBounds {
+            timeout: Duration::from_secs(1),
+            max_depth,
+            max_elements,
+        }
+    }
+
+    #[test]
+    fn duplicate_current_key_returns_match_count_without_calling_a_pattern() {
+        let mut source = FakeSource::new(
+            vec![0],
+            [
+                (0, node(None, 1, "root", vec![1, 2])),
+                (1, node(Some("duplicate"), 2, "first", Vec::new())),
+                (2, node(Some("duplicate"), 2, "second", Vec::new())),
+            ],
+        );
+        let name = UiaElementName::automation_id("duplicate");
+
+        assert_eq!(
+            invoke_accessibility_from(&mut source, 42, &name, invoke_bounds(2, 3)),
+            Err(AccessibilityInvokeError::ElementNameAmbiguous {
+                element_name: name,
+                match_count: 2,
+            })
+        );
+        assert!(source.current_pattern_calls.is_empty());
+        assert!(source.invoke_pattern_calls.is_empty());
+    }
+
+    #[test]
+    fn fresh_resolution_rejects_a_key_that_became_ambiguous_after_a_tree_read() {
+        let mut source = FakeSource::new(
+            vec![0],
+            [
+                (0, node(None, 1, "root", vec![1])),
+                (1, node(Some("target"), 2, "first", Vec::new())),
+            ],
+        );
+        let initial = read_tree_from(&mut source, 42, bounds(1, 2)).expect("constructed read");
+        assert_eq!(initial.completeness, UiaTreeCompleteness::Complete);
+
+        source
+            .nodes
+            .insert(2, node(Some("target"), 2, "second", Vec::new()));
+        source
+            .nodes
+            .get_mut(&0)
+            .expect("constructed root")
+            .children
+            .push(2);
+        let name = UiaElementName::automation_id("target");
+
+        assert_eq!(
+            invoke_accessibility_from(&mut source, 42, &name, invoke_bounds(1, 3)),
+            Err(AccessibilityInvokeError::ElementNameAmbiguous {
+                element_name: name,
+                match_count: 2,
+            })
+        );
+        assert!(source.current_pattern_calls.is_empty());
+        assert!(source.invoke_pattern_calls.is_empty());
+    }
+
+    #[test]
+    fn a_returning_fake_handler_reports_its_return_and_foreground_change() {
+        let mut source = FakeSource::new(
+            vec![0],
+            [(0, node(Some("save"), 50_000, "Save", Vec::new()))],
+        );
+        source.foreground_windows = vec![Some(10), Some(11)];
+        let name = UiaElementName::control_type_and_name(50_000, "Save");
+
+        assert_eq!(
+            invoke_accessibility_from(&mut source, 42, &name, invoke_bounds(0, 1)),
+            Ok(AccessibilityInvokeOutcome::HandlerReturned {
+                matched_by: name,
+                alternate_name: Some(UiaElementName::automation_id("save")),
+                unreadable_subtrees: 0,
+                foreground_window_changed: true,
+            })
+        );
+        assert_eq!(source.current_pattern_calls, vec![0]);
+        assert_eq!(source.invoke_pattern_calls, vec![0]);
+        assert_eq!(source.foreground_reads, 2);
+    }
+
+    #[test]
+    fn a_returning_fake_handler_discloses_an_unreadable_search_subtree() {
+        let mut source = FakeSource::new(
+            vec![0],
+            [
+                (0, node(None, 1, "root", vec![1, 2])),
+                (1, node(Some("save"), 50_000, "Save", Vec::new())),
+                (2, node(Some("unreadable"), 50_000, "Other", Vec::new())),
+            ],
+        );
+        source.snapshot_failure = Some((2, AccessibilityReadFailure::TargetNotInspectable));
+        let name = UiaElementName::automation_id("save");
+
+        assert_eq!(
+            invoke_accessibility_from(&mut source, 42, &name, invoke_bounds(1, 3)),
+            Ok(AccessibilityInvokeOutcome::HandlerReturned {
+                matched_by: name,
+                alternate_name: Some(UiaElementName::control_type_and_name(50_000, "Save")),
+                unreadable_subtrees: 1,
+                foreground_window_changed: false,
+            })
+        );
+        assert_eq!(source.invoke_pattern_calls, vec![1]);
+    }
+
+    #[test]
+    fn an_element_without_the_invoke_pattern_never_reaches_the_fake_handler() {
+        let mut source = FakeSource::new(
+            vec![0],
+            [(0, node(Some("save"), 50_000, "Save", Vec::new()))],
+        );
+        source.unavailable_patterns.push(0);
+        let name = UiaElementName::automation_id("save");
+
+        assert_eq!(
+            invoke_accessibility_from(&mut source, 42, &name, invoke_bounds(0, 1)),
+            Err(AccessibilityInvokeError::InvokePatternUnavailable { element_name: name })
+        );
+        assert_eq!(source.current_pattern_calls, vec![0]);
+        assert!(source.invoke_pattern_calls.is_empty());
+        assert_eq!(source.foreground_reads, 0);
     }
 
     #[test]
