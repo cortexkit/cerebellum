@@ -172,7 +172,25 @@ pub fn current_supervisor_generation() -> Result<SupervisorGeneration, ProfileCu
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    // Linux reads the same fact from procfs, in the same shape the macOS arm
+    // consumes. It shipped with the Linux launch barrier and nothing called it,
+    // so custody refused here and the refusal surfaced as unavailable storage
+    // several layers up.
+    #[cfg(target_os = "linux")]
+    {
+        match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => {
+                Ok(SupervisorGeneration { pid, start_time })
+            }
+            _ => Err(ProfileCustodyLockError::SupervisorGenerationUnavailable),
+        }
+    }
+
+    // A platform with no start-time reading cannot distinguish this supervisor
+    // from a later process that inherited its PID, and custody depends on that
+    // distinction. Refusing is correct here; it is only wrong when a reading
+    // exists and goes uncalled.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         Err(ProfileCustodyLockError::SupervisorGenerationUnavailable)
