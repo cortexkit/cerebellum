@@ -85,3 +85,47 @@ if [ "$failed" -ne 0 ]; then
 fi
 
 echo "module wiring: every module under crates/*/src is declared by its parent"
+
+# Assert every example carrying tests declares an example target with test = true.
+#
+# Cargo defaults an example target to test = false, so `cargo test --workspace`
+# BUILDS the example and skips its #[cfg(test)] module. The tests still pass
+# whenever someone invokes them directly, which is what makes this hard to see:
+# they are neither broken nor unwritten, merely absent from the only command
+# anyone runs. Seven such tests sat in this repository until a contributor found
+# the same thing on their own branch.
+#
+# Worse than missing coverage, because a workspace count that does not move
+# reads as a count that had nothing to add.
+example_failed=0
+for example in crates/*/examples/*.rs; do
+  [ -e "$example" ] || continue
+  grep -qE '^\s*#\[(tokio::)?test\]' "$example" || continue
+
+  crate_dir="${example%/examples/*}"
+  name="$(basename "$example" .rs)"
+  manifest="$crate_dir/Cargo.toml"
+
+  # The declaration must name THIS example and enable tests for it. Reading the
+  # block rather than grepping for the name separately, so a test = true meant
+  # for a different example cannot satisfy this one.
+  if ! awk -v want="$name" '
+      /^\[\[example\]\]/ { in_block = 1; found_name = 0; found_test = 0; next }
+      /^\[/ && !/^\[\[example\]\]/ { in_block = 0 }
+      in_block && $0 ~ "name[[:space:]]*=[[:space:]]*\"" want "\"" { found_name = 1 }
+      in_block && $0 ~ /test[[:space:]]*=[[:space:]]*true/ { found_test = 1 }
+      found_name && found_test { print "ok"; exit }
+    ' "$manifest" | grep -q ok; then
+    echo "example tests never run: $example has tests, but $manifest does not declare"
+    echo "  [[example]] name = \"$name\" with test = true"
+    example_failed=1
+  fi
+done
+
+if [ "$example_failed" -ne 0 ]; then
+  echo
+  echo "Declare the example target with test = true, or the tests build and never run."
+  exit 1
+fi
+
+echo "example tests: every example carrying tests declares a target that runs them"
