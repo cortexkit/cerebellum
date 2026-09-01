@@ -131,3 +131,43 @@ fn no_function_here_claims_to_judge() {
         }
     }
 }
+
+#[test]
+fn accessibility_reader_exposes_no_control_actuation() {
+    let source = std::fs::read_to_string(crate_root().join("src/accessibility.rs"))
+        .expect("the accessibility reader source is readable");
+    for actuator in [
+        "InvokePattern",
+        "GetCurrentPattern",
+        "PerformAction",
+        "request_accessibility_action",
+        "ELEMENT_SET_FOCUS",
+        "IUIAutomationElement::SetFocus",
+    ] {
+        assert!(
+            !source.contains(actuator),
+            "the read-only UIA seam contains the actuation entry point `{actuator}`"
+        );
+    }
+}
+
+#[test]
+fn auto_focus_is_disabled_before_the_reader_can_obtain_an_element() {
+    let source = std::fs::read_to_string(crate_root().join("src/accessibility.rs"))
+        .expect("the accessibility reader source is readable");
+    let disable_focus = source
+        .find("Self::put_uia_bool(&automation, UIA2_PUT_AUTO_SET_FOCUS, false)")
+        .expect("the reader disables IUIAutomation2 automatic focus");
+    let source_ready = source[disable_focus..]
+        .find("Ok(Self {")
+        .map(|offset| disable_focus + offset)
+        .expect("the UIA source is constructed after automatic focus is disabled");
+    let first_element = source
+        .find("self.element_from_handle(hwnd)")
+        .expect("the reader has an element-access call site");
+
+    assert!(
+        disable_focus < source_ready && source_ready < first_element,
+        "automatic focus must be disabled before any UIA element is obtained"
+    );
+}
