@@ -14,10 +14,10 @@ use cerebellum::profile::{
     ProfileOutcome, ProfileState, RegistryConfig,
 };
 use cerebellum::profile_custody::{
-    classify_supervisor_start_time, ProfileCustodyAcquisition, ProfileCustodyEvent,
-    ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLockError,
-    ProfileCustodyLocks, ProfileCustodyRelease, SupervisorGeneration, SupervisorLiveness,
-    SupervisorLivenessProbe,
+    classify_supervisor_start_time, read_record_if_present, ProfileCustodyAcquisition,
+    ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey,
+    ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks, ProfileCustodyRelease,
+    SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
 };
 use serde_json::{json, Value};
 
@@ -412,6 +412,23 @@ fn a_recycled_pid_with_a_different_start_time_is_not_the_recorded_process() {
         breaker.acquire(key, new_holder),
         Ok(ProfileCustodyAcquisition::Acquired(_))
     ));
+}
+
+#[test]
+fn custody_lock_reader_exposes_the_validated_supervisor_generation() {
+    let root = TestRoot::new("public-lock-reader");
+    let lock = root.path().join("reader.lock");
+    fs::write(
+        &lock,
+        r#"{"format_version":"ck-browser-profile-custody-lock/v1","holder_id":"reader-holder","supervisor_pid":17,"supervisor_start_time":1700,"profile_directory":null}"#,
+    )
+    .unwrap();
+
+    let record: ProfileCustodyLockRecord = read_record_if_present(&lock)
+        .unwrap()
+        .expect("record is present");
+
+    assert_eq!(record.supervisor(), generation(17, 1700));
 }
 
 #[test]

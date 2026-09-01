@@ -11,26 +11,51 @@
 //! cargo run -p cerebellum --example live_launch
 //! ```
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cerebellum::browser_config::BrowserConfig;
+#[cfg(target_os = "linux")]
+use cerebellum::browser_launch::{LINUX_EXEC_CHAIN_HOP_LIMIT, LINUX_EXEC_CHAIN_PROBE_WINDOW};
 use cerebellum::management;
+use cerebellum::profile_custody::{
+    classify_supervisor_start_time, read_record_if_present, SupervisorLiveness,
+};
 use cerebellum::Planes;
 use cerebellum_core::health::HealthState;
+#[cfg(target_os = "linux")]
+use cerebellum_linux::{executed_image_identity, spawn_barred};
 use serde_json::{json, Value};
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use subc_protocol::session::ModuleControlRequest;
 use subc_protocol::{
     BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
-const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+#[cfg(target_os = "macos")]
+const MACOS_CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+#[cfg(target_os = "linux")]
+const LINUX_CHROME_CANDIDATES: [&str; 3] = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+];
+const CUSTODY_LOCK_DIRECTORY: &str = ".ck-browser-profile-custody";
 const TOOL_CHANNEL: u16 = 9;
 const TOOL_EPOCH: u32 = 3;
 const MANAGEMENT_CHANNEL: u16 = 4;
@@ -38,14 +63,21 @@ const MANAGEMENT_EPOCH: u32 = 1;
 
 #[tokio::main]
 async fn main() {
-    let executable = PathBuf::from(CHROME);
-    if !executable.is_file() {
-        eprintln!("skipped: no browser at {}", executable.display());
-        return;
+    if let Err(refusal) = precheck_custody_residue() {
+        eprintln!("{refusal}");
+        std::process::exit(1);
     }
-    let Some(identity) = signing_identifier(&executable) else {
-        eprintln!("skipped: could not read a signing identifier from the browser");
+
+    let Some(executable) = browser_executable() else {
+        eprintln!("skipped: no browser at {}", browser_search_description());
         return;
+    };
+    let identity = match browser_identity(&executable) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            eprintln!("skipped: {reason}");
+            return;
+        }
     };
     println!("browser identity: {identity}");
 
@@ -635,7 +667,217 @@ impl Drop for ProbePage {
     }
 }
 
-fn signing_identifier(path: &PathBuf) -> Option<String> {
+fn browser_executable() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = PathBuf::from(MACOS_CHROME);
+        path.is_file().then_some(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        LINUX_CHROME_CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    None
+}
+
+fn browser_search_description() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        MACOS_CHROME.to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        LINUX_CHROME_CANDIDATES.join(", ")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    "a supported browser path on this platform".to_string()
+}
+
+fn browser_identity(path: &Path) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        signing_identifier(path)
+            .ok_or_else(|| "could not read a signing identifier from the browser".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let probe_profile = browser_probe_profile_path();
+        let crash_dumps_directory = probe_profile.join("crash-dumps");
+        let arguments = browser_probe_arguments(&probe_profile, &crash_dumps_directory);
+        let environment = browser_probe_environment(&probe_profile);
+        let result = (|| {
+            let final_image = configured_terminal_image(path, &arguments, &environment)?;
+            let digest = sha256_file(&final_image).map_err(|error| {
+                format!(
+                    "could not hash browser image {}: {error}",
+                    final_image.display()
+                )
+            })?;
+            println!(
+                "browser final image hashed: {} {digest}",
+                final_image.display()
+            );
+            Ok(digest)
+        })();
+        let cleanup = cleanup_browser_probe(&probe_profile);
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(digest), Ok(())) => Ok(digest),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        Err("browser identity is unsupported on this platform".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_profile_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cerebellum-live-launch-image-probe-{}",
+        std::process::id()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_arguments(
+    profile_directory: &Path,
+    crash_dumps_directory: &Path,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("--remote-debugging-pipe"),
+        OsString::from(format!(
+            "--user-data-dir={}",
+            profile_directory.to_string_lossy()
+        )),
+        OsString::from(format!(
+            "--crash-dumps-dir={}",
+            crash_dumps_directory.to_string_lossy()
+        )),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+// Mirrors `browser_launch_environment` in the module, for the same reason the
+// argument shape is mirrored: a discovery walk that runs the browser under a
+// different environment than the launch does is measuring a different process.
+// With only XDG_CONFIG_HOME the browser has no display and exits before its
+// second exec, so the walk observes ProcessExited and no terminal image.
+//
+// This must remain an allowlist rather than inheritance. An inherited LD_PRELOAD
+// would let something else control the behaviour of the very binary this walk
+// exists to identify -- the digest would still be accurate and would no longer
+// mean anything.
+fn browser_probe_environment(probe_profile: &Path) -> Vec<(OsString, OsString)> {
+    const ALLOWED_PARENT_VARIABLES: [&str; 5] = [
+        "DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "WAYLAND_DISPLAY",
+        "HOME",
+    ];
+
+    let mut environment = vec![(
+        OsString::from("XDG_CONFIG_HOME"),
+        probe_profile.join("config").into_os_string(),
+    )];
+    environment.extend(
+        ALLOWED_PARENT_VARIABLES
+            .into_iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value))),
+    );
+    environment
+}
+
+#[cfg(target_os = "linux")]
+fn configured_terminal_image(
+    configured: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+) -> Result<PathBuf, String> {
+    let (command_child, _command_parent) = UnixStream::pair()
+        .map_err(|error| format!("could not create browser probe command pipe: {error}"))?;
+    let (_response_parent, response_child) = UnixStream::pair()
+        .map_err(|error| format!("could not create browser probe response pipe: {error}"))?;
+    let mut child = spawn_barred(
+        configured,
+        arguments,
+        environment,
+        command_child.as_raw_fd(),
+        response_child.as_raw_fd(),
+    )
+    .map_err(|error| format!("could not bar browser image discovery: {error:?}"))?;
+    let result = (|| {
+        let mut observed = executed_image_identity(child.generation().pid)
+            .map_err(|error| format!("could not read configured browser image: {error:?}"))?;
+        for _ in 0..LINUX_EXEC_CHAIN_HOP_LIMIT {
+            let Some(next) = child
+                .continue_to_next_exec_stop_with_deadline(
+                    LINUX_EXEC_CHAIN_HOP_LIMIT,
+                    std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW,
+                )
+                .map_err(|error| format!("could not walk browser exec chain: {error:?}"))?
+            else {
+                return Ok(observed.resolved_path);
+            };
+            observed = next;
+        }
+        Err(format!(
+            "could not identify terminal browser image after {LINUX_EXEC_CHAIN_HOP_LIMIT} exec hops"
+        ))
+    })();
+    let cleanup = child
+        .terminate_and_reap()
+        .map_err(|error| format!("could not reap browser image discovery: {error:?}"));
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(path), Ok(())) => Ok(path),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_browser_probe(probe_profile: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(probe_profile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove browser image probe tree {}: {error}",
+            probe_profile.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(format!("{:x}", digest.finalize()));
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signing_identifier(path: &Path) -> Option<String> {
     let output = std::process::Command::new("/usr/bin/codesign")
         .args(["-d", "--verbose=4"])
         .arg(path)
@@ -645,4 +887,238 @@ fn signing_identifier(path: &PathBuf) -> Option<String> {
     text.lines()
         .find_map(|line| line.strip_prefix("Identifier="))
         .map(str::to_string)
+}
+
+fn precheck_custody_residue() -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "refusing: could not determine HOME for custody inspection. Next step: set HOME and rerun the probe.".to_string())?;
+    let root = PathBuf::from(home)
+        .join(".local/share/cortexkit/cerebellum/browser")
+        .join(CUSTODY_LOCK_DIRECTORY);
+    check_custody_residue(&root, observed_supervisor_start_time)
+}
+
+fn check_custody_residue(
+    root: &Path,
+    mut observe: impl FnMut(u32) -> Result<Option<u64>, String>,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "refusing: could not inspect custody lock directory {}: {error}. Next step: repair its permissions or inspect it manually before rerunning the probe.",
+                root.display()
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "refusing: could not inspect custody lock directory {}: {error}. Next step: repair its permissions or inspect it manually before rerunning the probe.",
+                root.display()
+            )
+        })?;
+        let lock_path = entry.path();
+        if !is_holder_lock_path(&lock_path) {
+            continue;
+        }
+        let Some(record) = read_record_if_present(&lock_path).map_err(|error| {
+            format!(
+                "refusing: could not read custody lock {}: {error:?}. Next step: repair access or inspect the lock manually before rerunning the probe.",
+                lock_path.display()
+            )
+        })? else {
+            continue;
+        };
+        let supervisor = record.supervisor();
+        let observed = observe(supervisor.pid).map_err(|error| {
+            format!(
+                "refusing: could not read custody supervisor for {}: recorded pid {} start time {}; {error}. Next step: inspect the lock and supervisor before rerunning the probe.",
+                lock_path.display(),
+                supervisor.pid,
+                supervisor.start_time,
+            )
+        })?;
+        match (
+            observed,
+            classify_supervisor_start_time(supervisor, observed),
+        ) {
+            (None, SupervisorLiveness::NotLive) => {
+                return Err(format!(
+                    "refusing: stale custody residue at {}: recorded pid {} start time {}; live reading: pid is gone. Next step: inspect the stale lock, then remove or move it aside only after confirming no live holder before rerunning the probe.",
+                    lock_path.display(),
+                    supervisor.pid,
+                    supervisor.start_time,
+                ));
+            }
+            (Some(start_time), SupervisorLiveness::Live) => {
+                return Err(format!(
+                    "refusing: another cerebellum holds this profile at {}: recorded pid {} start time {}; live reading: pid {} start time {}. Next step: wait for that supervisor to exit, then rerun the probe.",
+                    lock_path.display(),
+                    supervisor.pid,
+                    supervisor.start_time,
+                    supervisor.pid,
+                    start_time,
+                ));
+            }
+            (Some(start_time), SupervisorLiveness::NotLive) => {
+                return Err(format!(
+                    "refusing: stale custody residue at {}: recorded pid {} start time {}; live reading: pid {} start time {} (PID reuse). Next step: inspect the stale lock, then remove or move it aside only after confirming no live holder before rerunning the probe.",
+                    lock_path.display(),
+                    supervisor.pid,
+                    supervisor.start_time,
+                    supervisor.pid,
+                    start_time,
+                ));
+            }
+            _ => unreachable!("supervisor liveness classification matches its observation"),
+        }
+    }
+    Ok(())
+}
+
+fn is_holder_lock_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".lock") else {
+        return false;
+    };
+    stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn observed_supervisor_start_time(pid: u32) -> Result<Option<u64>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => Ok(Some(start_time)),
+            cerebellum_linux::ProcessStartTime::NoSuchProcess => Ok(None),
+            outcome => Err(format!("live reading unavailable: {outcome:?}")),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match cerebellum_macos::process_start_time(pid) {
+            cerebellum_macos::ProcessStartTime::Started(start_time) => Ok(Some(start_time)),
+            cerebellum_macos::ProcessStartTime::NoSuchProcess => Ok(None),
+            outcome => Err(format!("live reading unavailable: {outcome:?}")),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        Err("live reading unavailable on this platform".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn custody_precheck_refuses_a_gone_supervisor() {
+        let root = fixture_root("gone-supervisor");
+        let lock = root.join(format!("{}.lock", "a".repeat(64)));
+        write_lock(&lock, 42, 100);
+
+        let refusal = check_custody_residue(&root, |_| Ok(None)).expect_err("stale lock refuses");
+
+        assert!(refusal.contains("pid is gone"), "{refusal}");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn custody_precheck_distinguishes_a_live_holder_from_pid_reuse() {
+        let root = fixture_root("live-and-reused");
+        let lock = root.join(format!("{}.lock", "b".repeat(64)));
+        write_lock(&lock, 42, 100);
+
+        let live =
+            check_custody_residue(&root, |_| Ok(Some(100))).expect_err("live holder refuses");
+        assert!(
+            live.contains("another cerebellum holds this profile"),
+            "{live}"
+        );
+
+        let reused =
+            check_custody_residue(&root, |_| Ok(Some(101))).expect_err("reused pid refuses");
+        assert!(reused.contains("PID reuse"), "{reused}");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn custody_precheck_refuses_a_malformed_holder_lock() {
+        let root = fixture_root("malformed-lock");
+        let lock = root.join(format!("{}.lock", "c".repeat(64)));
+        fs::write(&lock, "not json").expect("write malformed lock");
+
+        let refusal =
+            check_custody_residue(&root, |_| Ok(None)).expect_err("malformed lock refuses");
+
+        assert!(refusal.contains("could not read custody lock"), "{refusal}");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_terminal_image_walks_the_configured_exec_chain() {
+        let terminal_image = configured_terminal_image(
+            Path::new("/bin/sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("exec /bin/sleep 1"),
+            ],
+            &[],
+        )
+        .expect("walk configured shell to its terminal image");
+
+        assert_eq!(
+            terminal_image,
+            fs::canonicalize("/bin/sleep").expect("canonical terminal image")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_file_digest_is_lowercase_sha256() {
+        let root = fixture_root("digest");
+        let image = root.join("image");
+        fs::write(&image, "abc").expect("write image");
+
+        assert_eq!(
+            sha256_file(&image).expect("hash image"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    fn fixture_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cerebellum-live-launch-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&root).expect("create fixture root");
+        root
+    }
+
+    fn write_lock(path: &Path, pid: u32, start_time: u64) {
+        fs::write(
+            path,
+            format!(
+                r#"{{"format_version":"ck-browser-profile-custody-lock/v1","holder_id":"holder-test","supervisor_pid":{pid},"supervisor_start_time":{start_time},"profile_directory":"/tmp/profile"}}"#
+            ),
+        )
+        .expect("write lock");
+    }
 }
