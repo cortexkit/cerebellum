@@ -772,11 +772,35 @@ fn browser_probe_arguments(
 }
 
 #[cfg(target_os = "linux")]
+// Mirrors `browser_launch_environment` in the module, for the same reason the
+// argument shape is mirrored: a discovery walk that runs the browser under a
+// different environment than the launch does is measuring a different process.
+// With only XDG_CONFIG_HOME the browser has no display and exits before its
+// second exec, so the walk observes ProcessExited and no terminal image.
+//
+// This must remain an allowlist rather than inheritance. An inherited LD_PRELOAD
+// would let something else control the behaviour of the very binary this walk
+// exists to identify -- the digest would still be accurate and would no longer
+// mean anything.
 fn browser_probe_environment(probe_profile: &Path) -> Vec<(OsString, OsString)> {
-    vec![(
+    const ALLOWED_PARENT_VARIABLES: [&str; 5] = [
+        "DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "WAYLAND_DISPLAY",
+        "HOME",
+    ];
+
+    let mut environment = vec![(
         OsString::from("XDG_CONFIG_HOME"),
         probe_profile.join("config").into_os_string(),
-    )]
+    )];
+    environment.extend(
+        ALLOWED_PARENT_VARIABLES
+            .into_iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value))),
+    );
+    environment
 }
 
 #[cfg(target_os = "linux")]
