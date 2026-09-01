@@ -58,3 +58,7 @@ test = true
 [[example]]
 name = "live_native_menu"
 test = true
+
+[[example]]
+name = "live_launch"
+test = true
