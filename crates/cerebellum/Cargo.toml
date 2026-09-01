@@ -44,3 +44,17 @@ cerebellum-linux = { path = "../cerebellum-linux" }
 [dev-dependencies]
 subc-control = { workspace = true }
 subc-core = { workspace = true }
+
+# Examples carry their own tests, and cargo defaults an example target to
+# test = false -- so `cargo test --workspace` builds them and skips their
+# #[cfg(test)] modules. iceteaSA found the workspace count unmoved by five
+# tests that passed whenever anyone ran them directly. Tests that are neither
+# broken nor unwritten, merely invisible to the only command anyone runs, are
+# worse than missing ones: the count going up reads as coverage.
+[[example]]
+name = "live_native_click"
+test = true
+
+[[example]]
+name = "live_native_menu"
+test = true
