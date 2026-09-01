@@ -1103,7 +1103,7 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
 }
 
 #[cfg(target_os = "linux")]
-const LINUX_EXEC_CHAIN_HOP_LIMIT: usize = 8;
+pub const LINUX_EXEC_CHAIN_HOP_LIMIT: usize = 8;
 
 #[cfg(target_os = "linux")]
 /// A queued wrapper exec should arrive quickly; this window sizes observation,
@@ -1112,7 +1112,7 @@ const LINUX_EXEC_CHAIN_HOP_LIMIT: usize = 8;
 /// cold after evicting 303.9 of 305.5 MiB with `POSIX_FADV_DONTNEED`.
 /// `execve` reports `PTRACE_EVENT_EXEC` after headers and mappings, before the
 /// whole image is paged in, so 100 ms provides about 56× cold headroom.
-pub(crate) const LINUX_EXEC_CHAIN_PROBE_WINDOW: std::time::Duration =
+pub const LINUX_EXEC_CHAIN_PROBE_WINDOW: std::time::Duration =
     std::time::Duration::from_millis(100);
 
 #[cfg(target_os = "linux")]
