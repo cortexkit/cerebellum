@@ -12,11 +12,11 @@ use std::collections::HashMap;
 mod holder_lock;
 
 pub use holder_lock::{
-    classify_supervisor_start_time, current_supervisor_generation, FilesystemProfileCustodyJournal,
-    HolderId, KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyClaim,
-    ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey,
-    ProfileCustodyLockError, ProfileCustodyLocks, ProfileCustodyRelease, SupervisorGeneration,
-    SupervisorLiveness, SupervisorLivenessProbe,
+    classify_supervisor_start_time, current_supervisor_generation, read_record_if_present,
+    FilesystemProfileCustodyJournal, HolderId, KernelSupervisorLiveness, ProfileCustodyAcquisition,
+    ProfileCustodyClaim, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
+    ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks,
+    ProfileCustodyRelease, SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
 };
 
 /// The caller-visible reason for an unavailable profile-storage operation.
