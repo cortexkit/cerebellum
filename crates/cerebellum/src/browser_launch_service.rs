@@ -401,13 +401,35 @@ fn launch_recovery_refusal(failure: BrowserLaunchRecoveryFailure) -> Value {
     })
 }
 
+/// Exposed so the live probe can call it rather than mirroring it.
+///
+/// Two hand-written mirrors of launch inputs have drifted from production: the
+/// argument shape, and this environment. The second drift made the probe's
+/// discovery walk run a browser with no display -- so it measured a process the
+/// real launch never runs, and reported a clean failure about the wrong thing.
+/// A probe that diverges from production in a way that makes it PASS is worse
+/// than one that fails, because it certifies something nobody built.
+///
+/// Not part of the module's supported surface; it exists for the probe.
+#[doc(hidden)]
 #[cfg(target_os = "linux")]
-fn browser_launch_environment(profile_directory: &Path) -> Vec<(OsString, OsString)> {
+pub fn browser_launch_environment(profile_directory: &Path) -> Vec<(OsString, OsString)> {
     linux_browser_launch_environment_from(profile_directory, std::env::vars_os())
 }
 
+/// Exposed so the live probe can call it rather than mirroring it.
+///
+/// Two hand-written mirrors of launch inputs have drifted from production: the
+/// argument shape, and this environment. The second drift made the probe's
+/// discovery walk run a browser with no display -- so it measured a process the
+/// real launch never runs, and reported a clean failure about the wrong thing.
+/// A probe that diverges from production in a way that makes it PASS is worse
+/// than one that fails, because it certifies something nobody built.
+///
+/// Not part of the module's supported surface; it exists for the probe.
+#[doc(hidden)]
 #[cfg(target_os = "macos")]
-fn browser_launch_environment(_profile_directory: &Path) -> Vec<(OsString, OsString)> {
+pub fn browser_launch_environment(_profile_directory: &Path) -> Vec<(OsString, OsString)> {
     Vec::new()
 }
 
@@ -444,7 +466,8 @@ fn linux_browser_launch_environment_from(
     environment
 }
 
-pub(crate) fn browser_launch_arguments(
+#[doc(hidden)]
+pub fn browser_launch_arguments(
     profile_directory: &Path,
     crash_dumps_directory: &Path,
 ) -> Vec<OsString> {

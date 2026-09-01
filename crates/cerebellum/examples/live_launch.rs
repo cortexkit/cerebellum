@@ -712,8 +712,15 @@ fn browser_identity(path: &Path) -> Result<String, String> {
     {
         let probe_profile = browser_probe_profile_path();
         let crash_dumps_directory = probe_profile.join("crash-dumps");
-        let arguments = browser_probe_arguments(&probe_profile, &crash_dumps_directory);
-        let environment = browser_probe_environment(&probe_profile);
+        let arguments = cerebellum::browser_launch_service::browser_launch_arguments(
+            &probe_profile,
+            &crash_dumps_directory,
+        );
+        // The production function itself, not a copy of it. Two mirrors of launch
+        // inputs have drifted before, and the second made this very walk measure a
+        // browser with no display -- a process the real launch never runs.
+        let environment =
+            cerebellum::browser_launch_service::browser_launch_environment(&probe_profile);
         let result = (|| {
             let final_image = configured_terminal_image(path, &arguments, &environment)?;
             let digest = sha256_file(&final_image).map_err(|error| {
@@ -749,58 +756,6 @@ fn browser_probe_profile_path() -> PathBuf {
         "cerebellum-live-launch-image-probe-{}",
         std::process::id()
     ))
-}
-
-#[cfg(target_os = "linux")]
-fn browser_probe_arguments(
-    profile_directory: &Path,
-    crash_dumps_directory: &Path,
-) -> Vec<OsString> {
-    vec![
-        OsString::from("--remote-debugging-pipe"),
-        OsString::from(format!(
-            "--user-data-dir={}",
-            profile_directory.to_string_lossy()
-        )),
-        OsString::from(format!(
-            "--crash-dumps-dir={}",
-            crash_dumps_directory.to_string_lossy()
-        )),
-        OsString::from("--no-first-run"),
-        OsString::from("--no-default-browser-check"),
-    ]
-}
-
-#[cfg(target_os = "linux")]
-// Mirrors `browser_launch_environment` in the module, for the same reason the
-// argument shape is mirrored: a discovery walk that runs the browser under a
-// different environment than the launch does is measuring a different process.
-// With only XDG_CONFIG_HOME the browser has no display and exits before its
-// second exec, so the walk observes ProcessExited and no terminal image.
-//
-// This must remain an allowlist rather than inheritance. An inherited LD_PRELOAD
-// would let something else control the behaviour of the very binary this walk
-// exists to identify -- the digest would still be accurate and would no longer
-// mean anything.
-fn browser_probe_environment(probe_profile: &Path) -> Vec<(OsString, OsString)> {
-    const ALLOWED_PARENT_VARIABLES: [&str; 5] = [
-        "DISPLAY",
-        "XAUTHORITY",
-        "XDG_RUNTIME_DIR",
-        "WAYLAND_DISPLAY",
-        "HOME",
-    ];
-
-    let mut environment = vec![(
-        OsString::from("XDG_CONFIG_HOME"),
-        probe_profile.join("config").into_os_string(),
-    )];
-    environment.extend(
-        ALLOWED_PARENT_VARIABLES
-            .into_iter()
-            .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value))),
-    );
-    environment
 }
 
 #[cfg(target_os = "linux")]
