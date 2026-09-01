@@ -122,7 +122,7 @@ mod macos_probe {
     use cerebellum_computer::platform::macos::MacOs26PlatformDriver;
     use cerebellum_computer::platform::{
         AccessibilityElementName, AccessibilityTreeRequest, DispatchMode, ElementResolutionRequest,
-        PlatformDriver, ProcessGrant,
+        PlatformDriver, ProcessGrant, SEMANTIC_CANCEL_ACTION, SEMANTIC_PRESS_ACTION,
     };
     use cerebellum_core::clock::MonotonicClock;
     use cerebellum_core::health::HealthState;
@@ -522,7 +522,8 @@ mod macos_probe {
         match observe_open_then_close(session, planes, &target, &menu, before).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                let cancel = dispatch_semantic_action(planes, &target, &menu, "AXCancel").await;
+                let cancel =
+                    dispatch_semantic_action(planes, &target, &menu, SEMANTIC_CANCEL_ACTION).await;
                 Err(format!(
                     "{error}; best-effort AXCancel on the failure path: {cancel:?}"
                 ))
@@ -595,7 +596,7 @@ mod macos_probe {
                  menu bar item"
             ));
         }
-        dispatch_semantic_action(planes, target, menu, "AXPress").await
+        dispatch_semantic_action(planes, target, menu, SEMANTIC_PRESS_ACTION).await
     }
 
     async fn observe_open_then_close(
@@ -627,7 +628,8 @@ mod macos_probe {
             "left unproven: wire computer.click cannot carry AXCancel; the menu is closed \
              below the frozen wire schema"
         );
-        let cancel_outcome = dispatch_semantic_action(planes, target, menu, "AXCancel").await?;
+        let cancel_outcome =
+            dispatch_semantic_action(planes, target, menu, SEMANTIC_CANCEL_ACTION).await?;
         println!("AXCancel dispatcher outcome: {cancel_outcome}");
 
         let (closed_tree, closed_counts, closed_elapsed, closed_attempts) = wait_for_menu_counts(

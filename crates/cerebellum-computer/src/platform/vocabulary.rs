@@ -1,6 +1,8 @@
 //! Digest-pinned, canonical computer action vocabulary validation.
 
-use super::PermissionService;
+use super::{
+    delivered_semantic_action, PermissionService, SemanticActionIntent, SemanticActionPlatform,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -17,14 +19,14 @@ use std::sync::OnceLock;
 //               what each one accepts.
 //
 // Changing what a capability accepts bumps the REVISION only, which is why
-// these currently read /v1 and -v5: the v2-v5 cutovers changed nested request
+// these currently read /v1 and -v7: the v2-v7 cutovers changed nested request
 // and result schemas or action annotations inside rows whose shape was unchanged.
 // A reviewer read the mismatch as a mistake before finding both fields in the
 // artifact, so it is stated here rather than left to be re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v6";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v7";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v6.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v7.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -32,7 +34,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "6087aa9bbc0438e88bb1770770620fcc9bced779db9ce186b94d3e197195b674";
+    "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -477,7 +479,14 @@ fn validate_click_action_catalog(row: &Value) -> Result<(), VocabularyValidation
     let served = entries
         .iter()
         .filter(|entry| entry.get("served").and_then(Value::as_bool) == Some(true))
-        .filter_map(|entry| entry.get("action").cloned())
+        .filter_map(|entry| entry.get("action").and_then(Value::as_str))
+        .filter_map(|platform_action| {
+            SemanticActionIntent::ALL.into_iter().find(|intent| {
+                delivered_semantic_action(SemanticActionPlatform::MacOs, *intent)
+                    .is_ok_and(|delivered| delivered == platform_action)
+            })
+        })
+        .map(|intent| Value::String(intent.wire_name().to_owned()))
         .collect::<Vec<_>>();
     if admitted != &served {
         return Err(VocabularyValidationError::RowBinding(

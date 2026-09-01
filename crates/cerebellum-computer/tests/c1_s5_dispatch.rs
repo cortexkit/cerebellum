@@ -1322,10 +1322,10 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
                 alternate_name: None,
                 owning_process: foreign,
-                semantic_actions: vec!["AXPress".into()],
+                semantic_actions: vec![SEMANTIC_PRESS_ACTION.into()],
                 unreadable_subtrees: 0,
             },
-            "AXPress",
+            SEMANTIC_PRESS_ACTION,
         )
         .with_synthetic(SyntheticAction::type_text("x"));
 
@@ -1359,10 +1359,10 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
                 alternate_name: None,
                 owning_process: target(),
-                semantic_actions: vec!["AXPress".into()],
+                semantic_actions: vec![SEMANTIC_PRESS_ACTION.into()],
                 unreadable_subtrees: 0,
             },
-            "AXCancel",
+            SEMANTIC_CANCEL_ACTION,
         )
         .with_synthetic(SyntheticAction::type_text("x"));
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
@@ -1376,8 +1376,8 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
         serde_json::to_value(&refusal).unwrap(),
         json!({
             "reason": "action_not_advertised",
-            "action": "AXCancel",
-            "advertised": ["AXPress"],
+            "action": "cancel",
+            "advertised": ["press"],
         })
     );
     assert_eq!(dispatcher.driver().semantic_calls, 0);
@@ -1393,8 +1393,8 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
             "outcome": "no_action",
             "refusal": {
                 "reason": "action_not_advertised",
-                "action": "AXCancel",
-                "advertised": ["AXPress"],
+                "action": "cancel",
+                "advertised": ["press"],
             },
         })
     );
@@ -1475,6 +1475,17 @@ fn a_recorded_condition_can_be_decided_when_it_is_read_back() {
 fn every_semantic_refusal_reaches_the_caller_with_its_remedy_payload() {
     let cases = vec![
         (
+            DriverError::Semantic(SemanticDriverError::ActionUnsupported {
+                intent: SemanticActionIntent::Cancel,
+                platform: SemanticActionPlatform::Windows,
+            }),
+            json!({
+                "reason": "semantic_action_unsupported",
+                "intent": "cancel",
+                "platform": "windows",
+            }),
+        ),
+        (
             DriverError::Semantic(SemanticDriverError::ElementNameAmbiguous {
                 key_form: AccessibilityKeyForm::RoleAndTitle,
                 match_count: 30,
@@ -1496,12 +1507,12 @@ fn every_semantic_refusal_reaches_the_caller_with_its_remedy_payload() {
         ),
         (
             DriverError::Semantic(SemanticDriverError::ActionNotAdvertised {
-                action: "AXPress".to_string(),
+                action: SEMANTIC_PRESS_ACTION.to_string(),
                 advertised: vec!["AXConfirm".to_string(), "AXCancel".to_string()],
             }),
             json!({
                 "reason": "action_not_advertised",
-                "action": "AXPress",
+                "action": "press",
                 "advertised": ["AXConfirm", "AXCancel"],
             }),
         ),
@@ -1589,10 +1600,10 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
                     title: "Save".into(),
                 }),
                 owning_process: target(),
-                semantic_actions: vec!["AXPress".into()],
+                semantic_actions: vec![SEMANTIC_PRESS_ACTION.into()],
                 unreadable_subtrees: 0,
             },
-            "AXPress",
+            SEMANTIC_PRESS_ACTION,
         );
     let mut dispatcher = Dispatcher::new(driver);
     let mut audit = audit_with_storage(storage);
@@ -1619,7 +1630,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
                     "RoleAndTitle": {"role": "AXButton", "title": "Save"},
                 },
             },
-            "action": "AXPress",
+            "action": "press",
             "grant_identity": {
                 "pid": 42,
                 "bundle_identity": "com.example.target",

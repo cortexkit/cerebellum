@@ -34,8 +34,8 @@ use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
     DriverError, ElementResolutionResult, FocusQueryRequest, HeldStateDisposition,
     InputObservationRequest, PermissionLiveness, PlatformDriver, ProcessEventRefusal, ProcessGrant,
-    SemanticDispatchRequest, SemanticDriverError, SyntheticAction, SyntheticDispatchRequest,
-    TargetDisposition,
+    SemanticActionIntent, SemanticActionPlatform, SemanticDispatchRequest, SemanticDriverError,
+    SyntheticAction, SyntheticDispatchRequest, TargetDisposition,
 };
 use cerebellum_core::journal::redaction::Redactor;
 use cerebellum_core::journal::severity::SeverityTaxonomy;
@@ -258,6 +258,10 @@ pub enum DispatchPhase {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum DispatchError {
     InvalidRequest,
+    SemanticActionUnsupported {
+        intent: SemanticActionIntent,
+        platform: SemanticActionPlatform,
+    },
     ElementNameAmbiguous {
         key_form: AccessibilityKeyForm,
         match_count: u64,
@@ -333,6 +337,10 @@ mod reason_code_tests {
         // construction and prove nothing.
         let all = [
             DispatchError::InvalidRequest,
+            DispatchError::SemanticActionUnsupported {
+                intent: SemanticActionIntent::Cancel,
+                platform: SemanticActionPlatform::Windows,
+            },
             DispatchError::SyntheticUnavailable,
             DispatchError::SyntheticSequenceFailed {
                 posts_returned: 1,
@@ -382,6 +390,7 @@ impl DispatchError {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
+            Self::SemanticActionUnsupported { .. } => "semantic_action_unsupported",
             Self::ElementNameAmbiguous { .. } => "element_name_ambiguous",
             Self::ElementNotFound { .. } => "element_not_found",
             Self::ActionNotAdvertised { .. } => "action_not_advertised",
@@ -1207,6 +1216,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
     fn semantic_refusal(error: DriverError, semantic: &SemanticDispatchRequest) -> DispatchError {
         match error {
             DriverError::Semantic(failure) => match failure {
+                SemanticDriverError::ActionUnsupported { intent, platform } => {
+                    DispatchError::SemanticActionUnsupported { intent, platform }
+                }
                 SemanticDriverError::ElementNameAmbiguous {
                     key_form,
                     match_count,

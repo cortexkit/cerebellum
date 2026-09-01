@@ -2,14 +2,15 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v6.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v7.json");
 
 use cerebellum_computer::platform::{
     attributed_permission_liveness, capability_declarations, computed_vocabulary_sha256,
-    implementation_source_lock_digest, validate_vocabulary, validate_vocabulary_digests,
-    CapabilityAdvertisementContext, ImmutableReleaseInputs, PermissionLiveness,
-    PermissionLivenessProbe, PermissionLivenessReport, PermissionProbeResult, PermissionService,
-    StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
+    delivered_semantic_action, implementation_source_lock_digest, validate_vocabulary,
+    validate_vocabulary_digests, CapabilityAdvertisementContext, ImmutableReleaseInputs,
+    PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport, PermissionProbeResult,
+    PermissionService, SemanticActionIntent, SemanticActionPlatform, StartupCapabilityProbe,
+    VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 #[cfg(target_os = "macos")]
 use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
@@ -17,7 +18,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v6");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v7");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -40,7 +41,7 @@ fn vocabulary_requires_all_three_digest_sources() {
 }
 
 #[test]
-fn implementation_source_lock_digest_matches_the_v5_artifact() {
+fn implementation_source_lock_digest_matches_the_v7_artifact() {
     assert_eq!(
         implementation_source_lock_digest().as_deref(),
         Some(COMPUTER_ACTION_VOCABULARY_SHA256)
@@ -60,14 +61,14 @@ fn computer_click_action_is_optional_and_closed_to_press_and_cancel() {
 
     assert_eq!(
         request["properties"]["action"]["enum"],
-        json!(["AXPress", "AXCancel"])
+        json!(["press", "cancel"])
     );
     assert!(
         !request["required"]
             .as_array()
             .expect("the request schema names required fields")
             .contains(&json!("action")),
-        "omitting action must preserve the historical AXPress default"
+        "omitting action must preserve the historical press default"
     );
 }
 
@@ -115,9 +116,21 @@ fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
         .find(|row| row["capability_id"] == "computer.click")
         .expect("the vocabulary contains computer.click");
     let action = &click["request_schema"]["properties"]["action"];
-    let admitted = action["enum"]
+    let admitted_platform_actions = action["enum"]
         .as_array()
-        .expect("the admitted actions are an enum");
+        .expect("the admitted actions are an enum")
+        .iter()
+        .map(|name| {
+            let intent = SemanticActionIntent::from_wire_name(
+                name.as_str().expect("an admitted intent is a string"),
+            )
+            .expect("the wire enum contains only known intents");
+            json!(
+                delivered_semantic_action(SemanticActionPlatform::MacOs, intent)
+                    .expect("macOS serves every admitted click intent")
+            )
+        })
+        .collect::<Vec<_>>();
     let entries = action["catalog"]["entries"]
         .as_array()
         .expect("the action catalog has entries");
@@ -126,7 +139,7 @@ fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
         if entry["served"] == false {
             let name = entry["action"].as_str().expect("an action name");
             assert!(
-                !admitted.contains(&json!(name)),
+                !admitted_platform_actions.contains(&json!(name)),
                 "unserved action {name} is present in the admitted set"
             );
         }
