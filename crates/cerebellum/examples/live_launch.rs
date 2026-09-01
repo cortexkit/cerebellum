@@ -12,9 +12,15 @@
 //! ```
 
 #[cfg(target_os = "linux")]
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
 use std::io::Read;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,9 +28,13 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cerebellum::browser_config::BrowserConfig;
+#[cfg(target_os = "linux")]
+use cerebellum::browser_launch::{LINUX_EXEC_CHAIN_HOP_LIMIT, LINUX_EXEC_CHAIN_PROBE_WINDOW};
 use cerebellum::management;
 use cerebellum::Planes;
 use cerebellum_core::health::HealthState;
+#[cfg(target_os = "linux")]
+use cerebellum_linux::{executed_image_identity, spawn_barred};
 use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(target_os = "linux")]
@@ -43,8 +53,6 @@ const LINUX_CHROME_CANDIDATES: [&str; 3] = [
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
 ];
-#[cfg(target_os = "linux")]
-const LINUX_CHROMIUM_WRAPPER_TARGET: &str = "/usr/lib/chromium/chromium";
 const CUSTODY_LOCK_DIRECTORY: &str = ".ck-browser-profile-custody";
 const CUSTODY_LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v1";
 const TOOL_CHANNEL: u16 = 9;
@@ -701,18 +709,30 @@ fn browser_identity(path: &Path) -> Result<String, String> {
 
     #[cfg(target_os = "linux")]
     {
-        let final_image = final_image_path(path, Path::new(LINUX_CHROMIUM_WRAPPER_TARGET));
-        let digest = sha256_file(&final_image).map_err(|error| {
-            format!(
-                "could not hash browser image {}: {error}",
+        let probe_profile = browser_probe_profile_path();
+        let crash_dumps_directory = probe_profile.join("crash-dumps");
+        let arguments = browser_probe_arguments(&probe_profile, &crash_dumps_directory);
+        let environment = browser_probe_environment(&probe_profile);
+        let result = (|| {
+            let final_image = configured_terminal_image(path, &arguments, &environment)?;
+            let digest = sha256_file(&final_image).map_err(|error| {
+                format!(
+                    "could not hash browser image {}: {error}",
+                    final_image.display()
+                )
+            })?;
+            println!(
+                "browser final image hashed: {} {digest}",
                 final_image.display()
-            )
-        })?;
-        println!(
-            "browser final image hashed: {} {digest}",
-            final_image.display()
-        );
-        Ok(digest)
+            );
+            Ok(digest)
+        })();
+        let cleanup = cleanup_browser_probe(&probe_profile);
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(digest), Ok(())) => Ok(digest),
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -723,13 +743,97 @@ fn browser_identity(path: &Path) -> Result<String, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn final_image_path(configured: &Path, wrapper_target: &Path) -> PathBuf {
-    // Debian-family Chromium launchers exec this terminal image; hashing the
-    // launcher would attest the shim rather than the browser that receives CDP.
-    if wrapper_target.is_file() {
-        wrapper_target.to_path_buf()
-    } else {
-        configured.to_path_buf()
+fn browser_probe_profile_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cerebellum-live-launch-image-probe-{}",
+        std::process::id()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_arguments(
+    profile_directory: &Path,
+    crash_dumps_directory: &Path,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("--remote-debugging-pipe"),
+        OsString::from(format!(
+            "--user-data-dir={}",
+            profile_directory.to_string_lossy()
+        )),
+        OsString::from(format!(
+            "--crash-dumps-dir={}",
+            crash_dumps_directory.to_string_lossy()
+        )),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn browser_probe_environment(probe_profile: &Path) -> Vec<(OsString, OsString)> {
+    vec![(
+        OsString::from("XDG_CONFIG_HOME"),
+        probe_profile.join("config").into_os_string(),
+    )]
+}
+
+#[cfg(target_os = "linux")]
+fn configured_terminal_image(
+    configured: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+) -> Result<PathBuf, String> {
+    let (command_child, _command_parent) = UnixStream::pair()
+        .map_err(|error| format!("could not create browser probe command pipe: {error}"))?;
+    let (_response_parent, response_child) = UnixStream::pair()
+        .map_err(|error| format!("could not create browser probe response pipe: {error}"))?;
+    let mut child = spawn_barred(
+        configured,
+        arguments,
+        environment,
+        command_child.as_raw_fd(),
+        response_child.as_raw_fd(),
+    )
+    .map_err(|error| format!("could not bar browser image discovery: {error:?}"))?;
+    let result = (|| {
+        let mut observed = executed_image_identity(child.generation().pid)
+            .map_err(|error| format!("could not read configured browser image: {error:?}"))?;
+        for _ in 0..LINUX_EXEC_CHAIN_HOP_LIMIT {
+            let Some(next) = child
+                .continue_to_next_exec_stop_with_deadline(
+                    LINUX_EXEC_CHAIN_HOP_LIMIT,
+                    std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW,
+                )
+                .map_err(|error| format!("could not walk browser exec chain: {error:?}"))?
+            else {
+                return Ok(observed.resolved_path);
+            };
+            observed = next;
+        }
+        Err(format!(
+            "could not identify terminal browser image after {LINUX_EXEC_CHAIN_HOP_LIMIT} exec hops"
+        ))
+    })();
+    let cleanup = child
+        .terminate_and_reap()
+        .map_err(|error| format!("could not reap browser image discovery: {error:?}"));
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(path), Ok(())) => Ok(path),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_browser_probe(probe_profile: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(probe_profile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove browser image probe tree {}: {error}",
+            probe_profile.display()
+        )),
     }
 }
 
@@ -965,15 +1069,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_final_image_uses_the_wrapper_target_when_present() {
-        let root = fixture_root("final-image");
-        let configured = root.join("configured-chromium");
-        let final_image = root.join("chromium");
-        fs::write(&configured, "wrapper").expect("write wrapper");
-        fs::write(&final_image, "terminal image").expect("write terminal image");
+    fn linux_terminal_image_walks_the_configured_exec_chain() {
+        let terminal_image = configured_terminal_image(
+            Path::new("/bin/sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("exec /bin/sleep 1"),
+            ],
+            &[],
+        )
+        .expect("walk configured shell to its terminal image");
 
-        assert_eq!(final_image_path(&configured, &final_image), final_image);
-        fs::remove_dir_all(root).expect("remove fixture");
+        assert_eq!(
+            terminal_image,
+            fs::canonicalize("/bin/sleep").expect("canonical terminal image")
+        );
     }
 
     #[cfg(target_os = "linux")]
