@@ -1165,7 +1165,11 @@ mod macos_probe {
     }
 }
 
-#[cfg(test)]
+// The probe body these tests exercise is macOS-only, so the module is gated to
+// match it. Without this the tests reference symbols that do not exist on other
+// hosts, and the cross-platform lint fails for a reason unrelated to the code
+// under test.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::display_value_changed;
 
