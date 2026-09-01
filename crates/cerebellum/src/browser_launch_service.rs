@@ -148,8 +148,17 @@ impl ProductionLaunchService {
         }
 
         record_profile_admission(accepted, browser_session_id, executable, &expected_identity)?;
-        let root =
-            browser_data_root().map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?;
+        // Three distinct failures follow, and a caller's next move differs for
+        // each: a data root that cannot be resolved is an environment problem,
+        // a registry that will not open is profile state, and custody locks
+        // that refuse are a supervisor-identity problem that has nothing to do
+        // with storage at all. They shared one reason code, so an operator was
+        // told to check a disk whichever one fired.
+        // browser_data_root reports only failure, so this stage cannot say more
+        // than which stage it was -- which is still the fact that was missing.
+        let root = browser_data_root().map_err(
+            |()| json!({"outcome": "profile_storage_unavailable", "stage": "data_root"}),
+        )?;
         let registry = RegistryConfig {
             uuid_protocol_compatible: true,
             grant_verifier_available: true,
@@ -158,12 +167,16 @@ impl ProductionLaunchService {
             ..RegistryConfig::default()
         };
         let lifecycle = Arc::new(Mutex::new(
-            ProfileLifecycle::open_with_config(&root, registry)
-                .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?,
+            ProfileLifecycle::open_with_config(&root, registry).map_err(|error| {
+                json!({"outcome": "profile_storage_unavailable", "stage": "profile_registry",
+                       "detail": format!("{error:?}")})
+            })?,
         ));
         let locks = Arc::new(Mutex::new(
-            ProfileCustodyLocks::open_filesystem(&root)
-                .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?,
+            ProfileCustodyLocks::open_filesystem(&root).map_err(|error| {
+                json!({"outcome": "custody_locks_unavailable", "stage": "custody_locks",
+                       "detail": format!("{error:?}")})
+            })?,
         ));
         let invocation =
             InvocationToken::from_trusted_invocation(format!("invocation-{browser_session_id}"));

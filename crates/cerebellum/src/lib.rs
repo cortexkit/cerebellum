@@ -1027,11 +1027,15 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
         BrowserSurface::Available(browser) => Some(browser.clone()),
         BrowserSurface::NotConfigured | BrowserSurface::Refused(_) => None,
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
-    #[cfg(target_os = "macos")]
+    // Recovery publishes the service before module_loop takes the transport, so
+    // an attested orphan from a previous process cannot race a fresh spawn. That
+    // ordering matters on every platform that can launch, not only the first one
+    // that could.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if planes.launch_service.is_none() {
         if let Some(browser) = browser_config.clone() {
             // Startup recovery belongs before `module_loop`: once that loop owns
@@ -1543,7 +1547,15 @@ impl Planes {
         browser_config: Option<BrowserConfig>,
         journal: JournalPersistence,
     ) -> Self {
-        #[cfg(target_os = "macos")]
+        // The launch service picks its process launcher per platform and has
+        // done since the Linux barrier landed. This wiring stayed macOS-only,
+        // which left a merged Linux launcher unreachable and the refusal
+        // blaming profile storage several layers away from the cause.
+        //
+        // Platforms without a launcher still get None: ProductionLaunchService
+        // resolves one at construction, so this cannot advertise a launch it
+        // cannot perform.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
             browser_config
                 .clone()
@@ -1557,7 +1569,7 @@ impl Planes {
                 .map(|service| {
                     Arc::new(service) as Arc<dyn browser_session::BrowserSessionLauncher>
                 });
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let launch_service = None;
         let sessions = browser_session::BrowserSessions::default();
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
@@ -2503,7 +2515,17 @@ async fn handle_browser_control(
             {
                 Err(json!({"outcome": "executable_missing", "expected_path": path}))
             } else {
-                Err(json!({"outcome": "profile_storage_unavailable"}))
+                // No launcher exists, and the configuration is correct -- the
+                // executable is present and is a file. Every other arm of this
+                // chain names something the operator got wrong; this one is
+                // reached BECAUSE they got it right, so blaming profile storage
+                // sent them to check a disk that was never involved. The build
+                // simply has no launcher wired for this platform.
+                Err(json!({
+                    "outcome": "browser_launch_unsupported",
+                    "reason": "this build has no browser launcher for this platform",
+                    "platform": std::env::consts::OS,
+                }))
             };
             match launch {
                 Ok(browser_session::LaunchedBrowser {
