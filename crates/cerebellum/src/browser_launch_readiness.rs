@@ -1,7 +1,13 @@
 //! Pipe-backed CDP readiness for an attested browser launch.
 
 use std::cmp;
-use std::io::{self, Read, Write};
+use std::io;
+// Only the unix pipe implementation below drives these traits. The readiness
+// loop's `pipe.read` is this module's own trait method, not io::Read, so on a
+// platform without that implementation these are genuinely unused rather than
+// suppressed.
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 

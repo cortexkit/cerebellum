@@ -260,6 +260,25 @@ else
   printf '    install it with: rustup target add x86_64-unknown-linux-gnu\n'
 fi
 
+# Windows: LIBRARY targets only, deliberately.
+#
+# The workspace gained Windows support before the Windows plane exists, so
+# nothing here exercises it -- this phase exists to stop it rotting. Portability
+# claimed and unenforced survives about as long as the next unix-only import.
+#
+# Not --all-targets: a dev-dependency compiles C and needs a Windows toolchain
+# this host does not have, so the test targets cannot be cross-checked from
+# macOS at all. Asking for them would make this phase fail for a reason that has
+# nothing to do with our code, and a phase that always fails teaches you to
+# ignore it. The VM covers what this cannot.
+if rustc --print target-libdir --target x86_64-pc-windows-msvc >/dev/null 2>&1; then
+  run_phase "cargo clippy --workspace --target x86_64-pc-windows-msvc -- -D warnings" \
+    cargo clippy --workspace --target x86_64-pc-windows-msvc --quiet -- -D warnings
+else
+  printf '==> SKIPPED: the windows target is not installed, so the windows build was not checked\n'
+  printf '    install it with: rustup target add x86_64-pc-windows-msvc\n'
+fi
+
 # Phase 4: compile + all tests (lib, bins, integration).
 run_phase "cargo test --workspace --quiet" \
   cargo test --workspace --quiet
