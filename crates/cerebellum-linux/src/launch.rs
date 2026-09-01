@@ -13,10 +13,16 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use crate::exec_stop::{
+    continue_to_exec_stop, ExecStopLoopError, ExecStopObservation, ExecStopOutcome,
+};
 use crate::{process_start_time, ProcessStartTime};
 
 const CDP_COMMAND_FD: RawFd = 3;
 const CDP_RESPONSE_FD: RawFd = 4;
+// Normal helper reaping produces only a handful of stops. This allows a broad
+// transient burst while still refusing a sustained signal storm between execs.
+const MAX_INTERVENING_SIGNAL_STOPS: usize = 64;
 
 /// The kernel generation that distinguishes a process from later PID reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +79,10 @@ pub enum ProcessControlError {
     Ptrace(io::ErrorKind),
     Signal(io::ErrorKind),
     Reap(io::ErrorKind),
-    UnexpectedStop,
+    UnexpectedStop { signal: c_int },
     ProcessExited,
     ExecChainExhausted,
+    SignalStopLimitExceeded { last_signal: c_int, limit: usize },
 }
 
 /// What a generation-checked termination did.
@@ -108,13 +115,12 @@ impl BarredChild {
         if self.exec_hops >= maximum_hops {
             return Err(ProcessControlError::ExecChainExhausted);
         }
-        ptrace_continue(self.generation.pid as c_int)?;
-        let status = wait_for_status(self.generation.pid as c_int)?;
-        if !is_stopped(status) {
-            return Err(ProcessControlError::ProcessExited);
-        }
-        if !is_exec_stop(status) {
-            return Err(ProcessControlError::UnexpectedStop);
+        let pid = self.generation.pid as c_int;
+        match continue_to_next_exec_stop_with(pid, || wait_for_status(pid).map(Some))? {
+            ExecStopOutcome::Exec => {}
+            ExecStopOutcome::Deadline => {
+                return Err(ProcessControlError::Reap(io::ErrorKind::TimedOut));
+            }
         }
         self.exec_hops += 1;
         executed_image_identity(self.generation.pid).map_err(image_error_to_control)
@@ -131,20 +137,16 @@ impl BarredChild {
         if self.exec_hops >= maximum_hops {
             return Err(ProcessControlError::ExecChainExhausted);
         }
-        ptrace_continue(self.generation.pid as c_int)?;
-        let Some(status) = wait_for_status_until(self.generation.pid as c_int, deadline)? else {
-            return Ok(None);
-        };
-        if !is_stopped(status) {
-            return Err(ProcessControlError::ProcessExited);
+        let pid = self.generation.pid as c_int;
+        match continue_to_next_exec_stop_with(pid, || wait_for_status_until(pid, deadline))? {
+            ExecStopOutcome::Deadline => Ok(None),
+            ExecStopOutcome::Exec => {
+                self.exec_hops += 1;
+                executed_image_identity(self.generation.pid)
+                    .map(Some)
+                    .map_err(image_error_to_control)
+            }
         }
-        if !is_exec_stop(status) {
-            return Err(ProcessControlError::UnexpectedStop);
-        }
-        self.exec_hops += 1;
-        executed_image_identity(self.generation.pid)
-            .map(Some)
-            .map_err(image_error_to_control)
     }
 
     /// Detach from the exact stopped generation and let it execute.
@@ -668,9 +670,41 @@ fn image_error_to_control(error: ImageIdentityError) -> ProcessControlError {
     }
 }
 
-fn ptrace_continue(pid: c_int) -> Result<(), ProcessControlError> {
-    // SAFETY: pid is the tracee owned by this handle; no pointer is dereferenced.
-    if unsafe { libc::ptrace(libc::PTRACE_CONT, pid, std::ptr::null_mut::<c_void>(), 0) } != 0 {
+fn continue_to_next_exec_stop_with(
+    pid: c_int,
+    wait_for_stop: impl FnMut() -> Result<Option<c_int>, ProcessControlError>,
+) -> Result<ExecStopOutcome, ProcessControlError> {
+    let mut wait_for_stop = wait_for_stop;
+    continue_to_exec_stop(
+        MAX_INTERVENING_SIGNAL_STOPS,
+        |signal| ptrace_continue(pid, signal),
+        || wait_for_stop().map(|status| status.map(exec_stop_observation)),
+    )
+    .map_err(|error| match error {
+        ExecStopLoopError::Control(error) => error,
+        ExecStopLoopError::UnexpectedStop { signal } => {
+            ProcessControlError::UnexpectedStop { signal }
+        }
+        ExecStopLoopError::ProcessExited => ProcessControlError::ProcessExited,
+        ExecStopLoopError::SignalStopLimitExceeded { last_signal, limit } => {
+            ProcessControlError::SignalStopLimitExceeded { last_signal, limit }
+        }
+    })
+}
+
+fn ptrace_continue(pid: c_int, signal: Option<c_int>) -> Result<(), ProcessControlError> {
+    // SAFETY: pid is the owned tracee, and ptrace interprets its data argument as
+    // a signal number for PTRACE_CONT rather than dereferencing it as a pointer.
+    let signal = signal.unwrap_or(0) as usize as *mut c_void;
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_CONT,
+            pid,
+            std::ptr::null_mut::<c_void>(),
+            signal,
+        )
+    } != 0
+    {
         return Err(ProcessControlError::Ptrace(
             io::Error::last_os_error().kind(),
         ));
@@ -791,6 +825,22 @@ fn stop_signal(status: c_int) -> c_int {
 
 fn is_exec_stop(status: c_int) -> bool {
     is_stopped(status) && (status >> 8) == (libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8))
+}
+
+fn exec_stop_observation(status: c_int) -> ExecStopObservation {
+    if !is_stopped(status) {
+        return ExecStopObservation::ProcessExited;
+    }
+    if is_exec_stop(status) {
+        return ExecStopObservation::Exec;
+    }
+
+    let signal = stop_signal(status);
+    if signal == 0 || status >> 16 != 0 {
+        ExecStopObservation::UnexpectedStop(signal)
+    } else {
+        ExecStopObservation::SignalDelivery(signal)
+    }
 }
 
 fn c_string(value: &OsStr) -> Option<CString> {
