@@ -1115,23 +1115,46 @@ fn configure_tcp_keepalive(stream: &TcpStream) -> Result<(), ModuleError> {
     let enabled = socket
         .keepalive()
         .map_err(|e| ModuleError::Message(format!("read TCP keepalive enabled state: {e}")))?;
-    let idle = socket
-        .tcp_keepalive_time()
-        .map_err(|e| ModuleError::Message(format!("read TCP keepalive idle time: {e}")))?;
-    let interval = socket
-        .tcp_keepalive_interval()
-        .map_err(|e| ModuleError::Message(format!("read TCP keepalive interval: {e}")))?;
-    let retries = socket
-        .tcp_keepalive_retries()
-        .map_err(|e| ModuleError::Message(format!("read TCP keepalive retry count: {e}")))?;
-    if !enabled
-        || idle != TCP_KEEPALIVE_IDLE
-        || interval != TCP_KEEPALIVE_INTERVAL
-        || retries != TCP_KEEPALIVE_RETRIES
+    // Read back what the platform will let us read back.
+    //
+    // The setter reporting success is not the same as the timings being in
+    // force, and this keepalive is what notices a subc socket that died without
+    // FIN or RST -- so a silently unapplied setting parks the module forever on
+    // a dead connection. Unix exposes every knob it accepts, so every knob is
+    // verified there.
+    //
+    // Windows accepts the same settings and exposes no per-knob getter, so the
+    // timings there are set and unverified. That gap is stated rather than
+    // hidden: reporting it as verified would be the more dangerous silence,
+    // because the failure it guards against is invisible by construction.
+    #[cfg(unix)]
     {
-        return Err(ModuleError::Message(format!(
-            "TCP keepalive was not applied: enabled={enabled}, idle={idle:?}, interval={interval:?}, retries={retries}"
-        )));
+        let idle = socket
+            .tcp_keepalive_time()
+            .map_err(|e| ModuleError::Message(format!("read TCP keepalive idle time: {e}")))?;
+        let interval = socket
+            .tcp_keepalive_interval()
+            .map_err(|e| ModuleError::Message(format!("read TCP keepalive interval: {e}")))?;
+        let retries = socket
+            .tcp_keepalive_retries()
+            .map_err(|e| ModuleError::Message(format!("read TCP keepalive retry count: {e}")))?;
+        if idle != TCP_KEEPALIVE_IDLE
+            || interval != TCP_KEEPALIVE_INTERVAL
+            || retries != TCP_KEEPALIVE_RETRIES
+        {
+            return Err(ModuleError::Message(format!(
+                "TCP keepalive was not applied: idle={idle:?}, interval={interval:?}, retries={retries}"
+            )));
+        }
+    }
+
+    // Verified on every platform: whether keepalive is on at all. This is the
+    // half that decides whether the socket is probed, and socket2 exposes it
+    // everywhere, so no platform accepts the setting unchecked.
+    if !enabled {
+        return Err(ModuleError::Message(
+            "TCP keepalive was not applied: the socket reports it disabled after being set".into(),
+        ));
     }
 
     Ok(())

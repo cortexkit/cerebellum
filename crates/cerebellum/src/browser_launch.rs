@@ -179,6 +179,32 @@ impl PreSpawnIdentityVerification {
     }
 }
 
+/// The bytes of an `OsStr` as this platform represents them.
+///
+/// Deliberately platform-specific rather than normalised. These bytes are
+/// attested: they record what was handed to the platform launcher, so a
+/// conversion that made every platform agree would be recording a translation
+/// rather than the submission. Unix hands the kernel bytes; Windows hands it
+/// UTF-16 code units, and encoding those little-endian preserves the argument
+/// exactly, including the unpaired surrogates a lossy conversion would destroy.
+///
+/// A reader therefore needs to know which platform produced a record before
+/// interpreting its bytes. Nothing ships on Windows yet, so no ambiguous record
+/// can exist; declaring the encoding in the record itself is a format change to
+/// settle before one can.
+fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+}
+
 /// The exact executable and argument bytes submitted to the platform launcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,21 +223,15 @@ impl VerifiedLaunchVector {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
     ) -> Self {
-        use std::os::unix::ffi::OsStrExt;
         Self {
-            executable: executable.as_os_str().as_bytes().to_vec(),
+            executable: os_bytes(executable.as_os_str()),
             arguments: arguments
                 .iter()
-                .map(|argument| argument.as_os_str().as_bytes().to_vec())
+                .map(|argument| os_bytes(argument.as_os_str()))
                 .collect(),
             environment: environment
                 .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_os_str().as_bytes().to_vec(),
-                        value.as_os_str().as_bytes().to_vec(),
-                    )
-                })
+                .map(|(name, value)| (os_bytes(name.as_os_str()), os_bytes(value.as_os_str())))
                 .collect(),
         }
     }
