@@ -10,9 +10,17 @@
 // Windows APIs and their raw handles exist only on Windows. Keeping this module
 // and its public surface behind the same gate makes other hosts build an empty
 // library rather than a pretend implementation.
+#[cfg(any(target_os = "windows", test))]
+mod accessibility;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(target_os = "windows")]
+pub use accessibility::{
+    read_accessibility_tree, AccessibilityReadBounds, AccessibilityReadFailure,
+    UiaAccessibilityTree, UiaControlTypeAndName, UiaElement, UiaElementIdentity, UiaRectangle,
+    UiaTreeCompleteness,
+};
 #[cfg(target_os = "windows")]
 pub use windows::{
     enumerated_window_visibility, process_start_time, retain_process_handle, ProcessHandleError,
