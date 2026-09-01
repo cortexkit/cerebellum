@@ -569,21 +569,139 @@ fn capability_declaration(
     }
 }
 
-/// Accessibility action names a click may ask a control to run.
+/// Platform-neutral semantic action intents admitted by `computer.click`.
+pub const SEMANTIC_PRESS_ACTION: &str = "press";
+pub const SEMANTIC_CANCEL_ACTION: &str = "cancel";
+
+/// The closed action intents a platform semantic driver may receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticActionIntent {
+    Press,
+    Cancel,
+}
+
+impl SemanticActionIntent {
+    pub const ALL: [Self; 2] = [Self::Press, Self::Cancel];
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Press => SEMANTIC_PRESS_ACTION,
+            Self::Cancel => SEMANTIC_CANCEL_ACTION,
+        }
+    }
+
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        match name {
+            SEMANTIC_PRESS_ACTION => Some(Self::Press),
+            SEMANTIC_CANCEL_ACTION => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// Platforms with an authored semantic-action mapping table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemanticActionPlatform {
+    #[serde(rename = "macos")]
+    MacOs,
+    #[serde(rename = "windows")]
+    Windows,
+}
+
+impl SemanticActionPlatform {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MacOs => "macos",
+            Self::Windows => "windows",
+        }
+    }
+}
+
+/// A known intent that the named platform cannot deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedSemanticAction {
+    pub intent: SemanticActionIntent,
+    pub platform: SemanticActionPlatform,
+}
+
+impl fmt::Display for UnsupportedSemanticAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "semantic action intent {} is unsupported on {}",
+            self.intent.wire_name(),
+            self.platform.name()
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSemanticAction {}
+
+/// Map one closed wire intent to the exact action a platform receives.
 ///
-/// One owner, because two spellings of this string cannot disagree quietly:
-/// the closed `AxAction` vocabulary parses exactly what macOS advertises, so a
-/// caller-side shorthand is refused as unadvertised and every click fails. That
-/// happened -- the wire handler said "press" while controls advertise
-/// "AXPress" -- and no fixture could see it, because a test double advertises
-/// whatever string the test also passes, so the two agree with each other and
-/// with nothing real.
-///
-/// `the_click_action_names_match_the_framework_vocabulary` holds these against
-/// the macOS spellings, so a future divergence fails a build rather than every
-/// click.
-pub const SEMANTIC_PRESS_ACTION: &str = "AXPress";
-pub const SEMANTIC_CANCEL_ACTION: &str = "AXCancel";
+/// The tuple match is deliberately exhaustive. A new intent or platform must
+/// state every mapping or typed refusal here, and no caller-supplied string can
+/// pass through as a platform action.
+pub const fn delivered_semantic_action(
+    platform: SemanticActionPlatform,
+    intent: SemanticActionIntent,
+) -> Result<&'static str, UnsupportedSemanticAction> {
+    match (platform, intent) {
+        (SemanticActionPlatform::MacOs, SemanticActionIntent::Press) => Ok("AXPress"),
+        (SemanticActionPlatform::MacOs, SemanticActionIntent::Cancel) => Ok("AXCancel"),
+        (SemanticActionPlatform::Windows, SemanticActionIntent::Press) => Ok("Invoke"),
+        (SemanticActionPlatform::Windows, SemanticActionIntent::Cancel) => {
+            Err(UnsupportedSemanticAction { intent, platform })
+        }
+    }
+}
+
+#[cfg(test)]
+mod semantic_action_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn macos_press_delivers_axpress() {
+        let delivered =
+            delivered_semantic_action(SemanticActionPlatform::MacOs, SemanticActionIntent::Press)
+                .expect("macOS serves press");
+
+        assert_eq!(delivered, "AXPress");
+    }
+
+    #[test]
+    fn windows_press_delivers_invoke() {
+        let delivered =
+            delivered_semantic_action(SemanticActionPlatform::Windows, SemanticActionIntent::Press)
+                .expect("Windows serves press");
+
+        assert_eq!(delivered, "Invoke");
+    }
+
+    #[test]
+    fn windows_cancel_returns_a_typed_refusal_naming_intent_and_platform() {
+        assert_eq!(
+            delivered_semantic_action(
+                SemanticActionPlatform::Windows,
+                SemanticActionIntent::Cancel,
+            ),
+            Err(UnsupportedSemanticAction {
+                intent: SemanticActionIntent::Cancel,
+                platform: SemanticActionPlatform::Windows,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_wire_action_has_no_platform_passthrough() {
+        assert_eq!(SemanticActionIntent::from_wire_name("AXPress"), None);
+        assert_eq!(
+            SemanticActionIntent::from_wire_name("caller_knows_best"),
+            None
+        );
+    }
+}
 
 /// A manifest-visible capability declaration. It contains no executor and
 /// therefore cannot cause an input event by being inspected.
@@ -1041,6 +1159,10 @@ impl fmt::Display for AccessibilityReadFailure {
 /// A semantic action failure split by the remedy available to its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticDriverError {
+    ActionUnsupported {
+        intent: SemanticActionIntent,
+        platform: SemanticActionPlatform,
+    },
     ElementNameAmbiguous {
         key_form: AccessibilityKeyForm,
         match_count: u64,

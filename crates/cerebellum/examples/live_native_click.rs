@@ -74,7 +74,7 @@ mod macos_probe {
     use cerebellum_computer::platform::macos::MacOs26PlatformDriver;
     use cerebellum_computer::platform::{
         AccessibilityElementName, AccessibilityTreeRequest, DispatchMode, ElementResolutionRequest,
-        PlatformDriver, ProcessGrant,
+        PlatformDriver, ProcessGrant, SEMANTIC_PRESS_ACTION,
     };
     use cerebellum_core::clock::MonotonicClock;
     use cerebellum_core::health::HealthState;
@@ -208,7 +208,7 @@ mod macos_probe {
             );
             println!("left unproven: wire computer.click cannot carry role_and_title");
             println!(
-                "lower-layer action name: AXPress; the wire handler's action-name translation remains unproven"
+                "lower-layer wire intent: press; the macOS driver maps it to AXPress before delivery"
             );
             let outcome = dispatch_role_and_title(&planes, &target, &button).await?;
             println!("computer.click dispatcher outcome: {outcome}");
@@ -899,7 +899,7 @@ mod macos_probe {
             attendance,
             dispatch_at_ms,
         )
-        .with_semantic(element, "AXPress");
+        .with_semantic(element, SEMANTIC_PRESS_ACTION);
         let identity = JournalIdentity {
             principal: format!("{:?}", Principal::Direct),
             conversation_key: CONVERSATION.to_string(),

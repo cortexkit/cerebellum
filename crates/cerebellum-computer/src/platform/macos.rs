@@ -449,6 +449,20 @@ fn alternate_element_name(
     }
 }
 
+fn semantic_intents_advertised_by(platform_actions: &[String]) -> Vec<String> {
+    SemanticActionIntent::ALL
+        .into_iter()
+        .filter_map(|intent| {
+            let delivered =
+                delivered_semantic_action(SemanticActionPlatform::MacOs, intent).ok()?;
+            platform_actions
+                .iter()
+                .any(|action| action == delivered)
+                .then(|| intent.wire_name().to_owned())
+        })
+        .collect()
+}
+
 fn resolution_from_cached_tree(
     tree: &CachedAccessibilityTree,
     request: &ElementResolutionRequest,
@@ -458,7 +472,7 @@ fn resolution_from_cached_tree(
         element_name: request.element_name.clone(),
         alternate_name: alternate_element_name(element, &request.element_name),
         owning_process: tree.target.clone(),
-        semantic_actions: element.actions.clone(),
+        semantic_actions: semantic_intents_advertised_by(&element.actions),
         unreadable_subtrees: u64::try_from(tree.unreadable_subtrees).unwrap_or(u64::MAX),
     })
 }
@@ -744,12 +758,21 @@ impl PlatformDriver for MacOs26PlatformDriver {
             // is the last moment before something changes.
             verify_cached_tree_owner(&request.element.owning_process)?;
 
-            // Only the actions named in the closed AxAction vocabulary can be
-            // requested. The wire carries a string, and passing it through
-            // would let a caller ask an application for any action its
-            // accessibility implementation happens to expose.
-            let action = cerebellum_macos::AxAction::from_name(&request.action)
-                .ok_or(DriverError::InvalidRequest("unknown accessibility action"))?;
+            let intent = SemanticActionIntent::from_wire_name(&request.action).ok_or(
+                DriverError::InvalidRequest("unknown semantic action intent"),
+            )?;
+            let delivered_action = delivered_semantic_action(SemanticActionPlatform::MacOs, intent)
+                .map_err(|refusal| {
+                    DriverError::Semantic(SemanticDriverError::ActionUnsupported {
+                        intent: refusal.intent,
+                        platform: refusal.platform,
+                    })
+                })?;
+            let action =
+                cerebellum_macos::AxAction::from_name(delivered_action)
+                    .ok_or(DriverError::StartupRefused(
+                    "semantic action mapping is not recognized by the macOS framework vocabulary",
+                ))?;
 
             let element_name = ax_element_name(&request.element.element_name)?;
 
@@ -1231,36 +1254,36 @@ mod tests {
         );
     }
 
-    /// The click action names match what the framework vocabulary parses.
+    /// Every mapped macOS action is accepted by the framework vocabulary.
     ///
-    /// Two crates hold these strings: `cerebellum-macos` maps the closed
-    /// `AxAction` variants to framework spellings, and the computer plane names
-    /// the actions a click may request. If they diverge, a requested action is
-    /// refused as unadvertised and nothing else notices because a test double
-    /// advertises whatever string its caller also passes.
+    /// The platform driver delivers the mapping result rather than the wire intent.
+    /// Keeping this assertion against `AxAction` prevents a mapping typo from being
+    /// accepted by neutral test doubles while every live action is refused.
     #[test]
-    fn the_click_action_names_match_the_framework_vocabulary() {
+    fn macos_delivered_actions_match_the_framework_vocabulary() {
         let actions = [
             (
-                super::SEMANTIC_PRESS_ACTION,
+                SemanticActionIntent::Press,
                 cerebellum_macos::AxAction::Press,
             ),
             (
-                super::SEMANTIC_CANCEL_ACTION,
+                SemanticActionIntent::Cancel,
                 cerebellum_macos::AxAction::Cancel,
             ),
         ];
 
-        for (name, action) in actions {
+        for (intent, action) in actions {
+            let delivered = delivered_semantic_action(SemanticActionPlatform::MacOs, intent)
+                .expect("macOS serves every admitted click intent");
             assert_eq!(
-                name,
+                delivered,
                 action.name(),
-                "the action a click requests is not the one the vocabulary parses"
+                "the delivered action differs from the framework spelling"
             );
             assert_eq!(
-                cerebellum_macos::AxAction::from_name(name),
+                cerebellum_macos::AxAction::from_name(delivered),
                 Some(action),
-                "the framework vocabulary does not recognise a click action"
+                "the framework vocabulary does not recognise the delivered action"
             );
         }
     }
@@ -1752,6 +1775,21 @@ mod cached_element_tests {
     }
 
     #[test]
+    fn resolution_exposes_only_closed_wire_intents() {
+        let platform_actions = vec![
+            "AXPress".to_owned(),
+            "AXCancel".to_owned(),
+            "AXConfirm".to_owned(),
+            "caller_knows_best".to_owned(),
+        ];
+
+        assert_eq!(
+            semantic_intents_advertised_by(&platform_actions),
+            vec![SEMANTIC_PRESS_ACTION, SEMANTIC_CANCEL_ACTION]
+        );
+    }
+
+    #[test]
     fn resolution_reports_the_exact_key_that_established_uniqueness() {
         let cases = [
             (
@@ -1780,7 +1818,7 @@ mod cached_element_tests {
                 .expect("the fixture makes each supplied key unique");
             assert_eq!(resolution.element_name, name);
             assert_eq!(resolution.alternate_name, alternate_name);
-            assert_eq!(resolution.semantic_actions, vec!["AXPress"]);
+            assert_eq!(resolution.semantic_actions, vec![SEMANTIC_PRESS_ACTION]);
             assert_eq!(resolution.unreadable_subtrees, 0);
         }
     }

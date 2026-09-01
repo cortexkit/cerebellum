@@ -724,7 +724,7 @@ where
         }
     }
 
-    /// Invoke the accessibility press action on one uniquely named element.
+    /// Invoke the requested semantic action on one uniquely named element.
     #[cfg(target_os = "macos")]
     async fn serve_click<C: MonotonicClock>(
         &self,
@@ -1561,7 +1561,7 @@ fn parse_click_request(arguments: &Value) -> Result<ParsedClick, Value> {
         ));
     }
     // Omission preserves the original wire contract: before this field existed,
-    // every computer.click requested AXPress.
+    // every computer.click requested the press intent.
     let action = match object.get("action") {
         None => SEMANTIC_PRESS_ACTION,
         Some(Value::String(action)) if action == SEMANTIC_PRESS_ACTION => SEMANTIC_PRESS_ACTION,
@@ -1759,6 +1759,9 @@ fn click_driver_refusal(
 ) -> Value {
     let refusal = match error {
         DriverError::Semantic(failure) => match failure {
+            SemanticDriverError::ActionUnsupported { intent, platform } => {
+                DispatchError::SemanticActionUnsupported { intent, platform }
+            }
             SemanticDriverError::ElementNameAmbiguous {
                 key_form,
                 match_count,
@@ -2668,7 +2671,7 @@ mod click_vocabulary_v3_tests {
         }
     }
 
-    fn action_that_reached_platform(wire_request: Value) -> String {
+    fn intent_that_reached_platform_driver(wire_request: Value) -> String {
         let parsed = parse_click_request(&wire_request).expect("the click request is valid");
         let semantic = click_semantic_request(
             &parsed,
@@ -2694,21 +2697,40 @@ mod click_vocabulary_v3_tests {
     }
 
     #[test]
-    fn a_named_cancel_reaches_the_platform_as_cancel_not_press() {
+    fn a_named_cancel_reaches_the_platform_driver_as_cancel_intent() {
         let mut request = left_click(json!({"by": "identifier", "identifier": "menu"}));
-        request["action"] = json!("AXCancel");
+        request["action"] = json!("cancel");
 
         assert_eq!(
-            action_that_reached_platform(request),
+            intent_that_reached_platform_driver(request),
             SEMANTIC_CANCEL_ACTION
         );
     }
 
     #[test]
-    fn an_absent_action_reaches_the_platform_as_press() {
+    fn an_absent_action_reaches_the_platform_driver_as_press_intent() {
         let request = left_click(json!({"by": "identifier", "identifier": "button"}));
 
-        assert_eq!(action_that_reached_platform(request), SEMANTIC_PRESS_ACTION);
+        assert_eq!(
+            intent_that_reached_platform_driver(request),
+            SEMANTIC_PRESS_ACTION
+        );
+    }
+
+    #[test]
+    fn a_platform_action_name_is_still_an_unknown_wire_value() {
+        let mut request = left_click(json!({"by": "identifier", "identifier": "button"}));
+        request["action"] = json!("AXPress");
+
+        assert_eq!(
+            parse_click_request(&request)
+                .expect_err("the wire accepts intents, not platform names"),
+            click_wire_envelope(json!({
+                "outcome": "invalid_request",
+                "field": "action",
+                "reason": "unknown_value",
+            }))
+        );
     }
 
     /// A role+title target reaches the resolver as that key form, and finds a
