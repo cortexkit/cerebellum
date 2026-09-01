@@ -56,6 +56,19 @@ type ProductionLaunchJournal =
 
 type SharedLaunchJournal = Arc<Mutex<Option<ProductionLaunchJournal>>>;
 
+fn map_poisoned_mutex<T>(
+    result: Result<T, std::sync::PoisonError<T>>,
+    stage: &'static str,
+) -> Result<T, Value> {
+    result.map_err(|error| {
+        json!({
+            "outcome": "internal_failure",
+            "stage": stage,
+            "detail": error.to_string(),
+        })
+    })
+}
+
 const BROWSER_LAUNCH_RECOVERY_FAILED: &str = "browser_launch_recovery_failed";
 const PROFILE_CUSTODY_DIRECTORY: &str = ".ck-browser-profile-custody";
 
@@ -97,7 +110,7 @@ impl ProductionLaunchService {
 
     fn require_recovered_startup(&self) -> Result<(), Value> {
         match self.startup_failure {
-            Some(_) => Err(launch_recovery_refusal()),
+            Some(failure) => Err(launch_recovery_refusal(failure)),
             None => Ok(()),
         }
     }
@@ -134,11 +147,12 @@ impl ProductionLaunchService {
                 "expected_path": executable,
             }));
         }
-        let expected = self
-            .config
-            .expected_identity
-            .as_deref()
-            .ok_or_else(|| json!({"outcome": "internal_failure"}))?;
+        let expected = self.config.expected_identity.as_deref().ok_or_else(|| {
+            json!({
+                "outcome": "internal_failure",
+                "stage": "expected_identity",
+            })
+        })?;
         let (expected_identity, pre_spawn_identity_verification) =
             verify_configured_executable(executable, expected)?;
         let context =
@@ -210,12 +224,8 @@ impl ProductionLaunchService {
             }
         };
 
-        let mut lifecycle_guard = lifecycle
-            .lock()
-            .map_err(|_| json!({"outcome": "internal_failure"}))?;
-        let mut locks_guard = locks
-            .lock()
-            .map_err(|_| json!({"outcome": "internal_failure"}))?;
+        let mut lifecycle_guard = map_poisoned_mutex(lifecycle.lock(), "profile_registry_lock")?;
+        let mut locks_guard = map_poisoned_mutex(locks.lock(), "custody_locks_lock")?;
         let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard);
         let prepared = bound
             .acquire_and_prepare(key, &invocation, &reservation, &context)
@@ -231,7 +241,11 @@ impl ProductionLaunchService {
         else {
             let _ = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
                 .rollback_opened(opened);
-            return Err(json!({"outcome": "internal_failure"}));
+            return Err(json!({
+                "outcome": "internal_failure",
+                "stage": "profile_uuid_lookup",
+                "rollback": "rollback_opened",
+            }));
         };
 
         let crash_dumps_directory = profile_directory.join("crash-dumps");
@@ -244,7 +258,11 @@ impl ProductionLaunchService {
         ) {
             let _ = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
                 .rollback_opened(opened);
-            return Err(json!({"outcome": "internal_failure"}));
+            return Err(json!({
+                "outcome": "internal_failure",
+                "stage": "argument_quarantine",
+                "rollback": "rollback_opened",
+            }));
         }
 
         let rollback = SharedRollback::new(
@@ -282,11 +300,11 @@ impl ProductionLaunchService {
             verified_executable_identity: expected_identity,
             pre_spawn_identity_verification,
         };
-        let (command_parent, command_child) = match pipe_pair() {
+        let (command_parent, command_child) = match pipe_pair("command") {
             Ok(pair) => pair,
             Err(outcome) => return Err(cleanup_before_spawn(rollback.clone(), outcome)),
         };
-        let (response_parent, response_child) = match pipe_pair() {
+        let (response_parent, response_child) = match pipe_pair("response") {
             Ok(pair) => pair,
             Err(outcome) => return Err(cleanup_before_spawn(rollback.clone(), outcome)),
         };
@@ -298,19 +316,34 @@ impl ProductionLaunchService {
             LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
         let pipe = match UnixCdpPipe::new(command_parent, response_parent) {
             Ok(pipe) => pipe,
-            Err(_) => {
+            Err(error) => {
                 return Err(cleanup_before_spawn(
                     rollback.clone(),
-                    json!({"outcome": "internal_failure"}),
+                    json!({
+                        "outcome": "internal_failure",
+                        "stage": "spawn_preparation",
+                        "pipe": "cdp",
+                        "detail": format!("{error:?}"),
+                    }),
                 ))
             }
         };
-        let mut journal_guard = self.journal.lock().map_err(|_| {
-            cleanup_before_spawn(rollback.clone(), json!({"outcome": "internal_failure"}))
+        let mut journal_guard = self.journal.lock().map_err(|error| {
+            cleanup_before_spawn(
+                rollback.clone(),
+                json!({
+                    "outcome": "internal_failure",
+                    "stage": "launch_journal_lock",
+                    "detail": format!("{error:?}"),
+                }),
+            )
         })?;
-        let journal = journal_guard
-            .as_mut()
-            .ok_or_else(|| json!({"outcome": "internal_failure"}))?;
+        let journal = journal_guard.as_mut().ok_or_else(|| {
+            json!({
+                "outcome": "internal_failure",
+                "stage": "launch_journal",
+            })
+        })?;
         let mut clock = SystemLaunchClock;
         let mut readiness_rollback = rollback.clone();
         let launch_started_at = SystemTime::now();
@@ -359,10 +392,12 @@ impl BrowserSessionLauncher for ProductionLaunchService {
     }
 }
 
-fn launch_recovery_refusal() -> Value {
+fn launch_recovery_refusal(failure: BrowserLaunchRecoveryFailure) -> Value {
     json!({
         "outcome": "internal_failure",
+        "stage": "startup_recovery",
         "reason_code": BROWSER_LAUNCH_RECOVERY_FAILED,
+        "detail": format!("{failure:?}"),
     })
 }
 
@@ -1167,8 +1202,13 @@ fn record_profile_admission(
         "executable_path": path_bytes(executable),
         "verified_executable_identity": identity,
     });
-    let mut bytes =
-        serde_json::to_vec(&record).map_err(|_| json!({"outcome": "internal_failure"}))?;
+    let mut bytes = serde_json::to_vec(&record).map_err(|error| {
+        json!({
+            "outcome": "internal_failure",
+            "stage": "admission_record_serialization",
+            "detail": format!("{error:?}"),
+        })
+    })?;
     bytes.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
@@ -1201,9 +1241,13 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
             crate::browser_launch_readiness::LaunchReadinessError::ProfileStartupIndeterminate(
                 failure,
             ),
-        ) => {
-            serde_json::to_value(failure).unwrap_or_else(|_| json!({"outcome":"internal_failure"}))
-        }
+        ) => serde_json::to_value(failure).unwrap_or_else(|error| {
+            json!({
+                "outcome": "internal_failure",
+                "stage": "readiness_error_serialization",
+                "detail": format!("{error:?}"),
+            })
+        }),
         AttestedReadinessError::Readiness(
             crate::browser_launch_readiness::LaunchReadinessError::CleanupFailed { .. },
         )
@@ -1211,7 +1255,11 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
         | AttestedReadinessError::AttestedLaunch(AttestedLaunchError::TerminationOrReapFailed) => {
             json!({"outcome":"cleanup_failure","stage":"reap"})
         }
-        _ => json!({"outcome": "internal_failure"}),
+        error => json!({
+            "outcome": "internal_failure",
+            "stage": "readiness_error_mapping",
+            "detail": format!("{error:?}"),
+        }),
     }
 }
 
@@ -1256,14 +1304,23 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }
 
-fn pipe_pair() -> Result<
+fn pipe_pair(
+    pipe: &'static str,
+) -> Result<
     (
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     ),
     Value,
 > {
-    std::os::unix::net::UnixStream::pair().map_err(|_| json!({"outcome":"internal_failure"}))
+    std::os::unix::net::UnixStream::pair().map_err(|error| {
+        json!({
+            "outcome": "internal_failure",
+            "stage": "spawn_preparation",
+            "pipe": pipe,
+            "detail": format!("{error:?}"),
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1395,6 +1452,29 @@ mod executable_identity_launch_tests {
     }
 
     #[test]
+    fn launch_reports_missing_expected_identity_by_stage() {
+        let executable = UnsignedExecutable::new();
+        let config = BrowserConfig {
+            executable_path: Some(executable.0.clone()),
+            expected_identity: None,
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 1_000,
+        };
+        let service = ProductionLaunchService::open_with_recovery(config, |_| (None, None));
+        let refusal = match service.launch(&accepted_facts(Path::new("/tmp")), "session-1") {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("launch proceeded without a configured expected identity"),
+        };
+
+        assert_eq!(refusal["outcome"], "internal_failure");
+        assert_eq!(refusal["stage"], "expected_identity");
+        assert!(refusal.get("detail").is_none());
+    }
+
+    #[test]
     fn launch_refuses_when_executable_identity_cannot_be_established() {
         let executable = UnsignedExecutable::new();
         let config = BrowserConfig {
@@ -1418,6 +1498,28 @@ mod executable_identity_launch_tests {
         assert_eq!(refusal["reason"], "verifier_failed");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(refusal["reason"], "configured_digest_invalid");
+    }
+
+    #[test]
+    fn poisoned_profile_registry_lock_reports_named_stage() {
+        let lock = Arc::new(Mutex::new(()));
+        let poisoned_lock = Arc::clone(&lock);
+        let panic = std::thread::spawn(move || {
+            let _guard = poisoned_lock.lock().expect("acquire lock for poisoning");
+            panic!("poison the fixture lock");
+        });
+        assert!(panic.join().is_err());
+
+        let refusal = match map_poisoned_mutex(lock.lock(), "profile_registry_lock") {
+            Ok(_) => panic!("poisoned lock was recovered"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(refusal["outcome"], "internal_failure");
+        assert_eq!(refusal["stage"], "profile_registry_lock");
+        assert_eq!(
+            refusal["detail"],
+            "poisoned lock: another task failed inside"
+        );
     }
 }
 
@@ -1925,7 +2027,9 @@ mod orphan_recovery_tests {
             service.require_recovered_startup(),
             Err(json!({
                 "outcome": "internal_failure",
+                "stage": "startup_recovery",
                 "reason_code": "browser_launch_recovery_failed",
+                "detail": "JournalTerminalization",
             }))
         );
     }
