@@ -278,7 +278,7 @@ impl ProductionLaunchService {
             },
             executable: executable.clone(),
             arguments,
-            environment: Vec::new(),
+            environment: browser_launch_environment(&profile_directory),
             verified_executable_identity: expected_identity,
             pre_spawn_identity_verification,
         };
@@ -364,6 +364,49 @@ fn launch_recovery_refusal() -> Value {
         "outcome": "internal_failure",
         "reason_code": BROWSER_LAUNCH_RECOVERY_FAILED,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn browser_launch_environment(profile_directory: &Path) -> Vec<(OsString, OsString)> {
+    linux_browser_launch_environment_from(profile_directory, std::env::vars_os())
+}
+
+#[cfg(target_os = "macos")]
+fn browser_launch_environment(_profile_directory: &Path) -> Vec<(OsString, OsString)> {
+    Vec::new()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_browser_launch_environment_from(
+    profile_directory: &Path,
+    parent_environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    const ALLOWED_PARENT_VARIABLES: [&str; 5] = [
+        "DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "WAYLAND_DISPLAY",
+        "HOME",
+    ];
+
+    let mut parent_environment = parent_environment
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut environment = vec![(
+        OsString::from("XDG_CONFIG_HOME"),
+        profile_directory.join("config").into_os_string(),
+    )];
+
+    // This must remain an allowlist. Inheriting the launcher's environment, or
+    // trying to deny known injection variables, could pass LD_PRELOAD (or a new
+    // equivalent) and make the attested executable's behaviour externally
+    // controlled without falsifying its recorded image identity.
+    environment.extend(ALLOWED_PARENT_VARIABLES.into_iter().filter_map(|name| {
+        parent_environment
+            .remove(std::ffi::OsStr::new(name))
+            .map(|value| (OsString::from(name), value))
+    }));
+    environment
 }
 
 pub(crate) fn browser_launch_arguments(
@@ -1227,6 +1270,71 @@ fn pipe_pair() -> Result<
 mod executable_identity_launch_tests {
     use super::*;
     use cerebellum_core::identity::{RouteIdentity, RouteSurface, SessionKind};
+
+    #[test]
+    fn linux_browser_launch_environment_allows_only_display_prerequisites() {
+        let profile = Path::new("/tmp/browser-profile");
+        let parent_environment = [
+            (OsString::from("DISPLAY"), OsString::from(":7")),
+            (
+                OsString::from("XAUTHORITY"),
+                OsString::from("/run/user/1000/xauthority"),
+            ),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/1000"),
+            ),
+            (
+                OsString::from("WAYLAND_DISPLAY"),
+                OsString::from("wayland-1"),
+            ),
+            (OsString::from("HOME"), OsString::from("/home/operator")),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                OsString::from("/home/operator/.config"),
+            ),
+            (
+                OsString::from("LD_PRELOAD"),
+                OsString::from("/tmp/inject.so"),
+            ),
+        ];
+
+        assert_eq!(
+            linux_browser_launch_environment_from(profile, parent_environment),
+            vec![
+                (
+                    OsString::from("XDG_CONFIG_HOME"),
+                    OsString::from("/tmp/browser-profile/config"),
+                ),
+                (OsString::from("DISPLAY"), OsString::from(":7")),
+                (
+                    OsString::from("XAUTHORITY"),
+                    OsString::from("/run/user/1000/xauthority"),
+                ),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/run/user/1000"),
+                ),
+                (
+                    OsString::from("WAYLAND_DISPLAY"),
+                    OsString::from("wayland-1"),
+                ),
+                (OsString::from("HOME"), OsString::from("/home/operator")),
+            ]
+        );
+
+        let without_display = linux_browser_launch_environment_from(
+            profile,
+            [(OsString::from("HOME"), OsString::from("/home/operator"))],
+        );
+        assert!(!without_display.iter().any(|(name, _)| name == "DISPLAY"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_browser_launch_environment_remains_empty() {
+        assert!(browser_launch_environment(Path::new("/tmp/browser-profile")).is_empty());
+    }
 
     #[test]
     fn browser_probe_arguments_include_a_separate_throwaway_crash_dumps_path() {
