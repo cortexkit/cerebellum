@@ -1017,3 +1017,44 @@ fn the_browser_surface_reporter_agrees_with_dispatch() {
         }
     }
 }
+
+/// The production constructor wires a launcher wherever one exists.
+///
+/// Every other test in this file ASSIGNS `launch_service` directly, which is
+/// why a real defect hid here for as long as it did: a fixture that injects a
+/// launcher never asks whether production builds one. iceteaSA found it by
+/// running on Linux, where the wiring was gated to macOS and the refusal blamed
+/// profile storage on a healthy disk.
+///
+/// This runs on every platform and asserts the platform's own answer, so it
+/// fails on the platform that regressed rather than only where it was written.
+#[tokio::test]
+async fn the_production_constructor_wires_a_launcher_on_every_platform_that_has_one() {
+    // A path that is a file, since the wiring filters on exactly that.
+    let executable = std::env::current_exe().expect("the test binary is a file");
+    let planes = cerebellum::Planes::with_browser_config_journaling(
+        std::sync::Arc::new(cerebellum_core::health::HealthState::new()),
+        Some(cerebellum::browser_config::BrowserConfig {
+            executable_path: Some(executable),
+            expected_identity: Some("test.identity".into()),
+            launch_handshake_deadline_ms: 10_000,
+            termination_grace_period_ms: 1_000,
+            browser_idle_timeout_ms: 60_000,
+            browser_exit_observation_deadline_ms: 5_000,
+            navigation_settle_deadline_ms: 10_000,
+        }),
+        cerebellum::JournalPersistence::Isolated,
+    );
+
+    // Platforms with a process launcher must wire one. The list is the same one
+    // the wiring itself uses, written out rather than derived from it, so
+    // narrowing the wiring cannot silently narrow its own test.
+    let has_launcher = cfg!(target_os = "macos") || cfg!(target_os = "linux");
+    assert_eq!(
+        planes.launch_service.is_some(),
+        has_launcher,
+        "on {} a launcher should be {}, and the production constructor said otherwise",
+        std::env::consts::OS,
+        if has_launcher { "wired" } else { "absent" }
+    );
+}
