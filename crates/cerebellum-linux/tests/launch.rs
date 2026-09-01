@@ -245,6 +245,28 @@ fn an_exec_chain_reports_the_next_mapped_image_and_honors_its_bound() {
 }
 
 #[test]
+fn exec_walk_crosses_a_signal_stop_and_reinjects_the_signal() {
+    let _lock = launch_lock();
+    let signal_effect = temporary_path("exec-signal-effect");
+    let _ = fs::remove_file(&signal_effect);
+    let script = format!(
+        "trap 'printf handled > \"{}\"' USR1; kill -USR1 $$; exec /bin/sleep 30",
+        signal_effect.display()
+    );
+    let mut child = spawn_shell(&script);
+
+    let identity = child.continue_to_next_exec_stop(1).expect("next exec stop");
+
+    assert!(identity.resolved_path.ends_with("sleep"));
+    assert_eq!(
+        fs::read_to_string(&signal_effect).expect("re-injected signal ran its handler"),
+        "handled"
+    );
+    child.terminate_and_reap().expect("reap signal fixture");
+    let _ = fs::remove_file(signal_effect);
+}
+
+#[test]
 fn exec_chain_attestation_ignores_rewritten_argv_zero() {
     let _lock = launch_lock();
     let mut child = spawn_bash("exec -a somethingelse /bin/sleep 30");

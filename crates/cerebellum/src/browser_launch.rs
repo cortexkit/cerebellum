@@ -474,6 +474,8 @@ pub enum PlatformLaunchError {
     PtraceUnavailable,
     ExecChainUnresolved { chain: ExecutableIdentityChain },
     GenerationUnreadable,
+    UnexpectedStop { signal: i32 },
+    SignalStopLimitExceeded { last_signal: i32, limit: usize },
 }
 
 impl PlatformLaunchError {
@@ -481,19 +483,29 @@ impl PlatformLaunchError {
         let (reason_code, remedy) = match self {
             Self::PtraceUnavailable => (
                 "ptrace_unavailable",
-                "grant CAP_SYS_PTRACE or lower ptrace_scope, then retry the launch",
+                "grant CAP_SYS_PTRACE or lower ptrace_scope, then retry the launch".to_string(),
             ),
             Self::ExecChainUnresolved { .. } => (
                 "exec_chain_unresolved",
-                "configure the final executable image digest, then retry the launch",
+                "configure the final executable image digest, then retry the launch".to_string(),
             ),
             Self::GenerationUnreadable => (
                 "generation_unreadable",
-                "restore readable procfs start-time access, then retry the launch",
+                "restore readable procfs start-time access, then retry the launch".to_string(),
+            ),
+            Self::UnexpectedStop { signal } => (
+                "unexpected_process_stop",
+                format!("inspect unexpected process stop signal {signal}, then retry the launch"),
+            ),
+            Self::SignalStopLimitExceeded { last_signal, limit } => (
+                "signal_stop_limit_exceeded",
+                format!(
+                    "inspect the signal storm after {limit} stops (last signal {last_signal}), then retry the launch"
+                ),
             ),
             Self::Spawn | Self::ImageIdentity | Self::ProcessControl => (
                 "platform_launch_failed",
-                "inspect the platform launch failure and retry after correcting it",
+                "inspect the platform launch failure and retry after correcting it".to_string(),
             ),
         };
         serde_json::json!({
@@ -1349,11 +1361,16 @@ fn map_linux_process_control_error(
             }
         }
         cerebellum_linux::ProcessControlError::Ptrace(_) => PlatformLaunchError::PtraceUnavailable,
+        cerebellum_linux::ProcessControlError::UnexpectedStop { signal } => {
+            PlatformLaunchError::UnexpectedStop { signal }
+        }
+        cerebellum_linux::ProcessControlError::SignalStopLimitExceeded { last_signal, limit } => {
+            PlatformLaunchError::SignalStopLimitExceeded { last_signal, limit }
+        }
         cerebellum_linux::ProcessControlError::AlreadyReleased
         | cerebellum_linux::ProcessControlError::GenerationChanged
         | cerebellum_linux::ProcessControlError::Signal(_)
         | cerebellum_linux::ProcessControlError::Reap(_)
-        | cerebellum_linux::ProcessControlError::UnexpectedStop
         | cerebellum_linux::ProcessControlError::ProcessExited => {
             PlatformLaunchError::ProcessControl
         }
@@ -1519,6 +1536,29 @@ impl BarredProcessLauncher for MacOsProcessLauncher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_stop_refusals_preserve_signal_diagnostics() {
+        assert_eq!(
+            PlatformLaunchError::UnexpectedStop { signal: 17 }.refusal(),
+            serde_json::json!({
+                "outcome": "launch_refused",
+                "reason_code": "unexpected_process_stop",
+                "remedy": "inspect unexpected process stop signal 17, then retry the launch",
+            })
+        );
+        assert_eq!(
+            PlatformLaunchError::SignalStopLimitExceeded {
+                last_signal: 10,
+                limit: 64,
+            }
+            .refusal(),
+            serde_json::json!({
+                "outcome": "launch_refused",
+                "reason_code": "signal_stop_limit_exceeded",
+                "remedy": "inspect the signal storm after 64 stops (last signal 10), then retry the launch",
+            })
+        );
+    }
 
     /// A walk that stopped at its hop bound attests nothing.
     ///

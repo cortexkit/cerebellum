@@ -8,10 +8,14 @@
 //! Keep additions here small and mechanical. This crate is the auditable place
 //! for platform calls, not a place to move browser policy.
 
-// Parsing procfs stays compiled under tests off Linux so the field-boundary
-// checks remain exercised where launching a Linux tracee is impossible.
+// The exec-stop state machine has no syscalls, so its loop and bounds remain
+// testable where launching a Linux tracee is impossible.
+#[cfg(any(target_os = "linux", test))]
+mod exec_stop;
 #[cfg(target_os = "linux")]
 mod launch;
+// Parsing procfs stays compiled under tests off Linux so the field-boundary
+// checks remain exercised where launching a Linux tracee is impossible.
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 
