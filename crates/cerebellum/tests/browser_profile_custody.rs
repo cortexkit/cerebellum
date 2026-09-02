@@ -320,9 +320,81 @@ fn a_held_lock_and_registry_profile_busy_is_internal_failure() {
         )
         .unwrap_err();
 
-    assert_eq!(outcome, BrowserLaunchOutcome::InternalFailure);
+    assert_eq!(
+        outcome,
+        BrowserLaunchOutcome::InternalFailure {
+            reason_code: "registry_profile_busy",
+        }
+    );
+    assert_eq!(
+        outcome.as_json(),
+        json!({
+            "outcome": "internal_failure",
+            "reason_code": "registry_profile_busy",
+        })
+    );
     assert!(profile_lock_paths(root.path()).is_empty());
     assert_eq!(profile_directory_count(root.path()), 1);
+}
+
+#[test]
+fn lifecycle_internal_failures_keep_named_codes_on_the_launch_wire() {
+    let root = TestRoot::new("named-internal-failures");
+    let mut lifecycle = ProfileLifecycle::open(root.path()).unwrap();
+    let invocation = InvocationToken::for_test("invocation-a");
+    let reservation_invocation = InvocationToken::for_test("invocation-b");
+    let reservation =
+        JournalReservationHandle::for_test(&reservation_invocation, "reservation-mismatched");
+
+    let mismatch = match lifecycle.prepare_context_open(
+        &invocation,
+        &reservation,
+        &context("subagent", "disposable", "mismatched-reservation"),
+    ) {
+        PrepareResult::Closed(outcome) => outcome,
+        PrepareResult::Prepared(_) => panic!("mismatched reservation was prepared"),
+    };
+    assert_eq!(
+        mismatch,
+        ProfileOutcome::InternalFailure {
+            reason_code: "invocation_reservation_mismatch",
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(mismatch).as_json(),
+        json!({
+            "outcome": "internal_failure",
+            "reason_code": "invocation_reservation_mismatch",
+        })
+    );
+
+    let (invocation, reservation, _) = tokens("committed-preparation");
+    let prepared = match lifecycle.prepare_context_open(
+        &invocation,
+        &reservation,
+        &context("subagent", "disposable", "mismatched-commitment"),
+    ) {
+        PrepareResult::Prepared(prepared) => prepared,
+        PrepareResult::Closed(outcome) => panic!("preparation unexpectedly closed: {outcome:?}"),
+    };
+    let (_, _, different_commitment) = tokens("different-commitment");
+    let mismatch = match lifecycle.launch_prepared_context(prepared, &different_commitment) {
+        LaunchResult::Closed(outcome) => outcome,
+        LaunchResult::Opened(_) => panic!("mismatched commitment opened a profile"),
+    };
+    assert_eq!(
+        mismatch,
+        ProfileOutcome::InternalFailure {
+            reason_code: "prepared_launch_commitment_mismatch",
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(mismatch).as_json(),
+        json!({
+            "outcome": "internal_failure",
+            "reason_code": "prepared_launch_commitment_mismatch",
+        })
+    );
 }
 
 #[test]
@@ -1021,7 +1093,9 @@ fn every_wire_outcome_is_structurally_profile_uuid_free() {
             reason_code: "profile_registry_managed_root_identity_changed",
         },
         BrowserLaunchOutcome::ProfileStorageUnavailable,
-        BrowserLaunchOutcome::InternalFailure,
+        BrowserLaunchOutcome::InternalFailure {
+            reason_code: "fixture_internal_failure",
+        },
         BrowserLaunchOutcome::CleanupFailure {
             stage: LaunchCleanupStage::RecordTerminalization,
         },

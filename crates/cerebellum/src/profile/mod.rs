@@ -2116,7 +2116,7 @@ impl ProfileLifecycle {
         }
         if invocation.id != reservation.invocation_id {
             return PrepareResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "invocation_reservation_mismatch",
             });
         }
         let conversation = context.conversation_key().to_string();
@@ -2352,20 +2352,20 @@ impl ProfileLifecycle {
     ) -> Result<PreparedProfileAttempt, ProfileOutcome> {
         if prepared.namespace != self.namespace {
             return Err(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_namespace_mismatch",
             });
         }
         let state = self
             .prepared
             .get(&prepared.id)
             .ok_or(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_context_absent",
             })?;
         let uuid = state
             .profile_uuid
             .as_deref()
             .ok_or(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_profile_uuid_absent",
             })?;
         let record = self.registry.record_for_by_uuid(uuid).map_err(|_| {
             ProfileOutcome::StorageUnavailable {
@@ -2399,18 +2399,18 @@ impl ProfileLifecycle {
     ) -> Result<PreparedRollback, ProfileOutcome> {
         if prepared.namespace != self.namespace {
             return Err(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_namespace_mismatch",
             });
         }
         let Some(state) = self.prepared.get(&prepared.id).cloned() else {
             return Err(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_context_absent",
             });
         };
         if let Some(signal) = state.terminal.as_ref() {
             if signal.cause != cause {
                 return Err(ProfileOutcome::InternalFailure {
-                    reason_code: "internal_failure",
+                    reason_code: "prepared_rollback_cause_mismatch",
                 });
             }
         } else {
@@ -2426,7 +2426,7 @@ impl ProfileLifecycle {
                         .profile_uuid
                         .as_deref()
                         .ok_or(ProfileOutcome::InternalFailure {
-                            reason_code: "internal_failure",
+                            reason_code: "prepared_rollback_profile_uuid_absent",
                         })?;
                 self.terminalize_profile_record(uuid, kind)?;
             }
@@ -2458,22 +2458,22 @@ impl ProfileLifecycle {
     ) -> AbortResult {
         if rollback.namespace != self.namespace {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_completion_namespace_mismatch",
             });
         }
         let Some(state) = self.prepared.get(&rollback.id).cloned() else {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_completion_context_absent",
             });
         };
         let Some(signal) = state.terminal.clone() else {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_not_terminalized",
             });
         };
         if signal.cause != rollback.cause {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_completion_cause_mismatch",
             });
         }
         let actual_attempt = match self.prepared_profile_attempt(&PreparedOpen {
@@ -2485,7 +2485,7 @@ impl ProfileLifecycle {
         };
         if &actual_attempt != attempt {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_rollback_attempt_mismatch",
             });
         }
         let result = match state.kind {
@@ -2507,18 +2507,18 @@ impl ProfileLifecycle {
     ) -> AbortResult {
         if prepared.namespace != self.namespace {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_abort_namespace_mismatch",
             });
         }
         let Some(state) = self.prepared.get(&prepared.id).cloned() else {
             return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_abort_context_absent",
             });
         };
         if let Some(signal) = state.terminal.clone() {
             if signal.cause != cause {
                 return AbortResult::Closed(ProfileOutcome::InternalFailure {
-                    reason_code: "internal_failure",
+                    reason_code: "prepared_abort_cause_mismatch",
                 });
             }
             return match signal.state {
@@ -2621,7 +2621,7 @@ impl ProfileLifecycle {
             .profile_uuid
             .as_deref()
             .ok_or(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "durable_rollback_profile_uuid_absent",
             })?;
         let record = self.registry.record_for_by_uuid(uuid).map_err(|_| {
             ProfileOutcome::StorageUnavailable {
@@ -2673,35 +2673,37 @@ impl ProfileLifecycle {
     ) -> LaunchResult {
         if prepared.namespace != self.namespace {
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_launch_namespace_mismatch",
             });
         }
         let Some(state) = self.prepared.get(&prepared.id).cloned() else {
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_launch_context_absent",
             });
         };
         if state.invocation_id != token.invocation_id
             || state.reservation_id != token.reservation_id
         {
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_launch_commitment_mismatch",
             });
         }
         if state.terminal.is_some() {
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_launch_already_terminalized",
             });
         }
         let uuid = state
             .profile_uuid
             .clone()
+            // The `else` below can only receive this missing UUID failure.
             .ok_or(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_launch_profile_uuid_absent",
             });
         let Ok(uuid) = uuid else {
+            // This branch returns the same error because the UUID is missing, matching the `ok_or` failure above.
             return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "prepared_launch_profile_uuid_absent",
             });
         };
         if self.registry.config.release_failure && matches!(state.kind, PreparedKind::Creating(_)) {
@@ -2714,12 +2716,12 @@ impl ProfileLifecycle {
             PreparedKind::Reuse => {
                 let Some(existing_id) = self.sessions.get(&state.conversation_key).copied() else {
                     return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                        reason_code: "internal_failure",
+                        reason_code: "reused_profile_session_absent",
                     });
                 };
                 let Some(existing) = self.opened.get(&existing_id) else {
                     return LaunchResult::Closed(ProfileOutcome::InternalFailure {
-                        reason_code: "internal_failure",
+                        reason_code: "reused_profile_opened_context_absent",
                     });
                 };
                 let opened = OpenedContext {
@@ -2849,14 +2851,14 @@ impl ProfileLifecycle {
     ) -> Result<PreparedProfileAttempt, ProfileOutcome> {
         if opened.namespace != self.namespace {
             return Err(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_profile_attempt_namespace_mismatch",
             });
         }
         let state = self
             .opened
             .get(&opened.id)
             .ok_or(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_profile_attempt_context_absent",
             })?;
         let record = self
             .registry
@@ -2888,7 +2890,7 @@ impl ProfileLifecycle {
     ) -> Result<OpenedRollback, ProfileOutcome> {
         if opened.namespace != self.namespace {
             return Err(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_rollback_namespace_mismatch",
             });
         }
         let state =
@@ -2896,14 +2898,14 @@ impl ProfileLifecycle {
                 .get(&opened.id)
                 .cloned()
                 .ok_or(ProfileOutcome::InternalFailure {
-                    reason_code: "internal_failure",
+                    reason_code: "opened_rollback_context_absent",
                 })?;
         if state
             .rollback_terminalized
             .is_some_and(|prior| prior != cause)
         {
             return Err(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_rollback_cause_mismatch",
             });
         }
         if state.rollback_terminalized.is_none() {
@@ -2933,7 +2935,7 @@ impl ProfileLifecycle {
     ) -> ReleaseResult {
         if rollback.namespace != self.namespace {
             return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_rollback_completion_namespace_mismatch",
             });
         }
         let opened = OpenedContext {
@@ -2946,17 +2948,17 @@ impl ProfileLifecycle {
         };
         if &actual_attempt != attempt {
             return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_rollback_attempt_mismatch",
             });
         }
         let Some(state) = self.opened.get(&rollback.id).cloned() else {
             return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_rollback_completion_context_absent",
             });
         };
         if state.rollback_terminalized != Some(rollback.cause) {
             return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "opened_rollback_completion_cause_mismatch",
             });
         }
         let outcome = match state.kind {
@@ -2980,18 +2982,18 @@ impl ProfileLifecycle {
     pub fn release_context(&mut self, opened: OpenedContext, cause: ReleaseCause) -> ReleaseResult {
         if opened.namespace != self.namespace {
             return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "profile_release_namespace_mismatch",
             });
         }
         let Some(state) = self.opened.get(&opened.id).cloned() else {
             return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                reason_code: "internal_failure",
+                reason_code: "profile_release_context_absent",
             });
         };
         if let Some((prior_cause, result)) = &state.release {
             if *prior_cause != cause {
                 return ReleaseResult::Closed(ProfileOutcome::InternalFailure {
-                    reason_code: "internal_failure",
+                    reason_code: "profile_release_cause_mismatch",
                 });
             }
             return match result {

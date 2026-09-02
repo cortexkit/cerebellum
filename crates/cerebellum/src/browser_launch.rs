@@ -3212,7 +3212,7 @@ pub enum BrowserLaunchOutcome {
     ProfileGrantRequired,
     ProfileRegistryUntrustedRoot { reason_code: &'static str },
     ProfileStorageUnavailable,
-    InternalFailure,
+    InternalFailure { reason_code: &'static str },
     CleanupFailure { stage: LaunchCleanupStage },
 }
 
@@ -3242,7 +3242,10 @@ impl BrowserLaunchOutcome {
             Self::ProfileStorageUnavailable => {
                 json!({"outcome": "profile_storage_unavailable"})
             }
-            Self::InternalFailure => json!({"outcome": "internal_failure"}),
+            Self::InternalFailure { reason_code } => json!({
+                "outcome": "internal_failure",
+                "reason_code": reason_code,
+            }),
             Self::CleanupFailure { stage } => {
                 json!({"outcome": "cleanup_failure", "stage": stage.as_str()})
             }
@@ -3255,11 +3258,15 @@ impl BrowserLaunchOutcome {
 /// cannot be reported as contention.
 pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
     match outcome {
-        ProfileOutcome::ProfileBusy { profile_uuid: _ } => BrowserLaunchOutcome::InternalFailure,
+        ProfileOutcome::ProfileBusy { profile_uuid: _ } => BrowserLaunchOutcome::InternalFailure {
+            reason_code: "registry_profile_busy",
+        },
         ProfileOutcome::ProfileGrantRequired { reason_code: _ } => {
             BrowserLaunchOutcome::ProfileGrantRequired
         }
-        ProfileOutcome::NoSession { reason_code: _ } => BrowserLaunchOutcome::InternalFailure,
+        ProfileOutcome::NoSession { reason_code } => {
+            BrowserLaunchOutcome::InternalFailure { reason_code }
+        }
         ProfileOutcome::StorageUnavailable {
             reason_code:
                 reason_code @ (PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
@@ -3270,7 +3277,9 @@ pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
             reason_code: _,
             origin: _,
         } => BrowserLaunchOutcome::ProfileStorageUnavailable,
-        ProfileOutcome::InternalFailure { reason_code: _ } => BrowserLaunchOutcome::InternalFailure,
+        ProfileOutcome::InternalFailure { reason_code } => {
+            BrowserLaunchOutcome::InternalFailure { reason_code }
+        }
     }
 }
 
@@ -3343,16 +3352,22 @@ where
         reservation: &JournalReservationHandle,
         context: &StampedBindContext,
     ) -> Result<HeldPreparedProfile, BrowserLaunchOutcome> {
-        let holder_id = self
-            .locks
-            .mint_holder()
-            .map_err(|_| BrowserLaunchOutcome::InternalFailure)?;
+        let holder_id =
+            self.locks
+                .mint_holder()
+                .map_err(|_| BrowserLaunchOutcome::InternalFailure {
+                    reason_code: "custody_holder_mint",
+                })?;
         let mut claim = match self.locks.acquire(key, holder_id) {
             Ok(ProfileCustodyAcquisition::Acquired(claim)) => claim,
             Ok(ProfileCustodyAcquisition::ProfileBusy { holder_id }) => {
                 return Err(BrowserLaunchOutcome::ProfileBusy { holder_id })
             }
-            Err(_) => return Err(BrowserLaunchOutcome::InternalFailure),
+            Err(_) => {
+                return Err(BrowserLaunchOutcome::InternalFailure {
+                    reason_code: "custody_acquisition",
+                })
+            }
         };
 
         let prepared = match self
@@ -3384,7 +3399,9 @@ where
             .is_err()
         {
             return match self.rollback_prepared_parts(prepared, Some(attempt), claim) {
-                Ok(()) => Err(BrowserLaunchOutcome::InternalFailure),
+                Ok(()) => Err(BrowserLaunchOutcome::InternalFailure {
+                    reason_code: "custody_profile_directory_bind",
+                }),
                 Err(cleanup) => Err(cleanup),
             };
         }
@@ -3585,7 +3602,9 @@ where
         let held = self
             .held
             .take()
-            .ok_or(BrowserLaunchOutcome::InternalFailure)?;
+            .ok_or(BrowserLaunchOutcome::InternalFailure {
+                reason_code: "opened_rollback_already_consumed",
+            })?;
         match ProfileBoundLaunch::new(self.lifecycle, self.locks).rollback_opened(held) {
             Ok(()) => Ok(()),
             Err(outcome) => {
@@ -3633,6 +3652,6 @@ const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     | BrowserLaunchOutcome::ProfileGrantRequired
     | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code: _ }
     | BrowserLaunchOutcome::ProfileStorageUnavailable
-    | BrowserLaunchOutcome::InternalFailure
+    | BrowserLaunchOutcome::InternalFailure { reason_code: _ }
     | BrowserLaunchOutcome::CleanupFailure { stage: _ } => {}
 };
