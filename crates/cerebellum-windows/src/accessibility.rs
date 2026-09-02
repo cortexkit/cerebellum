@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::session::SessionProvenance;
+
 /// Resource bounds applied to one UI Automation tree read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccessibilityReadBounds {
@@ -144,6 +146,21 @@ pub struct UiaAccessibilityTree {
     pub roots: Vec<UiaElement>,
     pub unreadable_roots: Vec<AccessibilityReadFailure>,
     pub completeness: UiaTreeCompleteness,
+    /// Which session produced this reading.
+    ///
+    /// Carried WITH the tree rather than offered as a separate call, because a
+    /// read from a non-interactive session SUCCEEDS and returns no windows.
+    /// Measured as SYSTEM in session 0: the COM stack loads, the root resolves
+    /// as the desktop window class, and enumerating its children returns an
+    /// empty collection -- while an interactive console session with real
+    /// windows existed at that same moment.
+    ///
+    /// So an empty `roots` cannot be read as "the target has no windows" without
+    /// this field, and a caller must not be able to obtain the tree without also
+    /// obtaining the fact that decides what its emptiness means. A separate
+    /// precondition call would leave a window between the check and the read;
+    /// travelling together, the two cannot disagree.
+    pub session: SessionProvenance,
 }
 
 /// Why a UI Automation scope could not be read.
@@ -427,7 +444,16 @@ fn read_tree_before_deadline<Source: ElementSource>(
             unreadable_subtrees: state.unreadable_subtrees,
         }
     };
+    // Read alongside the tree, not before it, so the provenance describes this
+    // reading rather than an earlier moment. The producing call is Windows-only;
+    // on other hosts this function exists solely to be exercised over
+    // constructed sources, where no session reading is available to take.
+    #[cfg(target_os = "windows")]
+    let session = crate::windows::current_session_provenance();
+    #[cfg(not(target_os = "windows"))]
+    let session = SessionProvenance::NotApplicable;
     Ok(UiaAccessibilityTree {
+        session,
         roots,
         unreadable_roots,
         completeness,

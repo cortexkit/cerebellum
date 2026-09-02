@@ -12,6 +12,8 @@
 // library rather than a pretend implementation.
 #[cfg(any(target_os = "windows", test))]
 mod accessibility;
+#[cfg(any(target_os = "windows", test))]
+mod session;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -26,5 +28,9 @@ pub use accessibility::{
 pub use windows::{
     current_session_provenance, enumerated_window_visibility, process_start_time,
     retain_process_handle, ProcessHandleError, ProcessStartTime, RetainedProcessHandle,
-    SessionProvenance, WindowVisibility,
+    WindowVisibility,
 };
+
+// Pure data, so it is reachable wherever the readers that carry it are.
+#[cfg(any(target_os = "windows", test))]
+pub use session::SessionProvenance;

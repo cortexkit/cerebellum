@@ -279,45 +279,7 @@ unsafe extern "system" fn collect_window_visibility(hwnd: HWND, lparam: LPARAM) 
     1
 }
 
-/// Which Windows session this process runs in, and whether that is the console.
-///
-/// This exists because a UI Automation read from a NON-INTERACTIVE session
-/// SUCCEEDS. Measured in a Windows 11 ARM64 guest as SYSTEM in session 0: the
-/// COM stack loads, `RootElement` resolves as the desktop window class, and
-/// enumerating its children returns an EMPTY COLLECTION -- while an interactive
-/// console session with real windows existed at that same moment.
-///
-/// So nothing in an empty tree distinguishes "the target has no windows" from
-/// "this process cannot see any desktop", and no accessibility call reports
-/// which. The discriminator has to be established BEFORE the read and from a
-/// different source, because the result is the one thing that cannot carry it.
-///
-/// Reported rather than judged: this seam says which session it is in and which
-/// one the console is, and the caller decides what an empty tree means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionProvenance {
-    /// This process runs in the session currently attached to the console, so a
-    /// tree read can observe a user's desktop.
-    Console { session_id: u32 },
-    /// This process runs in some other session -- a service session, or a
-    /// disconnected or remote one. An empty tree here describes this process's
-    /// visibility, not the target.
-    OtherSession {
-        session_id: u32,
-        console_session_id: u32,
-    },
-    /// The console has no attached session. `WTSGetActiveConsoleSessionId`
-    /// returns `0xFFFFFFFF` for this, which is a real state rather than an
-    /// error: nobody is at the machine.
-    NoConsoleSession { session_id: u32 },
-    /// This process's own session could not be read. Kept distinct from every
-    /// answer above so a failed lookup is never reported as a session number.
-    Unreadable { last_error: u32 },
-}
-
-/// The sentinel `WTSGetActiveConsoleSessionId` returns when no session is
-/// attached to the console.
-const NO_ACTIVE_CONSOLE_SESSION: u32 = 0xFFFF_FFFF;
+use crate::session::SessionProvenance;
 
 /// Read this process's session and compare it with the console's.
 pub fn current_session_provenance() -> SessionProvenance {
@@ -335,15 +297,5 @@ pub fn current_session_provenance() -> SessionProvenance {
 
     // SAFETY: no arguments and no pointers; returns a session id or a sentinel.
     let console_session_id = unsafe { WTSGetActiveConsoleSessionId() };
-    if console_session_id == NO_ACTIVE_CONSOLE_SESSION {
-        return SessionProvenance::NoConsoleSession { session_id };
-    }
-    if console_session_id == session_id {
-        SessionProvenance::Console { session_id }
-    } else {
-        SessionProvenance::OtherSession {
-            session_id,
-            console_session_id,
-        }
-    }
+    crate::session::classify(session_id, console_session_id)
 }
