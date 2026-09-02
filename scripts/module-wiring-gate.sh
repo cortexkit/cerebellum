@@ -99,7 +99,7 @@ if [ "$failed" -ne 0 ]; then
   exit 1
 fi
 
-echo "module wiring: every module under crates/*/src is declared by its parent"
+echo "module wiring: $sources_scanned modules across $crates_scanned crates, every one declared by its parent"
 
 # Assert every example carrying tests declares an example target with test = true.
 #
@@ -151,4 +151,4 @@ if [ "$example_failed" -ne 0 ]; then
   exit 1
 fi
 
-echo "example tests: every example carrying tests declares a target that runs them"
+echo "example tests: $examples_scanned examples, every one carrying tests declares a target that runs them"
