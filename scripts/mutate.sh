@@ -151,16 +151,45 @@ rm -f "$verify_output_file"
 printf '%s\n' "$verify_output"
 
 echo "=== result ==="
+# Three outcomes, not two. A nonzero exit means the verify command was unhappy,
+# which is NOT the same as the mutation being caught: a compile error, a grep
+# that matched nothing, or a killed run all exit nonzero too. Reporting those as
+# CAUGHT ends an investigation with the answer the reader expected, which is the
+# expensive direction.
+#
+# The previous version printed a "confirm this yourself" caveat on every CAUGHT.
+# It fired constantly -- most verify commands pass `-q` or filter through grep,
+# so per-test FAILED lines rarely reach here at all -- and a warning that always
+# fires is one nobody reads. It was read past twice in one day before it was
+# believed.
 if [ "$verify_status" -eq 0 ]; then
   echo "NOT CAUGHT: the guard was removed and the check still passed."
   echo "            Nothing is watching this mechanism."
+  exit 0
+fi
+
+# Individual test lines, then the suite summary, then a panic: any one of these
+# is a test that actually ran and actually failed.
+red="$(printf '%s\n' "$verify_output" | grep -cE '^test .* \.\.\. FAILED' || true)"
+summary_failed="$(printf '%s\n' "$verify_output" | grep -cE '^test result: FAILED' || true)"
+panics="$(printf '%s\n' "$verify_output" | grep -c 'panicked at' || true)"
+compile_errors="$(printf '%s\n' "$verify_output" | grep -cE '^error(\[E[0-9]+\])?: |could not compile' || true)"
+
+if [ "$compile_errors" -ne 0 ]; then
+  echo "INCONCLUSIVE: the mutant did not build ($compile_errors compiler errors)."
+  echo "              Nothing was tested. A mutation that breaks the build exits"
+  echo "              nonzero exactly like one that was caught, so this is not"
+  echo "              evidence either way -- rewrite it to compile."
+elif [ "$red" -ne 0 ] || [ "$summary_failed" -ne 0 ] || [ "$panics" -ne 0 ]; then
+  echo "CAUGHT: tests ran and failed with the guard removed."
+  echo "        named failures: $red   failing suites: $summary_failed   panics: $panics"
+  echo "        Read the names above: they should name the property you meant."
 else
-  # Count individual test failures, not the suite's own summary line, which
-  # also begins with "test " and ends in "FAILED".
-  red="$(printf '%s\n' "$verify_output" | grep -cE '^test .* \.\.\. FAILED' || true)"
-  echo "CAUGHT: the check failed with the guard removed ($red named failures)."
-  echo "        Confirm the failures name the property you meant to test -- a"
-  echo "        compile error or a timeout also exits nonzero."
+  echo "INCONCLUSIVE: the check exited $verify_status with no sign of a failing test."
+  echo "              No FAILED line, no failing suite summary, no panic. That is"
+  echo "              what a grep matching nothing, a filtered-away result line,"
+  echo "              or a killed run looks like -- not what a caught mutation"
+  echo "              looks like. Widen the verify command and run it again."
 fi
 
 # The verify command's status is deliberately not the script's: it inverts, and
