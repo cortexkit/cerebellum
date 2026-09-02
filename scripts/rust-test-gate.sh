@@ -271,13 +271,20 @@ fi
 # macOS at all. Asking for them would make this phase fail for a reason that has
 # nothing to do with our code, and a phase that always fails teaches you to
 # ignore it. The VM covers what this cannot.
-if rustc --print target-libdir --target x86_64-pc-windows-msvc >/dev/null 2>&1; then
-  run_phase "cargo clippy --workspace --target x86_64-pc-windows-msvc -- -D warnings" \
-    cargo clippy --workspace --target x86_64-pc-windows-msvc --quiet -- -D warnings
-else
-  printf '==> SKIPPED: the windows target is not installed, so the windows build was not checked\n'
-  printf '    install it with: rustup target add x86_64-pc-windows-msvc\n'
-fi
+# Both Windows architectures, and aarch64 is not the exotic one. Every Windows
+# machine reachable from an Apple Silicon host is ARM64, so that is the target
+# any measurement will actually run on -- checking only x86_64 verified the
+# hypothetical build and left the real one unchecked, which is how I came to
+# build the wrong architecture for a VM I was about to test against.
+for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+  if rustc --print target-libdir --target "$windows_target" >/dev/null 2>&1; then
+    run_phase "cargo clippy --workspace --target $windows_target -- -D warnings" \
+      cargo clippy --workspace --target "$windows_target" --quiet -- -D warnings
+  else
+    printf '==> SKIPPED: %s is not installed, so that windows build was not checked\n' "$windows_target"
+    printf '    install it with: rustup target add %s\n' "$windows_target"
+  fi
+done
 
 # Phase 4: compile + all tests (lib, bins, integration).
 run_phase "cargo test --workspace --quiet" \
