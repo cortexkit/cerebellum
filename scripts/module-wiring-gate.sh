@@ -26,12 +26,27 @@ EXPECTED_UNWIRED=()
 
 failed=0
 
+# Denominators, because an empty scan and a clean scan print the same line.
+# Pointing these loops at a directory that does not exist exits 0 with "every
+# module is declared" -- a check that cannot see anything reports everything it
+# saw as healthy. This repository always has crates and always has examples, so
+# zero is never a legitimate answer here and a floor is the cheap, strong fix.
+crates_scanned=0
+sources_scanned=0
+examples_scanned=0
+
 for crate_dir in crates/*/; do
+  [ -d "$crate_dir" ] || continue
+  crates_scanned=$((crates_scanned + 1))
   crate="$(basename "$crate_dir")"
   src="${crate_dir}src"
   [ -d "$src" ] || continue
 
   while IFS= read -r file; do
+    # Counted here rather than at the loop's end: the body continues early for
+    # most files, so a tail increment counts almost nothing and reads as a
+    # broken scan.
+    sources_scanned=$((sources_scanned + 1))
     relative="${file#"$src"/}"
     case "$relative" in
       lib.rs | main.rs) continue ;;
@@ -100,6 +115,7 @@ echo "module wiring: every module under crates/*/src is declared by its parent"
 example_failed=0
 for example in crates/*/examples/*.rs; do
   [ -e "$example" ] || continue
+  examples_scanned=$((examples_scanned + 1))
   grep -qE '^\s*#\[(tokio::)?test\]' "$example" || continue
 
   crate_dir="${example%/examples/*}"
@@ -121,6 +137,13 @@ for example in crates/*/examples/*.rs; do
     example_failed=1
   fi
 done
+
+if [ "$crates_scanned" -eq 0 ] || [ "$sources_scanned" -eq 0 ] || [ "$examples_scanned" -eq 0 ]; then
+  echo "this check could not look: crates=$crates_scanned sources=$sources_scanned examples=$examples_scanned"
+  echo "A zero here means a broken path or glob, not a healthy tree. Refusing"
+  echo "rather than reporting a clean scan it never performed."
+  exit 1
+fi
 
 if [ "$example_failed" -ne 0 ]; then
   echo
