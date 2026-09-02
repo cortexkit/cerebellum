@@ -24,6 +24,7 @@ pub use accessibility::{
 };
 #[cfg(target_os = "windows")]
 pub use windows::{
-    enumerated_window_visibility, process_start_time, retain_process_handle, ProcessHandleError,
-    ProcessStartTime, RetainedProcessHandle, WindowVisibility,
+    current_session_provenance, enumerated_window_visibility, process_start_time,
+    retain_process_handle, ProcessHandleError, ProcessStartTime, RetainedProcessHandle,
+    SessionProvenance, WindowVisibility,
 };
