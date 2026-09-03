@@ -290,7 +290,7 @@ fn invalid_artifact_is_a_non_mutating_gate_failure() {
     assert_eq!(
         result,
         cerebellum::profile::PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
-            reason_code: "profile_storage_unavailable",
+            reason_code: "profile_registry_artifact_unavailable",
             origin: cerebellum::profile::FailureOrigin::RegistryOrStorage,
         })
     );
@@ -317,7 +317,7 @@ fn gate_failure_is_fail_closed_for_all_dispositions() {
         assert_eq!(
             result,
             cerebellum::profile::PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
-                reason_code: "profile_storage_unavailable",
+                reason_code: "profile_registry_artifact_unavailable",
                 origin: cerebellum::profile::FailureOrigin::RegistryOrStorage,
             })
         );
