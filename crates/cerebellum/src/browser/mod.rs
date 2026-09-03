@@ -150,6 +150,10 @@ pub enum BrowserError {
     AuthorizationDenied {
         reason: &'static str,
     },
+    AuthorizationOriginScope {
+        attempted_origin: String,
+        granted_origins: Vec<String>,
+    },
     HazardNotDisclosed {
         missing: HazardClass,
     },
@@ -185,7 +189,9 @@ impl BrowserError {
             Self::PointOutsideViewport { .. } => "point_outside_viewport",
             Self::InvalidCoordinates { .. } => "invalid_coordinates",
             Self::ImageTooLarge { .. } => "image_too_large",
-            Self::AuthorizationDenied { .. } => "authorization_denied",
+            Self::AuthorizationDenied { .. } | Self::AuthorizationOriginScope { .. } => {
+                "authorization_denied"
+            }
             Self::HazardNotDisclosed { .. } => "hazard_not_disclosed",
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
             Self::NavigationFailed { .. } => "navigation_failed",
@@ -229,7 +235,7 @@ impl BrowserError {
             Self::ImageTooLarge { .. } => {
                 "use browser.snapshot for a text observation, or reduce the viewport before capturing another image"
             }
-            Self::AuthorizationDenied { .. } => {
+            Self::AuthorizationDenied { .. } | Self::AuthorizationOriginScope { .. } => {
                 "call browser.open_grant to mint a grant covering this action, then retry"
             }
             Self::HazardNotDisclosed { .. } => {
@@ -277,6 +283,14 @@ impl BrowserError {
                 json!({"bytes":bytes,"bound_bytes":bound_bytes})
             }
             Self::AuthorizationDenied { reason } => json!({"reason":reason}),
+            Self::AuthorizationOriginScope {
+                attempted_origin,
+                granted_origins,
+            } => json!({
+                "reason":"origin_scope",
+                "attempted_origin":attempted_origin,
+                "granted_origins":granted_origins,
+            }),
             Self::HazardNotDisclosed { missing } => {
                 json!({"reason":"hazard_not_disclosed","missing_hazard":missing.as_str()})
             }
@@ -1570,23 +1584,20 @@ impl BrowserPlane {
             });
         }
         {
-            let decision = self
-                .grants
+            let origin = origin_from_url(url);
+            self.grants
                 .lock()
                 .await
-                .authorize(AuthorizationRequest::navigate(
-                    &identity.conversation_key,
-                    requested_severity,
-                    url,
-                    &identity.agent_project_id,
-                ))
+                .authorize(
+                    AuthorizationRequest::navigate(
+                        &identity.conversation_key,
+                        requested_severity,
+                        url,
+                        &identity.agent_project_id,
+                    ),
+                    &origin,
+                )
                 .map_err(map_authorization_error)?;
-            let origin = origin_from_url(url);
-            if decision.evaluate_origin_scope(&origin).is_err() {
-                return Err(BrowserError::AuthorizationDenied {
-                    reason: "origin_scope",
-                });
-            }
         }
         if scheme != "http" && scheme != "https" {
             return Err(BrowserError::NavigationPolicyRejected {
@@ -1805,12 +1816,16 @@ impl BrowserPlane {
             )
         };
         {
+            let origin = origin_from_url(&source_origin);
             let grants = self.grants.lock().await;
-            let decision = match grants.authorize(AuthorizationRequest::snapshot(
-                &identity.conversation_key,
-                &source_origin,
-                &identity.agent_project_id,
-            )) {
+            let decision = match grants.authorize(
+                AuthorizationRequest::snapshot(
+                    &identity.conversation_key,
+                    &source_origin,
+                    &identity.agent_project_id,
+                ),
+                &origin,
+            ) {
                 Ok(decision) => decision,
                 Err(crate::authorization::AuthorizationError::NoGrant) => {
                     drop(grants);
@@ -1822,23 +1837,18 @@ impl BrowserPlane {
                     .await?;
                     return Err(BrowserError::AuthorizationDenied { reason: "no_grant" });
                 }
+                Err(error @ crate::authorization::AuthorizationError::OriginScope { .. }) => {
+                    drop(grants);
+                    self.record_snapshot_refusal(
+                        identity,
+                        &source_origin,
+                        SnapshotRefusalReason::OriginScope,
+                    )
+                    .await?;
+                    return Err(map_authorization_error(error));
+                }
                 Err(error) => return Err(map_authorization_error(error)),
             };
-            if decision
-                .evaluate_origin_scope(&origin_from_url(&source_origin))
-                .is_err()
-            {
-                drop(grants);
-                self.record_snapshot_refusal(
-                    identity,
-                    &source_origin,
-                    SnapshotRefusalReason::OriginScope,
-                )
-                .await?;
-                return Err(BrowserError::AuthorizationDenied {
-                    reason: "origin_scope",
-                });
-            }
             if grants.commit(&decision).is_err() {
                 drop(grants);
                 self.record_snapshot_refusal(
@@ -2134,10 +2144,8 @@ impl BrowserPlane {
                     &identity.agent_project_id,
                 ),
             };
-            grants.authorize(request).and_then(|decision| {
-                decision
-                    .evaluate_origin_scope(&origin_from_url(&source_origin))
-                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+            let origin = origin_from_url(&source_origin);
+            grants.authorize(request, &origin).and_then(|decision| {
                 grants
                     .commit(&decision)
                     .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
@@ -2302,19 +2310,18 @@ impl BrowserPlane {
             )
         };
         {
+            let origin = origin_from_url(&source_origin);
             let grants = self.grants.lock().await;
             let decision = grants
-                .authorize(AuthorizationRequest::screenshot(
-                    &identity.conversation_key,
-                    &source_origin,
-                    &identity.agent_project_id,
-                ))
+                .authorize(
+                    AuthorizationRequest::screenshot(
+                        &identity.conversation_key,
+                        &source_origin,
+                        &identity.agent_project_id,
+                    ),
+                    &origin,
+                )
                 .map_err(map_authorization_error)?;
-            decision
-                .evaluate_origin_scope(&origin_from_url(&source_origin))
-                .map_err(|_| BrowserError::AuthorizationDenied {
-                    reason: "origin_scope",
-                })?;
             grants
                 .commit(&decision)
                 .map_err(|_| BrowserError::AuthorizationDenied { reason: "no_grant" })?;
@@ -2502,10 +2509,8 @@ impl BrowserPlane {
                 snapshot_id,
                 &identity.agent_project_id,
             );
-            grants.authorize(request).and_then(|decision| {
-                decision
-                    .evaluate_origin_scope(&origin_from_url(&source_origin))
-                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+            let origin = origin_from_url(&source_origin);
+            grants.authorize(request, &origin).and_then(|decision| {
                 grants
                     .commit(&decision)
                     .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
@@ -2975,6 +2980,8 @@ fn refusal_detail_schema() -> Value {
             "field":string_schema(),
             "reason_code":string_schema(),
             "reason":string_schema(),
+            "attempted_origin":string_schema(),
+            "granted_origins":string_array_schema(),
             "error_text":string_schema(),
             "ref":string_schema(),
             "candidates":integer_schema(),
@@ -3609,6 +3616,13 @@ fn map_authorization_error(error: crate::authorization::AuthorizationError) -> B
         crate::authorization::AuthorizationError::NoGrant => {
             BrowserError::AuthorizationDenied { reason: "no_grant" }
         }
+        crate::authorization::AuthorizationError::OriginScope {
+            attempted_origin,
+            granted_origins,
+        } => BrowserError::AuthorizationOriginScope {
+            attempted_origin,
+            granted_origins,
+        },
         crate::authorization::AuthorizationError::HazardNotDisclosed(missing) => {
             BrowserError::HazardNotDisclosed { missing }
         }
@@ -3646,9 +3660,9 @@ fn origin_from_url(url: &str) -> String {
 fn journal_outcome(error: &BrowserError) -> Outcome {
     match error {
         BrowserError::InvalidRequest { .. } => Outcome::InvalidRequest,
-        BrowserError::AuthorizationDenied { .. } | BrowserError::HazardNotDisclosed { .. } => {
-            Outcome::Denied
-        }
+        BrowserError::AuthorizationDenied { .. }
+        | BrowserError::AuthorizationOriginScope { .. }
+        | BrowserError::HazardNotDisclosed { .. } => Outcome::Denied,
         BrowserError::StaleSnapshot { .. }
         | BrowserError::RefNotFound { .. }
         | BrowserError::RefAmbiguous { .. }

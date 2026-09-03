@@ -555,6 +555,7 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
     assert!(launcher.effects.lock().unwrap().is_empty());
 
     grant_browser(&planes, "https://other.example", Vec::new()).await;
+    grant_browser(&planes, "https://second-other.example", Vec::new()).await;
     let wrong_origin = invoke(&planes, 21, "browser.snapshot", json!({"mode": "ax"})).await;
     let wrong_origin: Value = serde_json::from_slice(&wrong_origin.body).unwrap();
     assert_eq!(
@@ -564,6 +565,11 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
     assert_eq!(
         wrong_origin["detail"]["reason"], "origin_scope",
         "{wrong_origin}"
+    );
+    assert_eq!(
+        wrong_origin["detail"]["granted_origins"],
+        json!(["https://other.example", "https://second-other.example"]),
+        "the origin-scope refusal must name every severity-covering grant: {wrong_origin}"
     );
     assert!(
         launcher.effects.lock().unwrap().is_empty(),

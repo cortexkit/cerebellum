@@ -554,14 +554,21 @@ impl GrantStore {
         &self,
         conversation_key: &str,
         required: Severity,
+        attempted_origin: &str,
     ) -> Result<ActionGrant, AuthorizationError> {
-        self.select_covering_grant_for_hazards(conversation_key, required, &BTreeSet::new())
+        self.select_covering_grant_for_hazards(
+            conversation_key,
+            required,
+            attempted_origin,
+            &BTreeSet::new(),
+        )
     }
 
     fn select_covering_grant_for_hazards(
         &self,
         conversation_key: &str,
         required: Severity,
+        attempted_origin: &str,
         required_hazards: &BTreeSet<HazardClass>,
     ) -> Result<ActionGrant, AuthorizationError> {
         self.ensure_valid()?;
@@ -570,35 +577,62 @@ impl GrantStore {
             .current
             .values()
             .filter(|grant| {
-                grant.conversation_key == conversation_key && grant.severity.covers(required)
+                grant.validate().is_ok()
+                    && grant.conversation_key == conversation_key
+                    && grant.severity.covers(required)
             })
             .collect::<Vec<_>>();
         candidates.sort_by(compare_grants);
-        if let Some(grant) = candidates
+        if candidates.is_empty() {
+            // An empty severity scope still names a target hazard when one is
+            // known. This is the actionable fact the caller needs in order to
+            // re-ask a person.
+            if let Some(missing) = required_hazards.iter().next().copied() {
+                return Err(AuthorizationError::HazardNotDisclosed(missing));
+            }
+            return Err(AuthorizationError::NoGrant);
+        }
+
+        let Some(canonical_attempted) = canonical_origin(attempted_origin) else {
+            return Err(AuthorizationError::OriginScope {
+                attempted_origin: attempted_origin.to_string(),
+                granted_origins: granted_origins(&candidates),
+            });
+        };
+        let scoped = candidates
+            .iter()
+            .copied()
+            .filter(|grant| {
+                grant
+                    .authorized_origins
+                    .iter()
+                    .any(|origin| origin == &canonical_attempted)
+            })
+            .collect::<Vec<_>>();
+        if scoped.is_empty() {
+            return Err(AuthorizationError::OriginScope {
+                attempted_origin: canonical_attempted,
+                granted_origins: granted_origins(&candidates),
+            });
+        }
+        if let Some(grant) = scoped
             .iter()
             .find(|grant| required_hazards.is_subset(&grant.disclosed_hazards))
         {
             return Ok((**grant).clone());
         }
 
-        if !candidates.is_empty() {
-            let missing = required_hazards.iter().copied().find(|hazard| {
-                candidates
-                    .iter()
-                    .all(|grant| !grant.disclosed_hazards.contains(hazard))
-            });
-            if let Some(missing) = missing.or_else(|| {
-                required_hazards
-                    .difference(&candidates[0].disclosed_hazards)
-                    .next()
-                    .copied()
-            }) {
-                return Err(AuthorizationError::HazardNotDisclosed(missing));
-            }
-        }
-        // An empty store still names a target hazard when one is known. This is
-        // the actionable fact the caller needs in order to re-ask a person.
-        if let Some(missing) = required_hazards.iter().next().copied() {
+        let missing = required_hazards.iter().copied().find(|hazard| {
+            scoped
+                .iter()
+                .all(|grant| !grant.disclosed_hazards.contains(hazard))
+        });
+        if let Some(missing) = missing.or_else(|| {
+            required_hazards
+                .difference(&scoped[0].disclosed_hazards)
+                .next()
+                .copied()
+        }) {
             return Err(AuthorizationError::HazardNotDisclosed(missing));
         }
         Err(AuthorizationError::NoGrant)
@@ -608,6 +642,7 @@ impl GrantStore {
     pub fn authorize(
         &self,
         request: AuthorizationRequest<'_>,
+        attempted_origin: &str,
     ) -> Result<AuthorizationDecision, AuthorizationError> {
         self.ensure_valid()?;
         let (computed, fingerprint) =
@@ -622,6 +657,7 @@ impl GrantStore {
         let grant = self.select_covering_grant_for_hazards(
             request.conversation_key,
             effective,
+            attempted_origin,
             &required_hazards,
         )?;
         make_decision(&grant, request, effective, fingerprint)
@@ -671,29 +707,42 @@ impl GrantStore {
 pub fn authorize(
     grants: &[ActionGrant],
     request: AuthorizationRequest<'_>,
+    attempted_origin: &str,
 ) -> Result<AuthorizationDecision, AuthorizationError> {
     let store = GrantStore::try_new(grants.iter().cloned())?;
-    store.authorize(request)
+    store.authorize(request, attempted_origin)
 }
 
 /// Select one covering grant using a total order independent of provider map
 /// iteration or arrival order.  Grant identity is the primary stable key;
 /// revision and the remaining immutable grant material complete the order.
-pub fn select_covering_grant(
-    candidates: &[ActionGrant],
+pub fn select_covering_grant<'a>(
+    candidates: &'a [ActionGrant],
     required: Severity,
-) -> Result<Option<&ActionGrant>, AuthorizationError> {
-    select_deterministic_covering_grant(candidates, required)
+    attempted_origin: &str,
+) -> Result<Option<&'a ActionGrant>, AuthorizationError> {
+    select_deterministic_covering_grant(candidates, required, attempted_origin)
 }
 
-pub fn select_deterministic_covering_grant(
-    candidates: &[ActionGrant],
+pub fn select_deterministic_covering_grant<'a>(
+    candidates: &'a [ActionGrant],
     required: Severity,
-) -> Result<Option<&ActionGrant>, AuthorizationError> {
+    attempted_origin: &str,
+) -> Result<Option<&'a ActionGrant>, AuthorizationError> {
     required.validate()?;
+    let Some(canonical_attempted) = canonical_origin(attempted_origin) else {
+        return Ok(None);
+    };
     let mut covering = candidates
         .iter()
-        .filter(|grant| grant.validate().is_ok() && grant.severity.covers(required))
+        .filter(|grant| {
+            grant.validate().is_ok()
+                && grant.severity.covers(required)
+                && grant
+                    .authorized_origins
+                    .iter()
+                    .any(|origin| origin == &canonical_attempted)
+        })
         .collect::<Vec<_>>();
     covering.sort_by(compare_grants);
     Ok(covering.into_iter().next())
@@ -805,6 +854,16 @@ fn make_decision(
         classification_fingerprint: fingerprint,
         action: request.action,
     })
+}
+
+fn granted_origins(candidates: &[&ActionGrant]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    candidates
+        .iter()
+        .flat_map(|grant| grant.authorized_origins.iter())
+        .filter(|origin| seen.insert(origin.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn compare_grants(left: &&ActionGrant, right: &&ActionGrant) -> Ordering {
@@ -923,6 +982,10 @@ pub enum AuthorizationError {
     InvalidSeverityTier,
     SeverityBelowFloor,
     NoGrant,
+    OriginScope {
+        attempted_origin: String,
+        granted_origins: Vec<String>,
+    },
     HazardNotDisclosed(HazardClass),
     SeverityUnclassifiable,
     InvalidGrant,
@@ -1028,16 +1091,21 @@ mod tests {
     #[test]
     fn deterministic_selection_is_independent_of_candidate_order() {
         let required = Severity::new(COMPOSE, false, false);
-        let a = grant("grant-b", 1, &["https://b.test"]);
-        let b = grant("grant-a", 1, &["https://a.test"]);
+        let a = grant("grant-b", 1, &["https://common.test"]);
+        let b = grant("grant-a", 1, &["https://common.test"]);
         let first_candidates = [a.clone(), b.clone()];
         let second_candidates = [b, a];
-        let first = select_deterministic_covering_grant(&first_candidates, required)
-            .unwrap()
-            .unwrap();
-        let second = select_deterministic_covering_grant(&second_candidates, required)
-            .unwrap()
-            .unwrap();
+        let first =
+            select_deterministic_covering_grant(&first_candidates, required, "https://common.test")
+                .unwrap()
+                .unwrap();
+        let second = select_deterministic_covering_grant(
+            &second_candidates,
+            required,
+            "https://common.test",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(first.id, "grant-a");
         assert_eq!(first, second);
     }
@@ -1118,12 +1186,15 @@ mod tests {
     fn revocation_before_commit_fails_but_later_revocation_does_not_rewrite_decision() {
         let mut store = GrantStore::new([grant("grant-a", 1, &["https://allowed.test"])]);
         let decision = store
-            .authorize(AuthorizationRequest::navigate(
-                "conversation",
-                Severity::new(OBSERVE, false, false),
-                "invocation-1",
-                "bind-1",
-            ))
+            .authorize(
+                AuthorizationRequest::navigate(
+                    "conversation",
+                    Severity::new(OBSERVE, false, false),
+                    "invocation-1",
+                    "bind-1",
+                ),
+                "https://allowed.test",
+            )
             .unwrap();
         store.revoke("grant-a").unwrap();
         assert_eq!(
@@ -1133,12 +1204,15 @@ mod tests {
 
         let mut store = GrantStore::new([grant("grant-a", 1, &["https://allowed.test"])]);
         let decision = store
-            .authorize(AuthorizationRequest::navigate(
-                "conversation",
-                Severity::new(OBSERVE, false, false),
-                "invocation-1",
-                "bind-1",
-            ))
+            .authorize(
+                AuthorizationRequest::navigate(
+                    "conversation",
+                    Severity::new(OBSERVE, false, false),
+                    "invocation-1",
+                    "bind-1",
+                ),
+                "https://allowed.test",
+            )
             .unwrap();
         let commitment = store.commit(&decision).unwrap();
         store.revoke("grant-a").unwrap();
@@ -1158,12 +1232,15 @@ mod tests {
             &["https://one.test", "https://two.test"],
         )]);
         let decision = store
-            .authorize(AuthorizationRequest::navigate(
-                "conversation",
-                Severity::new(OBSERVE, false, false),
-                "invocation-1",
-                "bind-1",
-            ))
+            .authorize(
+                AuthorizationRequest::navigate(
+                    "conversation",
+                    Severity::new(OBSERVE, false, false),
+                    "invocation-1",
+                    "bind-1",
+                ),
+                "https://one.test",
+            )
             .unwrap();
         assert_eq!(
             decision.evaluate_origin_scope("https://three.test"),
