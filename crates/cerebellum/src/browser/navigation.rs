@@ -28,11 +28,26 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_AX_NODES: usize = MAX_REFS;
 const MAX_AX_DEPTH: usize = 64;
 
-/// Longest edge a consuming vision model will actually use.
+/// Standard-tier vision long-edge cap, in pixels.
 ///
-/// Extra pixels past this are paid for and then discarded server-side, so a
-/// default capture asks Chrome to render at this size instead of shipping them.
+/// Claude's standard tier uses 1568 for two different limits: the longest
+/// side of an image, and the visual-token budget where an image costs
+/// `ceil(width / 28) * ceil(height / 28)` tokens. The high-resolution tier
+/// (Claude 4.7 and later) allows 2576 px and 4784 tokens. This module cannot
+/// know which model will read a capture. Undershooting costs a high-resolution
+/// consumer some detail; overshooting makes the API downscale again, so the
+/// model produces coordinates in a smaller space than we report. That is the
+/// mismatch `click_point` exists to prevent. Standard is the bound that keeps
+/// every consumer correct.
 pub const VISION_LONG_EDGE_PX: u32 = 1568;
+
+/// Pixel size of one visual-token patch.
+const VISION_PATCH_PX: u32 = 28;
+
+/// Standard-tier visual-token cap. Equal to [`VISION_LONG_EDGE_PX`] on the
+/// standard tier; a distinct constant because an image can satisfy the edge
+/// limit while still costing more tokens than this.
+const VISION_TOKEN_CAP: u32 = 1568;
 
 /// Page data extracted by the session-owned CDP driver.
 ///
@@ -63,12 +78,14 @@ struct CssVisualViewport {
     page_y: Option<f64>,
 }
 
-/// Scale Chrome should apply to a visual-viewport clip so the long edge of the
-/// returned bitmap is [`VISION_LONG_EDGE_PX`].
+/// Scale Chrome should apply to a visual-viewport clip so the returned bitmap
+/// is the largest aspect-preserving size that fits both standard-tier vision
+/// limits: the long-edge cap and the token cap.
 ///
 /// Chrome multiplies `clip.scale` by the device scale factor, so this value is
-/// `VISION_LONG_EDGE_PX / (long_css * device_scale_factor)`. `None` means the
-/// unclipped capture already fits, or the caller asked for `full`.
+/// `target / (css * device_scale_factor)` for either dimension. `None` means
+/// the unclipped capture already fits both limits, or the caller asked for
+/// `full`.
 pub fn screenshot_clip_scale(
     width_css: f64,
     height_css: f64,
@@ -78,19 +95,55 @@ pub fn screenshot_clip_scale(
     if full {
         return None;
     }
-    let long_css = width_css.max(height_css);
-    if !long_css.is_finite()
-        || long_css <= 0.0
+    if !width_css.is_finite()
+        || width_css <= 0.0
+        || !height_css.is_finite()
+        || height_css <= 0.0
         || !device_scale_factor.is_finite()
         || device_scale_factor <= 0.0
     {
         return None;
     }
-    let native_long = long_css * device_scale_factor;
-    if native_long <= f64::from(VISION_LONG_EDGE_PX) {
-        return None;
+    let native_width = width_css * device_scale_factor;
+    let native_height = height_css * device_scale_factor;
+    let target_width = max_vision_width_px(native_width, native_height);
+    if target_width <= 0.0 || target_width >= native_width {
+        None
+    } else {
+        Some(target_width / native_width)
     }
-    Some(f64::from(VISION_LONG_EDGE_PX) / native_long)
+}
+
+/// Largest aspect-preserving width, in pixels, that satisfies both
+/// standard-tier vision limits.
+///
+/// Tokens are counted on a grid of [`VISION_PATCH_PX`] squares, so feasible
+/// sizes are `patch_w` by `patch_h` rectangles with `patch_w * patch_h` at
+/// most [`VISION_TOKEN_CAP`] and each side at most [`VISION_LONG_EDGE_PX`].
+/// The largest size on the native aspect line is the right edge of the best
+/// such rectangle.
+fn max_vision_width_px(native_width: f64, native_height: f64) -> f64 {
+    let patch = f64::from(VISION_PATCH_PX);
+    let max_patches = VISION_LONG_EDGE_PX / VISION_PATCH_PX;
+    let aspect = native_height / native_width;
+    let mut best_width: f64 = 0.0;
+    for patch_w in 1..=max_patches {
+        for patch_h in 1..=max_patches {
+            if patch_w.saturating_mul(patch_h) > VISION_TOKEN_CAP {
+                continue;
+            }
+            // Half-open pixel box for this patch pair: width in
+            // ((patch_w-1)*patch, patch_w*patch], same for height. Intersect
+            // the aspect line with that box and keep the largest width.
+            let width_lo =
+                (f64::from(patch_w - 1) * patch).max(f64::from(patch_h - 1) * patch / aspect);
+            let width_hi = (f64::from(patch_w) * patch).min(f64::from(patch_h) * patch / aspect);
+            if width_hi > width_lo {
+                best_width = best_width.max(width_hi);
+            }
+        }
+    }
+    best_width.min(native_width)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,7 +869,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         ) {
             // Chrome's clip is document-relative CSS. scale is multiplied by
             // deviceScaleFactor in the compositor, so this value is chosen so
-            // the returned bitmap's long edge is VISION_LONG_EDGE_PX.
+            // the returned bitmap is the largest size that fits both
+            // standard-tier vision limits.
             let (page_x, page_y) = page_origin.ok_or(NavigationDriveError::CdpFailure)?;
             let mut clip = Map::new();
             clip.insert("x".into(), json_finite_number(page_x)?);
@@ -2463,13 +2517,76 @@ mod tests {
         assert_eq!(screenshot_clip_scale(3136.0, 1568.0, 1.0, true), None);
         assert_eq!(screenshot_clip_scale(800.0, 600.0, 1.0, false), None);
         assert_eq!(
-            screenshot_clip_scale(800.0, 600.0, 2.0, false),
-            Some(f64::from(VISION_LONG_EDGE_PX) / 1600.0)
-        );
-        assert_eq!(
             screenshot_clip_scale(f64::from(VISION_LONG_EDGE_PX), 100.0, 1.0, false),
             None
         );
+        assert_eq!(screenshot_clip_scale(1200.0, 953.0, 2.0, true), None);
+    }
+
+    fn vision_token_count(width_px: f64, height_px: f64) -> f64 {
+        let patch = f64::from(VISION_PATCH_PX);
+        (width_px / patch).ceil() * (height_px / patch).ceil()
+    }
+
+    fn assert_clip_scale_is_maximal_within_vision_limits(
+        width_css: f64,
+        height_css: f64,
+        device_scale_factor: f64,
+    ) {
+        let scale = screenshot_clip_scale(width_css, height_css, device_scale_factor, false)
+            .expect("fixture must exceed a vision limit so a scale is sent");
+        let width_px = width_css * scale * device_scale_factor;
+        let height_px = height_css * scale * device_scale_factor;
+        let tokens = vision_token_count(width_px, height_px);
+        let edge = f64::from(VISION_LONG_EDGE_PX);
+        let cap = f64::from(VISION_TOKEN_CAP);
+        assert!(
+            tokens <= cap,
+            "produced {width_px}x{height_px} costs {tokens} tokens"
+        );
+        assert!(
+            width_px <= edge && height_px <= edge,
+            "produced {width_px}x{height_px} exceeds the long-edge cap"
+        );
+
+        let wider = width_px + 1.0;
+        let taller = height_px * (wider / width_px);
+        let tokens_one_step = vision_token_count(wider, taller);
+        assert!(
+            tokens_one_step > cap || wider > edge || taller > edge,
+            "one pixel wider ({wider}x{taller}, {tokens_one_step} tokens) still fits"
+        );
+    }
+
+    #[test]
+    fn screenshot_clip_scale_keeps_a_wide_capture_within_the_token_cap() {
+        // 1200x953 CSS at device scale 2 -> 2400x1906 native. Scaling only to
+        // the long-edge cap yields 1568x1245, which costs 56*45 = 2520 tokens.
+        let width_css = 1200.0;
+        let height_css = 953.0;
+        let dpr = 2.0;
+        let scale = screenshot_clip_scale(width_css, height_css, dpr, false)
+            .expect("native 2400x1906 exceeds the token cap");
+        let edge_only = f64::from(VISION_LONG_EDGE_PX) / (width_css * dpr);
+        assert_ne!(
+            scale, edge_only,
+            "must not stop at the long-edge cap while tokens still overflow"
+        );
+        assert_clip_scale_is_maximal_within_vision_limits(width_css, height_css, dpr);
+    }
+
+    #[test]
+    fn screenshot_clip_scale_keeps_a_tall_capture_within_the_token_cap() {
+        // Same viewport rotated. A square would have both limits bind together,
+        // so it cannot tell an edge-only scale from a token-capped one.
+        assert_clip_scale_is_maximal_within_vision_limits(953.0, 1200.0, 2.0);
+    }
+
+    #[test]
+    fn screenshot_clip_scale_shrinks_when_edges_fit_but_tokens_do_not() {
+        // 1568x1245: both edges are legal, but 56*45 = 2520 tokens. An
+        // edge-only rule returns None and ships an image the API downscales.
+        assert_clip_scale_is_maximal_within_vision_limits(1568.0, 1245.0, 1.0);
     }
 
     fn oversized_css_viewport() -> (Value, Value) {
