@@ -163,12 +163,10 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
         .to_string();
     println!("[{label}] launch: {launched}");
 
-    // One grant covering both origins the probe will visit. Two grants would be
-    // the natural shape, and it is exactly what does not work today: grant
-    // selection ignores the target origin, so only the first-minted grant is
-    // ever consulted and every action on the second origin is refused. That
-    // defect is recorded separately; this probe measures the DNS reply, not it.
-    mint_browser_grant(&planes, &[page.origin(), "http://unreachable.invalid"]).await;
+    // Mint separate grants for the fixture page and DNS-failure destination so
+    // the probe exercises origin-aware grant selection on its second navigation.
+    mint_browser_grant(&planes, &[page.origin()]).await;
+    mint_browser_grant(&planes, &["http://unreachable.invalid"]).await;
 
     let navigated = invoke_tool(
         &planes,
@@ -474,6 +472,7 @@ async fn bind_route(
 }
 
 async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
+    let grant_count_before = planes.management.browser_grant_count().await;
     let (writer, mut frames) = mpsc::channel(8);
     let opening = route_request(
         MANAGEMENT_CHANNEL,
@@ -527,7 +526,7 @@ async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
-        while planes.management.browser_grant_count().await == 0 {
+        while planes.management.browser_grant_count().await <= grant_count_before {
             tokio::task::yield_now().await;
         }
     })

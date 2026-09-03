@@ -165,13 +165,16 @@ fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
         grant("a", &["https://pay.test"]),
     ]);
     let decision = grants
-        .authorize(AuthorizationRequest::click(
-            "conversation",
-            Severity::new(COMPOSE, false, false),
-            "invocation",
-            "bind",
-            &record,
-        ))
+        .authorize(
+            AuthorizationRequest::click(
+                "conversation",
+                Severity::new(COMPOSE, false, false),
+                "invocation",
+                "bind",
+                &record,
+            ),
+            "https://pay.test",
+        )
         .unwrap();
     assert_eq!(decision.grant_id(), "a");
     let commitment = grants.commit(&decision).unwrap();
@@ -187,15 +190,68 @@ fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
 }
 
 #[test]
+fn an_action_on_the_second_granted_origin_selects_its_grant() {
+    let store = GrantStore::new([
+        grant("grant-a", &["https://a.test"]),
+        grant("grant-b", &["https://b.test"]),
+    ]);
+
+    let decision = store
+        .authorize(
+            AuthorizationRequest::navigate(
+                "conversation",
+                Severity::new(OBSERVE, false, false),
+                "invocation",
+                "bind",
+            ),
+            "https://b.test",
+        )
+        .expect("the grant scoped to B authorizes an action on B");
+
+    assert_eq!(decision.grant_id(), "grant-b");
+}
+
+#[test]
+fn origin_scope_refusal_lists_every_severity_covering_grant_origin() {
+    let store = GrantStore::new([
+        grant("grant-a", &["https://a.test"]),
+        grant("grant-b", &["https://b.test"]),
+    ]);
+
+    let error = store
+        .authorize(
+            AuthorizationRequest::navigate(
+                "conversation",
+                Severity::new(OBSERVE, false, false),
+                "invocation",
+                "bind",
+            ),
+            "https://c.test",
+        )
+        .expect_err("neither grant covers C");
+
+    assert_eq!(
+        error,
+        AuthorizationError::OriginScope {
+            attempted_origin: "https://c.test".to_string(),
+            granted_origins: vec!["https://a.test".to_string(), "https://b.test".to_string()],
+        }
+    );
+}
+
+#[test]
 fn replacement_before_commit_is_rejected_by_the_commit_guard() {
     let mut store = GrantStore::new([grant("grant-a", &["https://allowed.test"])]);
     let decision = store
-        .authorize(AuthorizationRequest::navigate(
-            "conversation",
-            Severity::new(OBSERVE, false, false),
-            "invocation",
-            "bind",
-        ))
+        .authorize(
+            AuthorizationRequest::navigate(
+                "conversation",
+                Severity::new(OBSERVE, false, false),
+                "invocation",
+                "bind",
+            ),
+            "https://allowed.test",
+        )
         .unwrap();
     store
         .replace(ActionGrant::new(
@@ -216,12 +272,15 @@ fn replacement_before_commit_is_rejected_by_the_commit_guard() {
 fn missing_grant_is_opaque_and_observations_have_an_empty_hazard_floor() {
     let store = GrantStore::new([]);
     let error = store
-        .authorize(AuthorizationRequest::navigate(
-            "conversation",
-            Severity::new(OBSERVE, false, false),
-            "invocation",
-            "bind",
-        ))
+        .authorize(
+            AuthorizationRequest::navigate(
+                "conversation",
+                Severity::new(OBSERVE, false, false),
+                "invocation",
+                "bind",
+            ),
+            "https://missing.test",
+        )
         .unwrap_err();
     assert_eq!(
         error,
@@ -278,22 +337,28 @@ fn disclosure_coverage_is_subset_semantics_and_unknown_is_distinct() {
         .with_disclosed_hazards([HazardClass::CredentialFormSubmit]);
     let store = GrantStore::new([credential_only]);
     assert!(store
-        .authorize(AuthorizationRequest::click(
-            "conversation",
-            Severity::new(MUTATE_DURABLE, true, false),
-            "invocation",
-            "bind",
-            &record,
-        ))
+        .authorize(
+            AuthorizationRequest::click(
+                "conversation",
+                Severity::new(MUTATE_DURABLE, true, false),
+                "invocation",
+                "bind",
+                &record,
+            ),
+            "https://login.test",
+        )
         .is_ok());
 
     let unknown = store
-        .authorize(AuthorizationRequest::click_unverified(
-            "conversation",
-            Severity::new(COMPOSE, false, false),
-            "invocation",
-            "bind",
-        ))
+        .authorize(
+            AuthorizationRequest::click_unverified(
+                "conversation",
+                Severity::new(COMPOSE, false, false),
+                "invocation",
+                "bind",
+            ),
+            "https://login.test",
+        )
         .unwrap_err();
     assert_eq!(
         unknown,
@@ -303,11 +368,14 @@ fn disclosure_coverage_is_subset_semantics_and_unknown_is_distinct() {
     let unknown_grant = grant("unknown", &["https://login.test"])
         .with_disclosed_hazards([HazardClass::UnverifiedFormContents]);
     assert!(GrantStore::new([unknown_grant])
-        .authorize(AuthorizationRequest::click_unverified(
-            "conversation",
-            Severity::new(COMPOSE, false, false),
-            "invocation",
-            "bind",
-        ))
+        .authorize(
+            AuthorizationRequest::click_unverified(
+                "conversation",
+                Severity::new(COMPOSE, false, false),
+                "invocation",
+                "bind",
+            ),
+            "https://login.test",
+        )
         .is_ok());
 }
