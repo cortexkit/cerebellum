@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity};
+use cerebellum::browser::navigation::VISION_LONG_EDGE_PX;
 use cerebellum::browser::navigation::{
     BrowserScreenshotObservation, BrowserSnapshotObservation, CdpNavigationDriver,
 };
@@ -16,7 +17,9 @@ use cerebellum::browser_session::{
     OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, ViewportRefusal,
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
-use cerebellum::coordinate::{InputRect, ScreenshotPayload, TransformInputs, ViewportObservation};
+use cerebellum::coordinate::{
+    encode_base64, InputRect, ScreenshotPayload, TransformInputs, ViewportObservation,
+};
 use cerebellum::journal::Outcome;
 use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SameDocumentChange, SnapshotKind, SnapshotRef,
@@ -406,10 +409,11 @@ impl OwnedBrowserProcess for ScreenshotProcess {
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
+        full: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         self.driver
-            .screenshot(context_key, document_epoch, deadline_ms)
+            .screenshot(context_key, document_epoch, deadline_ms, full)
     }
 
     fn click_point(
@@ -833,6 +837,91 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         json!({"id":5,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
         json!({"id":6,"sessionId":"session-own","result":metrics.clone()}),
         json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
+        json!({"id":8,"sessionId":"session-own","result":metrics}),
+        json!({"id":9,"sessionId":"session-own","result":{}}),
+        json!({"id":10,"sessionId":"session-own","result":{}}),
+        json!({"id":11,"sessionId":"session-own","result":{}}),
+    ];
+    ScreenshotProcess {
+        driver: CdpNavigationDriver::new(
+            ScreenshotPipe::with_frames(frames),
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        ),
+        captures,
+    }
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn png_b64_claiming_dimensions(width: u32, height: u32) -> String {
+    // The 1x1 fixture is a valid PNG; only IHDR width/height (and that chunk's
+    // CRC) change. Pixel payload is not inflated during admission, so this is
+    // enough for a reply that must name these dimensions rather than the
+    // viewport's.
+    const ONE_BY_ONE_PNG_BYTES: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let mut bytes = ONE_BY_ONE_PNG_BYTES.to_vec();
+    bytes[16..20].copy_from_slice(&width.to_be_bytes());
+    bytes[20..24].copy_from_slice(&height.to_be_bytes());
+    let crc = png_crc32(&bytes[12..29]);
+    bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+    encode_base64(&bytes)
+}
+
+fn screenshot_process_with_capture(
+    captures: Arc<AtomicUsize>,
+    css_width: f64,
+    css_height: f64,
+    dpr: f64,
+    png_b64: &str,
+) -> ScreenshotProcess {
+    let viewport = json!({
+        "offsetX": 3.5,
+        "offsetY": 4.25,
+        "pageX": 40.0,
+        "pageY": 80.0,
+        "clientWidth": css_width,
+        "clientHeight": css_height,
+        "scale": 1.0
+    });
+    let device_viewport = json!({
+        "offsetX": 7.0,
+        "offsetY": 8.5,
+        "pageX": 80.0,
+        "pageY": 160.0,
+        "clientWidth": css_width * 2.0,
+        "clientHeight": css_height * 2.0,
+        "scale": 1.0
+    });
+    let metrics = json!({
+        "cssVisualViewport": viewport,
+        "visualViewport": device_viewport,
+    });
+    let frames = [
+        json!({"id":1,"result":{"targetId":"target-own"}}),
+        json!({"id":2,"result":{"sessionId":"session-own"}}),
+        json!({"id":3,"sessionId":"session-own","result":metrics.clone()}),
+        json!({"id":4,"sessionId":"session-own","result":{"result":{"type":"number","value":dpr}}}),
+        json!({"id":5,"sessionId":"session-own","result":{"data":png_b64}}),
+        json!({"id":6,"sessionId":"session-own","result":metrics.clone()}),
+        json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":dpr}}}),
         json!({"id":8,"sessionId":"session-own","result":metrics}),
         json!({"id":9,"sessionId":"session-own","result":{}}),
         json!({"id":10,"sessionId":"session-own","result":{}}),
@@ -1300,6 +1389,161 @@ async fn screenshot_refuses_when_browser_png_exceeds_max_bytes_and_names_both_si
     assert_eq!(refused["outcome"], "image_too_large", "{refused}");
     assert_eq!(refused["detail"]["bytes"], ONE_BY_ONE_PNG_B64.len());
     assert_eq!(refused["detail"]["bound_bytes"], bound_bytes);
+}
+
+#[tokio::test]
+async fn screenshot_reply_reports_resized_image_dimensions_not_the_capture() {
+    let route = identity();
+    // Native capture would be 3136x1568 CSS pixels at 1x. Chrome is asked to
+    // scale so the long edge is 1568, producing 1568x784. A reply that echoed
+    // the pre-resize size would make every later click_point echo check pass
+    // against the wrong number.
+    let capture_width = 3136;
+    let capture_height = 1568;
+    let resized_width = VISION_LONG_EDGE_PX;
+    let resized_height = 784;
+    assert_ne!(
+        (capture_width, capture_height),
+        (resized_width, resized_height),
+        "the fixture is worthless if pre- and post-resize sizes match"
+    );
+    let png = png_b64_claiming_dimensions(resized_width, resized_height);
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process_with_capture(
+            Arc::new(AtomicUsize::new(0)),
+            f64::from(capture_width),
+            f64::from(capture_height),
+            1.0,
+            &png,
+        )),
+        100,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let captured = plane
+        .dispatch(&route, BrowserCapability::Screenshot, &json!({}))
+        .await;
+
+    assert_eq!(captured["outcome"], "ok", "{captured}");
+    assert_eq!(captured["image_width_px"], resized_width);
+    assert_eq!(captured["image_height_px"], resized_height);
+    assert_ne!(captured["image_width_px"], capture_width);
+    assert_ne!(captured["image_height_px"], capture_height);
+}
+
+#[tokio::test]
+async fn screenshot_full_keeps_the_uncropped_capture_dimensions() {
+    let route = identity();
+    let capture_width = 3136;
+    let capture_height = 1568;
+    let png = png_b64_claiming_dimensions(capture_width, capture_height);
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process_with_capture(
+            Arc::new(AtomicUsize::new(0)),
+            f64::from(capture_width),
+            f64::from(capture_height),
+            1.0,
+            &png,
+        )),
+        100,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let captured = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Screenshot,
+            &json!({ "full": true }),
+        )
+        .await;
+
+    assert_eq!(captured["outcome"], "ok", "{captured}");
+    assert_eq!(captured["image_width_px"], capture_width);
+    assert_eq!(captured["image_height_px"], capture_height);
+}
+
+#[tokio::test]
+async fn screenshot_full_over_max_bytes_refuses_rather_than_downscaling() {
+    let route = identity();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let capture_width = 3136;
+    let capture_height = 1568;
+    let png = png_b64_claiming_dimensions(capture_width, capture_height);
+    let bound_bytes = png.len() - 1;
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process_with_capture(
+            Arc::clone(&captures),
+            f64::from(capture_width),
+            f64::from(capture_height),
+            1.0,
+            &png,
+        )),
+        100,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let refused = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Screenshot,
+            &json!({ "full": true, "max_bytes": bound_bytes }),
+        )
+        .await;
+
+    assert_eq!(refused["outcome"], "image_too_large", "{refused}");
+    assert_eq!(refused["detail"]["bytes"], png.len());
+    assert_eq!(refused["detail"]["bound_bytes"], bound_bytes);
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        1,
+        "full over the byte bound retried a downscaled capture"
+    );
+}
+
+#[tokio::test]
+async fn screenshot_path_is_refused_by_name_because_it_abandons_custody() {
+    let route = identity();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process(Arc::clone(&captures))),
+        100,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let refused = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Screenshot,
+            &json!({ "path": "/tmp/authenticated-session.png" }),
+        )
+        .await;
+
+    assert_eq!(refused["outcome"], "invalid_request", "{refused}");
+    assert_eq!(refused["detail"]["field"], "path", "{refused}");
+    assert_eq!(
+        refused["detail"]["reason_code"], "path_abandons_custody",
+        "{refused}"
+    );
+    let reason = refused["detail"]["reason"]
+        .as_str()
+        .expect("the path refusal names its reason");
+    assert!(
+        reason.contains("abandons custody"),
+        "path refusal did not name custody: {reason}"
+    );
+    assert_eq!(
+        captures.load(Ordering::SeqCst),
+        0,
+        "a path refusal reached the capture backend"
+    );
 }
 
 #[tokio::test]

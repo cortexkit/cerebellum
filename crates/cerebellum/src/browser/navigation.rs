@@ -28,6 +28,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_AX_NODES: usize = MAX_REFS;
 const MAX_AX_DEPTH: usize = 64;
 
+/// Longest edge a consuming vision model will actually use.
+///
+/// Extra pixels past this are paid for and then discarded server-side, so a
+/// default capture asks Chrome to render at this size instead of shipping them.
+pub const VISION_LONG_EDGE_PX: u32 = 1568;
+
 /// Page data extracted by the session-owned CDP driver.
 ///
 /// The caller retains this separately from the driver so the pipe and request
@@ -48,6 +54,43 @@ pub struct BrowserScreenshotObservation {
     pub before: ViewportObservation,
     pub after: ViewportObservation,
     pub invalidation_observed: bool,
+}
+
+struct CssVisualViewport {
+    rect: InputRect,
+    scale: f64,
+    page_x: Option<f64>,
+    page_y: Option<f64>,
+}
+
+/// Scale Chrome should apply to a visual-viewport clip so the long edge of the
+/// returned bitmap is [`VISION_LONG_EDGE_PX`].
+///
+/// Chrome multiplies `clip.scale` by the device scale factor, so this value is
+/// `VISION_LONG_EDGE_PX / (long_css * device_scale_factor)`. `None` means the
+/// unclipped capture already fits, or the caller asked for `full`.
+pub fn screenshot_clip_scale(
+    width_css: f64,
+    height_css: f64,
+    device_scale_factor: f64,
+    full: bool,
+) -> Option<f64> {
+    if full {
+        return None;
+    }
+    let long_css = width_css.max(height_css);
+    if !long_css.is_finite()
+        || long_css <= 0.0
+        || !device_scale_factor.is_finite()
+        || device_scale_factor <= 0.0
+    {
+        return None;
+    }
+    let native_long = long_css * device_scale_factor;
+    if native_long <= f64::from(VISION_LONG_EDGE_PX) {
+        return None;
+    }
+    Some(f64::from(VISION_LONG_EDGE_PX) / native_long)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,9 +226,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
+        full: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
-        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, &mut clock)
+        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, full, &mut clock)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -264,9 +308,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
+        full: bool,
         clock: &mut C,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
-        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, clock)
+        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, full, clock)
     }
 
     #[cfg(test)]
@@ -423,7 +468,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )?;
         let viewport = self
             .read_css_visual_viewport(&attachment.session_id, deadline, clock)
-            .map(|(viewport, _)| viewport)
+            .map(|visual| visual.rect)
             .map_err(ClickDriveError::Navigation)?;
         match geometry::require_point_in_viewport(position.x_css, position.y_css, viewport) {
             Ok(()) => {}
@@ -562,7 +607,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             ))?;
         let viewport = self
             .read_css_visual_viewport(&attachment.session_id, deadline, clock)
-            .map(|(viewport, _)| viewport)
+            .map(|visual| visual.rect)
             .map_err(ClickPointDriveError::Navigation)?;
         match geometry::require_point_in_viewport(position.x_css, position.y_css, viewport) {
             Ok(()) => {}
@@ -631,7 +676,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         session_id: &str,
         deadline: Instant,
         clock: &mut C,
-    ) -> Result<(InputRect, f64), NavigationDriveError> {
+    ) -> Result<CssVisualViewport, NavigationDriveError> {
         let metrics = self.command(
             "Page.getLayoutMetrics",
             None,
@@ -663,7 +708,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         {
             return Err(NavigationDriveError::CdpFailure);
         }
-        Ok((viewport, scale))
+        // Clip origin is document-relative. offsetX/Y are the visual viewport's
+        // offset inside the layout viewport, which is the wrong origin on a
+        // scrolled page.
+        let page_x = optional_result_number(visual_viewport, "pageX")?;
+        let page_y = optional_result_number(visual_viewport, "pageY")?;
+        Ok(CssVisualViewport {
+            rect: viewport,
+            scale,
+            page_x,
+            page_y,
+        })
     }
 
     fn actuate_click<C: NavigationClock>(
@@ -732,6 +787,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
+        full: bool,
         clock: &mut C,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let deadline = clock
@@ -746,12 +802,36 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .map(|attachment| attachment.session_id.clone())
             .ok_or(NavigationDriveError::CdpFailure)?;
 
-        let before =
+        let (before, page_origin) =
             self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
         let mut params = Map::new();
         params.insert("format".into(), Value::String("png".into()));
         params.insert("fromSurface".into(), Value::Bool(true));
         params.insert("captureBeyondViewport".into(), Value::Bool(false));
+        if let Some(scale) = screenshot_clip_scale(
+            before.transform.width_input_css,
+            before.transform.height_input_css,
+            before.transform.device_scale_factor,
+            full,
+        ) {
+            // Chrome's clip is document-relative CSS. scale is multiplied by
+            // deviceScaleFactor in the compositor, so this value is chosen so
+            // the returned bitmap's long edge is VISION_LONG_EDGE_PX.
+            let (page_x, page_y) = page_origin.ok_or(NavigationDriveError::CdpFailure)?;
+            let mut clip = Map::new();
+            clip.insert("x".into(), json_finite_number(page_x)?);
+            clip.insert("y".into(), json_finite_number(page_y)?);
+            clip.insert(
+                "width".into(),
+                json_finite_number(before.transform.width_input_css)?,
+            );
+            clip.insert(
+                "height".into(),
+                json_finite_number(before.transform.height_input_css)?,
+            );
+            clip.insert("scale".into(), json_finite_number(scale)?);
+            params.insert("clip".into(), Value::Object(clip));
+        }
         let captured = self.command(
             "Page.captureScreenshot",
             Some(params),
@@ -761,7 +841,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             clock,
         )?;
         let image_png_b64 = required_result_string(&captured, "data")?;
-        let after = self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
+        let (after, _) =
+            self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
 
         Ok(BrowserScreenshotObservation {
             image_png_b64,
@@ -777,9 +858,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         session_id: &str,
         deadline: Instant,
         clock: &mut C,
-    ) -> Result<ViewportObservation, NavigationDriveError> {
-        let (viewport, visual_viewport_scale) =
-            self.read_css_visual_viewport(session_id, deadline, clock)?;
+    ) -> Result<(ViewportObservation, Option<(f64, f64)>), NavigationDriveError> {
+        let visual = self.read_css_visual_viewport(session_id, deadline, clock)?;
+        let viewport = visual.rect;
+        let visual_viewport_scale = visual.scale;
 
         let mut params = Map::new();
         params.insert(
@@ -801,16 +883,23 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .ok_or(NavigationDriveError::CdpFailure)?;
         let device_scale_factor = required_result_number(remote_object, "value")?;
 
-        Ok(ViewportObservation::new(
-            document_epoch,
-            TransformInputs::from_values(
-                viewport.x_input_css,
-                viewport.y_input_css,
-                viewport.width_input_css,
-                viewport.height_input_css,
-                device_scale_factor,
-                visual_viewport_scale,
+        let page_origin = match (visual.page_x, visual.page_y) {
+            (Some(page_x), Some(page_y)) => Some((page_x, page_y)),
+            _ => None,
+        };
+        Ok((
+            ViewportObservation::new(
+                document_epoch,
+                TransformInputs::from_values(
+                    viewport.x_input_css,
+                    viewport.y_input_css,
+                    viewport.width_input_css,
+                    viewport.height_input_css,
+                    device_scale_factor,
+                    visual_viewport_scale,
+                ),
             ),
+            page_origin,
         ))
     }
 
@@ -2055,6 +2144,26 @@ fn required_result_number(
         .ok_or(NavigationDriveError::CdpFailure)
 }
 
+fn optional_result_number(
+    result: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<f64>, NavigationDriveError> {
+    match result.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(Some)
+            .ok_or(NavigationDriveError::CdpFailure),
+    }
+}
+
+fn json_finite_number(value: f64) -> Result<Value, NavigationDriveError> {
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or(NavigationDriveError::CdpFailure)
+}
+
 pub(crate) trait NavigationClock {
     fn now(&mut self) -> Instant;
     fn sleep(&mut self, duration: Duration);
@@ -2306,7 +2415,7 @@ mod tests {
         let mut clock = FakeClock::new();
 
         let screenshot = driver
-            .screenshot_for_test("route-own", 7, 100, &mut clock)
+            .screenshot_for_test("route-own", 7, 100, false, &mut clock)
             .expect("the CDP responses describe a coherent screenshot");
 
         assert_eq!(screenshot.image_png_b64, ONE_BY_ONE_PNG_B64);
@@ -2341,6 +2450,113 @@ mod tests {
         assert_eq!(
             driver.pipe.writes[2]["params"]["captureBeyondViewport"],
             false
+        );
+        assert!(
+            driver.pipe.writes[2]["params"].get("clip").is_none(),
+            "a viewport under the vision cap must not send a clip"
+        );
+    }
+
+    #[test]
+    fn screenshot_clip_scale_is_none_when_full_or_already_within_the_cap() {
+        assert_eq!(screenshot_clip_scale(3136.0, 1568.0, 1.0, false), Some(0.5));
+        assert_eq!(screenshot_clip_scale(3136.0, 1568.0, 1.0, true), None);
+        assert_eq!(screenshot_clip_scale(800.0, 600.0, 1.0, false), None);
+        assert_eq!(
+            screenshot_clip_scale(800.0, 600.0, 2.0, false),
+            Some(f64::from(VISION_LONG_EDGE_PX) / 1600.0)
+        );
+        assert_eq!(
+            screenshot_clip_scale(f64::from(VISION_LONG_EDGE_PX), 100.0, 1.0, false),
+            None
+        );
+    }
+
+    fn oversized_css_viewport() -> (Value, Value) {
+        // pageX/Y differ from offsetX/Y on purpose: clip origin is document
+        // coordinates. Using the visual-viewport offset would capture the wrong
+        // region of a scrolled page and still look like a plausible clip.
+        let css_viewport = json!({
+            "offsetX": 10.0,
+            "offsetY": 20.0,
+            "pageX": 40.0,
+            "pageY": 80.0,
+            "clientWidth": 3136.0,
+            "clientHeight": 1568.0,
+            "scale": 1.0
+        });
+        let device_viewport = json!({
+            "offsetX": 20.0,
+            "offsetY": 40.0,
+            "pageX": 80.0,
+            "pageY": 160.0,
+            "clientWidth": 6272.0,
+            "clientHeight": 3136.0,
+            "scale": 1.0
+        });
+        (css_viewport, device_viewport)
+    }
+
+    fn screenshot_driver_with_viewport(
+        css_viewport: Value,
+        device_viewport: Value,
+        dpr: f64,
+    ) -> CdpNavigationDriver<FakePipe> {
+        const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let metrics = json!({
+            "cssVisualViewport": css_viewport,
+            "visualViewport": device_viewport,
+        });
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":metrics.clone()}),
+            json!({"id":2,"sessionId":"session-own","result":{"result":{"type":"number","value":dpr}}}),
+            json!({"id":3,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
+            json!({"id":4,"sessionId":"session-own","result":metrics}),
+            json!({"id":5,"sessionId":"session-own","result":{"result":{"type":"number","value":dpr}}}),
+        ];
+        attached_driver(frames)
+    }
+
+    #[test]
+    fn screenshot_sends_a_document_clip_that_lands_the_long_edge_on_the_vision_cap() {
+        let (css_viewport, device_viewport) = oversized_css_viewport();
+        let mut driver = screenshot_driver_with_viewport(css_viewport, device_viewport, 1.0);
+        let mut clock = FakeClock::new();
+
+        driver
+            .screenshot_for_test("route-own", 7, 100, false, &mut clock)
+            .expect("the CDP responses describe a coherent screenshot");
+
+        let clip = &driver.pipe.writes[2]["params"]["clip"];
+        assert_eq!(
+            clip["x"].as_f64(),
+            Some(40.0),
+            "clip used layout offset rather than document origin: {clip}"
+        );
+        assert_eq!(
+            clip["y"].as_f64(),
+            Some(80.0),
+            "clip used layout offset rather than document origin: {clip}"
+        );
+        assert_eq!(clip["width"].as_f64(), Some(3136.0));
+        assert_eq!(clip["height"].as_f64(), Some(1568.0));
+        assert_eq!(clip["scale"].as_f64(), Some(0.5));
+    }
+
+    #[test]
+    fn screenshot_full_omits_the_clip_even_when_the_viewport_exceeds_the_vision_cap() {
+        let (css_viewport, device_viewport) = oversized_css_viewport();
+        let mut driver = screenshot_driver_with_viewport(css_viewport, device_viewport, 1.0);
+        let mut clock = FakeClock::new();
+
+        driver
+            .screenshot_for_test("route-own", 7, 100, true, &mut clock)
+            .expect("the CDP responses describe a coherent screenshot");
+
+        assert!(
+            driver.pipe.writes[2]["params"].get("clip").is_none(),
+            "full must skip resize rather than send a clip: {}",
+            driver.pipe.writes[2]["params"]
         );
     }
 

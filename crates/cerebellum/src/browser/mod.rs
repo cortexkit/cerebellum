@@ -187,6 +187,9 @@ impl BrowserError {
     /// Tell a caller which action can change this refusal, or explicitly when none exists.
     fn remedy(&self) -> &'static str {
         match self {
+            Self::InvalidRequest { reason_code, .. } if *reason_code == "path_abandons_custody" => {
+                "omit path; authenticated-session pixels stay inside this module's retention machinery"
+            }
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
             }
@@ -239,6 +242,15 @@ impl BrowserError {
 
     fn detail(&self) -> Option<Value> {
         Some(match self {
+            Self::InvalidRequest { field, reason_code }
+                if *reason_code == "path_abandons_custody" =>
+            {
+                json!({
+                    "field": field,
+                    "reason_code": reason_code,
+                    "reason": "writing authenticated-session pixels to a caller-chosen path abandons custody: outside the retention machinery, with no eviction and no audit of where they went",
+                })
+            }
             Self::InvalidRequest { field, reason_code } => {
                 json!({"field":field,"reason_code":reason_code})
             }
@@ -2114,9 +2126,18 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         args: &Value,
     ) -> Result<Value, BrowserError> {
-        let object = self.validate_request(args, &["max_bytes"]).await?;
+        let object = self
+            .validate_request(args, &["max_bytes", "full", "path"])
+            .await?;
+        if object.contains_key("path") {
+            return Err(BrowserError::InvalidRequest {
+                field: "path".into(),
+                reason_code: "path_abandons_custody",
+            });
+        }
         let max_bytes = optional_integer(object, "max_bytes", 1, MAX_ENCODED_PNG_BYTES as u64)?
             .unwrap_or(MAX_ENCODED_PNG_BYTES as u64) as usize;
+        let full = optional_bool(object, "full")?.unwrap_or(false);
         let (document_epoch, source_origin) = {
             let state = self.state.lock().await;
             let context = state
@@ -2174,7 +2195,8 @@ impl BrowserPlane {
             .ok_or(BrowserError::NoSession)?;
         let route_key = identity.conversation_key.clone();
         let driven = tokio::task::spawn_blocking(move || {
-            let result = session_operation.screenshot(&route_key, document_epoch, deadline_ms);
+            let result =
+                session_operation.screenshot(&route_key, document_epoch, deadline_ms, full);
             (session_operation, result)
         })
         .await
@@ -2823,6 +2845,18 @@ fn bounded_string<'a>(
     max: usize,
 ) -> Result<&'a str, BrowserError> {
     required_string(object, field, min, max)
+}
+fn optional_bool(object: &Map<String, Value>, field: &str) -> Result<Option<bool>, BrowserError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| BrowserError::InvalidRequest {
+            field: field.into(),
+            reason_code: "wrong_type",
+        })
 }
 fn optional_integer(
     object: &Map<String, Value>,

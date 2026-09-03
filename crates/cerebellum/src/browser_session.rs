@@ -314,6 +314,7 @@ pub trait OwnedBrowserProcess: Send {
         _context_key: &str,
         _document_epoch: u64,
         _deadline_ms: u64,
+        _full: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         Err(NavigationDriveError::Unavailable)
     }
@@ -524,6 +525,7 @@ impl OperationGuard {
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
+        full: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let mut state = self
             .sessions
@@ -538,7 +540,7 @@ impl OperationGuard {
             .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
             .and_then(|session| session.process.as_mut())
             .ok_or(NavigationDriveError::Unavailable)?;
-        process.screenshot(context_key, document_epoch, deadline_ms)
+        process.screenshot(context_key, document_epoch, deadline_ms, full)
     }
 
     pub(crate) fn click_point(

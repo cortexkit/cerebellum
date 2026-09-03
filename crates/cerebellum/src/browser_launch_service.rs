@@ -847,11 +847,12 @@ impl OwnedBrowserProcess for ProductionProcess {
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
+        full: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         self.driver
             .as_mut()
             .ok_or(NavigationDriveError::Unavailable)?
-            .screenshot(context_key, document_epoch, deadline_ms)
+            .screenshot(context_key, document_epoch, deadline_ms, full)
     }
 
     fn click_point(
