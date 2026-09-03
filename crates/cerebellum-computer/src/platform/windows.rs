@@ -127,6 +127,70 @@ impl From<cerebellum_windows::WindowVisibility> for WindowsWindowVisibility {
     }
 }
 
+/// Resolve an executable basename against a Windows top-level window reading.
+///
+/// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
+/// Windows the same caller names an executable basename (`notepad.exe`).
+/// Windows has no bundle identifier; the two identities are deliberately
+/// asymmetric. UWP frame windows may be owned by `ApplicationFrameHost.exe`
+/// while the content process is the app's own executable; which identity a
+/// caller must use for those apps is unmeasured.
+///
+/// Session provenance is gated before [`TargetResolution::decide`] so a
+/// service-session empty list is not reported as the application being absent.
+fn resolve_from_reading<F: FnOnce(u32) -> Option<String>>(
+    executable_basename: &str,
+    session: WindowsSessionProvenance,
+    windows: Option<&[(u32, String)]>,
+    read_generation: F,
+) -> Result<TargetResolution, DriverError> {
+    require_console_session(session)?;
+    Ok(TargetResolution::decide(
+        executable_basename,
+        windows,
+        read_generation,
+    ))
+}
+
+/// Resolve an executable basename against this machine's top-level windows.
+///
+/// Gathers the window-owner reading, refuses a non-console session before
+/// treating an empty list as not running, and then calls
+/// [`TargetResolution::decide`]. Generation evidence is the process creation
+/// `FILETIME` from [`cerebellum_windows::process_start_time`].
+#[cfg(target_os = "windows")]
+pub fn resolve_target(executable_basename: &str) -> TargetResolution {
+    let reading = match cerebellum_windows::enumerate_top_level_windows() {
+        Ok(reading) => reading,
+        Err(_) => return TargetResolution::Unreadable,
+    };
+    let named: Vec<(u32, String)> = reading
+        .windows
+        .iter()
+        .filter_map(|window| match window {
+            cerebellum_windows::TopLevelWindowOwner::Named {
+                pid,
+                executable_basename,
+            } => Some((*pid, executable_basename.clone())),
+            cerebellum_windows::TopLevelWindowOwner::Unreadable(_) => None,
+        })
+        .collect();
+    match resolve_from_reading(
+        executable_basename,
+        reading.session.into(),
+        Some(named.as_slice()),
+        |pid| match cerebellum_windows::process_start_time(pid) {
+            cerebellum_windows::ProcessStartTime::Started(started) => Some(started.to_string()),
+            cerebellum_windows::ProcessStartTime::NoSuchProcess
+            | cerebellum_windows::ProcessStartTime::AccessDenied
+            | cerebellum_windows::ProcessStartTime::Unclassified(_) => None,
+        },
+    ) {
+        Ok(resolution) => resolution,
+        Err(_) => TargetResolution::Unreadable,
+    }
+}
+
 fn require_console_session(session: WindowsSessionProvenance) -> Result<(), DriverError> {
     match session {
         WindowsSessionProvenance::Console { .. } => Ok(()),
@@ -1103,6 +1167,44 @@ mod tests {
             tree(WindowsSessionProvenance::Console { session_id: 1 }),
         );
         assert!(console.is_ok(), "the identical console tree must proceed");
+    }
+
+    #[test]
+    fn other_session_refuses_target_resolution_by_name_before_the_same_console_windows_proceed() {
+        let windows = vec![(41u32, "notepad.exe".to_owned())];
+        let generation = |_pid: u32| Some("100".to_owned());
+
+        let other = resolve_from_reading(
+            "notepad.exe",
+            WindowsSessionProvenance::OtherSession {
+                session_id: 0,
+                console_session_id: 1,
+            },
+            Some(&windows),
+            generation,
+        );
+        assert!(matches!(
+            other,
+            Err(DriverError::SessionNotInspectable(
+                SessionProvenanceRefusal::OtherSession {
+                    session_id: 0,
+                    console_session_id: 1
+                }
+            ))
+        ));
+
+        let console = resolve_from_reading(
+            "notepad.exe",
+            WindowsSessionProvenance::Console { session_id: 1 },
+            Some(&windows),
+            |_pid| Some("100".to_owned()),
+        );
+        let Ok(TargetResolution::Resolved(grant)) = console else {
+            panic!("the identical console windows must proceed, got {console:?}");
+        };
+        assert_eq!(grant.pid, 41);
+        assert_eq!(grant.bundle_identity, "notepad.exe");
+        assert_eq!(grant.process_generation_evidence, "100");
     }
 
     #[test]

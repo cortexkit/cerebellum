@@ -2,12 +2,14 @@ use std::{ffi::c_void, mem};
 
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
-        HWND, LPARAM,
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_INVALID_PARAMETER, FILETIME, HANDLE, HWND, LPARAM,
     },
     Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
     System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
-    System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    },
     UI::WindowsAndMessaging::{
         EnumWindows, GetWindowPlacement, GetWindowThreadProcessId, IsWindowVisible,
         SW_SHOWMINIMIZED, WINDOWPLACEMENT,
@@ -298,4 +300,128 @@ pub fn current_session_provenance() -> SessionProvenance {
     // SAFETY: no arguments and no pointers; returns a session id or a sentinel.
     let console_session_id = unsafe { WTSGetActiveConsoleSessionId() };
     crate::session::classify(session_id, console_session_id)
+}
+
+use crate::window_list::{
+    EnumerateWindowsError, TopLevelWindowOwner, TopLevelWindowReading, WindowOwnerUnreadable,
+};
+
+/// Enumerate top-level windows and name each one's owning executable.
+///
+/// `EnumWindows` failing is a typed error, never an empty list. A window whose
+/// owner cannot be opened is retained as unreadable so the caller can see that
+/// the named list is partial.
+///
+/// Session provenance is read alongside the list: from a non-interactive
+/// session `EnumWindows` succeeds against the SERVICE desktop, and that empty
+/// reading is true of this process's visibility, not of the console.
+pub fn enumerate_top_level_windows() -> Result<TopLevelWindowReading, EnumerateWindowsError> {
+    let mut search = WindowOwnerSearch {
+        windows: Vec::new(),
+    };
+
+    // SAFETY: `search` remains alive until `EnumWindows` returns, Windows calls
+    // the callback synchronously, and the callback casts this exact pointer back
+    // to `WindowOwnerSearch` before accessing it.
+    let completed = unsafe {
+        EnumWindows(
+            Some(collect_window_owners),
+            (&mut search as *mut WindowOwnerSearch).cast::<c_void>() as LPARAM,
+        )
+    };
+    if completed == 0 {
+        // SAFETY: no arguments, and the value is only meaningful immediately
+        // after a failed call on this thread.
+        let last_error = unsafe { GetLastError() };
+        return Err(EnumerateWindowsError::EnumerationFailed { last_error });
+    }
+
+    Ok(TopLevelWindowReading::from_enumerated(
+        current_session_provenance(),
+        search.windows,
+    ))
+}
+
+struct WindowOwnerSearch {
+    windows: Vec<TopLevelWindowOwner>,
+}
+
+unsafe extern "system" fn collect_window_owners(hwnd: HWND, lparam: LPARAM) -> i32 {
+    // SAFETY: `enumerate_top_level_windows` supplies this pointer to
+    // `EnumWindows`, which invokes the callback synchronously while `search` is
+    // alive. This callback neither stores it nor lets a panic cross the FFI edge.
+    let search = unsafe { &mut *(lparam as *mut WindowOwnerSearch) };
+    let mut window_pid = 0;
+
+    // SAFETY: `hwnd` is supplied by `EnumWindows`, and `window_pid` is writable
+    // for the duration of this call.
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut window_pid) };
+    if thread_id == 0 {
+        // SAFETY: this reads the calling thread's last-error value immediately
+        // after a failing Windows call and before another Windows call can replace it.
+        let last_error = unsafe { GetLastError() };
+        search.windows.push(TopLevelWindowOwner::Unreadable(
+            WindowOwnerUnreadable::ProcessIdUnreadable { last_error },
+        ));
+        return 1;
+    }
+    search.windows.push(read_window_owner(window_pid));
+    1
+}
+
+fn read_window_owner(pid: u32) -> TopLevelWindowOwner {
+    let process = match open_process_handle(pid) {
+        Ok(process) => process,
+        Err(ProcessAccessFailure::NoSuchProcess) => {
+            return TopLevelWindowOwner::Unreadable(WindowOwnerUnreadable::NoSuchProcess { pid });
+        }
+        Err(ProcessAccessFailure::AccessDenied) => {
+            return TopLevelWindowOwner::Unreadable(WindowOwnerUnreadable::AccessDenied { pid });
+        }
+        Err(ProcessAccessFailure::Unclassified(last_error)) => {
+            return TopLevelWindowOwner::Unreadable(WindowOwnerUnreadable::Unclassified {
+                pid,
+                last_error,
+            });
+        }
+    };
+    match query_executable_basename(&process) {
+        Ok(executable_basename) => TopLevelWindowOwner::Named {
+            pid,
+            executable_basename,
+        },
+        Err(last_error) => {
+            TopLevelWindowOwner::Unreadable(WindowOwnerUnreadable::Unclassified { pid, last_error })
+        }
+    }
+}
+
+fn query_executable_basename(process: &RetainedProcessHandle) -> Result<String, u32> {
+    match query_executable_basename_with_capacity(process, 260) {
+        Err(code) if code == ERROR_INSUFFICIENT_BUFFER => {
+            query_executable_basename_with_capacity(process, 32_768)
+        }
+        other => other,
+    }
+}
+
+fn query_executable_basename_with_capacity(
+    process: &RetainedProcessHandle,
+    capacity: u32,
+) -> Result<String, u32> {
+    let mut buf = vec![0u16; capacity as usize];
+    let mut char_count = capacity;
+    // SAFETY: `process.handle` is a live handle owned by `process`; `buf` is
+    // writable for `capacity` UTF-16 units; `char_count` is the documented in/out
+    // size in characters.
+    let ok =
+        unsafe { QueryFullProcessImageNameW(process.handle, 0, buf.as_mut_ptr(), &mut char_count) };
+    if ok == 0 {
+        // SAFETY: this reads the calling thread's last-error value immediately
+        // after a failing Windows call and before another Windows call can replace it.
+        return Err(unsafe { GetLastError() });
+    }
+    let len = (char_count as usize).min(buf.len());
+    let path = String::from_utf16(&buf[..len]).map_err(|_| 0u32)?;
+    Ok(crate::window_list::executable_basename(&path))
 }
