@@ -29,6 +29,10 @@ fn main() {
         std::process::exit(2);
     };
     let identity = identity.to_lowercase();
+    // `--all` prints every owner, matching or not. Needed when a name does
+    // not resolve and the question is what the reading DID see -- a UWP app's
+    // window is attributed to some process, and this shows which.
+    let print_all = std::env::args().any(|arg| arg == "--all");
 
     println!("session: {:?}", current_session_provenance());
 
@@ -47,6 +51,8 @@ fn main() {
                             println!(
                                 "  window owned by pid {pid} ({executable_basename}) <- matches"
                             );
+                        } else if print_all {
+                            println!("  window owned by pid {pid} ({executable_basename})");
                         }
                     }
                     TopLevelWindowOwner::Unreadable(reason) => {

@@ -127,13 +127,19 @@ impl TargetResolver for PlatformResolver {
     /// the reading SUCCEEDS with six service-desktop windows and would
     /// otherwise have called two open Notepads not running.
     ///
-    /// UWP applications do not resolve by either name yet. Calculator was
-    /// launched and neither `calculatorapp.exe` nor `applicationframehost.exe`
-    /// matched: the frame host was running with no main window handle, so
-    /// whatever owns a UWP app's top-level window is not what `EnumWindows`
-    /// attributes to either process. Unresolved, not guessed; a caller naming
-    /// a UWP app today gets NotRunning, which is the honest reading of a list
-    /// that genuinely contains no window under that name.
+    /// UWP applications resolve by their OWN executable basename, the same as
+    /// classic ones: Calculator running as the console user is
+    /// `calculatorapp.exe`, Resolved to its own pid, stable across repeated
+    /// reads. An earlier note here said the opposite; that run had never
+    /// launched Calculator (AppX activation is per-user and the launcher ran as
+    /// SYSTEM), so its NotRunning was true and proved nothing about UWP.
+    ///
+    /// Do not name `applicationframehost.exe` for a UWP app. It also resolves,
+    /// but to the frame host that owns the title bars of EVERY open UWP app --
+    /// two windows before Calculator, five after -- so it is the wrong process
+    /// for actuation and is ambiguous across apps in a way the count cannot
+    /// show. The app's content, and its accessibility tree, live in its own
+    /// process.
     #[cfg(target_os = "windows")]
     fn resolve(&self, bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;
