@@ -29,7 +29,7 @@ use cerebellum_computer::capture::{EnumeratedWindow, InMemoryCaptureBackend, Win
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError, CapabilityResultViolation,
 };
-use cerebellum_computer::platform::{TargetCandidate, TargetResolution};
+use cerebellum_computer::platform::{TargetCandidate, TargetResolution, UnreadableReason};
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::consent::ActionKind;
 use serde_json::{json, Value};
@@ -351,7 +351,9 @@ async fn served_wait_replies() -> Vec<Value> {
     let resolver = MutableTargetResolver::new(TargetResolution::Resolved(grant()));
     let management = management_with(Arc::new(resolver.clone()));
     grant_lease(&management, ActionKind::Observe, &clock).await;
-    resolver.replace(TargetResolution::Unreadable);
+    resolver.replace(TargetResolution::Unreadable(
+        UnreadableReason::WindowListUnavailable,
+    ));
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> = ComputerPlane::new(audit());
     let reply = plane
         .serve(

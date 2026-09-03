@@ -15,7 +15,7 @@ use cerebellum::computer_capability::{
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::audit::ComputerCapability;
 use cerebellum_computer::capture::{EnumeratedWindow, InMemoryCaptureBackend, WindowFrame};
-use cerebellum_computer::platform::TargetResolution;
+use cerebellum_computer::platform::{TargetResolution, UnreadableReason};
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{IoDiagnostic, StorageError};
 use serde_json::{json, Value};
@@ -627,7 +627,7 @@ async fn a_target_with_no_capturable_window_says_so() {
 #[tokio::test]
 async fn an_unreadable_window_list_is_not_reported_as_the_application_being_absent() {
     let plane = Arc::new(ManagementPlane::new(Arc::new(Fixed(
-        TargetResolution::Unreadable,
+        TargetResolution::Unreadable(UnreadableReason::WindowListUnavailable),
     ))));
     let clock = FakeClock::new();
 
@@ -649,6 +649,81 @@ async fn an_unreadable_window_list_is_not_reported_as_the_application_being_abse
         question.is_none(),
         "a person was asked to approve a target nothing could see: {body}"
     );
+}
+
+/// The REASON a target was unreadable reaches the wire, and the remedy is
+/// that reason's remedy.
+///
+/// One word used to carry every cause, and the remedy attached to it named a
+/// macOS screen-recording grant -- so a Windows caller running in a service
+/// session was told to check a permission on the wrong operating system for
+/// a problem that was the session it ran in. Asserted at the reply, because
+/// the reason travelled correctly inside the resolver for a day while the
+/// wire kept saying the same thing.
+#[tokio::test]
+async fn an_unreadable_reason_reaches_the_wire_with_its_own_remedy() {
+    let clock = FakeClock::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for (reason, remedy_names) in [
+        (
+            UnreadableReason::SessionNotInteractive {
+                session_id: 0,
+                console_session_id: 1,
+            },
+            "console session",
+        ),
+        (
+            UnreadableReason::NoConsoleSession { session_id: 0 },
+            "log a user in",
+        ),
+        (
+            UnreadableReason::PartialWindowList {
+                unreadable_owners: 2,
+            },
+            "could not be attributed",
+        ),
+        (
+            UnreadableReason::GenerationUnreadable { pid: 4242 },
+            "do NOT start another instance",
+        ),
+        (
+            UnreadableReason::WindowListUnavailable,
+            "window-reading permission",
+        ),
+    ] {
+        let plane = Arc::new(ManagementPlane::new(Arc::new(Fixed(
+            TargetResolution::Unreadable(reason.clone()),
+        ))));
+        let (body, _) = plane
+            .open_target(
+                "agent-under-test",
+                "com.example.App",
+                cerebellum_core::consent::ActionKind::Observe,
+                true,
+                &clock,
+            )
+            .await;
+
+        assert_eq!(body["outcome"], "targets_unreadable", "{body}");
+        // The reason itself, serialized, not merely a prose hint about it.
+        assert_eq!(
+            body["unreadable"],
+            serde_json::to_value(&reason).expect("reason serializes"),
+            "the wire did not carry the reason: {body}"
+        );
+        let remedy = body["remedy"].as_str().expect("a remedy string");
+        assert!(
+            remedy.contains(remedy_names),
+            "the remedy for {reason:?} does not name its own fix: {remedy}"
+        );
+        // Five reasons, five distinct remedies. A shared remedy would mean a
+        // reason with nothing to say for itself, which is the collapse again.
+        assert!(
+            seen.insert(remedy.to_string()),
+            "two reasons share one remedy: {remedy}"
+        );
+    }
 }
 
 /// A region outside any target window is refused before capture.

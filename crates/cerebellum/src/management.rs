@@ -109,6 +109,42 @@ impl PlatformResolver {
     }
 }
 
+/// Turn an unreadable-target reason into the remedy a caller can act on.
+///
+/// One word ("unreadable") used to carry every cause, and the remedy attached
+/// to it named a macOS screen-recording grant -- which is what a Windows caller
+/// running in the wrong session was told to check. The reasons are distinct
+/// because the remedies are, and the wire carries the reason itself so a
+/// caller need not parse the prose.
+fn unreadable_remedy(reason: &cerebellum_computer::platform::UnreadableReason) -> &'static str {
+    use cerebellum_computer::platform::UnreadableReason;
+    match reason {
+        UnreadableReason::WindowListUnavailable => {
+            "the window list could not be read, so nothing is known about this application; \
+             retry, and if it persists check that the process that launched this module still \
+             holds the platform's window-reading permission (screen recording on macOS)"
+        }
+        UnreadableReason::SessionNotInteractive { .. } => {
+            "this module is running in a session that cannot see the user's desktop, so \
+             nothing is known about this application; run it from the console session"
+        }
+        UnreadableReason::NoConsoleSession { .. } => {
+            "no user is logged in at the console, so no desktop exists to read; log a user in \
+             at the console"
+        }
+        UnreadableReason::PartialWindowList { .. } => {
+            "some windows' owners could not be read, so this name may belong to a window that \
+             could not be attributed; retry, and if it persists the application may be a \
+             protected process this module cannot inspect"
+        }
+        UnreadableReason::GenerationUnreadable { .. } => {
+            "exactly one instance is running but its start time could not be read, so no grant \
+             can be bound to it safely; do NOT start another instance -- retry, and if it \
+             persists the process is one this module cannot inspect"
+        }
+    }
+}
+
 impl TargetResolver for PlatformResolver {
     #[cfg(target_os = "macos")]
     fn resolve(&self, bundle_identity: &str) -> TargetResolution {
@@ -152,7 +188,9 @@ impl TargetResolver for PlatformResolver {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;
-        TargetResolution::Unreadable
+        TargetResolution::Unreadable(
+            cerebellum_computer::platform::UnreadableReason::WindowListUnavailable,
+        )
     }
 }
 
@@ -358,14 +396,13 @@ impl ManagementPlane {
             // the world and this one is only about our own sight. Telling
             // someone their running application is not running sends them to
             // start a second copy.
-            TargetResolution::Unreadable => {
+            TargetResolution::Unreadable(reason) => {
                 return (
                     json!({
                         "outcome": "targets_unreadable",
                         "bundle_identity": bundle_identity,
-                        "remedy": "the window list could not be read, so nothing \
-                    is known about this application; retry, and if it persists check that screen \
-                    recording is still granted to the process that launched this module",
+                        "unreadable": reason,
+                        "remedy": unreadable_remedy(&reason),
                     }),
                     None,
                 );
@@ -631,12 +668,11 @@ impl ManagementPlane {
             // its generation, and that cannot be re-established from a window
             // list that did not answer. Distinct from `target_not_running` so a
             // caller is not sent to start an application that is already there.
-            TargetResolution::Unreadable => ActionAuthority::Refused(json!({
+            TargetResolution::Unreadable(reason) => ActionAuthority::Refused(json!({
                 "outcome": "targets_unreadable",
                 "bundle_identity": key.bundle_identity,
-                "remedy": "the window list could not be read, so the target could \
-            not be confirmed; retry, and if it persists check that screen recording is still \
-            granted to the process that launched this module",
+                "unreadable": reason,
+                "remedy": unreadable_remedy(&reason),
             })),
         }
     }

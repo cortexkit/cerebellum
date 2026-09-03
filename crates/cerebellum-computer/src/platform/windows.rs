@@ -153,7 +153,9 @@ fn resolve_from_reading<F: FnOnce(u32) -> Option<String>>(
     // stand -- they were found in what WAS read -- but NotRunning would claim
     // absence about processes this reading could not see.
     if unreadable_owners > 0 && matches!(resolution, TargetResolution::NotRunning) {
-        return Ok(TargetResolution::Unreadable);
+        return Ok(TargetResolution::Unreadable(
+            UnreadableReason::PartialWindowList { unreadable_owners },
+        ));
     }
     Ok(resolution)
 }
@@ -168,7 +170,7 @@ fn resolve_from_reading<F: FnOnce(u32) -> Option<String>>(
 pub fn resolve_target(executable_basename: &str) -> TargetResolution {
     let reading = match cerebellum_windows::enumerate_top_level_windows() {
         Ok(reading) => reading,
-        Err(_) => return TargetResolution::Unreadable,
+        Err(_) => return TargetResolution::Unreadable(UnreadableReason::WindowListUnavailable),
     };
     let named: Vec<(u32, String)> = reading
         .windows
@@ -200,7 +202,20 @@ pub fn resolve_target(executable_basename: &str) -> TargetResolution {
         },
     ) {
         Ok(resolution) => resolution,
-        Err(_) => TargetResolution::Unreadable,
+        // The only error `resolve_from_reading` produces is the session
+        // refusal, and its remedy is "log in at the console", which the
+        // generic word would have hidden behind a macOS permission hint.
+        Err(DriverError::SessionNotInspectable(SessionProvenanceRefusal::OtherSession {
+            session_id,
+            console_session_id,
+        })) => TargetResolution::Unreadable(UnreadableReason::SessionNotInteractive {
+            session_id,
+            console_session_id,
+        }),
+        Err(DriverError::SessionNotInspectable(SessionProvenanceRefusal::NoConsoleSession {
+            session_id,
+        })) => TargetResolution::Unreadable(UnreadableReason::NoConsoleSession { session_id }),
+        Err(_) => TargetResolution::Unreadable(UnreadableReason::WindowListUnavailable),
     }
 }
 
@@ -1237,7 +1252,14 @@ mod tests {
         // Same list, one owner unreadable: the missing window may be the one.
         let partial = resolve_from_reading("notepad.exe", console, Some(&windows), 1, generation);
         assert!(
-            matches!(partial, Ok(TargetResolution::Unreadable)),
+            matches!(
+                partial,
+                Ok(TargetResolution::Unreadable(
+                    UnreadableReason::PartialWindowList {
+                        unreadable_owners: 1
+                    }
+                ))
+            ),
             "a partial list must not assert absence, got {partial:?}"
         );
 

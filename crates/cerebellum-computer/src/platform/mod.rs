@@ -781,7 +781,46 @@ pub enum TargetResolution {
     /// error in the same instant, so a transient window-server failure arrives
     /// wearing a permission denial's clothes. Reporting that as `NotRunning`
     /// tells someone their running application is not running.
-    Unreadable,
+    ///
+    /// The reason travels with it because the remedies differ by platform and
+    /// by cause, and a caller told only "unreadable" was being sent to check a
+    /// macOS screen-recording grant on a Windows machine whose real problem was
+    /// the session it ran in.
+    Unreadable(UnreadableReason),
+}
+
+/// Why the target list could not be read well enough to answer.
+///
+/// Each variant names a different remedy. Collapsing them into one word was
+/// measured to send a Windows caller a macOS remedy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum UnreadableReason {
+    /// The window server (macOS) or `EnumWindows` (Windows) did not answer.
+    /// Remedy: retry; if it persists, the platform's permission or
+    /// window-server state is the thing to check.
+    WindowListUnavailable,
+    /// The reading came from a session that cannot see the user's desktop, so
+    /// an empty list describes this module's own visibility. Remedy: run from
+    /// the console session.
+    SessionNotInteractive {
+        session_id: u32,
+        console_session_id: u32,
+    },
+    /// No console session exists at all -- nobody is at the machine -- so no
+    /// desktop can be observed from any session. Remedy: log a user in at
+    /// the console.
+    NoConsoleSession { session_id: u32 },
+    /// Some windows' owners could not be opened, so the name may belong to a
+    /// window this reading could not attribute. Remedy: retry, or name a
+    /// process that is not protected.
+    PartialWindowList { unreadable_owners: usize },
+    /// Exactly one process answers to the name, but its start time could not
+    /// be read, so no grant can carry the generation evidence that survives the
+    /// target being replaced. The application IS running; starting another
+    /// is the wrong remedy. Remedy: retry, then investigate why the process
+    /// start time is unreadable for that pid.
+    GenerationUnreadable { pid: u32 },
 }
 
 impl TargetResolution {
@@ -805,7 +844,7 @@ impl TargetResolution {
         // that only macOS builds. Those two are one keystroke apart and mean
         // opposite things to whoever receives the answer.
         let Some(windows) = windows else {
-            return Self::Unreadable;
+            return Self::Unreadable(UnreadableReason::WindowListUnavailable);
         };
         let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
         for (pid, identity) in windows {
@@ -829,16 +868,18 @@ impl TargetResolution {
         }
 
         // A process that owns windows but whose start time cannot be read is
-        // treated as not running rather than resolved: a grant without
-        // generation evidence cannot survive the target being replaced, which is
-        // the whole reason the evidence is carried.
+        // not resolved: a grant without generation evidence cannot survive the
+        // target being replaced, which is the whole reason the evidence is
+        // carried. But it is not NOT RUNNING either -- it visibly owns windows.
+        // That answer stood here for a while and would have sent a caller to
+        // start a second instance of an application already in front of them.
         match read_generation(pid) {
             Some(process_generation_evidence) => Self::Resolved(ProcessGrant {
                 pid,
                 bundle_identity: bundle_identity.to_string(),
                 process_generation_evidence,
             }),
-            None => Self::NotRunning,
+            None => Self::Unreadable(UnreadableReason::GenerationUnreadable { pid }),
         }
     }
 }
@@ -1624,11 +1665,22 @@ mod target_resolution_tests {
     /// replacement that inherits its process id, which is the whole reason the
     /// evidence is carried. Reported as not running because that is what the
     /// caller can act on: the process this identity named is not usable.
+    /// A running instance whose start time cannot be read is not resolved --
+    /// and it is not NOT RUNNING. It owns windows. The old answer here was
+    /// NotRunning, which sends a person to start a second copy of an
+    /// application already in front of them; the reason names the pid so the
+    /// remedy can be about that process rather than about launching anything.
     #[test]
-    fn an_instance_without_generation_evidence_does_not_resolve() {
+    fn an_instance_without_generation_evidence_is_unreadable_and_never_not_running() {
+        let resolution = TargetResolution::decide("com.apple.Safari", Some(&windows()), |_| None);
+        let TargetResolution::Unreadable(UnreadableReason::GenerationUnreadable { pid }) =
+            resolution
+        else {
+            panic!("an unreadable generation must be Unreadable with its pid, got {resolution:?}");
+        };
         assert_eq!(
-            TargetResolution::decide("com.apple.Safari", Some(&windows()), |_| None),
-            TargetResolution::NotRunning
+            pid, 100,
+            "the pid named is the one that owns Safari's windows"
         );
     }
 
@@ -1651,7 +1703,10 @@ mod target_resolution_tests {
             panic!("a generation was read for a target nothing could see")
         });
 
-        assert_eq!(resolution, TargetResolution::Unreadable);
+        assert_eq!(
+            resolution,
+            TargetResolution::Unreadable(UnreadableReason::WindowListUnavailable)
+        );
         assert_ne!(
             resolution,
             TargetResolution::NotRunning,
