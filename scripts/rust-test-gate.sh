@@ -322,7 +322,11 @@ check_build_rewrote_nothing() {
   fi
 }
 
-run_phase "the build rewrote no generated file" \
+# Named for what is being checked, not for the healthy outcome: the runner
+# prints "GATE FAILED: <label>", and a label stating the healthy outcome reads
+# as its own negation on the failing path ("GATE FAILED: the build rewrote no
+# generated file" was read as a pass twice).
+run_phase "generated files untouched by the build" \
   check_build_rewrote_nothing
 
 # A single line naming the outcome, so a caller reading a filtered view of this
