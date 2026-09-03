@@ -674,14 +674,22 @@ impl PlatformDriver for WindowsPlatformDriver {
         #[cfg(target_os = "windows")]
         {
             require_console_session(cerebellum_windows::current_session_provenance().into())?;
-            let visibility: WindowsWindowVisibility =
-                cerebellum_windows::enumerated_window_visibility(request.target.pid).into();
-            require_enumerable_visibility(request.target.pid, visibility)?;
-            // The retained handle pins the process object during the read. It
-            // cannot travel in `ProcessGrant`, so the driver still rechecks the
+            // Liveness before visibility. A process that has exited has no
+            // enumerable window either, so checking visibility first reports a
+            // dead target as "visibility unknown" -- which a caller reads as a
+            // UWP application with no window rather than as a process that is
+            // gone. Measured on the VM: pressing Close through this driver and
+            // reading again said visibility-unknown where the seam's own probe
+            // said TargetGone for the same process.
+            //
+            // The retained handle also pins the process object during the read.
+            // It cannot travel in `ProcessGrant`, so the driver still rechecks the
             // grant's start time at each operation boundary.
             let _retained =
                 retain_current_target(&request.target).map_err(accessibility_verification_error)?;
+            let visibility: WindowsWindowVisibility =
+                cerebellum_windows::enumerated_window_visibility(request.target.pid).into();
+            require_enumerable_visibility(request.target.pid, visibility)?;
             let tree = cerebellum_windows::read_accessibility_tree(
                 request.target.pid,
                 cerebellum_windows::AccessibilityReadBounds {

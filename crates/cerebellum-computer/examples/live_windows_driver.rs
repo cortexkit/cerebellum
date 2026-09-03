@@ -59,7 +59,7 @@ fn main() {
 
     let tree = match driver.read_accessibility_tree(AccessibilityTreeRequest {
         target: target.clone(),
-        settle_interval_ms: 0,
+        settle_interval_ms: 500,
     }) {
         Ok(tree) => tree,
         Err(error) => {
@@ -107,7 +107,7 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(500));
     match driver.read_accessibility_tree(AccessibilityTreeRequest {
         target,
-        settle_interval_ms: 0,
+        settle_interval_ms: 500,
     }) {
         Ok(after) => {
             println!("after: children={}", after.child_count);
