@@ -20,6 +20,8 @@ pub use synthetic::*;
 pub mod macos;
 #[cfg(target_os = "macos")]
 mod macos_synthetic;
+#[cfg(any(target_os = "windows", test))]
+pub mod windows;
 
 /// Converts raw operating-system permission readings into the
 /// [`PermissionProbeResult`] values the startup probe consumes.
@@ -33,6 +35,8 @@ pub mod native;
 pub use macos::{
     MacOs26PlatformDriver, PrivateEnvelopeStartupProbe, StartupProbeInput, MACOS_MAJOR_VERSION,
 };
+#[cfg(target_os = "windows")]
+pub use windows::{WindowsPlatformDriver, WindowsUnsupportedCaptureBackend};
 
 pub mod vocabulary;
 pub use vocabulary::{
@@ -199,6 +203,7 @@ pub struct ImmutableReleaseInputs {
     pub input_review_revision: Option<String>,
     pub capture_review_revision: Option<String>,
     pub semantic_actuation_review_revision: Option<String>,
+    pub windows_actuation_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
 }
@@ -1122,6 +1127,26 @@ pub struct AttendancePreconditionResult {
     pub age_ms: Option<u64>,
 }
 
+/// Why a Windows desktop session cannot support a UI Automation read or action.
+///
+/// The session identifiers are retained in the refusal so a service session is
+/// never mistaken for an empty target in the interactive console session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionProvenanceRefusal {
+    OtherSession {
+        session_id: u32,
+        console_session_id: u32,
+    },
+    NoConsoleSession {
+        session_id: u32,
+    },
+    Unreadable {
+        last_error: u32,
+    },
+    NotApplicable,
+}
+
 /// Why an accessibility tree could not be read.
 ///
 /// These outcomes name the remedy available to a caller rather than the
@@ -1207,6 +1232,12 @@ pub enum DriverError {
     SyntheticDispatchFailed(SequencePostFailure),
     /// The accessibility tree could not be read.
     AccessibilityUnreadable(AccessibilityReadFailure),
+    /// The current Windows session cannot inspect the interactive desktop.
+    SessionNotInspectable(SessionProvenanceRefusal),
+    /// Windows cannot distinguish an unenumerated app from a hidden window.
+    WindowVisibilityUnknown {
+        pid: u32,
+    },
     /// The tree was read and the named element is not in it.
     ElementNotFound,
     /// A semantic driver failure that tells the caller how the refused action can be handled.
@@ -1236,6 +1267,16 @@ impl fmt::Display for DriverError {
             Self::AccessibilityUnreadable(failure) => {
                 write!(f, "accessibility tree unreadable: {failure}")
             }
+            Self::SessionNotInspectable(session) => {
+                write!(
+                    f,
+                    "Windows session cannot inspect the console desktop: {session:?}"
+                )
+            }
+            Self::WindowVisibilityUnknown { pid } => write!(
+                f,
+                "Windows could not establish enumerated window visibility for process {pid}"
+            ),
             Self::ElementNotFound => f.write_str("accessibility element not found"),
             Self::Semantic(failure) => write!(f, "semantic action refused: {failure:?}"),
         }

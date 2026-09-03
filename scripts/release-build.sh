@@ -2,7 +2,7 @@
 #
 # Build the module with the release attestations that have been minted.
 #
-# Six identifiers gate what the computer plane may advertise and serve. Each
+# Seven identifiers gate what the computer plane may advertise and serve. Each
 # attests that something happened OUTSIDE this repository -- a review was
 # conducted, a doctrine was written down -- so none of them can be derived from
 # the code they govern. They are supplied to the COMPILER rather than read at
@@ -105,7 +105,12 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 # absence -- but the reason to leave them unset is not that a stand-in would be
 # caught. It is that absence is TRUE.
 #
-#   (none)
+# Keep Windows UI Automation actuation disabled and unadvertised until a
+# Windows-specific source review and live virtual-machine validation have been
+# completed and their revision identifier is supplied. The macOS semantic review
+# covers a separate implementation and does not authorize Windows actuation.
+#
+#   CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION
 
 # ---------------------------------------------------------------------------
 
@@ -114,6 +119,7 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 readonly ATTESTATIONS=(
   CEREBELLUM_CAPTURE_REVIEW_REVISION
   CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION
+  CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION
   CEREBELLUM_ATTENDANCE_CONTRACT_OWNER

@@ -24,6 +24,9 @@ sha2 = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 cerebellum-macos = { path = "../cerebellum-macos" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+cerebellum-windows = { path = "../cerebellum-windows" }
+
 # Tests read back the events the macOS driver would post, which needs the
 # framework event type the seam crate wraps. Dev-only and macOS-only, pinned
 # to the same version the seam uses: production code keeps its single

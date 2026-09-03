@@ -31,24 +31,42 @@ use cerebellum_computer::dispatch::{
 use cerebellum_computer::dispatch::WaitEvidence;
 // The outcome and result types belong to a completed poll, which only the macOS
 // handler performs -- and to the tests that shape its reply on any platform.
-#[cfg(any(target_os = "macos", test))]
-use cerebellum_computer::dispatch::{WaitOutcome, WaitResult};
-// The poller drives the macOS platform driver, so only that build reaches it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::dispatch::{wait_until_predicate, PlatformPredicatePoller};
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+use cerebellum_computer::dispatch::{WaitOutcome, WaitResult};
 use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_computer::platform::containment::ContainmentRung as DispatchContainmentRung;
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
 };
 use cerebellum_computer::platform::AccessibilityElementName;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::platform::{
     AccessibilityKeyForm, AccessibilityReadFailure, AccessibilityTreeRequest, DriverError,
-    ElementResolutionRequest, ElementResolutionResult, MacOs26PlatformDriver,
-    SemanticDispatchRequest, SemanticDriverError, TargetDisposition, SEMANTIC_CANCEL_ACTION,
-    SEMANTIC_PRESS_ACTION,
+    ElementResolutionRequest, ElementResolutionResult, SemanticDispatchRequest,
+    SemanticDriverError, TargetDisposition, SEMANTIC_CANCEL_ACTION, SEMANTIC_PRESS_ACTION,
 };
+#[cfg(target_os = "macos")]
+pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::MacOs26PlatformDriver;
+#[cfg(target_os = "windows")]
+pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::WindowsPlatformDriver;
+#[cfg(target_os = "macos")]
+pub(crate) type NativeComputerCaptureBackend =
+    cerebellum_computer::platform::native::NativeCaptureBackend;
+#[cfg(target_os = "windows")]
+pub(crate) type NativeComputerCaptureBackend =
+    cerebellum_computer::platform::WindowsUnsupportedCaptureBackend;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
+    NativeComputerCaptureBackend::new(std::time::Duration::from_secs(10))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
+    cerebellum_computer::platform::WindowsUnsupportedCaptureBackend
+}
 use cerebellum_computer::platform::{
     DispatchMode, EffectStatus, HeldStateDisposition, PlatformDriver, SyntheticAction,
     SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit,
@@ -172,7 +190,7 @@ fn screenshot_wire_reply(mut reply: Value) -> Value {
 /// A refusal has no delivered containment or observed effect. A zero unreadable
 /// count on a pre-read refusal means no tree read was attempted; callers receive
 /// the measured count instead on paths that did read a tree.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn click_wire_envelope(mut reply: Value) -> Value {
     let object = reply
         .as_object_mut()
@@ -196,7 +214,7 @@ fn click_wire_envelope(mut reply: Value) -> Value {
     reply
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn click_refusal_after_read(mut refusal: Value, unreadable_subtrees: u64) -> Value {
     refusal
         .as_object_mut()
@@ -214,13 +232,13 @@ fn click_refusal_after_read(mut refusal: Value, unreadable_subtrees: u64) -> Val
 /// severity table, redaction policy and storage are decisions this module makes
 /// once, and spelling them at each use invites a caller substituting a different
 /// redaction policy without that reading as a change of policy.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub type RunningComputerPlane = ComputerPlane<
-    cerebellum_computer::platform::native::NativeCaptureBackend,
+    NativeComputerCaptureBackend,
     cerebellum_computer::audit::redaction::ExcludeApplicationText,
     cerebellum_core::journal::ValidatedSeverityTaxonomy,
     cerebellum_core::journal::FilesystemJournalStorage,
-    MacOs26PlatformDriver,
+    NativeComputerPlatformDriver,
 >;
 
 /// Why the computer plane cannot be assembled at boot.
@@ -261,7 +279,8 @@ impl std::fmt::Display for ComputerPlaneUnavailable {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[allow(clippy::result_large_err)]
 fn reconcile_production_audit<R, T, S>(
     mut audit: ComputerAudit<R, T, S>,
     now_ms: u64,
@@ -290,7 +309,8 @@ where
 /// audit records are application data, not configuration. Initialization probes
 /// that directory before capabilities are offered and preserves the exact refusal
 /// reason instead of silently substituting process-local storage.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[allow(clippy::result_large_err)]
 pub fn production_audit() -> Result<
     ComputerAudit<
         cerebellum_computer::audit::redaction::ExcludeApplicationText,
@@ -629,7 +649,7 @@ where
                 self.serve_screenshot(arguments, context, make_backend)
                     .await
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             ComputerCapability::Click => self.serve_click(arguments, context).await,
             ComputerCapability::Type
             | ComputerCapability::Keys
@@ -643,7 +663,7 @@ where
             // arrives here. Answered rather than panicked: a dispatch table and
             // this match disagreeing is a bug to report, not a reason to take
             // the module down.
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             other => json!({
                 "outcome": "not_servable",
                 "capability": other.capability_id(),
@@ -652,7 +672,7 @@ where
         };
         let reply = match served_capability {
             ComputerCapability::Screenshot => screenshot_wire_reply(reply),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             ComputerCapability::Click => click_wire_envelope(reply),
             ComputerCapability::Type | ComputerCapability::Keys | ComputerCapability::Scroll => {
                 synthetic_wire_envelope(reply, true)
@@ -663,7 +683,7 @@ where
             ComputerCapability::Wait => reply,
             // The click reply above was already the not_servable answer on this
             // platform; it needs no envelope.
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             ComputerCapability::Click => reply,
         };
         self.finish_reply(served_capability, reply)
@@ -696,13 +716,13 @@ where
             }
         };
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let predicate = parsed.predicate;
             let timeout_ms = parsed.timeout_ms;
             match tokio::task::spawn_blocking(move || {
                 let mut poller =
-                    PlatformPredicatePoller::new(MacOs26PlatformDriver::default(), grant);
+                    PlatformPredicatePoller::new(NativeComputerPlatformDriver::default(), grant);
                 wait_until_predicate(&mut poller, predicate, timeout_ms)
             })
             .await
@@ -714,7 +734,7 @@ where
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = grant;
             wait_indeterminate_reply(
@@ -725,7 +745,7 @@ where
     }
 
     /// Invoke the requested semantic action on one uniquely named element.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     async fn serve_click<C: MonotonicClock>(
         &self,
         arguments: &Value,
@@ -755,9 +775,9 @@ where
         // inferred one can be true before the press, so it would report an
         // effect for a click that did nothing.
         let mut driver = if parsed.expect.is_some() {
-            MacOs26PlatformDriver::default()
+            NativeComputerPlatformDriver::default()
         } else {
-            MacOs26PlatformDriver::default().without_expected_post_condition()
+            NativeComputerPlatformDriver::default().without_expected_post_condition()
         };
         let tree = match driver.read_accessibility_tree(AccessibilityTreeRequest {
             target: grant.clone(),
@@ -1365,7 +1385,7 @@ fn invalid_wait_request(field: &str, reason: &str) -> Value {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn wait_wire_reply(result: WaitResult) -> Value {
     let outcome = match result.outcome {
         WaitOutcome::Settled => "predicate_satisfied",
@@ -1403,7 +1423,7 @@ fn wait_indeterminate_reply(predicate: Option<PostCondition>, reason: Value) -> 
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 struct ParsedClick {
     element_name: AccessibilityElementName,
@@ -1411,7 +1431,7 @@ struct ParsedClick {
     expect: Option<ParsedExpect>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn click_semantic_request(
     parsed: &ParsedClick,
     element: ElementResolutionResult,
@@ -1422,7 +1442,7 @@ fn click_semantic_request(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 struct ParsedExpect {
     condition: String,
@@ -1435,7 +1455,7 @@ struct ParsedExpect {
 /// The two forms are not interchangeable: a control that is unique by role and
 /// title may have no identifier, and rewriting the request as an identifier
 /// would look up a different name and miss it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn click_target_from_wire(target: &Value) -> Result<AccessibilityElementName, Value> {
     let Some(object) = target.as_object() else {
         return Err(invalid_click_request("target", field_reason(Some(target))));
@@ -1494,7 +1514,7 @@ fn click_target_from_wire(target: &Value) -> Result<AccessibilityElementName, Va
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn parse_click_request(arguments: &Value) -> Result<ParsedClick, Value> {
     let Some(object) = arguments.as_object() else {
         return Err(invalid_click_request("$", "wrong_type"));
@@ -1580,7 +1600,7 @@ fn parse_click_request(arguments: &Value) -> Result<ParsedClick, Value> {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn parse_click_expect(expect: &Value) -> Result<ParsedExpect, Value> {
     let Some(object) = expect.as_object() else {
         return Err(invalid_click_request("expect", field_reason(Some(expect))));
@@ -1633,7 +1653,7 @@ fn parse_click_expect(expect: &Value) -> Result<ParsedExpect, Value> {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn expected_post_condition_from_wire(parsed: &ParsedClick) -> Result<ExpectedPostCondition, Value> {
     let Some(expect) = parsed.expect.as_ref() else {
         // Placeholder only: the driver is marked as having no caller-supplied
@@ -1683,7 +1703,7 @@ fn expected_post_condition_from_wire(parsed: &ParsedClick) -> Result<ExpectedPos
 /// Build the click reply. A missing effect is a different fact from an
 /// observed one: the caller who did not ask for a post-condition must not
 /// receive a claim, even the coarser indeterminate one dressed as theirs.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn click_wire_reply(
     containment_rung: &str,
     unreadable_subtrees: u64,
@@ -1726,7 +1746,7 @@ fn effect_status_name(status: EffectStatus) -> &'static str {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn field_reason(value: Option<&Value>) -> &'static str {
     if value.is_some() {
         "wrong_type"
@@ -1735,7 +1755,7 @@ fn field_reason(value: Option<&Value>) -> &'static str {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn invalid_click_request(field: &str, reason: &str) -> Value {
     click_wire_envelope(json!({
         "outcome": "invalid_request",
@@ -1744,14 +1764,14 @@ fn invalid_click_request(field: &str, reason: &str) -> Value {
     }))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn dispatch_refusal(refusal: DispatchError, unreadable_subtrees: u64) -> Value {
     let refusal =
         serde_json::to_value(refusal).expect("the closed dispatch refusal taxonomy serializes");
     click_refusal_after_read(refusal, unreadable_subtrees)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn click_driver_refusal(
     error: DriverError,
     key_form: AccessibilityKeyForm,
@@ -1810,6 +1830,12 @@ fn click_driver_refusal(
             }
         },
         DriverError::ElementNotFound => DispatchError::ElementNotFound { key_form },
+        DriverError::SessionNotInspectable(session) => {
+            DispatchError::SessionNotInspectable { session }
+        }
+        DriverError::WindowVisibilityUnknown { pid } => {
+            DispatchError::WindowVisibilityUnknown { pid }
+        }
         DriverError::Unsupported(_)
         | DriverError::InvalidRequest(_)
         | DriverError::StartupRefused(_)

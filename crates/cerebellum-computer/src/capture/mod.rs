@@ -329,6 +329,7 @@ pub enum CaptureError {
     InvalidGrant,
     TeardownInProgress,
     ScreenIsLocked,
+    UnsupportedOnPlatform,
     Backend(String),
 }
 
@@ -342,6 +343,7 @@ impl fmt::Display for CaptureError {
             Self::InvalidGrant => f.write_str("invalid broad display grant"),
             Self::TeardownInProgress => f.write_str("capture teardown in progress"),
             Self::ScreenIsLocked => f.write_str("screen is locked"),
+            Self::UnsupportedOnPlatform => f.write_str("unsupported_on_platform"),
             Self::Backend(reason) => write!(f, "capture backend failure: {reason}"),
         }
     }
@@ -354,6 +356,7 @@ pub enum BackendError {
     Enumeration(String),
     Capture(String),
     ScreenLocked,
+    UnsupportedOnPlatform,
     Teardown(String),
 }
 
@@ -365,6 +368,7 @@ impl fmt::Display for BackendError {
             | Self::Capture(reason)
             | Self::Teardown(reason) => f.write_str(reason),
             Self::ScreenLocked => f.write_str("screen is locked"),
+            Self::UnsupportedOnPlatform => f.write_str("unsupported on this platform"),
         }
     }
 }
@@ -374,7 +378,11 @@ impl From<BackendError> for CaptureError {
     fn from(error: BackendError) -> Self {
         match error {
             BackendError::ScreenLocked => Self::ScreenIsLocked,
-            error => Self::Backend(error.to_string()),
+            BackendError::UnsupportedOnPlatform => Self::UnsupportedOnPlatform,
+            BackendError::Permission(reason)
+            | BackendError::Enumeration(reason)
+            | BackendError::Capture(reason)
+            | BackendError::Teardown(reason) => Self::Backend(reason),
         }
     }
 }
@@ -389,6 +397,14 @@ pub enum BackendTeardownProgress {
 /// non-blocking.  In particular, teardown is split into begin/poll so a revoked
 /// stream cannot wedge the health lane while the window-server releases it.
 pub trait CaptureBackend {
+    /// Whether this operating system has a capture implementation at all.
+    ///
+    /// This precedes permission checks so a platform with no backend is never
+    /// misreported as a denied permission or a locked screen.
+    fn platform_support(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn screen_recording_liveness(&self) -> PermissionLiveness;
     fn enumerate_windows(
         &mut self,
@@ -568,6 +584,9 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
     }
 
     fn ensure_capture_permission(&mut self, now_ms: u64) -> Result<(), CaptureError> {
+        self.backend
+            .platform_support()
+            .map_err(CaptureError::from)?;
         match self.backend.screen_recording_liveness() {
             PermissionLiveness::Live => {
                 if matches!(
@@ -741,6 +760,9 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         &mut self,
         request: BroadDisplayCaptureRequest,
     ) -> Result<BroadDisplayCaptureResult, CaptureError> {
+        self.backend
+            .platform_support()
+            .map_err(CaptureError::from)?;
         match self.backend.screen_recording_liveness() {
             PermissionLiveness::Live => {}
             PermissionLiveness::GrantedPendingRelaunch => {
@@ -1038,6 +1060,20 @@ mod tests {
         assert_eq!(
             CaptureError::from(BackendError::Capture("window no longer exists".into())),
             CaptureError::Backend("window no longer exists".into())
+        );
+    }
+
+    /// Platform absence remains distinguishable from permission, lock-screen,
+    /// and operational capture failures all the way to capture callers.
+    #[test]
+    fn an_unsupported_backend_error_reaches_capture_callers_by_type() {
+        assert_eq!(
+            CaptureError::from(BackendError::UnsupportedOnPlatform),
+            CaptureError::UnsupportedOnPlatform
+        );
+        assert_eq!(
+            CaptureError::UnsupportedOnPlatform.to_string(),
+            "unsupported_on_platform"
         );
     }
 
