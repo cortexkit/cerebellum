@@ -127,6 +127,35 @@ fn main() {
             root.bounding_rectangle
         );
     }
+
+    // `--list` prints every element with an automation id or a name, so a
+    // follow-up invoke probe can pick a real key rather than guessing one.
+    if std::env::args().any(|arg| arg == "--list") {
+        fn list(element: &UiaElement, depth: usize) {
+            let id = element.identity.automation_id.as_deref().unwrap_or("");
+            let name = &element.identity.control_type_and_name.name;
+            if !id.is_empty() || !name.is_empty() {
+                println!(
+                    "{:indent$}[{}] type={} id={:?} name={:?} pid={} enabled={} rect={:?}",
+                    "",
+                    element.class_name.as_deref().unwrap_or("?"),
+                    element.identity.control_type_and_name.control_type,
+                    id,
+                    name,
+                    element.process_id,
+                    element.enabled,
+                    element.bounding_rectangle,
+                    indent = depth * 2
+                );
+            }
+            for child in &element.children {
+                list(child, depth + 1);
+            }
+        }
+        for root in &tree.roots {
+            list(root, 0);
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
