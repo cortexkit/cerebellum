@@ -3211,7 +3211,7 @@ pub enum BrowserLaunchOutcome {
     ProfileBusy { holder_id: HolderId },
     ProfileGrantRequired,
     ProfileRegistryUntrustedRoot { reason_code: &'static str },
-    ProfileStorageUnavailable,
+    ProfileStorageUnavailable { reason_code: &'static str },
     InternalFailure { reason_code: &'static str },
     CleanupFailure { stage: LaunchCleanupStage },
 }
@@ -3239,9 +3239,10 @@ impl BrowserLaunchOutcome {
                 "outcome": "profile_registry_untrusted_root",
                 "reason_code": reason_code,
             }),
-            Self::ProfileStorageUnavailable => {
-                json!({"outcome": "profile_storage_unavailable"})
-            }
+            Self::ProfileStorageUnavailable { reason_code } => json!({
+                "outcome": "profile_storage_unavailable",
+                "reason_code": reason_code,
+            }),
             Self::InternalFailure { reason_code } => json!({
                 "outcome": "internal_failure",
                 "reason_code": reason_code,
@@ -3274,9 +3275,9 @@ pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
             origin: _,
         } => BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code },
         ProfileOutcome::StorageUnavailable {
-            reason_code: _,
+            reason_code,
             origin: _,
-        } => BrowserLaunchOutcome::ProfileStorageUnavailable,
+        } => BrowserLaunchOutcome::ProfileStorageUnavailable { reason_code },
         ProfileOutcome::InternalFailure { reason_code } => {
             BrowserLaunchOutcome::InternalFailure { reason_code }
         }
@@ -3651,7 +3652,7 @@ const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
     | BrowserLaunchOutcome::ProfileGrantRequired
     | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code: _ }
-    | BrowserLaunchOutcome::ProfileStorageUnavailable
+    | BrowserLaunchOutcome::ProfileStorageUnavailable { reason_code: _ }
     | BrowserLaunchOutcome::InternalFailure { reason_code: _ }
     | BrowserLaunchOutcome::CleanupFailure { stage: _ } => {}
 };

@@ -1,5 +1,7 @@
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -1054,13 +1056,90 @@ fn missing_managed_root_still_reports_profile_storage_unavailable() {
     assert_eq!(
         outcome,
         ProfileOutcome::StorageUnavailable {
-            reason_code: "profile_storage_unavailable",
+            reason_code: "profile_managed_root_missing",
             origin: FailureOrigin::RegistryOrStorage,
         }
     );
     assert_eq!(
         map_profile_outcome(outcome).as_json(),
-        json!({"outcome": "profile_storage_unavailable"})
+        json!({
+            "outcome": "profile_storage_unavailable",
+            "reason_code": "profile_managed_root_missing",
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_managed_root_names_the_persistence_condition() {
+    let root = TestRoot::new("unwritable-managed-root");
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    let original_mode = fs::metadata(root.path()).unwrap().permissions().mode();
+    let mut permissions = fs::metadata(root.path()).unwrap().permissions();
+    permissions.set_mode(original_mode & !0o222);
+    fs::set_permissions(root.path(), permissions).unwrap();
+
+    let (invocation, reservation, _) = tokens("unwritable-managed-root");
+    let outcome = match lifecycle.prepare_context_open(
+        &invocation,
+        &reservation,
+        &context("primary", "durable", "unwritable-managed-root"),
+    ) {
+        PrepareResult::Closed(outcome) => outcome,
+        PrepareResult::Prepared(_) => panic!("an unwritable root must remain closed"),
+    };
+    assert_eq!(
+        outcome,
+        ProfileOutcome::StorageUnavailable {
+            reason_code: "profile_managed_root_identity_changed",
+            origin: FailureOrigin::RegistryOrStorage,
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(outcome).as_json(),
+        json!({
+            "outcome": "profile_storage_unavailable",
+            "reason_code": "profile_managed_root_identity_changed",
+        })
+    );
+
+    let mut permissions = fs::metadata(root.path()).unwrap().permissions();
+    permissions.set_mode(original_mode);
+    fs::set_permissions(root.path(), permissions).unwrap();
+}
+
+#[test]
+fn poisoned_profile_registry_lock_names_the_unproven_owner() {
+    let root = TestRoot::new("poisoned-profile-registry-lock");
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    fs::write(
+        root.path().join(".ck-browser-profile-durable-slot.lock"),
+        b"poisoned",
+    )
+    .unwrap();
+
+    let (invocation, reservation, _) = tokens("poisoned-profile-registry-lock");
+    let outcome = match lifecycle.prepare_context_open(
+        &invocation,
+        &reservation,
+        &context("primary", "durable", "poisoned-profile-registry-lock"),
+    ) {
+        PrepareResult::Closed(outcome) => outcome,
+        PrepareResult::Prepared(_) => panic!("a poisoned registry lock must remain closed"),
+    };
+    assert_eq!(
+        outcome,
+        ProfileOutcome::StorageUnavailable {
+            reason_code: "profile_registry_lock_owner_unproven",
+            origin: FailureOrigin::RegistryOrStorage,
+        }
+    );
+    assert_eq!(
+        map_profile_outcome(outcome).as_json(),
+        json!({
+            "outcome": "profile_storage_unavailable",
+            "reason_code": "profile_registry_lock_owner_unproven",
+        })
     );
 }
 
@@ -1092,7 +1171,9 @@ fn every_wire_outcome_is_structurally_profile_uuid_free() {
         BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
             reason_code: "profile_registry_managed_root_identity_changed",
         },
-        BrowserLaunchOutcome::ProfileStorageUnavailable,
+        BrowserLaunchOutcome::ProfileStorageUnavailable {
+            reason_code: "fixture_storage_unavailable",
+        },
         BrowserLaunchOutcome::InternalFailure {
             reason_code: "fixture_internal_failure",
         },
