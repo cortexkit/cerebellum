@@ -140,6 +140,8 @@ fn readback_failure_reason(error: &DriverError) -> &'static str {
             "target_no_longer_current"
         }
         DriverError::ElementNotFound => "element_not_found",
+        DriverError::SessionNotInspectable(_) => "session_not_console",
+        DriverError::WindowVisibilityUnknown { .. } => "window_visibility_unknown",
         DriverError::Unsupported(_) => "scoped_read_unsupported",
         DriverError::InvalidRequest(_) => "invalid_scoped_read",
         DriverError::StartupRefused(_) => "platform_startup_refused",
@@ -363,6 +365,23 @@ mod tests {
                 readback: None,
                 reason: "target_not_inspectable".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn windows_read_preconditions_keep_distinct_wait_reason_names() {
+        assert_eq!(
+            readback_failure_reason(&DriverError::SessionNotInspectable(
+                crate::platform::SessionProvenanceRefusal::OtherSession {
+                    session_id: 0,
+                    console_session_id: 1,
+                },
+            )),
+            "session_not_console"
+        );
+        assert_eq!(
+            readback_failure_reason(&DriverError::WindowVisibilityUnknown { pid: 41 }),
+            "window_visibility_unknown"
         );
     }
 

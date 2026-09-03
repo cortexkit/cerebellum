@@ -1014,6 +1014,7 @@ mod tests {
             input_review_revision: Some("fixture-input-review-v1".to_string()),
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
             semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+            windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
             release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
             vocabulary_digests: VocabularyDigestInputs {
                 manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
@@ -1085,6 +1086,7 @@ mod tests {
             input_review_revision: Some("fixture-input-review-v1".to_string()),
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
             semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+            windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
             release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
             vocabulary_digests: VocabularyDigestInputs {
                 manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
@@ -1192,6 +1194,7 @@ mod tests {
                 input_review_revision: Some("fixture-input-review-v1".to_string()),
                 capture_review_revision: Some("fixture-capture-review-v1".to_string()),
                 semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+                windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
                 vocabulary_digests: VocabularyDigestInputs {
                     manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),

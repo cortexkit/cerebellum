@@ -1,0 +1,1187 @@
+//! Windows UI Automation driver and an explicitly unsupported capture backend.
+//!
+//! Operating-system calls are confined to `cfg(target_os = "windows")` blocks.
+//! The decisions made from their readings remain ordinary Rust so every host can
+//! exercise the fail-closed policy.
+
+use super::*;
+use crate::capture::{
+    BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
+    CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,
+};
+use std::collections::BTreeMap;
+
+pub const WINDOWS_ACTUATION_UNREVIEWED: &str = "windows_actuation_unreviewed";
+const WINDOWS_CAPTURE_UNSUPPORTED: &str = "windows_capture_unsupported";
+const UIA_ROLE_PREFIX: &str = "uia_control_type:";
+
+/// A capture backend whose type makes Windows capture absence explicit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WindowsUnsupportedCaptureBackend;
+
+impl CaptureBackend for WindowsUnsupportedCaptureBackend {
+    fn platform_support(&self) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+
+    fn screen_recording_liveness(&self) -> PermissionLiveness {
+        PermissionLiveness::Unresolved
+    }
+
+    fn enumerate_windows(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Vec<EnumeratedWindow>, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+
+    fn poll_window_change(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<WindowChange>, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+
+    fn capture_window(
+        &mut self,
+        _request: &WindowCaptureRequest,
+    ) -> Result<WindowCaptureFrame, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+
+    fn capture_display(
+        &mut self,
+        _request: &BroadDisplayCaptureRequest,
+    ) -> Result<CaptureArtifact, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+
+    fn begin_teardown(&mut self) -> Result<BackendTeardownProgress, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+
+    fn poll_teardown(&mut self, _elapsed_ms: u64) -> Result<BackendTeardownProgress, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSessionProvenance {
+    Console {
+        session_id: u32,
+    },
+    OtherSession {
+        session_id: u32,
+        console_session_id: u32,
+    },
+    NoConsoleSession {
+        session_id: u32,
+    },
+    Unreadable {
+        last_error: u32,
+    },
+    NotApplicable,
+}
+
+#[cfg(target_os = "windows")]
+impl From<cerebellum_windows::SessionProvenance> for WindowsSessionProvenance {
+    fn from(value: cerebellum_windows::SessionProvenance) -> Self {
+        match value {
+            cerebellum_windows::SessionProvenance::Console { session_id } => {
+                Self::Console { session_id }
+            }
+            cerebellum_windows::SessionProvenance::OtherSession {
+                session_id,
+                console_session_id,
+            } => Self::OtherSession {
+                session_id,
+                console_session_id,
+            },
+            cerebellum_windows::SessionProvenance::NoConsoleSession { session_id } => {
+                Self::NoConsoleSession { session_id }
+            }
+            cerebellum_windows::SessionProvenance::Unreadable { last_error } => {
+                Self::Unreadable { last_error }
+            }
+            cerebellum_windows::SessionProvenance::NotApplicable => Self::NotApplicable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsWindowVisibility {
+    Visible,
+    NotVisible,
+    Unknown,
+}
+
+#[cfg(target_os = "windows")]
+impl From<cerebellum_windows::WindowVisibility> for WindowsWindowVisibility {
+    fn from(value: cerebellum_windows::WindowVisibility) -> Self {
+        match value {
+            cerebellum_windows::WindowVisibility::Visible => Self::Visible,
+            cerebellum_windows::WindowVisibility::NotVisible => Self::NotVisible,
+            cerebellum_windows::WindowVisibility::Unknown => Self::Unknown,
+        }
+    }
+}
+
+fn require_console_session(session: WindowsSessionProvenance) -> Result<(), DriverError> {
+    match session {
+        WindowsSessionProvenance::Console { .. } => Ok(()),
+        WindowsSessionProvenance::OtherSession {
+            session_id,
+            console_session_id,
+        } => Err(DriverError::SessionNotInspectable(
+            SessionProvenanceRefusal::OtherSession {
+                session_id,
+                console_session_id,
+            },
+        )),
+        WindowsSessionProvenance::NoConsoleSession { session_id } => {
+            Err(DriverError::SessionNotInspectable(
+                SessionProvenanceRefusal::NoConsoleSession { session_id },
+            ))
+        }
+        WindowsSessionProvenance::Unreadable { last_error } => Err(
+            DriverError::SessionNotInspectable(SessionProvenanceRefusal::Unreadable { last_error }),
+        ),
+        WindowsSessionProvenance::NotApplicable => Err(DriverError::SessionNotInspectable(
+            SessionProvenanceRefusal::NotApplicable,
+        )),
+    }
+}
+
+fn require_enumerable_visibility(
+    pid: u32,
+    visibility: WindowsWindowVisibility,
+) -> Result<(), DriverError> {
+    match visibility {
+        WindowsWindowVisibility::Visible | WindowsWindowVisibility::NotVisible => Ok(()),
+        // `Unknown` commonly describes a UWP process that owns no EnumWindows
+        // entry. This result type has nowhere to carry that third state, so the
+        // driver refuses instead of relabelling it as a hidden window.
+        WindowsWindowVisibility::Unknown => Err(DriverError::WindowVisibilityUnknown { pid }),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsElement {
+    process_id: u32,
+    automation_id: Option<String>,
+    control_type: i32,
+    name: String,
+    enabled: bool,
+    focused: bool,
+    children: Vec<WindowsElement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsTreeReading {
+    session: WindowsSessionProvenance,
+    roots: Vec<WindowsElement>,
+    unreadable_subtrees: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedWindowsTree {
+    target: ProcessGrant,
+    roots: Vec<WindowsElement>,
+    unreadable_subtrees: usize,
+}
+
+fn root_cache_key(target: &ProcessGrant) -> String {
+    format!(
+        "windows-accessibility-root:{}:{}",
+        target.pid, target.process_generation_evidence
+    )
+}
+
+fn admit_tree_reading(
+    target: &ProcessGrant,
+    visibility: WindowsWindowVisibility,
+    reading: WindowsTreeReading,
+) -> Result<(String, CachedWindowsTree, AccessibilityTreeResult), DriverError> {
+    // Provenance precedes every interpretation of the tree, including emptiness.
+    // A service-session empty tree describes this module's desktop visibility,
+    // not the target application's accessibility surface.
+    require_console_session(reading.session)?;
+    require_enumerable_visibility(target.pid, visibility)?;
+    if reading.roots.is_empty() {
+        return Err(AccessibilityReadFailure::TargetNotInspectable.into());
+    }
+
+    let root_identifier = root_cache_key(target);
+    let child_count = u32::try_from(reading.roots.len()).unwrap_or(u32::MAX);
+    let unreadable_subtrees = u64::try_from(reading.unreadable_subtrees).unwrap_or(u64::MAX);
+    let result = AccessibilityTreeResult {
+        root_identifier: Some(root_identifier.clone()),
+        child_count,
+        handshake_attempted: true,
+        degenerate_reason: (reading.unreadable_subtrees > 0).then(|| {
+            format!(
+                "incomplete_accessibility_tree:{}_unreadable_subtrees",
+                reading.unreadable_subtrees
+            )
+        }),
+        unreadable_subtrees,
+    };
+    let cached = CachedWindowsTree {
+        target: target.clone(),
+        roots: reading.roots,
+        unreadable_subtrees: reading.unreadable_subtrees,
+    };
+    Ok((root_identifier, cached, result))
+}
+
+fn control_type_role(control_type: i32) -> String {
+    format!("{UIA_ROLE_PREFIX}{control_type}")
+}
+
+fn requested_control_type(role: &str) -> Option<i32> {
+    role.strip_prefix(UIA_ROLE_PREFIX)?.parse().ok()
+}
+
+fn element_matches(element: &WindowsElement, name: &AccessibilityElementName) -> bool {
+    match name {
+        AccessibilityElementName::Identifier(identifier) => {
+            element.automation_id.as_deref() == Some(identifier)
+        }
+        AccessibilityElementName::RoleAndTitle { role, title } => {
+            requested_control_type(role) == Some(element.control_type) && element.name == *title
+        }
+    }
+}
+
+fn collect_matches<'a>(
+    elements: &'a [WindowsElement],
+    name: &AccessibilityElementName,
+    matches: &mut Vec<&'a WindowsElement>,
+) {
+    for element in elements {
+        if element_matches(element, name) {
+            matches.push(element);
+        }
+        collect_matches(&element.children, name, matches);
+    }
+}
+
+fn alternate_name(
+    element: &WindowsElement,
+    matched_by: &AccessibilityElementName,
+) -> Option<AccessibilityElementName> {
+    match matched_by {
+        AccessibilityElementName::Identifier(_) => Some(AccessibilityElementName::RoleAndTitle {
+            role: control_type_role(element.control_type),
+            title: element.name.clone(),
+        }),
+        AccessibilityElementName::RoleAndTitle { .. } => element
+            .automation_id
+            .clone()
+            .map(AccessibilityElementName::Identifier),
+    }
+}
+
+fn matching_element<'a>(
+    tree: &'a CachedWindowsTree,
+    name: &AccessibilityElementName,
+) -> Result<&'a WindowsElement, DriverError> {
+    if !name.is_usable() {
+        return Err(DriverError::InvalidRequest(
+            "unusable accessibility element name",
+        ));
+    }
+    let mut matches = Vec::new();
+    collect_matches(&tree.roots, name, &mut matches);
+    match matches.len() {
+        0 => Err(DriverError::Semantic(
+            SemanticDriverError::ElementNotFound {
+                key_form: name.key_form(),
+            },
+        )),
+        1 => Ok(matches[0]),
+        match_count => Err(DriverError::Semantic(
+            SemanticDriverError::ElementNameAmbiguous {
+                key_form: name.key_form(),
+                match_count: u64::try_from(match_count).unwrap_or(u64::MAX),
+            },
+        )),
+    }
+}
+
+fn resolution_from_cached_tree(
+    tree: &CachedWindowsTree,
+    request: &ElementResolutionRequest,
+) -> Result<ElementResolutionResult, DriverError> {
+    let element = matching_element(tree, &request.element_name)?;
+    Ok(ElementResolutionResult {
+        element_name: request.element_name.clone(),
+        alternate_name: alternate_name(element, &request.element_name),
+        owning_process: tree.target.clone(),
+        // UIA's Invoke pattern is checked again by the seam immediately before
+        // invocation. This advertises only the neutral intent the driver knows
+        // how to translate; it does not claim the handler will accept it.
+        semantic_actions: vec![SemanticActionIntent::Press.wire_name().to_owned()],
+        unreadable_subtrees: u64::try_from(tree.unreadable_subtrees).unwrap_or(u64::MAX),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsGrantVerification {
+    Current,
+    Gone,
+    Replaced,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsProcessStartReading {
+    Started(u64),
+    Gone,
+    Unreadable,
+}
+
+fn verify_process_generation(
+    expected_generation: &str,
+    reading: WindowsProcessStartReading,
+) -> WindowsGrantVerification {
+    match reading {
+        WindowsProcessStartReading::Started(started)
+            if started.to_string() == expected_generation =>
+        {
+            WindowsGrantVerification::Current
+        }
+        WindowsProcessStartReading::Started(_) => WindowsGrantVerification::Replaced,
+        WindowsProcessStartReading::Gone => WindowsGrantVerification::Gone,
+        WindowsProcessStartReading::Unreadable => WindowsGrantVerification::Unreadable,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn retain_current_target(
+    target: &ProcessGrant,
+) -> Result<cerebellum_windows::RetainedProcessHandle, WindowsGrantVerification> {
+    use cerebellum_windows::{ProcessHandleError, ProcessStartTime};
+
+    let retained =
+        cerebellum_windows::retain_process_handle(target.pid).map_err(|error| match error {
+            ProcessHandleError::NoSuchProcess => WindowsGrantVerification::Gone,
+            ProcessHandleError::AccessDenied | ProcessHandleError::Unclassified(_) => {
+                WindowsGrantVerification::Unreadable
+            }
+        })?;
+    let reading = match cerebellum_windows::process_start_time(target.pid) {
+        ProcessStartTime::Started(started) => WindowsProcessStartReading::Started(started),
+        ProcessStartTime::NoSuchProcess => WindowsProcessStartReading::Gone,
+        ProcessStartTime::AccessDenied | ProcessStartTime::Unclassified(_) => {
+            WindowsProcessStartReading::Unreadable
+        }
+    };
+    let verification = verify_process_generation(&target.process_generation_evidence, reading);
+    match verification {
+        WindowsGrantVerification::Current => Ok(retained),
+        failure => Err(failure),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn accessibility_verification_error(verification: WindowsGrantVerification) -> DriverError {
+    match verification {
+        WindowsGrantVerification::Current => unreachable!("current verification is not an error"),
+        WindowsGrantVerification::Gone => AccessibilityReadFailure::TargetGone.into(),
+        WindowsGrantVerification::Replaced => AccessibilityReadFailure::TargetReplaced.into(),
+        WindowsGrantVerification::Unreadable => {
+            AccessibilityReadFailure::TargetNotInspectable.into()
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn semantic_verification_error(verification: WindowsGrantVerification) -> DriverError {
+    let semantic = match verification {
+        WindowsGrantVerification::Current => unreachable!("current verification is not an error"),
+        WindowsGrantVerification::Gone => SemanticDriverError::TargetNoLongerCurrent {
+            disposition: TargetDisposition::Gone,
+        },
+        WindowsGrantVerification::Replaced => SemanticDriverError::TargetNoLongerCurrent {
+            disposition: TargetDisposition::Replaced,
+        },
+        WindowsGrantVerification::Unreadable => SemanticDriverError::PathUnavailable,
+    };
+    DriverError::Semantic(semantic)
+}
+
+#[cfg(target_os = "windows")]
+fn map_read_failure(failure: cerebellum_windows::AccessibilityReadFailure) -> DriverError {
+    let failure = match failure {
+        cerebellum_windows::AccessibilityReadFailure::PermissionRequired => {
+            AccessibilityReadFailure::PermissionRequired
+        }
+        cerebellum_windows::AccessibilityReadFailure::TargetGone => {
+            AccessibilityReadFailure::TargetGone
+        }
+        cerebellum_windows::AccessibilityReadFailure::TargetReplaced => {
+            AccessibilityReadFailure::TargetReplaced
+        }
+        cerebellum_windows::AccessibilityReadFailure::TargetNotInspectable => {
+            AccessibilityReadFailure::TargetNotInspectable
+        }
+        cerebellum_windows::AccessibilityReadFailure::RetryableDeadlineExceeded => {
+            AccessibilityReadFailure::RetryableDeadlineExceeded
+        }
+        cerebellum_windows::AccessibilityReadFailure::TreeExceedsBound => {
+            AccessibilityReadFailure::TreeExceedsBound
+        }
+        cerebellum_windows::AccessibilityReadFailure::IncompatiblePlatformValue => {
+            AccessibilityReadFailure::IncompatiblePlatformValue
+        }
+        cerebellum_windows::AccessibilityReadFailure::PlatformReadFailed => {
+            AccessibilityReadFailure::PlatformReadFailed
+        }
+    };
+    failure.into()
+}
+
+#[cfg(target_os = "windows")]
+fn convert_element(element: cerebellum_windows::UiaElement) -> WindowsElement {
+    WindowsElement {
+        process_id: element.process_id,
+        automation_id: element.identity.automation_id,
+        control_type: element.identity.control_type_and_name.control_type,
+        name: element.identity.control_type_and_name.name,
+        enabled: element.enabled,
+        focused: element.has_keyboard_focus,
+        children: element.children.into_iter().map(convert_element).collect(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn convert_tree(tree: cerebellum_windows::UiaAccessibilityTree) -> WindowsTreeReading {
+    let unreadable_subtrees = match tree.completeness {
+        cerebellum_windows::UiaTreeCompleteness::Complete => 0,
+        cerebellum_windows::UiaTreeCompleteness::Incomplete {
+            unreadable_subtrees,
+        } => unreadable_subtrees,
+    };
+    WindowsTreeReading {
+        session: tree.session.into(),
+        roots: tree.roots.into_iter().map(convert_element).collect(),
+        unreadable_subtrees,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn uia_element_name(
+    name: &AccessibilityElementName,
+) -> Result<cerebellum_windows::UiaElementName, DriverError> {
+    match name {
+        AccessibilityElementName::Identifier(identifier) if !identifier.is_empty() => Ok(
+            cerebellum_windows::UiaElementName::automation_id(identifier.clone()),
+        ),
+        AccessibilityElementName::RoleAndTitle { role, title } => requested_control_type(role)
+            .map(|control_type| {
+                cerebellum_windows::UiaElementName::control_type_and_name(
+                    control_type,
+                    title.clone(),
+                )
+            })
+            .ok_or(DriverError::InvalidRequest(
+                "Windows accessibility role is not a UIA control type",
+            )),
+        _ => Err(DriverError::InvalidRequest(
+            "unusable accessibility element name",
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn map_invoke_error(
+    error: cerebellum_windows::AccessibilityInvokeError,
+    action: &str,
+    deadline_ms: u64,
+) -> DriverError {
+    use cerebellum_windows::AccessibilityInvokeError;
+
+    match error {
+        AccessibilityInvokeError::Resolution(failure)
+        | AccessibilityInvokeError::Invocation(failure) => match map_read_failure(failure) {
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::PermissionRequired) => {
+                DriverError::Semantic(SemanticDriverError::AccessibilityPermissionUnavailable)
+            }
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetGone) => {
+                semantic_verification_error(WindowsGrantVerification::Gone)
+            }
+            DriverError::AccessibilityUnreadable(AccessibilityReadFailure::TargetReplaced) => {
+                semantic_verification_error(WindowsGrantVerification::Replaced)
+            }
+            DriverError::AccessibilityUnreadable(
+                AccessibilityReadFailure::RetryableDeadlineExceeded,
+            ) => DriverError::Semantic(SemanticDriverError::Transient { deadline_ms }),
+            _ => DriverError::Semantic(SemanticDriverError::PathUnavailable),
+        },
+        AccessibilityInvokeError::ElementNotFound { element_name } => {
+            DriverError::Semantic(SemanticDriverError::ElementNotFound {
+                key_form: match element_name {
+                    cerebellum_windows::UiaElementName::AutomationId(_) => {
+                        AccessibilityKeyForm::Identifier
+                    }
+                    cerebellum_windows::UiaElementName::ControlTypeAndName(_) => {
+                        AccessibilityKeyForm::RoleAndTitle
+                    }
+                },
+            })
+        }
+        AccessibilityInvokeError::ElementNameAmbiguous {
+            element_name,
+            match_count,
+        } => DriverError::Semantic(SemanticDriverError::ElementNameAmbiguous {
+            key_form: match element_name {
+                cerebellum_windows::UiaElementName::AutomationId(_) => {
+                    AccessibilityKeyForm::Identifier
+                }
+                cerebellum_windows::UiaElementName::ControlTypeAndName(_) => {
+                    AccessibilityKeyForm::RoleAndTitle
+                }
+            },
+            match_count: u64::try_from(match_count).unwrap_or(u64::MAX),
+        }),
+        AccessibilityInvokeError::InvokePatternUnavailable { .. } => {
+            DriverError::Semantic(SemanticDriverError::ActionNotAdvertised {
+                action: action.to_owned(),
+                advertised: Vec::new(),
+            })
+        }
+    }
+}
+
+fn accepted_invoke_result(unreadable_subtrees: usize) -> DispatchResult {
+    DispatchResult {
+        accepted_by_platform: true,
+        effect_status: EffectStatus::EffectIndeterminate,
+        unreadable_subtrees: u64::try_from(unreadable_subtrees).unwrap_or(u64::MAX),
+        delivery_posts_returned: 0,
+        delivery_generation_verifications: 0,
+    }
+}
+
+/// Windows UI Automation implementation of `PlatformDriver`.
+///
+/// Accessibility reads and Invoke-pattern actions are implemented; capture and
+/// synthetic input remain unavailable.
+#[derive(Debug, Clone)]
+pub struct WindowsPlatformDriver {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    accessibility_trees: BTreeMap<String, CachedWindowsTree>,
+    expected_post_condition_available: bool,
+}
+
+impl Default for WindowsPlatformDriver {
+    fn default() -> Self {
+        Self {
+            accessibility_trees: BTreeMap::new(),
+            expected_post_condition_available: true,
+        }
+    }
+}
+
+impl WindowsPlatformDriver {
+    pub fn without_expected_post_condition(mut self) -> Self {
+        self.expected_post_condition_available = false;
+        self
+    }
+
+    pub fn declarations(
+        &self,
+        context: &CapabilityAdvertisementContext,
+    ) -> Vec<CapabilityDeclaration> {
+        let mut declarations = super::capability_declarations(context, true);
+        let windows_review_bound = context.inputs.windows_actuation_review_revision.is_some();
+        let vocabulary_ready = context.inputs.vocabulary_ready();
+        let signing_ready = context.inputs.release_signing_topology_revision.is_some();
+        let capture_supported = WindowsUnsupportedCaptureBackend.platform_support().is_ok();
+
+        for declaration in &mut declarations {
+            declaration.synthetic_background = SupportState::Unsupported;
+            declaration.synthetic_observed =
+                if declaration.dispatch_modes.contains(&DispatchMode::Observed) {
+                    SupportState::ConsentGated
+                } else {
+                    SupportState::Unsupported
+                };
+
+            match declaration.capability_id.as_str() {
+                "computer.click" => {
+                    declaration.semantic_path = SupportState::Supported;
+                    declaration.advertised =
+                        windows_review_bound && vocabulary_ready && signing_ready;
+                    declaration.suppression_reason = if !windows_review_bound {
+                        Some(WINDOWS_ACTUATION_UNREVIEWED.to_owned())
+                    } else if !vocabulary_ready {
+                        Some("computer action vocabulary input unresolved".to_owned())
+                    } else if !signing_ready {
+                        Some("release signing topology revision is not bound".to_owned())
+                    } else {
+                        None
+                    };
+                }
+                "computer.wait" => {
+                    declaration.advertised = windows_review_bound && vocabulary_ready;
+                    declaration.suppression_reason = if !windows_review_bound {
+                        Some(WINDOWS_ACTUATION_UNREVIEWED.to_owned())
+                    } else if !vocabulary_ready {
+                        Some("computer action vocabulary input unresolved".to_owned())
+                    } else {
+                        None
+                    };
+                }
+                "computer.screenshot" => {
+                    declaration.advertised = capture_supported;
+                    declaration.suppression_reason =
+                        (!capture_supported).then(|| WINDOWS_CAPTURE_UNSUPPORTED.to_owned());
+                }
+                _ => {
+                    // Consent-gated observed delivery cannot be used here, and
+                    // Windows has no background synthetic path. Recompute
+                    // `advertised` so only observations, supported semantic
+                    // actions, or supported background synthetic actions remain.
+                    declaration.advertised = declaration.advertised
+                        && (declaration.action_kind == ActionKind::Observe
+                            || declaration.semantic_path == SupportState::Supported
+                            || declaration.synthetic_background == SupportState::Supported);
+                }
+            }
+        }
+        declarations
+    }
+}
+
+impl PlatformDriver for WindowsPlatformDriver {
+    fn capability_declarations(
+        &self,
+        context: &CapabilityAdvertisementContext,
+    ) -> Vec<CapabilityDeclaration> {
+        self.declarations(context)
+    }
+
+    fn read_accessibility_tree(
+        &mut self,
+        request: AccessibilityTreeRequest,
+    ) -> Result<AccessibilityTreeResult, DriverError> {
+        request.target.validate()?;
+        let timeout = Self::bounded_duration(u64::from(request.settle_interval_ms))?;
+
+        #[cfg(target_os = "windows")]
+        {
+            require_console_session(cerebellum_windows::current_session_provenance().into())?;
+            let visibility: WindowsWindowVisibility =
+                cerebellum_windows::enumerated_window_visibility(request.target.pid).into();
+            require_enumerable_visibility(request.target.pid, visibility)?;
+            // The retained handle pins the process object during the read. It
+            // cannot travel in `ProcessGrant`, so the driver still rechecks the
+            // grant's start time at each operation boundary.
+            let _retained =
+                retain_current_target(&request.target).map_err(accessibility_verification_error)?;
+            let tree = cerebellum_windows::read_accessibility_tree(
+                request.target.pid,
+                cerebellum_windows::AccessibilityReadBounds {
+                    timeout,
+                    ..Default::default()
+                },
+            )
+            .map_err(map_read_failure)?;
+            let (root, cached, result) =
+                admit_tree_reading(&request.target, visibility, convert_tree(tree))?;
+            self.accessibility_trees.insert(root, cached);
+            Ok(result)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = timeout;
+            Err(DriverError::Unsupported("Windows accessibility tree read"))
+        }
+    }
+
+    fn read_accessibility_element(
+        &mut self,
+        request: AccessibilityElementReadRequest,
+    ) -> Result<AccessibilityElementReadResult, DriverError> {
+        request.target.validate()?;
+        let _ = Self::bounded_duration(u64::from(request.deadline_ms))?;
+        #[cfg(target_os = "windows")]
+        {
+            let tree = self.read_accessibility_tree(AccessibilityTreeRequest {
+                target: request.target,
+                settle_interval_ms: request.deadline_ms,
+            })?;
+            let root = tree.root_identifier.ok_or(DriverError::ElementNotFound)?;
+            let cached = self
+                .accessibility_trees
+                .get(&root)
+                .ok_or(DriverError::ElementNotFound)?;
+            let mut matches = Vec::new();
+            collect_matches(&cached.roots, &request.element_name, &mut matches);
+            if matches.len() > 1 {
+                return Err(DriverError::Semantic(
+                    SemanticDriverError::ElementNameAmbiguous {
+                        key_form: request.element_name.key_form(),
+                        match_count: u64::try_from(matches.len()).unwrap_or(u64::MAX),
+                    },
+                ));
+            }
+            let Some(element) = matches.first().copied() else {
+                return Ok(AccessibilityElementReadResult {
+                    element_name: request.element_name,
+                    present: false,
+                    focused: None,
+                    enabled: None,
+                    value: None,
+                });
+            };
+            let (focused, enabled) = match request.attribute {
+                AccessibilityReadbackAttribute::Presence => (None, None),
+                AccessibilityReadbackAttribute::Focused => (Some(element.focused), None),
+                AccessibilityReadbackAttribute::Enabled => (None, Some(element.enabled)),
+                AccessibilityReadbackAttribute::Value => {
+                    return Err(DriverError::Unsupported("Windows UIA value readback"))
+                }
+            };
+            Ok(AccessibilityElementReadResult {
+                element_name: request.element_name,
+                present: true,
+                focused,
+                enabled,
+                value: None,
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported(
+                "Windows scoped accessibility read",
+            ))
+        }
+    }
+
+    fn resolve_element(
+        &mut self,
+        request: ElementResolutionRequest,
+    ) -> Result<ElementResolutionResult, DriverError> {
+        #[cfg(target_os = "windows")]
+        {
+            let cached = self
+                .accessibility_trees
+                .get(&request.root_identifier)
+                .ok_or(DriverError::ElementNotFound)?;
+            let _retained =
+                retain_current_target(&cached.target).map_err(accessibility_verification_error)?;
+            resolution_from_cached_tree(cached, &request)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("Windows element resolution"))
+        }
+    }
+
+    fn dispatch_semantic(
+        &mut self,
+        request: SemanticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        #[cfg(target_os = "windows")]
+        {
+            require_console_session(cerebellum_windows::current_session_provenance().into())?;
+            let _retained = retain_current_target(&request.element.owning_process)
+                .map_err(semantic_verification_error)?;
+            let intent = SemanticActionIntent::from_wire_name(&request.action).ok_or(
+                DriverError::InvalidRequest("unknown semantic action intent"),
+            )?;
+            let _delivered_action =
+                delivered_semantic_action(SemanticActionPlatform::Windows, intent).map_err(
+                    |refusal| {
+                        DriverError::Semantic(SemanticDriverError::ActionUnsupported {
+                            intent: refusal.intent,
+                            platform: refusal.platform,
+                        })
+                    },
+                )?;
+            let element_name = uia_element_name(&request.element.element_name)?;
+            let bounds = cerebellum_windows::AccessibilityInvokeBounds::default();
+            let deadline_ms = u64::try_from(bounds.timeout.as_millis()).unwrap_or(u64::MAX);
+            let outcome = cerebellum_windows::invoke_accessibility_element(
+                request.element.owning_process.pid,
+                &element_name,
+                bounds,
+            )
+            .map_err(|error| map_invoke_error(error, &request.action, deadline_ms))?;
+            match outcome {
+                cerebellum_windows::AccessibilityInvokeOutcome::HandlerReturned {
+                    unreadable_subtrees,
+                    ..
+                } => Ok(accepted_invoke_result(unreadable_subtrees)),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("Windows semantic dispatch"))
+        }
+    }
+
+    fn dispatch_per_pid(
+        &mut self,
+        _request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        Err(DriverError::Unsupported(
+            "Windows per-process synthetic dispatch",
+        ))
+    }
+
+    fn dispatch_global(
+        &mut self,
+        _request: SyntheticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        Err(DriverError::Unsupported(
+            "Windows global synthetic dispatch",
+        ))
+    }
+
+    fn query_focus(
+        &mut self,
+        _request: FocusQueryRequest,
+    ) -> Result<FocusQueryResult, DriverError> {
+        Err(DriverError::Unsupported("Windows focus query"))
+    }
+
+    fn fronting_snapshot(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<FrontingSnapshot, DriverError> {
+        Err(DriverError::Unsupported("Windows fronting snapshot"))
+    }
+
+    fn input_observer_liveness(&self) -> InputObserverLiveness {
+        InputObserverLiveness {
+            session_tap_live: false,
+            raw_hid_live: false,
+            self_echo_filter_live: false,
+        }
+    }
+
+    fn observe_input(
+        &mut self,
+        _request: InputObservationRequest,
+    ) -> Result<InputObservationResult, DriverError> {
+        Err(DriverError::Unsupported("Windows input observation"))
+    }
+
+    fn observe_effect(
+        &mut self,
+        request: EffectObservationRequest,
+    ) -> Result<EffectObservationResult, DriverError> {
+        if !self.expected_post_condition_available {
+            return Ok(EffectObservationResult {
+                status: EffectStatus::EffectIndeterminate,
+                failure_reason: Some("post_condition_undeclarable".to_owned()),
+            });
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use crate::dispatch::post_condition::{evaluate, ConditionOutcome, ObservedElement};
+            use crate::dispatch::ExpectedPostCondition;
+
+            let Ok(envelope) = serde_json::from_str::<ExpectedPostCondition>(&request.predicate)
+            else {
+                return Ok(EffectObservationResult {
+                    status: EffectStatus::EffectIndeterminate,
+                    failure_reason: Some("post_condition_undeclarable".to_owned()),
+                });
+            };
+            let readback = match self.read_accessibility_element(AccessibilityElementReadRequest {
+                target: request.target,
+                element_name: envelope.condition.element().clone(),
+                attribute: envelope.condition.readback_attribute(),
+                deadline_ms: request.deadline_ms,
+            }) {
+                Ok(readback) => readback,
+                Err(_) => {
+                    return Ok(EffectObservationResult {
+                        status: EffectStatus::EffectIndeterminate,
+                        failure_reason: Some("observation_primitive_unavailable".to_owned()),
+                    })
+                }
+            };
+            let observed = ObservedElement {
+                present: readback.present,
+                focused: readback.focused,
+                enabled: readback.enabled,
+                value: readback.value,
+            };
+            let status = match evaluate(&envelope.condition, &observed) {
+                ConditionOutcome::Satisfied => EffectStatus::EffectObserved,
+                ConditionOutcome::Unsatisfied => EffectStatus::NoEffectObserved,
+                ConditionOutcome::Indeterminate => EffectStatus::EffectIndeterminate,
+            };
+            Ok(EffectObservationResult {
+                status,
+                failure_reason: (status == EffectStatus::EffectIndeterminate)
+                    .then(|| "post_condition_undeclarable".to_owned()),
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("Windows effect observation"))
+        }
+    }
+
+    fn verify_attendance(
+        &mut self,
+        request: AttendancePreconditionRequest,
+    ) -> Result<AttendancePreconditionResult, DriverError> {
+        request.target.validate()?;
+        #[cfg(target_os = "windows")]
+        let valid = retain_current_target(&request.target).is_ok();
+        #[cfg(not(target_os = "windows"))]
+        let valid = false;
+        Ok(AttendancePreconditionResult {
+            valid,
+            lease_generation: None,
+            age_ms: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::containment::{
+        finalize_input_containment, ContainmentRung, DeliveryPrimitive,
+    };
+
+    fn permissions() -> PermissionLivenessReport {
+        PermissionLivenessReport::from_results(
+            [
+                PermissionService::ScreenRecording,
+                PermissionService::Accessibility,
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ]
+            .into_iter()
+            .map(|service| PermissionProbeResult {
+                service,
+                liveness: PermissionLiveness::Live,
+                responsible_process: "fixture".to_owned(),
+                off_main: true,
+            }),
+        )
+    }
+
+    fn fully_bound_inputs() -> ImmutableReleaseInputs {
+        let digest = COMPUTER_ACTION_VOCABULARY_SHA256.to_owned();
+        ImmutableReleaseInputs {
+            attendance_contract_owner: Some("fixture-owner".to_owned()),
+            attendance_contract_revision: Some("fixture-attendance".to_owned()),
+            input_review_revision: Some("fixture-input".to_owned()),
+            capture_review_revision: Some("fixture-capture".to_owned()),
+            semantic_actuation_review_revision: Some("fixture-macos-semantic".to_owned()),
+            windows_actuation_review_revision: Some("fixture-windows-actuation".to_owned()),
+            release_signing_topology_revision: Some("fixture-signing".to_owned()),
+            vocabulary_digests: VocabularyDigestInputs {
+                manifest_digest: Some(digest.clone()),
+                source_lock_digest: Some(digest.clone()),
+                computed_artifact_digest: Some(digest),
+            },
+        }
+    }
+
+    fn context(inputs: ImmutableReleaseInputs) -> CapabilityAdvertisementContext {
+        let permissions = permissions();
+        CapabilityAdvertisementContext {
+            inputs,
+            permissions: permissions.clone(),
+            startup: StartupCapabilityProbe {
+                permissions,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn advertised(context: &CapabilityAdvertisementContext) -> Vec<String> {
+        WindowsPlatformDriver::default()
+            .declarations(context)
+            .into_iter()
+            .filter(|declaration| declaration.advertised)
+            .map(|declaration| declaration.capability_id)
+            .collect()
+    }
+
+    #[test]
+    fn fully_reviewed_windows_advertises_only_click_and_wait() {
+        assert_eq!(
+            advertised(&context(fully_bound_inputs())),
+            vec!["computer.click", "computer.wait"]
+        );
+    }
+
+    #[test]
+    fn macos_review_cannot_admit_windows_when_windows_review_is_unbound() {
+        let mut inputs = fully_bound_inputs();
+        inputs.windows_actuation_review_revision = None;
+        let declarations = WindowsPlatformDriver::default().declarations(&context(inputs));
+        assert!(declarations
+            .iter()
+            .all(|declaration| !declaration.advertised));
+        for id in ["computer.click", "computer.wait"] {
+            let declaration = declarations
+                .iter()
+                .find(|declaration| declaration.capability_id == id)
+                .expect("the canonical declaration exists");
+            assert_eq!(
+                declaration.suppression_reason.as_deref(),
+                Some(WINDOWS_ACTUATION_UNREVIEWED)
+            );
+        }
+    }
+
+    fn grant() -> ProcessGrant {
+        ProcessGrant {
+            pid: 41,
+            bundle_identity: "notepad.exe".to_owned(),
+            process_generation_evidence: "100".to_owned(),
+        }
+    }
+
+    fn tree(session: WindowsSessionProvenance) -> WindowsTreeReading {
+        WindowsTreeReading {
+            session,
+            roots: vec![WindowsElement {
+                process_id: 41,
+                automation_id: Some("save".to_owned()),
+                control_type: 50_000,
+                name: "Save".to_owned(),
+                enabled: true,
+                focused: false,
+                children: Vec::new(),
+            }],
+            unreadable_subtrees: 0,
+        }
+    }
+
+    #[test]
+    fn other_session_refuses_by_name_before_the_same_console_tree_proceeds() {
+        let other = admit_tree_reading(
+            &grant(),
+            WindowsWindowVisibility::Visible,
+            tree(WindowsSessionProvenance::OtherSession {
+                session_id: 0,
+                console_session_id: 1,
+            }),
+        );
+        assert!(matches!(
+            other,
+            Err(DriverError::SessionNotInspectable(
+                SessionProvenanceRefusal::OtherSession {
+                    session_id: 0,
+                    console_session_id: 1
+                }
+            ))
+        ));
+
+        let console = admit_tree_reading(
+            &grant(),
+            WindowsWindowVisibility::Visible,
+            tree(WindowsSessionProvenance::Console { session_id: 1 }),
+        );
+        assert!(console.is_ok(), "the identical console tree must proceed");
+    }
+
+    #[test]
+    fn unknown_visibility_is_refused_without_becoming_not_visible() {
+        assert_eq!(
+            require_enumerable_visibility(41, WindowsWindowVisibility::Unknown),
+            Err(DriverError::WindowVisibilityUnknown { pid: 41 })
+        );
+        assert!(require_enumerable_visibility(41, WindowsWindowVisibility::NotVisible).is_ok());
+    }
+
+    #[test]
+    fn unique_invoke_uses_the_neutral_mapping_and_earns_semantic_element() {
+        let (_, cached, _) = admit_tree_reading(
+            &grant(),
+            WindowsWindowVisibility::Visible,
+            tree(WindowsSessionProvenance::Console { session_id: 1 }),
+        )
+        .expect("the console fixture is readable");
+        let resolved = resolution_from_cached_tree(
+            &cached,
+            &ElementResolutionRequest {
+                root_identifier: root_cache_key(&grant()),
+                element_name: AccessibilityElementName::identifier("save"),
+            },
+        )
+        .expect("the element key is unique");
+        assert_eq!(resolved.semantic_actions, vec![SEMANTIC_PRESS_ACTION]);
+        assert_eq!(
+            delivered_semantic_action(SemanticActionPlatform::Windows, SemanticActionIntent::Press),
+            Ok("Invoke")
+        );
+        let result = accepted_invoke_result(0);
+        assert!(result.accepted_by_platform);
+        let mut identity = crate::platform::containment::IdentityCheckEvidence::matched(
+            &crate::platform::containment::ProcessIdentityPrimitive::pinned_v1(),
+            0,
+        );
+        identity.identity_to_delivery_binding =
+            crate::platform::containment::IdentityAtomicBinding::Atomic;
+        let containment = finalize_input_containment(
+            DeliveryPrimitive::SemanticAccessibility,
+            false,
+            Some(identity),
+            None,
+            false,
+        )
+        .expect("semantic element delivery is structurally contained");
+        assert_eq!(containment.rung(), Some(ContainmentRung::SemanticElement));
+    }
+
+    #[test]
+    fn process_generation_is_rechecked_without_trusting_the_pid() {
+        assert_eq!(
+            verify_process_generation("100", WindowsProcessStartReading::Started(100)),
+            WindowsGrantVerification::Current
+        );
+        assert_eq!(
+            verify_process_generation("100", WindowsProcessStartReading::Started(101)),
+            WindowsGrantVerification::Replaced
+        );
+        assert_eq!(
+            verify_process_generation("100", WindowsProcessStartReading::Gone),
+            WindowsGrantVerification::Gone
+        );
+        assert_eq!(
+            verify_process_generation("100", WindowsProcessStartReading::Unreadable),
+            WindowsGrantVerification::Unreadable
+        );
+    }
+
+    #[test]
+    fn refusing_capture_backend_is_the_source_of_screenshot_suppression() {
+        let backend = WindowsUnsupportedCaptureBackend;
+        assert_eq!(
+            backend.platform_support(),
+            Err(BackendError::UnsupportedOnPlatform)
+        );
+        let screenshot = WindowsPlatformDriver::default()
+            .declarations(&context(fully_bound_inputs()))
+            .into_iter()
+            .find(|declaration| declaration.capability_id == "computer.screenshot")
+            .expect("the canonical declaration exists");
+        assert!(!screenshot.advertised);
+        assert_eq!(
+            screenshot.suppression_reason.as_deref(),
+            Some(WINDOWS_CAPTURE_UNSUPPORTED)
+        );
+    }
+}

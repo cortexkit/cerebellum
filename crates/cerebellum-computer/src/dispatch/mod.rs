@@ -284,6 +284,12 @@ pub enum DispatchError {
         deadline_ms: u64,
     },
     SemanticPathUnavailable,
+    SessionNotInspectable {
+        session: crate::platform::SessionProvenanceRefusal,
+    },
+    WindowVisibilityUnknown {
+        pid: u32,
+    },
     SyntheticUnavailable,
     /// A per-process synthetic sequence stopped mid-flight.
     ///
@@ -341,6 +347,13 @@ mod reason_code_tests {
                 intent: SemanticActionIntent::Cancel,
                 platform: SemanticActionPlatform::Windows,
             },
+            DispatchError::SessionNotInspectable {
+                session: crate::platform::SessionProvenanceRefusal::OtherSession {
+                    session_id: 0,
+                    console_session_id: 1,
+                },
+            },
+            DispatchError::WindowVisibilityUnknown { pid: 41 },
             DispatchError::SyntheticUnavailable,
             DispatchError::SyntheticSequenceFailed {
                 posts_returned: 1,
@@ -399,6 +412,8 @@ impl DispatchError {
             Self::TargetNoLongerCurrent { .. } => "target_no_longer_current",
             Self::SemanticDispatchTransient { .. } => "semantic_dispatch_transient",
             Self::SemanticPathUnavailable => "semantic_path_unavailable",
+            Self::SessionNotInspectable { .. } => "session_not_console",
+            Self::WindowVisibilityUnknown { .. } => "window_visibility_unknown",
             Self::SyntheticUnavailable => "synthetic_unavailable",
             Self::SyntheticSequenceFailed { .. } => "synthetic_sequence_failed",
             Self::EnvelopeUnrecognized => "envelope_unrecognized",
@@ -1273,6 +1288,12 @@ impl<D: PlatformDriver> Dispatcher<D> {
             DriverError::ElementNotFound => DispatchError::ElementNotFound {
                 key_form: semantic.element.element_name.key_form(),
             },
+            DriverError::SessionNotInspectable(session) => {
+                DispatchError::SessionNotInspectable { session }
+            }
+            DriverError::WindowVisibilityUnknown { pid } => {
+                DispatchError::WindowVisibilityUnknown { pid }
+            }
             DriverError::Unsupported(_)
             | DriverError::InvalidRequest(_)
             | DriverError::StartupRefused(_)

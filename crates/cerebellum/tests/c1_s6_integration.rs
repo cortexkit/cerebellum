@@ -19,6 +19,7 @@ fn valid_inputs() -> ComputerReleaseInputs {
         input_review_revision: Some("fixture-input-review-v1".into()),
         capture_review_revision: Some("fixture-capture-review-v1".into()),
         semantic_actuation_review_revision: Some("fixture-semantic-actuation-review-v1".into()),
+        windows_actuation_review_revision: Some("fixture-windows-actuation-review-v1".into()),
         release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
         vocabulary_digests: VocabularyDigestInputs {
             manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
@@ -345,7 +346,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 9],
+        vec![ComputerGateOutcome::Pass; 10],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -355,6 +356,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "input_review_revision",
         "capture_review_revision",
         "semantic_actuation_review_revision",
+        "windows_actuation_review_revision",
         "release_signing_topology_revision",
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
@@ -370,6 +372,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "semantic_actuation_review_revision" => {
                 inputs.semantic_actuation_review_revision = None
             }
+            "windows_actuation_review_revision" => inputs.windows_actuation_review_revision = None,
             "release_signing_topology_revision" => inputs.release_signing_topology_revision = None,
             "vocabulary_manifest_digest" => inputs.vocabulary_digests.manifest_digest = None,
             "vocabulary_source_lock_digest" => inputs.vocabulary_digests.source_lock_digest = None,
@@ -416,6 +419,11 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                 assert!(admitted.iter().any(|id| id == "computer.screenshot"));
                 assert!(admitted.iter().any(|id| id == "computer.wait"));
             }
+            "windows_actuation_review_revision" => assert_eq!(
+                admitted,
+                available_capabilities(&complete),
+                "the Windows-specific review must not govern another platform"
+            ),
             "release_signing_topology_revision" => {
                 assert!(!admitted.iter().any(|id| id == "computer.click"));
                 assert!(!admitted.iter().any(|id| id == "computer.screenshot"));

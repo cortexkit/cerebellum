@@ -195,7 +195,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 17] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 18] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -226,6 +226,10 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 17] = [
     },
     ComputerReleaseGate {
         name: "semantic_actuation_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "windows_actuation_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     ComputerReleaseGate {
@@ -359,6 +363,7 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         "semantic_actuation_review_revision" => {
             inputs.semantic_actuation_review_revision.as_deref()
         }
+        "windows_actuation_review_revision" => inputs.windows_actuation_review_revision.as_deref(),
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
         _ => unreachable!("every external release gate has a bound input"),
     }
@@ -395,12 +400,14 @@ fn declaration_gate_passes(
             .iter()
             .all(|gate| gate_passes(outcomes, gate))
     } else if id == "computer.click" {
-        [
-            "semantic_actuation_review_revision",
-            "release_signing_topology_revision",
-        ]
-        .iter()
-        .all(|gate| gate_passes(outcomes, gate))
+        let platform_review = if cfg!(target_os = "windows") {
+            "windows_actuation_review_revision"
+        } else {
+            "semantic_actuation_review_revision"
+        };
+        [platform_review, "release_signing_topology_revision"]
+            .iter()
+            .all(|gate| gate_passes(outcomes, gate))
     } else if matches!(
         id,
         "computer.type" | "computer.keys" | "computer.scroll" | "computer.move" | "computer.drag"
@@ -489,6 +496,9 @@ fn gate_admitted_computer_declarations<'a>(
 fn canonical_computer_declarations(
     context: &ComputerCapabilityAdvertisementContext,
 ) -> (Vec<ComputerCapabilityDeclaration>, ComputerGateOutcomes) {
+    #[cfg(target_os = "windows")]
+    let declarations = computer::platform::WindowsPlatformDriver::default().declarations(context);
+    #[cfg(not(target_os = "windows"))]
     let declarations =
         computer::platform::capability_declarations(context, cfg!(target_os = "macos"));
     let outcomes = computer_gate_outcomes(context);
@@ -871,6 +881,7 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
         option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
         option_env!("CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION"),
+        option_env!("CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION"),
         option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION"),
     )
 }
@@ -881,6 +892,7 @@ fn release_inputs_from_build_bindings(
     input_review_revision: Option<&str>,
     capture_review_revision: Option<&str>,
     semantic_actuation_review_revision: Option<&str>,
+    windows_actuation_review_revision: Option<&str>,
     release_signing_topology_revision: Option<&str>,
 ) -> ComputerReleaseInputs {
     let computed_vocabulary_digest = computer::platform::computed_vocabulary_sha256();
@@ -890,6 +902,7 @@ fn release_inputs_from_build_bindings(
         input_review_revision: input_review_revision.map(str::to_owned),
         capture_review_revision: capture_review_revision.map(str::to_owned),
         semantic_actuation_review_revision: semantic_actuation_review_revision.map(str::to_owned),
+        windows_actuation_review_revision: windows_actuation_review_revision.map(str::to_owned),
         release_signing_topology_revision: release_signing_topology_revision.map(str::to_owned),
         vocabulary_digests: computer::platform::VocabularyDigestInputs {
             // The manifest and computed-artifact mirrors are recalculated from
@@ -1460,7 +1473,7 @@ pub struct Planes {
     ///
     /// Keeping the outcome in one field prevents availability and its diagnostic
     /// from drifting into contradictory states.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub computer: Result<
         Arc<computer_capability::RunningComputerPlane>,
         computer_capability::ComputerPlaneUnavailable,
@@ -1472,7 +1485,7 @@ pub struct Planes {
     /// this the derivation runs one way only, and a build whose release
     /// identifiers are unbound advertises nothing while still serving a
     /// capability a caller names directly.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub computer_admitted: Arc<std::collections::BTreeSet<String>>,
     /// Questions this module has put to whoever is on the other end of a route.
     pub elicitor: SharedElicitor,
@@ -1618,24 +1631,21 @@ impl Planes {
             lease_clock,
             launch_service,
             management,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: computer_capability::production_audit().map(|audit| {
                 Arc::new(computer_capability::ComputerPlane::with_synthetic_driver(
                     audit,
-                    // Built fresh per dispatch, as the click handler builds
-                    // its own: the driver caches accessibility trees, and a
-                    // stale cache is a resolved element in a process that may
-                    // be gone. Post-condition evaluation is disabled because
-                    // none of the synthetic request schemas declares one; the
-                    // effect of a post call is recorded as indeterminate
-                    // rather than claimed.
+                    // Built fresh per dispatch: each platform driver caches
+                    // accessibility trees, and a stale cache may name a process
+                    // generation that is gone. Synthetic requests declare no
+                    // post-condition, so their effects remain indeterminate.
                     || {
-                        cerebellum_computer::platform::MacOs26PlatformDriver::default()
+                        computer_capability::NativeComputerPlatformDriver::default()
                             .without_expected_post_condition()
                     },
                 ))
             }),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::new(
                 computer_release_evidence(&default_computer_context())
                     .gate_admitted_capabilities
@@ -1653,14 +1663,13 @@ impl Planes {
 /// gates would exercise release binding rather than the behaviour under test,
 /// and would go silently green the day an identifier came unbound: every
 /// request refused, and every assertion about a refusal still passing.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn test_admitted_computer_capabilities() -> Arc<std::collections::BTreeSet<String>> {
-    Arc::new(
-        ["computer.click", "computer.screenshot", "computer.wait"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    )
+    #[cfg(target_os = "macos")]
+    let capabilities = ["computer.click", "computer.screenshot", "computer.wait"].as_slice();
+    #[cfg(target_os = "windows")]
+    let capabilities = ["computer.click", "computer.wait"].as_slice();
+    Arc::new(capabilities.iter().copied().map(str::to_string).collect())
 }
 
 impl Clone for Planes {
@@ -1674,9 +1683,9 @@ impl Clone for Planes {
             lease_clock: Arc::clone(&self.lease_clock),
             launch_service: self.launch_service.clone(),
             management: Arc::clone(&self.management),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: self.computer.clone(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::clone(&self.computer_admitted),
             elicitor: Arc::clone(&self.elicitor),
         }
@@ -2345,7 +2354,7 @@ async fn handle_tool_request(
     // sees it. The two planes share a request envelope and nothing else, so a
     // computer capability reaching the browser handler would be reported as an
     // unknown method -- a refusal that describes the wrong subsystem.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(servable) = computer_capability::servable(name) {
         let clock = planes.lease_clock.as_ref();
 
@@ -2414,11 +2423,7 @@ async fn handle_tool_request(
                         .map(|since| since.as_millis() as u64)
                         .unwrap_or_default(),
                 },
-                |_grant| {
-                    cerebellum_computer::platform::native::NativeCaptureBackend::new(
-                        std::time::Duration::from_secs(10),
-                    )
-                },
+                |_grant| computer_capability::native_capture_backend(),
             )
             .await;
         return match result {
@@ -3059,8 +3064,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            6,
-            "expected six attestations, found {read_here:?}"
+            7,
+            "expected seven attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -3946,6 +3951,7 @@ mod tests {
             Some("cerebellum-capture-review/v1@cb1f669"),
             None,
             None,
+            None,
         );
         assert_eq!(
             inputs,
@@ -3955,6 +3961,7 @@ mod tests {
                 input_review_revision: None,
                 capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669".to_string()),
                 semantic_actuation_review_revision: None,
+                windows_actuation_review_revision: None,
                 release_signing_topology_revision: None,
                 vocabulary_digests: computer::platform::VocabularyDigestInputs {
                     manifest_digest: Some(
@@ -4013,6 +4020,7 @@ mod tests {
                 Some("fixture-input-review"),
                 Some("fixture-capture-review"),
                 Some("fixture-semantic-actuation-review"),
+                Some("fixture-windows-actuation-review"),
                 Some("fixture-signing-topology"),
             ),
             permissions: Default::default(),
@@ -4021,7 +4029,7 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 9]
+            vec![ComputerGateOutcome::Pass; 10]
         );
     }
 }

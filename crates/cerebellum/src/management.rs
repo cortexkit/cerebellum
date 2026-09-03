@@ -115,11 +115,25 @@ impl TargetResolver for PlatformResolver {
         cerebellum_computer::platform::native::resolve_target(bundle_identity, self.timeout)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+        let _ = self.timeout;
+        windows_target_resolution_without_enumerator()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;
         TargetResolution::NotRunning
     }
+}
+
+/// Windows does not yet have the process-name enumerator needed to resolve an
+/// application identity. `Unreadable` is an honest absence of a reading;
+/// `NotRunning` would fabricate a negative about a machine nobody inspected.
+#[cfg(any(target_os = "windows", test))]
+fn windows_target_resolution_without_enumerator() -> TargetResolution {
+    TargetResolution::Unreadable
 }
 
 /// The state a management route needs.
@@ -694,6 +708,14 @@ fn new_ask_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_without_a_process_enumerator_never_reports_not_running() {
+        assert_eq!(
+            windows_target_resolution_without_enumerator(),
+            TargetResolution::Unreadable
+        );
+    }
     use cerebellum_computer::platform::ProcessGrant;
     use cerebellum_core::clock::FakeClock;
 
