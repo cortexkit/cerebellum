@@ -190,11 +190,12 @@ pub trait BrowserSessionLauncher: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessControlFailure;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationDriveError {
     Unavailable,
     ConnectorFailure,
     CdpFailure,
+    NavigationFailed { error_text: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +250,7 @@ pub struct ViewportRefusal {
     pub viewport: InputRect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClickDriveError {
     NoPosition,
     ClassificationChanged,
@@ -257,7 +258,7 @@ pub enum ClickDriveError {
     Navigation(NavigationDriveError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClickPointDriveError {
     OutsideViewport(ViewportRefusal),
     Navigation(NavigationDriveError),

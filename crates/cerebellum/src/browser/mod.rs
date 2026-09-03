@@ -150,6 +150,9 @@ pub enum BrowserError {
     NavigationPolicyRejected {
         reason_code: &'static str,
     },
+    NavigationFailed {
+        error_text: String,
+    },
     NotSettled {
         url_final: Option<String>,
         lifecycle: Vec<String>,
@@ -179,6 +182,7 @@ impl BrowserError {
             Self::AuthorizationDenied { .. } => "authorization_denied",
             Self::HazardNotDisclosed { .. } => "hazard_not_disclosed",
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
+            Self::NavigationFailed { .. } => "navigation_failed",
             Self::NotSettled { .. } => "not_settled",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
@@ -228,6 +232,9 @@ impl BrowserError {
             Self::NavigationPolicyRejected { .. } => {
                 "navigate to an http or https URL allowed by browser policy"
             }
+            Self::NavigationFailed { .. } => {
+                "inspect detail.error_text and choose a reachable destination or retry when that browser error is transient"
+            }
             Self::NotSettled { .. } => {
                 "call browser.snapshot to re-observe the page before depending on its current state"
             }
@@ -276,6 +283,7 @@ impl BrowserError {
                 json!({"url_final":url_final,"lifecycle":lifecycle,"inflight_count":inflight_count,"deadline_ms":deadline_ms})
             }
             Self::NavigationPolicyRejected { reason_code } => json!({"reason_code":reason_code}),
+            Self::NavigationFailed { error_text } => json!({"error_text":error_text}),
             Self::Internal { reason_code } => json!({"reason_code":reason_code.as_str()}),
             Self::NoSession => {
                 json!({"reason_code":"no_session","reason":"no browser session is open"})
@@ -374,13 +382,23 @@ impl BrowserContextResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainFrameResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Map<String, Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tracker {
     pub url_final: Option<String>,
+    pub main_frame_response: Option<MainFrameResponse>,
     pub lifecycle: Vec<String>,
     pub inflight_count: u64,
     pub settled: bool,
     pub load_observed: bool,
+    main_frame_id: Option<String>,
+    pending_document_responses: HashMap<String, MainFrameResponse>,
     quiet_since: Option<Instant>,
 }
 impl Tracker {
@@ -397,6 +415,49 @@ impl Tracker {
         if self.inflight_count == 0 {
             self.quiet_since = Some(now);
         }
+    }
+    pub fn observe_main_frame_response(
+        &mut self,
+        frame_id: &str,
+        status: u16,
+        status_text: String,
+        headers: Map<String, Value>,
+    ) {
+        let response = MainFrameResponse {
+            status,
+            status_text,
+            headers,
+        };
+        match self.main_frame_id.as_deref() {
+            Some(main_frame_id) if main_frame_id == frame_id => {
+                self.main_frame_response = Some(response);
+            }
+            Some(_) => {}
+            None => {
+                self.pending_document_responses
+                    .insert(frame_id.to_string(), response);
+            }
+        }
+    }
+    pub fn main_frame_navigated(&mut self, frame_id: Option<String>, url: String) {
+        self.main_frame_response = frame_id
+            .as_ref()
+            .and_then(|frame_id| self.pending_document_responses.remove(frame_id));
+        self.pending_document_responses.clear();
+        self.main_frame_id = frame_id;
+        self.url_final = Some(url);
+    }
+    pub fn http_status(&self) -> Option<u16> {
+        self.main_frame_response
+            .as_ref()
+            .map(|response| response.status)
+    }
+    pub fn cloudflare_challenge(&self) -> bool {
+        self.main_frame_response.as_ref().is_some_and(|response| {
+            response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("cf-mitigated") && value.as_str() == Some("challenge")
+            })
+        })
     }
     pub fn load(&mut self, now: Instant) {
         self.load_observed = true;
@@ -1525,13 +1586,6 @@ impl BrowserPlane {
         } else {
             Outcome::Success
         };
-        self.finalize(
-            identity,
-            BrowserCapability::Navigate,
-            outcome,
-            json!({"outcome":if should_settle && !tracker.settled {"not_settled"} else {"ok"},"url_final":tracker.url_final,"lifecycle":tracker.lifecycle}),
-        )
-        .await?;
         let mut response = if should_settle && !tracker.settled {
             json!({
                 "outcome":"not_settled",
@@ -1542,6 +1596,25 @@ impl BrowserPlane {
         } else {
             json!({"outcome":"ok","url_final":tracker.url_final,"lifecycle":tracker.lifecycle})
         };
+        let response_object = response
+            .as_object_mut()
+            .expect("navigation response is an object");
+        if let Some(status) = tracker.http_status() {
+            response_object.insert("http_status".into(), json!(status));
+        }
+        if tracker.cloudflare_challenge() {
+            response_object.insert(
+                "challenge".into(),
+                json!({"vendor":"cloudflare","evidence":"cf-mitigated: challenge"}),
+            );
+        }
+        self.finalize(
+            identity,
+            BrowserCapability::Navigate,
+            outcome,
+            response.clone(),
+        )
+        .await?;
         if !read_page {
             return Ok(response);
         }
@@ -2970,6 +3043,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::Internal { .. }
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }
+        | BrowserError::NavigationFailed { .. }
         | BrowserError::NavigationPolicyRejected { .. }
         | BrowserError::InvalidCoordinates { .. }
         | BrowserError::ImageTooLarge { .. } => Outcome::InternalError,
@@ -2999,14 +3073,20 @@ fn map_journal_error(error: JournalError) -> BrowserError {
 }
 
 fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveError) -> BrowserError {
-    let reason_code = match error {
+    match error {
+        crate::browser_session::NavigationDriveError::NavigationFailed { error_text } => {
+            BrowserError::NavigationFailed { error_text }
+        }
         crate::browser_session::NavigationDriveError::Unavailable
         | crate::browser_session::NavigationDriveError::ConnectorFailure => {
-            JournalReasonCode::ConnectorFailure
+            BrowserError::Internal {
+                reason_code: JournalReasonCode::ConnectorFailure,
+            }
         }
-        crate::browser_session::NavigationDriveError::CdpFailure => JournalReasonCode::CdpFailure,
-    };
-    BrowserError::Internal { reason_code }
+        crate::browser_session::NavigationDriveError::CdpFailure => BrowserError::Internal {
+            reason_code: JournalReasonCode::CdpFailure,
+        },
+    }
 }
 
 fn map_snapshot_error(error: SnapshotError) -> BrowserError {
@@ -3321,6 +3401,14 @@ mod tests {
                 },
                 "navigation_policy_rejected",
                 "navigate to an http or https URL allowed by browser policy",
+            ),
+            (
+                "navigation_failed",
+                BrowserError::NavigationFailed {
+                    error_text: "net::ERR_NAME_NOT_RESOLVED".to_string(),
+                },
+                "navigation_failed",
+                "inspect detail.error_text and choose a reachable destination or retry when that browser error is transient",
             ),
             (
                 "not_settled",

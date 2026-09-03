@@ -1114,7 +1114,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
         let mut params = Map::new();
         params.insert("url".into(), Value::String(url.to_string()));
-        self.command(
+        let navigate_result = self.command(
             "Page.navigate",
             Some(params),
             Some(attachment.session_id.clone()),
@@ -1122,6 +1122,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             Some((context_key, tracker)),
             clock,
         )?;
+        if let Some(error_text) = navigate_result
+            .get("errorText")
+            .and_then(Value::as_str)
+            .filter(|error_text| !error_text.is_empty())
+        {
+            return Err(NavigationDriveError::NavigationFailed {
+                error_text: error_text.to_string(),
+            });
+        }
 
         if wait == NavigationWait::None {
             return Ok(());
@@ -1491,9 +1500,45 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .and_then(Value::as_object);
                 if let Some(frame) = frame.filter(|frame| !frame.contains_key("parentId")) {
                     if let Some(url) = frame.get("url").and_then(Value::as_str) {
-                        tracker.url_final = Some(url.to_string());
+                        tracker.main_frame_navigated(
+                            frame.get("id").and_then(Value::as_str).map(str::to_string),
+                            url.to_string(),
+                        );
                     }
                 }
+            }
+            "Network.responseReceived" => {
+                let Some(params) = event.params.as_ref() else {
+                    return;
+                };
+                if params.get("type").and_then(Value::as_str) != Some("Document") {
+                    return;
+                }
+                let Some(frame_id) = params.get("frameId").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(response) = params.get("response").and_then(Value::as_object) else {
+                    return;
+                };
+                let Some(status) = response
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .and_then(|status| u16::try_from(status).ok())
+                else {
+                    return;
+                };
+                let Some(status_text) = response.get("statusText").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(headers) = response.get("headers").and_then(Value::as_object) else {
+                    return;
+                };
+                tracker.observe_main_frame_response(
+                    frame_id,
+                    status,
+                    status_text.to_string(),
+                    headers.clone(),
+                );
             }
             _ => {}
         }
