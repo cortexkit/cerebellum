@@ -1584,6 +1584,9 @@ impl Planes {
                     Arc::clone(&lease_clock),
                     config.navigation_settle_deadline_ms,
                 )
+                .with_result_schema_enforcement(
+                    computer_capability::ResultSchemaEnforcement::Withhold,
+                )
                 .with_shared_grants(browser_grants)
                 .with_journal_persistence(
                     matches!(journal, JournalPersistence::Durable),
@@ -1598,7 +1601,13 @@ impl Planes {
             // -- every capability refuses for want of a browser -- so opening a
             // file on disk for a surface that cannot produce a record would be
             // a claim about audit coverage that does not exist.
-            Arc::new(BrowserPlane::new().with_shared_grants(browser_grants))
+            Arc::new(
+                BrowserPlane::new()
+                    .with_result_schema_enforcement(
+                        computer_capability::ResultSchemaEnforcement::Withhold,
+                    )
+                    .with_shared_grants(browser_grants),
+            )
         };
         Self {
             health,
@@ -2436,12 +2445,48 @@ async fn handle_tool_request(
     let Some(capability) = browser::BrowserCapability::parse(name) else {
         let result =
             browser::handle_tool(browser_plane, &accepted_facts.identity, name, arguments).await;
-        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
+        return match result {
+            Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!(
+                        "the capability reply violated its frozen result schema ({error}); the \
+                         operation may already have completed, so do not retry it based on this \
+                         response"
+                    ),
+                )
+                .await
+            }
+        };
     };
     let result = browser_plane
-        .dispatch(&accepted_facts.identity, capability, arguments)
+        .serve(&accepted_facts.identity, capability, arguments)
         .await;
-    send_tool_response(writer, ver, channel, epoch, corr, result).await
+    match result {
+        Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
+        Err(error) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                browser::RESULT_SCHEMA_VIOLATION_CODE,
+                &format!(
+                    "the capability reply violated its frozen result schema ({error}); the \
+                     operation may already have completed, so do not retry it based on this \
+                     response"
+                ),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_browser_control(

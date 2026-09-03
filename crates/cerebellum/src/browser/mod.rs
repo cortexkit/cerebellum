@@ -9,9 +9,9 @@ pub mod extraction;
 pub mod geometry;
 pub mod navigation;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cerebellum_core::journal::{
@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::authorization::{AuthorizationRequest, GrantStore, HazardClass, Severity};
+use crate::computer_capability::ResultSchemaEnforcement;
 use crate::coordinate::{
     capture_screenshot, map_pixel_to_css, validate_png_base64_dimensions, CoordinateError,
     InvalidCoordinatesReason, ScreenshotPayload, TransformInputs, ViewportObservation,
@@ -41,6 +42,9 @@ use crate::snapshot_store::{
     self, AxRecord, BrowserSnapshotStore, DocumentEpoch, DocumentTransition, SameDocumentChange,
     SnapshotError, SnapshotKind, TextSnapshot, AX_SCHEMA, DOM_SCHEMA, MAX_REFS,
 };
+use cerebellum_computer::platform::vocabulary::{
+    CapabilityResultValidationError, CapabilityResultViolation,
+};
 use cerebellum_core::identity::{RouteIdentity, SessionKind};
 
 pub const NAVIGATE: &str = "browser.navigate";
@@ -49,6 +53,8 @@ pub const CLICK: &str = "browser.click";
 pub const SCREENSHOT: &str = "browser.screenshot";
 pub const CLICK_POINT: &str = "browser.click_point";
 pub const WAIT_FOR: &str = "browser.wait_for";
+/// The wire refusal code shared with the computer plane for a result-schema violation.
+pub const RESULT_SCHEMA_VIOLATION_CODE: &str = "computer_result_schema_violation";
 pub const ALL_TOOLS: [&str; 6] = [NAVIGATE, SNAPSHOT, CLICK, SCREENSHOT, CLICK_POINT, WAIT_FOR];
 
 /// Whether a browser capability has a working module-wire dispatch route.
@@ -804,6 +810,8 @@ pub struct BrowserPlane {
         Arc<cerebellum_core::clock::SystemClock>,
         u64,
     )>,
+    result_schema_enforcement: ResultSchemaEnforcement,
+    result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
 }
 
 impl BrowserPlane {
@@ -819,8 +827,38 @@ impl BrowserPlane {
             refusal_ring: Arc::new(Mutex::new(BrowserRefusalRing::Disabled)),
             journal: Arc::new(Mutex::new(BrowserJournalState::default())),
             session_gate: None,
+            result_schema_enforcement: ResultSchemaEnforcement::DetectOnly,
+            result_schema_findings: StdMutex::new(BTreeMap::new()),
         }
     }
+
+    /// Select whether the serving boundary only records or withholds a reply
+    /// that does not conform to its declared result schema.
+    pub fn with_result_schema_enforcement(
+        mut self,
+        result_schema_enforcement: ResultSchemaEnforcement,
+    ) -> Self {
+        self.result_schema_enforcement = result_schema_enforcement;
+        self
+    }
+
+    /// Distinct result-schema violations detected so far, with occurrence counts.
+    pub fn result_schema_findings(&self) -> Vec<crate::computer_capability::ResultSchemaFinding> {
+        let findings = self
+            .result_schema_findings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        findings
+            .iter()
+            .map(
+                |(error, occurrences)| crate::computer_capability::ResultSchemaFinding {
+                    error: error.clone(),
+                    occurrences: *occurrences,
+                },
+            )
+            .collect()
+    }
+
     pub fn with_session_gate(
         sessions: crate::browser_session::BrowserSessions,
         clock: Arc<cerebellum_core::clock::SystemClock>,
@@ -1090,6 +1128,42 @@ impl BrowserPlane {
                 .await;
         }
         self.result(identity, result).await
+    }
+
+    /// Serve one browser capability and certify its completed reply before it
+    /// reaches the module wire.
+    pub async fn serve(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+        args: &Value,
+    ) -> Result<Value, CapabilityResultValidationError> {
+        let reply = self.dispatch(identity, capability, args).await;
+        self.finish_reply(capability, reply)
+    }
+
+    fn finish_reply(
+        &self,
+        capability: BrowserCapability,
+        reply: Value,
+    ) -> Result<Value, CapabilityResultValidationError> {
+        match validate_browser_result(capability.name(), &reply) {
+            Ok(()) => Ok(reply),
+            Err(error) => {
+                let mut findings = self
+                    .result_schema_findings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let occurrences = findings.entry(error.clone()).or_default();
+                *occurrences = occurrences.saturating_add(1);
+                drop(findings);
+
+                match self.result_schema_enforcement {
+                    ResultSchemaEnforcement::DetectOnly => Ok(reply),
+                    ResultSchemaEnforcement::Withhold => Err(error),
+                }
+            }
+        }
     }
 
     async fn dispatch_inner(
@@ -2773,10 +2847,10 @@ pub async fn handle_tool(
     identity: &RouteIdentity,
     name: &str,
     args: &Value,
-) -> Value {
+) -> Result<Value, CapabilityResultValidationError> {
     match BrowserCapability::parse(name) {
-        Some(capability) => plane.dispatch(identity, capability, args).await,
-        None => json!({"outcome":"unknown_method"}),
+        Some(capability) => plane.serve(identity, capability, args).await,
+        None => Ok(json!({"outcome":"unknown_method"})),
     }
 }
 
@@ -2784,39 +2858,582 @@ fn severity_schema() -> Value {
     json!({"type":"object","properties":{"tier":{"type":"integer","minimum":1,"maximum":5},"credential":{"type":"boolean"},"financial":{"type":"boolean"}},"required":["tier","credential","financial"],"additionalProperties":false})
 }
 
-pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
+struct BrowserToolDefinition {
+    name: &'static str,
+    description: &'static str,
+    request_schema: Value,
+    result_schema: Value,
+}
+
+fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
     vec![
-        (
-            NAVIGATE,
-            "Navigate managed Chromium through the enforcing connector. Set read_page to return a bounded snapshot of the landing page.",
-            json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return an accessibility snapshot of the landing page."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
-        ),
-        (
-            SNAPSHOT,
-            "Capture a structured accessibility or DOM snapshot.",
-            json!({"type":"object","properties":{"mode":{"enum":["ax","dom_full"]},"max_bytes":{"type":"integer"}},"additionalProperties":false}),
-        ),
-        (
-            CLICK,
-            "Click a retained structured reference.",
-            json!({"type":"object","properties":{"ref":{"type":"string"},"snapshot_id":{"type":"string"},"intent":{"type":"string"},"severity":severity_schema()},"required":["ref","snapshot_id","intent","severity"],"additionalProperties":false}),
-        ),
-        (
-            SCREENSHOT,
-            "Capture the current visual viewport as PNG base64; max_bytes guards context size but does not reduce vision-token cost because vision APIs may downscale independently.",
-            json!({"type":"object","properties":{"max_bytes":{"type":"integer","minimum":1,"maximum":MAX_ENCODED_PNG_BYTES}},"additionalProperties":false}),
-        ),
-        (
-            CLICK_POINT,
-            "Click a retained screenshot pixel. Coordinates address the image this module declared; pass its image_width_px and image_height_px so a coordinate taken from a resized copy is refused rather than mis-clicked.",
-            json!({"type":"object","properties":{"snapshot_id":{"type":"string"},"x_px":{"type":"integer"},"y_px":{"type":"integer"},"image_width_px":{"type":"integer"},"image_height_px":{"type":"integer"},"intent":{"type":"string"},"severity":severity_schema()},"required":["snapshot_id","x_px","y_px","image_width_px","image_height_px","intent","severity"],"additionalProperties":false}),
-        ),
-        (
-            WAIT_FOR,
-            "Wait for browser settlement or a queued browser event.",
-            json!({"type":"object","properties":{"deadline_ms":{"type":"integer","minimum":0,"maximum":30000}},"additionalProperties":false}),
-        ),
+        BrowserToolDefinition {
+            name: NAVIGATE,
+            description: "Navigate managed Chromium through the enforcing connector. Set read_page to return a bounded snapshot of the landing page.",
+            request_schema: json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return an accessibility snapshot of the landing page."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
+            result_schema: navigate_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: SNAPSHOT,
+            description: "Capture a structured accessibility or DOM snapshot.",
+            request_schema: json!({"type":"object","properties":{"mode":{"enum":["ax","dom_full"]},"max_bytes":{"type":"integer"}},"additionalProperties":false}),
+            result_schema: snapshot_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: CLICK,
+            description: "Click a retained structured reference.",
+            request_schema: json!({"type":"object","properties":{"ref":{"type":"string"},"snapshot_id":{"type":"string"},"intent":{"type":"string"},"severity":severity_schema()},"required":["ref","snapshot_id","intent","severity"],"additionalProperties":false}),
+            result_schema: click_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: SCREENSHOT,
+            description: "Capture the current visual viewport as PNG base64; max_bytes guards context size but does not reduce vision-token cost because vision APIs may downscale independently.",
+            request_schema: json!({"type":"object","properties":{"max_bytes":{"type":"integer","minimum":1,"maximum":MAX_ENCODED_PNG_BYTES}},"additionalProperties":false}),
+            result_schema: screenshot_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: CLICK_POINT,
+            description: "Click a retained screenshot pixel. Coordinates address the image this module declared; pass its image_width_px and image_height_px so a coordinate taken from a resized copy is refused rather than mis-clicked.",
+            request_schema: json!({"type":"object","properties":{"snapshot_id":{"type":"string"},"x_px":{"type":"integer"},"y_px":{"type":"integer"},"image_width_px":{"type":"integer"},"image_height_px":{"type":"integer"},"intent":{"type":"string"},"severity":severity_schema()},"required":["snapshot_id","x_px","y_px","image_width_px","image_height_px","intent","severity"],"additionalProperties":false}),
+            result_schema: click_point_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: WAIT_FOR,
+            description: "Wait for browser settlement or a queued browser event.",
+            request_schema: json!({"type":"object","properties":{"deadline_ms":{"type":"integer","minimum":0,"maximum":30000}},"additionalProperties":false}),
+            result_schema: wait_for_result_schema(),
+        },
     ]
+}
+
+pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
+    browser_tool_definitions()
+        .into_iter()
+        .map(|definition| {
+            (
+                definition.name,
+                definition.description,
+                definition.request_schema,
+            )
+        })
+        .collect()
+}
+
+fn string_schema() -> Value {
+    json!({"type":"string"})
+}
+
+fn nullable_string_schema() -> Value {
+    json!({"type":["null","string"]})
+}
+
+fn integer_schema() -> Value {
+    json!({"type":"integer"})
+}
+
+fn number_schema() -> Value {
+    json!({"type":"number"})
+}
+
+fn boolean_schema() -> Value {
+    json!({"type":"boolean"})
+}
+
+fn string_array_schema() -> Value {
+    json!({"type":"array","items":string_schema()})
+}
+
+fn closed_object(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type":"object",
+        "properties":properties,
+        "required":required,
+        "additionalProperties":false,
+    })
+}
+
+fn context_result_schema() -> Value {
+    closed_object(
+        json!({
+            "profile_uuid":nullable_string_schema(),
+            "profile_name":nullable_string_schema(),
+            "session_kind_effective":string_schema(),
+            "profile_disposition":string_schema(),
+        }),
+        &[
+            "profile_uuid",
+            "profile_name",
+            "session_kind_effective",
+            "profile_disposition",
+        ],
+    )
+}
+
+fn refusal_detail_schema() -> Value {
+    closed_object(
+        json!({
+            "field":string_schema(),
+            "reason_code":string_schema(),
+            "reason":string_schema(),
+            "error_text":string_schema(),
+            "ref":string_schema(),
+            "candidates":integer_schema(),
+            "bytes":integer_schema(),
+            "bound_bytes":integer_schema(),
+            "missing_hazard":string_schema(),
+            "url_final":nullable_string_schema(),
+            "lifecycle":string_array_schema(),
+            "inflight_count":integer_schema(),
+            "deadline_ms":integer_schema(),
+            "point":closed_object(json!({"x_css":number_schema(),"y_css":number_schema()}), &["x_css", "y_css"]),
+            "viewport":closed_object(json!({"x_css":number_schema(),"y_css":number_schema(),"width_css":number_schema(),"height_css":number_schema()}), &["x_css", "y_css", "width_css", "height_css"]),
+        }),
+        &[],
+    )
+}
+
+fn text_snapshot_properties() -> Value {
+    json!({
+        "snapshot_id":string_schema(),
+        "document_epoch":integer_schema(),
+        "source_origin":string_schema(),
+        "content_schema":string_schema(),
+        "truncated":boolean_schema(),
+        "refs_truncated":boolean_schema(),
+        "content":string_schema(),
+        "refs":json!({"type":"array","items":closed_object(json!({"ref":string_schema(),"role":string_schema(),"name":string_schema(),"nth":integer_schema()}), &["ref", "role", "name", "nth"])}),
+    })
+}
+
+fn screenshot_properties() -> Value {
+    json!({
+        "snapshot_id":string_schema(),
+        "document_epoch":integer_schema(),
+        "source_origin":string_schema(),
+        "image_png_b64":string_schema(),
+        "image_width_px":integer_schema(),
+        "image_height_px":integer_schema(),
+        "input_rect":closed_object(json!({"x_input_css":number_schema(),"y_input_css":number_schema(),"width_input_css":number_schema(),"height_input_css":number_schema()}), &["x_input_css", "y_input_css", "width_input_css", "height_input_css"]),
+        "device_scale_factor":number_schema(),
+        "visual_viewport_scale":number_schema(),
+    })
+}
+
+fn browser_result_outcome_schema() -> Value {
+    json!({"type":"string","enum":[
+        "ok",
+        "javascript_dialog_dismissed",
+        "unsupported_download",
+        "unsupported_js_dialog",
+        "invalid_request",
+        "no_session",
+        "browser_launch_pending",
+        "stale_snapshot",
+        "ref_not_found",
+        "ref_ambiguous",
+        "element_intercepted",
+        "outside_viewport_after_scroll",
+        "point_outside_viewport",
+        "invalid_coordinates",
+        "image_too_large",
+        "authorization_denied",
+        "hazard_not_disclosed",
+        "navigation_policy_rejected",
+        "navigation_failed",
+        "not_settled",
+        "browser_crashed",
+        "internal_error"
+    ]})
+}
+
+fn reply_schema(mut properties: Value, required: &[&str]) -> Value {
+    let properties = properties
+        .as_object_mut()
+        .expect("browser result properties are objects");
+    properties.insert("outcome".into(), browser_result_outcome_schema());
+    properties.insert("remedy".into(), string_schema());
+    properties.insert("detail".into(), refusal_detail_schema());
+    properties.insert("context".into(), context_result_schema());
+    let mut required = required.to_vec();
+    required.extend(["outcome", "context"]);
+    closed_object(properties.clone().into(), &required)
+}
+
+fn embedded_read_page_schema() -> Value {
+    let properties = text_snapshot_properties();
+    let properties = properties
+        .as_object()
+        .expect("text snapshot properties are objects")
+        .clone();
+    let mut properties = properties;
+    properties.insert("outcome".into(), browser_result_outcome_schema());
+    properties.insert("remedy".into(), string_schema());
+    properties.insert("detail".into(), refusal_detail_schema());
+    closed_object(properties.into(), &["outcome"])
+}
+
+fn navigate_result_schema() -> Value {
+    reply_schema(
+        json!({
+            "url_final":nullable_string_schema(),
+            "lifecycle":string_array_schema(),
+            "http_status":integer_schema(),
+            "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
+            "read_page":embedded_read_page_schema(),
+        }),
+        &[],
+    )
+}
+
+fn snapshot_result_schema() -> Value {
+    reply_schema(text_snapshot_properties(), &[])
+}
+
+fn click_result_schema() -> Value {
+    reply_schema(
+        json!({
+            "url_final":nullable_string_schema(),
+            "lifecycle":string_array_schema(),
+            "dialogs":json!({"type":"array","items":closed_object(json!({"dialog_type":string_schema(),"response":string_schema()}), &["dialog_type", "response"])}),
+        }),
+        &[],
+    )
+}
+
+fn screenshot_result_schema() -> Value {
+    reply_schema(screenshot_properties(), &[])
+}
+
+fn click_point_result_schema() -> Value {
+    click_result_schema()
+}
+
+fn wait_for_result_schema() -> Value {
+    reply_schema(
+        json!({
+            "url_final":nullable_string_schema(),
+            "lifecycle":string_array_schema(),
+            "inflight_count":integer_schema(),
+        }),
+        &[],
+    )
+}
+
+fn schema_types(
+    schema: &Map<String, Value>,
+    path: &str,
+) -> Result<Vec<String>, CapabilityResultValidationError> {
+    let values = match schema.get("type") {
+        Some(Value::String(value)) => vec![value.clone()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(Value::as_str)
+            .map(|value| value.map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path}.type contains a non-string"
+                ))
+            })?,
+        _ => {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path} result schema has no string or string-array type"
+            )))
+        }
+    };
+    if values.is_empty()
+        || values.iter().any(|value| {
+            !matches!(
+                value.as_str(),
+                "array" | "boolean" | "integer" | "null" | "number" | "object" | "string"
+            )
+        })
+        || values
+            .iter()
+            .any(|value| value == "array" || value == "object")
+            && values.len() != 1
+    {
+        return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path} has unsupported or incompatible result types"
+        )));
+    }
+    Ok(values)
+}
+
+fn value_has_type(value: &Value, schema_type: &str) -> bool {
+    match schema_type {
+        "array" => value.is_array(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        "number" => value.is_number(),
+        "object" => value.is_object(),
+        "string" => value.is_string(),
+        _ => false,
+    }
+}
+
+fn validate_runtime_result_schema(
+    schema: &Value,
+    path: &str,
+) -> Result<(), CapabilityResultValidationError> {
+    let object = schema.as_object().ok_or_else(|| {
+        CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path} result schema is not an object"
+        ))
+    })?;
+    for keyword in object.keys() {
+        if !matches!(
+            keyword.as_str(),
+            "additionalProperties"
+                | "description"
+                | "enum"
+                | "items"
+                | "properties"
+                | "required"
+                | "type"
+        ) {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path} uses unsupported result-schema keyword {keyword}"
+            )));
+        }
+    }
+
+    let schema_types = schema_types(object, path)?;
+    let schema_type = schema_types
+        .first()
+        .expect("a result schema with types is nonempty");
+    if object
+        .get("description")
+        .is_some_and(|description| !description.is_string())
+    {
+        return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+            "{path}.description is not a string"
+        )));
+    }
+    if let Some(choices) = object.get("enum") {
+        let choices = choices.as_array().ok_or_else(|| {
+            CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.enum is not an array"
+            ))
+        })?;
+        if choices.is_empty()
+            || choices.iter().any(|choice| {
+                !schema_types
+                    .iter()
+                    .any(|schema_type| value_has_type(choice, schema_type))
+            })
+        {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.enum is empty or disagrees with its type"
+            )));
+        }
+    }
+
+    match schema_type.as_str() {
+        "object" => {
+            let properties = object
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.properties is not an object"
+                    ))
+                })?;
+            if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path} is not closed"
+                )));
+            }
+            let required = object
+                .get("required")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.required is not an array"
+                    ))
+                })?;
+            for required_name in required {
+                let required_name = required_name.as_str().ok_or_else(|| {
+                    CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.required contains a non-string"
+                    ))
+                })?;
+                if !properties.contains_key(required_name) {
+                    return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                        "{path}.required names undeclared property {required_name}"
+                    )));
+                }
+            }
+            for (name, property_schema) in properties {
+                validate_runtime_result_schema(property_schema, &format!("{path}.{name}"))?;
+            }
+        }
+        "array" => {
+            let items = object.get("items").ok_or_else(|| {
+                CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path}.items is missing"
+                ))
+            })?;
+            validate_runtime_result_schema(items, &format!("{path}[]"))?;
+        }
+        _ => {
+            if object.keys().any(|keyword| {
+                matches!(
+                    keyword.as_str(),
+                    "additionalProperties" | "items" | "properties" | "required"
+                )
+            }) {
+                return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path} uses an object or array keyword for a scalar result type"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_browser_result_schema_table(
+) -> Result<BTreeMap<String, Value>, CapabilityResultValidationError> {
+    let mut table = BTreeMap::new();
+    for definition in browser_tool_definitions() {
+        validate_runtime_result_schema(
+            &definition.result_schema,
+            &format!("{}.result_schema", definition.name),
+        )?;
+        if table
+            .insert(definition.name.to_string(), definition.result_schema)
+            .is_some()
+        {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "duplicate result schema for {}",
+                definition.name
+            )));
+        }
+    }
+    Ok(table)
+}
+
+fn browser_result_schema_table(
+) -> Result<&'static BTreeMap<String, Value>, CapabilityResultValidationError> {
+    static TABLE: OnceLock<Result<BTreeMap<String, Value>, CapabilityResultValidationError>> =
+        OnceLock::new();
+    match TABLE.get_or_init(parse_browser_result_schema_table) {
+        Ok(table) => Ok(table),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn collect_result_violations(
+    schema: &Value,
+    result: &Value,
+    path: &str,
+    violations: &mut Vec<CapabilityResultViolation>,
+) {
+    let object = schema
+        .as_object()
+        .expect("cached result schemas were validated while loading");
+    let schema_types = schema_types(object, path)
+        .expect("cached result schema types were validated while loading");
+    if !schema_types
+        .iter()
+        .any(|schema_type| value_has_type(result, schema_type))
+    {
+        violations.push(CapabilityResultViolation::ExpectedType {
+            path: path.to_string(),
+            expected: schema_types.join("|"),
+        });
+        return;
+    }
+    if object
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.contains(result))
+    {
+        violations.push(CapabilityResultViolation::EnumMismatch {
+            path: path.to_string(),
+        });
+    }
+
+    match schema_types.first().map(String::as_str) {
+        Some("object") => {
+            let result = result
+                .as_object()
+                .expect("the result type was checked above");
+            let properties = object["properties"]
+                .as_object()
+                .expect("cached object schemas have properties");
+            for required_name in object["required"]
+                .as_array()
+                .expect("cached object schemas have required lists")
+            {
+                let required_name = required_name
+                    .as_str()
+                    .expect("cached required names are strings");
+                if !result.contains_key(required_name) {
+                    violations.push(CapabilityResultViolation::MissingRequiredProperty {
+                        path: path.to_string(),
+                        property: required_name.to_string(),
+                    });
+                }
+            }
+            for (name, value) in result {
+                let Some(property_schema) = properties.get(name) else {
+                    violations.push(CapabilityResultViolation::UndeclaredProperty {
+                        path: format!("{path}.{name}"),
+                    });
+                    continue;
+                };
+                collect_result_violations(
+                    property_schema,
+                    value,
+                    &format!("{path}.{name}"),
+                    violations,
+                );
+            }
+        }
+        Some("array") => {
+            let items = object["items"]
+                .as_object()
+                .expect("cached arrays have item schemas");
+            for (index, value) in result
+                .as_array()
+                .expect("the result type was checked above")
+                .iter()
+                .enumerate()
+            {
+                collect_result_violations(
+                    &Value::Object(items.clone()),
+                    value,
+                    &format!("{path}[{index}]"),
+                    violations,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check a served browser reply against the result schema declared beside its request schema.
+pub fn validate_browser_result(
+    capability_id: &str,
+    result: &Value,
+) -> Result<(), CapabilityResultValidationError> {
+    let table = browser_result_schema_table()?;
+    let schema = table.get(capability_id).ok_or_else(|| {
+        CapabilityResultValidationError::UnknownCapability(capability_id.to_string())
+    })?;
+    let mut violations = Vec::new();
+    collect_result_violations(schema, result, "$", &mut violations);
+    violations.sort();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(CapabilityResultValidationError::ReplyViolations {
+            capability_id: capability_id.to_string(),
+            violations,
+        })
+    }
 }
 
 fn parse_severity(object: &Map<String, Value>) -> Result<Severity, BrowserError> {
@@ -3446,6 +4063,20 @@ mod tests {
                 "wrong outcome for {name}"
             );
             assert_eq!(reply["remedy"], expected_remedy, "wrong remedy for {name}");
+            for capability in [
+                BrowserCapability::Navigate,
+                BrowserCapability::Snapshot,
+                BrowserCapability::Click,
+                BrowserCapability::Screenshot,
+                BrowserCapability::ClickPoint,
+                BrowserCapability::WaitFor,
+            ] {
+                assert!(
+                    validate_browser_result(capability.name(), &reply).is_ok(),
+                    "{name} is not declared by {}: {reply}",
+                    capability.name()
+                );
+            }
         }
     }
 
@@ -3479,6 +4110,35 @@ mod tests {
                 event.remedy(),
                 expected_remedy,
                 "wrong remedy for {event:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_late_browser_refusal_reaches_the_wait_result_schema() {
+        for event in [
+            LateEvent::DownloadBlocked,
+            LateEvent::JsDialogDismissed,
+            LateEvent::NavigationPolicyRejected {
+                reason_code: "scheme_not_allowed".into(),
+            },
+            LateEvent::AuthorizationDenied {
+                reason: "no_grant".into(),
+            },
+        ] {
+            let plane = BrowserPlane::new();
+            let identity = identity();
+            plane.queue_event(&identity, event).await;
+            let reply = plane
+                .dispatch(
+                    &identity,
+                    BrowserCapability::WaitFor,
+                    &json!({"deadline_ms": 0}),
+                )
+                .await;
+            assert!(
+                validate_browser_result(WAIT_FOR, &reply).is_ok(),
+                "the wait handler emitted an undeclared late-event reply: {reply}"
             );
         }
     }
@@ -3566,6 +4226,76 @@ mod tests {
 
         assert_eq!(result["outcome"], "no_session");
         assert!(plane.operation_log().await.is_empty());
+    }
+
+    fn declared_navigate_reply() -> Value {
+        json!({
+            "outcome": "ok",
+            "context": {
+                "profile_uuid": null,
+                "profile_name": "default",
+                "session_kind_effective": "primary",
+                "profile_disposition": "durable"
+            }
+        })
+    }
+
+    #[test]
+    fn browser_result_schemas_are_closed_and_accept_optional_presence_or_absence() {
+        let absent = declared_navigate_reply();
+        assert!(validate_browser_result(NAVIGATE, &absent).is_ok());
+
+        let mut present = declared_navigate_reply();
+        present
+            .as_object_mut()
+            .expect("navigate reply is an object")
+            .insert(
+                "challenge".into(),
+                json!({"vendor":"cloudflare","evidence":"cf-mitigated: challenge"}),
+            );
+        assert!(validate_browser_result(NAVIGATE, &present).is_ok());
+    }
+
+    #[test]
+    fn browser_result_schema_withholds_undeclared_and_wrong_typed_reply_fields() {
+        let plane =
+            BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+        let mut undeclared = declared_navigate_reply();
+        undeclared
+            .as_object_mut()
+            .expect("navigate reply is an object")
+            .insert("not_declared".into(), json!(true));
+        let error = plane
+            .finish_reply(BrowserCapability::Navigate, undeclared)
+            .expect_err("an undeclared reply field is withheld");
+        assert!(matches!(
+            error,
+            CapabilityResultValidationError::ReplyViolations { ref violations, .. }
+                if violations == &[CapabilityResultViolation::UndeclaredProperty {
+                    path: "$.not_declared".into()
+                }]
+        ));
+        assert_eq!(
+            RESULT_SCHEMA_VIOLATION_CODE,
+            "computer_result_schema_violation"
+        );
+
+        let mut wrong_type = declared_navigate_reply();
+        wrong_type
+            .as_object_mut()
+            .expect("navigate reply is an object")
+            .insert("http_status".into(), json!("200"));
+        let error = plane
+            .finish_reply(BrowserCapability::Navigate, wrong_type)
+            .expect_err("a wrong-typed reply field is withheld");
+        assert!(matches!(
+            error,
+            CapabilityResultValidationError::ReplyViolations { ref violations, .. }
+                if violations == &[CapabilityResultViolation::ExpectedType {
+                    path: "$.http_status".into(),
+                    expected: "integer".into()
+                }]
+        ));
     }
 
     #[tokio::test]
