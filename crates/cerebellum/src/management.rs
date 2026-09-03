@@ -118,9 +118,22 @@ impl TargetResolver for PlatformResolver {
     /// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
     /// Windows the same caller names an executable basename (`notepad.exe`).
     /// Windows has no bundle identifier; the two identities are deliberately
-    /// asymmetric. UWP frame windows may be owned by `ApplicationFrameHost.exe`
-    /// while the content process is the app's own executable; which identity a
-    /// caller must use for those apps is unmeasured.
+    /// asymmetric.
+    ///
+    /// Measured on Windows 11 ARM64, console session: one Notepad resolves,
+    /// two are refused as ambiguous with both pids and window counts, an
+    /// absent name is NotRunning over a complete 95-window reading, and the
+    /// same command from the service session refuses by provenance -- where
+    /// the reading SUCCEEDS with six service-desktop windows and would
+    /// otherwise have called two open Notepads not running.
+    ///
+    /// UWP applications do not resolve by either name yet. Calculator was
+    /// launched and neither `calculatorapp.exe` nor `applicationframehost.exe`
+    /// matched: the frame host was running with no main window handle, so
+    /// whatever owns a UWP app's top-level window is not what `EnumWindows`
+    /// attributes to either process. Unresolved, not guessed; a caller naming
+    /// a UWP app today gets NotRunning, which is the honest reading of a list
+    /// that genuinely contains no window under that name.
     #[cfg(target_os = "windows")]
     fn resolve(&self, bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;

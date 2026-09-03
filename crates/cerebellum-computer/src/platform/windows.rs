@@ -142,14 +142,20 @@ fn resolve_from_reading<F: FnOnce(u32) -> Option<String>>(
     executable_basename: &str,
     session: WindowsSessionProvenance,
     windows: Option<&[(u32, String)]>,
+    unreadable_owners: usize,
     read_generation: F,
 ) -> Result<TargetResolution, DriverError> {
     require_console_session(session)?;
-    Ok(TargetResolution::decide(
-        executable_basename,
-        windows,
-        read_generation,
-    ))
+    let resolution = TargetResolution::decide(executable_basename, windows, read_generation);
+    // A window whose owner could not be opened is absent from `windows`, so
+    // "nothing named that" was decided over a list known to be short. The
+    // missing window may be the one the caller means. Resolved and Ambiguous
+    // stand -- they were found in what WAS read -- but NotRunning would claim
+    // absence about processes this reading could not see.
+    if unreadable_owners > 0 && matches!(resolution, TargetResolution::NotRunning) {
+        return Ok(TargetResolution::Unreadable);
+    }
+    Ok(resolution)
 }
 
 /// Resolve an executable basename against this machine's top-level windows.
@@ -175,10 +181,17 @@ pub fn resolve_target(executable_basename: &str) -> TargetResolution {
             cerebellum_windows::TopLevelWindowOwner::Unreadable(_) => None,
         })
         .collect();
+    let unreadable_owners = match reading.completeness {
+        cerebellum_windows::WindowListCompleteness::Complete => 0,
+        cerebellum_windows::WindowListCompleteness::Partial { unreadable_owners } => {
+            unreadable_owners
+        }
+    };
     match resolve_from_reading(
         executable_basename,
         reading.session.into(),
         Some(named.as_slice()),
+        unreadable_owners,
         |pid| match cerebellum_windows::process_start_time(pid) {
             cerebellum_windows::ProcessStartTime::Started(started) => Some(started.to_string()),
             cerebellum_windows::ProcessStartTime::NoSuchProcess
@@ -1181,6 +1194,7 @@ mod tests {
                 console_session_id: 1,
             },
             Some(&windows),
+            0,
             generation,
         );
         assert!(matches!(
@@ -1197,6 +1211,7 @@ mod tests {
             "notepad.exe",
             WindowsSessionProvenance::Console { session_id: 1 },
             Some(&windows),
+            0,
             |_pid| Some("100".to_owned()),
         );
         let Ok(TargetResolution::Resolved(grant)) = console else {
@@ -1205,6 +1220,31 @@ mod tests {
         assert_eq!(grant.pid, 41);
         assert_eq!(grant.bundle_identity, "notepad.exe");
         assert_eq!(grant.process_generation_evidence, "100");
+    }
+
+    /// A reading with unreadable owners is a list known to be short, so a
+    /// name absent from it has not been shown absent from the machine.
+    #[test]
+    fn a_partial_window_list_cannot_claim_a_target_is_not_running() {
+        let console = WindowsSessionProvenance::Console { session_id: 1 };
+        let windows = vec![(41u32, "explorer.exe".to_owned())];
+        let generation = |_pid: u32| Some("100".to_owned());
+
+        // Complete list, name absent: a claim about the world, and permitted.
+        let complete = resolve_from_reading("notepad.exe", console, Some(&windows), 0, generation);
+        assert!(matches!(complete, Ok(TargetResolution::NotRunning)));
+
+        // Same list, one owner unreadable: the missing window may be the one.
+        let partial = resolve_from_reading("notepad.exe", console, Some(&windows), 1, generation);
+        assert!(
+            matches!(partial, Ok(TargetResolution::Unreadable)),
+            "a partial list must not assert absence, got {partial:?}"
+        );
+
+        // But a name FOUND in the partial list still resolves: presence was
+        // observed, and the unread remainder cannot un-observe it.
+        let found = resolve_from_reading("explorer.exe", console, Some(&windows), 1, generation);
+        assert!(matches!(found, Ok(TargetResolution::Resolved(_))));
     }
 
     #[test]
