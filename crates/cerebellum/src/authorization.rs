@@ -602,12 +602,7 @@ impl GrantStore {
         let scoped = candidates
             .iter()
             .copied()
-            .filter(|grant| {
-                grant
-                    .authorized_origins
-                    .iter()
-                    .any(|origin| origin == &canonical_attempted)
-            })
+            .filter(|grant| grant_authorizes_origin(grant, &canonical_attempted))
             .collect::<Vec<_>>();
         if scoped.is_empty() {
             return Err(AuthorizationError::OriginScope {
@@ -738,10 +733,7 @@ pub fn select_deterministic_covering_grant<'a>(
         .filter(|grant| {
             grant.validate().is_ok()
                 && grant.severity.covers(required)
-                && grant
-                    .authorized_origins
-                    .iter()
-                    .any(|origin| origin == &canonical_attempted)
+                && grant_authorizes_origin(grant, &canonical_attempted)
         })
         .collect::<Vec<_>>();
     covering.sort_by(compare_grants);
@@ -854,6 +846,19 @@ fn make_decision(
         classification_fingerprint: fingerprint,
         action: request.action,
     })
+}
+
+/// The one place origin membership is decided.
+///
+/// Both selection paths call this rather than each carrying a copy of the
+/// comparison. Two copies of a scope rule drift independently, and a reader
+/// who finds one and fixes it has no way to know the other exists -- which is
+/// how the origin came to be checked after selection instead of during it.
+fn grant_authorizes_origin(grant: &ActionGrant, canonical_attempted: &str) -> bool {
+    grant
+        .authorized_origins
+        .iter()
+        .any(|origin| origin == canonical_attempted)
 }
 
 fn granted_origins(candidates: &[&ActionGrant]) -> Vec<String> {
