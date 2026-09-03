@@ -163,7 +163,12 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
         .to_string();
     println!("[{label}] launch: {launched}");
 
-    mint_browser_grant(&planes, page.origin()).await;
+    // One grant covering both origins the probe will visit. Two grants would be
+    // the natural shape, and it is exactly what does not work today: grant
+    // selection ignores the target origin, so only the first-minted grant is
+    // ever consulted and every action on the second origin is refused. That
+    // defect is recorded separately; this probe measures the DNS reply, not it.
+    mint_browser_grant(&planes, &[page.origin(), "http://unreachable.invalid"]).await;
 
     let navigated = invoke_tool(
         &planes,
@@ -379,6 +384,33 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
         }
     }
 
+    // A navigation Chrome cannot complete must answer with Chrome's own error
+    // rather than `ok` or a settlement timeout. `.invalid` is reserved by RFC
+    // 2606 so this can never resolve. Same-session, so it also proves the
+    // failure leaves the session usable enough to close cleanly below.
+    let failed = invoke_tool(
+        &planes,
+        7,
+        "browser.navigate",
+        json!({
+            "url": "http://unreachable.invalid/",
+            "intent": "prove a DNS failure is reported as Chrome names it",
+            "wait": "none",
+            "severity": {"tier": 1, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    println!("[{label}] DNS FAILURE reply: {failed}");
+    let dns_named = failed["outcome"] == "navigation_failed"
+        && failed["detail"]["error_text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("net::ERR_"));
+    if dns_named {
+        println!("[{label}] DNS FAILURE VERDICT: reported as navigation_failed with Chrome's net:: error");
+    } else {
+        eprintln!("[{label}] DNS FAILURE VERDICT: the reply does not carry Chrome's error");
+    }
+
     let closed = close_browser(&planes, label, &browser_session_id, 6).await;
     if page_changed {
         println!(
@@ -389,7 +421,7 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
             "[{label}] CLICK VERDICT: the two printed snapshots do not prove the page changed"
         );
     }
-    page_changed && closed["outcome"] == "closed"
+    page_changed && dns_named && closed["outcome"] == "closed"
 }
 
 async fn bind_route(
@@ -441,7 +473,7 @@ async fn bind_route(
     assert_eq!(reply.header.ty, FrameType::Response);
 }
 
-async fn mint_browser_grant(planes: &Planes, origin: &str) {
+async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
     let (writer, mut frames) = mpsc::channel(8);
     let opening = route_request(
         MANAGEMENT_CHANNEL,
@@ -450,7 +482,7 @@ async fn mint_browser_grant(planes: &Planes, origin: &str) {
         json!({
             "method": management::OPEN_GRANT,
             "params": {
-                "origins": [origin],
+                "origins": origins,
                 "hazards": [
                     "credential_form_submit",
                     "unverified_form_contents"
