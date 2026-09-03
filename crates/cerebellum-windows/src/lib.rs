@@ -14,6 +14,8 @@
 mod accessibility;
 #[cfg(any(target_os = "windows", test))]
 mod session;
+#[cfg(any(target_os = "windows", test))]
+mod window_list;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -26,11 +28,16 @@ pub use accessibility::{
 };
 #[cfg(target_os = "windows")]
 pub use windows::{
-    current_session_provenance, enumerated_window_visibility, process_start_time,
-    retain_process_handle, ProcessHandleError, ProcessStartTime, RetainedProcessHandle,
-    WindowVisibility,
+    current_session_provenance, enumerate_top_level_windows, enumerated_window_visibility,
+    process_start_time, retain_process_handle, ProcessHandleError, ProcessStartTime,
+    RetainedProcessHandle, WindowVisibility,
 };
 
 // Pure data, so it is reachable wherever the readers that carry it are.
 #[cfg(any(target_os = "windows", test))]
 pub use session::SessionProvenance;
+#[cfg(any(target_os = "windows", test))]
+pub use window_list::{
+    EnumerateWindowsError, TopLevelWindowOwner, TopLevelWindowReading, WindowListCompleteness,
+    WindowOwnerUnreadable,
+};

@@ -92,10 +92,10 @@ pub trait TargetResolver: Send + Sync {
 
 /// Resolves application names against this machine.
 ///
-/// The macOS reading and a refusal elsewhere are the two halves: a host with no
-/// window server cannot say an application is absent, only that it cannot look,
-/// and reporting "not running" would be a claim rather than a reading. Both
-/// answers refuse; only one of them is evidence.
+/// macOS and Windows each supply a window-owner reading to the platform-neutral
+/// [`TargetResolution::decide`]. A host with no enumerator cannot say an
+/// application is absent, only that it cannot look, and reporting "not running"
+/// would be a claim rather than a reading.
 #[derive(Debug, Default)]
 pub struct PlatformResolver {
     timeout: Duration,
@@ -115,28 +115,26 @@ impl TargetResolver for PlatformResolver {
         cerebellum_computer::platform::native::resolve_target(bundle_identity, self.timeout)
     }
 
+    /// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
+    /// Windows the same caller names an executable basename (`notepad.exe`).
+    /// Windows has no bundle identifier; the two identities are deliberately
+    /// asymmetric. UWP frame windows may be owned by `ApplicationFrameHost.exe`
+    /// while the content process is the app's own executable; which identity a
+    /// caller must use for those apps is unmeasured.
     #[cfg(target_os = "windows")]
-    fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+    fn resolve(&self, bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;
-        windows_target_resolution_without_enumerator()
+        cerebellum_computer::platform::windows::resolve_target(bundle_identity)
     }
 
-    // No enumerator exists for these platforms either, so the answer is the
-    // same honest one as Windows: the module could not look. `NotRunning`
-    // here would assert an absence about a machine nobody inspected.
+    // No enumerator exists for these platforms, so the answer is that the
+    // module could not look. `NotRunning` here would assert an absence about a
+    // machine nobody inspected.
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;
         TargetResolution::Unreadable
     }
-}
-
-/// Windows does not yet have the process-name enumerator needed to resolve an
-/// application identity. `Unreadable` is an honest absence of a reading;
-/// `NotRunning` would fabricate a negative about a machine nobody inspected.
-#[cfg(any(target_os = "windows", test))]
-fn windows_target_resolution_without_enumerator() -> TargetResolution {
-    TargetResolution::Unreadable
 }
 
 /// The state a management route needs.
@@ -712,13 +710,6 @@ fn new_ask_id() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn windows_without_a_process_enumerator_never_reports_not_running() {
-        assert_eq!(
-            windows_target_resolution_without_enumerator(),
-            TargetResolution::Unreadable
-        );
-    }
     use cerebellum_computer::platform::ProcessGrant;
     use cerebellum_core::clock::FakeClock;
 
