@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "cerebellum-core",
  "cerebellum-macos",
+ "cerebellum-windows",
  "objc2-core-graphics",
  "serde",
  "serde_json",
@@ -867,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.16.1"
+version = "0.16.3"
 dependencies = [
  "base64",
  "cortexkit-paths",

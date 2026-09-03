@@ -121,10 +121,13 @@ impl TargetResolver for PlatformResolver {
         windows_target_resolution_without_enumerator()
     }
 
+    // No enumerator exists for these platforms either, so the answer is the
+    // same honest one as Windows: the module could not look. `NotRunning`
+    // here would assert an absence about a machine nobody inspected.
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
         let _ = self.timeout;
-        TargetResolution::NotRunning
+        TargetResolution::Unreadable
     }
 }
 

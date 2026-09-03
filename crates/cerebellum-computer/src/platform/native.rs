@@ -934,12 +934,18 @@ mod tests {
         // identity because that field is copied from the grant, so asserting on
         // it would compare the grant with itself and hold however the list was
         // filtered.
-        let expected: Vec<String> = all
+        // Compared as sets: the two enumerations are separate window-server
+        // reads, and z-order can change between them. It did, under a load
+        // average past 300 -- the same eleven windows came back with the top
+        // two swapped, which is not a filtering defect. The property under
+        // test is membership, so membership is what is asserted.
+        let expected: std::collections::BTreeSet<String> = all
             .iter()
             .filter(|window| window.owner_pid == sample.owner_pid)
             .map(|window| window.window_id.to_string())
             .collect();
-        let returned: Vec<String> = mine.iter().map(|window| window.window_id.clone()).collect();
+        let returned: std::collections::BTreeSet<String> =
+            mine.iter().map(|window| window.window_id.clone()).collect();
 
         assert!(!expected.is_empty(), "the target owns at least one window");
         assert!(
