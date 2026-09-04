@@ -219,6 +219,51 @@ pub fn resolve_target(executable_basename: &str) -> TargetResolution {
     }
 }
 
+/// Everything a semantic dispatch decides before the platform is asked to do
+/// anything, in the order it decides it, with the platform calls handed in.
+///
+/// The order is the property: PROVENANCE, then LIVENESS, then the intent, then
+/// the invoke. Provenance first because a tree read from a service session
+/// succeeds and describes this module's own desktop -- an element resolved
+/// from it uniquely and correctly still names a control the user cannot see,
+/// and invoking it would act on the wrong desktop with every other check
+/// satisfied. So the refusal must land before resolution or liveness get a
+/// say, and `invoke` must not have run. The platform calls arrive as closures
+/// so this ordering compiles and is tested on every host; the FFI that fills
+/// them compiles only on Windows.
+fn dispatch_semantic_in_order<R, I>(
+    session: WindowsSessionProvenance,
+    request: &SemanticDispatchRequest,
+    retain: R,
+    invoke: I,
+) -> Result<DispatchResult, DriverError>
+where
+    R: FnOnce(&ProcessGrant) -> Result<(), DriverError>,
+    I: FnOnce(
+        &ProcessGrant,
+        &AccessibilityElementName,
+        SemanticActionIntent,
+    ) -> Result<DispatchResult, DriverError>,
+{
+    require_console_session(session)?;
+    retain(&request.element.owning_process)?;
+    let intent = SemanticActionIntent::from_wire_name(&request.action).ok_or(
+        DriverError::InvalidRequest("unknown semantic action intent"),
+    )?;
+    let _delivered_action = delivered_semantic_action(SemanticActionPlatform::Windows, intent)
+        .map_err(|refusal| {
+            DriverError::Semantic(SemanticDriverError::ActionUnsupported {
+                intent: refusal.intent,
+                platform: refusal.platform,
+            })
+        })?;
+    invoke(
+        &request.element.owning_process,
+        &request.element.element_name,
+        intent,
+    )
+}
+
 fn require_console_session(session: WindowsSessionProvenance) -> Result<(), DriverError> {
     match session {
         WindowsSessionProvenance::Console { .. } => Ok(()),
@@ -891,36 +936,32 @@ impl PlatformDriver for WindowsPlatformDriver {
     ) -> Result<DispatchResult, DriverError> {
         #[cfg(target_os = "windows")]
         {
-            require_console_session(cerebellum_windows::current_session_provenance().into())?;
-            let _retained = retain_current_target(&request.element.owning_process)
-                .map_err(semantic_verification_error)?;
-            let intent = SemanticActionIntent::from_wire_name(&request.action).ok_or(
-                DriverError::InvalidRequest("unknown semantic action intent"),
-            )?;
-            let _delivered_action =
-                delivered_semantic_action(SemanticActionPlatform::Windows, intent).map_err(
-                    |refusal| {
-                        DriverError::Semantic(SemanticDriverError::ActionUnsupported {
-                            intent: refusal.intent,
-                            platform: refusal.platform,
-                        })
-                    },
-                )?;
-            let element_name = uia_element_name(&request.element.element_name)?;
-            let bounds = cerebellum_windows::AccessibilityInvokeBounds::default();
-            let deadline_ms = u64::try_from(bounds.timeout.as_millis()).unwrap_or(u64::MAX);
-            let outcome = cerebellum_windows::invoke_accessibility_element(
-                request.element.owning_process.pid,
-                &element_name,
-                bounds,
+            dispatch_semantic_in_order(
+                cerebellum_windows::current_session_provenance().into(),
+                &request,
+                |target| {
+                    retain_current_target(target)
+                        .map(|_retained| ())
+                        .map_err(semantic_verification_error)
+                },
+                |target, element_name, _intent| {
+                    let element_name = uia_element_name(element_name)?;
+                    let bounds = cerebellum_windows::AccessibilityInvokeBounds::default();
+                    let deadline_ms = u64::try_from(bounds.timeout.as_millis()).unwrap_or(u64::MAX);
+                    let outcome = cerebellum_windows::invoke_accessibility_element(
+                        target.pid,
+                        &element_name,
+                        bounds,
+                    )
+                    .map_err(|error| map_invoke_error(error, &request.action, deadline_ms))?;
+                    match outcome {
+                        cerebellum_windows::AccessibilityInvokeOutcome::HandlerReturned {
+                            unreadable_subtrees,
+                            ..
+                        } => Ok(accepted_invoke_result(unreadable_subtrees)),
+                    }
+                },
             )
-            .map_err(|error| map_invoke_error(error, &request.action, deadline_ms))?;
-            match outcome {
-                cerebellum_windows::AccessibilityInvokeOutcome::HandlerReturned {
-                    unreadable_subtrees,
-                    ..
-                } => Ok(accepted_invoke_result(unreadable_subtrees)),
-            }
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -1167,6 +1208,101 @@ mod tests {
             }],
             unreadable_subtrees: 0,
         }
+    }
+
+    /// Provenance refuses BEFORE liveness and before the invoke, and refuses an
+    /// element that would otherwise be actuated -- unique, correct, and named
+    /// both ways.
+    ///
+    /// This is the falsifying vector for the session gate. The reader-side
+    /// test shows a service-session read is refused; it does not show that an
+    /// actuation presented with such a tree refuses before doing anything. A
+    /// change that moved the provenance check after resolution or after the
+    /// liveness probe would pass every reader test and every live probe, and
+    /// would invoke a control on a desktop the user cannot see. So: counts on
+    /// the platform closures, asserted zero on the refusing arm.
+    #[test]
+    fn other_session_refuses_actuation_before_liveness_and_before_any_invoke() {
+        use std::cell::Cell;
+
+        let request = SemanticDispatchRequest {
+            element: ElementResolutionResult {
+                element_name: AccessibilityElementName::Identifier("save".to_owned()),
+                alternate_name: Some(AccessibilityElementName::RoleAndTitle {
+                    role: control_type_role(50_000),
+                    title: "Save".to_owned(),
+                }),
+                owning_process: ProcessGrant {
+                    pid: 41,
+                    bundle_identity: "pid:41".to_owned(),
+                    process_generation_evidence: "100".to_owned(),
+                },
+                semantic_actions: vec![SemanticActionIntent::Press.wire_name().to_owned()],
+                unreadable_subtrees: 0,
+            },
+            action: SemanticActionIntent::Press.wire_name().to_owned(),
+        };
+
+        let retained = Cell::new(0u32);
+        let invoked = Cell::new(0u32);
+        let refused = dispatch_semantic_in_order(
+            WindowsSessionProvenance::OtherSession {
+                session_id: 0,
+                console_session_id: 1,
+            },
+            &request,
+            |_| {
+                retained.set(retained.get() + 1);
+                Ok(())
+            },
+            |_, _, _| {
+                invoked.set(invoked.get() + 1);
+                Ok(accepted_invoke_result(0))
+            },
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(DriverError::SessionNotInspectable(
+                    SessionProvenanceRefusal::OtherSession {
+                        session_id: 0,
+                        console_session_id: 1
+                    }
+                ))
+            ),
+            "a service-session actuation must refuse by provenance, got {refused:?}"
+        );
+        assert_eq!(
+            retained.get(),
+            0,
+            "liveness was probed before provenance refused"
+        );
+        assert_eq!(
+            invoked.get(),
+            0,
+            "the platform was asked to invoke on a refused actuation"
+        );
+
+        // The identical request from the console proceeds through both, in order.
+        let order = std::cell::RefCell::new(Vec::new());
+        let accepted = dispatch_semantic_in_order(
+            WindowsSessionProvenance::Console { session_id: 1 },
+            &request,
+            |_| {
+                order.borrow_mut().push("retain");
+                Ok(())
+            },
+            |_, _, intent| {
+                order.borrow_mut().push("invoke");
+                assert_eq!(intent, SemanticActionIntent::Press);
+                Ok(accepted_invoke_result(0))
+            },
+        );
+        assert!(
+            accepted.is_ok(),
+            "the identical console actuation must proceed: {accepted:?}"
+        );
+        assert_eq!(*order.borrow(), ["retain", "invoke"]);
     }
 
     #[test]
