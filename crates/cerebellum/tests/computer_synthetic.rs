@@ -10,7 +10,9 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
-use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
+use cerebellum::computer_capability::{
+    servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
+};
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::capture::InMemoryCaptureBackend;
 use cerebellum_computer::platform::{
@@ -457,6 +459,78 @@ async fn computer_move_requires_and_consumes_a_once_mutate_durable_lease() {
         dispatched_calls(&shared).len(),
         1,
         "the consumed Once lease admitted a second global post"
+    );
+}
+
+/// A once-grant refusal keeps its repair instruction when the production serving
+/// boundary enforces the frozen result schema instead of merely detecting it.
+#[tokio::test]
+async fn withholding_mode_preserves_move_once_grant_remedy() {
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
+        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+
+    let reply = plane
+        .serve(
+            servable("computer.move").expect("move is servable"),
+            &move_request(),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("a declared refusal reaches the caller in withholding mode");
+
+    assert_eq!(reply["outcome"], "once_grant_required");
+    assert_eq!(
+        reply["remedy"],
+        "call computer.open_target for action_kind 'mutate_durable', choose the 'once' grant kind, then retry"
+    );
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "withholding a declared refusal recorded a schema finding: {:?}",
+        plane.result_schema_findings()
+    );
+}
+
+/// Invalid synthetic requests preserve both the failed field and its one-word
+/// reason when the production serving boundary enforces the frozen schema.
+#[tokio::test]
+async fn withholding_mode_preserves_keys_invalid_request_diagnostics() {
+    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
+        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
+    let clock = FakeClock::new();
+    let management = management();
+
+    let reply = plane
+        .serve(
+            servable("computer.keys").expect("keys is servable"),
+            &keys_request(&["a", "b"]),
+            ServeContext {
+                grantee: GRANTEE,
+                identity: identity(),
+                management: &management,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .expect("a declared refusal reaches the caller in withholding mode");
+
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["field"], "keys");
+    assert_eq!(reply["reason"], "multiple_keys");
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "withholding a declared refusal recorded a schema finding: {:?}",
+        plane.result_schema_findings()
     );
 }
 

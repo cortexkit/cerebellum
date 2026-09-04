@@ -232,7 +232,7 @@ async fn declared_screenshot_refusal_leaves_no_result_schema_finding() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
-/// Withholding mode must permit an actionable refusal declared by vocabulary v5.
+/// Withholding mode must permit an actionable refusal declared by vocabulary v8.
 #[tokio::test]
 async fn withholding_mode_permits_a_declared_refusal() {
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
@@ -532,7 +532,7 @@ async fn a_region_request_returns_the_named_window_rows() {
     );
 }
 
-/// A present region must have the object shape declared by vocabulary v5.
+/// A present region must have the object shape declared by vocabulary v8.
 #[tokio::test]
 async fn a_null_region_request_is_rejected_as_the_wrong_type() {
     let clock = FakeClock::new();

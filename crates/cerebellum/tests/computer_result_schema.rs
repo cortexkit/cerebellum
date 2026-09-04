@@ -1,4 +1,4 @@
-//! Exact inventory of computer replies against the frozen v5 result schemas.
+//! Exact inventory of computer replies against the frozen v8 result schemas.
 //!
 //! Every reply recorded here is returned by `ComputerPlane::serve`. The shared
 //! fixture from `computer_screenshot` supplies fake clocks, leases, audit storage,
@@ -7,7 +7,8 @@
 //! The inventory reaches these refusal states: invalid screenshot region and
 //! scope, missing broad grant, ambiguous target, unavailable audit, failed and
 //! oversized capture, no capturable window, invalid click request, ambiguous
-//! click target, and a wait target that becomes unreadable after consent.
+//! click target, five invalid synthetic requests, and a wait target that becomes
+//! unreadable after consent.
 //!
 //! The following states cannot be reached deterministically through `serve` yet:
 //! semantic click-driver refusals (the production macOS driver is constructed
@@ -346,6 +347,45 @@ async fn served_screenshot_replies() -> Vec<Value> {
     replies
 }
 
+async fn served_synthetic_replies() -> Vec<(&'static str, Value)> {
+    let cases = [
+        ("computer.type", json!({})),
+        (
+            "computer.keys",
+            json!({"keys": ["a", "b"], "target": "editor"}),
+        ),
+        (
+            "computer.scroll",
+            json!({"target": "editor", "axis": "vertical", "amount_lines": "bad"}),
+        ),
+        ("computer.move", json!({})),
+        ("computer.drag", json!({})),
+    ];
+    let mut replies = Vec::with_capacity(cases.len());
+    for (capability_id, arguments) in cases {
+        let clock = FakeClock::new();
+        let plane = ComputerPlane::new(audit());
+        let management = unleased_management();
+        let reply = plane
+            .serve(
+                servable(capability_id).expect("synthetic capability is servable"),
+                &arguments,
+                ServeContext {
+                    grantee: GRANTEE,
+                    identity: identity(),
+                    management: &management,
+                    clock: &clock,
+                    now_ms: 10,
+                },
+                |_| InMemoryCaptureBackend::default(),
+            )
+            .await
+            .expect("detect-only validation preserves the synthetic refusal");
+        replies.push((capability_id, named_reply(reply, "invalid_request")));
+    }
+    replies
+}
+
 async fn served_wait_replies() -> Vec<Value> {
     let clock = FakeClock::new();
     let resolver = MutableTargetResolver::new(TargetResolution::Resolved(grant()));
@@ -469,8 +509,18 @@ async fn served_reply_divergence_inventory_is_empty() {
     let screenshot = observed_facts("computer.screenshot", served_screenshot_replies().await);
     let wait = observed_facts("computer.wait", served_wait_replies().await);
     let click = observed_facts("computer.click", served_click_replies().await);
+    let synthetic: BTreeSet<_> = served_synthetic_replies()
+        .await
+        .into_iter()
+        .flat_map(|(capability_id, reply)| observed_facts(capability_id, [reply]))
+        .collect();
 
-    let actual: BTreeSet<_> = screenshot.into_iter().chain(click).chain(wait).collect();
+    let actual: BTreeSet<_> = screenshot
+        .into_iter()
+        .chain(click)
+        .chain(wait)
+        .chain(synthetic)
+        .collect();
     let code_owned: BTreeSet<_> = actual
         .iter()
         .filter(|fact| fact.owed_by == OwedBy::Reply)

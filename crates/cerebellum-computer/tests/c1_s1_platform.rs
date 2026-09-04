@@ -1,24 +1,40 @@
 use std::collections::BTreeSet;
 
-use serde_json::{json, Value};
-
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v7.json");
-
 use cerebellum_computer::platform::{
-    attributed_permission_liveness, capability_declarations, computed_vocabulary_sha256,
-    delivered_semantic_action, implementation_source_lock_digest, validate_vocabulary,
-    validate_vocabulary_digests, CapabilityAdvertisementContext, ImmutableReleaseInputs,
-    PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport, PermissionProbeResult,
-    PermissionService, SemanticActionIntent, SemanticActionPlatform, StartupCapabilityProbe,
-    VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
+    attributed_permission_liveness, canonical_json_bytes, capability_declarations,
+    computed_vocabulary_sha256, delivered_semantic_action, implementation_source_lock_digest,
+    validate_vocabulary, validate_vocabulary_digests, CapabilityAdvertisementContext,
+    ImmutableReleaseInputs, PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport,
+    PermissionProbeResult, PermissionService, SemanticActionIntent, SemanticActionPlatform,
+    StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 #[cfg(target_os = "macos")]
 use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v8.json");
+const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
+const SYNTHETIC_CAPABILITIES: [&str; 5] = [
+    "computer.type",
+    "computer.keys",
+    "computer.scroll",
+    "computer.move",
+    "computer.drag",
+];
+const SYNTHETIC_REFUSAL_FIELDS: [&str; 4] = ["chord", "field", "reason", "remedy"];
+
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v7");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v8");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -41,10 +57,88 @@ fn vocabulary_requires_all_three_digest_sources() {
 }
 
 #[test]
-fn implementation_source_lock_digest_matches_the_v7_artifact() {
+fn implementation_source_lock_digest_matches_the_v8_artifact() {
     assert_eq!(
         implementation_source_lock_digest().as_deref(),
         Some(COMPUTER_ACTION_VOCABULARY_SHA256)
+    );
+}
+
+#[test]
+fn every_synthetic_row_declares_all_refusal_fields_without_requiring_them() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let mut checked = 0;
+    for row in vocabulary["rows"].as_array().expect("rows") {
+        let capability = row["capability_id"]
+            .as_str()
+            .expect("every row has a capability id");
+        if !SYNTHETIC_CAPABILITIES.contains(&capability) {
+            continue;
+        }
+        checked += 1;
+        let properties = row["result_schema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{capability} has result properties"));
+        let required = row["result_schema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{capability} has result required fields"));
+        for field in SYNTHETIC_REFUSAL_FIELDS {
+            let property = properties
+                .get(field)
+                .unwrap_or_else(|| panic!("{capability} does not declare result field {field}"));
+            assert_eq!(
+                property["type"], "string",
+                "{capability}.{field} must be a string"
+            );
+            let description = property["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{capability}.{field} needs a description"));
+            assert!(
+                !description.is_empty(),
+                "{capability}.{field} has an empty description"
+            );
+            assert!(
+                !required.iter().any(|name| name.as_str() == Some(field)),
+                "{capability}.{field} must remain optional"
+            );
+            if field == "chord" {
+                assert!(
+                    description.contains("hard-blocklist"),
+                    "{capability}.chord does not mention the upcoming hard-blocklist slice"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        checked,
+        SYNTHETIC_CAPABILITIES.len(),
+        "the five synthetic rows were not all checked"
+    );
+}
+
+#[test]
+fn v8_only_adds_refusal_fields_to_the_five_synthetic_rows() {
+    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    before["revision"] = json!("computer_action_vocabulary-v7");
+    for row in before["rows"].as_array_mut().expect("rows") {
+        let capability = row["capability_id"]
+            .as_str()
+            .expect("every row has a capability id")
+            .to_owned();
+        if SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
+            let properties = row["result_schema"]["properties"]
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("{capability} has result properties"));
+            for field in SYNTHETIC_REFUSAL_FIELDS {
+                properties.remove(field);
+            }
+        }
+    }
+    let recreated_v7 = canonical_json_bytes(&before).expect("the recreated v7 is canonical");
+    assert_eq!(
+        hex_digest(&recreated_v7),
+        V7_ARTIFACT_SHA256,
+        "v8 changed a row or field outside the five synthetic refusal additions"
     );
 }
 
@@ -147,7 +241,7 @@ fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
 }
 
 #[test]
-fn click_query_and_wait_settle_markers_are_closed_to_v5_values() {
+fn click_query_and_wait_settle_markers_are_closed_to_v8_values() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows");
     let click = rows
