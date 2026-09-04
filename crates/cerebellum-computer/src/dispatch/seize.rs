@@ -48,7 +48,9 @@ pub enum AbortReason {
     UserSeizedControl,
     ObserverUnavailable,
     SeizeLatencyBoundExceeded,
-    IdleGateRefused,
+    /// Carries the refusal, because "not idle" without the threshold and the
+    /// observed milliseconds cannot tell an operator why it was true.
+    IdleGateRefused(IdleGateRefusal),
     FocusMismatch,
 }
 
@@ -180,14 +182,14 @@ impl SeizeWatcher {
 pub const OBSERVER_HEARTBEAT_BOUND_MS: u64 = 50;
 
 /// Starting point for how long the desk must have been idle before an observed
-/// post may go out, in seconds.
+/// post may go out, in milliseconds.
 ///
 /// One second is a starting point, not a measured human-factors result: it is
 /// long enough that a key still bouncing is "not idle", and short enough that
 /// a pause between thoughts is not a lockout. The gate is evaluated at each
 /// post against a reading handed in, never at grant time and never at sequence
 /// start.
-pub const OBSERVED_DISPATCH_IDLE_SECONDS: f64 = 1.0;
+pub const OBSERVED_DISPATCH_IDLE_MS: u64 = 1_000;
 
 /// `kCGEventSourceUnixProcessID` value treated as hardware input.
 ///
@@ -303,28 +305,26 @@ pub fn classify_sourced_input(source_unix_process_id: i64, our_pid: i64) -> Sour
 ///
 /// `BelowThreshold` carries both numbers so a caller can show why "non-idle"
 /// was true rather than collapsing it to a boolean.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "idle")]
 pub enum IdleGateRefusal {
     Unreadable(IdleUnreadable),
-    BelowThreshold {
-        threshold_seconds: f64,
-        observed_seconds: f64,
-    },
+    BelowThreshold { threshold_ms: u64, observed_ms: u64 },
 }
 
-/// Check an idle reading against [`OBSERVED_DISPATCH_IDLE_SECONDS`].
+/// Check an idle reading against [`OBSERVED_DISPATCH_IDLE_MS`].
 ///
 /// Unreadable refuses. Below the threshold refuses. Equal or above proceeds.
 pub fn idle_gate(reading: IdleReading) -> Result<(), IdleGateRefusal> {
     match reading {
         IdleReading::Unreadable(reason) => Err(IdleGateRefusal::Unreadable(reason)),
-        IdleReading::Seconds(observed) if observed < OBSERVED_DISPATCH_IDLE_SECONDS => {
+        IdleReading::Milliseconds(observed) if observed < OBSERVED_DISPATCH_IDLE_MS => {
             Err(IdleGateRefusal::BelowThreshold {
-                threshold_seconds: OBSERVED_DISPATCH_IDLE_SECONDS,
-                observed_seconds: observed,
+                threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
+                observed_ms: observed,
             })
         }
-        IdleReading::Seconds(_) => Ok(()),
+        IdleReading::Milliseconds(_) => Ok(()),
     }
 }
 
@@ -376,7 +376,7 @@ where
 
     let idle_reading = read_idle();
     if let Err(refusal) = idle_gate(idle_reading) {
-        watcher.abort(AbortReason::IdleGateRefused, index, None);
+        watcher.abort(AbortReason::IdleGateRefused(refusal), index, None);
         return Err(ObservedPostRefusal::Idle(refusal));
     }
 
@@ -413,7 +413,7 @@ mod tests {
     }
 
     fn idle_enough() -> IdleReading {
-        IdleReading::Seconds(OBSERVED_DISPATCH_IDLE_SECONDS + 0.1)
+        IdleReading::Milliseconds(OBSERVED_DISPATCH_IDLE_MS + 100)
     }
 
     fn run_post<H, I, F, P, T>(
@@ -621,12 +621,12 @@ mod tests {
 
     #[test]
     fn idle_below_threshold_refuses_carrying_both_numbers() {
-        let observed = OBSERVED_DISPATCH_IDLE_SECONDS - 0.1;
+        let observed = OBSERVED_DISPATCH_IDLE_MS - 100;
         assert_eq!(
-            idle_gate(IdleReading::Seconds(observed)),
+            idle_gate(IdleReading::Milliseconds(observed)),
             Err(IdleGateRefusal::BelowThreshold {
-                threshold_seconds: OBSERVED_DISPATCH_IDLE_SECONDS,
-                observed_seconds: observed,
+                threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
+                observed_ms: observed,
             })
         );
 
@@ -635,7 +635,7 @@ mod tests {
         let refused = run_post(
             &mut watcher,
             |posted| seen_at(*posted, posted.posted_at_ms),
-            || IdleReading::Seconds(observed),
+            || IdleReading::Milliseconds(observed),
             || true,
             || {
                 posts.set(posts.get() + 1);
@@ -644,8 +644,8 @@ mod tests {
         assert_eq!(
             refused,
             Err(ObservedPostRefusal::Idle(IdleGateRefusal::BelowThreshold {
-                threshold_seconds: OBSERVED_DISPATCH_IDLE_SECONDS,
-                observed_seconds: observed,
+                threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
+                observed_ms: observed,
             }))
         );
         assert_eq!(posts.get(), 0);

@@ -1126,18 +1126,41 @@ pub struct InputObservationResult {
     pub detection_latency_ms: u32,
 }
 
-/// Seconds since last input, or a reason the idle table could not be read.
+/// Milliseconds since last input, or a reason the idle table could not be read.
+///
+/// Integer milliseconds rather than the float CoreGraphics reports, so the
+/// reading and every refusal built from it stay `Eq` and can sit inside audit
+/// records that are compared whole. Sub-millisecond idleness is not a
+/// distinction this gate makes.
 ///
 /// Unreadable is a first-class state: collapsing it to zero would look like
 /// "just now" and collapsing it to infinity would look like "idle forever".
 /// Either lie would pass or fail the idle gate for the wrong reason. A blind
 /// tap counting pid-0 events would also invent a false idle, which is why
 /// this reading is handed in rather than derived from the observer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleReading {
-    Seconds(f64),
+    Milliseconds(u64),
     Unreadable(IdleUnreadable),
+}
+
+impl IdleReading {
+    /// From the float seconds CoreGraphics reports. Negative or non-finite
+    /// values are not a time since anything; they read as unreadable rather
+    /// than as zero.
+    pub fn from_seconds(seconds: f64) -> Self {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return IdleReading::Unreadable(IdleUnreadable::TableUnavailable);
+        }
+        // Saturate rather than wrap: a reading past u64 milliseconds is idle.
+        let ms = (seconds * 1000.0).floor();
+        if ms >= u64::MAX as f64 {
+            IdleReading::Milliseconds(u64::MAX)
+        } else {
+            IdleReading::Milliseconds(ms as u64)
+        }
+    }
 }
 
 /// Why the HID idle table could not be trusted as a number of seconds.

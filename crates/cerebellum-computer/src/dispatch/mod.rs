@@ -307,6 +307,11 @@ pub enum DispatchError {
     EnvelopeUnrecognized,
     UnsupportedMode,
     ObserverUnavailable,
+    /// The machine is in use, or its idleness could not be read. Carries the
+    /// refusal so the wire shows the threshold and the observed milliseconds
+    /// -- the remedy ("wait for the user to step away") is nothing like the
+    /// remedy for an unavailable observer, and the two used to share a word.
+    IdleGateRefused(IdleGateRefusal),
     UserSeizedControl,
     AttendanceUnavailable,
     TargetFocusMismatch,
@@ -419,6 +424,8 @@ impl DispatchError {
             Self::EnvelopeUnrecognized => "envelope_unrecognized",
             Self::UnsupportedMode => "unsupported_mode",
             Self::ObserverUnavailable => "observer_unavailable",
+            Self::IdleGateRefused(IdleGateRefusal::Unreadable(_)) => "idle_unreadable",
+            Self::IdleGateRefused(IdleGateRefusal::BelowThreshold { .. }) => "not_idle",
             Self::UserSeizedControl => "user_seized_control",
             Self::AttendanceUnavailable => "attendance_unavailable",
             Self::TargetFocusMismatch => "target_focus_mismatch",
@@ -592,7 +599,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                     Some(
                         AbortReason::ObserverUnavailable
                         | AbortReason::SeizeLatencyBoundExceeded
-                        | AbortReason::IdleGateRefused,
+                        | AbortReason::IdleGateRefused(_),
                     ) => DispatchError::ObserverUnavailable,
                     Some(AbortReason::FocusMismatch) => DispatchError::TargetFocusMismatch,
                     Some(AbortReason::UserSeizedControl) | None => DispatchError::UserSeizedControl,
@@ -839,8 +846,12 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 if let Some(abort) = guard.abort_decision() {
                     let refusal = match abort.reason {
                         AbortReason::ObserverUnavailable
-                        | AbortReason::SeizeLatencyBoundExceeded
-                        | AbortReason::IdleGateRefused => DispatchError::ObserverUnavailable,
+                        | AbortReason::SeizeLatencyBoundExceeded => {
+                            DispatchError::ObserverUnavailable
+                        }
+                        AbortReason::IdleGateRefused(refusal) => {
+                            DispatchError::IdleGateRefused(refusal)
+                        }
                         AbortReason::FocusMismatch => DispatchError::TargetFocusMismatch,
                         AbortReason::UserSeizedControl => DispatchError::UserSeizedControl,
                     };
@@ -1462,5 +1473,47 @@ mod delivery_containment_validation_tests {
             ),
             Ok(())
         );
+    }
+}
+
+#[cfg(test)]
+mod idle_refusal_wire_tests {
+    use super::*;
+    use crate::platform::IdleUnreadable;
+
+    /// The idle gate's two refusals reach the wire under their own codes,
+    /// carrying their numbers, and neither is "observer_unavailable".
+    ///
+    /// The first version of this mapping folded IdleGateRefused into
+    /// ObserverUnavailable so an exhaustive match would compile. An operator
+    /// reading that would check the observer; the remedy is to wait for the
+    /// user to step away. Asserted here at the code, because the only
+    /// production path to this variant is not wired yet and a later change
+    /// that restores the fold would compile.
+    #[test]
+    fn idle_refusals_reach_the_wire_under_their_own_codes_with_their_numbers() {
+        let below = DispatchError::IdleGateRefused(IdleGateRefusal::BelowThreshold {
+            threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
+            observed_ms: 40,
+        });
+        let unreadable = DispatchError::IdleGateRefused(IdleGateRefusal::Unreadable(
+            IdleUnreadable::TableUnavailable,
+        ));
+
+        assert_eq!(below.reason_code(), "not_idle");
+        assert_eq!(unreadable.reason_code(), "idle_unreadable");
+        for refusal in [&below, &unreadable] {
+            assert_ne!(
+                refusal.reason_code(),
+                DispatchError::ObserverUnavailable.reason_code(),
+                "an idle refusal was reported as the observer being unavailable: {refusal:?}"
+            );
+        }
+
+        // The numbers survive serialization: this is what the wire carries.
+        let json = serde_json::to_value(&below).expect("serializes");
+        let text = json.to_string();
+        assert!(text.contains("1000"), "threshold missing from {text}");
+        assert!(text.contains("40"), "observed missing from {text}");
     }
 }
