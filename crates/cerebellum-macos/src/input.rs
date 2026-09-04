@@ -309,6 +309,30 @@ mod framework {
             .ok_or(InputEventConstructionError::EventSourceUnavailable)
     }
 
+    /// A mouse-move built from a PRIVATE event source, for measurement only.
+    ///
+    /// Production events come from `HIDSystemState`, and a measured consequence
+    /// is that posting one resets the hardware idle table -- the machine reads
+    /// "just touched" because we touched it. Whether a private-state source
+    /// leaves that table alone is the question this exists to let a probe ask.
+    /// It is not a second construction path for dispatch: nothing in the
+    /// computer crate calls it, and the thin-seam tests keep it that way.
+    pub fn mouse_move_event_from_private_source(
+        point: EventPoint,
+    ) -> Result<OwnedCgEvent, InputEventConstructionError> {
+        let source = CGEventSource::new(CGEventSourceStateID::Private)
+            .ok_or(InputEventConstructionError::EventSourceUnavailable)?;
+        let event = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::MouseMoved,
+            CGPoint::new(point.x, point.y),
+            CGMouseButton::Left,
+        )
+        .ok_or(InputEventConstructionError::MouseMoveUnavailable)?;
+        CGEvent::set_flags(Some(&event), CGEventFlags::empty());
+        Ok(event)
+    }
+
     /// Seconds since any input event in `table`, as CoreGraphics reports it.
     ///
     /// Uses `kCGAnyInputEventType`. The objc2 binding skips that constant; the
@@ -494,7 +518,8 @@ mod framework {
 #[cfg(target_os = "macos")]
 pub use framework::{
     event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
-    mouse_move_event, scroll_wheel_event, seconds_since_last_input, text_input_events,
+    mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
+    seconds_since_last_input, text_input_events,
 };
 
 #[cfg(test)]

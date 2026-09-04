@@ -393,6 +393,19 @@ pub fn post_event_globally(event: OwnedCgEvent) -> CgEventPostCall {
     CgEventPostCall
 }
 
+/// Ask CoreGraphics to post one event at the SESSION tap, for measurement only.
+///
+/// The HID-tap post resets the hardware idle table whatever event source built
+/// the event (measured: both HIDSystemState and Private sources, 20024s and
+/// 29s to under a second after one post). The remaining variable is the
+/// location the event enters the stream, and a probe needs to post at the
+/// session location to read it. Not a second dispatch path: nothing in the
+/// computer crate calls this, and the thin-seam tests keep it that way.
+pub fn post_event_at_session_tap(event: OwnedCgEvent) -> CgEventPostCall {
+    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
+    CgEventPostCall
+}
+
 /// When a process was started, as kernel-sourced microseconds since the epoch.
 ///
 /// This is the discriminator that survives pid reuse. A pid alone identifies

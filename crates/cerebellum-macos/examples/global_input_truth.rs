@@ -53,9 +53,19 @@ fn parse_seconds(arg: Option<String>, default: u64) -> u64 {
 #[cfg(target_os = "macos")]
 fn idle(table_name: Option<&str>) {
     use cerebellum_macos::{
-        mouse_move_event, post_event_globally, seconds_since_last_input, EventPoint,
-        EventSourceStateTable,
+        mouse_move_event, mouse_move_event_from_private_source, post_event_at_session_tap,
+        post_event_globally, seconds_since_last_input, EventPoint, EventSourceStateTable,
     };
+
+    // `--private-source` posts from a Private event source instead of the
+    // production HIDSystemState one. Measured: the production source RESETS
+    // the HID idle table (20024s -> 0.8s after one post), so this arm asks
+    // whether a private source leaves it alone -- which decides whether the
+    // idleness gate can read the HID table at all.
+    let private_source = std::env::args().any(|arg| arg == "--private-source");
+    // `--session-tap` posts at the session tap location instead of the HID
+    // tap, the other variable that could decide which table a post disturbs.
+    let session_tap = std::env::args().any(|arg| arg == "--session-tap");
 
     let table = match table_name {
         Some("hid") | Some("HIDSystemState") => EventSourceStateTable::HidSystem,
@@ -75,18 +85,36 @@ fn idle(table_name: Option<&str>) {
     println!("seconds_before {before}");
 
     let point = current_pointer();
-    let event = match mouse_move_event(EventPoint {
+    let at = EventPoint {
         x: point.x,
         y: point.y,
-    }) {
+    };
+    let built = if private_source {
+        mouse_move_event_from_private_source(at)
+    } else {
+        mouse_move_event(at)
+    };
+    let event = match built {
         Ok(event) => event,
         Err(error) => {
             eprintln!("could not construct a mouse-move: {error}");
             std::process::exit(1);
         }
     };
-    let _ = post_event_globally(event);
-    println!("posted mouse-moved globally");
+    if session_tap {
+        let _ = post_event_at_session_tap(event);
+    } else {
+        let _ = post_event_globally(event);
+    }
+    println!(
+        "posted mouse-moved at {} tap from {} source",
+        if session_tap { "SESSION" } else { "HID" },
+        if private_source {
+            "PRIVATE"
+        } else {
+            "HIDSystemState"
+        }
+    );
 
     let after = seconds_since_last_input(table);
     println!("seconds_after {after}");

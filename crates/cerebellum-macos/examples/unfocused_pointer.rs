@@ -50,7 +50,7 @@ fn main() {
 
     let Some(target) = pid_of("TextEdit") else {
         eprintln!("PROBE FAILED: TextEdit did not appear in the process list");
-        return;
+        std::process::exit(1);
     };
     println!("target TextEdit pid: {target}");
 
@@ -58,9 +58,16 @@ fn main() {
     // the geometry is the same either way and a reading taken later would be one
     // more thing the background state could be blamed for.
     let Some(text_frame) = read_text_area_frame(target) else {
-        eprintln!("PROBE FAILED: TextEdit's text area has no readable frame");
+        // An application launched while the screen is locked starts without
+        // realising its windows, so this is the lock's fingerprint more often
+        // than TextEdit's fault. Say which, and exit non-zero: a probe that
+        // fails and exits 0 reads as a pass to anything that did not read it.
+        eprintln!(
+            "PROBE FAILED: TextEdit's text area has no readable frame (screen locked: {:?})",
+            cerebellum_macos::screen_is_locked()
+        );
         quit_textedit();
-        return;
+        std::process::exit(1);
     };
     println!("text area frame: {text_frame:?}");
 
@@ -130,7 +137,7 @@ fn main() {
         Err(error) => {
             eprintln!("PROBE FAILED: could not build the drag sequence: {error:?}");
             quit_textedit();
-            return;
+            std::process::exit(1);
         }
     };
     // A second control, for the control run only: post the SAME constructed
@@ -140,11 +147,19 @@ fn main() {
     // the one place a global post appears in this repository, it is diagnostic,
     // and it is why it lives in a probe rather than in the driver.
     let post_globally = std::env::var("CEREBELLUM_PROBE_POST_GLOBAL").is_ok();
+    // The HID tap resets the hardware idle table and the session tap does not
+    // (measured with global_input_truth). An idleness gate can only read that
+    // table if global posts enter at the session tap -- provided they still
+    // DELIVER from there, which is what this switch lets the drag arm measure.
+    let at_session_tap = std::env::var("CEREBELLUM_PROBE_SESSION_TAP").is_ok();
     println!(
         "posting {} pointer events {}",
         events.len(),
         if post_globally {
-            "GLOBALLY (diagnostic control)".to_string()
+            format!(
+                "GLOBALLY at the {} tap (diagnostic control)",
+                if at_session_tap { "SESSION" } else { "HID" }
+            )
         } else {
             format!("to pid {target}")
         }
@@ -152,7 +167,11 @@ fn main() {
     for event in events {
         if post_globally {
             objc2_core_graphics::CGEvent::post(
-                objc2_core_graphics::CGEventTapLocation::HIDEventTap,
+                if at_session_tap {
+                    objc2_core_graphics::CGEventTapLocation::SessionEventTap
+                } else {
+                    objc2_core_graphics::CGEventTapLocation::HIDEventTap
+                },
                 Some(event.as_ref()),
             );
         } else {
