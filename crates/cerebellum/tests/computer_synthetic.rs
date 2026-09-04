@@ -16,14 +16,15 @@ use cerebellum::computer_capability::{
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::capture::InMemoryCaptureBackend;
 use cerebellum_computer::platform::{
-    AccessibilityTreeRequest, AccessibilityTreeResult, AttendancePreconditionRequest,
-    AttendancePreconditionResult, CapabilityAdvertisementContext, CapabilityDeclaration,
-    DispatchResult, DriverError, EffectObservationRequest, EffectObservationResult, EffectStatus,
-    ElementResolutionRequest, ElementResolutionResult, FocusQueryRequest, FocusQueryResult,
-    FrontingSnapshot, HeldStateDisposition, InputObservationRequest, InputObservationResult,
-    InputObserverLiveness, PlatformDriver, PostCallFailure, ProcessEventRefusal, ProcessGrant,
-    SemanticDispatchRequest, SequencePostFailure, SyntheticAction, SyntheticDispatchRequest,
-    SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit,
+    current_blocked_chord_platform, AccessibilityTreeRequest, AccessibilityTreeResult,
+    AttendancePreconditionRequest, AttendancePreconditionResult, CapabilityAdvertisementContext,
+    CapabilityDeclaration, DispatchResult, DriverError, EffectObservationRequest,
+    EffectObservationResult, EffectStatus, ElementResolutionRequest, ElementResolutionResult,
+    FocusQueryRequest, FocusQueryResult, FrontingSnapshot, HeldStateDisposition,
+    InputObservationRequest, InputObservationResult, InputObserverLiveness, PlatformDriver,
+    PostCallFailure, ProcessEventRefusal, ProcessGrant, SemanticDispatchRequest,
+    SequencePostFailure, SyntheticAction, SyntheticDispatchRequest, SyntheticKey,
+    SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit, BLOCKED_CHORDS,
 };
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::consent::ActionKind;
@@ -497,6 +498,127 @@ async fn withholding_mode_preserves_move_once_grant_remedy() {
         "withholding a declared refusal recorded a schema finding: {:?}",
         plane.result_schema_findings()
     );
+}
+
+/// Every session-ending chord remains refused even with the widest lease this
+/// fixture can mint; the floor runs before authority and records the attempt.
+#[tokio::test]
+async fn every_listed_session_ending_chord_is_refused_above_a_full_lease() {
+    let platform = current_blocked_chord_platform().expect("this test runs on a synthetic host");
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+    let shared = Shared::handle();
+    let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+        audit(),
+        ResultSchemaEnforcement::Withhold,
+        SyntheticDriver::factory(Arc::clone(&shared)),
+    );
+    let mut tested = 0;
+
+    for blocked in BLOCKED_CHORDS
+        .iter()
+        .filter(|blocked| blocked.platform == platform)
+    {
+        let reply = serve(
+            &plane,
+            "computer.keys",
+            keys_request(blocked.chord),
+            &management,
+            &clock,
+        )
+        .await;
+        let chord = blocked.chord.join("+");
+        assert_eq!(reply["outcome"], "chord_blocked", "{chord} was admitted");
+        assert_eq!(
+            reply["chord"], chord,
+            "{chord} was rewritten in its refusal"
+        );
+        assert_eq!(reply["reason"], blocked.reason, "{chord} lost its reason");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains("do this yourself")),
+            "{chord} offered a grant path"
+        );
+        tested += 1;
+    }
+    assert!(
+        tested > 0,
+        "the current platform has no session-ending chord coverage"
+    );
+    assert!(
+        plane.result_schema_findings().is_empty(),
+        "the declared chord refusal failed schema validation: {:?}",
+        plane.result_schema_findings()
+    );
+
+    let history = plane
+        .refusal_history_for_test(GRANTEE)
+        .await
+        .expect("a blocked chord enters the refusal ring");
+    assert_eq!(history.total_count, tested);
+    for (record, blocked) in history.records.iter().zip(
+        BLOCKED_CHORDS
+            .iter()
+            .filter(|blocked| blocked.platform == platform),
+    ) {
+        let chord = blocked.chord.join("+");
+        assert_eq!(record.claimed_addressing, chord);
+        assert_eq!(record.reason.chord, chord);
+        assert_eq!(record.reason.reason, blocked.reason);
+    }
+}
+
+/// Exact modifiers matter: quitting an app and saving-as remain grantable.
+#[tokio::test]
+async fn session_floor_leaves_command_near_misses_grantable() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+
+    for keys in [&["command", "q"][..], &["command", "shift", "s"][..]] {
+        let reply = serve(
+            &plane,
+            "computer.keys",
+            keys_request(keys),
+            &management,
+            &clock,
+        )
+        .await;
+        assert_eq!(
+            reply["outcome"],
+            "completed",
+            "{} was blocked",
+            keys.join("+")
+        );
+    }
+}
+
+/// Semantic click titles lack the key-chord information this floor uses; a
+/// locale- and role-aware session-action policy would be needed to cover them.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn semantic_click_log_out_title_is_not_refused_by_the_chord_floor() {
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management();
+    let reply = serve(
+        &plane,
+        "computer.click",
+        json!({
+            "target": {"by": "role_and_title", "role": "AXMenuItem", "title": "Log Out…"},
+            "button": "left",
+            "click_count": 1,
+            "modifiers": [],
+        }),
+        &management,
+        &clock,
+    )
+    .await;
+
+    assert_ne!(reply["outcome"], "chord_blocked");
 }
 
 /// Invalid synthetic requests preserve both the failed field and its one-word

@@ -20,6 +20,10 @@ pub struct SyntheticKeyModifiers {
     pub shift: bool,
     pub option: bool,
     pub control: bool,
+    /// Windows key. It is rejected by the macOS wire decoder rather than
+    /// silently translated into a different modifier.
+    #[serde(default)]
+    pub windows: bool,
 }
 
 impl SyntheticKeyModifiers {
@@ -28,6 +32,7 @@ impl SyntheticKeyModifiers {
         shift: false,
         option: false,
         control: false,
+        windows: false,
     };
 }
 
