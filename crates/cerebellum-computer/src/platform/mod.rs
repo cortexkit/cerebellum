@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
+pub mod blocked_chord;
 pub mod containment;
 pub mod process_event;
 pub mod severity;
 pub mod synthetic;
+pub use blocked_chord::*;
 pub use containment::*;
 pub use process_event::*;
 pub use synthetic::*;

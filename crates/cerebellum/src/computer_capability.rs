@@ -68,14 +68,17 @@ pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
     cerebellum_computer::platform::WindowsUnsupportedCaptureBackend
 }
 use cerebellum_computer::platform::{
-    DispatchMode, EffectStatus, HeldStateDisposition, PlatformDriver, SyntheticAction,
-    SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit,
-    UnsupportedPlatformDriver,
+    blocked_chord, current_blocked_chord_platform, DispatchMode, EffectStatus,
+    HeldStateDisposition, PlatformDriver, SyntheticAction, SyntheticKey, SyntheticKeyModifiers,
+    SyntheticPoint, SyntheticScrollUnit, UnsupportedPlatformDriver,
 };
 use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::consent::{ActionKind, LeaseKey};
 use cerebellum_core::journal::JournalIdentity;
-use cerebellum_core::journal::{JournalStorage, Redactor, SeverityTaxonomy};
+use cerebellum_core::journal::{
+    CallerRefusalHistory, JournalStorage, Redactor, RefusalRing, RefusalRingConfig,
+    SeverityTaxonomy,
+};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -473,6 +476,13 @@ pub struct ResultSchemaFinding {
     pub occurrences: u64,
 }
 
+/// The typed detail retained when the session floor refuses a key chord.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerRefusalReason {
+    pub chord: String,
+    pub reason: String,
+}
+
 /// What a served capability needs beyond the request itself.
 ///
 /// The synthetic driver is the platform object that translates and posts input
@@ -492,6 +502,7 @@ where
     capture: Mutex<Option<ScopedCaptureController<B>>>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
+    refusal_ring: Mutex<RefusalRing<ComputerRefusalReason>>,
     make_synthetic_driver: Arc<dyn Fn() -> D + Send + Sync>,
 }
 
@@ -542,9 +553,22 @@ where
         audit: ComputerAudit<R, T, S>,
         make_synthetic_driver: impl Fn() -> D + Send + Sync + 'static,
     ) -> Self {
-        Self::assemble(
+        Self::with_synthetic_driver_and_result_schema_enforcement(
             audit,
             ResultSchemaEnforcement::DetectOnly,
+            make_synthetic_driver,
+        )
+    }
+
+    /// Construct a synthetic-input plane with an explicit result-schema policy.
+    pub fn with_synthetic_driver_and_result_schema_enforcement(
+        audit: ComputerAudit<R, T, S>,
+        result_schema_enforcement: ResultSchemaEnforcement,
+        make_synthetic_driver: impl Fn() -> D + Send + Sync + 'static,
+    ) -> Self {
+        Self::assemble(
+            audit,
+            result_schema_enforcement,
             Arc::new(make_synthetic_driver),
         )
     }
@@ -559,6 +583,12 @@ where
             capture: Mutex::new(None),
             result_schema_enforcement,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
+            refusal_ring: Mutex::new(
+                RefusalRing::new_in_memory(RefusalRingConfig {
+                    records_per_caller: 16,
+                })
+                .expect("the fixed computer refusal-ring capacity is valid"),
+            ),
             make_synthetic_driver,
         }
     }
@@ -587,6 +617,15 @@ where
             .read_obligation_audit(action_obligation_id)
             .ok()
             .map(|record| record.lifecycle)
+    }
+
+    /// Typed session-floor refusals retained for one caller.
+    #[doc(hidden)]
+    pub async fn refusal_history_for_test(
+        &self,
+        caller: &str,
+    ) -> Option<CallerRefusalHistory<ComputerRefusalReason>> {
+        self.refusal_ring.lock().await.history(caller).cloned()
     }
 
     /// Distinct result-schema violations detected so far, with occurrence counts.
@@ -1190,7 +1229,7 @@ where
         arguments: &Value,
         context: ServeContext<'_, C>,
     ) -> Value {
-        let parsed = match parse_synthetic_request(capability, arguments) {
+        let mut parsed = match parse_synthetic_request(capability, arguments) {
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
@@ -1202,6 +1241,22 @@ where
             clock,
             now_ms: _,
         } = context;
+        if let SyntheticAction::KeyCombination { key, modifiers } = &parsed.action {
+            if let Some(blocked) = current_blocked_chord_platform()
+                .and_then(|platform| blocked_chord(*modifiers, *key, platform))
+            {
+                let chord = parsed
+                    .chord
+                    .as_deref()
+                    .expect("a parsed key combination retains its wire chord");
+                self.record_blocked_chord(grantee, chord, blocked.reason)
+                    .await;
+                return chord_blocked_refusal(chord, blocked.reason);
+            }
+            // The session floor is checked before a Command chord escalates to
+            // mutate_durable, so no lease can make a session-ending action valid.
+            parsed.action_kind = chord_action_kind(*modifiers);
+        }
         // Pointer events have no working per-process path, so scroll, move and
         // drag use the observed global path. Type and keys remain bound to the
         // leased process generation.
@@ -1354,6 +1409,17 @@ where
             }
             Err(refusal) => synthetic_dispatch_refusal(&refusal),
         }
+    }
+
+    async fn record_blocked_chord(&self, caller: &str, chord: &str, reason: &str) {
+        let _ = self.refusal_ring.lock().await.record_refusal(
+            caller,
+            chord,
+            ComputerRefusalReason {
+                chord: chord.to_string(),
+                reason: reason.to_string(),
+            },
+        );
     }
 }
 
@@ -1876,6 +1942,8 @@ fn click_driver_refusal(
 #[derive(Debug)]
 struct ParsedSynthetic {
     action: SyntheticAction,
+    /// The wire spelling of a parsed key chord, retained for a floor refusal.
+    chord: Option<String>,
     /// The consent action kind the lease must cover. Usually the row's own
     /// kind; a durable chord or a drag takes the escalated kind the frozen
     /// vocabulary assigns to it.
@@ -1884,6 +1952,15 @@ struct ParsedSynthetic {
     /// evaluated -- the five schemas declare no post-condition -- so it labels
     /// the serialized predicate rather than naming a resolved target.
     placeholder_element: AccessibilityElementName,
+}
+
+fn chord_blocked_refusal(chord: &str, reason: &str) -> Value {
+    json!({
+        "outcome": "chord_blocked",
+        "chord": chord,
+        "reason": reason,
+        "remedy": "do this yourself; no grant admits a session-ending chord",
+    })
 }
 
 fn once_dispatch_refusal() -> Value {
@@ -2003,6 +2080,7 @@ fn parse_type_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     // one behavior, and the field states the caller's expectation of it.
     Ok(ParsedSynthetic {
         action: SyntheticAction::type_text(text),
+        chord: None,
         action_kind: ActionKind::Compose,
         placeholder_element: AccessibilityElementName::Identifier(target),
     })
@@ -2023,15 +2101,25 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     };
     let mut modifiers = SyntheticKeyModifiers::NONE;
     let mut chord_key: Option<SyntheticKey> = None;
+    let mut chord_names = Vec::with_capacity(keys.len());
     for name in keys {
         let Some(name) = name.as_str() else {
             return Err(invalid_synthetic_request("keys", "wrong_type"));
         };
+        chord_names.push(name);
         match name {
             "command" => modifiers.command = true,
             "shift" => modifiers.shift = true,
             "option" => modifiers.option = true,
             "control" => modifiers.control = true,
+            "windows" => {
+                #[cfg(target_os = "windows")]
+                {
+                    modifiers.windows = true;
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(invalid_synthetic_request("keys", "unknown_key"));
+            }
             _ => {
                 let Some(key) = synthetic_key_from_wire(name) else {
                     return Err(invalid_synthetic_request("keys", "unknown_key"));
@@ -2050,7 +2138,10 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     };
     Ok(ParsedSynthetic {
         action: SyntheticAction::key_combination(key, modifiers),
-        action_kind: chord_action_kind(modifiers),
+        chord: Some(chord_names.join("+")),
+        // The session floor must run before durable-chord escalation; serve
+        // classifies this only after the floor declines the exact chord.
+        action_kind: ActionKind::Compose,
         placeholder_element: AccessibilityElementName::Identifier(target),
     })
 }
@@ -2107,6 +2198,7 @@ fn parse_scroll_request(object: &serde_json::Map<String, Value>) -> Result<Parse
         .map_err(|_| invalid_synthetic_request("amount_lines", "invalid_value"))?;
     Ok(ParsedSynthetic {
         action: SyntheticAction::scroll(SyntheticScrollUnit::Line, delta),
+        chord: None,
         action_kind: ActionKind::Compose,
         placeholder_element: AccessibilityElementName::Identifier(target),
     })
@@ -2116,6 +2208,7 @@ fn parse_move_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     let to = synthetic_point_from_wire(object, "to")?;
     Ok(ParsedSynthetic {
         action: SyntheticAction::move_pointer(to),
+        chord: None,
         action_kind: ActionKind::Compose,
         // No element is named or resolved on this path; the label identifies
         // the capability in the serialized placeholder predicate.
@@ -2157,6 +2250,7 @@ fn parse_drag_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     }
     Ok(ParsedSynthetic {
         action: SyntheticAction::drag_pointer(from, to),
+        chord: None,
         // The frozen row is mutate_durable outright: a drag moves or drops
         // whatever is under the pointer, which is not session-scoped state.
         action_kind: ActionKind::MutateDurable,
@@ -3313,6 +3407,20 @@ mod synthetic_parse_tests {
         assert_eq!(synthetic_key_from_wire("S"), None);
     }
 
+    /// The Windows modifier has a neutral representation for Windows lock,
+    /// but macOS must refuse its wire spelling rather than dropping it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_refuses_the_windows_modifier_as_an_unknown_key() {
+        let refusal = parse(
+            ComputerCapability::Keys,
+            json!({"keys": ["windows", "l"], "target": "editor"}),
+        )
+        .expect_err("macOS has no Windows modifier");
+        assert_eq!(refusal["field"], "keys");
+        assert_eq!(refusal["reason"], "unknown_key");
+    }
+
     /// The durable_chord override, asserted at the classification itself:
     /// Command escalates, everything else stays compose.
     #[test]
@@ -3340,6 +3448,7 @@ mod synthetic_parse_tests {
                 shift: true,
                 option: true,
                 control: true,
+                windows: false,
                 command: false,
             },
         ] {

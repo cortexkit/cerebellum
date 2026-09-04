@@ -188,6 +188,17 @@ fn map_event_construction_error(
 pub fn synthetic_event_steps(
     action: &SyntheticAction,
 ) -> Result<Vec<SyntheticStep<OwnedCgEvent>>, DriverError> {
+    if matches!(
+        action,
+        SyntheticAction::KeyCombination {
+            modifiers: SyntheticKeyModifiers { windows: true, .. },
+            ..
+        }
+    ) {
+        return Err(DriverError::InvalidRequest(
+            "Windows modifier is unsupported on macOS",
+        ));
+    }
     let roles = action.step_roles();
     let events: Vec<OwnedCgEvent> = match action {
         SyntheticAction::TypeText { text } => {
@@ -230,4 +241,27 @@ pub fn synthetic_event_steps(
         .zip(events)
         .map(|(role, event)| SyntheticStep { role, event })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_modifier_is_refused_before_macos_event_construction() {
+        let action = SyntheticAction::key_combination(
+            SyntheticKey::L,
+            SyntheticKeyModifiers {
+                windows: true,
+                ..SyntheticKeyModifiers::NONE
+            },
+        );
+
+        assert!(matches!(
+            synthetic_event_steps(&action),
+            Err(DriverError::InvalidRequest(
+                "Windows modifier is unsupported on macOS"
+            ))
+        ));
+    }
 }
