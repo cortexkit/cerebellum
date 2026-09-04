@@ -1126,6 +1126,28 @@ pub struct InputObservationResult {
     pub detection_latency_ms: u32,
 }
 
+/// Seconds since last input, or a reason the idle table could not be read.
+///
+/// Unreadable is a first-class state: collapsing it to zero would look like
+/// "just now" and collapsing it to infinity would look like "idle forever".
+/// Either lie would pass or fail the idle gate for the wrong reason. A blind
+/// tap counting pid-0 events would also invent a false idle, which is why
+/// this reading is handed in rather than derived from the observer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleReading {
+    Seconds(f64),
+    Unreadable(IdleUnreadable),
+}
+
+/// Why the HID idle table could not be trusted as a number of seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleUnreadable {
+    /// The table itself did not answer.
+    TableUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectObservationRequest {
     /// Which application to read when checking the condition.
