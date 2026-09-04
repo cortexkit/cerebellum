@@ -149,10 +149,23 @@ impl SeizeWatcher {
         }
     }
 
-    /// Classify a sourced event and abort only on hardware (pid 0).
+    /// Classify a sourced event and abort on anything that is not ours.
     ///
-    /// Returns the classification so a caller can journal other-process
-    /// synthetic input without treating it as a seize.
+    /// Hardware (pid 0) is the user. Another process's synthetic input is
+    /// ALSO treated as the user, because on the desk it was: every scroll
+    /// event in a 150-second window arrived from the Logi Options+ agent's
+    /// pid and never from pid 0 -- the driver intercepts the wheel and
+    /// re-posts it as synthetic. A rule that aborted only on pid 0 was blind
+    /// to the user scrolling while we drove the cursor. So the only input
+    /// that does not abort is our own; the classification is returned so the
+    /// journal can say WHICH pid seized, and an operator can tell a driver
+    /// utility from another agent after the fact.
+    ///
+    /// The cost is stated rather than hidden: another agent posting global
+    /// synthetic input on the same desk aborts us. Two global drivers on one
+    /// cursor are a collision either way, and stopping is the safe half of
+    /// it. Per-process posts from another agent are believed not to reach a
+    /// session tap at all; unmeasured, and noted.
     pub fn observe_sourced_input(
         &mut self,
         event: SourcedInputEvent,
@@ -160,7 +173,7 @@ impl SeizeWatcher {
         index: usize,
     ) -> SourcedInputKind {
         let kind = classify_sourced_input(event.source_unix_process_id, our_pid);
-        if matches!(kind, SourcedInputKind::Hardware) {
+        if !matches!(kind, SourcedInputKind::OurProcess) {
             self.abort(
                 AbortReason::UserSeizedControl,
                 index,
@@ -286,9 +299,10 @@ pub enum SourcedInputKind {
 
 /// Classify a source pid against ours.
 ///
-/// Other non-zero pids are neither hardware nor us: another agent's synthetic
-/// input is not the user seizing control, and aborting on it would let any
-/// process on the machine veto ours.
+/// The three kinds are kept distinct for the journal even though two of them
+/// abort: which pid seized is the difference between "the user scrolled
+/// through a driver utility" and "another agent is driving this desk", and
+/// only the record can tell an operator which.
 pub fn classify_sourced_input(source_unix_process_id: i64, our_pid: i64) -> SourcedInputKind {
     if source_unix_process_id == HARDWARE_INPUT_SOURCE_PID {
         SourcedInputKind::Hardware
@@ -573,8 +587,15 @@ mod tests {
         assert_eq!(posts.get(), 1);
     }
 
+    /// Another process's synthetic input aborts, and the journal still learns
+    /// which process.
+    ///
+    /// Measured on the desk: the user's scroll wheel arrives from the Logi
+    /// Options+ agent's pid, never from pid 0. The first version of this rule
+    /// let other-pid input through as "not the user", and would have kept
+    /// posting while the user scrolled.
     #[test]
-    fn other_pid_event_is_observed_and_does_not_abort() {
+    fn other_pid_event_aborts_and_is_still_attributed() {
         let mut watcher = SeizeWatcher::new(50);
         let kind = watcher.observe_sourced_input(
             SourcedInputEvent {
@@ -585,8 +606,11 @@ mod tests {
             0,
         );
         assert_eq!(kind, SourcedInputKind::OtherProcess { pid: OTHER_PID });
-        assert!(watcher.can_post());
-        assert!(watcher.abort_decision().is_none());
+        assert!(!watcher.can_post(), "another process's input did not abort");
+        assert_eq!(
+            watcher.abort_decision().map(|d| d.reason),
+            Some(AbortReason::UserSeizedControl)
+        );
     }
 
     #[test]
