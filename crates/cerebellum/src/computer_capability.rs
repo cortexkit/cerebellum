@@ -168,7 +168,7 @@ fn capture_region(region: CaptureRegion) -> WindowCaptureRegion {
     }
 }
 
-/// Give every screenshot outcome the result envelope declared by vocabulary v5.
+/// Give every screenshot outcome the result envelope declared by vocabulary v8.
 ///
 /// `value` repeats the caller's request and `detail` exposes backend diagnostics;
 /// neither is part of the public refusal contract. The remaining refusal fields
@@ -1894,11 +1894,10 @@ fn once_dispatch_refusal() -> Value {
 }
 
 fn invalid_synthetic_request(field: &str, reason: &str) -> Value {
-    // `field` and `reason` are stripped by the wire envelope before this
-    // reaches the caller: the five result schemas declare no diagnostic
-    // fields. They stay in the value this returns so in-module tests can
-    // assert which check refused, and so the shape matches the other
-    // capabilities' refusals up to the boundary that must drop them.
+    // `field` and `reason` are declared by every synthetic row as of vocabulary
+    // v8, so the wire envelope carries them to the caller. They stay in the value
+    // this returns so in-module tests can assert which check refused, and so the
+    // shape matches the other capabilities' refusals.
     json!({
         "outcome": "invalid_request",
         "field": field,
@@ -2229,10 +2228,9 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
 /// `effect_status`. `computer.move` and `computer.drag` declare no rung:
 /// their delivery is coordinate-addressed and always records the weakest one,
 /// so carrying the field would assert a distinction the row does not make.
-/// Diagnostic fields no row declares (`field`, `reason`, `remedy`, `detail`)
-/// are stripped here rather than shipped: the response contract checker
-/// rejects them, and the audit record is where the typed refusal already
-/// lives.
+/// `detail` is an implementation diagnostic and is stripped here rather than
+/// shipped. The five rows declare `field`, `reason`, `remedy`, and `chord` so
+/// a refusal tells callers what failed and how to continue.
 fn synthetic_wire_envelope(mut reply: Value, carries_containment_rung: bool) -> Value {
     let object = reply
         .as_object_mut()
@@ -2258,9 +2256,7 @@ fn synthetic_wire_envelope(mut reply: Value, carries_containment_rung: bool) -> 
     } else {
         object.remove("containment_rung");
     }
-    for field in ["field", "reason", "remedy", "detail"] {
-        object.remove(field);
-    }
+    object.remove("detail");
     reply
 }
 
