@@ -326,10 +326,18 @@ fn dispatch_synthetic_globally(
                 | ObservedPostRefusal::FocusMismatch
                 | ObservedPostRefusal::AlreadyAborted(_),
             ) => {
-                let abort = watcher.abort_decision().expect(
-                    "every observed-post refusal records the abort that stopped the sequence",
-                );
-                return Err(DriverError::ObservedDispatchAborted(abort));
+                // Every refusal arm in dispatch_observed_post_in_order records
+                // its abort before returning, so this is Some today. The
+                // invariant lives in another file; a refusal added there
+                // without an abort call must surface as a refusal here, not
+                // as a panic on the module loop -- the sequence has already
+                // stopped, and "stopped, reason unrecorded" is the true state.
+                return Err(match watcher.abort_decision() {
+                    Some(abort) => DriverError::ObservedDispatchAborted(abort),
+                    None => DriverError::StartupRefused(
+                        "observed post refused without a recorded abort reason",
+                    ),
+                });
             }
         }
     }
