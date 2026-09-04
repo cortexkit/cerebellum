@@ -570,6 +570,83 @@ async fn every_listed_session_ending_chord_is_refused_above_a_full_lease() {
 }
 
 /// Exact modifiers matter: quitting an app and saving-as remain grantable.
+/// The floor's membership, as literals this file owns.
+///
+/// The test above iterates BLOCKED_CHORDS, so removing an entry from the
+/// constant removes that entry's check with it and the test stays green --
+/// that mutation was run and was not caught. This one names what the floor
+/// must hold on each platform in its own words, so a chord dropped from the
+/// constant fails here by name. Add to BOTH when the floor grows.
+#[test]
+fn the_session_floor_holds_every_chord_this_test_names() {
+    use cerebellum_computer::platform::{blocked_chord, BlockedChordPlatform};
+
+    let mods = |command: bool, control: bool, option: bool, shift: bool, windows: bool| {
+        SyntheticKeyModifiers {
+            command,
+            control,
+            option,
+            shift,
+            windows,
+        }
+    };
+    let expected: [(
+        BlockedChordPlatform,
+        SyntheticKeyModifiers,
+        SyntheticKey,
+        &str,
+    ); 6] = [
+        (
+            BlockedChordPlatform::MacOs,
+            mods(true, true, false, false, false),
+            SyntheticKey::Q,
+            "lock",
+        ),
+        (
+            BlockedChordPlatform::MacOs,
+            mods(true, false, false, true, false),
+            SyntheticKey::Q,
+            "logout",
+        ),
+        (
+            BlockedChordPlatform::MacOs,
+            mods(true, false, true, false, false),
+            SyntheticKey::Escape,
+            "force_quit",
+        ),
+        (
+            BlockedChordPlatform::MacOs,
+            mods(true, false, false, true, false),
+            SyntheticKey::Backspace,
+            "empty_trash",
+        ),
+        (
+            BlockedChordPlatform::MacOs,
+            mods(true, false, true, true, false),
+            SyntheticKey::Escape,
+            "force_quit",
+        ),
+        (
+            BlockedChordPlatform::Windows,
+            mods(false, false, false, false, true),
+            SyntheticKey::L,
+            "lock",
+        ),
+    ];
+    for (platform, modifiers, key, reason) in expected {
+        let found = blocked_chord(modifiers, key, platform);
+        assert!(
+            found.is_some_and(|b| b.reason == reason),
+            "the floor no longer holds {platform:?} {modifiers:?}+{key:?} ({reason}); found {found:?}"
+        );
+    }
+    assert_eq!(
+        BLOCKED_CHORDS.len(),
+        expected.len(),
+        "the constant and this list disagree on how many chords the floor holds"
+    );
+}
+
 #[tokio::test]
 async fn session_floor_leaves_command_near_misses_grantable() {
     let shared = Shared::handle();

@@ -1245,13 +1245,18 @@ where
             if let Some(blocked) = current_blocked_chord_platform()
                 .and_then(|platform| blocked_chord(*modifiers, *key, platform))
             {
+                // The parser sets `chord` on every KeyCombination it produces,
+                // so this is Some today. The refusal must not depend on that
+                // staying true: a blocked chord that panicked here would take
+                // the module loop down instead of refusing, and the chord is
+                // reconstructible from the parts that decided the block.
                 let chord = parsed
                     .chord
-                    .as_deref()
-                    .expect("a parsed key combination retains its wire chord");
-                self.record_blocked_chord(grantee, chord, blocked.reason)
+                    .clone()
+                    .unwrap_or_else(|| describe_chord(*modifiers, *key));
+                self.record_blocked_chord(grantee, &chord, blocked.reason)
                     .await;
-                return chord_blocked_refusal(chord, blocked.reason);
+                return chord_blocked_refusal(&chord, blocked.reason);
             }
             // The session floor is checked before a Command chord escalates to
             // mutate_durable, so no lease can make a session-ending action valid.
@@ -2156,6 +2161,33 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
 /// session-scoped, every Command chord takes the durable side and requires a
 /// `mutate_durable` lease. A chord without Command is an editing or
 /// navigation keystroke, which is what `compose` covers.
+/// The chord in the wire's own spelling, rebuilt from the parsed parts.
+///
+/// Used only when the parser's retained text is absent, which it is not
+/// today; kept so a refusal never has to choose between a panic and an
+/// empty chord field.
+fn describe_chord(modifiers: SyntheticKeyModifiers, key: SyntheticKey) -> String {
+    let mut parts = Vec::with_capacity(5);
+    if modifiers.command {
+        parts.push("command");
+    }
+    if modifiers.control {
+        parts.push("control");
+    }
+    if modifiers.option {
+        parts.push("option");
+    }
+    if modifiers.shift {
+        parts.push("shift");
+    }
+    if modifiers.windows {
+        parts.push("windows");
+    }
+    let key = format!("{key:?}").to_lowercase();
+    parts.push(&key);
+    parts.join("+")
+}
+
 fn chord_action_kind(modifiers: SyntheticKeyModifiers) -> ActionKind {
     if modifiers.command {
         ActionKind::MutateDurable
