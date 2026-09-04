@@ -1,11 +1,12 @@
-//! The two-channel observed-mode abort guard.
+//! The observed-mode abort guard.
 //!
-//! The session tap sees our events and therefore needs the self-echo filter;
-//! the raw-HID channel cannot see injected events and is the independent second
-//! signal.  Once the guard records an abort, queued work is cancelled and the
-//! guard never permits another post.
+//! A stalled tap still reports itself enabled, so observer liveness is derived
+//! from a heartbeat: the dispatcher posts a marker and requires the observer to
+//! have seen it (our pid, non-zero) within a bound. Hardware input is pid 0;
+//! our own posts must not abort us. Once the guard records an abort, queued
+//! work is cancelled and the guard never permits another post.
 
-use crate::platform::{InputObservationResult, InputObserverLiveness};
+use crate::platform::{IdleReading, IdleUnreadable, InputObservationResult, InputObserverLiveness};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +48,8 @@ pub enum AbortReason {
     UserSeizedControl,
     ObserverUnavailable,
     SeizeLatencyBoundExceeded,
+    IdleGateRefused,
+    FocusMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,5 +135,604 @@ impl SeizeWatcher {
 
     pub fn queued_posts(&self) -> u32 {
         self.queued_posts
+    }
+
+    /// Abort if the heartbeat showed a blind observer.
+    ///
+    /// A blind observer cannot see hardware input either, so the sequence stops
+    /// before the next real post rather than proceeding with a warning.
+    pub fn observe_heartbeat(&mut self, liveness: ObserverLiveness, index: usize) {
+        if matches!(liveness, ObserverLiveness::Blind) {
+            self.abort(AbortReason::ObserverUnavailable, index, None);
+        }
+    }
+
+    /// Classify a sourced event and abort only on hardware (pid 0).
+    ///
+    /// Returns the classification so a caller can journal other-process
+    /// synthetic input without treating it as a seize.
+    pub fn observe_sourced_input(
+        &mut self,
+        event: SourcedInputEvent,
+        our_pid: i64,
+        index: usize,
+    ) -> SourcedInputKind {
+        let kind = classify_sourced_input(event.source_unix_process_id, our_pid);
+        if matches!(kind, SourcedInputKind::Hardware) {
+            self.abort(
+                AbortReason::UserSeizedControl,
+                index,
+                Some(event.detection_latency_ms),
+            );
+        }
+        kind
+    }
+}
+
+/// Bound within which a posted heartbeat marker must reappear in the observed
+/// stream.
+///
+/// A listen-only tap whose callback was blocked for ten seconds still reported
+/// itself enabled, so an enabled flag cannot detect a blind observer. Fifty
+/// milliseconds is a starting point aligned with the existing seize-detection
+/// latency default: if the observer cannot echo our own marker in that window,
+/// it cannot abort on hardware either.
+pub const OBSERVER_HEARTBEAT_BOUND_MS: u64 = 50;
+
+/// Starting point for how long the desk must have been idle before an observed
+/// post may go out, in seconds.
+///
+/// One second is a starting point, not a measured human-factors result: it is
+/// long enough that a key still bouncing is "not idle", and short enough that
+/// a pause between thoughts is not a lockout. The gate is evaluated at each
+/// post against a reading handed in, never at grant time and never at sequence
+/// start.
+pub const OBSERVED_DISPATCH_IDLE_SECONDS: f64 = 1.0;
+
+/// `kCGEventSourceUnixProcessID` value treated as hardware input.
+///
+/// Synthetic posts carry our real non-zero pid at the tap. Hardware is
+/// expected to carry 0; that arm has not been measured with a human at the
+/// desk, and the abort still fires on this value. Our own events must not
+/// fire it: a sequence that aborts on its own posts makes every abort test
+/// pass for the wrong reason.
+pub const HARDWARE_INPUT_SOURCE_PID: i64 = 0;
+
+/// Identity of a marker the dispatcher posted so it can recognise the echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HeartbeatMarker {
+    pub nonce: u64,
+}
+
+impl HeartbeatMarker {
+    pub const fn new(nonce: u64) -> Self {
+        Self { nonce }
+    }
+}
+
+/// The marker we posted, when we posted it, and which pid counts as ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatProbe {
+    pub marker: HeartbeatMarker,
+    pub posted_at_ms: u64,
+    pub our_pid: i64,
+}
+
+/// Whether the observer saw the marker we posted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatObservation {
+    /// The observer saw this marker, attributed to this pid, at this time.
+    Seen {
+        marker: HeartbeatMarker,
+        source_unix_process_id: i64,
+        observed_at_ms: u64,
+    },
+    /// Nothing matching the marker arrived.
+    Missed,
+}
+
+/// Liveness derived from a heartbeat echo, not from a platform enabled flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserverLiveness {
+    Live,
+    Blind,
+}
+
+/// Decide whether the observer saw our marker within the bound.
+///
+/// The echo must carry our pid, and that pid must be non-zero: a zero pid is
+/// hardware, and treating it as our own heartbeat would make a live observer
+/// indistinguishable from a user at the keys.
+pub fn heartbeat_liveness(
+    posted: HeartbeatProbe,
+    observation: HeartbeatObservation,
+) -> ObserverLiveness {
+    if posted.our_pid == HARDWARE_INPUT_SOURCE_PID {
+        return ObserverLiveness::Blind;
+    }
+    match observation {
+        HeartbeatObservation::Seen {
+            marker,
+            source_unix_process_id,
+            observed_at_ms,
+        } if marker == posted.marker
+            && source_unix_process_id == posted.our_pid
+            && observed_at_ms >= posted.posted_at_ms
+            && observed_at_ms.saturating_sub(posted.posted_at_ms)
+                <= OBSERVER_HEARTBEAT_BOUND_MS =>
+        {
+            ObserverLiveness::Live
+        }
+        _ => ObserverLiveness::Blind,
+    }
+}
+
+/// An observed input event carrying the source pid the tap attributed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcedInputEvent {
+    pub source_unix_process_id: i64,
+    pub detection_latency_ms: u32,
+}
+
+/// How a sourced event relates to us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcedInputKind {
+    Hardware,
+    OurProcess,
+    OtherProcess { pid: i64 },
+}
+
+/// Classify a source pid against ours.
+///
+/// Other non-zero pids are neither hardware nor us: another agent's synthetic
+/// input is not the user seizing control, and aborting on it would let any
+/// process on the machine veto ours.
+pub fn classify_sourced_input(source_unix_process_id: i64, our_pid: i64) -> SourcedInputKind {
+    if source_unix_process_id == HARDWARE_INPUT_SOURCE_PID {
+        SourcedInputKind::Hardware
+    } else if source_unix_process_id == our_pid && our_pid != HARDWARE_INPUT_SOURCE_PID {
+        SourcedInputKind::OurProcess
+    } else {
+        SourcedInputKind::OtherProcess {
+            pid: source_unix_process_id,
+        }
+    }
+}
+
+/// Why the idle gate refused a post.
+///
+/// `BelowThreshold` carries both numbers so a caller can show why "non-idle"
+/// was true rather than collapsing it to a boolean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IdleGateRefusal {
+    Unreadable(IdleUnreadable),
+    BelowThreshold {
+        threshold_seconds: f64,
+        observed_seconds: f64,
+    },
+}
+
+/// Check an idle reading against [`OBSERVED_DISPATCH_IDLE_SECONDS`].
+///
+/// Unreadable refuses. Below the threshold refuses. Equal or above proceeds.
+pub fn idle_gate(reading: IdleReading) -> Result<(), IdleGateRefusal> {
+    match reading {
+        IdleReading::Unreadable(reason) => Err(IdleGateRefusal::Unreadable(reason)),
+        IdleReading::Seconds(observed) if observed < OBSERVED_DISPATCH_IDLE_SECONDS => {
+            Err(IdleGateRefusal::BelowThreshold {
+                threshold_seconds: OBSERVED_DISPATCH_IDLE_SECONDS,
+                observed_seconds: observed,
+            })
+        }
+        IdleReading::Seconds(_) => Ok(()),
+    }
+}
+
+/// Why an observed post did not go out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ObservedPostRefusal {
+    ObserverBlind,
+    Idle(IdleGateRefusal),
+    FocusMismatch,
+    AlreadyAborted(AbortReason),
+}
+
+/// Everything an observed post decides before the platform is asked to post,
+/// in the order it decides it, with the platform calls handed in.
+///
+/// The order is the property: HEARTBEAT LIVENESS, then IDLE, then FOCUS, then
+/// the post. Heartbeat first because a stalled tap still reports itself
+/// enabled, and posting while blind means hardware input cannot abort us.
+/// Idle next because a non-idle desk is the user present at the keys. Focus
+/// before post because a mismatch means the events land in the wrong place.
+/// The post must not have run if any prior gate refused. The platform calls
+/// arrive as closures so this ordering compiles and is tested on every host;
+/// nothing here posts to the seam.
+pub fn dispatch_observed_post_in_order<H, I, F, P, T>(
+    watcher: &mut SeizeWatcher,
+    index: usize,
+    posted: HeartbeatProbe,
+    observe_heartbeat: H,
+    read_idle: I,
+    query_focus: F,
+    post: P,
+) -> Result<T, ObservedPostRefusal>
+where
+    H: FnOnce(&HeartbeatProbe) -> HeartbeatObservation,
+    I: FnOnce() -> IdleReading,
+    F: FnOnce() -> bool,
+    P: FnOnce() -> T,
+{
+    if let Some(decision) = watcher.abort_decision() {
+        return Err(ObservedPostRefusal::AlreadyAborted(decision.reason));
+    }
+
+    let observation = observe_heartbeat(&posted);
+    let liveness = heartbeat_liveness(posted, observation);
+    watcher.observe_heartbeat(liveness, index);
+    if matches!(liveness, ObserverLiveness::Blind) {
+        return Err(ObservedPostRefusal::ObserverBlind);
+    }
+
+    let idle_reading = read_idle();
+    if let Err(refusal) = idle_gate(idle_reading) {
+        watcher.abort(AbortReason::IdleGateRefused, index, None);
+        return Err(ObservedPostRefusal::Idle(refusal));
+    }
+
+    if !query_focus() {
+        watcher.abort(AbortReason::FocusMismatch, index, None);
+        return Err(ObservedPostRefusal::FocusMismatch);
+    }
+
+    Ok(post())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    const OUR_PID: i64 = 7282;
+    const OTHER_PID: i64 = 99;
+
+    fn probe(posted_at_ms: u64) -> HeartbeatProbe {
+        HeartbeatProbe {
+            marker: HeartbeatMarker::new(7),
+            posted_at_ms,
+            our_pid: OUR_PID,
+        }
+    }
+
+    fn seen_at(posted: HeartbeatProbe, observed_at_ms: u64) -> HeartbeatObservation {
+        HeartbeatObservation::Seen {
+            marker: posted.marker,
+            source_unix_process_id: posted.our_pid,
+            observed_at_ms,
+        }
+    }
+
+    fn idle_enough() -> IdleReading {
+        IdleReading::Seconds(OBSERVED_DISPATCH_IDLE_SECONDS + 0.1)
+    }
+
+    fn run_post<H, I, F, P, T>(
+        watcher: &mut SeizeWatcher,
+        observe_heartbeat: H,
+        read_idle: I,
+        query_focus: F,
+        post: P,
+    ) -> Result<T, ObservedPostRefusal>
+    where
+        H: FnOnce(&HeartbeatProbe) -> HeartbeatObservation,
+        I: FnOnce() -> IdleReading,
+        F: FnOnce() -> bool,
+        P: FnOnce() -> T,
+    {
+        let posted = probe(0);
+        dispatch_observed_post_in_order(
+            watcher,
+            0,
+            posted,
+            observe_heartbeat,
+            read_idle,
+            query_focus,
+            post,
+        )
+    }
+
+    #[test]
+    fn heartbeat_not_observed_within_bound_is_blind_and_does_not_post() {
+        let posted = probe(0);
+        assert_eq!(
+            heartbeat_liveness(posted, HeartbeatObservation::Missed),
+            ObserverLiveness::Blind
+        );
+        assert_eq!(
+            heartbeat_liveness(posted, seen_at(posted, OBSERVER_HEARTBEAT_BOUND_MS + 1),),
+            ObserverLiveness::Blind
+        );
+
+        let mut watcher = SeizeWatcher::new(50);
+        let posts = Cell::new(0u32);
+        let refused = run_post(
+            &mut watcher,
+            |_| HeartbeatObservation::Missed,
+            idle_enough,
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert_eq!(refused, Err(ObservedPostRefusal::ObserverBlind));
+        assert_eq!(posts.get(), 0);
+        assert!(!watcher.can_post());
+        assert_eq!(
+            watcher.abort_decision().unwrap().reason,
+            AbortReason::ObserverUnavailable
+        );
+    }
+
+    #[test]
+    fn heartbeat_observed_within_bound_proceeds() {
+        let posted = probe(10);
+        assert_eq!(
+            heartbeat_liveness(posted, seen_at(posted, 10)),
+            ObserverLiveness::Live
+        );
+        assert_eq!(
+            heartbeat_liveness(posted, seen_at(posted, 10 + OBSERVER_HEARTBEAT_BOUND_MS)),
+            ObserverLiveness::Live
+        );
+
+        let mut watcher = SeizeWatcher::new(50);
+        let posts = Cell::new(0u32);
+        let accepted = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            idle_enough,
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+                "posted"
+            },
+        );
+        assert_eq!(accepted, Ok("posted"));
+        assert_eq!(posts.get(), 1);
+        assert!(watcher.can_post());
+    }
+
+    #[test]
+    fn pid_zero_event_aborts_and_blocks_further_posts() {
+        let mut watcher = SeizeWatcher::new(50);
+        assert!(watcher.queue_post());
+        assert!(watcher.queue_post());
+
+        let kind = watcher.observe_sourced_input(
+            SourcedInputEvent {
+                source_unix_process_id: HARDWARE_INPUT_SOURCE_PID,
+                detection_latency_ms: 2,
+            },
+            OUR_PID,
+            1,
+        );
+        assert_eq!(kind, SourcedInputKind::Hardware);
+        assert!(!watcher.can_post());
+        assert_eq!(
+            watcher.abort_decision().unwrap().reason,
+            AbortReason::UserSeizedControl
+        );
+        assert!(!watcher.take_post_slot());
+
+        let posts = Cell::new(0u32);
+        let refused = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            idle_enough,
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert_eq!(
+            refused,
+            Err(ObservedPostRefusal::AlreadyAborted(
+                AbortReason::UserSeizedControl
+            ))
+        );
+        assert_eq!(posts.get(), 0);
+        assert!(!watcher.can_post());
+    }
+
+    #[test]
+    fn our_pid_event_does_not_abort() {
+        let mut watcher = SeizeWatcher::new(50);
+        let kind = watcher.observe_sourced_input(
+            SourcedInputEvent {
+                source_unix_process_id: OUR_PID,
+                detection_latency_ms: 1,
+            },
+            OUR_PID,
+            0,
+        );
+        assert_eq!(kind, SourcedInputKind::OurProcess);
+        assert!(watcher.can_post());
+        assert!(watcher.abort_decision().is_none());
+
+        let posts = Cell::new(0u32);
+        let accepted = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            idle_enough,
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert!(accepted.is_ok());
+        assert_eq!(posts.get(), 1);
+    }
+
+    #[test]
+    fn other_pid_event_is_observed_and_does_not_abort() {
+        let mut watcher = SeizeWatcher::new(50);
+        let kind = watcher.observe_sourced_input(
+            SourcedInputEvent {
+                source_unix_process_id: OTHER_PID,
+                detection_latency_ms: 1,
+            },
+            OUR_PID,
+            0,
+        );
+        assert_eq!(kind, SourcedInputKind::OtherProcess { pid: OTHER_PID });
+        assert!(watcher.can_post());
+        assert!(watcher.abort_decision().is_none());
+    }
+
+    #[test]
+    fn unreadable_idle_refuses() {
+        assert_eq!(
+            idle_gate(IdleReading::Unreadable(IdleUnreadable::TableUnavailable)),
+            Err(IdleGateRefusal::Unreadable(
+                IdleUnreadable::TableUnavailable
+            ))
+        );
+
+        let mut watcher = SeizeWatcher::new(50);
+        let posts = Cell::new(0u32);
+        let refused = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            || IdleReading::Unreadable(IdleUnreadable::TableUnavailable),
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert_eq!(
+            refused,
+            Err(ObservedPostRefusal::Idle(IdleGateRefusal::Unreadable(
+                IdleUnreadable::TableUnavailable
+            )))
+        );
+        assert_eq!(posts.get(), 0);
+        assert!(!watcher.can_post());
+    }
+
+    #[test]
+    fn idle_below_threshold_refuses_carrying_both_numbers() {
+        let observed = OBSERVED_DISPATCH_IDLE_SECONDS - 0.1;
+        assert_eq!(
+            idle_gate(IdleReading::Seconds(observed)),
+            Err(IdleGateRefusal::BelowThreshold {
+                threshold_seconds: OBSERVED_DISPATCH_IDLE_SECONDS,
+                observed_seconds: observed,
+            })
+        );
+
+        let mut watcher = SeizeWatcher::new(50);
+        let posts = Cell::new(0u32);
+        let refused = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            || IdleReading::Seconds(observed),
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert_eq!(
+            refused,
+            Err(ObservedPostRefusal::Idle(IdleGateRefusal::BelowThreshold {
+                threshold_seconds: OBSERVED_DISPATCH_IDLE_SECONDS,
+                observed_seconds: observed,
+            }))
+        );
+        assert_eq!(posts.get(), 0);
+    }
+
+    #[test]
+    fn idle_above_threshold_proceeds() {
+        assert_eq!(idle_gate(idle_enough()), Ok(()));
+
+        let mut watcher = SeizeWatcher::new(50);
+        let posts = Cell::new(0u32);
+        let accepted = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            idle_enough,
+            || true,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert!(accepted.is_ok());
+        assert_eq!(posts.get(), 1);
+    }
+
+    #[test]
+    fn focus_mismatch_does_not_call_the_post() {
+        let mut watcher = SeizeWatcher::new(50);
+        let posts = Cell::new(0u32);
+        let refused = run_post(
+            &mut watcher,
+            |posted| seen_at(*posted, posted.posted_at_ms),
+            idle_enough,
+            || false,
+            || {
+                posts.set(posts.get() + 1);
+            },
+        );
+        assert_eq!(refused, Err(ObservedPostRefusal::FocusMismatch));
+        assert_eq!(posts.get(), 0);
+        assert!(!watcher.can_post());
+        assert_eq!(
+            watcher.abort_decision().unwrap().reason,
+            AbortReason::FocusMismatch
+        );
+    }
+
+    #[test]
+    fn observed_post_gates_run_heartbeat_then_idle_then_focus_then_post() {
+        let order = RefCell::new(Vec::new());
+        let mut watcher = SeizeWatcher::new(50);
+        let accepted = run_post(
+            &mut watcher,
+            |posted| {
+                order.borrow_mut().push("heartbeat");
+                seen_at(*posted, posted.posted_at_ms)
+            },
+            || {
+                order.borrow_mut().push("idle");
+                idle_enough()
+            },
+            || {
+                order.borrow_mut().push("focus");
+                true
+            },
+            || {
+                order.borrow_mut().push("post");
+            },
+        );
+        assert!(accepted.is_ok());
+        assert_eq!(*order.borrow(), ["heartbeat", "idle", "focus", "post"]);
+    }
+
+    #[test]
+    fn existing_enabled_flag_liveness_still_aborts_when_any_channel_is_down() {
+        let mut watcher = SeizeWatcher::new(50);
+        watcher.observe_liveness(
+            SeizeWatcherState {
+                session_tap_live: true,
+                raw_hid_live: false,
+                self_echo_filter_live: true,
+            },
+            0,
+        );
+        assert!(!watcher.can_post());
+        assert_eq!(
+            watcher.abort_decision().unwrap().reason,
+            AbortReason::ObserverUnavailable
+        );
     }
 }

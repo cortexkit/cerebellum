@@ -42,6 +42,17 @@ pub enum GrantKind {
     Until(MonoInstant),
 }
 
+/// Proof that a [`GrantKind::Once`] lease was consumed for one dispatch.
+///
+/// Constructible only by consuming a Once lease through [`ConsentLeases::admit_use`].
+/// No `Default`, no `Clone`: a standing [`GrantKind::Until`] grant cannot
+/// produce this token, so a durable configuration grant cannot pre-authorize
+/// global dispatch until a later review changes that on purpose.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OnceDispatchToken {
+    _private: (),
+}
+
 /// Which kind of action a lease admits.
 ///
 /// Looking and touching are separate grants: approving a screenshot of a browser
@@ -284,6 +295,25 @@ impl ConsentLeases {
                 Admission::Admitted(lease)
             }
             needs => needs,
+        }
+    }
+
+    /// Consume a Once lease into a one-shot dispatch token.
+    ///
+    /// Goes through [`Self::admit_use`]: an Until lease of any duration is
+    /// admitted without being spent and still does not yield a token. Only a
+    /// consumed Once does. A second call on the same key yields nothing
+    /// because the lease was spent.
+    pub fn admit_once_dispatch<C: MonotonicClock>(
+        &mut self,
+        key: &LeaseKey,
+        clock: &C,
+    ) -> Option<OnceDispatchToken> {
+        match self.admit_use(key, clock) {
+            Admission::Admitted(lease) if lease.kind == GrantKind::Once => {
+                Some(OnceDispatchToken { _private: () })
+            }
+            _ => None,
         }
     }
 
@@ -854,5 +884,43 @@ mod tests {
         // The new expiry governs: the old one has already passed.
         clock.advance(Duration::from_millis(1_000));
         assert!(leases.admits(&target, &clock).is_admitted());
+    }
+
+    /// A standing Until grant of any duration does not yield a dispatch token.
+    /// Only a consumed Once does, and a second consume on the same key yields
+    /// nothing because the lease was spent.
+    #[test]
+    fn only_a_consumed_once_lease_yields_a_dispatch_token() {
+        let mut leases = ConsentLeases::new();
+        let clock = FakeClock::new();
+        let until_key = key(ActionKind::Compose);
+        let once_key = LeaseKey {
+            bundle_identity: "com.apple.Mail".to_string(),
+            ..key(ActionKind::Compose)
+        };
+
+        leases.grant(until_key.clone(), GrantKind::Until(at(10_000)), &clock);
+        assert!(
+            leases.admit_once_dispatch(&until_key, &clock).is_none(),
+            "an Until lease yielded a one-shot dispatch token"
+        );
+        assert!(
+            leases.admits(&until_key, &clock).is_admitted(),
+            "asking for a token spent the Until lease"
+        );
+
+        leases.grant(once_key.clone(), GrantKind::Once, &clock);
+        assert!(
+            leases.admit_once_dispatch(&once_key, &clock).is_some(),
+            "a consumed Once lease did not yield a token"
+        );
+        assert!(
+            leases.admit_once_dispatch(&once_key, &clock).is_none(),
+            "a second admit_use on a spent Once lease yielded another token"
+        );
+        assert_eq!(
+            leases.admit_use(&once_key, &clock),
+            Admission::NeedsConsent(NeedsConsent::NoLeaseHeld)
+        );
     }
 }

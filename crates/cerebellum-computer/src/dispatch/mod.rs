@@ -590,8 +590,11 @@ impl<D: PlatformDriver> Dispatcher<D> {
             return Err(
                 match watcher.abort_decision().map(|decision| decision.reason) {
                     Some(
-                        AbortReason::ObserverUnavailable | AbortReason::SeizeLatencyBoundExceeded,
+                        AbortReason::ObserverUnavailable
+                        | AbortReason::SeizeLatencyBoundExceeded
+                        | AbortReason::IdleGateRefused,
                     ) => DispatchError::ObserverUnavailable,
+                    Some(AbortReason::FocusMismatch) => DispatchError::TargetFocusMismatch,
                     Some(AbortReason::UserSeizedControl) | None => DispatchError::UserSeizedControl,
                 },
             );
@@ -836,9 +839,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 if let Some(abort) = guard.abort_decision() {
                     let refusal = match abort.reason {
                         AbortReason::ObserverUnavailable
-                        | AbortReason::SeizeLatencyBoundExceeded => {
-                            DispatchError::ObserverUnavailable
-                        }
+                        | AbortReason::SeizeLatencyBoundExceeded
+                        | AbortReason::IdleGateRefused => DispatchError::ObserverUnavailable,
+                        AbortReason::FocusMismatch => DispatchError::TargetFocusMismatch,
                         AbortReason::UserSeizedControl => DispatchError::UserSeizedControl,
                     };
                     Self::journal_no_action(audit, journal_identity.clone(), &request, &refusal)?;
