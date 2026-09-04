@@ -4,10 +4,10 @@ use cerebellum_computer::capture_custody::{
 };
 use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
-    authorize_escalation, retry_decision, AbortReason, AttemptDisposition, AttendanceContext,
-    AttendanceLease, ConsentDecision, DispatchError, DispatchPhase, DispatchRequest, Dispatcher,
-    ExpectedPostCondition, FocusCheckPlan, FrozenDispatchRow, ReconciliationResult, RetryDecision,
-    SeizeWatcher,
+    authorize_escalation, retry_decision, AbortDecision, AbortReason, AttemptDisposition,
+    AttendanceContext, AttendanceLease, ConsentDecision, DispatchError, DispatchPhase,
+    DispatchRequest, Dispatcher, ExpectedPostCondition, FocusCheckPlan, FrozenDispatchRow,
+    ReconciliationResult, RetryDecision, SeizeWatcher,
 };
 use cerebellum_computer::platform::containment::IdentityAtomicBinding;
 use cerebellum_computer::platform::*;
@@ -316,8 +316,31 @@ impl PlatformDriver for RecordingDriver {
     }
     fn dispatch_global(
         &mut self,
-        _request: SyntheticDispatchRequest,
+        request: GlobalDispatchRequest,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+        let reason = if self
+            .input
+            .as_ref()
+            .is_ok_and(|input| input.human_or_ambiguous_input)
+        {
+            Some(AbortReason::UserSeizedControl)
+        } else if self.focus.as_ref().is_ok_and(|focus| !focus.matches_target) {
+            Some(AbortReason::FocusMismatch)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(DriverError::ObservedDispatchAborted(AbortDecision {
+                reason,
+                stopped_action_index: 0,
+                detection_latency_ms: Some(1),
+                sourced_input_kind: (reason == AbortReason::UserSeizedControl).then_some(
+                    cerebellum_computer::dispatch::SourcedInputKind::OtherProcess { pid: 36_680 },
+                ),
+                maximum_detection_latency_ms: request.maximum_seize_detection_latency_ms,
+                queued_posts_cancelled: 1,
+            }));
+        }
         self.global_calls += 1;
         Ok(cerebellum_computer::platform::DispatchResult {
             accepted_by_platform: true,
@@ -377,6 +400,24 @@ impl cerebellum_computer::dispatch::EscalationConsent for RecordingConsent {
         self.calls.push(escalation_id.to_string());
         self.decision
     }
+}
+
+fn once_dispatch_token() -> cerebellum_core::consent::OnceDispatchToken {
+    let clock = cerebellum_core::clock::FakeClock::new();
+    let key = cerebellum_core::consent::LeaseKey {
+        grantee: "process-1".to_string(),
+        bundle_identity: target().bundle_identity,
+        action_kind: cerebellum_core::consent::ActionKind::MutateDurable,
+    };
+    let mut leases = cerebellum_core::consent::ConsentLeases::new();
+    leases.grant(
+        key.clone(),
+        cerebellum_core::consent::GrantKind::Once,
+        &clock,
+    );
+    leases
+        .admit_once_dispatch(&key, &clock)
+        .expect("the fixture consumes its Once lease")
 }
 
 fn background_attendance() -> AttendanceContext {
@@ -676,7 +717,8 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         0,
     )
     .with_synthetic(SyntheticAction::type_text("x"))
-    .with_focus_plan(FocusCheckPlan::immediate(0));
+    .with_focus_plan(FocusCheckPlan::immediate(0))
+    .with_once_dispatch_token(once_dispatch_token());
     let mut dispatcher = Dispatcher::new(driver);
     let mut audit = audit();
     let sequence = dispatcher
@@ -692,13 +734,17 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         &audit.journal().export_bytes(),
     )
     .unwrap();
-    assert_eq!(entry["phase"], json!("rejected"));
+    assert_eq!(entry["phase"], json!("finalized"));
     assert_eq!(
-        decode_embedded_json(&entry["rejection_material"]),
+        decode_embedded_json(&entry["completed_result"]),
         json!({
-            "outcome": "no_action",
-            "refusal": {"reason": "user_seized_control"},
-        })
+            "outcome": "refused",
+            "refusal": {
+                "reason": "user_seized_control",
+                "sourced_input_kind": {"source": "other_process", "pid": 36_680},
+            },
+        }),
+        "the journal must retain which process seized global input"
     );
 
     let mut watcher = SeizeWatcher::new(50);
@@ -1156,7 +1202,8 @@ fn seize_latency_must_fit_between_observed_posts() {
         0,
     )
     .with_synthetic(SyntheticAction::type_text("x"))
-    .with_focus_plan(FocusCheckPlan::immediate(0));
+    .with_focus_plan(FocusCheckPlan::immediate(0))
+    .with_once_dispatch_token(once_dispatch_token());
     let second = DispatchRequest::new(
         row,
         DispatchMode::Observed,
@@ -1172,7 +1219,8 @@ fn seize_latency_must_fit_between_observed_posts() {
         1,
     )
     .with_synthetic(SyntheticAction::type_text("x"))
-    .with_focus_plan(FocusCheckPlan::immediate(1));
+    .with_focus_plan(FocusCheckPlan::immediate(1))
+    .with_once_dispatch_token(once_dispatch_token());
     let mut dispatcher = Dispatcher::new(RecordingDriver::default());
     let result = dispatcher
         .dispatch_sequence(&mut audit(), &audit_identity(), [first, second])
@@ -1245,7 +1293,8 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         0,
     )
     .with_synthetic(SyntheticAction::type_text("x"))
-    .with_focus_plan(FocusCheckPlan::immediate(0));
+    .with_focus_plan(FocusCheckPlan::immediate(0))
+    .with_once_dispatch_token(once_dispatch_token());
     let mut dispatcher = Dispatcher::new(driver);
     assert_eq!(
         dispatcher.dispatch(&mut audit(), audit_identity(), request),

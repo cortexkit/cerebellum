@@ -7,6 +7,7 @@
 use std::ffi::CStr;
 use std::fmt;
 use std::os::raw::{c_char, c_int, c_uint};
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -383,27 +384,48 @@ pub fn post_event_to_pid(pid: i32, event: &CGEvent) -> CgEventPostCall {
     CgEventPostCall
 }
 
-/// Ask CoreGraphics to post one event at the HID tap.
+const GLOBAL_POST_TAP_LOCATION: CGEventTapLocation = CGEventTapLocation::SessionEventTap;
+
+/// Ask CoreGraphics to post one production event at the session tap.
 ///
-/// Consumes the event by value so a retry cannot hand the same event to a
-/// second transport. A returned [`CgEventPostCall`] means only that the void
-/// framework call returned.
+/// The location is load-bearing: HID-tap posts reset the HID idle table even
+/// when a private event source builds them, while session-tap posts both deliver
+/// and leave that hardware reading unchanged. Consumes the event by value so a
+/// retry cannot hand the same event to a second transport. A returned
+/// [`CgEventPostCall`] means only that the void framework call returned.
 pub fn post_event_globally(event: OwnedCgEvent) -> CgEventPostCall {
+    CGEvent::post(GLOBAL_POST_TAP_LOCATION, Some(&event));
+    CgEventPostCall
+}
+
+/// Ask CoreGraphics to post one event at the HID tap for a measurement.
+///
+/// Production must not call this path because the post resets the hardware idle
+/// table and would make the next observed action mistake our own input for the
+/// user's. It remains only so the desk probe can reproduce that distinction.
+pub fn post_event_at_hid_tap_for_measurement(event: OwnedCgEvent) -> CgEventPostCall {
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     CgEventPostCall
 }
 
-/// Ask CoreGraphics to post one event at the SESSION tap, for measurement only.
+/// Read the unix process id of the frontmost application through System Events.
 ///
-/// The HID-tap post resets the hardware idle table whatever event source built
-/// the event (measured: both HIDSystemState and Private sources, 20024s and
-/// 29s to under a second after one post). The remaining variable is the
-/// location the event enters the stream, and a probe needs to post at the
-/// session location to read it. Not a second dispatch path: nothing in the
-/// computer crate calls this, and the thin-seam tests keep it that way.
-pub fn post_event_at_session_tap(event: OwnedCgEvent) -> CgEventPostCall {
-    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
-    CgEventPostCall
+/// This is a reading rather than a focus change. A failed command, malformed
+/// response, or non-positive pid is absent so the policy caller can refuse it.
+pub fn frontmost_process_id() -> Option<i32> {
+    let output = Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to get unix id of first process whose frontmost is true",
+        ])
+        .output()
+        .ok()?;
+    output.status.success().then_some(())?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
 }
 
 /// When a process was started, as kernel-sourced microseconds since the epoch.
@@ -1061,6 +1083,15 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn production_global_post_enters_at_the_session_tap() {
+        assert_eq!(
+            GLOBAL_POST_TAP_LOCATION,
+            CGEventTapLocation::SessionEventTap,
+            "the production global post must preserve the HID idle-table reading"
+        );
+    }
 
     /// Serializes every test that talks to the window server.
     ///

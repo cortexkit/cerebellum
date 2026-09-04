@@ -2,7 +2,7 @@
 #
 # Build the module with the release attestations that have been minted.
 #
-# Seven identifiers gate what the computer plane may advertise and serve. Each
+# Eight identifiers gate what the computer plane may advertise and serve. Each
 # attests that something happened OUTSIDE this repository -- a review was
 # conducted, a doctrine was written down -- so none of them can be derived from
 # the code they govern. They are supplied to the COMPILER rather than read at
@@ -151,7 +151,11 @@ export CEREBELLUM_ATTENDANCE_CONTRACT_REVISION="v1"
 export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 
 # ---------------------------------------------------------------------------
-# Not yet minted: nothing, as of windows-actuation-review/v1.
+# Not yet minted: global observed dispatch.
+#
+# CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION is deliberately listed below and
+# left unset. The implementation therefore ships inert until an external review
+# mints the revision that authorizes session-global input posting.
 # ---------------------------------------------------------------------------
 #
 # When a new identifier is added, leave it UNSET here until its review exists,
@@ -171,6 +175,7 @@ readonly ATTESTATIONS=(
   CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION
+  CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION
   CEREBELLUM_ATTENDANCE_CONTRACT_OWNER
   CEREBELLUM_ATTENDANCE_CONTRACT_REVISION
 )

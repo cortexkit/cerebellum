@@ -122,10 +122,10 @@ impl PlatformDriver for SyntheticDriver {
 
     fn dispatch_global(
         &mut self,
-        request: SyntheticDispatchRequest,
+        request: cerebellum_computer::platform::GlobalDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
         let mut shared = self.0.lock().unwrap();
-        shared.calls.push(DispatchedCall::Global(request));
+        shared.calls.push(DispatchedCall::Global(request.synthetic));
         shared.global.clone()
     }
 
@@ -236,6 +236,27 @@ async fn management_leased(kind: ActionKind, clock: &FakeClock) -> Arc<Managemen
     management
 }
 
+async fn management_once(clock: &FakeClock) -> Arc<ManagementPlane> {
+    let management = management();
+    let (reply, _) = management
+        .open_target(
+            GRANTEE,
+            support::computer::TARGET_BUNDLE_ID,
+            ActionKind::MutateDurable,
+            true,
+            clock,
+        )
+        .await;
+    let ask_id = reply["ask_id"].as_str().expect("an ask is minted");
+    assert!(
+        management
+            .settle(ask_id, Some(&json!({"decision": "allow_once"})), clock,)
+            .await,
+        "the fixture Once lease settles"
+    );
+    management
+}
+
 fn type_request() -> Value {
     json!({"target": "editor", "text": "hi", "replace_selection": false})
 }
@@ -336,11 +357,11 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
 
 /// Scrolling reaches the leased process as the wheel delta requested.
 #[tokio::test]
-async fn computer_scroll_dispatches_its_wheel_event_to_the_leased_process() {
+async fn computer_scroll_dispatches_its_wheel_event_through_observed_global_input() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = management_once(&clock).await;
 
     let reply = serve(
         &plane,
@@ -353,8 +374,8 @@ async fn computer_scroll_dispatches_its_wheel_event_to_the_leased_process() {
 
     assert_eq!(reply["outcome"], "completed");
     let calls = dispatched_calls(&shared);
-    let [DispatchedCall::PerPid(request)] = &calls[..] else {
-        panic!("scroll must deliver per-process exactly once: {calls:?}");
+    let [DispatchedCall::Global(request)] = &calls[..] else {
+        panic!("scroll must deliver through observed global dispatch exactly once: {calls:?}");
     };
     assert_eq!(request.target, grant());
     assert_eq!(
@@ -375,7 +396,7 @@ async fn computer_move_dispatches_through_the_global_path_while_observed() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = management_once(&clock).await;
 
     let reply = serve(&plane, "computer.move", move_request(), &management, &clock).await;
 
@@ -407,14 +428,46 @@ async fn computer_move_dispatches_through_the_global_path_while_observed() {
     );
 }
 
-/// Dragging is mutate_durable outright and delivers its three events
-/// per-process: press, move, release at the requested points.
+/// An Until lease cannot authorize global dispatch. A Once lease admits one
+/// move and is gone before a second move asks, proving the wire consumes it.
 #[tokio::test]
-async fn computer_drag_dispatches_its_drag_events_to_the_leased_process() {
+async fn computer_move_requires_and_consumes_a_once_mutate_durable_lease() {
+    let clock = FakeClock::new();
+
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let until = management_leased(ActionKind::MutateDurable, &clock).await;
+    let refused = serve(&plane, "computer.move", move_request(), &until, &clock).await;
+    assert_eq!(refused["outcome"], "once_grant_required");
+    assert!(
+        dispatched_calls(&shared).is_empty(),
+        "an Until lease reached global dispatch"
+    );
+
+    let shared = Shared::handle();
+    let plane = plane_with(&shared);
+    let once = management_once(&clock).await;
+    let first = serve(&plane, "computer.move", move_request(), &once, &clock).await;
+    assert_eq!(first["outcome"], "completed");
+    assert_eq!(dispatched_calls(&shared).len(), 1);
+
+    let second = serve(&plane, "computer.move", move_request(), &once, &clock).await;
+    assert_eq!(second["outcome"], "once_grant_required");
+    assert_eq!(
+        dispatched_calls(&shared).len(),
+        1,
+        "the consumed Once lease admitted a second global post"
+    );
+}
+
+/// Dragging is mutate_durable outright and globally delivers its three events
+/// while observed: press, move, release at the requested points.
+#[tokio::test]
+async fn computer_drag_dispatches_its_drag_events_through_observed_global_input() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+    let management = management_once(&clock).await;
 
     let reply = serve(&plane, "computer.drag", drag_request(), &management, &clock).await;
 
@@ -431,8 +484,8 @@ async fn computer_drag_dispatches_its_drag_events_to_the_leased_process() {
          coordinate-addressed row from a failed one"
     );
     let calls = dispatched_calls(&shared);
-    let [DispatchedCall::PerPid(request)] = &calls[..] else {
-        panic!("drag must deliver per-process exactly once: {calls:?}");
+    let [DispatchedCall::Global(request)] = &calls[..] else {
+        panic!("drag must deliver through observed global dispatch exactly once: {calls:?}");
     };
     assert_eq!(request.target, grant());
     assert_eq!(
@@ -470,8 +523,13 @@ async fn an_observe_only_lease_is_refused_for_each_of_the_five() {
     for (name, request) in cases {
         let before = plane.journal_entry_count().await;
         let reply = serve(&plane, name, request, &management, &clock).await;
+        let expected = if matches!(name, "computer.scroll" | "computer.move" | "computer.drag") {
+            "once_grant_required"
+        } else {
+            "no_lease"
+        };
         assert_eq!(
-            reply["outcome"], "no_lease",
+            reply["outcome"], expected,
             "{name} ran under an observe-only lease"
         );
         assert_eq!(

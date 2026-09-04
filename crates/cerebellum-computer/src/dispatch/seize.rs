@@ -59,6 +59,8 @@ pub struct AbortDecision {
     pub reason: AbortReason,
     pub stopped_action_index: usize,
     pub detection_latency_ms: Option<u32>,
+    /// Which source seized control when the tap supplied source attribution.
+    pub sourced_input_kind: Option<SourcedInputKind>,
     pub maximum_detection_latency_ms: u32,
     pub queued_posts_cancelled: u32,
 }
@@ -101,6 +103,7 @@ impl SeizeWatcher {
             reason,
             stopped_action_index: index,
             detection_latency_ms: latency,
+            sourced_input_kind: None,
             maximum_detection_latency_ms: self.maximum_detection_latency_ms,
             queued_posts_cancelled: cancelled,
         });
@@ -173,12 +176,15 @@ impl SeizeWatcher {
         index: usize,
     ) -> SourcedInputKind {
         let kind = classify_sourced_input(event.source_unix_process_id, our_pid);
-        if !matches!(kind, SourcedInputKind::OurProcess) {
+        if !matches!(kind, SourcedInputKind::OurProcess) && self.abort.is_none() {
             self.abort(
                 AbortReason::UserSeizedControl,
                 index,
                 Some(event.detection_latency_ms),
             );
+            if let Some(abort) = self.abort.as_mut() {
+                abort.sourced_input_kind = Some(kind);
+            }
         }
         kind
     }
@@ -290,7 +296,8 @@ pub struct SourcedInputEvent {
 }
 
 /// How a sourced event relates to us.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "source")]
 pub enum SourcedInputKind {
     Hardware,
     OurProcess,

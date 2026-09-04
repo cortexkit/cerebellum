@@ -203,6 +203,7 @@ pub enum InputEventConstructionError {
     KeyCombinationUpUnavailable,
     ScrollUnavailable,
     MouseMoveUnavailable,
+    HeartbeatMarkerUnavailable,
     DragPressUnavailable,
     DragMoveUnavailable,
     DragReleaseUnavailable,
@@ -231,6 +232,9 @@ impl fmt::Display for InputEventConstructionError {
             }
             Self::MouseMoveUnavailable => {
                 write!(f, "CoreGraphics could not create the mouse-move event")
+            }
+            Self::HeartbeatMarkerUnavailable => {
+                write!(f, "CoreGraphics could not create the observer heartbeat marker")
             }
             Self::DragPressUnavailable => {
                 write!(f, "CoreGraphics could not create the drag press event")
@@ -294,8 +298,8 @@ mod framework {
         }
     }
     use objc2_core_graphics::{
-        CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventType, CGMouseButton,
-        CGScrollEventUnit,
+        CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventType,
+        CGMouseButton, CGScrollEventUnit,
     };
 
     use super::{
@@ -331,6 +335,31 @@ mod framework {
         .ok_or(InputEventConstructionError::MouseMoveUnavailable)?;
         CGEvent::set_flags(Some(&event), CGEventFlags::empty());
         Ok(event)
+    }
+
+    /// Build a no-displacement mouse event carrying an observer nonce.
+    ///
+    /// The marker enters at the session tap through the production post function.
+    /// It uses the current pointer location so the liveness probe cannot move the
+    /// cursor before the observer has proved it can see input.
+    pub fn heartbeat_marker_event(nonce: u64) -> Result<OwnedCgEvent, InputEventConstructionError> {
+        let source = event_source()?;
+        let current = CGEvent::new(Some(&source))
+            .ok_or(InputEventConstructionError::HeartbeatMarkerUnavailable)?;
+        let marker = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::MouseMoved,
+            CGEvent::location(Some(&current)),
+            CGMouseButton::Left,
+        )
+        .ok_or(InputEventConstructionError::HeartbeatMarkerUnavailable)?;
+        CGEvent::set_flags(Some(&marker), CGEventFlags::empty());
+        CGEvent::set_integer_value_field(
+            Some(&marker),
+            CGEventField::EventSourceUserData,
+            nonce as i64,
+        );
+        Ok(marker)
     }
 
     /// Seconds since any input event in `table`, as CoreGraphics reports it.
@@ -517,8 +546,8 @@ mod framework {
 
 #[cfg(target_os = "macos")]
 pub use framework::{
-    event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
-    mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
+    event_post_access, heartbeat_marker_event, input_monitoring_access, key_combination_events,
+    mouse_drag_events, mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
     seconds_since_last_input, text_input_events,
 };
 
@@ -547,6 +576,7 @@ mod platform_neutral_tests {
             InputEventConstructionError::KeyCombinationUpUnavailable,
             InputEventConstructionError::ScrollUnavailable,
             InputEventConstructionError::MouseMoveUnavailable,
+            InputEventConstructionError::HeartbeatMarkerUnavailable,
             InputEventConstructionError::DragPressUnavailable,
             InputEventConstructionError::DragMoveUnavailable,
             InputEventConstructionError::DragReleaseUnavailable,

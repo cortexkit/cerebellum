@@ -4,8 +4,13 @@
 //! grants and envelope drift without linking macOS frameworks on other hosts.
 
 use super::*;
+use crate::dispatch::{
+    dispatch_observed_post_in_order, HeartbeatMarker, HeartbeatObservation, HeartbeatProbe,
+    ObservedPostRefusal, SeizeWatcher, SourcedInputEvent, OBSERVER_HEARTBEAT_BOUND_MS,
+};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub const MACOS_MAJOR_VERSION: u16 = 26;
 pub const PRIVATE_ENVELOPE_REVISION: &str = "skylight-macos26-v1";
@@ -102,6 +107,7 @@ pub struct MacOs26PlatformDriver {
     startup: StartupCapabilityProbe,
     accessibility_trees: BTreeMap<String, CachedAccessibilityTree>,
     expected_post_condition_available: bool,
+    global_dispatch_review_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +184,162 @@ fn dispatch_synthetic_to_pid(
         unreadable_subtrees: 0,
         delivery_posts_returned: report.posts_returned,
         delivery_generation_verifications: report.generation_verifications,
+    })
+}
+
+const SESSION_TAP_UNREAD_BOUND: usize = 256;
+static NEXT_HEARTBEAT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn observe_session_event(
+    watcher: &mut SeizeWatcher,
+    event: cerebellum_macos::SessionEvent,
+    our_pid: i64,
+    index: usize,
+    started: Instant,
+) {
+    let detection_latency_ms = u32::try_from(elapsed_millis(started)).unwrap_or(u32::MAX);
+    watcher.observe_sourced_input(
+        SourcedInputEvent {
+            source_unix_process_id: event.source_unix_process_id,
+            detection_latency_ms,
+        },
+        our_pid,
+        index,
+    );
+}
+
+fn drain_session_events(
+    tap: &cerebellum_macos::SessionEventTap,
+    watcher: &mut SeizeWatcher,
+    our_pid: i64,
+    index: usize,
+    started: Instant,
+) {
+    while let Ok(event) = tap.events().try_recv() {
+        observe_session_event(watcher, event, our_pid, index, started);
+    }
+}
+
+fn heartbeat_observation(
+    tap: &cerebellum_macos::SessionEventTap,
+    watcher: &mut SeizeWatcher,
+    probe: HeartbeatProbe,
+    started: Instant,
+) -> HeartbeatObservation {
+    let deadline = Instant::now() + Duration::from_millis(OBSERVER_HEARTBEAT_BOUND_MS);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(event) = tap.events().recv_timeout(remaining) else {
+            return HeartbeatObservation::Missed;
+        };
+        observe_session_event(watcher, event, probe.our_pid, 0, started);
+        if event.source_unix_process_id == probe.our_pid && event.marker_nonce == probe.marker.nonce
+        {
+            return HeartbeatObservation::Seen {
+                marker: probe.marker,
+                source_unix_process_id: event.source_unix_process_id,
+                observed_at_ms: elapsed_millis(started),
+            };
+        }
+        if watcher.abort_decision().is_some() {
+            return HeartbeatObservation::Missed;
+        }
+    }
+}
+
+/// Deliver one action through the session-global transport under observed gates.
+///
+/// A fresh tap is held for the whole action rather than shared across actions.
+/// This bounds unread state to one request, prevents an event left by one caller
+/// being attributed to the next, and forces every sequence to prove liveness
+/// with its own heartbeat before its first real post.
+fn dispatch_synthetic_globally(
+    request: GlobalDispatchRequest,
+    tap: &cerebellum_macos::SessionEventTap,
+) -> Result<DispatchResult, DriverError> {
+    let GlobalDispatchRequest {
+        synthetic,
+        once_dispatch_token: _once_dispatch_token,
+        maximum_seize_detection_latency_ms,
+        minimum_inter_post_interval_ms,
+    } = request;
+    if minimum_inter_post_interval_ms < maximum_seize_detection_latency_ms {
+        return Err(DriverError::InvalidRequest(
+            "observed inter-post interval is shorter than the seize-detection bound",
+        ));
+    }
+
+    let steps = super::macos_synthetic::synthetic_event_steps(&synthetic.action)?;
+    let our_pid = i64::from(std::process::id());
+    let started = Instant::now();
+    let nonce = NEXT_HEARTBEAT_NONCE.fetch_add(1, Ordering::Relaxed) & i64::MAX as u64;
+    let marker = HeartbeatMarker::new(nonce.max(1));
+    let marker_event = cerebellum_macos::heartbeat_marker_event(marker.nonce)
+        .map_err(|_| DriverError::EventConstructionFailed("observer heartbeat marker"))?;
+    let posted_at_ms = elapsed_millis(started);
+    let _ = cerebellum_macos::post_event_globally(marker_event);
+    let probe = HeartbeatProbe {
+        marker,
+        posted_at_ms,
+        our_pid,
+    };
+    let mut watcher = SeizeWatcher::new(maximum_seize_detection_latency_ms);
+    for _ in &steps {
+        watcher.queue_post();
+    }
+    let heartbeat = heartbeat_observation(tap, &mut watcher, probe, started);
+    let mut posts_returned = 0_u64;
+
+    for (index, step) in steps.into_iter().enumerate() {
+        if index > 0 {
+            std::thread::sleep(Duration::from_millis(u64::from(
+                minimum_inter_post_interval_ms,
+            )));
+        }
+        drain_session_events(tap, &mut watcher, our_pid, index, started);
+        let target_pid = synthetic.target.pid;
+        let result = dispatch_observed_post_in_order(
+            &mut watcher,
+            index,
+            probe,
+            |_| heartbeat,
+            || {
+                IdleReading::from_seconds(cerebellum_macos::seconds_since_last_input(
+                    cerebellum_macos::EventSourceStateTable::HidSystem,
+                ))
+            },
+            || cerebellum_macos::frontmost_process_id() == i32::try_from(target_pid).ok(),
+            || cerebellum_macos::post_event_globally(step.event),
+        );
+        match result {
+            Ok(_) => {
+                watcher.take_post_slot();
+                posts_returned = posts_returned.saturating_add(1);
+            }
+            Err(
+                ObservedPostRefusal::ObserverBlind
+                | ObservedPostRefusal::Idle(_)
+                | ObservedPostRefusal::FocusMismatch
+                | ObservedPostRefusal::AlreadyAborted(_),
+            ) => {
+                let abort = watcher.abort_decision().expect(
+                    "every observed-post refusal records the abort that stopped the sequence",
+                );
+                return Err(DriverError::ObservedDispatchAborted(abort));
+            }
+        }
+    }
+
+    Ok(DispatchResult {
+        accepted_by_platform: posts_returned > 0,
+        effect_status: EffectStatus::EffectIndeterminate,
+        unreadable_subtrees: 0,
+        delivery_posts_returned: posts_returned,
+        delivery_generation_verifications: 0,
     })
 }
 
@@ -538,6 +700,7 @@ impl MacOs26PlatformDriver {
             startup: StartupCapabilityProbe::run(input),
             accessibility_trees: BTreeMap::new(),
             expected_post_condition_available: true,
+            global_dispatch_review_revision: None,
         }
     }
 
@@ -549,6 +712,13 @@ impl MacOs26PlatformDriver {
     /// effect with an undeclarable post-condition.
     pub fn without_expected_post_condition(mut self) -> Self {
         self.expected_post_condition_available = false;
+        self
+    }
+
+    /// Store the external authorization for session-global event posting.
+    /// Global dispatch remains unavailable unless this revision is supplied.
+    pub fn with_global_dispatch_review_revision(mut self, revision: Option<String>) -> Self {
+        self.global_dispatch_review_revision = revision;
         self
     }
 
@@ -799,21 +969,29 @@ impl PlatformDriver for MacOs26PlatformDriver {
     }
     fn dispatch_global(
         &mut self,
-        _request: SyntheticDispatchRequest,
+        request: GlobalDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
-        // Global posting reaches whatever has focus anywhere in the session.
-        // That is a strictly larger authority than per-process delivery, and
-        // it has not been approved — so this refuses by naming the authority
-        // rather than any implementation detail.
-        Err(DriverError::StartupRefused(
-            "global event posting is a larger authority than per-process delivery and has not been approved",
-        ))
+        if self
+            .global_dispatch_review_revision
+            .as_deref()
+            .is_none_or(|revision| revision.trim().is_empty())
+        {
+            return Err(DriverError::StartupRefused(
+                "global_dispatch_review_revision is not bound",
+            ));
+        }
+        request.synthetic.target.validate()?;
+        let tap = cerebellum_macos::SessionEventTap::listen(SESSION_TAP_UNREAD_BOUND)
+            .map_err(|_| DriverError::StartupRefused("session input observer is unavailable"))?;
+        dispatch_synthetic_globally(request, &tap)
     }
-    fn query_focus(
-        &mut self,
-        _request: FocusQueryRequest,
-    ) -> Result<FocusQueryResult, DriverError> {
-        Err(DriverError::Unsupported("focus query"))
+    fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
+        request.target.validate()?;
+        let frontmost = cerebellum_macos::frontmost_process_id()
+            .ok_or(DriverError::Unsupported("frontmost process reading"))?;
+        Ok(FocusQueryResult {
+            matches_target: i32::try_from(request.target.pid).ok() == Some(frontmost),
+        })
     }
     fn fronting_snapshot(
         &mut self,
@@ -1012,6 +1190,7 @@ mod tests {
             attendance_contract_owner: Some("fixture-owner".to_string()),
             attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
             input_review_revision: Some("fixture-input-review-v1".to_string()),
+            global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
             semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
             windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
@@ -1084,6 +1263,7 @@ mod tests {
             attendance_contract_owner: Some("fixture-owner".to_string()),
             attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
             input_review_revision: Some("fixture-input-review-v1".to_string()),
+            global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
             semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
             windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
@@ -1125,13 +1305,9 @@ mod tests {
         // The same context plus accessibility clears the PERMISSION refusal, so
         // the one above is the accessibility check and not some unrelated gate.
         //
-        // It does not advertise even then, and that is correct rather than a
-        // second bug: move has no semantic action, the per-process path does not
-        // carry pointer events, and global posting is unbuilt -- so nothing can
-        // deliver it. Asserting advertisement here would demand that a row with
-        // no working path be offered to callers, which is what this module now
-        // refuses on purpose. The discriminating check is that the REASON
-        // changes: permissions stop being what withholds it.
+        // The same context plus accessibility clears the permission refusal.
+        // This fixture also supplies the external authorization required for
+        // session-global posting, so the observed route is permitted to deliver.
         let with_accessibility = PermissionLivenessReport::from_results(vec![
             PermissionProbeResult {
                 service: PermissionService::InputMonitoring,
@@ -1167,8 +1343,8 @@ mod tests {
             declaration.suppression_reason
         );
         assert!(
-            !declaration.advertised,
-            "computer.move has no deliverable path, so no permission grant should advertise it"
+            declaration.advertised,
+            "reviewed observed move was suppressed after every permission became live"
         );
     }
 
@@ -1192,6 +1368,7 @@ mod tests {
                 attendance_contract_owner: Some("fixture-owner".to_string()),
                 attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
                 input_review_revision: Some("fixture-input-review-v1".to_string()),
+                global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
                 capture_review_revision: Some("fixture-capture-review-v1".to_string()),
                 semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
@@ -1993,6 +2170,29 @@ mod cached_element_tests {
             }
         }
 
+        fn global_request(action: SyntheticAction) -> GlobalDispatchRequest {
+            let clock = cerebellum_core::clock::FakeClock::new();
+            let key = cerebellum_core::consent::LeaseKey {
+                grantee: "test-agent".to_string(),
+                bundle_identity: grant().bundle_identity,
+                action_kind: cerebellum_core::consent::ActionKind::MutateDurable,
+            };
+            let mut leases = cerebellum_core::consent::ConsentLeases::new();
+            leases.grant(
+                key.clone(),
+                cerebellum_core::consent::GrantKind::Once,
+                &clock,
+            );
+            GlobalDispatchRequest {
+                synthetic: request(action),
+                once_dispatch_token: leases
+                    .admit_once_dispatch(&key, &clock)
+                    .expect("the fixture consumes its Once lease"),
+                maximum_seize_detection_latency_ms: 50,
+                minimum_inter_post_interval_ms: 50,
+            }
+        }
+
         fn dispatch(
             action: SyntheticAction,
             transport: &mut RecordingTransport,
@@ -2261,25 +2461,18 @@ mod cached_element_tests {
         }
 
         #[test]
-        fn dispatch_global_is_refused_as_an_unapproved_larger_authority() {
+        fn dispatch_global_is_refused_by_the_unbound_review_key() {
             let mut driver = MacOs26PlatformDriver::default();
             let refusal = driver
-                .dispatch_global(request(SyntheticAction::move_pointer(SyntheticPoint {
-                    x: 0.0,
-                    y: 0.0,
-                })))
-                .expect_err("global dispatch stays refused");
+                .dispatch_global(global_request(SyntheticAction::move_pointer(
+                    SyntheticPoint { x: 0.0, y: 0.0 },
+                )))
+                .expect_err("an unbound global review key refuses dispatch");
 
-            let DriverError::StartupRefused(reason) = refusal else {
-                panic!("the refusal names the unapproved authority: {refusal:?}")
-            };
-            assert!(
-                reason.contains("larger authority"),
-                "the refusal must name the authority, not a skeleton: {reason}"
-            );
-            assert!(
-                reason.contains("not been approved"),
-                "the refusal must say the authority was not approved: {reason}"
+            assert_eq!(
+                refusal,
+                DriverError::StartupRefused("global_dispatch_review_revision is not bound"),
+                "the refusal must name the missing release gate"
             );
         }
     }

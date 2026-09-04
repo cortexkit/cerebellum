@@ -17,6 +17,7 @@ fn valid_inputs() -> ComputerReleaseInputs {
         attendance_contract_owner: Some("fixture-attendance-owner".into()),
         attendance_contract_revision: Some("fixture-attendance-contract-v1".into()),
         input_review_revision: Some("fixture-input-review-v1".into()),
+        global_dispatch_review_revision: Some("fixture-global-dispatch-review-v1".into()),
         capture_review_revision: Some("fixture-capture-review-v1".into()),
         semantic_actuation_review_revision: Some("fixture-semantic-actuation-review-v1".into()),
         windows_actuation_review_revision: Some("fixture-windows-actuation-review-v1".into()),
@@ -346,7 +347,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 10],
+        vec![ComputerGateOutcome::Pass; 11],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -354,6 +355,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "attendance_contract_owner",
         "attendance_contract_revision",
         "input_review_revision",
+        "global_dispatch_review_revision",
         "capture_review_revision",
         "semantic_actuation_review_revision",
         "windows_actuation_review_revision",
@@ -368,6 +370,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "attendance_contract_owner" => inputs.attendance_contract_owner = None,
             "attendance_contract_revision" => inputs.attendance_contract_revision = None,
             "input_review_revision" => inputs.input_review_revision = None,
+            "global_dispatch_review_revision" => inputs.global_dispatch_review_revision = None,
             "capture_review_revision" => inputs.capture_review_revision = None,
             "semantic_actuation_review_revision" => {
                 inputs.semantic_actuation_review_revision = None
@@ -404,7 +407,8 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         match gate {
             "attendance_contract_owner"
             | "attendance_contract_revision"
-            | "input_review_revision" => assert_eq!(
+            | "input_review_revision"
+            | "global_dispatch_review_revision" => assert_eq!(
                 admitted,
                 vec!["computer.click", "computer.screenshot", "computer.wait"],
                 "the synthetic-input gates must not govern reviewed semantic click"
@@ -472,4 +476,61 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
             .iter()
             .any(|id| id == "computer.screenshot"));
     }
+}
+
+/// All other release inputs and runtime permissions are live; pointer rows are
+/// withheld only because authorization for session-global dispatch is absent.
+#[test]
+fn global_dispatch_review_gate_isolated_from_every_other_release_input() {
+    let mut inputs = valid_inputs();
+    inputs.global_dispatch_review_revision = None;
+    assert!(
+        inputs.input_review_revision.is_some(),
+        "the isolation fixture must bind the ordinary input review"
+    );
+    let permissions = PermissionLivenessReport::from_results(
+        [
+            PermissionService::ScreenRecording,
+            PermissionService::Accessibility,
+            PermissionService::PostEvent,
+            PermissionService::InputMonitoring,
+            PermissionService::RawHidObservation,
+        ]
+        .into_iter()
+        .map(|service| PermissionProbeResult {
+            service,
+            liveness: PermissionLiveness::Live,
+            responsible_process: "ck-subc".into(),
+            off_main: true,
+        }),
+    );
+    let context = ComputerCapabilityAdvertisementContext {
+        inputs,
+        permissions: permissions.clone(),
+        startup: StartupCapabilityProbe {
+            os_major: 26,
+            private_envelope_recognized: true,
+            permissions,
+        },
+    };
+
+    assert_eq!(
+        available_capabilities(&context),
+        vec![
+            "computer.click",
+            "computer.type",
+            "computer.keys",
+            "computer.screenshot",
+            "computer.wait",
+        ],
+        "a missing global review must withhold exactly scroll, move, and drag"
+    );
+    assert!(
+        computer_release_evidence(&context).gate_outcomes.contains(
+            &ComputerGateOutcome::MissingExternalInput {
+                gate: "global_dispatch_review_revision".to_string(),
+            }
+        ),
+        "the withheld rows must name the missing global-dispatch gate"
+    );
 }

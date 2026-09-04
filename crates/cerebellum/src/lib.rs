@@ -195,7 +195,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 18] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 19] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -218,6 +218,10 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 18] = [
     },
     ComputerReleaseGate {
         name: "input_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "global_dispatch_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     ComputerReleaseGate {
@@ -359,6 +363,7 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         "attendance_contract_owner" => inputs.attendance_contract_owner.as_deref(),
         "attendance_contract_revision" => inputs.attendance_contract_revision.as_deref(),
         "input_review_revision" => inputs.input_review_revision.as_deref(),
+        "global_dispatch_review_revision" => inputs.global_dispatch_review_revision.as_deref(),
         "capture_review_revision" => inputs.capture_review_revision.as_deref(),
         "semantic_actuation_review_revision" => {
             inputs.semantic_actuation_review_revision.as_deref()
@@ -408,14 +413,21 @@ fn declaration_gate_passes(
         [platform_review, "release_signing_topology_revision"]
             .iter()
             .all(|gate| gate_passes(outcomes, gate))
-    } else if matches!(
-        id,
-        "computer.type" | "computer.keys" | "computer.scroll" | "computer.move" | "computer.drag"
-    ) {
+    } else if matches!(id, "computer.type" | "computer.keys") {
         [
             "attendance_contract_owner",
             "attendance_contract_revision",
             "input_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
+    } else if matches!(id, "computer.scroll" | "computer.move" | "computer.drag") {
+        [
+            "attendance_contract_owner",
+            "attendance_contract_revision",
+            "input_review_revision",
+            "global_dispatch_review_revision",
             "release_signing_topology_revision",
         ]
         .iter()
@@ -871,39 +883,58 @@ fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>
 /// Collect the release attestations supplied to the compiler and derive the
 /// vocabulary mirrors from their independent checked-in sources.
 ///
-/// The six external identifiers use `option_env!` so a release invocation must
+/// The eight external identifiers use `option_env!` so a release invocation must
 /// supply each attestation before compilation. Starting a binary with a new
 /// environment value cannot manufacture a review after the binary was built.
 fn compiled_release_inputs() -> ComputerReleaseInputs {
-    release_inputs_from_build_bindings(
-        option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_OWNER"),
-        option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_REVISION"),
-        option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
-        option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
-        option_env!("CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION"),
-        option_env!("CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION"),
-        option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION"),
-    )
+    let semantic_actuation_review_revision =
+        option_env!("CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION");
+    let windows_actuation_review_revision =
+        option_env!("CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION");
+    let release_signing_topology_revision =
+        option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION");
+    release_inputs_from_build_bindings(BuildReleaseBindings {
+        attendance_contract_owner: option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_OWNER"),
+        attendance_contract_revision: option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_REVISION"),
+        input_review_revision: option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
+        global_dispatch_review_revision: option_env!("CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION"),
+        capture_review_revision: option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
+        semantic_actuation_review_revision,
+        windows_actuation_review_revision,
+        release_signing_topology_revision,
+    })
 }
 
-fn release_inputs_from_build_bindings(
-    attendance_contract_owner: Option<&str>,
-    attendance_contract_revision: Option<&str>,
-    input_review_revision: Option<&str>,
-    capture_review_revision: Option<&str>,
-    semantic_actuation_review_revision: Option<&str>,
-    windows_actuation_review_revision: Option<&str>,
-    release_signing_topology_revision: Option<&str>,
-) -> ComputerReleaseInputs {
+struct BuildReleaseBindings<'a> {
+    attendance_contract_owner: Option<&'a str>,
+    attendance_contract_revision: Option<&'a str>,
+    input_review_revision: Option<&'a str>,
+    global_dispatch_review_revision: Option<&'a str>,
+    capture_review_revision: Option<&'a str>,
+    semantic_actuation_review_revision: Option<&'a str>,
+    windows_actuation_review_revision: Option<&'a str>,
+    release_signing_topology_revision: Option<&'a str>,
+}
+
+fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> ComputerReleaseInputs {
     let computed_vocabulary_digest = computer::platform::computed_vocabulary_sha256();
     ComputerReleaseInputs {
-        attendance_contract_owner: attendance_contract_owner.map(str::to_owned),
-        attendance_contract_revision: attendance_contract_revision.map(str::to_owned),
-        input_review_revision: input_review_revision.map(str::to_owned),
-        capture_review_revision: capture_review_revision.map(str::to_owned),
-        semantic_actuation_review_revision: semantic_actuation_review_revision.map(str::to_owned),
-        windows_actuation_review_revision: windows_actuation_review_revision.map(str::to_owned),
-        release_signing_topology_revision: release_signing_topology_revision.map(str::to_owned),
+        attendance_contract_owner: bindings.attendance_contract_owner.map(str::to_owned),
+        attendance_contract_revision: bindings.attendance_contract_revision.map(str::to_owned),
+        input_review_revision: bindings.input_review_revision.map(str::to_owned),
+        global_dispatch_review_revision: bindings
+            .global_dispatch_review_revision
+            .map(str::to_owned),
+        capture_review_revision: bindings.capture_review_revision.map(str::to_owned),
+        semantic_actuation_review_revision: bindings
+            .semantic_actuation_review_revision
+            .map(str::to_owned),
+        windows_actuation_review_revision: bindings
+            .windows_actuation_review_revision
+            .map(str::to_owned),
+        release_signing_topology_revision: bindings
+            .release_signing_topology_revision
+            .map(str::to_owned),
         vocabulary_digests: computer::platform::VocabularyDigestInputs {
             // The manifest and computed-artifact mirrors are recalculated from
             // the frozen vocabulary, while the source-lock digest comes from its
@@ -1622,6 +1653,9 @@ impl Planes {
                     .with_shared_grants(browser_grants),
             )
         };
+        #[cfg(target_os = "macos")]
+        let global_dispatch_review_revision =
+            compiled_release_inputs().global_dispatch_review_revision;
         Self {
             health,
             routes: Arc::new(RouteBindings::new()),
@@ -1639,9 +1673,14 @@ impl Planes {
                     // accessibility trees, and a stale cache may name a process
                     // generation that is gone. Synthetic requests declare no
                     // post-condition, so their effects remain indeterminate.
-                    || {
-                        computer_capability::NativeComputerPlatformDriver::default()
-                            .without_expected_post_condition()
+                    move || {
+                        let driver = computer_capability::NativeComputerPlatformDriver::default()
+                            .without_expected_post_condition();
+                        #[cfg(target_os = "macos")]
+                        let driver = driver.with_global_dispatch_review_revision(
+                            global_dispatch_review_revision.clone(),
+                        );
+                        driver
                     },
                 ))
             }),
@@ -3064,8 +3103,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            7,
-            "expected seven attestations, found {read_here:?}"
+            8,
+            "expected eight attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -3944,21 +3983,23 @@ mod tests {
 
     #[test]
     fn build_bindings_preserve_absence_and_bind_only_the_supplied_capture_review() {
-        let inputs = release_inputs_from_build_bindings(
-            None,
-            None,
-            None,
-            Some("cerebellum-capture-review/v1@cb1f669"),
-            None,
-            None,
-            None,
-        );
+        let inputs = release_inputs_from_build_bindings(BuildReleaseBindings {
+            attendance_contract_owner: None,
+            attendance_contract_revision: None,
+            input_review_revision: None,
+            global_dispatch_review_revision: None,
+            capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669"),
+            semantic_actuation_review_revision: None,
+            windows_actuation_review_revision: None,
+            release_signing_topology_revision: None,
+        });
         assert_eq!(
             inputs,
             ComputerReleaseInputs {
                 attendance_contract_owner: None,
                 attendance_contract_revision: None,
                 input_review_revision: None,
+                global_dispatch_review_revision: None,
                 capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669".to_string()),
                 semantic_actuation_review_revision: None,
                 windows_actuation_review_revision: None,
@@ -4014,22 +4055,23 @@ mod tests {
         }
 
         let context = ComputerCapabilityAdvertisementContext {
-            inputs: release_inputs_from_build_bindings(
-                Some("fixture-attendance-owner"),
-                Some("fixture-attendance-revision"),
-                Some("fixture-input-review"),
-                Some("fixture-capture-review"),
-                Some("fixture-semantic-actuation-review"),
-                Some("fixture-windows-actuation-review"),
-                Some("fixture-signing-topology"),
-            ),
+            inputs: release_inputs_from_build_bindings(BuildReleaseBindings {
+                attendance_contract_owner: Some("fixture-attendance-owner"),
+                attendance_contract_revision: Some("fixture-attendance-revision"),
+                input_review_revision: Some("fixture-input-review"),
+                global_dispatch_review_revision: Some("fixture-global-dispatch-review"),
+                capture_review_revision: Some("fixture-capture-review"),
+                semantic_actuation_review_revision: Some("fixture-semantic-actuation-review"),
+                windows_actuation_review_revision: Some("fixture-windows-actuation-review"),
+                release_signing_topology_revision: Some("fixture-signing-topology"),
+            }),
             permissions: Default::default(),
             startup: StartupCapabilityProbe::default(),
         };
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 10]
+            vec![ComputerGateOutcome::Pass; 11]
         );
     }
 }

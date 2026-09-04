@@ -22,7 +22,9 @@ use std::time::Duration;
 
 use cerebellum_computer::platform::{ProcessGrant, TargetCandidate, TargetResolution};
 use cerebellum_core::clock::MonotonicClock;
-use cerebellum_core::consent::{ActionKind, ConsentLeases, GrantKind, LeaseKey, Opening};
+use cerebellum_core::consent::{
+    ActionKind, ConsentLeases, GrantKind, LeaseKey, OnceDispatchToken, Opening,
+};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -515,6 +517,19 @@ impl ManagementPlane {
     pub async fn admits<C: MonotonicClock>(&self, key: &LeaseKey, clock: &C) -> bool {
         let mut leases = self.leases.lock().await;
         leases.admits(key, clock).is_admitted()
+    }
+
+    /// Consume an exact Once lease into the token required by global dispatch.
+    ///
+    /// The same write lock guards both lease minting and consumption, so a
+    /// concurrent opening and dispatch cannot both observe one single-use grant.
+    pub async fn admit_once_dispatch<C: MonotonicClock>(
+        &self,
+        key: &LeaseKey,
+        clock: &C,
+    ) -> Option<OnceDispatchToken> {
+        let mut leases = self.leases.lock().await;
+        leases.admit_once_dispatch(key, clock)
     }
 }
 

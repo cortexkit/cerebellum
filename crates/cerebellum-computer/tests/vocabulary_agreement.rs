@@ -435,9 +435,10 @@ fn scroll_declares_a_semantic_path_that_no_action_implements() {
 /// events are right; the per-process path does not carry pointer events.
 ///
 /// So a pointer row must not claim background support. It is not broken -- it is
-/// deliverable through the global path, which seizes the shared cursor and is
-/// the authority this module calls observed mode, deliberately unbuilt. Claiming
-/// Supported would offer a caller a background capability that cannot deliver.
+/// deliverable through the separately gated global path, which seizes the
+/// shared cursor and is the authority this module calls observed mode. Claiming
+/// background Supported would offer a caller a per-process capability that
+/// cannot deliver.
 ///
 /// Asserted because the claim is invisible from the code that makes it: the
 /// field is a constant expression, and every test that reads a declaration
@@ -568,6 +569,7 @@ fn fully_bound_context() -> CapabilityAdvertisementContext {
         attendance_contract_owner: Some("fixture-owner".to_string()),
         attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
         input_review_revision: Some("fixture-input-review-v1".to_string()),
+        global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
         capture_review_revision: Some("fixture-capture-review-v1".to_string()),
         semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
         windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
@@ -663,7 +665,8 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
         actuating += 1;
 
         let deliverable = declaration.semantic_path == SupportState::Supported
-            || declaration.synthetic_background == SupportState::Supported;
+            || declaration.synthetic_background == SupportState::Supported
+            || declaration.dispatch_modes.contains(&DispatchMode::Observed);
         if !deliverable {
             assert!(
                 !declaration.advertised,
