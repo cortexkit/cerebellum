@@ -176,18 +176,62 @@ fn tap_liveness(seconds: u64) {
     use std::thread::sleep;
     use std::time::Duration;
 
-    use cerebellum_macos::SessionEventTap;
+    use cerebellum_macos::{mouse_move_event, post_event_globally, EventPoint, SessionEventTap};
 
-    // Bound of 1 so an undrained tap stalls the callback on the next event,
-    // which is the condition whose timeout this arm is measuring.
-    let tap = match SessionEventTap::listen(1) {
+    // A rendezvous channel (bound 0): every send blocks until received, so the
+    // callback stalls on the FIRST event and stays stalled for the whole sleep
+    // with nothing draining. A bound of 1 could not prove a stall -- draining
+    // afterwards wakes a blocked sender, so one event or two both drain as
+    // two.
+    let tap = match SessionEventTap::listen(0) {
         Ok(tap) => tap,
         Err(error) => exit_tap_unmeasured(error),
     };
     println!("enabled_before {}", tap.is_enabled());
-    println!("slept_seconds {seconds} without draining");
-    sleep(Duration::from_secs(seconds));
+    // Generate the load the arm is measuring. A silent machine produces no
+    // events, so a tap that is never invoked can never stall and never be
+    // disabled -- the first run of this arm reported enabled_after=true on an
+    // idle desk with nobody draining, which proved only that. Two posts
+    // against a bound of one: the second blocks the callback, and macOS's
+    // timeout is what the sleep waits out.
+    for _ in 0..1 {
+        match mouse_move_event(EventPoint { x: 640.0, y: 400.0 }) {
+            Ok(event) => {
+                let _ = post_event_globally(event);
+            }
+            Err(error) => {
+                eprintln!("UNMEASURED: could not construct a mouse-move: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    println!("posted 1 event into a rendezvous channel without draining");
+    // Half the sleep with the callback stalled, then a second event from THIS
+    // thread while the tap thread is still blocked. If CoreGraphics only
+    // notices a timed-out callback when it next tries to deliver, this is the
+    // delivery that lets it notice; on a silent desk nothing else would.
+    let half = Duration::from_secs(seconds / 2);
+    sleep(half);
+    println!("enabled_midway {}", tap.is_enabled());
+    if let Ok(event) = mouse_move_event(EventPoint { x: 650.0, y: 410.0 }) {
+        let _ = post_event_globally(event);
+        println!("posted a second event while the callback was stalled");
+    }
+    sleep(half);
+    println!("slept_seconds {seconds}");
     println!("enabled_after {}", tap.is_enabled());
+    // Drain what queued. One event means the second post's callback is still
+    // blocked on the send (the stall happened); two means it was never blocked
+    // and this arm measured nothing about a stalled tap.
+    let mut drained = 0;
+    while tap.events().try_recv().is_ok() {
+        drained += 1;
+    }
+    sleep(Duration::from_millis(200));
+    while tap.events().try_recv().is_ok() {
+        drained += 1;
+    }
+    println!("drained_after_sleep {drained} (1 = the event was delivered and its callback blocked for the sleep; 0 = never delivered, arm unmeasured)");
 }
 
 #[cfg(target_os = "macos")]
