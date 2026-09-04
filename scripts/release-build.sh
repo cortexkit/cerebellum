@@ -48,6 +48,60 @@ export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
 # fail by name when their guard is removed.
 export CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION="semantic-actuation-review/v2@928cf90"
 
+# Windows semantic actuation, reviewed under the v2 shape at 9b59170 with the
+# differences from macOS recorded here as the Windows appendix. This binds only
+# UIA Invoke on a uniquely resolved element (computer.click) and computer.wait;
+# Windows has no per-process input path and no capture backend, so every other
+# row is withheld by the advertisement rule rather than by this key.
+#
+# Measured on ARM64 Windows 11 from the console session, through the production
+# driver: attendance verified, tree read, Close resolved uniquely with its
+# alternate key, the neutral press dispatched as Invoke and accepted, after-read
+# TargetGone. A duplicate id refused match_count 2 without invoking; an absent
+# id refused; one Notepad resolves, two are Ambiguous by count.
+#
+# What differs from macOS, and why each is load-bearing:
+#
+# 1. Session provenance precedes everything, in this order: PROVENANCE, then
+#    LIVENESS, then VISIBILITY, then RESOLUTION, then the invoke. A UIA read
+#    from a service session SUCCEEDS and returns that session's own windows, so
+#    an element resolved from it uniquely and correctly still names a control
+#    the user cannot see. Measured: session 0 reads six service-desktop windows
+#    while the console has ninety-five. The ordering is a rule, pinned by
+#    other_session_refuses_actuation_before_liveness_and_before_any_invoke:
+#    a service-session actuation of an element that would otherwise resolve
+#    refuses by provenance with the liveness probe uncalled and the invoke
+#    count zero; moving the check after liveness fails it by name.
+#
+# 2. Window visibility carries Unknown, never collapsed to NotVisible: a UWP
+#    application has no enumerable window, and claiming absence would be false.
+#    An Unknown target is actuatable only if resolution is unique; Unknown is
+#    not itself a refusal.
+#
+# 3. The identity a caller names is the executable basename (notepad.exe), not
+#    a bundle identifier, which Windows does not have. UWP applications resolve
+#    by their own basename; applicationframehost.exe resolves to the host of
+#    every UWP frame and is the wrong name. Two executables sharing a basename
+#    in different paths resolve Ambiguous by instance count, never by path
+#    preference -- the two-Notepad measurement covers that case.
+#
+# 4. Liveness is checked before visibility, or a dead target reads as
+#    "visibility unknown": a process that has exited has no enumerable window
+#    either. Found live (a Close whose after-read said unknown where the seam
+#    said gone) and fixed at b326b61.
+#
+# 5. Refusal reasons reach the wire typed, each with its own remedy (44afafc).
+#    The generic word had sent a Windows caller in the wrong session to check a
+#    macOS screen-recording grant.
+#
+# NOT COVERED. accepted_by_platform: true from UIA Invoke means the provider's
+# handler returned, not that the element did anything. The effect vocabulary
+# is unexercised on Windows: the one effect witness in the record is TargetGone
+# after Close, for that action alone. Nobody may read the accepted flag as
+# verification. Also unmeasured: any application other than Notepad, explorer
+# and Calculator, and anything under load.
+export CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION="windows-actuation-review/v1@9b59170"
+
 # Synthetic input: manufacturing input events rather than asking an element to
 # invoke its own action. Reviewed against measurements rather than intentions --
 # the review required a live end-to-end run on the served wire path as a
@@ -97,21 +151,16 @@ export CEREBELLUM_ATTENDANCE_CONTRACT_REVISION="v1"
 export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 
 # ---------------------------------------------------------------------------
-# Not yet minted
+# Not yet minted: nothing, as of windows-actuation-review/v1.
 # ---------------------------------------------------------------------------
 #
-# Deliberately unset rather than filled with a placeholder. The gate rejects
-# "placeholder", "tbd" and "unknown" outright, so a stand-in fails louder than
-# absence -- but the reason to leave them unset is not that a stand-in would be
-# caught. It is that absence is TRUE.
+# When a new identifier is added, leave it UNSET here until its review exists,
+# rather than filling it with a placeholder. The gate rejects "placeholder",
+# "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
+# the reason to leave it unset is not that a stand-in would be caught. It is
+# that absence is TRUE, and the module withholds the capability with a named
+# reason while it is.
 #
-# Keep Windows UI Automation actuation disabled and unadvertised until a
-# Windows-specific source review and live virtual-machine validation have been
-# completed and their revision identifier is supplied. The macOS semantic review
-# covers a separate implementation and does not authorize Windows actuation.
-#
-#   CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION
-
 # ---------------------------------------------------------------------------
 
 # The identifiers the compiler reads. Kept as one list so the loop below and
