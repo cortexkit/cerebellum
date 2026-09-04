@@ -15,7 +15,8 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_foundation::{CFData, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGEvent, CGImage,
+    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGEvent,
+    CGEventTapLocation, CGImage,
 };
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
@@ -363,11 +364,11 @@ pub fn screen_is_locked() -> Option<bool> {
 /// An owned CoreGraphics event that can cross the safe platform seam.
 pub type OwnedCgEvent = CFRetained<CGEvent>;
 
-/// Evidence that CoreGraphics returned from a per-process post call.
+/// Evidence that CoreGraphics returned from a post call.
 ///
-/// `CGEvent::post_to_pid` has no delivery result. This type therefore records
-/// only that the call returned; it says nothing about whether an application
-/// received the event or acted on it.
+/// `CGEvent::post` and `CGEvent::post_to_pid` have no delivery result. This
+/// type therefore records only that the call returned; it says nothing about
+/// whether an application received the event or acted on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a returned post call is not evidence that the event was delivered"]
 pub struct CgEventPostCall;
@@ -379,6 +380,16 @@ pub struct CgEventPostCall;
 /// [`CgEventPostCall`] means only that the void framework call returned.
 pub fn post_event_to_pid(pid: i32, event: &CGEvent) -> CgEventPostCall {
     CGEvent::post_to_pid(pid, Some(event));
+    CgEventPostCall
+}
+
+/// Ask CoreGraphics to post one event at the HID tap.
+///
+/// Consumes the event by value so a retry cannot hand the same event to a
+/// second transport. A returned [`CgEventPostCall`] means only that the void
+/// framework call returned.
+pub fn post_event_globally(event: OwnedCgEvent) -> CgEventPostCall {
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     CgEventPostCall
 }
 

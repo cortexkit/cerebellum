@@ -9,14 +9,14 @@
 //!
 //! The bargain only works if this crate stays small and stays dumb. It returns
 //! plain framework values, exposes one typed accessibility action request, and
-//! makes one public CoreGraphics post call. It decides nothing: not which
+//! makes public CoreGraphics post calls. It decides nothing: not which
 //! permissions a capability needs, not whether a grant counts, not what a
 //! missing reading implies. Every one of those lives in the platform-neutral
 //! code, which is built and tested on every host rather than only on this one.
 //!
 //! The action request asks an application to invoke one control action that the
 //! application itself advertised. Input construction produces owned framework
-//! events without targeting them, and the event-post request only forwards one
+//! events without targeting them, and each event-post request only forwards one
 //! such event. Direct focus changes and window-raising actions remain outside
 //! this seam.
 //!
@@ -26,6 +26,8 @@
 // input-bound checks run even where the macOS framework APIs are unavailable.
 #[cfg(any(target_os = "macos", test))]
 mod accessibility;
+#[cfg(any(target_os = "macos", test))]
+mod event_tap;
 #[cfg(any(target_os = "macos", test))]
 mod input;
 #[cfg(target_os = "macos")]
@@ -55,12 +57,19 @@ pub use accessibility::{
     request_accessibility_action,
 };
 #[cfg(target_os = "macos")]
+pub use event_tap::SessionEventTap;
+#[cfg(any(target_os = "macos", test))]
+pub use event_tap::{SessionEvent, SessionEventTapError};
+#[cfg(target_os = "macos")]
 pub use input::{
     event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
-    mouse_move_event, scroll_wheel_event, text_input_events, InputMonitoringAccess,
+    mouse_move_event, scroll_wheel_event, seconds_since_last_input, text_input_events,
 };
 #[cfg(any(target_os = "macos", test))]
-pub use input::{EventPoint, InputEventConstructionError, KeyModifiers, ScrollUnit, VirtualKey};
+pub use input::{
+    EventPoint, EventSourceStateTable, InputEventConstructionError, InputMonitoringAccess,
+    KeyModifiers, ScrollUnit, VirtualKey,
+};
 #[cfg(target_os = "macos")]
 pub use launch::{
     executed_image_identity, process_descriptors, spawn_barred, terminate_exact_generation,
@@ -70,7 +79,8 @@ pub use launch::{
 #[cfg(target_os = "macos")]
 pub use macos::{
     capture_window, encode_png, enumerate_windows, establish_window_server_connection,
-    is_off_main_thread, post_event_to_pid, process_start_time, process_start_time_micros,
-    responsible_process, screen_capture_is_permitted, screen_is_locked, CaptureError,
-    CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessStartTime, RawCapture, RawWindow,
+    is_off_main_thread, post_event_globally, post_event_to_pid, process_start_time,
+    process_start_time_micros, responsible_process, screen_capture_is_permitted, screen_is_locked,
+    CaptureError, CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessStartTime, RawCapture,
+    RawWindow,
 };

@@ -151,6 +151,48 @@ pub struct EventPoint {
     pub y: f64,
 }
 
+/// Which CoreGraphics event-source state table a seconds-since-input reading
+/// is taken from.
+///
+/// The tables are not interchangeable. Synthetic events in this crate are
+/// created from HID system state, so a reading from that table may be reset by
+/// our own posts while combined session state is not, or the reverse. The seam
+/// reports the number from the table the caller named; it does not pick one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventSourceStateTable {
+    /// `kCGEventSourceStateHIDSystemState`.
+    HidSystem,
+    /// `kCGEventSourceStateCombinedSessionState`.
+    CombinedSession,
+}
+
+impl EventSourceStateTable {
+    /// The integer CoreGraphics uses for this table (`CGEventSourceStateID`).
+    pub const fn raw_id(self) -> i32 {
+        match self {
+            Self::CombinedSession => 0,
+            Self::HidSystem => 1,
+        }
+    }
+}
+
+/// What macOS says about this process's Input Monitoring grant.
+///
+/// Three states rather than a bool, because "not yet decided" is a real
+/// answer distinct from a refusal: an undetermined grant becomes granted the
+/// moment a user approves a prompt, while a denial stands until they change
+/// it in System Settings. Collapsing them would tell an operator to go
+/// change a setting that does not yet have a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMonitoringAccess {
+    Granted,
+    Denied,
+    Undetermined,
+    /// IOKit answered with a value this build does not recognise. Carried
+    /// rather than folded into Denied so an OS change is visible as itself.
+    Unrecognised(u32),
+}
+
 /// The exact CoreGraphics allocation that failed while building input events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputEventConstructionError {
@@ -218,23 +260,6 @@ mod framework {
         fn IOHIDCheckAccess(request: u32) -> u32;
     }
 
-    /// What macOS says about this process's Input Monitoring grant.
-    ///
-    /// Three states rather than a bool, because "not yet decided" is a real
-    /// answer distinct from a refusal: an undetermined grant becomes granted the
-    /// moment a user approves a prompt, while a denial stands until they change
-    /// it in System Settings. Collapsing them would tell an operator to go
-    /// change a setting that does not yet have a row.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum InputMonitoringAccess {
-        Granted,
-        Denied,
-        Undetermined,
-        /// IOKit answered with a value this build does not recognise. Carried
-        /// rather than folded into Denied so an OS change is visible as itself.
-        Unrecognised(u32),
-    }
-
     /// Read the Input Monitoring grant without prompting.
     ///
     /// `kIOHIDRequestTypeListenEvent` (1) is the listening grant, which is what
@@ -273,12 +298,27 @@ mod framework {
         CGScrollEventUnit,
     };
 
-    use super::{EventPoint, InputEventConstructionError, KeyModifiers, ScrollUnit, VirtualKey};
+    use super::{
+        EventPoint, EventSourceStateTable, InputEventConstructionError, InputMonitoringAccess,
+        KeyModifiers, ScrollUnit, VirtualKey,
+    };
     use crate::OwnedCgEvent;
 
     fn event_source() -> Result<CFRetained<CGEventSource>, InputEventConstructionError> {
         CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .ok_or(InputEventConstructionError::EventSourceUnavailable)
+    }
+
+    /// Seconds since any input event in `table`, as CoreGraphics reports it.
+    ///
+    /// Uses `kCGAnyInputEventType`. The objc2 binding skips that constant; the
+    /// header defines it as `(CGEventType)(~0)`.
+    pub fn seconds_since_last_input(table: EventSourceStateTable) -> f64 {
+        const ANY_INPUT_EVENT_TYPE: CGEventType = CGEventType(u32::MAX);
+        CGEventSource::seconds_since_last_event_type(
+            CGEventSourceStateID(table.raw_id()),
+            ANY_INPUT_EVENT_TYPE,
+        )
     }
 
     fn modifier_flags(modifiers: KeyModifiers) -> CGEventFlags {
@@ -454,14 +494,14 @@ mod framework {
 #[cfg(target_os = "macos")]
 pub use framework::{
     event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
-    mouse_move_event, scroll_wheel_event, text_input_events, InputMonitoringAccess,
+    mouse_move_event, scroll_wheel_event, seconds_since_last_input, text_input_events,
 };
 
 #[cfg(test)]
 mod platform_neutral_tests {
     use std::collections::HashSet;
 
-    use super::{InputEventConstructionError, VirtualKey};
+    use super::{EventSourceStateTable, InputEventConstructionError, VirtualKey};
 
     #[test]
     fn virtual_keys_carry_the_macos_hardware_codes() {
@@ -488,6 +528,17 @@ mod platform_neutral_tests {
         ];
 
         assert_eq!(HashSet::from(failures).len(), failures.len());
+    }
+
+    #[test]
+    fn hid_system_and_combined_session_are_distinct_tables() {
+        assert_ne!(
+            EventSourceStateTable::HidSystem,
+            EventSourceStateTable::CombinedSession
+        );
+        // The integers CoreGraphics uses: CombinedSessionState = 0, HIDSystemState = 1.
+        assert_eq!(EventSourceStateTable::CombinedSession.raw_id(), 0);
+        assert_eq!(EventSourceStateTable::HidSystem.raw_id(), 1);
     }
 }
 
