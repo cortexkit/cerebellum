@@ -62,8 +62,8 @@ pub use event_tap::SessionEventTap;
 pub use event_tap::{SessionEvent, SessionEventTapError};
 #[cfg(target_os = "macos")]
 pub use input::{
-    event_post_access, input_monitoring_access, key_combination_events, mouse_drag_events,
-    mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
+    event_post_access, heartbeat_marker_event, input_monitoring_access, key_combination_events,
+    mouse_drag_events, mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
     seconds_since_last_input, text_input_events,
 };
 #[cfg(any(target_os = "macos", test))]
@@ -80,8 +80,8 @@ pub use launch::{
 #[cfg(target_os = "macos")]
 pub use macos::{
     capture_window, encode_png, enumerate_windows, establish_window_server_connection,
-    is_off_main_thread, post_event_at_session_tap, post_event_globally, post_event_to_pid,
-    process_start_time, process_start_time_micros, responsible_process,
-    screen_capture_is_permitted, screen_is_locked, CaptureError, CaptureSourceRect,
-    CgEventPostCall, OwnedCgEvent, ProcessStartTime, RawCapture, RawWindow,
+    frontmost_process_id, is_off_main_thread, post_event_at_hid_tap_for_measurement,
+    post_event_globally, post_event_to_pid, process_start_time, process_start_time_micros,
+    responsible_process, screen_capture_is_permitted, screen_is_locked, CaptureError,
+    CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessStartTime, RawCapture, RawWindow,
 };

@@ -165,6 +165,9 @@ fn map_event_construction_error(
         }
         Construction::ScrollUnavailable => "CoreGraphics could not create the scroll event",
         Construction::MouseMoveUnavailable => "CoreGraphics could not create the mouse-move event",
+        Construction::HeartbeatMarkerUnavailable => {
+            "CoreGraphics could not create the observer heartbeat marker"
+        }
         Construction::DragPressUnavailable => "CoreGraphics could not create the drag press event",
         Construction::DragMoveUnavailable => "CoreGraphics could not create the drag move event",
         Construction::DragReleaseUnavailable => {

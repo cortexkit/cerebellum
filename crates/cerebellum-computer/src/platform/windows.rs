@@ -981,7 +981,7 @@ impl PlatformDriver for WindowsPlatformDriver {
 
     fn dispatch_global(
         &mut self,
-        _request: SyntheticDispatchRequest,
+        _request: GlobalDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
         Err(DriverError::Unsupported(
             "Windows global synthetic dispatch",
@@ -1125,6 +1125,7 @@ mod tests {
             attendance_contract_owner: Some("fixture-owner".to_owned()),
             attendance_contract_revision: Some("fixture-attendance".to_owned()),
             input_review_revision: Some("fixture-input".to_owned()),
+            global_dispatch_review_revision: Some("fixture-global-review".to_owned()),
             capture_review_revision: Some("fixture-capture".to_owned()),
             semantic_actuation_review_revision: Some("fixture-macos-semantic".to_owned()),
             windows_actuation_review_revision: Some("fixture-windows-actuation".to_owned()),

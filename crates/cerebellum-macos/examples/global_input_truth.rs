@@ -53,8 +53,9 @@ fn parse_seconds(arg: Option<String>, default: u64) -> u64 {
 #[cfg(target_os = "macos")]
 fn idle(table_name: Option<&str>) {
     use cerebellum_macos::{
-        mouse_move_event, mouse_move_event_from_private_source, post_event_at_session_tap,
-        post_event_globally, seconds_since_last_input, EventPoint, EventSourceStateTable,
+        mouse_move_event, mouse_move_event_from_private_source,
+        post_event_at_hid_tap_for_measurement, post_event_globally, seconds_since_last_input,
+        EventPoint, EventSourceStateTable,
     };
 
     // `--private-source` posts from a Private event source instead of the
@@ -102,9 +103,9 @@ fn idle(table_name: Option<&str>) {
         }
     };
     if session_tap {
-        let _ = post_event_at_session_tap(event);
-    } else {
         let _ = post_event_globally(event);
+    } else {
+        let _ = post_event_at_hid_tap_for_measurement(event);
     }
     println!(
         "posted mouse-moved at {} tap from {} source",

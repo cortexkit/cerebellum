@@ -12,6 +12,8 @@ pub struct SessionEvent {
     pub source_unix_process_id: i64,
     /// `CGEventType` as the integer CoreGraphics uses.
     pub event_type: u32,
+    /// `kCGEventSourceUserData`, used to recognize an observer heartbeat.
+    pub marker_nonce: u64,
 }
 
 /// Why a session event tap was not started.
@@ -255,9 +257,14 @@ mod framework {
             Some(unsafe { event.as_ref() }),
             CGEventField::EventSourceUnixProcessID,
         );
+        let marker_nonce = CGEvent::integer_value_field(
+            Some(unsafe { event.as_ref() }),
+            CGEventField::EventSourceUserData,
+        ) as u64;
         let _ = state.tx.send(SessionEvent {
             source_unix_process_id,
             event_type: event_type.0,
+            marker_nonce,
         });
         event.as_ptr()
     }
@@ -277,6 +284,7 @@ mod tests {
         let event = SessionEvent {
             source_unix_process_id: 0,
             event_type: 5,
+            marker_nonce: 0,
         };
         let (tx, rx) = session_event_channel(2);
         assert!(tx.try_send(event).is_ok());

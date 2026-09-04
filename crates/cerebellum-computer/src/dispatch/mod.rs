@@ -32,11 +32,12 @@ use crate::platform::containment::{
 };
 use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
-    DriverError, ElementResolutionResult, FocusQueryRequest, HeldStateDisposition,
-    InputObservationRequest, PermissionLiveness, PlatformDriver, ProcessEventRefusal, ProcessGrant,
-    SemanticActionIntent, SemanticActionPlatform, SemanticDispatchRequest, SemanticDriverError,
-    SyntheticAction, SyntheticDispatchRequest, TargetDisposition,
+    DriverError, ElementResolutionResult, GlobalDispatchRequest, HeldStateDisposition,
+    PermissionLiveness, PlatformDriver, ProcessEventRefusal, ProcessGrant, SemanticActionIntent,
+    SemanticActionPlatform, SemanticDispatchRequest, SemanticDriverError, SyntheticAction,
+    SyntheticDispatchRequest, TargetDisposition,
 };
+use cerebellum_core::consent::OnceDispatchToken;
 use cerebellum_core::journal::redaction::Redactor;
 use cerebellum_core::journal::severity::SeverityTaxonomy;
 use cerebellum_core::journal::storage::JournalStorage;
@@ -144,7 +145,7 @@ impl FocusCheckPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct DispatchRequest {
     pub row: FrozenDispatchRow,
     pub mode: DispatchMode,
@@ -156,6 +157,8 @@ pub struct DispatchRequest {
     pub expected_post_condition: ExpectedPostCondition,
     pub attendance: AttendanceContext,
     pub focus_plan: Option<FocusCheckPlan>,
+    #[serde(skip)]
+    pub once_dispatch_token: Option<OnceDispatchToken>,
     pub now_ms: u64,
 }
 
@@ -179,6 +182,7 @@ impl DispatchRequest {
             expected_post_condition,
             attendance,
             focus_plan: None,
+            once_dispatch_token: None,
             now_ms,
         }
     }
@@ -206,6 +210,11 @@ impl DispatchRequest {
 
     pub fn with_focus_plan(mut self, plan: FocusCheckPlan) -> Self {
         self.focus_plan = Some(plan);
+        self
+    }
+
+    pub fn with_once_dispatch_token(mut self, token: OnceDispatchToken) -> Self {
+        self.once_dispatch_token = Some(token);
         self
     }
 
@@ -307,12 +316,16 @@ pub enum DispatchError {
     EnvelopeUnrecognized,
     UnsupportedMode,
     ObserverUnavailable,
+    SeizeLatencyBoundExceeded,
     /// The machine is in use, or its idleness could not be read. Carries the
     /// refusal so the wire shows the threshold and the observed milliseconds
     /// -- the remedy ("wait for the user to step away") is nothing like the
     /// remedy for an unavailable observer, and the two used to share a word.
     IdleGateRefused(IdleGateRefusal),
-    UserSeizedControl,
+    UserSeizedControl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sourced_input_kind: Option<SourcedInputKind>,
+    },
     AttendanceUnavailable,
     TargetFocusMismatch,
     GroundingUntrusted,
@@ -368,7 +381,10 @@ mod reason_code_tests {
             DispatchError::EnvelopeUnrecognized,
             DispatchError::UnsupportedMode,
             DispatchError::ObserverUnavailable,
-            DispatchError::UserSeizedControl,
+            DispatchError::SeizeLatencyBoundExceeded,
+            DispatchError::UserSeizedControl {
+                sourced_input_kind: None,
+            },
             DispatchError::AttendanceUnavailable,
             DispatchError::TargetFocusMismatch,
             DispatchError::GroundingUntrusted,
@@ -424,9 +440,10 @@ impl DispatchError {
             Self::EnvelopeUnrecognized => "envelope_unrecognized",
             Self::UnsupportedMode => "unsupported_mode",
             Self::ObserverUnavailable => "observer_unavailable",
+            Self::SeizeLatencyBoundExceeded => "seize_latency_bound_exceeded",
             Self::IdleGateRefused(IdleGateRefusal::Unreadable(_)) => "idle_unreadable",
             Self::IdleGateRefused(IdleGateRefusal::BelowThreshold { .. }) => "not_idle",
-            Self::UserSeizedControl => "user_seized_control",
+            Self::UserSeizedControl { .. } => "user_seized_control",
             Self::AttendanceUnavailable => "attendance_unavailable",
             Self::TargetFocusMismatch => "target_focus_mismatch",
             Self::GroundingUntrusted => "grounding_untrusted",
@@ -453,6 +470,7 @@ impl std::error::Error for DispatchError {}
 pub struct Dispatcher<D> {
     driver: D,
     trace: Vec<DispatchPhase>,
+    last_observed_abort: Option<AbortDecision>,
 }
 
 #[derive(Debug)]
@@ -485,6 +503,7 @@ impl<D> Dispatcher<D> {
         Self {
             driver,
             trace: Vec::new(),
+            last_observed_abort: None,
         }
     }
 
@@ -521,6 +540,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
         T: SeverityTaxonomy,
         S: JournalStorage,
     {
+        self.last_observed_abort = None;
         let mut audit_state = if request.row.action_kind == ActionKind::Observe {
             None
         } else {
@@ -554,7 +574,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
         &mut self,
         audit: &mut ComputerAudit<R, T, S>,
         audit_state: Option<&mut ActuationAuditState>,
-        request: DispatchRequest,
+        mut request: DispatchRequest,
     ) -> Result<DispatchReport, DispatchError>
     where
         R: Redactor,
@@ -577,10 +597,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
         {
             return Err(DispatchError::GrantIdentityMismatch);
         }
-        let mut watcher = SeizeWatcher::new(request.row.maximum_seize_detection_latency_ms);
-        if request.mode == DispatchMode::Observed && input {
-            self.observe_before_post(&request, &mut watcher, 0)?;
-        }
+        let once_dispatch_token = request.once_dispatch_token.take();
 
         let pre_fronting = if input {
             self.driver.fronting_snapshot(&request.target).ok()
@@ -592,20 +609,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
         }
 
         let (delivery_primitive, platform_result, focus) =
-            self.deliver(audit, audit_state, &request, &mut watcher)?;
-        if !watcher.can_post() {
-            return Err(
-                match watcher.abort_decision().map(|decision| decision.reason) {
-                    Some(
-                        AbortReason::ObserverUnavailable
-                        | AbortReason::SeizeLatencyBoundExceeded
-                        | AbortReason::IdleGateRefused(_),
-                    ) => DispatchError::ObserverUnavailable,
-                    Some(AbortReason::FocusMismatch) => DispatchError::TargetFocusMismatch,
-                    Some(AbortReason::UserSeizedControl) | None => DispatchError::UserSeizedControl,
-                },
-            );
-        }
+            self.deliver(audit, audit_state, &request, once_dispatch_token)?;
 
         let effect = EffectEvidence::observe_serialized(
             &mut self.driver,
@@ -817,49 +821,35 @@ impl<D: PlatformDriver> Dispatcher<D> {
         S: JournalStorage,
     {
         let mut completed = Vec::new();
-        let mut watcher: Option<SeizeWatcher> = None;
         let mut previous_post_at_ms = None;
-        for (index, request) in requests.into_iter().enumerate() {
-            if request.mode == DispatchMode::Observed
-                && request.row.action_kind != ActionKind::Observe
-            {
-                let guard = watcher.get_or_insert_with(|| {
-                    SeizeWatcher::new(request.row.maximum_seize_detection_latency_ms)
-                });
-                guard.observe_liveness(self.driver.input_observer_liveness().into(), index);
+        for request in requests {
+            if request.mode == DispatchMode::Observed {
                 if let Some(previous) = previous_post_at_ms {
                     if request.now_ms.saturating_sub(previous)
                         < request.row.maximum_seize_detection_latency_ms as u64
                     {
-                        guard.abort(
-                            AbortReason::SeizeLatencyBoundExceeded,
-                            index,
-                            Some(request.row.maximum_seize_detection_latency_ms),
-                        );
+                        let abort = AbortDecision {
+                            reason: AbortReason::SeizeLatencyBoundExceeded,
+                            stopped_action_index: completed.len(),
+                            detection_latency_ms: None,
+                            sourced_input_kind: None,
+                            maximum_detection_latency_ms: request
+                                .row
+                                .maximum_seize_detection_latency_ms,
+                            queued_posts_cancelled: 0,
+                        };
+                        let refusal = Self::dispatch_error_for_abort(abort);
+                        Self::journal_no_action(
+                            audit,
+                            journal_identity.clone(),
+                            &request,
+                            &refusal,
+                        )?;
+                        return Ok(SequenceDispatchReport {
+                            completed,
+                            abort: Some(abort),
+                        });
                     }
-                }
-                if let Ok(observation) = self.driver.observe_input(InputObservationRequest {
-                    maximum_latency_ms: request.row.maximum_seize_detection_latency_ms,
-                }) {
-                    guard.observe_input(observation, index);
-                }
-                if let Some(abort) = guard.abort_decision() {
-                    let refusal = match abort.reason {
-                        AbortReason::ObserverUnavailable
-                        | AbortReason::SeizeLatencyBoundExceeded => {
-                            DispatchError::ObserverUnavailable
-                        }
-                        AbortReason::IdleGateRefused(refusal) => {
-                            DispatchError::IdleGateRefused(refusal)
-                        }
-                        AbortReason::FocusMismatch => DispatchError::TargetFocusMismatch,
-                        AbortReason::UserSeizedControl => DispatchError::UserSeizedControl,
-                    };
-                    Self::journal_no_action(audit, journal_identity.clone(), &request, &refusal)?;
-                    return Ok(SequenceDispatchReport {
-                        completed,
-                        abort: Some(abort),
-                    });
                 }
             }
             let post_at = request
@@ -870,21 +860,33 @@ impl<D: PlatformDriver> Dispatcher<D> {
             match self.dispatch(audit, journal_identity.clone(), request) {
                 Ok(report) => {
                     previous_post_at_ms = Some(post_at);
-                    completed.push(report)
+                    completed.push(report);
                 }
-                Err(DispatchError::UserSeizedControl | DispatchError::ObserverUnavailable) => {
+                Err(_) if self.last_observed_abort.is_some() => {
                     return Ok(SequenceDispatchReport {
                         completed,
-                        abort: watcher.as_ref().and_then(SeizeWatcher::abort_decision),
-                    })
+                        abort: self.last_observed_abort,
+                    });
                 }
                 Err(error) => return Err(error),
             }
         }
         Ok(SequenceDispatchReport {
             completed,
-            abort: watcher.as_ref().and_then(SeizeWatcher::abort_decision),
+            abort: None,
         })
+    }
+
+    fn dispatch_error_for_abort(abort: AbortDecision) -> DispatchError {
+        match abort.reason {
+            AbortReason::ObserverUnavailable => DispatchError::ObserverUnavailable,
+            AbortReason::SeizeLatencyBoundExceeded => DispatchError::SeizeLatencyBoundExceeded,
+            AbortReason::IdleGateRefused(refusal) => DispatchError::IdleGateRefused(refusal),
+            AbortReason::FocusMismatch => DispatchError::TargetFocusMismatch,
+            AbortReason::UserSeizedControl => DispatchError::UserSeizedControl {
+                sourced_input_kind: abort.sourced_input_kind,
+            },
+        }
     }
 
     fn validate_row_and_target(&self, request: &DispatchRequest) -> Result<(), DispatchError> {
@@ -972,35 +974,12 @@ impl<D: PlatformDriver> Dispatcher<D> {
         Ok(evidence)
     }
 
-    fn observe_before_post(
-        &mut self,
-        request: &DispatchRequest,
-        watcher: &mut SeizeWatcher,
-        index: usize,
-    ) -> Result<(), DispatchError> {
-        watcher.observe_liveness(self.driver.input_observer_liveness().into(), index);
-        if watcher.abort_decision().is_some() {
-            return Err(DispatchError::ObserverUnavailable);
-        }
-        let observation = self
-            .driver
-            .observe_input(InputObservationRequest {
-                maximum_latency_ms: request.row.maximum_seize_detection_latency_ms,
-            })
-            .map_err(|_| DispatchError::ObserverUnavailable)?;
-        watcher.observe_input(observation, index);
-        if watcher.abort_decision().is_some() {
-            return Err(DispatchError::UserSeizedControl);
-        }
-        Ok(())
-    }
-
     fn deliver<R, T, S>(
         &mut self,
         audit: &mut ComputerAudit<R, T, S>,
         mut audit_state: Option<&mut ActuationAuditState>,
         request: &DispatchRequest,
-        watcher: &mut SeizeWatcher,
+        once_dispatch_token: Option<OnceDispatchToken>,
     ) -> Result<
         (
             DeliveryPrimitive,
@@ -1100,14 +1079,6 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 if !request.row.private_envelope_recognized {
                     return Err(DispatchError::EnvelopeUnrecognized);
                 }
-                watcher.observe_liveness(
-                    SeizeWatcherState {
-                        session_tap_live: true,
-                        raw_hid_live: true,
-                        self_echo_filter_live: true,
-                    },
-                    0,
-                );
                 let state = audit_state
                     .as_deref_mut()
                     .ok_or(DispatchError::AuditUnavailable)?;
@@ -1157,15 +1128,17 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 if request.row.global_cursor_movement != PermissionLiveness::Live {
                     return Err(DispatchError::AttendanceUnavailable);
                 }
-                let focus = self.focus_before_global_post(request)?;
-                self.trace.push(DispatchPhase::GlobalFocusChecked);
-                watcher.queue_post();
-                if !watcher.take_post_slot() {
-                    return Err(DispatchError::UserSeizedControl);
-                }
+                let token = once_dispatch_token.ok_or(DispatchError::AttendanceUnavailable)?;
                 let state = audit_state.ok_or(DispatchError::AuditUnavailable)?;
                 Self::commit_audit_intent(audit, state, &intent)?;
-                let result = match self.driver.dispatch_global(synthetic) {
+                let result = match self.driver.dispatch_global(GlobalDispatchRequest {
+                    synthetic,
+                    once_dispatch_token: token,
+                    maximum_seize_detection_latency_ms: request
+                        .row
+                        .maximum_seize_detection_latency_ms,
+                    minimum_inter_post_interval_ms: request.row.minimum_inter_post_interval_ms,
+                }) {
                     Ok(result) => {
                         Self::finalize_audit_outcome(
                             audit,
@@ -1175,6 +1148,18 @@ impl<D: PlatformDriver> Dispatcher<D> {
                             },
                         )?;
                         result
+                    }
+                    Err(DriverError::ObservedDispatchAborted(abort)) => {
+                        self.last_observed_abort = Some(abort);
+                        let refusal = Self::dispatch_error_for_abort(abort);
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Refused {
+                                refusal: refusal.clone(),
+                            },
+                        )?;
+                        return Err(refusal);
                     }
                     Err(_) => {
                         let refusal = DispatchError::SyntheticUnavailable;
@@ -1189,7 +1174,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                     }
                 };
                 self.trace.push(DispatchPhase::GlobalDispatch);
-                Ok((DeliveryPrimitive::GlobalSynthetic, result, Some(focus)))
+                Ok((DeliveryPrimitive::GlobalSynthetic, result, None))
             }
         }
     }
@@ -1312,71 +1297,9 @@ impl<D: PlatformDriver> Dispatcher<D> {
             | DriverError::InvalidRequest(_)
             | DriverError::StartupRefused(_)
             | DriverError::EventConstructionFailed(_)
-            | DriverError::SyntheticDispatchFailed(_) => DispatchError::SemanticPathUnavailable,
+            | DriverError::SyntheticDispatchFailed(_)
+            | DriverError::ObservedDispatchAborted(_) => DispatchError::SemanticPathUnavailable,
         }
-    }
-
-    fn focus_before_global_post(
-        &mut self,
-        request: &DispatchRequest,
-    ) -> Result<FocusEvidence, DispatchError> {
-        let plan = request
-            .focus_plan
-            .clone()
-            .unwrap_or_else(|| FocusCheckPlan::immediate(request.now_ms));
-        let first = self
-            .driver
-            .query_focus(FocusQueryRequest {
-                target: request.target.clone(),
-            })
-            .map_err(|_| DispatchError::TargetFocusMismatch)?;
-        let mut checked_at = plan.checked_at_ms;
-        let mut post_at = plan.post_at_ms;
-        let mut measured = post_at.checked_sub(checked_at);
-        if measured.is_none_or(|value| value > request.row.maximum_focus_check_to_post_interval_ms)
-        {
-            let (Some(retry_checked), Some(retry_post)) =
-                (plan.retry_checked_at_ms, plan.retry_post_at_ms)
-            else {
-                return Err(DispatchError::TargetFocusMismatch);
-            };
-            let retry = self
-                .driver
-                .query_focus(FocusQueryRequest {
-                    target: request.target.clone(),
-                })
-                .map_err(|_| DispatchError::TargetFocusMismatch)?;
-            if !retry.matches_target {
-                return Err(DispatchError::TargetFocusMismatch);
-            }
-            checked_at = retry_checked;
-            post_at = retry_post;
-            measured = post_at.checked_sub(checked_at);
-            if measured
-                .is_none_or(|value| value > request.row.maximum_focus_check_to_post_interval_ms)
-            {
-                return Err(DispatchError::TargetFocusMismatch);
-            }
-            return Ok(FocusEvidence {
-                matches_target: true,
-                checked_at_ms: checked_at,
-                post_at_ms: post_at,
-                measured_check_to_post_interval_ms: measured,
-                maximum_check_to_post_interval_ms: request
-                    .row
-                    .maximum_focus_check_to_post_interval_ms,
-            });
-        }
-        if !first.matches_target {
-            return Err(DispatchError::TargetFocusMismatch);
-        }
-        Ok(FocusEvidence {
-            matches_target: true,
-            checked_at_ms: checked_at,
-            post_at_ms: post_at,
-            measured_check_to_post_interval_ms: measured,
-            maximum_check_to_post_interval_ms: request.row.maximum_focus_check_to_post_interval_ms,
-        })
     }
 }
 
@@ -1479,7 +1402,7 @@ mod delivery_containment_validation_tests {
 #[cfg(test)]
 mod idle_refusal_wire_tests {
     use super::*;
-    use crate::platform::IdleUnreadable;
+    use crate::platform::{IdleUnreadable, PlatformNeutralTestDriver};
 
     /// The idle gate's two refusals reach the wire under their own codes,
     /// carrying their numbers, and neither is "observer_unavailable".
@@ -1488,8 +1411,46 @@ mod idle_refusal_wire_tests {
     /// ObserverUnavailable so an exhaustive match would compile. An operator
     /// reading that would check the observer; the remedy is to wait for the
     /// user to step away. Asserted here at the code, because the only
-    /// production path to this variant is not wired yet and a later change
-    /// that restores the fold would compile.
+    /// production path is platform-gated; this test prevents a future match
+    /// from compiling after it maps either idle refusal to the observer error.
+    #[test]
+    fn every_observed_abort_reason_maps_to_its_own_dispatch_error() {
+        let abort = |reason| AbortDecision {
+            reason,
+            stopped_action_index: 0,
+            detection_latency_ms: None,
+            sourced_input_kind: None,
+            maximum_detection_latency_ms: 50,
+            queued_posts_cancelled: 0,
+        };
+        let errors = [
+            Dispatcher::<PlatformNeutralTestDriver>::dispatch_error_for_abort(abort(
+                AbortReason::ObserverUnavailable,
+            )),
+            Dispatcher::<PlatformNeutralTestDriver>::dispatch_error_for_abort(abort(
+                AbortReason::SeizeLatencyBoundExceeded,
+            )),
+            Dispatcher::<PlatformNeutralTestDriver>::dispatch_error_for_abort(abort(
+                AbortReason::IdleGateRefused(IdleGateRefusal::Unreadable(
+                    IdleUnreadable::TableUnavailable,
+                )),
+            )),
+            Dispatcher::<PlatformNeutralTestDriver>::dispatch_error_for_abort(abort(
+                AbortReason::FocusMismatch,
+            )),
+            Dispatcher::<PlatformNeutralTestDriver>::dispatch_error_for_abort(abort(
+                AbortReason::UserSeizedControl,
+            )),
+        ];
+        let codes: std::collections::BTreeSet<_> =
+            errors.iter().map(DispatchError::reason_code).collect();
+        assert_eq!(
+            codes.len(),
+            errors.len(),
+            "two observed abort reasons collapsed to one caller remedy: {errors:?}"
+        );
+    }
+
     #[test]
     fn idle_refusals_reach_the_wire_under_their_own_codes_with_their_numbers() {
         let below = DispatchError::IdleGateRefused(IdleGateRefusal::BelowThreshold {

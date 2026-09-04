@@ -73,7 +73,7 @@ use cerebellum_computer::platform::{
     UnsupportedPlatformDriver,
 };
 use cerebellum_core::clock::MonotonicClock;
-use cerebellum_core::consent::ActionKind;
+use cerebellum_core::consent::{ActionKind, LeaseKey};
 use cerebellum_core::journal::JournalIdentity;
 use cerebellum_core::journal::{JournalStorage, Redactor, SeverityTaxonomy};
 use serde_json::{json, Value};
@@ -1202,16 +1202,45 @@ where
             clock,
             now_ms: _,
         } = context;
-        // The lease is keyed on the action kind: an observe-only lease admits
-        // none of these, and a compose lease does not admit a durable chord or
-        // a drag. The kind comes from the request just parsed, never from a
-        // field the caller can set.
-        let grant = match management
-            .authority_for(grantee, parsed.action_kind, clock)
-            .await
-        {
-            ActionAuthority::Admitted(grant) => grant,
-            ActionAuthority::Refused(refusal) => return refusal,
+        // Pointer events have no working per-process path, so scroll, move and
+        // drag use the observed global path. Type and keys remain bound to the
+        // leased process generation.
+        let mode = match capability {
+            ComputerCapability::Scroll | ComputerCapability::Move | ComputerCapability::Drag => {
+                DispatchMode::Observed
+            }
+            _ => DispatchMode::Background,
+        };
+        // Global authority is deliberately stronger than the row's ordinary
+        // action kind. It consumes a Once MutateDurable lease for the selected
+        // target; a standing Until lease cannot manufacture the token carried
+        // into the platform request.
+        let (grant, once_dispatch_token) = match mode {
+            DispatchMode::Background => match management
+                .authority_for(grantee, parsed.action_kind, clock)
+                .await
+            {
+                ActionAuthority::Admitted(grant) => (grant, None),
+                ActionAuthority::Refused(refusal) => return refusal,
+            },
+            DispatchMode::Observed => {
+                let grant = match management
+                    .authority_for(grantee, ActionKind::MutateDurable, clock)
+                    .await
+                {
+                    ActionAuthority::Admitted(grant) => grant,
+                    ActionAuthority::Refused(_) => return once_dispatch_refusal(),
+                };
+                let key = LeaseKey {
+                    grantee: grantee.to_string(),
+                    bundle_identity: grant.bundle_identity.clone(),
+                    action_kind: ActionKind::MutateDurable,
+                };
+                let Some(token) = management.admit_once_dispatch(&key, clock).await else {
+                    return once_dispatch_refusal();
+                };
+                (grant, Some(token))
+            }
         };
 
         let capability_id = capability.capability_id();
@@ -1224,13 +1253,6 @@ where
             // rather than what an ordinary compose action could.
             row.action_kind = cerebellum_computer::platform::ActionKind::MutateDurable;
         }
-        // computer.move is frozen observed-only: it has no per-process path,
-        // so it dispatches globally with the observer guard active. The other
-        // four deliver to the leased process generation in the background.
-        let mode = match capability {
-            ComputerCapability::Move => DispatchMode::Observed,
-            _ => DispatchMode::Background,
-        };
         let dispatch_at_ms = clock.now().as_nanos() / 1_000_000;
         let attendance = match mode {
             DispatchMode::Background => {
@@ -1284,8 +1306,12 @@ where
                 element: parsed.placeholder_element,
             },
         );
-        let request = DispatchRequest::new(row, mode, grant, expected, attendance, dispatch_at_ms)
-            .with_synthetic(parsed.action);
+        let mut request =
+            DispatchRequest::new(row, mode, grant, expected, attendance, dispatch_at_ms)
+                .with_synthetic(parsed.action);
+        if let Some(token) = once_dispatch_token {
+            request = request.with_once_dispatch_token(token);
+        }
 
         let mut audit = self.audit.lock().await;
         match Dispatcher::new((self.make_synthetic_driver)())
@@ -1840,7 +1866,8 @@ fn click_driver_refusal(
         | DriverError::InvalidRequest(_)
         | DriverError::StartupRefused(_)
         | DriverError::EventConstructionFailed(_)
-        | DriverError::SyntheticDispatchFailed(_) => DispatchError::SemanticPathUnavailable,
+        | DriverError::SyntheticDispatchFailed(_)
+        | DriverError::ObservedDispatchAborted(_) => DispatchError::SemanticPathUnavailable,
     };
     dispatch_refusal(refusal, unreadable_subtrees)
 }
@@ -1857,6 +1884,13 @@ struct ParsedSynthetic {
     /// evaluated -- the five schemas declare no post-condition -- so it labels
     /// the serialized predicate rather than naming a resolved target.
     placeholder_element: AccessibilityElementName,
+}
+
+fn once_dispatch_refusal() -> Value {
+    json!({
+        "outcome": "once_grant_required",
+        "remedy": "call computer.open_target for action_kind 'mutate_durable', choose the 'once' grant kind, then retry",
+    })
 }
 
 fn invalid_synthetic_request(field: &str, reason: &str) -> Value {
@@ -2379,6 +2413,18 @@ mod wait_tests {
     use super::*;
     use cerebellum_computer::dispatch::post_condition::ObservedElement;
 
+    #[test]
+    fn observed_dispatch_refusal_names_the_once_open_target_remedy() {
+        let refusal = once_dispatch_refusal();
+        assert_eq!(refusal["outcome"], "once_grant_required");
+        let remedy = refusal["remedy"]
+            .as_str()
+            .expect("a typed remedy is present");
+        assert!(remedy.contains("computer.open_target"));
+        assert!(remedy.contains("once"));
+        assert!(remedy.contains("mutate_durable"));
+    }
+
     fn predicate() -> PostCondition {
         PostCondition::ElementEnabledIs {
             element: AccessibilityElementName::role_and_title("AXButton", "Save"),
@@ -2643,7 +2689,7 @@ mod click_vocabulary_v3_tests {
 
         fn dispatch_global(
             &mut self,
-            _request: cerebellum_computer::platform::SyntheticDispatchRequest,
+            _request: cerebellum_computer::platform::GlobalDispatchRequest,
         ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
             Err(DriverError::Unsupported(
                 "test does not dispatch synthetic input",

@@ -4,6 +4,7 @@
 //! The macOS implementation is an injectable skeleton: it can prove whether a
 //! capability is safe to advertise, while later slices provide the operations.
 
+use cerebellum_core::consent::OnceDispatchToken;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -201,6 +202,7 @@ pub struct ImmutableReleaseInputs {
     pub attendance_contract_owner: Option<String>,
     pub attendance_contract_revision: Option<String>,
     pub input_review_revision: Option<String>,
+    pub global_dispatch_review_revision: Option<String>,
     pub capture_review_revision: Option<String>,
     pub semantic_actuation_review_revision: Option<String>,
     pub windows_actuation_review_revision: Option<String>,
@@ -217,6 +219,11 @@ impl ImmutableReleaseInputs {
         self.attendance_contract_owner.is_some()
             && self.attendance_contract_revision.is_some()
             && self.input_review_revision.is_some()
+            && self.release_signing_topology_revision.is_some()
+    }
+
+    fn global_dispatch_ready(&self) -> bool {
+        self.global_dispatch_review_revision.is_some()
             && self.release_signing_topology_revision.is_some()
     }
 
@@ -399,6 +406,8 @@ fn capability_declaration(
             Some("attendance contract inputs are not bound".to_string())
         } else if !context.inputs.input_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
+        } else if synthetic_path_is_pointer(id) && !context.inputs.global_dispatch_ready() {
+            Some("global dispatch review revision is not bound".to_string())
         } else {
             // Every permission the frozen vocabulary names for THIS row, PLUS
             // accessibility for all five.
@@ -479,6 +488,9 @@ fn capability_declaration(
     } else {
         SupportState::Unsupported
     };
+    let observed_support = platform_available
+        && dispatch_modes.contains(&DispatchMode::Observed)
+        && context.inputs.global_dispatch_ready();
 
     CapabilityDeclaration {
         capability_id: id.to_string(),
@@ -520,10 +532,10 @@ fn capability_declaration(
         //
         // Those rows are not broken: they are deliverable through the GLOBAL
         // path, which seizes the shared cursor and is the authority this module
-        // calls observed mode. That path is deliberately unbuilt, so the honest
-        // claim here is Unsupported rather than a mode we do not offer.
-        // Two independent reasons, one answer: no platform driver to post with,
-        // or a row whose events the per-process path does not carry.
+        // calls observed mode. That separately gated path is now built, but it
+        // does not turn a global cursor action into background delivery. The
+        // honest claim here remains Unsupported because the per-process path
+        // does not carry these events.
         synthetic_background: background_support,
         // Derived from the dispatch modes rather than asserted beside them, so
         // the two cannot disagree about whether a row has an observed path.
@@ -569,7 +581,8 @@ fn capability_declaration(
             && permission_lookup_failure.is_none()
             && (action_kind == ActionKind::Observe
                 || semantic_support == SupportState::Supported
-                || background_support == SupportState::Supported),
+                || background_support == SupportState::Supported
+                || observed_support),
         suppression_reason,
     }
 }
@@ -1035,6 +1048,19 @@ pub struct SyntheticDispatchRequest {
     pub action: SyntheticAction,
 }
 
+/// A global request that cannot be constructed without consuming a Once lease.
+///
+/// The token is held by value and is neither cloneable nor defaultable. Timing
+/// bounds travel with the request because the platform driver applies them
+/// between the individual events of one synthetic action.
+#[derive(Debug)]
+pub struct GlobalDispatchRequest {
+    pub synthetic: SyntheticDispatchRequest,
+    pub once_dispatch_token: OnceDispatchToken,
+    pub maximum_seize_detection_latency_ms: u32,
+    pub minimum_inter_post_interval_ms: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchResult {
     pub accepted_by_platform: bool,
@@ -1318,6 +1344,8 @@ pub enum DriverError {
     SyntheticDispatchFailed(SequencePostFailure),
     /// The accessibility tree could not be read.
     AccessibilityUnreadable(AccessibilityReadFailure),
+    /// Observed dispatch stopped before all of its events could be posted.
+    ObservedDispatchAborted(crate::dispatch::AbortDecision),
     /// The current Windows session cannot inspect the interactive desktop.
     SessionNotInspectable(SessionProvenanceRefusal),
     /// Windows cannot distinguish an unenumerated app from a hidden window.
@@ -1352,6 +1380,9 @@ impl fmt::Display for DriverError {
             ),
             Self::AccessibilityUnreadable(failure) => {
                 write!(f, "accessibility tree unreadable: {failure}")
+            }
+            Self::ObservedDispatchAborted(abort) => {
+                write!(f, "observed dispatch aborted: {:?}", abort.reason)
             }
             Self::SessionNotInspectable(session) => {
                 write!(
@@ -1402,7 +1433,7 @@ pub trait PlatformDriver {
     ) -> Result<DispatchResult, DriverError>;
     fn dispatch_global(
         &mut self,
-        request: SyntheticDispatchRequest,
+        request: GlobalDispatchRequest,
     ) -> Result<DispatchResult, DriverError>;
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)
@@ -1486,7 +1517,7 @@ impl PlatformDriver for UnsupportedPlatformDriver {
 
     fn dispatch_global(
         &mut self,
-        _request: SyntheticDispatchRequest,
+        _request: GlobalDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
         Err(DriverError::Unsupported("global synthetic dispatch"))
     }
@@ -1590,7 +1621,7 @@ impl PlatformDriver for PlatformNeutralTestDriver {
 
     fn dispatch_global(
         &mut self,
-        _request: SyntheticDispatchRequest,
+        _request: GlobalDispatchRequest,
     ) -> Result<DispatchResult, DriverError> {
         panic!("test driver must not execute platform operations")
     }
