@@ -16,15 +16,14 @@ use cerebellum::computer_capability::{
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::capture::InMemoryCaptureBackend;
 use cerebellum_computer::platform::{
-    current_blocked_chord_platform, AccessibilityTreeRequest, AccessibilityTreeResult,
-    AttendancePreconditionRequest, AttendancePreconditionResult, CapabilityAdvertisementContext,
-    CapabilityDeclaration, DispatchResult, DriverError, EffectObservationRequest,
-    EffectObservationResult, EffectStatus, ElementResolutionRequest, ElementResolutionResult,
-    FocusQueryRequest, FocusQueryResult, FrontingSnapshot, HeldStateDisposition,
-    InputObservationRequest, InputObservationResult, InputObserverLiveness, PlatformDriver,
-    PostCallFailure, ProcessEventRefusal, ProcessGrant, SemanticDispatchRequest,
-    SequencePostFailure, SyntheticAction, SyntheticDispatchRequest, SyntheticKey,
-    SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit, BLOCKED_CHORDS,
+    AccessibilityTreeRequest, AccessibilityTreeResult, AttendancePreconditionRequest,
+    AttendancePreconditionResult, CapabilityAdvertisementContext, CapabilityDeclaration,
+    DispatchResult, DriverError, EffectObservationRequest, EffectObservationResult, EffectStatus,
+    ElementResolutionRequest, ElementResolutionResult, FocusQueryRequest, FocusQueryResult,
+    FrontingSnapshot, HeldStateDisposition, InputObservationRequest, InputObservationResult,
+    InputObserverLiveness, PlatformDriver, PostCallFailure, ProcessEventRefusal, ProcessGrant,
+    SemanticDispatchRequest, SequencePostFailure, SyntheticAction, SyntheticDispatchRequest,
+    SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit, BLOCKED_CHORDS,
 };
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::consent::ActionKind;
@@ -502,9 +501,20 @@ async fn withholding_mode_preserves_move_once_grant_remedy() {
 
 /// Every session-ending chord remains refused even with the widest lease this
 /// fixture can mint; the floor runs before authority and records the attempt.
+///
+/// Gated to the platforms that HAVE a chord set. The fixture is neutral, but
+/// the floor is consulted through `current_blocked_chord_platform()`, which is
+/// None on Linux because there is no synthetic dispatch there to block -- so
+/// on Linux this test has nothing to iterate and panicked at the expect
+/// instead (red on CI for one run, #18). Membership on every platform is held
+/// by `the_session_floor_holds_every_chord_this_test_names`, which passes the
+/// platform explicitly; this test adds the wire-level proof on hosts where the
+/// wire can reach the floor.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[tokio::test]
 async fn every_listed_session_ending_chord_is_refused_above_a_full_lease() {
-    let platform = current_blocked_chord_platform().expect("this test runs on a synthetic host");
+    let platform = cerebellum_computer::platform::current_blocked_chord_platform()
+        .expect("this test is compiled only where a chord set exists");
     let clock = FakeClock::new();
     let management = management_leased(ActionKind::MutateDurable, &clock).await;
     let shared = Shared::handle();

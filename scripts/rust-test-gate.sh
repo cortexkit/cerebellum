@@ -247,7 +247,8 @@ run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
 # Rust target. zig ships one, and using it means no separate toolchain to
 # install or keep in step. An operator who already has a real cross-gcc
 # configured keeps it: these are only set when unset.
-if rustc --print target-libdir --target x86_64-unknown-linux-gnu >/dev/null 2>&1; then
+# Directory probe, not exit status -- see the Windows loop below for why.
+if [ -d "$(rustc --print target-libdir --target x86_64-unknown-linux-gnu 2>/dev/null)" ]; then
   if [ -z "${CC_x86_64_unknown_linux_gnu:-}" ] && command -v zig >/dev/null 2>&1; then
     CC_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-cc.sh"
     AR_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-ar.sh"
@@ -276,8 +277,14 @@ fi
 # any measurement will actually run on -- checking only x86_64 verified the
 # hypothetical build and left the real one unchecked, which is how I came to
 # build the wrong architecture for a VM I was about to test against.
+# The probe is the DIRECTORY, not the command's exit status. `rustc --print
+# target-libdir` computes a path from the triple and exits 0 for any triple
+# rustc recognises, installed or not -- so testing its exit status made the
+# skip branch unreachable, and on a host without the Windows targets (CI) the
+# phase ran and failed the whole gate, 25 runs in a row, for a toolchain
+# reason that says nothing about the code. Reported by iceteaSA in #18.
 for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-  if rustc --print target-libdir --target "$windows_target" >/dev/null 2>&1; then
+  if [ -d "$(rustc --print target-libdir --target "$windows_target" 2>/dev/null)" ]; then
     run_phase "cargo clippy --workspace --target $windows_target -- -D warnings" \
       cargo clippy --workspace --target "$windows_target" --quiet -- -D warnings
   else
