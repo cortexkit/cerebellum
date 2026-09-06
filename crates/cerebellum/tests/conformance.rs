@@ -69,7 +69,14 @@ async fn hello_body_matches_wire_v2_contract() {
     assert_eq!(body["protocol_ver"], 2);
     assert_eq!(body["manifest"]["protocol_ver"], 2);
     assert_eq!(body["manifest"]["module_id"], MODULE_ID);
-    assert_eq!(body["manifest"]["trust_tier"], "first_party");
+    // Absent, never `first_party`: the manifest diet (subc-protocol 0.19)
+    // made the tier optional because the daemon never read it, and this
+    // module stopped fabricating one.
+    assert!(
+        body["manifest"].get("trust_tier").is_none(),
+        "trust_tier should be absent from the wire manifest, got {:?}",
+        body["manifest"]["trust_tier"]
+    );
 
     // An absent browser member keeps every browser operation unadvertised. The
     // tool role remains so independently gated computer capabilities can still

@@ -34,9 +34,8 @@ use crate::browser_type::{
 use crate::journal::JournalConfig;
 use subc_protocol::manifest::CapabilityDeclarations;
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
-    ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-    StorageScope, Tool, TrustTier,
+    Concurrency, ExecutionMode, IdentityScope, ManagementOperation, ManagementOperationKind,
+    ModuleManifest, ProviderRole, Tool,
 };
 use subc_protocol::manifest::{
     ManifestProvenance, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
@@ -276,75 +275,61 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
     // break every module's construction site at once. `protocol_ver` and
     // `consumes` are left to their defaults -- the linked protocol version and
     // an empty list are exactly what this module would have written.
-    ModuleManifest::builder(
-        module_id.to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-        TrustTier::FirstParty,
-        Bindings {
-            // Spec A has no profile storage (Spec B owns that). The manifest enum
-            // has no none/ephemeral storage kind yet, so this is the honest
-            // expression: sqlite-scoped, but the module owns no schema and does
-            // not open a database in this slice.
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
+    // No trust tier and no bindings: the daemon reads neither on any
+    // production path (subc-protocol 0.19, the manifest diet), so declaring
+    // `first_party` and a sqlite/project binding was this module saying
+    // things about itself that nothing consumed -- including a storage kind
+    // it does not open. Absence is the honest form; an old daemon that still
+    // decodes them treats absence as it treated the fabricated values.
+    ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .provenance(build_provenance())
+        .self_signals(Some(self_signals()))
+        .provides(vec![
+            ProviderRole::ToolProvider {
+                tools: if browser_configured {
+                    browser_control_tools()
+                } else {
+                    Vec::new()
+                },
+                identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: false,
+                sub_supervises: false,
             },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provenance(build_provenance())
-    .self_signals(Some(self_signals()))
-    .provides(vec![
-        ProviderRole::ToolProvider {
-            tools: if browser_configured {
-                browser_control_tools()
-            } else {
-                Vec::new()
-            },
-            identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: false,
-            sub_supervises: false,
-        },
-        management_surface(),
-    ])
-    // One negative claim, and nothing else yet.
-    //
-    // `must_never_reach` fences THIS MODULE AS CALLER: the daemon refuses
-    // any route we open toward a provider of the named capability, and
-    // force-closes live ones if a matching provider appears later. It is
-    // not a claim that nothing may be handed to us -- receipt rides routes
-    // the sender opens, so the inbound half of the credential boundary is
-    // not expressible here and remains an agreement with the vault module.
-    //
-    // We declare it because this module must never pull a secret. It holds
-    // live browser sessions and durable per-agent profiles, so a path from
-    // here into a secret store is the one route whose absence is worth
-    // enforcing rather than remembering.
-    //
-    // Costs nothing today and is not expected to: the vault's sealing
-    // surface, which durable profiles are designed to consult, is a
-    // SEPARATE capability that does not exist yet. Enforcement is
-    // module-granular though, so when sealing lands it will need one of an
-    // op-scoped deny, a distinct provider module, or a visible relaxation
-    // of this line -- a decision that design pass owns explicitly rather
-    // than discovering.
-    //
-    // `provides` stays empty because it is capability-grammar naming, a
-    // different axis from the provider roles above, and this module's
-    // capabilities have no grammar names cut yet. Empty claims nothing; it
-    // does not claim we provide nothing.
-    .capabilities(Some(CapabilityDeclarations {
-        provides: Vec::new(),
-        requires: Vec::new(),
-        must_never_reach: vec!["credentials-provider/v1".to_string()],
-    }))
-    .build()
+            management_surface(),
+        ])
+        // One negative claim, and nothing else yet.
+        //
+        // `must_never_reach` fences THIS MODULE AS CALLER: the daemon refuses
+        // any route we open toward a provider of the named capability, and
+        // force-closes live ones if a matching provider appears later. It is
+        // not a claim that nothing may be handed to us -- receipt rides routes
+        // the sender opens, so the inbound half of the credential boundary is
+        // not expressible here and remains an agreement with the vault module.
+        //
+        // We declare it because this module must never pull a secret. It holds
+        // live browser sessions and durable per-agent profiles, so a path from
+        // here into a secret store is the one route whose absence is worth
+        // enforcing rather than remembering.
+        //
+        // Costs nothing today and is not expected to: the vault's sealing
+        // surface, which durable profiles are designed to consult, is a
+        // SEPARATE capability that does not exist yet. Enforcement is
+        // module-granular though, so when sealing lands it will need one of an
+        // op-scoped deny, a distinct provider module, or a visible relaxation
+        // of this line -- a decision that design pass owns explicitly rather
+        // than discovering.
+        //
+        // `provides` stays empty because it is capability-grammar naming, a
+        // different axis from the provider roles above, and this module's
+        // capabilities have no grammar names cut yet. Empty claims nothing; it
+        // does not claim we provide nothing.
+        .capabilities(Some(CapabilityDeclarations {
+            provides: Vec::new(),
+            requires: Vec::new(),
+            must_never_reach: vec!["credentials-provider/v1".to_string()],
+        }))
+        .build()
 }
 
 /// Compose only the browser routes the wire dispatcher admits.
@@ -872,10 +857,14 @@ mod tests {
         assert_eq!(manifest.protocol_ver, 2);
     }
 
+    /// The diet's honest form: this module claims no trust tier and no
+    /// bindings, because the daemon reads neither. A test asserting
+    /// `first_party` here would be asserting a fabrication.
     #[test]
-    fn manifest_trust_tier_is_first_party() {
+    fn manifest_declares_no_trust_tier_and_no_bindings() {
         let manifest = build("cerebellum");
-        assert_eq!(manifest.trust_tier, TrustTier::FirstParty);
+        assert_eq!(manifest.trust_tier, None);
+        assert!(manifest.bindings.is_none());
     }
 
     #[test]
