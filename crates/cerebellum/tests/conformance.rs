@@ -996,7 +996,20 @@ async fn start_live_daemon_with_browser(
             "modules": {
                 MODULE_ID: {
                     "program": binary,
-                    "env": { "HOME": home },
+                    // The daemon spawns the module with ITS environment plus
+                    // this block, so anything the runner sets leaks through
+                    // unless overridden here. The module resolves its config and
+                    // data homes by the daemon's ladder, XDG first; a runner that
+                    // sets XDG_CONFIG_HOME (GitHub's does) would otherwise send
+                    // the module to a directory this test never wrote, and
+                    // "browser unconfigured" would be true about the wrong tree.
+                    // Pin both XDG homes to the isolated home explicitly rather
+                    // than relying on their absence.
+                    "env": {
+                        "HOME": home,
+                        "XDG_CONFIG_HOME": home.join(".config"),
+                        "XDG_DATA_HOME": home.join(".local").join("share"),
+                    },
                     "reserved": true,
                 }
             }
