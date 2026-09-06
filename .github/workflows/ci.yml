@@ -9,6 +9,15 @@ on:
     branches: [main, 'train/**']
   pull_request:
     branches: [main]
+  # The push gate asks "is this change good". This asks "is what already
+  # landed still good against the siblings as they are NOW" -- a different
+  # question, with an answer that changes on its own. CI clones the sibling
+  # at its tip and builds --locked, so a sibling bump makes main red with no
+  # commit here; measured fleet-wide 2026-09-06 (same sha: push=success,
+  # schedule=failure four hours later). Without this, that red waits for the
+  # next push and arrives attached to an unrelated change.
+  schedule:
+    - cron: '17 4 * * *'
 
 concurrency:
   group: ci-${{ github.ref }}
