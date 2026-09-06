@@ -119,10 +119,21 @@ case "$requirement" in
     ;;
 esac
 
+# The digest sidecar, in `shasum -c` form, hashed from the bytes AT REST in the
+# staging directory after signing -- never from the build output, which the
+# signature step has since rewritten. Placement refuses a bare binary: the
+# sidecar is what lets the placer prove the bytes it copies are the bytes
+# this gate examined, without trusting this script's own printout.
+(cd "$STAGE" && shasum -a 256 "$DEPLOYED_NAME" > "$DEPLOYED_NAME.sha256" \
+  && shasum -a 256 -c "$DEPLOYED_NAME.sha256" >/dev/null) || {
+  echo "REFUSING: could not write or verify the digest sidecar" >&2
+  exit 1
+}
+
 echo
 echo "==> staged $STAGE/$DEPLOYED_NAME"
 echo "    rev:         $HEAD_REV"
-echo "    sha256:      $(shasum -a 256 "$STAGE/$DEPLOYED_NAME" | cut -d' ' -f1)"
+echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar $DEPLOYED_NAME.sha256)"
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
 echo
