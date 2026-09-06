@@ -139,6 +139,29 @@ check_no_mutation_in_progress() {
 run_phase "no mutation left in the working tree" \
   check_no_mutation_in_progress
 
+# Phase 0a: say so, loudly, if Cargo.lock already differs from HEAD before any
+# cargo command in this gate runs. NOT a refusal -- a deliberate absorb is
+# exactly this state -- but a statement made while the operator is still
+# looking. Measured against this repo's history: eleven commits carry a subc
+# version bump under a message about something else, every one the same
+# mechanism (an unflagged cargo run rewrote the lock, `git add -A` took it).
+# Phase 6 cannot see those: it compares the tree before the BUILD to after,
+# and a lock rewritten by an earlier cargo run is already in the "before".
+# Only a comparison against HEAD is anchored to something the operator
+# decided. Every cargo command below carries --locked, so this gate itself
+# is a reader; the rewrite, if any, happened before it started.
+report_lock_drift_from_head() {
+  local drift
+  drift="$(git diff --stat HEAD -- Cargo.lock 2>/dev/null)"
+  if [ -n "$drift" ]; then
+    echo "    NOTE: Cargo.lock differs from HEAD before this gate ran anything:" >&2
+    git diff HEAD -- Cargo.lock | grep -E '^[-+]version|^[-+]name' | paste - - - - 2>/dev/null | sed 's/^/      /' >&2
+    echo "    Commit it as its own lock change, or restore it --" >&2
+    echo "    do NOT let it ride in a commit about something else (git add by path)." >&2
+  fi
+}
+report_lock_drift_from_head
+
 # Phase 0b: refuse to certify against a sibling that is not the one this commit
 # declares. The workspace takes subc-* by PATH, so the crates compiled here come
 # from whatever ../subconscious currently holds -- and if that disagrees with the
