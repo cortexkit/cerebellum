@@ -3,6 +3,14 @@
 # green. Operator tooling runs through the real GitHub CLI (gh) via watch-ci.sh;
 # the shim is only for AI agent commands.
 #
+# Lifting this into another repository: carry four files together —
+# scripts/train-push.sh, scripts/watch-ci.sh, scripts/lib/operator-gh.sh,
+# scripts/lib/workflow-gates.py — plus `python3`, `git`, and the real `gh` on
+# PATH. Nothing else here assumes this repository's layout: the default branch
+# is read from origin/HEAD, and repo-local preflights run only when their
+# scripts exist (see "Repo-local preflights" below), with the header line
+# naming which ones ran.
+#
 # Why this is the default push path instead of scripts/gated-push.sh:
 # the local full Rust gate takes ~12 minutes on this box and only sees macOS.
 # Measured over the last week, about half the red trains failed on Linux or
@@ -78,11 +86,27 @@ remote="origin"
 # that is not the one protection and CI are configured for.
 default_branch=""
 # The workflow whose run gates a landing, shared with watch-ci.sh so the probe
-# and the watch cannot disagree about which run counts.
+# and the watch cannot disagree about which run counts. WATCH_CI_WORKFLOW is
+# the one override for both scripts (a lift with `ci.yml` sets it once); the
+# step-0 scan below reads the same variable, so the file it checks and the run
+# it waits for cannot name two different workflows.
 tests_workflow_name="${WATCH_CI_WORKFLOW:-tests.yml}"
-# The repository the runs live in, same default as watch-ci.sh so the probe and
-# the watch cannot end up querying two different repositories.
-repo_slug="${REPO:-cortexkit/aft}"
+# The repository the runs live in: from origin unless REPO is given, the same
+# derivation watch-ci.sh uses, so the probe and the watch query one repository.
+# A fixed default here was kept by the first lift and watched this repository's
+# runs for another repository's trains.
+repo_from_origin() {
+  local url
+  url="$(git config --get "remote.$remote.url" 2>/dev/null)" || return 1
+  case "$url" in
+    git@github.com:*) url="${url#git@github.com:}" ;;
+    https://github.com/*) url="${url#https://github.com/}" ;;
+    ssh://git@github.com/*) url="${url#ssh://git@github.com/}" ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "${url%.git}"
+}
+repo_slug="${REPO:-}"
 # How long the first-run probe waits for a run to start. Overridable for the
 # same reason watch-ci.sh's resolver knobs are: tests cannot wait out the
 # real budget.
@@ -143,6 +167,14 @@ fi
 # shellcheck source=lib/operator-gh.sh
 source "$script_dir/lib/operator-gh.sh" || exit 2
 
+if [ -z "$repo_slug" ]; then
+  repo_slug="$(repo_from_origin)" ||
+    refuse "cannot derive the repository from $remote's URL; set REPO=owner/name"
+fi
+# watch-ci.sh derives the same value the same way; exporting it pins the watch
+# to the repository this script proved the trigger on.
+export REPO="$repo_slug"
+
 # ---------------------------------------------------------------------------
 # Preconditions
 # ---------------------------------------------------------------------------
@@ -157,8 +189,10 @@ source "$script_dir/lib/operator-gh.sh" || exit 2
 # The reading is done by scripts/lib/workflow-gates.py rather than by matching
 # lines here: `if:` conditions are routinely written as folded scalars, and a
 # line-oriented search misses them on exactly the workflows whose behaviour
-# depends on the ref.
-tests_workflow=".github/workflows/tests.yml"
+# depends on the ref. The path derives from the same variable the probe and
+# the watch use: two spellings of the workflow name in one script disagreed on
+# every lift whose gate is not called tests.yml.
+tests_workflow=".github/workflows/$tests_workflow_name"
 gate_scanner="$script_dir/lib/workflow-gates.py"
 # Absolute, so the pre-push warning below names a path the reader can act on
 # from anywhere rather than one relative to the repo root.
@@ -167,7 +201,10 @@ git_dir="$(git rev-parse --absolute-git-dir)"
 command -v python3 >/dev/null 2>&1 ||
   refuse "python3 is required to read the workflow files"
 if [ ! -f "$tests_workflow" ]; then
-  refuse "no $tests_workflow — add \`train/**\` to on.push.branches in .github/workflows/tests.yml"
+  # `ls` on an unmatched glob exits nonzero, which under `set -e` would end the
+  # script inside this substitution before the refusal is printed.
+  present="$({ find .github/workflows -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null || true; } | sort | tr '\n' ' ')"
+  refuse "no $tests_workflow — set WATCH_CI_WORKFLOW=<file> to the workflow that gates a landing (present: ${present:-none}), and add \`train/**\` to on.push.branches in that file"
 fi
 
 set +e
@@ -354,10 +391,22 @@ run_trigger_probe() {
 
   # ~2 minutes. A run that is going to exist is queued within seconds; waiting
   # longer would only delay the first train in every clone.
+  #
+  # Resolved by SHA across every workflow rather than filtered by workflow
+  # file: the forge lists workflow files from the default branch, so a file the
+  # train itself adds or renames is not queryable under its new name until it
+  # lands, and a file-filtered query found nothing for a probe whose run had
+  # started (the first lift that renamed ci.yml hit exactly this). The run is
+  # matched to the gating workflow by its display name, which the file carries
+  # in `name:` and which survives a rename; a file without `name:` is shown
+  # under its path, so that is the fallback expectation.
+  local want_name
+  want_name="$(sed -n 's/^name:[[:space:]]*//p' "$tests_workflow" | head -1 | sed 's/^["'"'"']//; s/["'"'"']$//')"
+  [ -n "$want_name" ] || want_name="$tests_workflow"
   for _attempt in $(seq 1 "$probe_attempts"); do
-    rid="$("$OPERATOR_GH" run list --repo "$repo_slug" --workflow "$tests_workflow_name" \
-      --branch "$probe_ref" --limit 10 --json databaseId,headSha \
-      --jq ".[] | select(.headSha==\"$probe_sha\") | .databaseId" 2>/dev/null | head -1)"
+    rid="$("$OPERATOR_GH" run list --repo "$repo_slug" \
+      --branch "$probe_ref" --limit 20 --json databaseId,headSha,workflowName \
+      --jq ".[] | select(.headSha==\"$probe_sha\" and .workflowName==\"$want_name\") | .databaseId" 2>/dev/null | head -1)"
     [ -n "$rid" ] && break
     sleep "$probe_sleep"
   done
@@ -378,18 +427,35 @@ if [ ! -f "$probe_marker" ]; then
   run_trigger_probe
 fi
 
-# Governed-docs alignment, using the same two commands gated-push.sh runs as
-# its preflight. Both are read-only here; scripts/align-governed-docs.sh is the
-# writing half and stays the remedy, not something this script performs.
-# LOCAL DIVERGENCE FROM aft@5baba0f49 (cerebellum): these two are aft's own
-# governed-docs gates and exist in no other repo, so unguarded they make the
-# script unrunnable anywhere but its birthplace. Guarded by presence until
-# AFT's lift-side fix lands; re-lift and drop this block then.
-if [ -f scripts/audit-v049-agent-surface.ts ] && ! bun scripts/audit-v049-agent-surface.ts; then
-  refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
+# Repo-local preflights. The script is lifted into other repositories as a
+# file, so nothing here may assume this repository's layout: each preflight
+# runs only when its script exists, and the header line names which ones ran
+# so a repository with none is distinguishable from one whose block was
+# deleted. This repository's two are the governed-docs gates gated-push.sh
+# runs; both are read-only here (scripts/align-governed-docs.sh is the
+# writing half and stays the remedy, not something this script performs).
+preflights_ran=()
+if [ -f scripts/audit-v049-agent-surface.ts ]; then
+  bun scripts/audit-v049-agent-surface.ts \
+    || refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
+  preflights_ran+=(governed-surface-audit)
 fi
-if [ -f scripts/release-gate-v049.mjs ] && ! node scripts/release-gate-v049.mjs; then
-  refuse "release gate failed — run scripts/align-governed-docs.sh"
+if [ -f scripts/release-gate-v049.mjs ]; then
+  node scripts/release-gate-v049.mjs \
+    || refuse "release gate failed — run scripts/align-governed-docs.sh"
+  preflights_ran+=(release-gate)
+fi
+# A repository may add its own preflights beside this script without editing
+# it; the hook is sourced so it can call `refuse` and `say`.
+if [ -f scripts/train-push.local.sh ]; then
+  # shellcheck disable=SC1091
+  . scripts/train-push.local.sh
+  preflights_ran+=(train-push.local.sh)
+fi
+if [ "${#preflights_ran[@]}" -eq 0 ]; then
+  say "preflights: none (no repo-local preflight scripts present)"
+else
+  say "preflights: ${preflights_ran[*]}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -497,7 +563,7 @@ while true; do
   push_train
 
   verified_sha=""
-  say "watching CI for $head_sha on $train_ref (round $round of $max_rounds)"
+  say "watching CI for $head_sha on $train_ref in $repo_slug (round $round of $max_rounds)"
   set +e
   "$script_dir/watch-ci.sh" "$head_sha" 2>&1 | tee "$watch_log"
   watch_rc="${PIPESTATUS[0]}"
