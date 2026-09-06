@@ -381,10 +381,14 @@ fi
 # Governed-docs alignment, using the same two commands gated-push.sh runs as
 # its preflight. Both are read-only here; scripts/align-governed-docs.sh is the
 # writing half and stays the remedy, not something this script performs.
-if ! bun scripts/audit-v049-agent-surface.ts; then
+# LOCAL DIVERGENCE FROM aft@5baba0f49 (cerebellum): these two are aft's own
+# governed-docs gates and exist in no other repo, so unguarded they make the
+# script unrunnable anywhere but its birthplace. Guarded by presence until
+# AFT's lift-side fix lands; re-lift and drop this block then.
+if [ -f scripts/audit-v049-agent-surface.ts ] && ! bun scripts/audit-v049-agent-surface.ts; then
   refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
 fi
-if ! node scripts/release-gate-v049.mjs; then
+if [ -f scripts/release-gate-v049.mjs ] && ! node scripts/release-gate-v049.mjs; then
   refuse "release gate failed — run scripts/align-governed-docs.sh"
 fi
 
