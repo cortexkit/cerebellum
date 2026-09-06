@@ -1288,12 +1288,12 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
 }
 
 fn browser_data_root() -> Result<PathBuf, ()> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or(())?;
-    let root = PathBuf::from(home)
-        .join(".local")
-        .join("share")
+    // The daemon's data-home ladder (XDG_DATA_HOME first), not a bare HOME
+    // read, for the same reason the journal uses it: the backup catalog
+    // resolves against the daemon's root, and profiles written under a
+    // different one are undeclarable.
+    let root = cerebellum_core::platform_dirs::data_home()
+        .ok_or(())?
         .join("cortexkit")
         // Under the module's own directory rather than beside it: the fleet's
         // backup enrollment resolves declared paths against

@@ -34,5 +34,6 @@ pub mod dispatch;
 pub mod health;
 pub mod identity;
 pub mod journal;
+pub mod platform_dirs;
 pub mod principal;
 pub mod serde_base64;

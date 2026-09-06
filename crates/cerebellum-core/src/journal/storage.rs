@@ -411,14 +411,16 @@ impl JournalStorage for FilesystemJournalStorage {
 /// so it can be neither backed up nor deliberately excluded, and its absence
 /// from a catalog looks identical to an oversight.
 pub fn journal_data_path(file_name: &str) -> Result<PathBuf, StorageError> {
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| StorageError::HomeDirectoryUnavailable {
+    // The daemon's ladder, not a bare HOME read: an operator with
+    // XDG_DATA_HOME set had the backup catalog resolving under it while the
+    // journal was written under ~/.local/share -- undeclared and unbacked-up,
+    // with both sides healthy.
+    let data_home = crate::platform_dirs::data_home().ok_or_else(|| {
+        StorageError::HomeDirectoryUnavailable {
             variable: "HOME".to_string(),
-        })?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
+        }
+    })?;
+    Ok(data_home
         .join("cortexkit")
         .join("cerebellum")
         .join("journal")

@@ -137,21 +137,16 @@ impl Default for Config {
 
 /// The canonical config file path: `~/.config/cortexkit/cerebellum.jsonc`.
 pub fn config_path() -> Option<PathBuf> {
-    dirs_or_home().map(|mut p| {
-        p.push(".config");
+    // The daemon's config ladder, so `cerebellum.jsonc` is looked for where
+    // `subc.jsonc` is found. With only HOME consulted, an operator who set
+    // XDG_CONFIG_HOME had the daemon reading its config from there and this
+    // module reading "no config" from ~/.config -- browser silently
+    // unconfigured, no error anywhere.
+    crate::platform_dirs::config_home().map(|mut p| {
         p.push("cortexkit");
         p.push("cerebellum.jsonc");
         p
     })
-}
-
-fn dirs_or_home() -> Option<PathBuf> {
-    // Prefer the HOME env var (stable across launch contexts) over a config
-    // crate dependency. Returns None only if HOME is unset/empty, in which
-    // case the caller treats config as absent and uses defaults.
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
 }
 
 /// Parse a JSONC configuration document (the contents of
