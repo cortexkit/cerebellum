@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.17"
+version = "0.17.18"
 dependencies = [
  "base64",
  "cortexkit-paths",
@@ -909,10 +909,11 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "getrandom",
  "hmac",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
