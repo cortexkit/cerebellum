@@ -26,11 +26,13 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// A non-empty environment value, or None. Empty is treated as unset, the
-/// way the daemon treats it, so an `export XDG_DATA_HOME=` clears the rung
-/// rather than producing an empty root.
-fn non_empty_os_var(key: &str) -> Option<OsString> {
-    std::env::var_os(key).filter(|value| !value.is_empty())
+/// The raw environment read. Emptiness is decided in the LADDER, not here:
+/// a filter at the accessor is invisible to tests that inject their own
+/// environment, so "empty means unset" was certified by a fixture that
+/// filtered empties itself and the shipped filter could be deleted with
+/// every test green. Measured, then moved.
+fn raw_os_var(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
 }
 
 /// `<data home>` in the daemon's sense: the root under which
@@ -78,7 +80,7 @@ fn resolve_home(xdg_var: &str, roaming_suffix: &[&str], home_suffix: &[&str]) ->
         xdg_var,
         roaming_suffix,
         home_suffix,
-        non_empty_os_var,
+        raw_os_var,
     )
 }
 
@@ -106,8 +108,13 @@ pub fn resolve_home_on(
     xdg_var: &str,
     roaming_suffix: &[&str],
     home_suffix: &[&str],
-    env: impl Fn(&str) -> Option<OsString>,
+    raw_env: impl Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
+    // Empty is unset, the way the daemon's `non_empty_os_var` treats it, so
+    // `export XDG_DATA_HOME=` (which some rigs use to mean "unset") clears
+    // the rung rather than resolving `cortexkit/...` relative to the cwd.
+    // Applied HERE so an injected environment exercises it.
+    let env = |key: &str| raw_env(key).filter(|value| !value.is_empty());
     if let Some(xdg) = env(xdg_var) {
         return Some(PathBuf::from(xdg));
     }
@@ -141,7 +148,9 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |key: &str| map.get(key).filter(|v| !v.is_empty()).map(OsString::from)
+        // Deliberately does NOT filter empties: that is the ladder's job, and
+        // a fixture that did it too would certify its own premise.
+        move |key: &str| map.get(key).map(OsString::from)
     }
 
     fn data(platform: HomePlatform, pairs: &[(&str, &str)]) -> Option<PathBuf> {
