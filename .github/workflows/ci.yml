@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # train/** must be here BEFORE main gets required status checks: a
+    # protected main refuses any sha without a check, and a train push that
+    # triggers no workflow never earns one -- main would become unpushable
+    # with nothing ever arriving to unblock it.
+    branches: [main, 'train/**']
   pull_request:
     branches: [main]
 
