@@ -32,24 +32,38 @@
 //! The next plain run reopens that file in a fresh process and reconciles
 //! it, which is the round-trip the in-memory unit tests cannot take.
 
-#![cfg(any(target_os = "macos", target_os = "windows"))]
-
 use std::process::ExitCode;
 
+/// The computer audit only exists where a computer plane does. On other hosts
+/// the example still has to build (the Linux lint phase compiles every
+/// target), so it compiles to a main that says why there is nothing to run.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn main() -> ExitCode {
+    eprintln!("this drill reconciles the computer-plane audit journal, which only exists on macOS and Windows");
+    ExitCode::from(1)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::audit::{
     ActuationElementIdentity, ActuationIntent, ComputerAudit, ComputerCapability,
     ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::capture_custody::{
     CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::grounding::ContainmentRung;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_core::identity::SessionKind;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cerebellum_core::journal::{
     journal_data_path, FilesystemJournalStorage, JournalConfig, JournalIdentity,
 };
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn main() -> ExitCode {
     let orphan = match std::env::args().nth(1).as_deref() {
         None => None,
