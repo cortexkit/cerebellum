@@ -42,7 +42,7 @@ use crate::browser_session::{
 use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
     BindFacts, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
-    ProfileLifecycle, RegistryConfig, StampedBindContext,
+    ProfileLifecycle, RegistryConfig, RegistryError, StampedBindContext,
 };
 use crate::profile_custody::{
     current_supervisor_generation, FilesystemProfileCustodyJournal, KernelSupervisorLiveness,
@@ -71,6 +71,34 @@ fn map_poisoned_mutex<T>(
 
 const BROWSER_LAUNCH_RECOVERY_FAILED: &str = "browser_launch_recovery_failed";
 const PROFILE_CUSTODY_DIRECTORY: &str = ".ck-browser-profile-custody";
+
+#[derive(Debug)]
+pub(crate) enum ProductionProfileLifecycleError {
+    DataRoot,
+    Registry(RegistryError),
+}
+
+impl ProductionProfileLifecycleError {
+    pub(crate) const fn stage(&self) -> &'static str {
+        match self {
+            Self::DataRoot => "data_root",
+            Self::Registry(_) => "profile_registry",
+        }
+    }
+
+    fn into_launch_refusal(self) -> Value {
+        match self {
+            Self::DataRoot => {
+                json!({"outcome": "profile_storage_unavailable", "stage": "data_root"})
+            }
+            Self::Registry(error) => json!({
+                "outcome": "profile_storage_unavailable",
+                "stage": "profile_registry",
+                "detail": format!("{error:?}"),
+            }),
+        }
+    }
+}
 
 pub struct ProductionLaunchService {
     config: BrowserConfig,
@@ -170,22 +198,10 @@ impl ProductionLaunchService {
         // told to check a disk whichever one fired.
         // browser_data_root reports only failure, so this stage cannot say more
         // than which stage it was -- which is still the fact that was missing.
-        let root = browser_data_root().map_err(
-            |()| json!({"outcome": "profile_storage_unavailable", "stage": "data_root"}),
-        )?;
-        let registry = RegistryConfig {
-            uuid_protocol_compatible: true,
-            grant_verifier_available: true,
-            grant_accepted: true,
-            sealing_available: true,
-            ..RegistryConfig::default()
-        };
-        let lifecycle = Arc::new(Mutex::new(
-            ProfileLifecycle::open_with_config(&root, registry).map_err(|error| {
-                json!({"outcome": "profile_storage_unavailable", "stage": "profile_registry",
-                       "detail": format!("{error:?}")})
-            })?,
-        ));
+        let lifecycle = production_profile_lifecycle()
+            .map_err(ProductionProfileLifecycleError::into_launch_refusal)?;
+        let root = lifecycle.registry().root().canonical_path().to_path_buf();
+        let lifecycle = Arc::new(Mutex::new(lifecycle));
         let locks = Arc::new(Mutex::new(
             ProfileCustodyLocks::open_filesystem(&root).map_err(|error| {
                 json!({"outcome": "custody_locks_unavailable", "stage": "custody_locks",
@@ -1285,6 +1301,24 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
             "detail": format!("{error:?}"),
         }),
     }
+}
+
+fn production_registry_config() -> RegistryConfig {
+    RegistryConfig {
+        uuid_protocol_compatible: true,
+        grant_verifier_available: true,
+        grant_accepted: true,
+        sealing_available: true,
+        ..RegistryConfig::default()
+    }
+}
+
+/// Open the exact registry configuration used by production browser launches.
+pub(crate) fn production_profile_lifecycle(
+) -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
+    let root = browser_data_root().map_err(|()| ProductionProfileLifecycleError::DataRoot)?;
+    ProfileLifecycle::open_with_config(root, production_registry_config())
+        .map_err(ProductionProfileLifecycleError::Registry)
 }
 
 fn browser_data_root() -> Result<PathBuf, ()> {

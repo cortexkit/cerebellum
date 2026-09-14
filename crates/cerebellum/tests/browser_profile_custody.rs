@@ -13,7 +13,7 @@ use cerebellum::browser_launch::{
 use cerebellum::profile::{
     stamped_bind_context, BindFacts, DispatchCommitmentToken, DurableResolution, FailureOrigin,
     InvocationToken, JournalReservationHandle, LaunchResult, PrepareResult, ProfileLifecycle,
-    ProfileOutcome, ProfileState, RegistryConfig,
+    ProfileOutcome, ProfileState, RegistryConfig, UntrustworthyRegistryReason,
 };
 use cerebellum::profile_custody::{
     classify_supervisor_start_time, read_record_if_present, ProfileCustodyAcquisition,
@@ -990,9 +990,8 @@ fn registry_root_identity_refusal_is_not_reported_as_profile_storage_unavailable
         };
     assert_eq!(
         outcome,
-        ProfileOutcome::StorageUnavailable {
-            reason_code: "profile_registry_managed_root_identity_changed",
-            origin: FailureOrigin::RegistryOrStorage,
+        ProfileOutcome::UntrustworthyRegistry {
+            reason: UntrustworthyRegistryReason::ManagedRootIdentityChanged,
         }
     );
     assert_eq!(
@@ -1000,6 +999,7 @@ fn registry_root_identity_refusal_is_not_reported_as_profile_storage_unavailable
         json!({
             "outcome": "profile_registry_untrusted_root",
             "reason_code": "profile_registry_managed_root_identity_changed",
+            "remedy": "run browser.rebind_profile_root to re-identify the restored or moved browser root; that operation will itself refuse and name any directory the registry did not mint",
         })
     );
 
@@ -1023,9 +1023,8 @@ fn unaccounted_profile_directory_reports_why_the_root_is_untrusted() {
     };
     assert_eq!(
         outcome,
-        ProfileOutcome::StorageUnavailable {
-            reason_code: "profile_registry_possibly_managed_path",
-            origin: FailureOrigin::RegistryOrStorage,
+        ProfileOutcome::UntrustworthyRegistry {
+            reason: UntrustworthyRegistryReason::PossiblyManagedPath,
         }
     );
     assert_eq!(
@@ -1033,6 +1032,7 @@ fn unaccounted_profile_directory_reports_why_the_root_is_untrusted() {
         json!({
             "outcome": "profile_registry_untrusted_root",
             "reason_code": "profile_registry_possibly_managed_path",
+            "remedy": "move or account for the unaccounted profile directories before running browser.rebind_profile_root; the rebind operation will not adopt them",
         })
     );
 }
@@ -1169,7 +1169,7 @@ fn every_wire_outcome_is_structurally_profile_uuid_free() {
         BrowserLaunchOutcome::ProfileBusy { holder_id: holder },
         BrowserLaunchOutcome::ProfileGrantRequired,
         BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
-            reason_code: "profile_registry_managed_root_identity_changed",
+            reason: UntrustworthyRegistryReason::ManagedRootIdentityChanged,
         },
         BrowserLaunchOutcome::ProfileStorageUnavailable {
             reason_code: "fixture_storage_unavailable",

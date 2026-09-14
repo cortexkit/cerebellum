@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cerebellum_computer::platform::{ProcessGrant, TargetCandidate, TargetResolution};
 use cerebellum_core::clock::MonotonicClock;
@@ -32,11 +32,14 @@ use crate::authorization::{
     ActionGrant, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE,
 };
 use crate::classification::canonical_origin;
+use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
 
 /// The computer-target operation this surface serves.
 pub const OPEN_TARGET: &str = "computer.open_target";
 /// Ask a person to issue a hazard-scoped browser action grant.
 pub const OPEN_GRANT: &str = "browser.open_grant";
+/// Re-identify a moved or restored browser profile root without adopting profiles.
+pub const REBIND_PROFILE_ROOT: &str = "browser.rebind_profile_root";
 
 /// Read an action kind from its wire spelling.
 ///
@@ -202,6 +205,8 @@ pub struct ManagementPlane {
     resolver: Arc<dyn TargetResolver>,
     browser_grants: Arc<Mutex<GrantStore>>,
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
+    profile_lifecycle: Option<Arc<ProfileLifecycle>>,
+    pending_profile_root_rebinds: Mutex<BTreeMap<String, PendingProfileRootRebind>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +217,12 @@ struct PendingBrowserGrant {
     severity: Severity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingProfileRootRebind {
+    conversation_key: String,
+    preview: RebindReport,
+}
+
 impl ManagementPlane {
     pub fn new(resolver: Arc<dyn TargetResolver>) -> Self {
         Self {
@@ -219,7 +230,19 @@ impl ManagementPlane {
             resolver,
             browser_grants: Arc::new(Mutex::new(GrantStore::default())),
             pending_browser_grants: Mutex::new(BTreeMap::new()),
+            profile_lifecycle: None,
+            pending_profile_root_rebinds: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Build a plane against an explicitly held registry, for isolated callers and tests.
+    pub fn with_profile_lifecycle(
+        resolver: Arc<dyn TargetResolver>,
+        profile_lifecycle: Arc<ProfileLifecycle>,
+    ) -> Self {
+        let mut plane = Self::new(resolver);
+        plane.profile_lifecycle = Some(profile_lifecycle);
+        plane
     }
 
     pub(crate) fn browser_grants(&self) -> Arc<Mutex<GrantStore>> {
@@ -347,6 +370,137 @@ impl ManagementPlane {
 
     pub async fn browser_grant_count(&self) -> usize {
         self.browser_grants.lock().await.current_grants().count()
+    }
+
+    fn profile_lifecycle_for_rebind(&self) -> Result<Arc<ProfileLifecycle>, &'static str> {
+        if let Some(lifecycle) = self.profile_lifecycle.as_ref() {
+            return Ok(Arc::clone(lifecycle));
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            crate::browser_launch_service::production_profile_lifecycle()
+                .map(Arc::new)
+                .map_err(|error| error.stage())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err("profile_registry_platform_unavailable")
+        }
+    }
+
+    /// Preflight a profile-root rebind and prepare an attributed consent question.
+    pub async fn open_profile_root_rebind(
+        &self,
+        conversation_key: &str,
+        can_relay_to_a_person: bool,
+    ) -> (Value, Option<Question>) {
+        let lifecycle = match self.profile_lifecycle_for_rebind() {
+            Ok(lifecycle) => lifecycle,
+            Err(stage) => return (json!({"outcome": "internal_failure", "stage": stage}), None),
+        };
+        let root_path = lifecycle
+            .registry()
+            .root()
+            .canonical_path()
+            .display()
+            .to_string();
+        let preview = match lifecycle.registry().preview_rebind() {
+            Ok(preview) => preview,
+            Err(RebindRefusal::AlreadyBound) => {
+                return (
+                    json!({
+                        "outcome": "rebind_not_needed",
+                        "root_path": root_path,
+                        "remedy": "the registry is already bound to the current browser root; no action is required",
+                    }),
+                    None,
+                )
+            }
+            Err(refusal) => return (rebind_refusal_reply(refusal), None),
+        };
+
+        if !can_relay_to_a_person {
+            return (
+                json!({
+                    "outcome": "consent_unavailable",
+                    "root_path": root_path,
+                    "old_identity": preview.old_identity,
+                    "new_identity": preview.new_identity,
+                    "generation": preview.generation_before,
+                    "record_count": preview.record_count,
+                    "remedy": "reconnect declaring the ability to relay a question to a person",
+                }),
+                None,
+            );
+        }
+
+        let ask_id = new_profile_root_rebind_ask_id();
+        self.pending_profile_root_rebinds.lock().await.insert(
+            ask_id.clone(),
+            PendingProfileRootRebind {
+                conversation_key: conversation_key.to_string(),
+                preview: preview.clone(),
+            },
+        );
+        let question = Question {
+            ask_id: ask_id.clone(),
+            body: profile_root_rebind_question(&ask_id, &root_path, &preview),
+            deadline: CONSENT_DEADLINE,
+        };
+        (
+            json!({
+                "outcome": "consent_pending",
+                "ask_id": ask_id,
+                "root_path": root_path,
+                "old_identity": preview.old_identity,
+                "new_identity": preview.new_identity,
+                "generation": preview.generation_before,
+                "record_count": preview.record_count,
+                "remedy": "wait for the person to answer before retrying browser launch",
+            }),
+            Some(question),
+        )
+    }
+
+    /// Apply one answer only when the registry situation still matches the question.
+    pub async fn settle_profile_root_rebind(&self, ask_id: &str, answer: Option<&Value>) -> bool {
+        let Some(pending) = self
+            .pending_profile_root_rebinds
+            .lock()
+            .await
+            .remove(ask_id)
+        else {
+            return false;
+        };
+        if answer
+            .and_then(|body| body.get("decision"))
+            .and_then(Value::as_str)
+            != Some("allow")
+        {
+            return true;
+        }
+        let Ok(lifecycle) = self.profile_lifecycle_for_rebind() else {
+            return true;
+        };
+        let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return true;
+        };
+        let Ok(at_unix_ms) = u64::try_from(elapsed.as_millis()) else {
+            return true;
+        };
+        let provenance = RebindProvenance {
+            ask_id: ask_id.to_string(),
+            conversation_key: pending.conversation_key,
+            at_unix_ms,
+        };
+        let _ = lifecycle
+            .registry()
+            .rebind_managed_root_from_preview(&provenance, &pending.preview);
+        true
+    }
+
+    pub async fn profile_root_rebind_pending_count(&self) -> usize {
+        self.pending_profile_root_rebinds.lock().await.len()
     }
 
     /// Resolve an application name and report what authority exists over it.
@@ -606,6 +760,89 @@ fn browser_grant_question(
     })
 }
 
+fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindReport) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": ask_id,
+        "method": "elicitation/create",
+        "params": {
+            "message": format!(
+                "Re-identify browser profile root {root_path} from identity {} to {}? \
+                 The registry has {} record(s) at generation {}; allowing advances it to generation {}. \
+                 This operation refuses rather than adopts any profile directory the registry did not mint.",
+                preview.old_identity,
+                preview.new_identity,
+                preview.record_count,
+                preview.generation_before,
+                preview.generation_after,
+            ),
+            "root_path": root_path,
+            "old_identity": preview.old_identity,
+            "new_identity": preview.new_identity,
+            "generation_before": preview.generation_before,
+            "generation_after": preview.generation_after,
+            "record_count": preview.record_count,
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["allow", "deny"],
+                    }
+                },
+                "required": ["decision"],
+                "additionalProperties": false,
+            },
+        },
+    })
+}
+
+fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
+    match refusal {
+        RebindRefusal::RegistryMissing => json!({
+            "outcome": "refused",
+            "reason": "registry_missing",
+            "remedy": "there is no browser profile registry to re-identify; launch once to mint one or restore the registry together with its profiles",
+        }),
+        RebindRefusal::MalformedRegistry => json!({
+            "outcome": "refused",
+            "reason": "malformed_registry",
+            "remedy": "restore a parseable registry from backup; this operation will not rewrite malformed registry data",
+        }),
+        RebindRefusal::UnsupportedRegistrySchema => json!({
+            "outcome": "refused",
+            "reason": "unsupported_registry_schema",
+            "remedy": "use a cerebellum build that supports the stored registry schema",
+        }),
+        RebindRefusal::IntegrityMismatch => json!({
+            "outcome": "refused",
+            "reason": "integrity_mismatch",
+            "remedy": "restore the registry exactly as written; this operation will not heal an edited or swapped registry",
+        }),
+        RebindRefusal::AlreadyBound => json!({
+            "outcome": "rebind_not_needed",
+            "remedy": "the registry is already bound to the current browser root; no action is required",
+        }),
+        RebindRefusal::PossiblyManagedPath { unaccounted } => json!({
+            "outcome": "refused",
+            "reason": "possibly_managed_path",
+            "unaccounted": unaccounted,
+            "remedy": "the operator must move or account for these directories before the root can be re-identified; browser.rebind_profile_root will never adopt them",
+        }),
+        RebindRefusal::RootUnstable => json!({
+            "outcome": "refused",
+            "reason": "root_unstable",
+            "remedy": "stop modifying or replacing the browser root, then retry the rebind preflight",
+        }),
+        RebindRefusal::Io(error) => json!({
+            "outcome": "refused",
+            "reason": "io",
+            "detail": error.to_string(),
+            "remedy": "restore filesystem access to the browser root and retry",
+        }),
+    }
+}
+
 /// A question to put to the user, and how long it stays one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Question {
@@ -766,6 +1003,15 @@ fn new_browser_grant_ask_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
         "browser-grant-consent-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed) + 1
+    )
+}
+
+fn new_profile_root_rebind_ask_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "browser-profile-root-rebind-consent-{}",
         NEXT.fetch_add(1, Ordering::Relaxed) + 1
     )
 }

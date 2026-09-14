@@ -128,11 +128,16 @@ fn management_surface() -> ProviderRole {
                  disclosing the hazards the page carries. Returns once the \
                  request is pending; the grant exists only if they agree.",
             ),
+            (
+                crate::management::REBIND_PROFILE_ROOT,
+                "Ask the person to re-identify a moved or restored browser profile root. \
+                 Refuses rather than adopts any profile directory the registry did not mint.",
+            ),
         ]
         .into_iter()
         .map(|(name, description)| ManagementOperation {
             name: name.to_string(),
-            // Both operations return before a person answers. They report the
+            // These operations return before a person answers. They report the
             // pending request and arrange authority without performing the
             // browser or computer action the authority may later admit.
             kind: ManagementOperationKind::Query,
@@ -796,7 +801,8 @@ mod tests {
             advertised,
             vec![
                 crate::management::OPEN_TARGET,
-                crate::management::OPEN_GRANT
+                crate::management::OPEN_GRANT,
+                crate::management::REBIND_PROFILE_ROOT,
             ]
         );
     }

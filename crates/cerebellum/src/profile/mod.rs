@@ -30,6 +30,7 @@ pub const REGISTRY_ARTIFACT_ID: &str = "ck-browser-profile-registry";
 pub const REGISTRY_ARTIFACT_REVISION: &str = "v1";
 pub const REGISTRY_SCHEMA: &str = "ck-browser-profile-registry/v1";
 const REGISTRY_FILE: &str = ".ck-browser-profile-registry-v1.json";
+pub const PROFILE_ROOT_REBINDS_FILE: &str = ".ck-browser-profile-root-rebinds.jsonl";
 const DURABLE_LOCK_FILE: &str = ".ck-browser-profile-durable-slot.lock";
 static UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const IMPLEMENTATION_MAGIC: &[u8] = b"ck-browser-profile-registry-implementation-bundle/v1\n";
@@ -324,6 +325,9 @@ pub enum ProfileOutcome {
         reason_code: &'static str,
         origin: FailureOrigin,
     },
+    UntrustworthyRegistry {
+        reason: UntrustworthyRegistryReason,
+    },
     InternalFailure {
         reason_code: &'static str,
     },
@@ -337,6 +341,7 @@ impl ProfileOutcome {
             | Self::NoSession { reason_code }
             | Self::StorageUnavailable { reason_code, .. }
             | Self::InternalFailure { reason_code } => reason_code,
+            Self::UntrustworthyRegistry { reason } => untrustworthy_registry_reason_code(*reason),
         }
     }
 }
@@ -1022,6 +1027,64 @@ impl fmt::Display for UntrustworthyRegistryReason {
     }
 }
 
+/// Stable wire code for a typed registry refusal.
+pub const fn untrustworthy_registry_reason_code(
+    reason: UntrustworthyRegistryReason,
+) -> &'static str {
+    match reason {
+        UntrustworthyRegistryReason::LockContentionWithoutOwnerProof => {
+            "profile_registry_lock_owner_unproven"
+        }
+        UntrustworthyRegistryReason::MalformedRegistry => "profile_registry_malformed",
+        UntrustworthyRegistryReason::UnsupportedRegistrySchema => {
+            "profile_registry_schema_unsupported"
+        }
+        UntrustworthyRegistryReason::ManagedRootIdentityChanged => {
+            PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
+        }
+        UntrustworthyRegistryReason::IntegrityMismatch => "profile_registry_integrity_mismatch",
+        UntrustworthyRegistryReason::InvalidRegistryIdentity => "profile_registry_identity_invalid",
+        UntrustworthyRegistryReason::NonCanonicalTarget => "profile_target_non_canonical",
+        UntrustworthyRegistryReason::MissingRegistry => "profile_registry_missing",
+        UntrustworthyRegistryReason::MissingRecord => "profile_registry_record_missing",
+        UntrustworthyRegistryReason::MissingProfileUuid => "profile_registry_profile_uuid_missing",
+        UntrustworthyRegistryReason::PossiblyManagedPath => PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
+        UntrustworthyRegistryReason::DurableKindConflict => "profile_durable_kind_conflict",
+        UntrustworthyRegistryReason::DurableDeletionState => "profile_durable_deletion_state",
+        UntrustworthyRegistryReason::RecordTargetMissing => {
+            "profile_registry_record_target_missing"
+        }
+    }
+}
+
+/// Actionable launch remedy for registry-root refusals that have a safe recovery.
+pub const fn untrustworthy_registry_remedy(
+    reason: UntrustworthyRegistryReason,
+) -> Option<&'static str> {
+    match reason {
+        UntrustworthyRegistryReason::ManagedRootIdentityChanged => Some(
+            "run browser.rebind_profile_root to re-identify the restored or moved browser root; \
+             that operation will itself refuse and name any directory the registry did not mint",
+        ),
+        UntrustworthyRegistryReason::PossiblyManagedPath => Some(
+            "move or account for the unaccounted profile directories before running \
+             browser.rebind_profile_root; the rebind operation will not adopt them",
+        ),
+        UntrustworthyRegistryReason::LockContentionWithoutOwnerProof => None,
+        UntrustworthyRegistryReason::MalformedRegistry => None,
+        UntrustworthyRegistryReason::UnsupportedRegistrySchema => None,
+        UntrustworthyRegistryReason::IntegrityMismatch => None,
+        UntrustworthyRegistryReason::InvalidRegistryIdentity => None,
+        UntrustworthyRegistryReason::NonCanonicalTarget => None,
+        UntrustworthyRegistryReason::MissingRegistry => None,
+        UntrustworthyRegistryReason::MissingRecord => None,
+        UntrustworthyRegistryReason::MissingProfileUuid => None,
+        UntrustworthyRegistryReason::DurableKindConflict => None,
+        UntrustworthyRegistryReason::DurableDeletionState => None,
+        UntrustworthyRegistryReason::RecordTargetMissing => None,
+    }
+}
+
 #[derive(Debug)]
 pub enum RegistryError {
     Root(RootError),
@@ -1137,6 +1200,55 @@ struct RegistryDocument {
     integrity: String,
 }
 
+/// Provenance recorded beside the registry before its root identity is changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebindProvenance {
+    pub ask_id: String,
+    pub conversation_key: String,
+    pub at_unix_ms: u64,
+}
+
+/// The exact registry transition a root rebind performed or would perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebindReport {
+    pub old_identity: String,
+    pub new_identity: String,
+    pub generation_before: u64,
+    pub generation_after: u64,
+    pub record_count: usize,
+}
+
+/// Closed reasons a managed-root identity rebind can refuse.
+#[derive(Debug)]
+pub enum RebindRefusal {
+    RegistryMissing,
+    MalformedRegistry,
+    UnsupportedRegistrySchema,
+    IntegrityMismatch,
+    AlreadyBound,
+    PossiblyManagedPath { unaccounted: Vec<String> },
+    RootUnstable,
+    Io(io::Error),
+}
+
+#[derive(Serialize)]
+struct DurableRebindRecord<'a> {
+    schema: &'static str,
+    old_identity: &'a str,
+    new_identity: &'a str,
+    generation_before: u64,
+    generation_after: u64,
+    record_count: usize,
+    at_unix_ms: u64,
+    elicited: DurableRebindElicitation<'a>,
+}
+
+#[derive(Serialize)]
+struct DurableRebindElicitation<'a> {
+    ask_id: &'a str,
+    conversation_key: &'a str,
+}
+
 fn record_payload(record: &RegistryRecord) -> Value {
     let mut value = serde_json::to_value(record).expect("registry record is serializable");
     if let Some(object) = value.as_object_mut() {
@@ -1187,6 +1299,51 @@ fn empty_artifact_report() -> ArtifactGateReport {
         implementation_digest: String::new(),
         provider_ids: BTreeSet::new(),
         fixture_count: 0,
+    }
+}
+
+fn rebind_root_refusal(error: RootError) -> RebindRefusal {
+    match error {
+        RootError::Io(error) => RebindRefusal::Io(error),
+        RootError::NotDirectory
+        | RootError::SymlinkNotAllowed
+        | RootError::Unstable
+        | RootError::OutsideRoot
+        | RootError::InvalidTarget => RebindRefusal::RootUnstable,
+    }
+}
+
+fn rebind_registry_error(error: RegistryError) -> RebindRefusal {
+    match error {
+        RegistryError::Root(error) => rebind_root_refusal(error),
+        RegistryError::Io(error) => RebindRefusal::Io(error),
+        RegistryError::Untrustworthy(UntrustworthyRegistryReason::IntegrityMismatch) => {
+            RebindRefusal::IntegrityMismatch
+        }
+        RegistryError::Artifact(error) => RebindRefusal::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("profile registry artifact error during rebind: {error}"),
+        )),
+        RegistryError::UnknownField(field) => RebindRefusal::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown profile registry field during rebind: {field}"),
+        )),
+        RegistryError::UnsupportedState => RebindRefusal::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported profile registry state during rebind",
+        )),
+        RegistryError::Conflict => RebindRefusal::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile registry conflict during rebind",
+        )),
+        RegistryError::Untrustworthy(reason) => RebindRefusal::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected untrustworthy registry during rebind: {reason}"),
+        )),
+        RegistryError::InvalidTransition => RebindRefusal::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid profile registry transition during rebind",
+        )),
     }
 }
 
@@ -1286,6 +1443,188 @@ impl ProfileRegistry {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn acquire_rebind_slot_lock(&self) -> Result<RegistryLock, RebindRefusal> {
+        self.acquire_slot_lock().map_err(rebind_registry_error)
+    }
+
+    fn read_rebind_document(&self) -> Result<RegistryDocument, RebindRefusal> {
+        let path = self
+            .root
+            .target_path(Path::new(REGISTRY_FILE), false)
+            .map_err(rebind_root_refusal)?;
+        let mut bytes = Vec::new();
+        match File::open(&path) {
+            Ok(mut file) => file.read_to_end(&mut bytes).map_err(RebindRefusal::Io)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(RebindRefusal::RegistryMissing)
+            }
+            Err(error) => return Err(RebindRefusal::Io(error)),
+        };
+        let document: RegistryDocument =
+            serde_json::from_slice(&bytes).map_err(|_| RebindRefusal::MalformedRegistry)?;
+        if document.schema != REGISTRY_SCHEMA {
+            return Err(RebindRefusal::UnsupportedRegistrySchema);
+        }
+        if hex(&Sha256::digest(canonical_json(&document_payload(
+            &document,
+        )))) != document.integrity
+            || document
+                .records
+                .values()
+                .any(|record| record_integrity(record) != record.integrity)
+        {
+            return Err(RebindRefusal::IntegrityMismatch);
+        }
+        Ok(document)
+    }
+
+    fn unaccounted_profile_paths(
+        &self,
+        document: &RegistryDocument,
+    ) -> Result<Vec<String>, RebindRefusal> {
+        self.root.revalidate().map_err(rebind_root_refusal)?;
+        let profiles = self
+            .root
+            .target_path(Path::new("profiles"), false)
+            .map_err(rebind_root_refusal)?;
+        let metadata = match fs::symlink_metadata(&profiles) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(RebindRefusal::Io(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RebindRefusal::RootUnstable);
+        }
+
+        let accounted: BTreeSet<String> = document
+            .records
+            .values()
+            .filter_map(|record| {
+                Path::new(&record.target)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        let mut unaccounted = BTreeSet::new();
+        for entry in fs::read_dir(profiles).map_err(RebindRefusal::Io)? {
+            let entry = entry.map_err(RebindRefusal::Io)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !accounted.contains(&name) {
+                unaccounted.insert(name);
+            }
+        }
+        Ok(unaccounted.into_iter().collect())
+    }
+
+    fn inspect_rebind_locked(&self) -> Result<(RegistryDocument, RebindReport), RebindRefusal> {
+        let document = self.read_rebind_document()?;
+        let new_identity = self.root.binding();
+        if document.managed_root_identity == new_identity {
+            return Err(RebindRefusal::AlreadyBound);
+        }
+        let unaccounted = self.unaccounted_profile_paths(&document)?;
+        if !unaccounted.is_empty() {
+            return Err(RebindRefusal::PossiblyManagedPath { unaccounted });
+        }
+        let generation_after = document.generation.checked_add(1).ok_or_else(|| {
+            RebindRefusal::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile registry generation cannot advance",
+            ))
+        })?;
+        let report = RebindReport {
+            old_identity: document.managed_root_identity.clone(),
+            new_identity,
+            generation_before: document.generation,
+            generation_after,
+            record_count: document.records.len(),
+        };
+        Ok((document, report))
+    }
+
+    fn write_rebind_record(
+        &self,
+        report: &RebindReport,
+        provenance: &RebindProvenance,
+    ) -> Result<(), RebindRefusal> {
+        let record = DurableRebindRecord {
+            schema: "ck-browser-profile-root-rebind/v1",
+            old_identity: &report.old_identity,
+            new_identity: &report.new_identity,
+            generation_before: report.generation_before,
+            generation_after: report.generation_after,
+            record_count: report.record_count,
+            at_unix_ms: provenance.at_unix_ms,
+            elicited: DurableRebindElicitation {
+                ask_id: &provenance.ask_id,
+                conversation_key: &provenance.conversation_key,
+            },
+        };
+        let mut bytes = serde_json::to_vec(&record).map_err(|error| {
+            RebindRefusal::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+        })?;
+        bytes.push(b'\n');
+        let path = self
+            .root
+            .target_path(Path::new(PROFILE_ROOT_REBINDS_FILE), true)
+            .map_err(rebind_root_refusal)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(RebindRefusal::Io)?;
+        file.write_all(&bytes).map_err(RebindRefusal::Io)?;
+        file.sync_all().map_err(RebindRefusal::Io)
+    }
+
+    fn rebind_managed_root_checked(
+        &self,
+        provenance: &RebindProvenance,
+        expected: Option<&RebindReport>,
+    ) -> Result<RebindReport, RebindRefusal> {
+        let _lock = self.acquire_rebind_slot_lock()?;
+        let (mut document, report) = self.inspect_rebind_locked()?;
+        if expected.is_some_and(|expected| expected != &report) {
+            return Err(RebindRefusal::RootUnstable);
+        }
+        self.write_rebind_record(&report, provenance)?;
+        document.managed_root_identity = report.new_identity.clone();
+        document.generation = report.generation_after;
+        self.write_document(document)
+            .map_err(rebind_registry_error)?;
+        Ok(report)
+    }
+
+    /// Read and validate the rebind situation without writing provenance or registry state.
+    pub fn preview_rebind(&self) -> Result<RebindReport, RebindRefusal> {
+        let _lock = self.acquire_rebind_slot_lock()?;
+        self.inspect_rebind_locked().map(|(_, report)| report)
+    }
+
+    /// Re-identify a registry whose already-provenanced managed root was moved.
+    ///
+    /// > Healing an identity mismatch asserts "this is the same root I minted, moved". Adopting an
+    /// > unaccounted path asserts "these profiles, which nobody minted, are now mine". The first
+    /// > re-identifies a thing that already has a provenance; the second MANUFACTURES provenance. Only the
+    /// > second can launder an attacker-placed directory into an attested launch.
+    ///
+    /// The durable provenance record is synced before the registry starts trusting
+    /// the new identity. Unaccounted profile paths always refuse rather than being adopted.
+    pub fn rebind_managed_root(
+        &self,
+        provenance: &RebindProvenance,
+    ) -> Result<RebindReport, RebindRefusal> {
+        self.rebind_managed_root_checked(provenance, None)
+    }
+
+    pub(crate) fn rebind_managed_root_from_preview(
+        &self,
+        provenance: &RebindProvenance,
+        expected: &RebindReport,
+    ) -> Result<RebindReport, RebindRefusal> {
+        self.rebind_managed_root_checked(provenance, Some(expected))
     }
 
     fn read_document(&self) -> Result<Option<RegistryDocument>, RegistryError> {
@@ -2074,40 +2413,30 @@ impl ProfileLifecycle {
     }
 
     fn closed_untrusted_root(&self, reason: UntrustworthyRegistryReason) -> PrepareResult {
-        let reason_code = match reason {
-            UntrustworthyRegistryReason::ManagedRootIdentityChanged => {
-                PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
+        let outcome = match reason {
+            UntrustworthyRegistryReason::ManagedRootIdentityChanged
+            | UntrustworthyRegistryReason::PossiblyManagedPath => {
+                ProfileOutcome::UntrustworthyRegistry { reason }
             }
-            UntrustworthyRegistryReason::PossiblyManagedPath => {
-                PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH
-            }
-            UntrustworthyRegistryReason::LockContentionWithoutOwnerProof => {
-                "profile_registry_lock_owner_unproven"
-            }
-            UntrustworthyRegistryReason::MalformedRegistry => "profile_registry_malformed",
-            UntrustworthyRegistryReason::UnsupportedRegistrySchema => {
-                "profile_registry_schema_unsupported"
-            }
-            UntrustworthyRegistryReason::IntegrityMismatch => "profile_registry_integrity_mismatch",
-            UntrustworthyRegistryReason::InvalidRegistryIdentity => {
-                "profile_registry_identity_invalid"
-            }
-            UntrustworthyRegistryReason::NonCanonicalTarget => "profile_target_non_canonical",
-            UntrustworthyRegistryReason::MissingRegistry => "profile_registry_missing",
-            UntrustworthyRegistryReason::MissingRecord => "profile_registry_record_missing",
-            UntrustworthyRegistryReason::MissingProfileUuid => {
-                "profile_registry_profile_uuid_missing"
-            }
-            UntrustworthyRegistryReason::DurableKindConflict => "profile_durable_kind_conflict",
-            UntrustworthyRegistryReason::DurableDeletionState => "profile_durable_deletion_state",
-            UntrustworthyRegistryReason::RecordTargetMissing => {
-                "profile_registry_record_target_missing"
+            UntrustworthyRegistryReason::LockContentionWithoutOwnerProof
+            | UntrustworthyRegistryReason::MalformedRegistry
+            | UntrustworthyRegistryReason::UnsupportedRegistrySchema
+            | UntrustworthyRegistryReason::IntegrityMismatch
+            | UntrustworthyRegistryReason::InvalidRegistryIdentity
+            | UntrustworthyRegistryReason::NonCanonicalTarget
+            | UntrustworthyRegistryReason::MissingRegistry
+            | UntrustworthyRegistryReason::MissingRecord
+            | UntrustworthyRegistryReason::MissingProfileUuid
+            | UntrustworthyRegistryReason::DurableKindConflict
+            | UntrustworthyRegistryReason::DurableDeletionState
+            | UntrustworthyRegistryReason::RecordTargetMissing => {
+                ProfileOutcome::StorageUnavailable {
+                    reason_code: untrustworthy_registry_reason_code(reason),
+                    origin: FailureOrigin::RegistryOrStorage,
+                }
             }
         };
-        PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
-            reason_code,
-            origin: FailureOrigin::RegistryOrStorage,
-        })
+        PrepareResult::Closed(outcome)
     }
 
     pub fn prepare_context_open(
@@ -3606,12 +3935,33 @@ mod tests {
                 "profile_registry_record_target_missing",
             ),
         ] {
+            let expected = match reason {
+                UntrustworthyRegistryReason::ManagedRootIdentityChanged
+                | UntrustworthyRegistryReason::PossiblyManagedPath => {
+                    ProfileOutcome::UntrustworthyRegistry { reason }
+                }
+                UntrustworthyRegistryReason::LockContentionWithoutOwnerProof
+                | UntrustworthyRegistryReason::MalformedRegistry
+                | UntrustworthyRegistryReason::UnsupportedRegistrySchema
+                | UntrustworthyRegistryReason::IntegrityMismatch
+                | UntrustworthyRegistryReason::InvalidRegistryIdentity
+                | UntrustworthyRegistryReason::NonCanonicalTarget
+                | UntrustworthyRegistryReason::MissingRegistry
+                | UntrustworthyRegistryReason::MissingRecord
+                | UntrustworthyRegistryReason::MissingProfileUuid
+                | UntrustworthyRegistryReason::DurableKindConflict
+                | UntrustworthyRegistryReason::DurableDeletionState
+                | UntrustworthyRegistryReason::RecordTargetMissing => {
+                    ProfileOutcome::StorageUnavailable {
+                        reason_code,
+                        origin: FailureOrigin::RegistryOrStorage,
+                    }
+                }
+            };
+            assert_eq!(expected.reason_code(), reason_code);
             assert_eq!(
                 lifecycle.closed_untrusted_root(reason),
-                PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
-                    reason_code,
-                    origin: FailureOrigin::RegistryOrStorage,
-                })
+                PrepareResult::Closed(expected)
             );
         }
         fs::remove_dir_all(path).unwrap();

@@ -1912,7 +1912,10 @@ async fn handle_management_request(
         )
         .await;
     };
-    if !matches!(method, management::OPEN_TARGET | management::OPEN_GRANT) {
+    if !matches!(
+        method,
+        management::OPEN_TARGET | management::OPEN_GRANT | management::REBIND_PROFILE_ROOT
+    ) {
         return send_route_error(
             writer,
             ver,
@@ -1944,6 +1947,7 @@ async fn handle_management_request(
     enum Settlement {
         ComputerTarget,
         BrowserGrant,
+        ProfileRootRebind,
     }
 
     let (reply, question, settlement) = if method == management::OPEN_TARGET {
@@ -1991,7 +1995,7 @@ async fn handle_management_request(
             )
             .await;
         (reply, question, Settlement::ComputerTarget)
-    } else {
+    } else if method == management::OPEN_GRANT {
         if let Some(field) = params_object
             .keys()
             .filter(|field| !matches!(field.as_str(), "origins" | "hazards"))
@@ -2109,6 +2113,27 @@ async fn handle_management_request(
             }
         };
         (reply, question, Settlement::BrowserGrant)
+    } else {
+        if let Some(field) = params_object.keys().min() {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
+        let (reply, question) = planes
+            .management
+            .open_profile_root_rebind(
+                &facts.identity.conversation_key,
+                facts.declares_elicitation(),
+            )
+            .await;
+        (reply, question, Settlement::ProfileRootRebind)
     };
 
     if let Some(question) = question {
@@ -2135,6 +2160,11 @@ async fn handle_management_request(
                 Settlement::BrowserGrant => {
                     management_plane
                         .settle_browser_grant(&question.ask_id, answer.as_ref())
+                        .await;
+                }
+                Settlement::ProfileRootRebind => {
+                    management_plane
+                        .settle_profile_root_rebind(&question.ask_id, answer.as_ref())
                         .await;
                 }
             }

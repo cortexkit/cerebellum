@@ -3176,11 +3176,11 @@ mod tests {
 use serde_json::{json, Value};
 
 use crate::profile::{
-    AbortCause, AbortResult, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
-    LaunchResult, OpenedContext, PrepareResult, PreparedOpen, PreparedProfileAttempt,
-    ProfileDisposition, ProfileLifecycle, ProfileOutcome, ReleaseCause, ReleaseResult,
-    StampedBindContext, PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
-    PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED,
+    untrustworthy_registry_reason_code, untrustworthy_registry_remedy, AbortCause, AbortResult,
+    DispatchCommitmentToken, InvocationToken, JournalReservationHandle, LaunchResult,
+    OpenedContext, PrepareResult, PreparedOpen, PreparedProfileAttempt, ProfileDisposition,
+    ProfileLifecycle, ProfileOutcome, ReleaseCause, ReleaseResult, StampedBindContext,
+    UntrustworthyRegistryReason,
 };
 use crate::profile_custody::{
     HolderId, ProfileCustodyAcquisition, ProfileCustodyClaim, ProfileCustodyJournal,
@@ -3210,7 +3210,7 @@ impl LaunchCleanupStage {
 pub enum BrowserLaunchOutcome {
     ProfileBusy { holder_id: HolderId },
     ProfileGrantRequired,
-    ProfileRegistryUntrustedRoot { reason_code: &'static str },
+    ProfileRegistryUntrustedRoot { reason: UntrustworthyRegistryReason },
     ProfileStorageUnavailable { reason_code: &'static str },
     InternalFailure { reason_code: &'static str },
     CleanupFailure { stage: LaunchCleanupStage },
@@ -3235,10 +3235,16 @@ impl BrowserLaunchOutcome {
                 })
             }
             Self::ProfileGrantRequired => json!({"outcome": "profile_grant_required"}),
-            Self::ProfileRegistryUntrustedRoot { reason_code } => json!({
-                "outcome": "profile_registry_untrusted_root",
-                "reason_code": reason_code,
-            }),
+            Self::ProfileRegistryUntrustedRoot { reason } => {
+                let mut response = json!({
+                    "outcome": "profile_registry_untrusted_root",
+                    "reason_code": untrustworthy_registry_reason_code(*reason),
+                });
+                if let Some(remedy) = untrustworthy_registry_remedy(*reason) {
+                    response["remedy"] = Value::String(remedy.to_string());
+                }
+                response
+            }
             Self::ProfileStorageUnavailable { reason_code } => json!({
                 "outcome": "profile_storage_unavailable",
                 "reason_code": reason_code,
@@ -3251,6 +3257,40 @@ impl BrowserLaunchOutcome {
                 json!({"outcome": "cleanup_failure", "stage": stage.as_str()})
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_registry_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_root_remedies_are_typed_and_selective() {
+        let identity_changed = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason: UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+        }
+        .as_json();
+        assert_eq!(
+            identity_changed["remedy"],
+            "run browser.rebind_profile_root to re-identify the restored or moved browser root; \
+             that operation will itself refuse and name any directory the registry did not mint"
+        );
+
+        let possibly_managed = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason: UntrustworthyRegistryReason::PossiblyManagedPath,
+        }
+        .as_json();
+        assert_eq!(
+            possibly_managed["remedy"],
+            "move or account for the unaccounted profile directories before running \
+             browser.rebind_profile_root; the rebind operation will not adopt them"
+        );
+
+        let malformed = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason: UntrustworthyRegistryReason::MalformedRegistry,
+        }
+        .as_json();
+        assert!(malformed.get("remedy").is_none(), "{malformed}");
     }
 }
 
@@ -3268,12 +3308,9 @@ pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
         ProfileOutcome::NoSession { reason_code } => {
             BrowserLaunchOutcome::InternalFailure { reason_code }
         }
-        ProfileOutcome::StorageUnavailable {
-            reason_code:
-                reason_code @ (PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
-                | PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH),
-            origin: _,
-        } => BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code },
+        ProfileOutcome::UntrustworthyRegistry { reason } => {
+            BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason }
+        }
         ProfileOutcome::StorageUnavailable {
             reason_code,
             origin: _,
@@ -3651,7 +3688,7 @@ fn cleanup_stage_after_profile_completion(attempt: &PreparedProfileAttempt) -> L
 const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
     | BrowserLaunchOutcome::ProfileGrantRequired
-    | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason_code: _ }
+    | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason: _ }
     | BrowserLaunchOutcome::ProfileStorageUnavailable { reason_code: _ }
     | BrowserLaunchOutcome::InternalFailure { reason_code: _ }
     | BrowserLaunchOutcome::CleanupFailure { stage: _ } => {}
