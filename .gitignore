@@ -18,3 +18,7 @@ docs/field-notes.md
 
 # Rust build artifacts.
 target/
+
+# Finder metadata. One was committed at the root for a month before the
+# fleet gitignore census found it; the rule keeps the next one out.
+.DS_Store
