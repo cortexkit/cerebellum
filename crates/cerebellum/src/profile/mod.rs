@@ -30,6 +30,12 @@ pub const REGISTRY_ARTIFACT_ID: &str = "ck-browser-profile-registry";
 pub const REGISTRY_ARTIFACT_REVISION: &str = "v1";
 pub const REGISTRY_SCHEMA: &str = "ck-browser-profile-registry/v1";
 const REGISTRY_FILE: &str = ".ck-browser-profile-registry-v1.json";
+/// Append-only provenance for every re-identification of the managed root,
+/// kept BESIDE the registry rather than inside it. A rebound root is trusted
+/// from then on, so the rebind itself is the fact a later reader needs; a
+/// record inside the registry would be replaced by the next rewrite of the
+/// thing it describes. One JSON object per line, fsynced before the registry
+/// starts trusting the new identity.
 pub const PROFILE_ROOT_REBINDS_FILE: &str = ".ck-browser-profile-root-rebinds.jsonl";
 const DURABLE_LOCK_FILE: &str = ".ck-browser-profile-durable-slot.lock";
 static UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1224,9 +1230,23 @@ pub enum RebindRefusal {
     RegistryMissing,
     MalformedRegistry,
     UnsupportedRegistrySchema,
+    /// The stored document's digest does not verify. Checked before the
+    /// identity compare: `AlreadyBound` is a statement about a document the
+    /// registry has decided to trust, and it may not be made about bytes that
+    /// fail their own digest.
     IntegrityMismatch,
+    /// The stored identity already matches this root; nothing to heal.
     AlreadyBound,
-    PossiblyManagedPath { unaccounted: Vec<String> },
+    /// `profiles/` holds entries no record names. Never healed: rebinding
+    /// would adopt directories nobody minted, and only that path can launder
+    /// an attacker-placed profile into an attested launch.
+    PossiblyManagedPath {
+        unaccounted: Vec<String>,
+    },
+    /// The held root failed revalidation, or -- when a rebind is applied to a
+    /// preview taken earlier -- the registry no longer matches what the
+    /// person was shown. An elicited answer arrives minutes after its
+    /// question; a root that changed in between is not the one consented to.
     RootUnstable,
     Io(io::Error),
 }

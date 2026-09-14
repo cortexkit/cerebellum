@@ -17,7 +17,7 @@
     "algorithm": "sha256",
     "bundle": "ck-browser-profile-registry-implementation-bundle/v1",
     "member_order": "unsigned_utf8_identifier",
-    "value": "95685b1fc2588fa9fd5efa0b14ba4eb6d83e6c4890b919b604a32b5565c8d2f1"
+    "value": "e577c3f0bef1bc706defc6be5909cce1ff0a72ad0575a3c56a4b688ccc9388b7"
   },
   "schemas": {
     "registry": {

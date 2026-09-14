@@ -244,6 +244,40 @@ fn rebind_checks_integrity_before_considering_profile_paths() {
     assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
 }
 
+/// Integrity is checked BEFORE the identity compare. A registry whose root
+/// still matches but whose records were edited must refuse as tampered, not
+/// as "nothing to do": `AlreadyBound` is a statement about a document the
+/// primitive has decided to trust, and it may not make that statement about
+/// bytes whose digest does not verify. The other integrity test cannot see this
+/// -- its root is recreated, so either order reaches the digest check.
+#[test]
+fn tampered_records_refuse_as_integrity_even_when_the_root_is_already_bound() {
+    let root = TestRoot::new("integrity-first");
+    let project_id = "project-integrity-first";
+    mint_durable_record(root.path(), project_id);
+
+    let mut document = registry_document(root.path());
+    document["records"][project_id]["target"] = Value::String("profiles/edited-target".to_string());
+    fs::write(
+        root.path().join(REGISTRY_FILE),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .expect("write parseable edited registry");
+    let edited = registry_bytes(root.path());
+    let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
+
+    let refusal = lifecycle
+        .registry()
+        .rebind_managed_root(&provenance("integrity-first"))
+        .expect_err("tampered records must refuse");
+    assert!(
+        matches!(refusal, RebindRefusal::IntegrityMismatch),
+        "expected IntegrityMismatch ahead of AlreadyBound, got {refusal:?}"
+    );
+    assert_eq!(registry_bytes(root.path()), edited);
+    assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
+}
+
 #[test]
 fn already_bound_registry_is_byte_identical_after_refusal() {
     let root = TestRoot::new("already-bound");
