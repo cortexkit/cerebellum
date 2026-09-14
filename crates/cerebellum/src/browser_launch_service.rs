@@ -73,13 +73,14 @@ const BROWSER_LAUNCH_RECOVERY_FAILED: &str = "browser_launch_recovery_failed";
 const PROFILE_CUSTODY_DIRECTORY: &str = ".ck-browser-profile-custody";
 
 #[derive(Debug)]
-pub(crate) enum ProductionProfileLifecycleError {
+#[doc(hidden)]
+pub enum ProductionProfileLifecycleError {
     DataRoot,
     Registry(RegistryError),
 }
 
 impl ProductionProfileLifecycleError {
-    pub(crate) const fn stage(&self) -> &'static str {
+    pub const fn stage(&self) -> &'static str {
         match self {
             Self::DataRoot => "data_root",
             Self::Registry(_) => "profile_registry",
@@ -518,7 +519,11 @@ pub fn browser_launch_arguments(
 /// 44% in the direction that runs out sooner than the comment promises.
 const LAUNCH_JOURNAL_RETENTION_BYTES: u64 = 64 * 1024 * 1024;
 
-fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
+/// Public for the restore drill, for the same reason as
+/// `production_profile_lifecycle`: the drill opens the launch journal with the
+/// bounds production uses, not a copy of them.
+#[doc(hidden)]
+pub fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
     cerebellum_core::journal::JournalConfig {
         journal_retention_bytes: LAUNCH_JOURNAL_RETENTION_BYTES,
         journal_max_entry_bytes: 1024 * 1024,
@@ -1314,8 +1319,12 @@ fn production_registry_config() -> RegistryConfig {
 }
 
 /// Open the exact registry configuration used by production browser launches.
-pub(crate) fn production_profile_lifecycle(
-) -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
+///
+/// Public for the restore drill (`examples/launch_restore_drill.rs`), which
+/// must open the registry the way a launch does rather than carry a copy of
+/// this configuration that would drift from it.
+#[doc(hidden)]
+pub fn production_profile_lifecycle() -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
     let root = browser_data_root().map_err(|()| ProductionProfileLifecycleError::DataRoot)?;
     ProfileLifecycle::open_with_config(root, production_registry_config())
         .map_err(ProductionProfileLifecycleError::Registry)
