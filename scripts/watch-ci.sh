@@ -44,6 +44,13 @@ fi
 # (cost-gate, testbox), so resolving a run BY SHA has to name the gating one or
 # it can latch a run that says nothing about the tests.
 WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
+# Which trigger produced the run. A sha is not unique across triggers either: a
+# commit that a schedule (or workflow_dispatch) later re-ran carries several
+# runs of the same workflow with possibly different conclusions, and the
+# newest-first list then answers for whichever fired last. A landing asks
+# whether THIS PUSH is green, so the default is the push run; set the event to
+# watch a different trigger's run for the same sha.
+EVENT="${WATCH_CI_EVENT:-push}"
 # How long to wait for a run to appear for a sha: 40 tries, 15s apart, is ten
 # minutes of patience for a queue that normally produces a run in seconds. Both
 # knobs exist so tests can drive the resolver without waiting out that budget.
@@ -61,13 +68,19 @@ WATCH_SHA=""
 # Run ids are decimal and around 11 digits; a sha is 7-40 hex characters. The
 # two only overlap for an all-decimal sha, so length decides that case: a
 # 32-or-longer all-decimal string is a sha, never a run id.
+#
+# Anything that is not a run id is resolved through git rather than pattern
+# matched: the run lookup below compares against the FULL head sha, so a short
+# sha stored verbatim never matches and the watch reports "no run appeared"
+# after the whole poll budget. Resolving also admits tags, branch names and
+# HEAD~n, and dereferences an annotated tag to the commit that carries runs.
 if [ -n "$ARG" ]; then
   if [[ "$ARG" =~ ^[0-9]+$ ]] && [ "${#ARG}" -lt 32 ]; then
     RID="$ARG"
-  elif [[ "$ARG" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-    WATCH_SHA="$ARG"
+  elif WATCH_SHA=$(git rev-parse --verify --quiet "${ARG}^{commit}"); then
+    :
   else
-    echo "watch-ci: argument must be a numeric run id or a commit sha (got '$ARG'); pass nothing to watch HEAD's run" >&2
+    echo "watch-ci: argument must be a numeric run id or a commit ref this checkout can resolve (got '$ARG'); pass nothing to watch HEAD's run" >&2
     exit 2
   fi
 fi
@@ -86,14 +99,14 @@ if [ -z "$RID" ]; then
     WATCH_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
   fi
   for _ in $(seq 1 "$RESOLVE_ATTEMPTS"); do
-    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --limit 40 \
+    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
       --json databaseId,headSha \
       --jq ".[] | select(.headSha==\"$WATCH_SHA\") | .databaseId" | head -1)
     [ -n "$RID" ] && break
     sleep "$RESOLVE_SLEEP"
   done
   if [ -z "$RID" ]; then
-    echo "no $WORKFLOW run appeared for $WATCH_SHA" >&2
+    echo "no $WORKFLOW run (event=$EVENT) appeared for $WATCH_SHA" >&2
     exit 2
   fi
 fi
@@ -108,12 +121,13 @@ fi
 
 while true; do
   STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
-  # 'Bash permission e2e (Windows)' is continue-on-error in PR mode
-  # (_unit-suite.yml strict=false): its job-level conclusion still reads
-  # 'failure' in the API, but it does not gate the run. Fail-fast must not
-  # fire on it; the run-level conclusion check below remains authoritative.
+  # Advisory (continue-on-error) jobs read 'failure' at the job level but do
+  # not gate the run: 'Bash permission e2e (Windows)' in PR mode
+  # (_unit-suite.yml strict=false) and 'OpenCode 2 (Linux Docker)' until its
+  # matrix is green and the check is required. Fail-fast must not fire on
+  # them; the run-level conclusion check below remains authoritative.
   FAILED_JOB=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | contains("Bash permission") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
+    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
