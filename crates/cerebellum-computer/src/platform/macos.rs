@@ -1410,6 +1410,61 @@ mod tests {
         }
     }
 
+    /// A probe that panicked is not an absent grant, and the reason must say
+    /// so on every row that consults permissions. The two send an operator to
+    /// different places -- "not established" is answered in System Settings;
+    /// a crashed probe is a module fault that no settings change repairs --
+    /// so a report that names the wrong one costs a real person a wrong trip.
+    /// Fixed against every OTHER gate so a row can only be withheld for this.
+    #[test]
+    fn a_panicked_permission_probe_is_named_as_a_module_fault_not_as_an_absent_grant() {
+        let driver = MacOs26PlatformDriver::default();
+        let mut startup = driver.startup_probe().clone();
+        startup.permissions = PermissionLivenessReport::probe_failed();
+        let context = CapabilityAdvertisementContext {
+            inputs: ImmutableReleaseInputs {
+                attendance_contract_owner: Some("fixture-owner".to_string()),
+                attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
+                input_review_revision: Some("fixture-input-review-v1".to_string()),
+                global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
+                capture_review_revision: Some("fixture-capture-review-v1".to_string()),
+                semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+                windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
+                release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
+                vocabulary_digests: VocabularyDigestInputs {
+                    manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                    source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                    computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+                },
+            },
+            permissions: PermissionLivenessReport::probe_failed(),
+            startup,
+        };
+
+        for id in [
+            "computer.screenshot",
+            "computer.type",
+            "computer.keys",
+            "computer.scroll",
+            "computer.move",
+            "computer.drag",
+        ] {
+            let declaration = driver.declaration(id, &context);
+            assert!(!declaration.advertised, "{id} was advertised");
+            let reason = declaration
+                .suppression_reason
+                .expect("a suppressed capability states why");
+            assert!(
+                reason.contains("probe did not complete") && reason.contains("module fault"),
+                "{id} names something other than the crash: {reason}"
+            );
+            assert!(
+                !reason.contains("not established") && !reason.contains("not granted"),
+                "{id} describes a grant nobody looked at: {reason}"
+            );
+        }
+    }
+
     /// A wire surface with no expected post-condition makes no effect claim.
     #[test]
     fn absent_wire_post_condition_skips_observation_and_reports_the_frozen_coarser_status() {

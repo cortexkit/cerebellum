@@ -845,8 +845,17 @@ fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Optio
 /// Empty where there is nothing to ask. An empty reading resolves every service
 /// to unknown rather than to denied, which is the honest answer: a host that
 /// cannot be asked has not refused.
+/// The probe thread panicked before reporting. Distinct from an empty reading
+/// because the two mean different things to whoever reads the manifest: an
+/// empty reading describes grants nobody could see, a panic describes a fault
+/// in this module. Substituting an empty reading here would send an operator
+/// to System Settings to fix a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionProbePanicked;
+
 #[cfg(target_os = "macos")]
-fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>) {
+fn computer_permission_readings(
+) -> Result<(Vec<PermissionProbeResult>, Option<String>), PermissionProbePanicked> {
     // Taken on a background thread, because a reading from the main thread is
     // discarded: the main thread of this process runs the module's event loop,
     // and what it can do is not evidence about the threads that will actually
@@ -872,12 +881,13 @@ fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>
         )
     })
     .join()
-    .unwrap_or_else(|_| (Vec::new(), None))
+    .map_err(|_| PermissionProbePanicked)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn computer_permission_readings() -> (Vec<PermissionProbeResult>, Option<String>) {
-    (Vec::new(), None)
+fn computer_permission_readings(
+) -> Result<(Vec<PermissionProbeResult>, Option<String>), PermissionProbePanicked> {
+    Ok((Vec::new(), None))
 }
 
 /// Collect the release attestations supplied to the compiler and derive the
@@ -957,12 +967,16 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
 /// capture is performed, so this does not pay the first-capture cost that
 /// contends with other processes.
 pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
-    #[cfg(target_os = "macos")]
-    let (permission_results, responsible_process) = computer_permission_readings();
+    let readings = computer_permission_readings();
+    let probe_panicked = readings.is_err();
+    // A panicked probe contributes no readings; the report below is then
+    // replaced wholesale so every service names the crash rather than an
+    // absent grant.
+    let (permission_results, responsible_process) = readings.unwrap_or((Vec::new(), None));
     #[cfg(not(target_os = "macos"))]
-    let (permission_results, _) = computer_permission_readings();
+    let _ = responsible_process;
     #[cfg(target_os = "macos")]
-    let startup = StartupCapabilityProbe::run(&StartupProbeInput {
+    let mut startup = StartupCapabilityProbe::run(&StartupProbeInput {
         os_major: computer::platform::MACOS_MAJOR_VERSION,
         private_envelope_revision: None,
         resolved_private_symbols: BTreeSet::new(),
@@ -970,10 +984,13 @@ pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
         responsible_process,
     });
     #[cfg(not(target_os = "macos"))]
-    let startup = StartupCapabilityProbe {
+    let mut startup = StartupCapabilityProbe {
         permissions: PermissionLivenessReport::from_results(permission_results),
         ..Default::default()
     };
+    if probe_panicked {
+        startup.permissions = PermissionLivenessReport::probe_failed();
+    }
     ComputerCapabilityAdvertisementContext {
         inputs: compiled_release_inputs(),
         permissions: startup.permissions.clone(),

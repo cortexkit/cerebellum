@@ -105,6 +105,12 @@ pub enum PermissionLiveness {
     Unavailable,
     GrantedPendingRelaunch,
     Unresolved,
+    /// The probe itself did not complete -- its thread panicked before it
+    /// reported anything -- so nothing is known about the grant. Kept apart
+    /// from `Unresolved` because the two send an operator to different
+    /// places: an unresolved reading is answered in System Settings, a
+    /// crashed probe is a module fault that no settings change repairs.
+    ProbeFailed,
 }
 
 /// A probe result includes the responsible process so settings-only reads cannot
@@ -120,6 +126,7 @@ pub struct PermissionProbeResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionLivenessReport {
     states: BTreeMap<PermissionService, PermissionLiveness>,
+    probe_failed: bool,
 }
 
 impl PermissionLivenessReport {
@@ -129,10 +136,24 @@ impl PermissionLivenessReport {
                 .into_iter()
                 .map(|result| (result.service, result.liveness))
                 .collect(),
+            probe_failed: false,
+        }
+    }
+
+    /// The report for a probe that never returned. Every service reads
+    /// `ProbeFailed` so each suppression reason names the crash instead of
+    /// describing a grant nobody looked at.
+    pub fn probe_failed() -> Self {
+        Self {
+            states: BTreeMap::new(),
+            probe_failed: true,
         }
     }
 
     pub fn state(&self, service: PermissionService) -> PermissionLiveness {
+        if self.probe_failed {
+            return PermissionLiveness::ProbeFailed;
+        }
         self.states
             .get(&service)
             .copied()
@@ -384,6 +405,11 @@ fn capability_declaration(
                 PermissionLiveness::Unresolved => {
                     Some("screen recording permission is not established".to_string())
                 }
+                PermissionLiveness::ProbeFailed => Some(
+                    "the permission probe did not complete (module fault, not a settings \
+                     state); check the module log rather than System Settings"
+                        .to_string(),
+                ),
             }
         };
         advertised = suppression_reason.is_none();
@@ -443,6 +469,11 @@ fn capability_declaration(
                     PermissionLiveness::Unresolved => {
                         Some(format!("{service:?} permission is not established"))
                     }
+                    PermissionLiveness::ProbeFailed => Some(
+                        "the permission probe did not complete (module fault, not a \
+                         settings state); check the module log rather than System Settings"
+                            .to_string(),
+                    ),
                 })
         };
         advertised = suppression_reason.is_none();

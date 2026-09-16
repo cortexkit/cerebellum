@@ -606,7 +606,13 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
                 }
                 Err(CaptureError::PermissionPendingRelaunch)
             }
-            PermissionLiveness::Unavailable | PermissionLiveness::Unresolved => {
+            // A probe that never returned is treated as no permission at
+            // dispatch, the same fail-closed answer as an absent grant. The
+            // manifest names the two apart; the capture path only needs to
+            // refuse, and refusing on unknown is the safe direction.
+            PermissionLiveness::Unavailable
+            | PermissionLiveness::Unresolved
+            | PermissionLiveness::ProbeFailed => {
                 if self.enumeration_generation > 0 {
                     self.start_revocation_teardown(now_ms)?;
                 } else {
@@ -768,9 +774,9 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             PermissionLiveness::GrantedPendingRelaunch => {
                 return Err(CaptureError::PermissionPendingRelaunch)
             }
-            PermissionLiveness::Unavailable | PermissionLiveness::Unresolved => {
-                return Err(CaptureError::PermissionUnavailable)
-            }
+            PermissionLiveness::Unavailable
+            | PermissionLiveness::Unresolved
+            | PermissionLiveness::ProbeFailed => return Err(CaptureError::PermissionUnavailable),
         }
         let grant = self
             .broad_display_grant
