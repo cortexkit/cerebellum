@@ -235,47 +235,51 @@ done
 #
 # Keep this list equal to the [dependencies] entries that resolve into the
 # sibling, and re-derive it rather than editing by hand when they change.
-SIBLING_DIR="$(cd "$(dirname "$0")/../../subconscious" 2>/dev/null && pwd || true)"
-DECLARATION="$(dirname "$0")/../subconscious-source.txt"
-
-if [ -z "$SIBLING_DIR" ]; then
-  echo "The subconscious checkout is not beside this repository." >&2
-  echo "Every workspace dependency resolves through it, so there is nothing" >&2
-  echo "to build against. Nothing has been produced." >&2
-  exit 2
-fi
-
-if [ -n "$(git -C "$SIBLING_DIR" status --porcelain -- crates)" ]; then
-  echo "The subconscious crates have uncommitted changes." >&2
-  echo "A recorded hash does not describe what would be compiled, so the" >&2
-  echo "declaration cannot be honoured. Nothing has been produced." >&2
-  exit 2
-fi
-
-DRIFTED=""
-while read -r declared_hash crate; do
-  # Skip blanks and comments, so the declaration can explain what it holds.
-  # A bare list of hashes reads as commit shas to everyone, which is exactly
-  # the mistake that made this check compare a tree against a commit and
-  # refuse every release build it was asked to approve.
-  case "$declared_hash" in ""|\#*) continue ;; esac
-  [ -z "$crate" ] && continue
-  actual_hash="$(git -C "$SIBLING_DIR" rev-parse "HEAD:crates/$crate")"
-  if [ "$actual_hash" != "$declared_hash" ]; then
-    DRIFTED="$DRIFTED  $crate: declared $declared_hash, actual $actual_hash\n"
+# Two siblings now: subconscious for the wire crates, commons for the
+# daemon-aligned home resolvers. Each has its own declaration file with the
+# same content-addressed format, and each is checked the same way, so adding
+# a sibling is one line here and one file, never a second copy of the check.
+check_sibling_declaration() {
+  local sibling_name="$1" declaration="$2" sibling_dir drifted=""
+  sibling_dir="$(cd "$(dirname "$0")/../../$sibling_name" 2>/dev/null && pwd || true)"
+  if [ -z "$sibling_dir" ]; then
+    echo "The $sibling_name checkout is not beside this repository." >&2
+    echo "Workspace dependencies resolve through it, so there is nothing to" >&2
+    echo "build against. Nothing has been produced." >&2
+    exit 2
   fi
-done < "$DECLARATION"
-
-if [ -n "$DRIFTED" ]; then
-  echo "A subconscious crate this binary links has changed since it was" >&2
-  echo "declared:" >&2
-  printf "%b" "$DRIFTED" >&2
-  echo "A path dependency records no source or checksum in Cargo.lock, so" >&2
-  echo "--locked cannot see this and the binary would link code no gate has" >&2
-  echo "verified. If the move is intended, update subconscious-source.txt and" >&2
-  echo "commit it, so the combination is verified before it ships." >&2
-  exit 2
-fi
+  if [ -n "$(git -C "$sibling_dir" status --porcelain -- crates)" ]; then
+    echo "The $sibling_name crates have uncommitted changes." >&2
+    echo "A recorded hash does not describe what would be compiled, so the" >&2
+    echo "declaration cannot be honoured. Nothing has been produced." >&2
+    exit 2
+  fi
+  while read -r declared_hash crate; do
+    # Skip blanks and comments, so the declaration can explain what it holds.
+    # A bare list of hashes reads as commit shas to everyone, which is exactly
+    # the mistake that made this check compare a tree against a commit and
+    # refuse every release build it was asked to approve.
+    case "$declared_hash" in ""|\#*) continue ;; esac
+    [ -z "$crate" ] && continue
+    local actual_hash
+    actual_hash="$(git -C "$sibling_dir" rev-parse "HEAD:crates/$crate")"
+    if [ "$actual_hash" != "$declared_hash" ]; then
+      drifted="$drifted  $crate: declared $declared_hash, actual $actual_hash\n"
+    fi
+  done < "$declaration"
+  if [ -n "$drifted" ]; then
+    echo "A $sibling_name crate this binary links has changed since it was" >&2
+    echo "declared:" >&2
+    printf "%b" "$drifted" >&2
+    echo "A path dependency records no source or checksum in Cargo.lock, so" >&2
+    echo "--locked cannot see this and the binary would link code no gate has" >&2
+    echo "verified. If the move is intended, update $(basename "$declaration") and" >&2
+    echo "commit it, so the combination is verified before it ships." >&2
+    exit 2
+  fi
+}
+check_sibling_declaration subconscious "$(dirname "$0")/../subconscious-source.txt"
+check_sibling_declaration commons "$(dirname "$0")/../commons-source.txt"
 
 # --locked, because this repo's workspace dependencies are PATH deps on a
 # sibling checkout. Without it a release build re-resolves those siblings

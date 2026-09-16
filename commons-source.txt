@@ -1,0 +1,14 @@
+# SUBTREE hashes, not commit shas -- same contract as subconscious-source.txt.
+#
+# Each line is `git rev-parse <rev>:crates/<crate>` for a crate this workspace
+# links from the sibling cortexkit/commons checkout. scripts/release-build.sh
+# and the test gate's Phase 0b compare these against ../commons at HEAD and
+# refuse when they differ, so a release cannot link sibling code no gate has
+# verified. Content-addressed so a doc-only commit moves nothing and a history
+# rewrite that preserves content orphans nothing.
+#
+# Re-derive rather than edit:
+# for c in cortexkit-store-types; do
+# echo "$(git -C ../commons rev-parse HEAD:crates/$c) $c"
+# done > commons-source.txt
+af52e618d03090c2b265659b14193069794bb4d7 cortexkit-store-types

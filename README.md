@@ -9,20 +9,24 @@ See [docs/charter.md](docs/charter.md).
 
 ## Building
 
-This workspace has **path dependencies on a sibling checkout** of
+This workspace has **path dependencies on two sibling checkouts**:
 [cortexkit/subconscious](https://github.com/cortexkit/subconscious), which
-provides the wire protocol and transport. It is a path dependency rather than a
-registry version, so the sibling has to be on disk: no published crate
-substitutes for it.
+provides the wire protocol and transport, and
+[cortexkit/commons](https://github.com/cortexkit/commons), which provides the
+daemon-aligned data-home and config-home resolvers. They are path
+dependencies rather than registry versions, so both siblings have to be on
+disk: no published crate substitutes for either.
 
-Clone the two beside each other:
+Clone the three beside each other:
 
     git clone https://github.com/cortexkit/subconscious.git
+    git clone https://github.com/cortexkit/commons.git
     git clone https://github.com/cortexkit/cerebellum.git
     cd cerebellum && cargo build
 
 The paths are relative, so any sibling layout works. `subconscious-source.txt`
-pins the sibling crate contents this workspace is built against.
+and `commons-source.txt` pin the sibling crate contents this workspace is
+built against.
 
 **Keep `Cargo.lock` in step with the sibling.** While the committed lock
 disagrees with what the sibling supplies, every `cargo check` rewrites it —

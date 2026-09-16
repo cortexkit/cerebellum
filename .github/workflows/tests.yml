@@ -92,11 +92,12 @@ jobs:
         with:
           path: cerebellum
 
-      # cerebellum path-deps one private sibling: cortexkit/subconscious, for
-      # the subc wire crates. The default GITHUB_TOKEN is scoped to this repo
-      # only, so mint a short-lived token from the org-installed cortexkit-ci
-      # GitHub App (Contents: read). The client id is public App metadata and so
-      # is a repo variable; the private key stays a secret.
+      # cerebellum path-deps two siblings: cortexkit/subconscious for the subc
+      # wire crates, and cortexkit/commons for the daemon-aligned home
+      # resolvers. The default GITHUB_TOKEN is scoped to this repo only, so
+      # mint a short-lived token from the org-installed cortexkit-ci GitHub
+      # App (Contents: read). The client id is public App metadata and so is a
+      # repo variable; the private key stays a secret.
       - name: Mint cross-repo read token
         id: app-token
         uses: actions/create-github-app-token@v3
@@ -104,13 +105,20 @@ jobs:
           client-id: ${{ vars.CK_CI_APP_CLIENT_ID }}
           private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
           owner: cortexkit
-          repositories: subconscious
+          repositories: subconscious,commons
 
       - name: Checkout subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: subconscious
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Checkout commons
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/commons
+          path: commons
           token: ${{ steps.app-token.outputs.token }}
 
       # Both checkouts land side by side in the workspace directory, which is
@@ -126,6 +134,7 @@ jobs:
           ls -la .
           test -d subconscious/crates/subc-protocol
           test -d subconscious/crates/subc-transport
+          test -d commons/crates/cortexkit-store-types
 
       - uses: dtolnay/rust-toolchain@stable
         with:

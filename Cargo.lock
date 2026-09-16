@@ -119,6 +119,7 @@ dependencies = [
 name = "cerebellum-core"
 version = "0.1.0"
 dependencies = [
+ "cortexkit-store-types 0.2.2",
  "serde",
  "serde_json",
  "sha2",
@@ -180,7 +181,7 @@ version = "0.2.0"
 source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
 dependencies = [
  "chrono",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.1",
  "regex",
  "tracing",
  "tracing-subscriber",
@@ -196,6 +197,13 @@ checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 name = "cortexkit-store-types"
 version = "0.2.1"
 source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cortexkit-store-types"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]

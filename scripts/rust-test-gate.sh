@@ -178,10 +178,24 @@ report_lock_drift_from_head
 # pins, so a gate run and a release build cannot disagree about which sibling is
 # the right one.
 check_sibling_matches_declaration() {
-  local declaration sibling drift=0
-  declaration="$(dirname "$0")/../subconscious-source.txt"
-  sibling="$(dirname "$0")/../../subconscious"
-  [ -f "$declaration" ] || { echo "    no sibling declaration to check against" >&2; return 1; }
+  local drift=0
+  check_one_sibling subconscious "$(dirname "$0")/../subconscious-source.txt" || drift=1
+  check_one_sibling commons "$(dirname "$0")/../commons-source.txt" || drift=1
+  if [ "$drift" -ne 0 ]; then
+    echo "    move the sibling to the declared revisions, or repin its" >&2
+    echo "    *-source.txt if the move is intended. Building against a" >&2
+    echo "    different sibling silently rewrites Cargo.lock and reports a" >&2
+    echo "    true test count for a dependency graph nobody chose." >&2
+    return 1
+  fi
+}
+
+# One sibling, one declaration file. Same format for every sibling so a new
+# one is a line in the caller above, never a second copy of this loop.
+check_one_sibling() {
+  local name="$1" declaration="$2" sibling drift=0
+  sibling="$(dirname "$0")/../../$name"
+  [ -f "$declaration" ] || { echo "    no $name declaration to check against" >&2; return 1; }
   [ -d "$sibling" ] || { echo "    sibling checkout missing at $sibling" >&2; return 1; }
   while read -r declared crate; do
     case "$declared" in ""|\#*) continue ;; esac
@@ -189,17 +203,11 @@ check_sibling_matches_declaration() {
     local actual
     actual="$(git -C "$sibling" rev-parse "HEAD:crates/$crate" 2>/dev/null || echo missing)"
     if [ "$actual" != "$declared" ]; then
-      echo "    $crate: declared $declared, sibling has $actual" >&2
+      echo "    $name/$crate: declared $declared, sibling has $actual" >&2
       drift=1
     fi
   done < "$declaration"
-  if [ "$drift" -ne 0 ]; then
-    echo "    move ../subconscious to the declared revisions, or repin" >&2
-    echo "    subconscious-source.txt if the move is intended. Building against" >&2
-    echo "    a different sibling silently rewrites Cargo.lock and reports a" >&2
-    echo "    true test count for a dependency graph nobody chose." >&2
-    return 1
-  fi
+  return "$drift"
 }
 
 run_phase "sibling matches the declared revisions" \
