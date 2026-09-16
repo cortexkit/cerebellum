@@ -1574,7 +1574,9 @@ pub enum JournalPersistence {
 }
 
 impl Planes {
-    /// The set a running module uses.
+    /// A browser config with every deadline short and no executable, for
+    /// tests. A running module builds through `with_browser_config` with the
+    /// config it loaded, `None` when the file names no browser.
     pub fn new(health: Arc<HealthState>) -> Self {
         Self::with_browser_config(
             health,
@@ -2451,19 +2453,29 @@ async fn handle_tool_request(
         // Every capability name is fixed in the action vocabulary, which is a
         // published artifact, so a caller can name one without having seen it
         // in a manifest -- and before this check such a request was served.
+        //
+        // The code is the same one the browser plane answers for a withheld
+        // tool, because it means the same thing: this build knows the name and
+        // does not serve it. A consumer keys its handling on the code, and two
+        // spellings of one fact would force it to keep a per-plane list.
         if !planes.computer_admitted.contains(name) {
+            let withheld = CapabilityWithheld::NotAdmitted;
             return send_route_error(
                 writer,
                 ver,
                 channel,
                 epoch,
                 corr,
-                "capability_unavailable",
-                "this build does not offer that capability",
+                withheld.reason_code(),
+                &format!("'{name}' is not served here: {}", withheld.remedy()),
             )
             .await;
         }
 
+        // Distinct from withheld: the capability IS admitted, and this host
+        // could not build the plane that serves it (an audit journal that will
+        // not open, for instance). A caller can do nothing about a build that
+        // withholds; an operator can do something about a host that cannot.
         let plane = match planes.computer.as_ref() {
             Ok(plane) => plane,
             Err(reason) => {
@@ -2473,8 +2485,8 @@ async fn handle_tool_request(
                     channel,
                     epoch,
                     corr,
-                    "capability_unavailable",
-                    &reason.to_string(),
+                    "computer_plane_unavailable",
+                    &format!("the computer plane could not be built on this host: {reason}"),
                 )
                 .await;
             }
@@ -3093,6 +3105,30 @@ pub async fn handle_tool_request_for_test_admitting(
     let route_bindings = Arc::new(RouteBindings::new());
     install_test_bind(&route_bindings, &frame);
     let mut planes = Planes::new(Arc::clone(health_state));
+    planes.routes = route_bindings;
+    #[cfg(target_os = "macos")]
+    {
+        planes.computer_admitted = Arc::new(admitted.iter().map(|name| name.to_string()).collect());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = admitted;
+    handle_tool_request(frame, writer, &planes).await
+}
+
+/// Like [`handle_tool_request_for_test_admitting`] on a host with NO browser
+/// configured, which is the shape an operator's machine has before
+/// `cerebellum.jsonc` names an executable. `Planes::new` installs a browser
+/// config with the executable unset, so it cannot mint the
+/// `browser_not_configured` arm; this can.
+pub async fn handle_tool_request_for_test_unconfigured_browser(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    health_state: &Arc<HealthState>,
+    admitted: &[&str],
+) -> Result<(), ModuleError> {
+    let route_bindings = Arc::new(RouteBindings::new());
+    install_test_bind(&route_bindings, &frame);
+    let mut planes = Planes::with_browser_config(Arc::clone(health_state), None);
     planes.routes = route_bindings;
     #[cfg(target_os = "macos")]
     {

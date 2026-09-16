@@ -1368,8 +1368,10 @@ async fn unadvertised_semantic_click_is_refused_before_its_serving_handler() {
 
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    // The same code the browser plane answers for a withheld tool: one
+    // meaning, one spelling, on both planes.
     assert_eq!(
-        body["code"], "capability_unavailable",
+        body["code"], "capability_not_admitted",
         "unadvertised semantic click reached its serving handler: {body}"
     );
     assert_ne!(body["outcome"], "no_lease");
@@ -1422,7 +1424,7 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
     assert_eq!(
-        body["code"], "capability_unavailable",
+        body["code"], "capability_not_admitted",
         "a withheld capability was served on request: {body}"
     );
     assert_ne!(
