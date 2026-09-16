@@ -1704,10 +1704,16 @@ impl BrowserPlane {
             return Ok(response);
         }
 
-        // Action grants are not capability-scoped today, so a same-origin navigation
-        // grant also admits a snapshot. The read still goes through snapshot
-        // authorization against the landing URL because redirects can change origin.
-        // If grants become action-scoped, this path must not inherit navigate authority.
+        // Action grants are scoped by ORIGIN and SEVERITY TIER, not by capability,
+        // so a same-origin navigation grant also admits a snapshot. That is the
+        // model, decided rather than inherited: "act but not read" is not a real
+        // power (every actuation targets a ref only a snapshot can produce),
+        // "read but not act" already exists as an observe-tier grant, and the
+        // origin is the confidentiality boundary the web itself enforces, so
+        // an action axis would multiply consent prompts without narrowing
+        // anything the origin does not already narrow. The read still
+        // authorizes against the LANDING url, because a redirect can leave the
+        // granted origin.
         //
         // The read journals under its own capability. It did not when this landed
         // -- the vocabulary had no Snapshot member, so recording the read would
