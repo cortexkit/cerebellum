@@ -7,7 +7,7 @@
 # rather than in the workflow.
 #
 # Run from the repo root after any code change. The first phase is
-# `cargo fmt --all -- --check`, so an unformatted commit fails the gate.
+# `cargo fmt -p <each member> -- --check`, so an unformatted commit fails the gate.
 # Serialize cargo invocations (never parallel cargo): other workers share this
 # machine and concurrent workspace builds have saturated it.
 set -euo pipefail
@@ -248,10 +248,29 @@ check_tests_do_not_journal_durably() {
 run_phase "no test journals to the operator's disk" \
   check_tests_do_not_journal_durably
 
-# Phase 1: formatting check. `cargo fmt --all` must be run before committing;
-# this check fails the gate on an unformatted commit.
-run_phase "cargo fmt --all -- --check" \
-  cargo fmt --all -- --check
+# Phase 1: formatting check, over THIS workspace's members only.
+#
+# Not `--all`: cargo fmt's --all follows path dependencies out of the
+# workspace, so it reaches every crate in ../subconscious and ../commons.
+# Measured here: `cargo fmt --all -- --check -v` listed both siblings' crates.
+# As a check that makes this gate fail on a sibling's formatting; as a write
+# (`cargo fmt --all` before a commit) it rewrites files in another
+# repository's checkout. The member list comes from cargo metadata rather
+# than a hand-kept string, and an empty list refuses rather than checking
+# nothing and passing.
+check_members_formatted() {
+  local members
+  members="$(cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json,sys; print(" ".join("-p " + p["name"] for p in json.load(sys.stdin)["packages"]))')"
+  if [ -z "$members" ]; then
+    echo "    cargo metadata listed no workspace members; refusing to check nothing" >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  cargo fmt $members -- --check
+}
+run_phase "workspace members are formatted (not --all: that reaches the siblings)" \
+  check_members_formatted
 
 # Phase 2: structural wiring. A module that exists on disk but is not declared
 # in its crate root compiles only where a test includes it explicitly, so dead
