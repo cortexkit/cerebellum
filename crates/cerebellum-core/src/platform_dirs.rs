@@ -16,14 +16,17 @@
 //!
 //! Empty values count as unset at every rung.
 //!
-//! One arm is deliberately NOT inherited. When no rung answers, the callable
-//! falls through to a RELATIVE `.local/share` or `.config`, resolved against
-//! whatever the process's cwd happens to be. A module that writes an audit
-//! journal there has written it somewhere no catalog will find, with every
-//! gate green. Both functions here refuse that case instead: every populated
-//! rung yields an absolute path, so a relative result can only mean nothing
-//! was set, and `None` sends the caller to a named error rather than to a
-//! directory nobody chose.
+//! One arm is deliberately NOT inherited. The callable can return a RELATIVE
+//! path in two cases it does not distinguish: no rung answered and it fell
+//! through to `.local/share` or `.config`, or the operator set `XDG_*_HOME`
+//! to a relative value, which the XDG rung passes through as-is (a pinned
+//! case on both sides, not an accident). Either way the path resolves
+//! against whatever the process's cwd happens to be, and a module that
+//! writes an audit journal there has written it somewhere no catalog will
+//! find, with every gate green. Both functions here refuse a relative result
+//! for that reason: not because it proves nothing was set, but because it
+//! proves the directory depends on the cwd, and `None` sends the caller to
+//! a named error rather than to a directory nobody chose.
 
 use std::path::PathBuf;
 
@@ -41,8 +44,9 @@ pub fn config_home() -> Option<PathBuf> {
 }
 
 /// The fail-closed arm, kept separate from the environment read so it is
-/// testable without mutating the process environment. A relative result is
-/// the callable's "nothing was set" fallback and is refused.
+/// testable without mutating the process environment. A relative result
+/// means the directory depends on the cwd (nothing set, or a relative
+/// `XDG_*_HOME`), and is refused.
 fn absolute_or_none(resolved: String) -> Option<PathBuf> {
     let path = PathBuf::from(resolved);
     path.is_absolute().then_some(path)
@@ -52,14 +56,16 @@ fn absolute_or_none(resolved: String) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The callable's no-rung fallback is a relative path; here that is a
-    /// refusal, never a directory. The wrong implementation (pass the result
-    /// through) would return `Some(".local/share")`, so the assertion is on
-    /// `None` for exactly the two fallback shapes the callable produces.
+    /// A relative result is a refusal, never a directory, whichever of the
+    /// two ways it arose. The wrong implementation (pass the result through)
+    /// would return `Some(".local/share")`, so the assertion is on `None` for
+    /// the two fallback shapes the callable produces AND for a relative XDG
+    /// value it would pass through unchanged.
     #[test]
-    fn the_relative_fallback_is_refused_not_used() {
+    fn a_cwd_dependent_result_is_refused_not_used() {
         assert_eq!(absolute_or_none(".local/share".to_string()), None);
         assert_eq!(absolute_or_none(".config".to_string()), None);
+        assert_eq!(absolute_or_none("relative/xdg/home".to_string()), None);
         assert_eq!(absolute_or_none(String::new()), None);
     }
 
@@ -69,7 +75,11 @@ mod tests {
     /// `/home` prefix would fail the Windows shape).
     #[test]
     fn absolute_results_pass_through_unchanged() {
-        for absolute in ["/home/op/.local/share", "/tmp/x/.config", "/Users/op/Library"] {
+        for absolute in [
+            "/home/op/.local/share",
+            "/tmp/x/.config",
+            "/Users/op/Library",
+        ] {
             assert_eq!(
                 absolute_or_none(absolute.to_string()),
                 Some(PathBuf::from(absolute))
