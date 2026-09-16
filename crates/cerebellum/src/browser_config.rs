@@ -42,6 +42,15 @@ pub enum BrowserConfigReason {
         path: PathBuf,
         sha256: String,
     },
+    /// The identity probe reported a mismatch but did not say what it saw.
+    /// Its own contract is to name both the final image path and its digest,
+    /// so this is a fault in the probe rather than in the configuration. Kept
+    /// apart from `FinalImageMismatch` because that variant's remedy is "pin
+    /// this digest", and with the digest missing that remedy would tell an
+    /// operator to pin an empty string.
+    FinalImageMismatchUndisclosed {
+        expected: String,
+    },
     BelowSettlementQuietWindow {
         quiet_ms: u64,
     },
@@ -62,6 +71,7 @@ impl BrowserConfigReason {
             Self::ExpectedIdentityRequired => "expected_identity_required",
             Self::ExecutableProbeFailed(_) => "executable_probe_failed",
             Self::FinalImageMismatch { .. } => "final_image_mismatch",
+            Self::FinalImageMismatchUndisclosed { .. } => "final_image_mismatch_undisclosed",
             Self::BelowSettlementQuietWindow { .. } => "below_settlement_quiet_window",
         }
     }
@@ -80,6 +90,7 @@ impl BrowserConfigReason {
             | Self::PathNotAbsolute
             | Self::ExpectedIdentityRequired
             | Self::FinalImageMismatch { .. }
+            | Self::FinalImageMismatchUndisclosed { .. }
             | Self::BelowSettlementQuietWindow { .. } => None,
         }
     }
@@ -122,6 +133,12 @@ impl std::fmt::Display for BrowserConfigError {
                 f,
                 "browser.expected_identity: configured sha256={expected} is not final; pin sha256={sha256} for {}",
                 path.display()
+            ),
+            BrowserConfigReason::FinalImageMismatchUndisclosed { expected } => write!(
+                f,
+                "browser.expected_identity: configured sha256={expected} is not final, but the \
+                 identity probe did not report the digest it observed; re-run the probe and \
+                 report this as a module fault if it recurs"
             ),
             BrowserConfigReason::BelowSettlementQuietWindow { quiet_ms } => write!(
                 f,
@@ -218,18 +235,7 @@ pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), Bro
         )
         .map_err(|refusal| BrowserConfigError {
             field: "browser.expected_identity".to_string(),
-            reason: if refusal["outcome"] == "executable_identity_mismatch" {
-                BrowserConfigReason::FinalImageMismatch {
-                    expected: expected.to_string(),
-                    path: PathBuf::from(refusal["final_image_path"].as_str().unwrap_or_default()),
-                    sha256: refusal["final_image_sha256"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                }
-            } else {
-                BrowserConfigReason::ExecutableProbeFailed(refusal.to_string())
-            },
+            reason: reason_from_identity_refusal(&refusal, expected),
         });
         // Probe cleanup is part of config refusal: leaving SingletonLock or
         // XDG-derived Crashpad state behind would turn every later boot into a
@@ -434,9 +440,93 @@ fn required_positive_ms(
     }
 }
 
+/// Map an executable-identity refusal to the configuration reason it means.
+///
+/// A mismatch names what the probe observed so the operator can pin it. When
+/// the refusal carries no observed digest -- or no path -- the mismatch is
+/// reported as undisclosed rather than as a mismatch against an empty value,
+/// which would print a remedy nobody can follow.
+// The load-time identity probe only runs on Linux (macOS pins by code-signing
+// identity instead), but the mapping is host-neutral and its tests run
+// everywhere, so the wrong-remedy case is caught on the macOS gate too.
+#[cfg(any(target_os = "linux", test))]
+fn reason_from_identity_refusal(refusal: &Value, expected: &str) -> BrowserConfigReason {
+    if refusal["outcome"] != "executable_identity_mismatch" {
+        return BrowserConfigReason::ExecutableProbeFailed(refusal.to_string());
+    }
+    let path = refusal["final_image_path"]
+        .as_str()
+        .filter(|path| !path.is_empty());
+    let sha256 = refusal["final_image_sha256"]
+        .as_str()
+        .filter(|sha| !sha.is_empty());
+    match (path, sha256) {
+        (Some(path), Some(sha256)) => BrowserConfigReason::FinalImageMismatch {
+            expected: expected.to_string(),
+            path: PathBuf::from(path),
+            sha256: sha256.to_string(),
+        },
+        _ => BrowserConfigReason::FinalImageMismatchUndisclosed {
+            expected: expected.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mismatch that names what it saw becomes the pinnable remedy; one
+    /// that omits either the path or the digest becomes its own reason. The
+    /// wrong implementation -- defaulting a missing field to "" -- would
+    /// print "pin sha256=" with nothing after it, so the assertion is on the
+    /// variant and the rendered text, not on absence of a panic.
+    #[test]
+    fn a_mismatch_without_an_observed_digest_is_undisclosed_not_a_mismatch_against_empty() {
+        let full = serde_json::json!({
+            "outcome": "executable_identity_mismatch",
+            "final_image_path": "/opt/google/chrome/chrome",
+            "final_image_sha256": "abc123",
+        });
+        match reason_from_identity_refusal(&full, "expected") {
+            BrowserConfigReason::FinalImageMismatch { path, sha256, .. } => {
+                assert_eq!(path, PathBuf::from("/opt/google/chrome/chrome"));
+                assert_eq!(sha256, "abc123");
+            }
+            other => panic!("a full refusal must be a pinnable mismatch, got {other:?}"),
+        }
+
+        for stripped in [
+            serde_json::json!({"outcome": "executable_identity_mismatch", "final_image_path": "/opt/google/chrome/chrome"}),
+            serde_json::json!({"outcome": "executable_identity_mismatch", "final_image_sha256": "abc123"}),
+            serde_json::json!({"outcome": "executable_identity_mismatch", "final_image_path": "", "final_image_sha256": ""}),
+        ] {
+            let reason = reason_from_identity_refusal(&stripped, "expected");
+            assert!(
+                matches!(
+                    reason,
+                    BrowserConfigReason::FinalImageMismatchUndisclosed { .. }
+                ),
+                "{stripped} must be undisclosed, got {reason:?}"
+            );
+            assert_eq!(reason.reason_code(), "final_image_mismatch_undisclosed");
+            let rendered = BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason,
+            }
+            .to_string();
+            assert!(
+                !rendered.contains("pin sha256="),
+                "an undisclosed mismatch must not tell the operator to pin anything: {rendered}"
+            );
+        }
+
+        let other = serde_json::json!({"outcome": "identity_unverifiable"});
+        assert!(matches!(
+            reason_from_identity_refusal(&other, "expected"),
+            BrowserConfigReason::ExecutableProbeFailed(_)
+        ));
+    }
 
     fn configured() -> String {
         r#"{
