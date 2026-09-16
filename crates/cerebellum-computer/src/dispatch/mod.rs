@@ -1039,6 +1039,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                             state,
                             &ActuationOutcome::Refused {
                                 refusal: refusal.clone(),
+                                abort: None,
                             },
                         )?;
                         return Err(refusal);
@@ -1116,6 +1117,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                             state,
                             &ActuationOutcome::Refused {
                                 refusal: refusal.clone(),
+                                abort: None,
                             },
                         )?;
                         return Err(refusal);
@@ -1152,11 +1154,22 @@ impl<D: PlatformDriver> Dispatcher<D> {
                     Err(DriverError::ObservedDispatchAborted(abort)) => {
                         self.last_observed_abort = Some(abort);
                         let refusal = Self::dispatch_error_for_abort(abort);
+                        // The whole stop decision goes to the journal, and only
+                        // to the journal. The caller's refusal keeps the two
+                        // fields the action vocabulary declares for it
+                        // (`user_seized_control` plus which source seized);
+                        // anything else added here would be stripped from the
+                        // reply by result-schema enforcement before it left the
+                        // module, so the numbers an operator needs afterwards --
+                        // how long detection took, which action stopped, how
+                        // many queued posts were cancelled -- are readable from
+                        // the audit record rather than from the wire.
                         Self::finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::Refused {
                                 refusal: refusal.clone(),
+                                abort: Some(abort),
                             },
                         )?;
                         return Err(refusal);
@@ -1168,6 +1181,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                             state,
                             &ActuationOutcome::Refused {
                                 refusal: refusal.clone(),
+                                abort: None,
                             },
                         )?;
                         return Err(refusal);

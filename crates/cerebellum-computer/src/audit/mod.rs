@@ -8,7 +8,7 @@
 
 pub mod redaction;
 
-use crate::dispatch::DispatchError;
+use crate::dispatch::{AbortDecision, DispatchError};
 use crate::grounding::ContainmentRung;
 use crate::platform::{AccessibilityElementName, ActionKind, ProcessGrant};
 use cerebellum_core::identity::SessionKind;
@@ -734,6 +734,16 @@ pub enum ActuationOutcome {
     },
     Refused {
         refusal: DispatchError,
+        /// The whole stop decision, when the refusal came from an
+        /// observed-mode abort.
+        ///
+        /// The refusal that reaches the caller keeps only the reason and which
+        /// source seized, because that is all a caller can act on. The numbers
+        /// an operator needs after the fact -- how long detection took, which
+        /// action in the sequence stopped, how many queued posts were thrown
+        /// away -- have nowhere else to live, so they live here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        abort: Option<AbortDecision>,
     },
     NoAction {
         refusal: DispatchError,

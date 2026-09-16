@@ -7,7 +7,7 @@ use cerebellum_computer::dispatch::{
     authorize_escalation, retry_decision, AbortDecision, AbortReason, AttemptDisposition,
     AttendanceContext, AttendanceLease, ConsentDecision, DispatchError, DispatchPhase,
     DispatchRequest, Dispatcher, ExpectedPostCondition, FocusCheckPlan, FrozenDispatchRow,
-    ReconciliationResult, RetryDecision, SeizeWatcher,
+    ReconciliationResult, RetryDecision, SeizeWatcher, SourcedInputKind,
 };
 use cerebellum_computer::platform::containment::IdentityAtomicBinding;
 use cerebellum_computer::platform::*;
@@ -219,6 +219,9 @@ struct RecordingDriver {
     effect_targets: Vec<ProcessGrant>,
     dispatch_probe: Option<Arc<Mutex<DispatchProbe>>>,
     panic_during_semantic_dispatch: bool,
+    /// An exact stop decision for the global path to return, when a test needs
+    /// to name the numbers rather than accept the ones this driver derives.
+    global_abort: Option<AbortDecision>,
 }
 
 impl Default for RecordingDriver {
@@ -268,6 +271,7 @@ impl Default for RecordingDriver {
             effect_calls: 0,
             dispatch_probe: None,
             panic_during_semantic_dispatch: false,
+            global_abort: None,
         }
     }
 }
@@ -318,6 +322,9 @@ impl PlatformDriver for RecordingDriver {
         &mut self,
         request: GlobalDispatchRequest,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+        if let Some(abort) = self.global_abort {
+            return Err(DriverError::ObservedDispatchAborted(abort));
+        }
         let reason = if self
             .input
             .as_ref()
@@ -743,6 +750,14 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
                 "reason": "user_seized_control",
                 "sourced_input_kind": {"source": "other_process", "pid": 36_680},
             },
+            "abort": {
+                "reason": "user_seized_control",
+                "stopped_action_index": 0,
+                "detection_latency_ms": 1,
+                "sourced_input_kind": {"source": "other_process", "pid": 36_680},
+                "maximum_detection_latency_ms": 50,
+                "queued_posts_cancelled": 1,
+            },
         }),
         "the journal must retain which process seized global input"
     );
@@ -753,6 +768,92 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
     watcher.abort(AbortReason::UserSeizedControl, 1, Some(2));
     assert_eq!(watcher.abort_decision().unwrap().queued_posts_cancelled, 2);
     assert!(!watcher.take_post_slot());
+}
+
+/// An observed abort leaves its numbers in the journal, and only there.
+///
+/// The refusal the caller receives is fixed: a reason and which source seized.
+/// How long detection took, which action in the sequence stopped, and how many
+/// queued posts were thrown away have no declared place in that reply, so the
+/// audit record is the only place anyone can read them afterwards. Both halves
+/// are asserted, because a change that widened the reply instead would satisfy
+/// the journal half alone.
+///
+/// The three numbers are asserted as literals rather than as presence: a record
+/// that carried the right shape with the wrong values -- a default, a zero, the
+/// latency bound in place of the measurement -- would read as a pass.
+#[test]
+fn an_observed_abort_journals_its_numbers_while_the_wire_reply_carries_none() {
+    let driver = RecordingDriver {
+        global_abort: Some(AbortDecision {
+            reason: AbortReason::UserSeizedControl,
+            stopped_action_index: 2,
+            detection_latency_ms: Some(23),
+            sourced_input_kind: Some(SourcedInputKind::Hardware),
+            maximum_detection_latency_ms: 50,
+            queued_posts_cancelled: 3,
+        }),
+        ..RecordingDriver::default()
+    };
+    let request = DispatchRequest::new(
+        FrozenDispatchRow::for_capability("computer.move").unwrap(),
+        DispatchMode::Observed,
+        target(),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element: AccessibilityElementName::identifier("element-1"),
+                expected: true,
+            },
+        ),
+        AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
+        0,
+    )
+    .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+        x: 10.0,
+        y: 20.0,
+    }))
+    .with_focus_plan(FocusCheckPlan::immediate(0))
+    .with_once_dispatch_token(once_dispatch_token());
+
+    let mut dispatcher = Dispatcher::new(driver);
+    let mut audit = audit();
+    let refusal = dispatcher
+        .dispatch(&mut audit, audit_identity(), request)
+        .expect_err("the driver aborted this dispatch");
+    assert_eq!(
+        refusal,
+        DispatchError::UserSeizedControl {
+            sourced_input_kind: Some(SourcedInputKind::Hardware),
+        }
+    );
+
+    // Exactly what the module serializes into the tool reply.
+    let wire = serde_json::to_value(&refusal).expect("the refusal taxonomy serializes");
+    assert_eq!(wire["reason"], json!("user_seized_control"));
+    assert!(
+        wire.get("abort").is_none(),
+        "the stop decision reached the caller's reply: {wire}"
+    );
+
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], json!("finalized"));
+    let outcome = decode_embedded_json(&entry["completed_result"]);
+    assert_eq!(
+        outcome["abort"],
+        json!({
+            "reason": "user_seized_control",
+            "stopped_action_index": 2,
+            "detection_latency_ms": 23,
+            "sourced_input_kind": {"source": "hardware"},
+            "maximum_detection_latency_ms": 50,
+            "queued_posts_cancelled": 3,
+        }),
+        "the journal must carry the whole stop decision: {outcome}"
+    );
 }
 
 #[test]
