@@ -547,7 +547,7 @@ mod tests {
         AuthorizedLaunchIntent, BrowserProcessGeneration, ExecutableIdentityChain,
         ExecutableIdentityCheckpoints, ExecutableIdentityClaim, ExecutableIdentityRecord,
         LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
-        LaunchRouteIdentity, PreSpawnIdentityVerification,
+        LaunchRouteIdentity, PreSpawnIdentityVerification, VerifiedExecutableIdentity,
     };
 
     fn instant() -> Instant {
@@ -897,6 +897,14 @@ mod tests {
         }
     }
 
+    /// The file read before spawn, whose one slice is the image that ran.
+    fn verified_executable_identity() -> VerifiedExecutableIdentity {
+        VerifiedExecutableIdentity::CodeSignedFile {
+            signing_identifier: "com.example.browser".to_string(),
+            slice_code_hashes: std::collections::BTreeSet::from(["abc123".to_string()]),
+        }
+    }
+
     fn launch_request() -> AttestedLaunchRequest {
         AttestedLaunchRequest {
             launch_attempt_id: "attempt-1".to_string(),
@@ -915,7 +923,7 @@ mod tests {
             executable: PathBuf::from("/Applications/Browser.app/Contents/MacOS/Browser"),
             arguments: vec![OsString::from("--remote-debugging-pipe")],
             environment: vec![],
-            verified_executable_identity: executable_identity(),
+            verified_executable_identity: verified_executable_identity(),
             pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
         }
     }
@@ -942,11 +950,11 @@ mod tests {
                     start_time_micros: 77,
                 },
             },
-            observed_executable_identity: request.verified_executable_identity.clone(),
+            observed_executable_identity: executable_identity(),
             executable_identity_chain:
                 crate::browser_launch::ExecutableIdentityChain::NoWalkPerformed {
                     attestation: crate::browser_launch::ExecutableIdentityRecord {
-                        claim: request.verified_executable_identity,
+                        claim: executable_identity(),
                         path: Some(request.executable),
                     },
                 },
@@ -1239,9 +1247,9 @@ mod live_chrome_test {
 
     use super::*;
     use crate::browser_launch::{
-        AttestedLaunchRequest, AuthorizedLaunchIntent, ExecutableIdentityClaim,
-        LaunchGenerationRecord, LaunchIdentityMismatchRecord, LaunchProfileIdentity,
-        LaunchRouteIdentity, MacOsProcessLauncher, PreSpawnIdentityVerification,
+        AttestedLaunchRequest, AuthorizedLaunchIntent, LaunchGenerationRecord,
+        LaunchIdentityMismatchRecord, LaunchProfileIdentity, LaunchRouteIdentity,
+        MacOsProcessLauncher, PreSpawnIdentityVerification, VerifiedExecutableIdentity,
     };
 
     struct PassingJournal;
@@ -1284,7 +1292,7 @@ mod live_chrome_test {
     fn request(
         executable: PathBuf,
         arguments: Vec<OsString>,
-        identity: ExecutableIdentityClaim,
+        identity: VerifiedExecutableIdentity,
         profile: &Path,
     ) -> AttestedLaunchRequest {
         AttestedLaunchRequest {
@@ -1355,9 +1363,9 @@ mod live_chrome_test {
         let request = request(
             chrome,
             arguments,
-            ExecutableIdentityClaim::CodeSigned {
+            VerifiedExecutableIdentity::CodeSignedFile {
                 signing_identifier: observed.signing_identifier,
-                unique_code_hash: observed.unique_code_hash,
+                slice_code_hashes: std::collections::BTreeSet::from([observed.unique_code_hash]),
             },
             &profile,
         );

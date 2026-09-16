@@ -108,6 +108,142 @@ impl ExecutableIdentityClaim {
     }
 }
 
+/// What was verified about the executable FILE before any process was created.
+///
+/// Deliberately not the same type as [`ExecutableIdentityClaim`], because the
+/// two answer different questions: a file on disk versus the image mapped into
+/// a running process. One macOS file can carry several signed architecture
+/// slices, each with its own code hash, and the kernel decides which slice a
+/// new process executes -- arm64e is reserved for platform binaries, and some
+/// chips run a further subtype of it. Predicting that choice here would be a
+/// copy of kernel policy that drifts without anyone noticing, so the pre-spawn
+/// read collects EVERY slice of the file and the after-exec check asks only
+/// whether the image that actually ran is one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "claim_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerifiedExecutableIdentity {
+    /// Every signed slice of a code-signed file, read before spawn.
+    ///
+    /// The serialized tag stays `code_signed` and the hash field accepts the
+    /// single `unique_code_hash` string earlier records wrote, so a launch
+    /// journal written before this module read slices still decodes; such a
+    /// record simply verified one slice.
+    #[serde(rename = "code_signed")]
+    CodeSignedFile {
+        signing_identifier: String,
+        #[serde(
+            alias = "unique_code_hash",
+            deserialize_with = "deserialize_slice_code_hashes"
+        )]
+        slice_code_hashes: BTreeSet<String>,
+    },
+    /// Byte equality with a previously pinned image. A digest names one file's
+    /// exact bytes, so there is no per-slice question to ask.
+    ImageDigest { sha256: String },
+}
+
+/// Accept either the set this module writes or the single hash older records
+/// carry, so one stored shape does not have to be migrated to be readable.
+fn deserialize_slice_code_hashes<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrSeveral {
+        One(String),
+        Several(BTreeSet<String>),
+    }
+
+    Ok(match OneOrSeveral::deserialize(deserializer)? {
+        OneOrSeveral::One(hash) => BTreeSet::from([hash]),
+        OneOrSeveral::Several(hashes) => hashes,
+    })
+}
+
+impl VerifiedExecutableIdentity {
+    pub const fn claim_kind(&self) -> &'static str {
+        match self {
+            Self::CodeSignedFile { .. } => "code_signed",
+            Self::ImageDigest { .. } => "image_digest",
+        }
+    }
+
+    /// Whether the image a process actually executed is one of the slices this
+    /// file was verified to carry before spawn.
+    ///
+    /// Membership in the set read from THIS file, not signer equality: a file
+    /// swapped between the pre-spawn read and exec is signed by whoever
+    /// swapped it, and its code hashes are outside the set even when it keeps
+    /// the same signing identifier. Both halves are required, so neither an
+    /// unrelated program that happens to share a code hash nor a differently
+    /// signed image with a familiar identifier is admitted.
+    ///
+    /// The kind pairs are written out rather than ending in a catch-all,
+    /// because a catch-all answers `false`, `false` here means "the identity
+    /// differed", and a kind added later would be reported as a mismatch when
+    /// the truth is that nothing compared it.
+    pub fn admits(&self, executed: &ExecutableIdentityClaim) -> bool {
+        match (self, executed) {
+            (
+                Self::CodeSignedFile {
+                    signing_identifier,
+                    slice_code_hashes,
+                },
+                ExecutableIdentityClaim::CodeSigned {
+                    signing_identifier: executed_identifier,
+                    unique_code_hash,
+                },
+            ) => {
+                signing_identifier == executed_identifier
+                    && slice_code_hashes.contains(unique_code_hash)
+            }
+            (
+                Self::ImageDigest { sha256 },
+                ExecutableIdentityClaim::ImageDigest {
+                    sha256: executed_sha256,
+                },
+            ) => sha256 == executed_sha256,
+            (Self::CodeSignedFile { .. }, ExecutableIdentityClaim::ImageDigest { .. })
+            | (Self::ImageDigest { .. }, ExecutableIdentityClaim::CodeSigned { .. }) => false,
+        }
+    }
+
+    /// Whether this verified file satisfies the configured identity.
+    ///
+    /// Configuration pins a signer or a digest, never a slice: which slices a
+    /// signed file carries is a property of the build, and an operator who had
+    /// to list them would be re-pinning the browser on every universal update.
+    pub fn matches_configured(&self, expected: &str) -> bool {
+        match self {
+            Self::CodeSignedFile {
+                signing_identifier, ..
+            } => expected == signing_identifier || expected == self.display_identity(),
+            Self::ImageDigest { sha256 } => {
+                expected == sha256 || expected == self.display_identity()
+            }
+        }
+    }
+
+    /// Render the verified file identity for human-readable logs and refusals.
+    pub fn display_identity(&self) -> String {
+        match self {
+            Self::CodeSignedFile {
+                signing_identifier,
+                slice_code_hashes,
+            } => format!(
+                "identifier={signing_identifier};cdhashes={{{}}}",
+                slice_code_hashes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::ImageDigest { sha256 } => format!("sha256={sha256}"),
+        }
+    }
+}
+
 /// One executable image observed during an identity walk.
 ///
 /// The path is diagnostic context for a human reading a refusal; it is never
@@ -246,7 +382,7 @@ pub struct AuthorizedLaunchIntent {
     pub holder_id: String,
     pub route: LaunchRouteIdentity,
     pub profile: LaunchProfileIdentity,
-    pub verified_executable_identity: ExecutableIdentityClaim,
+    pub verified_executable_identity: VerifiedExecutableIdentity,
     pub launch_vector: VerifiedLaunchVector,
 }
 
@@ -387,7 +523,7 @@ pub struct AttestedLaunchRequest {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
-    pub verified_executable_identity: ExecutableIdentityClaim,
+    pub verified_executable_identity: VerifiedExecutableIdentity,
     pub pre_spawn_identity_verification: PreSpawnIdentityVerification,
 }
 
@@ -638,7 +774,7 @@ where
         };
     };
 
-    if observed != request.verified_executable_identity {
+    if !request.verified_executable_identity.admits(&observed) {
         let mismatch = LaunchIdentityMismatchRecord {
             generation,
             claim_kind: request
@@ -873,8 +1009,9 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                         })
                         .filter(|attestation| {
                             attestation.generation.intent == *intent
-                                && attestation.observed_executable_identity
-                                    == intent.verified_executable_identity
+                                && intent
+                                    .verified_executable_identity
+                                    .admits(&attestation.observed_executable_identity)
                         })
                         .map(|attestation| attestation.generation.process_generation)
                 })
@@ -1416,8 +1553,8 @@ impl BarredProcessLauncher for LinuxProcessLauncher {
         )
         .map(|child| {
             let expected = match &request.verified_executable_identity {
-                ExecutableIdentityClaim::ImageDigest { sha256 } => sha256.clone(),
-                ExecutableIdentityClaim::CodeSigned { .. } => String::new(),
+                VerifiedExecutableIdentity::ImageDigest { sha256 } => sha256.clone(),
+                VerifiedExecutableIdentity::CodeSignedFile { .. } => String::new(),
             };
             LinuxBarredProcess(RefCell::new(child), expected)
         })
@@ -1929,6 +2066,15 @@ mod tests {
         }
     }
 
+    /// The pre-spawn read of a file carrying two slices, one of which is the
+    /// image [`identity`] describes.
+    fn verified_identity() -> VerifiedExecutableIdentity {
+        VerifiedExecutableIdentity::CodeSignedFile {
+            signing_identifier: "com.example.browser".to_string(),
+            slice_code_hashes: BTreeSet::from(["a1b2c3".to_string(), "d4e5f6".to_string()]),
+        }
+    }
+
     #[test]
     fn executable_identity_chain_completeness_states_are_distinct() {
         let hop = ExecutableIdentityRecord {
@@ -1978,7 +2124,7 @@ mod tests {
             executable: PathBuf::from("/Applications/Browser.app/Contents/MacOS/Browser"),
             arguments: vec![OsString::from("--remote-debugging-pipe")],
             environment: vec![],
-            verified_executable_identity: identity(),
+            verified_executable_identity: verified_identity(),
             pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
         }
     }
@@ -2219,7 +2365,7 @@ mod tests {
             outcome.map(|_| ()),
             Err(AttestedLaunchError::ExecutableIdentityMismatch {
                 claim_kind: "code_signed".to_string(),
-                expected_identity: identity().display_identity(),
+                expected_identity: verified_identity().display_identity(),
                 observed_identity: observed.display_identity(),
             })
         );
@@ -2234,6 +2380,146 @@ mod tests {
                 "terminated_and_reaped",
                 "barred_dropped",
             ]
+        );
+    }
+
+    #[test]
+    fn executed_slice_outside_the_verified_set_is_refused() {
+        // Same signer, a code hash the pre-spawn read never saw. That is the
+        // shape of a file swapped between the check and the exec: whoever
+        // swapped it can sign under any identifier, but they cannot put their
+        // code hash into a set that was read from the earlier file.
+        let observed = ExecutableIdentityClaim::CodeSigned {
+            signing_identifier: "com.example.browser".to_string(),
+            unique_code_hash: "c7c7c7".to_string(),
+        };
+        let (mut journal, mut launcher, events) =
+            harness(FailJournalAt::Never, Ok(observed.clone()));
+
+        let outcome = launch_attested_with(&mut journal, &mut launcher, &request());
+
+        let Err(AttestedLaunchError::ExecutableIdentityMismatch {
+            claim_kind,
+            expected_identity,
+            observed_identity,
+        }) = outcome.map(|_| ())
+        else {
+            panic!("an executed image outside the verified set must be refused");
+        };
+        assert_eq!(claim_kind, "code_signed");
+        // Carried out of the recorded mismatch verbatim, so the record names
+        // every slice that would have been admitted rather than one of them.
+        assert_eq!(
+            expected_identity,
+            "identifier=com.example.browser;cdhashes={a1b2c3,d4e5f6}"
+        );
+        assert_eq!(observed_identity, observed.display_identity());
+        assert_eq!(
+            events.snapshot(),
+            vec![
+                "intent_recorded",
+                "spawned_barred",
+                "generation_recorded",
+                "image_attested",
+                "mismatch_recorded",
+                "terminated_and_reaped",
+                "barred_dropped",
+            ]
+        );
+    }
+
+    #[test]
+    fn executed_slice_inside_the_verified_set_is_admitted() {
+        // Fixed against the refusal above: same request, same signer, and the
+        // only difference is that this code hash is one the file was read to
+        // carry. Set membership is therefore what separates the two outcomes,
+        // not the signer and not equality with a single chosen slice.
+        let observed = ExecutableIdentityClaim::CodeSigned {
+            signing_identifier: "com.example.browser".to_string(),
+            unique_code_hash: "d4e5f6".to_string(),
+        };
+        let (mut journal, mut launcher, events) =
+            harness(FailJournalAt::Never, Ok(observed.clone()));
+
+        let released = launch_attested_with(&mut journal, &mut launcher, &request())
+            .expect("an image whose slice was verified before spawn must be released");
+
+        assert_eq!(released.attestation.observed_executable_identity, observed);
+        assert_eq!(
+            events.snapshot(),
+            vec![
+                "intent_recorded",
+                "spawned_barred",
+                "generation_recorded",
+                "image_attested",
+                "attestation_committed",
+                "released",
+                "barred_dropped",
+            ]
+        );
+    }
+
+    #[test]
+    fn identifier_mismatch_is_refused_even_when_a_cdhash_matches() {
+        // A code hash in the set is not an identity on its own: an image
+        // signed by someone else is a different program however it was built.
+        let observed = ExecutableIdentityClaim::CodeSigned {
+            signing_identifier: "com.example.substitute".to_string(),
+            unique_code_hash: "a1b2c3".to_string(),
+        };
+        let (mut journal, mut launcher, _) = harness(FailJournalAt::Never, Ok(observed.clone()));
+
+        let outcome = launch_attested_with(&mut journal, &mut launcher, &request());
+
+        assert_eq!(
+            outcome.map(|_| ()),
+            Err(AttestedLaunchError::ExecutableIdentityMismatch {
+                claim_kind: "code_signed".to_string(),
+                expected_identity: verified_identity().display_identity(),
+                observed_identity: observed.display_identity(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_digest_never_admits_a_code_signed_image() {
+        // The two kinds establish different guarantees, so one can never stand
+        // in for the other however the strings compare.
+        assert!(!VerifiedExecutableIdentity::ImageDigest {
+            sha256: "a1b2c3".to_string(),
+        }
+        .admits(&identity()));
+        assert!(
+            !verified_identity().admits(&ExecutableIdentityClaim::ImageDigest {
+                sha256: "a1b2c3".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_stored_single_code_hash_decodes_as_a_one_slice_set() {
+        // Launch records written before this module read slices carry one
+        // `unique_code_hash` string. They must still decode, and they mean
+        // exactly what they said: one slice was verified.
+        let stored = serde_json::json!({
+            "claim_kind": "code_signed",
+            "signing_identifier": "com.example.browser",
+            "unique_code_hash": "a1b2c3",
+        });
+
+        let decoded: VerifiedExecutableIdentity =
+            serde_json::from_value(stored).expect("decode a single-hash launch record");
+
+        assert_eq!(
+            decoded,
+            VerifiedExecutableIdentity::CodeSignedFile {
+                signing_identifier: "com.example.browser".to_string(),
+                slice_code_hashes: BTreeSet::from(["a1b2c3".to_string()]),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("re-encode")["slice_code_hashes"],
+            serde_json::json!(["a1b2c3"])
         );
     }
 
@@ -2862,9 +3148,9 @@ mod tests {
             OsString::from("-c"),
             OsString::from(format!("printf ran > '{}'", effect.display())),
         ];
-        launch_request.verified_executable_identity = ExecutableIdentityClaim::CodeSigned {
+        launch_request.verified_executable_identity = VerifiedExecutableIdentity::CodeSignedFile {
             signing_identifier: expected.signing_identifier,
-            unique_code_hash: expected.unique_code_hash,
+            slice_code_hashes: BTreeSet::from([expected.unique_code_hash]),
         };
 
         let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
@@ -2928,7 +3214,7 @@ mod tests {
         let expected = sha256_file_for_test(Path::new("/bin/sleep"));
         let mut launch_request = request();
         launch_request.executable = path.clone();
-        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+        launch_request.verified_executable_identity = VerifiedExecutableIdentity::ImageDigest {
             sha256: expected.clone(),
         };
 
@@ -2962,7 +3248,7 @@ mod tests {
 
         let mut launch_request = request();
         launch_request.executable = paths[0].clone();
-        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+        launch_request.verified_executable_identity = VerifiedExecutableIdentity::ImageDigest {
             sha256: sha256_file_for_test(Path::new("/bin/sleep")),
         };
         let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
@@ -2988,7 +3274,7 @@ mod tests {
         let (root, paths) = linux_exec_chain_fixture(9, "beyond-hop-bound");
         let mut launch_request = request();
         launch_request.executable = paths[0].clone();
-        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+        launch_request.verified_executable_identity = VerifiedExecutableIdentity::ImageDigest {
             sha256: sha256_file_for_test(Path::new("/bin/sleep")),
         };
         let (command_child, _command_parent) = UnixStream::pair().expect("command pair");
@@ -3073,7 +3359,7 @@ mod tests {
 
         let mut launch_request = request();
         launch_request.executable = path.clone();
-        launch_request.verified_executable_identity = ExecutableIdentityClaim::ImageDigest {
+        launch_request.verified_executable_identity = VerifiedExecutableIdentity::ImageDigest {
             sha256: sha256_file_for_test(Path::new("/bin/sleep")),
         };
         launch_request.pre_spawn_identity_verification = PreSpawnIdentityVerification::Unavailable;

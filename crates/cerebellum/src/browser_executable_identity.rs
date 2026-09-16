@@ -1,12 +1,14 @@
 //! Platform dispatch for claims about a configured browser executable.
 
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::browser_launch::{ExecutableIdentityClaim, PreSpawnIdentityVerification};
+use crate::browser_launch::{PreSpawnIdentityVerification, VerifiedExecutableIdentity};
 
 #[cfg(target_os = "linux")]
 use crate::browser_launch::{LinuxDryRunObservation, LinuxProcessLauncher};
@@ -64,7 +66,7 @@ pub(crate) fn validate_configured_executable_at_load(
 pub fn verify_configured_executable(
     path: &Path,
     expected: &str,
-) -> Result<(ExecutableIdentityClaim, PreSpawnIdentityVerification), Value> {
+) -> Result<(VerifiedExecutableIdentity, PreSpawnIdentityVerification), Value> {
     #[cfg(target_os = "macos")]
     {
         verify_code_signed_executable(Path::new("/usr/bin/codesign"), path, expected)
@@ -82,7 +84,7 @@ pub fn verify_configured_executable(
             }));
         }
         Ok((
-            ExecutableIdentityClaim::ImageDigest {
+            VerifiedExecutableIdentity::ImageDigest {
                 sha256: expected.to_ascii_lowercase(),
             },
             PreSpawnIdentityVerification::Unavailable,
@@ -90,55 +92,159 @@ pub fn verify_configured_executable(
     }
 }
 
+/// Read every signed slice of the file, then check it against configuration.
+///
+/// `codesign` invoked without `--arch` reports ONE slice of a universal file,
+/// and the slice it picks need not be the one the kernel executes: on macOS 27
+/// `/bin/sleep` is `x86_64 arm64e arm64e.x1`, the default read names
+/// `arm64e.x1`, and an Apple Silicon machine runs `arm64e`. Storing that one
+/// slice as "the identity of this file" made an honest launch look like a
+/// substituted binary. Which slice runs is kernel policy, so this reads them
+/// all and leaves the choice unpredicted.
 #[cfg(target_os = "macos")]
 fn verify_code_signed_executable(
     verifier: &Path,
     path: &Path,
     expected: &str,
-) -> Result<ExecutableIdentityClaim, Value> {
-    let output = std::process::Command::new(verifier)
-        .args(["-d", "--verbose=4"])
-        .arg(path)
-        .output()
-        .map_err(|error| {
-            identity_unverifiable(if error.kind() == std::io::ErrorKind::NotFound {
-                "verifier_missing"
-            } else {
-                "verifier_failed"
-            })
-        })?;
+) -> Result<VerifiedExecutableIdentity, Value> {
+    let whole_file = read_signing_details(verifier, path, None)?;
+    let Some(architectures) = whole_file
+        .format
+        .as_deref()
+        .and_then(signed_slice_architectures)
+    else {
+        // Never fall back to the unqualified read: that read is exactly the
+        // one that named the wrong slice, so using it here would restore the
+        // defect for every file whose format this code cannot enumerate.
+        return Err(identity_unverifiable("verifier_failed"));
+    };
+
+    let mut signing_identifier: Option<String> = None;
+    let mut slice_code_hashes = BTreeSet::new();
+    for architecture in &architectures {
+        let slice = read_signing_details(verifier, path, Some(architecture))?;
+        let (Some(identifier), Some(code_hash)) = (slice.identifier, slice.code_hash) else {
+            return Err(identity_unverifiable("verifier_failed"));
+        };
+        // Asking for an architecture the file does not contain returns some
+        // other slice rather than failing, so the answer is checked against
+        // the question. Without this, a silently substituted slice would leave
+        // the real one out of the set and refuse the launch it should admit.
+        if slice.format.as_deref().and_then(signed_slice_architectures)
+            != Some(vec![architecture.clone()])
+        {
+            return Err(identity_unverifiable("verifier_failed"));
+        }
+        // Slices that disagree about who signed them are not one program, and
+        // there would be no single identifier to compare against config.
+        match &signing_identifier {
+            None => signing_identifier = Some(identifier),
+            Some(first) if first != &identifier => {
+                return Err(identity_unverifiable("verifier_failed"))
+            }
+            Some(_) => {}
+        }
+        slice_code_hashes.insert(code_hash);
+    }
+    let Some(signing_identifier) = signing_identifier else {
+        return Err(identity_unverifiable("verifier_failed"));
+    };
+
+    let verified = VerifiedExecutableIdentity::CodeSignedFile {
+        signing_identifier,
+        slice_code_hashes,
+    };
+    if !verified.matches_configured(expected) {
+        return Err(json!({
+            "outcome": "executable_identity_mismatch",
+            "claim_kind": verified.claim_kind(),
+            "expected_identity": expected,
+            "observed_identity": verified.display_identity(),
+        }));
+    }
+    Ok(verified)
+}
+
+/// The signing facts one `codesign -d` read reported.
+#[cfg(target_os = "macos")]
+struct SigningDetails {
+    identifier: Option<String>,
+    format: Option<String>,
+    code_hash: Option<String>,
+}
+
+/// Run the verifier once, for the whole file or for one architecture slice.
+#[cfg(target_os = "macos")]
+fn read_signing_details(
+    verifier: &Path,
+    path: &Path,
+    architecture: Option<&str>,
+) -> Result<SigningDetails, Value> {
+    let mut command = std::process::Command::new(verifier);
+    command.args(["-d", "--verbose=4"]);
+    if let Some(architecture) = architecture {
+        command.args(["--arch", architecture]);
+    }
+    let output = command.arg(path).output().map_err(|error| {
+        identity_unverifiable(if error.kind() == std::io::ErrorKind::NotFound {
+            "verifier_missing"
+        } else {
+            "verifier_failed"
+        })
+    })?;
     if !output.status.success() {
         return Err(identity_unverifiable("verifier_failed"));
     }
 
     let details = String::from_utf8_lossy(&output.stderr);
-    let mut signing_identifier = None;
-    let mut unique_code_hash = None;
+    let mut parsed = SigningDetails {
+        identifier: None,
+        format: None,
+        code_hash: None,
+    };
     for line in details.lines() {
         if let Some(value) = line.strip_prefix("Identifier=") {
-            signing_identifier = Some(value.to_string());
+            parsed.identifier = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("Format=") {
+            parsed.format = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("CDHash=") {
-            unique_code_hash = Some(value.to_ascii_lowercase());
+            parsed.code_hash = Some(value.to_ascii_lowercase());
         }
     }
-    let (Some(signing_identifier), Some(unique_code_hash)) = (signing_identifier, unique_code_hash)
-    else {
-        return Err(identity_unverifiable("verifier_failed"));
-    };
-    let observed = ExecutableIdentityClaim::CodeSigned {
-        signing_identifier,
-        unique_code_hash,
-    };
-    let configured_matches = observed.matches_configured(expected);
-    if !configured_matches {
-        return Err(json!({
-            "outcome": "executable_identity_mismatch",
-            "claim_kind": observed.claim_kind(),
-            "expected_identity": expected,
-            "observed_identity": observed.display_identity(),
-        }));
+    Ok(parsed)
+}
+
+/// The architecture slices a `codesign` `Format=` value names, in file order.
+///
+/// The shapes seen in the wild all carry the slice list in parentheses:
+/// `Mach-O universal (x86_64 arm64e arm64e.x1)`, `Mach-O thin (arm64)`, and
+/// `app bundle with Mach-O universal (x86_64 arm64)`. Anything else -- a
+/// `generic` signature over something that is not Mach-O, or a shape a later
+/// macOS invents -- returns `None`, which callers must treat as "this file's
+/// slices are unknown" rather than falling back to a single read.
+///
+/// Only macOS produces these strings, but parsing them needs no platform, so
+/// this is not gated and its behaviour can be tested on any host.
+pub fn signed_slice_architectures(format: &str) -> Option<Vec<String>> {
+    let opened = format.find('(')?;
+    let closed = format.rfind(')')?;
+    let listed = format.get(opened + 1..closed)?;
+    let architectures: Vec<String> = listed.split_whitespace().map(str::to_string).collect();
+    if architectures.is_empty() || !architectures.iter().all(|name| is_architecture_name(name)) {
+        return None;
     }
-    Ok(observed)
+    Some(architectures)
+}
+
+/// Whether a token can be an architecture name rather than, say, a flag.
+///
+/// The names go back to `codesign` as `--arch` arguments, so a token that
+/// could be read as an option is refused before it is passed as one.
+fn is_architecture_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '.'
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -299,7 +405,185 @@ mod tests {
         assert_eq!(refusal["claim_kind"], "code_signed");
         assert!(refusal["observed_identity"]
             .as_str()
-            .is_some_and(|identity| identity.starts_with("identifier=com.apple.sh;cdhash=")));
+            .is_some_and(|identity| identity.starts_with("identifier=com.apple.sh;cdhashes={")));
+    }
+
+    #[test]
+    fn format_line_parsing() {
+        assert_eq!(
+            signed_slice_architectures("Mach-O universal (x86_64 arm64e arm64e.x1)"),
+            Some(vec![
+                "x86_64".to_string(),
+                "arm64e".to_string(),
+                "arm64e.x1".to_string(),
+            ])
+        );
+        assert_eq!(
+            signed_slice_architectures("Mach-O thin (arm64)"),
+            Some(vec!["arm64".to_string()])
+        );
+        assert_eq!(
+            signed_slice_architectures("app bundle with Mach-O universal (x86_64 arm64)"),
+            Some(vec!["x86_64".to_string(), "arm64".to_string()])
+        );
+        // A signature over something that is not Mach-O names no slices, and
+        // neither does a shape this parser has never seen. Both must refuse
+        // rather than resolve to the one slice an unqualified read reports.
+        assert_eq!(signed_slice_architectures("generic"), None);
+        assert_eq!(signed_slice_architectures("Mach-O universal ()"), None);
+        // Slice names are handed back to the verifier as arguments, so a name
+        // that could be read as an option is not a name.
+        assert_eq!(
+            signed_slice_architectures("Mach-O universal (x86_64 --output)"),
+            None
+        );
+    }
+
+    /// Write an executable stand-in for `codesign` that prints the signing
+    /// lines the real tool prints, so slice collection can be observed without
+    /// depending on which slices this machine's system binaries happen to have.
+    #[cfg(target_os = "macos")]
+    fn fake_verifier(name: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-fake-verifier-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create fake verifier directory");
+        let verifier = directory.join("codesign");
+        std::fs::write(&verifier, script).expect("write fake verifier");
+        let mut permissions = std::fs::metadata(&verifier)
+            .expect("fake verifier metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&verifier, permissions).expect("make fake verifier executable");
+        verifier
+    }
+
+    #[cfg(target_os = "macos")]
+    const TWO_SLICE_VERIFIER: &str = r#"#!/bin/sh
+arch=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--arch" ]; then arch="$2"; fi
+  shift
+done
+if [ -z "$arch" ]; then
+  echo 'Identifier=com.example.two-slice' >&2
+  echo 'Format=Mach-O universal (x86_64 arm64e)' >&2
+  echo 'CDHash=1111aaaa' >&2
+else
+  echo 'Identifier=com.example.two-slice' >&2
+  echo "Format=Mach-O thin ($arch)" >&2
+  if [ "$arch" = x86_64 ]; then echo 'CDHash=1111AAAA' >&2; else echo 'CDHash=2222bbbb' >&2; fi
+fi
+"#;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_slice_of_a_universal_file_is_collected_before_spawn() {
+        let verifier = fake_verifier("two-slice", TWO_SLICE_VERIFIER);
+
+        let verified = verify_code_signed_executable(
+            &verifier,
+            Path::new("/bin/sleep"),
+            "com.example.two-slice",
+        )
+        .expect("a two-slice file verifies against its signing identifier");
+
+        // A verifier that read only the unqualified default slice would record
+        // one hash here, which is the read that refused honest launches.
+        assert_eq!(
+            verified,
+            VerifiedExecutableIdentity::CodeSignedFile {
+                signing_identifier: "com.example.two-slice".to_string(),
+                slice_code_hashes: BTreeSet::from(
+                    ["1111aaaa".to_string(), "2222bbbb".to_string(),]
+                ),
+            }
+        );
+        std::fs::remove_dir_all(verifier.parent().expect("fake verifier directory"))
+            .expect("remove fake verifier directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn slices_signed_by_different_identifiers_are_unverifiable() {
+        let verifier = fake_verifier(
+            "split-identifier",
+            r#"#!/bin/sh
+arch=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--arch" ]; then arch="$2"; fi
+  shift
+done
+if [ -z "$arch" ]; then
+  echo 'Identifier=com.example.first' >&2
+  echo 'Format=Mach-O universal (x86_64 arm64e)' >&2
+else
+  echo "Format=Mach-O thin ($arch)" >&2
+  if [ "$arch" = x86_64 ]; then
+    echo 'Identifier=com.example.first' >&2
+  else
+    echo 'Identifier=com.example.second' >&2
+  fi
+  echo 'CDHash=3333cccc' >&2
+fi
+"#,
+        );
+
+        let refusal =
+            verify_code_signed_executable(&verifier, Path::new("/bin/sleep"), "com.example.first")
+                .expect_err("slices that name different signers are not one program");
+
+        assert_eq!(refusal["outcome"], "identity_unverifiable");
+        assert_eq!(refusal["reason"], "verifier_failed");
+        std::fs::remove_dir_all(verifier.parent().expect("fake verifier directory"))
+            .expect("remove fake verifier directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unparseable_format_refuses_instead_of_reading_one_slice() {
+        let verifier = fake_verifier(
+            "generic-format",
+            "#!/bin/sh\necho 'Identifier=com.example.generic' >&2\necho 'Format=generic' >&2\necho 'CDHash=4444dddd' >&2\n",
+        );
+
+        let refusal = verify_code_signed_executable(
+            &verifier,
+            Path::new("/bin/sleep"),
+            "com.example.generic",
+        )
+        .expect_err("a format naming no slices cannot be enumerated");
+
+        assert_eq!(refusal["outcome"], "identity_unverifiable");
+        assert_eq!(refusal["reason"], "verifier_failed");
+        std::fs::remove_dir_all(verifier.parent().expect("fake verifier directory"))
+            .expect("remove fake verifier directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_real_system_binary_verifies_through_the_real_verifier() {
+        let (verified, checkpoint) =
+            verify_configured_executable(Path::new("/bin/sleep"), "com.apple.sleep")
+                .expect("verify the system sleep binary");
+
+        assert_eq!(checkpoint, PreSpawnIdentityVerification::Established);
+        let VerifiedExecutableIdentity::CodeSignedFile {
+            signing_identifier,
+            slice_code_hashes,
+        } = &verified
+        else {
+            panic!("a macOS executable verifies as a code-signed file");
+        };
+        assert_eq!(signing_identifier, "com.apple.sleep");
+        // How many slices Apple ships varies by release, so the claim here is
+        // only that the real tool was driven end to end. That the set contains
+        // the slice the kernel actually runs is proved by the launch test that
+        // spawns this binary and re-reads the running image.
+        assert!(!slice_code_hashes.is_empty());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -313,7 +597,7 @@ mod tests {
 
         assert_eq!(
             identity,
-            ExecutableIdentityClaim::ImageDigest {
+            VerifiedExecutableIdentity::ImageDigest {
                 sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(),
             }

@@ -26,9 +26,9 @@ use crate::browser_launch::MacOsProcessLauncher;
 use crate::browser_launch::{
     recover_browser_launches, AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome,
     BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
-    ExecutableIdentityClaim, LaunchAttestationRecord, LaunchProfileIdentity, LaunchRouteIdentity,
+    LaunchAttestationRecord, LaunchProfileIdentity, LaunchRouteIdentity,
     OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
-    OrphanProfileCustodyFailure, ProfileBoundLaunch,
+    OrphanProfileCustodyFailure, ProfileBoundLaunch, VerifiedExecutableIdentity,
 };
 use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
@@ -1228,7 +1228,7 @@ fn record_profile_admission(
     accepted: &AcceptedBindFacts,
     browser_session_id: &str,
     executable: &Path,
-    identity: &ExecutableIdentityClaim,
+    identity: &VerifiedExecutableIdentity,
 ) -> Result<(), Value> {
     let path = cerebellum_core::journal::journal_data_path("browser-launch-admission.jsonl")
         .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?;
@@ -1985,9 +1985,9 @@ mod orphan_recovery_tests {
                 canonical_profile_path: path_bytes(&root.join("profiles/profile-1")),
                 disposition: ProfileDisposition::Durable,
             },
-            verified_executable_identity: ExecutableIdentityClaim::CodeSigned {
+            verified_executable_identity: VerifiedExecutableIdentity::CodeSignedFile {
                 signing_identifier: "com.example.browser".to_string(),
-                unique_code_hash: "abc123".to_string(),
+                slice_code_hashes: std::collections::BTreeSet::from(["abc123".to_string()]),
             },
             launch_vector: VerifiedLaunchVector {
                 executable: b"/Applications/Browser".to_vec(),
