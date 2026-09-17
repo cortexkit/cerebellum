@@ -34,8 +34,8 @@ use crate::browser_type::{
 use crate::journal::JournalConfig;
 use subc_protocol::manifest::CapabilityDeclarations;
 use subc_protocol::manifest::{
-    Concurrency, ExecutionMode, IdentityScope, ManagementOperation, ManagementOperationKind,
-    ModuleManifest, ProviderRole, Tool,
+    BuildGitShaAbsenceReason, Concurrency, ExecutionMode, IdentityScope, ManagementOperation,
+    ManagementOperationKind, ModuleManifest, ProviderRole, Tool,
 };
 use subc_protocol::manifest::{
     ManifestProvenance, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
@@ -184,15 +184,40 @@ pub fn build(module_id: &str) -> ModuleManifest {
 /// `unverifiable` -- the module made no claim at all -- and this module always
 /// has at least one honest fact to state.
 fn build_provenance() -> Option<ManifestProvenance> {
+    let rev = env!("CEREBELLUM_BUILD_REV");
+    let tree = env!("CEREBELLUM_BUILD_TREE");
+    let build_git_sha = attestable_commit(rev, tree);
     Some(ManifestProvenance {
-        build_git_sha: attestable_commit(
-            env!("CEREBELLUM_BUILD_REV"),
-            env!("CEREBELLUM_BUILD_TREE"),
-        ),
+        build_git_sha_absence_reason: build_git_sha
+            .is_none()
+            .then(|| build_git_sha_absence_reason(rev, tree)),
+        build_git_sha,
         build_lock_digest: None,
         wire_crate_version: Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
         store_schema_version: None,
     })
+}
+
+/// Why no commit is attested, when none is. A reader of an absent sha needs
+/// to know whether the build declined to name a commit it had (dirty tree,
+/// so the sha would not describe the binary) or never had one (build.rs
+/// could not run git); the two are repaired in different places.
+fn build_git_sha_absence_reason(rev: &str, tree: &str) -> BuildGitShaAbsenceReason {
+    if tree != "clean" && !rev.is_empty() && !is_builder_sentinel(rev) {
+        BuildGitShaAbsenceReason::DeclinedDirty
+    } else {
+        BuildGitShaAbsenceReason::NeverDerived
+    }
+}
+
+/// Every builder sentinel, in any casing, not just the one our own build.rs
+/// happens to emit. Matching only "unknown" would be adequate today and
+/// silently inadequate the moment that script changes its stand-in -- and a
+/// sentinel published as a fact is the failure this check exists to prevent,
+/// because a present well-formed field stops the reader asking.
+fn is_builder_sentinel(rev: &str) -> bool {
+    const SENTINELS: [&str; 3] = ["unknown", "unavailable", "none"];
+    SENTINELS.contains(&rev.to_ascii_lowercase().as_str())
 }
 
 /// The commit a binary may attest, given what the build observed.
@@ -203,14 +228,7 @@ fn build_provenance() -> Option<ManifestProvenance> {
 /// whichever one the developer happened to be in -- and the refusing branch
 /// would never run.
 fn attestable_commit(rev: &str, tree: &str) -> Option<String> {
-    // Every builder sentinel, in any casing, not just the one our own build.rs
-    // happens to emit. Matching only "unknown" would be adequate today and
-    // silently inadequate the moment that script changes its stand-in -- and a
-    // sentinel published as a fact is the failure this check exists to prevent,
-    // because a present well-formed field stops the reader asking.
-    const SENTINELS: [&str; 3] = ["unknown", "unavailable", "none"];
-    let lowered = rev.to_ascii_lowercase();
-    if tree != "clean" || rev.is_empty() || SENTINELS.contains(&lowered.as_str()) {
+    if tree != "clean" || rev.is_empty() || is_builder_sentinel(rev) {
         return None;
     }
     Some(rev.to_string())
@@ -676,6 +694,33 @@ mod tests {
         // commit, and passing it through would put the literal string "unknown"
         // in a field a reader parses as a sha.
         assert_eq!(super::attestable_commit("unknown", "clean"), None);
+    }
+
+    /// The absence reason names the repair: a dirty tree with a real revision
+    /// is a build that DECLINED (rebuild from a clean tree); a sentinel or an
+    /// empty revision is one that never had a commit (build.rs could not run
+    /// git). A wrong implementation that always says NeverDerived sends the
+    /// dirty-tree case to the wrong place.
+    #[test]
+    fn the_absence_reason_distinguishes_declined_from_never_derived() {
+        use subc_protocol::manifest::BuildGitShaAbsenceReason as R;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            super::build_git_sha_absence_reason(sha, "dirty"),
+            R::DeclinedDirty
+        );
+        assert_eq!(
+            super::build_git_sha_absence_reason("unknown", "clean"),
+            R::NeverDerived
+        );
+        assert_eq!(
+            super::build_git_sha_absence_reason("unknown", "dirty"),
+            R::NeverDerived
+        );
+        assert_eq!(
+            super::build_git_sha_absence_reason("", "dirty"),
+            R::NeverDerived
+        );
         assert_eq!(super::attestable_commit("", "clean"), None);
 
         // Every builder sentinel in the fleet contract, in casings a script
