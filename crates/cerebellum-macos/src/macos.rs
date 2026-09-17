@@ -7,7 +7,6 @@
 use std::ffi::CStr;
 use std::fmt;
 use std::os::raw::{c_char, c_int, c_uint};
-use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -408,24 +407,27 @@ pub fn post_event_at_hid_tap_for_measurement(event: OwnedCgEvent) -> CgEventPost
     CgEventPostCall
 }
 
-/// Read the unix process id of the frontmost application through System Events.
+/// Read the unix process id of the frontmost application.
 ///
-/// This is a reading rather than a focus change. A failed command, malformed
-/// response, or non-positive pid is absent so the policy caller can refuse it.
+/// This is a reading rather than a focus change, from the workspace's own
+/// notion of the frontmost application. It was first read by asking System
+/// Events over AppleScript, which answers the same question from the same
+/// source and costs 170-260 ms per call on a VM; the observed dispatch loop
+/// asks before every post, so that one call was most of the latency between
+/// a person's input and the sequence stopping. This is tens of microseconds.
+///
+/// The pid is a focus reading, not an identity: which process that pid is
+/// right now is established by the caller's generation check, never by the
+/// running-application object this reads it from.
+///
+/// A missing frontmost application or a non-positive pid is absent so the
+/// policy caller can refuse it.
 pub fn frontmost_process_id() -> Option<i32> {
-    let output = Command::new("/usr/bin/osascript")
-        .args([
-            "-e",
-            "tell application \"System Events\" to get unix id of first process whose frontmost is true",
-        ])
-        .output()
-        .ok()?;
-    output.status.success().then_some(())?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .filter(|pid| *pid > 0)
+    use objc2_app_kit::NSWorkspace;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let application = workspace.frontmostApplication()?;
+    let pid = application.processIdentifier();
+    (pid > 0).then_some(pid)
 }
 
 /// When a process was started, as kernel-sourced microseconds since the epoch.
