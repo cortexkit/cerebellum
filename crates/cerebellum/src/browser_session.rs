@@ -119,6 +119,7 @@ struct Handoff {
     opened_at: MonoInstant,
     expires_at: MonoInstant,
     opening_cookie_names: BTreeSet<String>,
+    saw_credential_field: bool,
     cookie_names_added: usize,
 }
 
@@ -922,6 +923,7 @@ impl BrowserSessions {
             opened_at,
             expires_at,
             opening_cookie_names,
+            saw_credential_field: false,
             cookie_names_added: 0,
         }));
         Ok(PresentedHandoff {
@@ -1026,6 +1028,7 @@ impl BrowserSessions {
         }
 
         let opening_cookie_names = handoff.opening_cookie_names.clone();
+        let saw_credential_field = handoff.saw_credential_field;
         let origin = handoff.origin.clone();
         session.lease.renew(clock);
         let Some(process) = session.process.as_mut() else {
@@ -1040,7 +1043,7 @@ impl BrowserSessions {
             Ok(url) => url,
             Err(_) => return HandoffPollResult::Open,
         };
-        let has_credential_field = match process.has_credential_field(route_key, deadline_ms) {
+        let has_credential_field_now = match process.has_credential_field(route_key, deadline_ms) {
             Ok(value) => value,
             Err(_) => return HandoffPollResult::Open,
         };
@@ -1048,15 +1051,17 @@ impl BrowserSessions {
             .difference(&opening_cookie_names)
             .count();
         let observed = handoff_login_observed(
+            saw_credential_field,
+            has_credential_field_now,
             &opening_cookie_names,
             &current_cookie_names,
-            has_credential_field,
             &main_frame_url,
             &origin,
         );
         let Some(HandoffState::Open(handoff)) = session.handoff.as_mut() else {
             return HandoffPollResult::Gone;
         };
+        handoff.saw_credential_field |= has_credential_field_now;
         handoff.cookie_names_added = cookie_names_added;
         if !observed {
             return HandoffPollResult::Open;
@@ -1407,19 +1412,26 @@ impl BrowserSessions {
     }
 }
 
-/// Login is observed only when all three independently sampled facts agree.
+/// Login is observed only after a credential field has appeared and then gone,
+/// while the cookie set grows and the page remains on the handoff origin.
+///
+/// A passkey-only or OAuth-only flow never shows a credential field, so it cannot
+/// close by observation. The caller must use `browser.resume`, or let the handoff
+/// expire; either path reports which outcome ended the handoff.
 pub fn handoff_login_observed(
+    saw_credential_field: bool,
+    has_credential_field_now: bool,
     opening_cookie_names: &BTreeSet<String>,
     current_cookie_names: &BTreeSet<String>,
-    has_credential_field: bool,
     main_frame_url: &str,
     handoff_origin: &str,
 ) -> bool {
-    current_cookie_names
-        .difference(opening_cookie_names)
-        .next()
-        .is_some()
-        && !has_credential_field
+    saw_credential_field
+        && !has_credential_field_now
+        && current_cookie_names
+            .difference(opening_cookie_names)
+            .next()
+            .is_some()
         && main_frame_origin(main_frame_url) == handoff_origin
 }
 
@@ -2433,31 +2445,34 @@ mod tests {
     }
 
     #[test]
-    fn login_is_observed_only_when_all_three_facts_hold() {
+    fn login_is_observed_only_when_all_four_facts_hold() {
         let opening = BTreeSet::from(["before".to_string()]);
-        for grown in [false, true] {
-            for no_field in [false, true] {
-                for same_origin in [false, true] {
-                    let mut current = opening.clone();
-                    if grown {
-                        current.insert("authenticated".to_string());
+        for saw_field in [false, true] {
+            for has_field_now in [false, true] {
+                for grown in [false, true] {
+                    for same_origin in [false, true] {
+                        let mut current = opening.clone();
+                        if grown {
+                            current.insert("authenticated".to_string());
+                        }
+                        let url = if same_origin {
+                            "https://login.example/done"
+                        } else {
+                            "https://sso.example/done"
+                        };
+                        assert_eq!(
+                            handoff_login_observed(
+                                saw_field,
+                                has_field_now,
+                                &opening,
+                                &current,
+                                url,
+                                "https://login.example",
+                            ),
+                            saw_field && !has_field_now && grown && same_origin,
+                            "saw_field={saw_field}, has_field_now={has_field_now}, grown={grown}, same_origin={same_origin}",
+                        );
                     }
-                    let url = if same_origin {
-                        "https://login.example/done"
-                    } else {
-                        "https://sso.example/done"
-                    };
-                    assert_eq!(
-                        handoff_login_observed(
-                            &opening,
-                            &current,
-                            !no_field,
-                            url,
-                            "https://login.example",
-                        ),
-                        grown && no_field && same_origin,
-                        "grown={grown}, no_field={no_field}, same_origin={same_origin}",
-                    );
                 }
             }
         }
@@ -2468,9 +2483,10 @@ mod tests {
         let opening = BTreeSet::from(["before".to_string()]);
         let current = BTreeSet::from(["before".to_string(), "authenticated".to_string()]);
         assert!(!handoff_login_observed(
+            true,
+            true,
             &opening,
             &current,
-            true,
             "https://login.example/2fa",
             "https://login.example",
         ));
@@ -2481,10 +2497,25 @@ mod tests {
         let opening = BTreeSet::from(["before".to_string()]);
         let current = BTreeSet::from(["before".to_string(), "authenticated".to_string()]);
         assert!(!handoff_login_observed(
+            true,
+            false,
             &opening,
             &current,
-            false,
             "https://sso.example/login",
+            "https://login.example",
+        ));
+    }
+
+    #[test]
+    fn a_username_first_step_with_a_banner_cookie_is_not_done() {
+        let opening = BTreeSet::from(["before".to_string()]);
+        let current = BTreeSet::from(["before".to_string(), "cookie_banner".to_string()]);
+        assert!(!handoff_login_observed(
+            false,
+            false,
+            &opening,
+            &current,
+            "https://login.example/username",
             "https://login.example",
         ));
     }
@@ -2497,6 +2528,11 @@ mod tests {
         let presented = sessions
             .present("route", "https://login.example", 10, &clock)
             .unwrap();
+        assert_eq!(
+            sessions.poll_handoff("route", presented.generation, 10, &clock),
+            HandoffPollResult::Open,
+            "the first credential-bearing tick records the transition prerequisite"
+        );
         facts
             .cookie_names
             .lock()

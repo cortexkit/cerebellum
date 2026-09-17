@@ -171,7 +171,7 @@ struct RecordingLauncher {
     present_error: Option<&'static str>,
     cookie_value: Option<&'static str>,
     cookie_grows_on_poll: bool,
-    credential_field: bool,
+    credential_field_then_clears: bool,
 }
 
 impl BrowserSessionLauncher for RecordingLauncher {
@@ -189,7 +189,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 present_error: self.present_error,
                 cookie_value: self.cookie_value,
                 cookie_grows_on_poll: self.cookie_grows_on_poll,
-                credential_field: self.credential_field,
+                credential_field_then_clears: self.credential_field_then_clears,
                 cookie_reads: 0,
             }),
             cleanup: Box::new(RecordingCleanup {
@@ -222,7 +222,7 @@ struct RecordingProcess {
     present_error: Option<&'static str>,
     cookie_value: Option<&'static str>,
     cookie_grows_on_poll: bool,
-    credential_field: bool,
+    credential_field_then_clears: bool,
     cookie_reads: usize,
 }
 
@@ -258,7 +258,7 @@ impl OwnedBrowserProcess for RecordingProcess {
     }
 
     fn has_credential_field(&mut self, _: &str, _: u64) -> Result<bool, NavigationDriveError> {
-        Ok(self.credential_field)
+        Ok(self.credential_field_then_clears && self.cookie_reads == 2)
     }
 
     fn navigate(
@@ -1227,7 +1227,7 @@ async fn cookie_values_never_leave_the_driver() {
     let launcher = Arc::new(RecordingLauncher {
         cookie_value: Some(SECRET),
         cookie_grows_on_poll: true,
-        credential_field: false,
+        credential_field_then_clears: true,
         ..RecordingLauncher::default()
     });
     let mut planes = Planes::with_browser_config_journaling(
@@ -1243,7 +1243,7 @@ async fn cookie_values_never_leave_the_driver() {
         cerebellum::present_browser_handoff_for_test(&planes, &route, "https://landed.example")
             .await;
     assert_eq!(presented["outcome"], "presented", "{presented}");
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             if planes
                 .browser
