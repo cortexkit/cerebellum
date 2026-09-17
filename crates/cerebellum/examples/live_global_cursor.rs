@@ -86,6 +86,21 @@ mod probe {
     /// Activated to steal the front, which is the whole point of arm 3.
     const INTRUDER_APP: &str = "Finder";
     const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Frame-level timeline on stderr when `CEREBELLUM_PROBE_TRACE` is set.
+    /// Each line carries milliseconds since the probe started, so a stalled
+    /// reply reads as a gap between a `->` and its `<-` rather than as a
+    /// timeout with no history.
+    fn trace(line: &str) {
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| std::env::var_os("CEREBELLUM_PROBE_TRACE").is_some());
+        if enabled {
+            let start = START.get_or_init(std::time::Instant::now);
+            eprintln!("[{:>8} ms] {line}", start.elapsed().as_millis());
+        }
+    }
     /// The idle gate's threshold in milliseconds, as `OBSERVED_DISPATCH_IDLE_MS`
     /// defines it.
     ///
@@ -1055,6 +1070,13 @@ mod probe {
             corr: u64,
             body: Value,
         ) -> Result<(), String> {
+            trace(&format!(
+                "-> request ch={channel} corr={corr} {}",
+                body["name"]
+                    .as_str()
+                    .or(body["method"].as_str())
+                    .unwrap_or("?")
+            ));
             let frame = Frame::build_with_version(
                 PROTOCOL_VERSION,
                 FrameType::Request,
@@ -1080,7 +1102,16 @@ mod probe {
         async fn await_response(&mut self, corr: u64) -> Result<Frame, String> {
             loop {
                 let frame = match timeout(REPLY_TIMEOUT, read_frame(&mut self.stream)).await {
-                    Ok(Ok(Some(frame))) => frame,
+                    Ok(Ok(Some(frame))) => {
+                        trace(&format!(
+                            "<- {:?} ch={} corr={} {} bytes",
+                            frame.header.ty,
+                            frame.header.channel,
+                            frame.header.corr,
+                            frame.body.len()
+                        ));
+                        frame
+                    }
                     Ok(Ok(None)) => return Err("the daemon closed the connection".to_string()),
                     Ok(Err(error)) => return Err(format!("read frame: {error:?}")),
                     Err(_) => {
