@@ -21,6 +21,10 @@ pub struct SessionEvent {
     /// is the quantity a seize-latency bound is about. Time since some other
     /// instant of the consumer's choosing is not.
     pub timestamp_ns: u64,
+    /// [`uptime_now_ns`] read inside the tap callback, the moment the platform
+    /// handed the event to this process. `timestamp_ns` to here is the
+    /// platform's delivery; here to the consumer's drain is the consumer's.
+    pub observed_at_ns: u64,
 }
 
 /// Nanoseconds since boot on the clock CoreGraphics stamps events with
@@ -283,11 +287,13 @@ mod framework {
             CGEventField::EventSourceUserData,
         ) as u64;
         let timestamp_ns = CGEvent::timestamp(Some(unsafe { event.as_ref() }));
+        let observed_at_ns = super::uptime_now_ns();
         let _ = state.tx.send(SessionEvent {
             source_unix_process_id,
             event_type: event_type.0,
             marker_nonce,
             timestamp_ns,
+            observed_at_ns,
         });
         event.as_ptr()
     }
@@ -309,6 +315,7 @@ mod tests {
             event_type: 5,
             marker_nonce: 0,
             timestamp_ns: 0,
+            observed_at_ns: 0,
         };
         let (tx, rx) = session_event_channel(2);
         assert!(tx.try_send(event).is_ok());

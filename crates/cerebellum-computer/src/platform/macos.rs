@@ -203,14 +203,7 @@ fn observe_session_event(
     our_pid: i64,
     index: usize,
 ) {
-    watcher.observe_sourced_input(
-        SourcedInputEvent {
-            source_unix_process_id: event.source_unix_process_id,
-            detection_latency_ms: detection_latency_ms(&event),
-        },
-        our_pid,
-        index,
-    );
+    watcher.observe_sourced_input(sourced_event(&event), our_pid, index);
 }
 
 fn drain_session_events(
@@ -234,13 +227,26 @@ fn detection_latency_ms(event: &cerebellum_macos::SessionEvent) -> u32 {
     u32::try_from(now.saturating_sub(event.timestamp_ns) / 1_000_000).unwrap_or(u32::MAX)
 }
 
+/// The platform's share of the latency: event timestamp to the tap callback.
+/// What remains after subtracting this from the end-to-end number is this
+/// loop's own pace, which is what the seize bound promises.
+fn platform_delivery_latency_ms(event: &cerebellum_macos::SessionEvent) -> u32 {
+    u32::try_from(event.observed_at_ns.saturating_sub(event.timestamp_ns) / 1_000_000)
+        .unwrap_or(u32::MAX)
+}
+
+fn sourced_event(event: &cerebellum_macos::SessionEvent) -> SourcedInputEvent {
+    SourcedInputEvent {
+        source_unix_process_id: event.source_unix_process_id,
+        detection_latency_ms: detection_latency_ms(event),
+        platform_delivery_latency_ms: Some(platform_delivery_latency_ms(event)),
+    }
+}
+
 fn sourced_from_tap(tap: &cerebellum_macos::SessionEventTap) -> Vec<SourcedInputEvent> {
     let mut events = Vec::new();
     while let Ok(event) = tap.events().try_recv() {
-        events.push(SourcedInputEvent {
-            source_unix_process_id: event.source_unix_process_id,
-            detection_latency_ms: detection_latency_ms(&event),
-        });
+        events.push(sourced_event(&event));
     }
     events
 }
@@ -412,10 +418,7 @@ fn dispatch_synthetic_globally(
         let remaining = tail_until.saturating_duration_since(Instant::now());
         match tap.events().recv_timeout(remaining) {
             Ok(event) => {
-                let sourced = SourcedInputEvent {
-                    source_unix_process_id: event.source_unix_process_id,
-                    detection_latency_ms: detection_latency_ms(&event),
-                };
+                let sourced = sourced_event(&event);
                 if !event_is_ours(sourced, our_pid) {
                     hardware_seen = true;
                     break;

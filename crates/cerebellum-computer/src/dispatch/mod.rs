@@ -832,6 +832,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                             reason: AbortReason::SeizeLatencyBoundExceeded,
                             stopped_action_index: completed.len(),
                             detection_latency_ms: None,
+                            platform_delivery_latency_ms: None,
                             sourced_input_kind: None,
                             maximum_detection_latency_ms: request
                                 .row
@@ -1433,6 +1434,7 @@ mod idle_refusal_wire_tests {
             reason,
             stopped_action_index: 0,
             detection_latency_ms: None,
+            platform_delivery_latency_ms: None,
             sourced_input_kind: None,
             maximum_detection_latency_ms: 50,
             queued_posts_cancelled: 0,

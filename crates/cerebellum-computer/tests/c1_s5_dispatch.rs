@@ -341,6 +341,7 @@ impl PlatformDriver for RecordingDriver {
                 reason,
                 stopped_action_index: 0,
                 detection_latency_ms: Some(1),
+                platform_delivery_latency_ms: None,
                 sourced_input_kind: (reason == AbortReason::UserSeizedControl).then_some(
                     cerebellum_computer::dispatch::SourcedInputKind::OtherProcess { pid: 36_680 },
                 ),
@@ -789,6 +790,7 @@ fn an_observed_abort_journals_its_numbers_while_the_wire_reply_carries_none() {
             reason: AbortReason::UserSeizedControl,
             stopped_action_index: 2,
             detection_latency_ms: Some(23),
+            platform_delivery_latency_ms: None,
             sourced_input_kind: Some(SourcedInputKind::Hardware),
             maximum_detection_latency_ms: 50,
             queued_posts_cancelled: 3,

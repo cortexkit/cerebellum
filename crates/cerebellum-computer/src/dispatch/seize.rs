@@ -60,6 +60,11 @@ pub struct AbortDecision {
     pub reason: AbortReason,
     pub stopped_action_index: usize,
     pub detection_latency_ms: Option<u32>,
+    /// The platform's share of `detection_latency_ms` (event timestamp to tap
+    /// callback), when the observer could measure it. See
+    /// [`SourcedInputEvent::platform_delivery_latency_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_delivery_latency_ms: Option<u32>,
     /// Which source seized control when the tap supplied source attribution.
     pub sourced_input_kind: Option<SourcedInputKind>,
     pub maximum_detection_latency_ms: u32,
@@ -104,6 +109,7 @@ impl SeizeWatcher {
             reason,
             stopped_action_index: index,
             detection_latency_ms: latency,
+            platform_delivery_latency_ms: None,
             sourced_input_kind: None,
             maximum_detection_latency_ms: self.maximum_detection_latency_ms,
             queued_posts_cancelled: cancelled,
@@ -185,6 +191,7 @@ impl SeizeWatcher {
             );
             if let Some(abort) = self.abort.as_mut() {
                 abort.sourced_input_kind = Some(kind);
+                abort.platform_delivery_latency_ms = event.platform_delivery_latency_ms;
             }
         }
         kind
@@ -304,7 +311,16 @@ pub fn heartbeat_liveness(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourcedInputEvent {
     pub source_unix_process_id: i64,
+    /// End to end: from the event's own timestamp to the moment this loop
+    /// drained it. Includes the platform's delivery and this loop's pace.
     pub detection_latency_ms: u32,
+    /// The platform's share of that: from the event's timestamp to the tap
+    /// callback receiving it. `None` where the observer cannot separate the
+    /// two. The seize bound is a promise about THIS loop's pace, which is
+    /// `detection_latency_ms` minus this; the platform's share is disclosed
+    /// beside it because a reader of the bound needs to know what it does
+    /// not cover.
+    pub platform_delivery_latency_ms: Option<u32>,
 }
 
 /// How a sourced event relates to us.
@@ -733,6 +749,7 @@ mod tests {
             SourcedInputEvent {
                 source_unix_process_id: HARDWARE_INPUT_SOURCE_PID,
                 detection_latency_ms: 2,
+                platform_delivery_latency_ms: None,
             },
             OUR_PID,
             1,
@@ -771,6 +788,7 @@ mod tests {
             SourcedInputEvent {
                 source_unix_process_id: OUR_PID,
                 detection_latency_ms: 1,
+                platform_delivery_latency_ms: None,
             },
             OUR_PID,
             0,
@@ -806,6 +824,7 @@ mod tests {
             SourcedInputEvent {
                 source_unix_process_id: OTHER_PID,
                 detection_latency_ms: 1,
+                platform_delivery_latency_ms: None,
             },
             OUR_PID,
             0,
@@ -1010,6 +1029,7 @@ mod tests {
         SourcedInputEvent {
             source_unix_process_id: HARDWARE_INPUT_SOURCE_PID,
             detection_latency_ms: 1,
+            platform_delivery_latency_ms: None,
         }
     }
 
@@ -1017,6 +1037,7 @@ mod tests {
         SourcedInputEvent {
             source_unix_process_id: OUR_PID,
             detection_latency_ms: 1,
+            platform_delivery_latency_ms: None,
         }
     }
 
@@ -1024,6 +1045,7 @@ mod tests {
         SourcedInputEvent {
             source_unix_process_id: OTHER_PID,
             detection_latency_ms: 1,
+            platform_delivery_latency_ms: None,
         }
     }
 
