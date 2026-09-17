@@ -5,8 +5,10 @@
 
 use super::*;
 use crate::dispatch::{
-    dispatch_observed_post_in_order, HeartbeatMarker, HeartbeatObservation, HeartbeatProbe,
-    ObservedPostRefusal, SeizeWatcher, SourcedInputEvent, OBSERVER_HEARTBEAT_BOUND_MS,
+    begin_observed_sequence, dispatch_observed_post_in_order, event_is_ours,
+    observed_tail_deadline, AbortReason, HeartbeatMarker, HeartbeatObservation, HeartbeatProbe,
+    ObservedPostRefusal, ObservedSequenceHooks, SeizeWatcher, SourcedInputEvent, UserIdleEstimator,
+    OBSERVER_HEARTBEAT_BOUND_MS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,6 +110,7 @@ pub struct MacOs26PlatformDriver {
     accessibility_trees: BTreeMap<String, CachedAccessibilityTree>,
     expected_post_condition_available: bool,
     global_dispatch_review_revision: Option<String>,
+    user_idle: UserIdleEstimator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +227,29 @@ fn drain_session_events(
     }
 }
 
+fn sourced_from_tap(
+    tap: &cerebellum_macos::SessionEventTap,
+    started: Instant,
+) -> Vec<SourcedInputEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = tap.events().try_recv() {
+        events.push(SourcedInputEvent {
+            source_unix_process_id: event.source_unix_process_id,
+            detection_latency_ms: u32::try_from(elapsed_millis(started)).unwrap_or(u32::MAX),
+        });
+    }
+    events
+}
+
+fn observed_abort_error(watcher: &SeizeWatcher) -> DriverError {
+    match watcher.abort_decision() {
+        Some(abort) => DriverError::ObservedDispatchAborted(abort),
+        None => {
+            DriverError::StartupRefused("observed post refused without a recorded abort reason")
+        }
+    }
+}
+
 fn heartbeat_observation(
     tap: &cerebellum_macos::SessionEventTap,
     watcher: &mut SeizeWatcher,
@@ -253,13 +279,12 @@ fn heartbeat_observation(
 
 /// Deliver one action through the session-global transport under observed gates.
 ///
-/// A fresh tap is held for the whole action rather than shared across actions.
-/// This bounds unread state to one request, prevents an event left by one caller
-/// being attributed to the next, and forces every sequence to prove liveness
-/// with its own heartbeat before its first real post.
+/// The tap precedes the idle read and stays live through the HID table's update
+/// lag after the final post. Idle is read once before the heartbeat because our
+/// session-tap posts also reset the HID idle table.
 fn dispatch_synthetic_globally(
     request: GlobalDispatchRequest,
-    tap: &cerebellum_macos::SessionEventTap,
+    estimator: &mut UserIdleEstimator,
 ) -> Result<DispatchResult, DriverError> {
     let GlobalDispatchRequest {
         synthetic,
@@ -280,38 +305,79 @@ fn dispatch_synthetic_globally(
     let marker = HeartbeatMarker::new(nonce.max(1));
     let marker_event = cerebellum_macos::heartbeat_marker_event(marker.nonce)
         .map_err(|_| DriverError::EventConstructionFailed("observer heartbeat marker"))?;
-    let posted_at_ms = elapsed_millis(started);
-    let _ = cerebellum_macos::post_event_globally(marker_event);
-    let probe = HeartbeatProbe {
-        marker,
-        posted_at_ms,
-        our_pid,
-    };
+    let tap = cerebellum_macos::SessionEventTap::listen(SESSION_TAP_UNREAD_BOUND)
+        .map_err(|_| DriverError::StartupRefused("session input observer is unavailable"))?;
     let mut watcher = SeizeWatcher::new(maximum_seize_detection_latency_ms);
     for _ in &steps {
         watcher.queue_post();
     }
-    let heartbeat = heartbeat_observation(tap, &mut watcher, probe, started);
-    let mut posts_returned = 0_u64;
 
+    let idle_read_at = Instant::now();
+    let begin = begin_observed_sequence(
+        estimator,
+        &mut watcher,
+        our_pid,
+        idle_read_at,
+        ObservedSequenceHooks {
+            create_tap: || tap,
+            read_idle: || {
+                IdleReading::from_seconds(cerebellum_macos::seconds_since_last_input(
+                    cerebellum_macos::EventSourceStateTable::HidSystem,
+                ))
+            },
+            drain: |tap: &cerebellum_macos::SessionEventTap| sourced_from_tap(tap, started),
+            post_heartbeat: || {
+                let posted_at_ms = elapsed_millis(started);
+                let _ = cerebellum_macos::post_event_globally(marker_event);
+                let last_post_at = Instant::now();
+                (
+                    HeartbeatProbe {
+                        marker,
+                        posted_at_ms,
+                        our_pid,
+                    },
+                    last_post_at,
+                )
+            },
+        },
+    );
+    let (tap, user_idle, (probe, mut last_post_at)) = match begin {
+        Ok(started_sequence) => started_sequence,
+        Err(refusal) => {
+            if matches!(
+                refusal,
+                ObservedPostRefusal::AlreadyAborted(AbortReason::UserSeizedControl)
+            ) {
+                estimator.clear_carry();
+            }
+            return Err(observed_abort_error(&watcher));
+        }
+    };
+
+    let heartbeat = heartbeat_observation(&tap, &mut watcher, probe, started);
+    if let Some(abort) = watcher.abort_decision() {
+        estimator.clear_carry();
+        return Err(DriverError::ObservedDispatchAborted(abort));
+    }
+
+    let mut posts_returned = 0_u64;
+    let target_pid = synthetic.target.pid;
     for (index, step) in steps.into_iter().enumerate() {
         if index > 0 {
             std::thread::sleep(Duration::from_millis(u64::from(
                 minimum_inter_post_interval_ms,
             )));
         }
-        drain_session_events(tap, &mut watcher, our_pid, index, started);
-        let target_pid = synthetic.target.pid;
+        drain_session_events(&tap, &mut watcher, our_pid, index, started);
+        if let Some(abort) = watcher.abort_decision() {
+            estimator.clear_carry();
+            return Err(DriverError::ObservedDispatchAborted(abort));
+        }
         let result = dispatch_observed_post_in_order(
             &mut watcher,
             index,
             probe,
             |_| heartbeat,
-            || {
-                IdleReading::from_seconds(cerebellum_macos::seconds_since_last_input(
-                    cerebellum_macos::EventSourceStateTable::HidSystem,
-                ))
-            },
             || cerebellum_macos::frontmost_process_id() == i32::try_from(target_pid).ok(),
             || cerebellum_macos::post_event_globally(step.event),
         );
@@ -319,6 +385,7 @@ fn dispatch_synthetic_globally(
             Ok(_) => {
                 watcher.take_post_slot();
                 posts_returned = posts_returned.saturating_add(1);
+                last_post_at = Instant::now();
             }
             Err(
                 ObservedPostRefusal::ObserverBlind
@@ -326,20 +393,46 @@ fn dispatch_synthetic_globally(
                 | ObservedPostRefusal::FocusMismatch
                 | ObservedPostRefusal::AlreadyAborted(_),
             ) => {
-                // Every refusal arm in dispatch_observed_post_in_order records
-                // its abort before returning, so this is Some today. The
-                // invariant lives in another file; a refusal added there
-                // without an abort call must surface as a refusal here, not
-                // as a panic on the module loop -- the sequence has already
-                // stopped, and "stopped, reason unrecorded" is the true state.
-                return Err(match watcher.abort_decision() {
-                    Some(abort) => DriverError::ObservedDispatchAborted(abort),
-                    None => DriverError::StartupRefused(
-                        "observed post refused without a recorded abort reason",
-                    ),
-                });
+                // Every refusal arm records an abort before returning. Keep a
+                // defensive startup refusal if a future arm breaks that invariant.
+                estimator.clear_carry();
+                return Err(observed_abort_error(&watcher));
             }
         }
+    }
+
+    let tail_until = observed_tail_deadline(last_post_at);
+    let mut hardware_seen = false;
+    let mut tail_observed = true;
+    while Instant::now() < tail_until {
+        let remaining = tail_until.saturating_duration_since(Instant::now());
+        match tap.events().recv_timeout(remaining) {
+            Ok(event) => {
+                let sourced = SourcedInputEvent {
+                    source_unix_process_id: event.source_unix_process_id,
+                    detection_latency_ms: u32::try_from(elapsed_millis(started))
+                        .unwrap_or(u32::MAX),
+                };
+                if !event_is_ours(sourced, our_pid) {
+                    hardware_seen = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tail_observed = false;
+                break;
+            }
+        }
+    }
+    if hardware_seen || !tail_observed {
+        estimator.clear_carry();
+    } else {
+        estimator.sequence_finished(
+            last_post_at,
+            user_idle,
+            last_post_at.saturating_duration_since(idle_read_at),
+        );
     }
 
     Ok(DispatchResult {
@@ -709,6 +802,7 @@ impl MacOs26PlatformDriver {
             accessibility_trees: BTreeMap::new(),
             expected_post_condition_available: true,
             global_dispatch_review_revision: None,
+            user_idle: UserIdleEstimator::new(),
         }
     }
 
@@ -989,9 +1083,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             ));
         }
         request.synthetic.target.validate()?;
-        let tap = cerebellum_macos::SessionEventTap::listen(SESSION_TAP_UNREAD_BOUND)
-            .map_err(|_| DriverError::StartupRefused("session input observer is unavailable"))?;
-        dispatch_synthetic_globally(request, &tap)
+        dispatch_synthetic_globally(request, &mut self.user_idle)
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;

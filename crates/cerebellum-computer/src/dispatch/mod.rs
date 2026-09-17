@@ -1469,7 +1469,8 @@ mod idle_refusal_wire_tests {
     fn idle_refusals_reach_the_wire_under_their_own_codes_with_their_numbers() {
         let below = DispatchError::IdleGateRefused(IdleGateRefusal::BelowThreshold {
             threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
-            observed_ms: 40,
+            hid_idle_ms: 320,
+            user_idle_ms: 40,
         });
         let unreadable = DispatchError::IdleGateRefused(IdleGateRefusal::Unreadable(
             IdleUnreadable::TableUnavailable,
@@ -1489,6 +1490,15 @@ mod idle_refusal_wire_tests {
         let json = serde_json::to_value(&below).expect("serializes");
         let text = json.to_string();
         assert!(text.contains("1000"), "threshold missing from {text}");
-        assert!(text.contains("40"), "observed missing from {text}");
+        assert!(text.contains("320"), "raw HID idle missing from {text}");
+        assert!(text.contains("40"), "user idle missing from {text}");
+        assert!(
+            text.contains("hid_idle_ms"),
+            "raw HID idle missing from {text}"
+        );
+        assert!(
+            text.contains("user_idle_ms"),
+            "user idle missing from {text}"
+        );
     }
 }
