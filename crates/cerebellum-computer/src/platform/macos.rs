@@ -382,9 +382,31 @@ fn dispatch_synthetic_globally(
     let target_pid = synthetic.target.pid;
     for (index, step) in steps.into_iter().enumerate() {
         if index > 0 {
-            std::thread::sleep(Duration::from_millis(u64::from(
-                minimum_inter_post_interval_ms,
-            )));
+            // Wait out the inter-post interval ON the tap, not beside it: a
+            // sleep followed by a drain detects an event that lands just after
+            // a post only when the sleep ends, so the measured detection
+            // latency was the interval plus jitter (88 ms against a 50 ms
+            // bound on the VM) and could never be inside the bound by
+            // construction. Blocking on the tap wakes on the event itself.
+            let next_post_at =
+                last_post_at + Duration::from_millis(u64::from(minimum_inter_post_interval_ms));
+            loop {
+                let remaining = next_post_at.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tap.events().recv_timeout(remaining) {
+                    Ok(event) => {
+                        observe_session_event(&mut watcher, event, our_pid, index);
+                        if let Some(abort) = watcher.abort_decision() {
+                            estimator.clear_carry();
+                            return Err(DriverError::ObservedDispatchAborted(abort));
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
         drain_session_events(&tap, &mut watcher, our_pid, index);
         if let Some(abort) = watcher.abort_decision() {
