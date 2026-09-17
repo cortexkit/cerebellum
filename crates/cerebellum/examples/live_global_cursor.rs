@@ -608,7 +608,7 @@ mod probe {
                     NAME,
                     format!(
                         "attempt {attempt}: wire outcome=not_idle; journal \
-                         abort.reason.idle_gate_refused observed_ms={observed} \
+                         abort.reason.idle_gate_refused hid_idle_ms={observed} \
                          threshold_ms={threshold}"
                     ),
                 );
@@ -1191,7 +1191,10 @@ mod probe {
                 .get("reason")?
                 .get("idle_gate_refused")?;
             Some((
-                refusal.get("observed_ms")?.as_u64()?,
+                refusal
+                    .get("hid_idle_ms")
+                    .or_else(|| refusal.get("observed_ms"))?
+                    .as_u64()?,
                 refusal.get("threshold_ms")?.as_u64()?,
             ))
         }
@@ -1322,28 +1325,30 @@ mod probe {
     /// permission and posts no input event, so it cannot itself trip the idle
     /// gate the arm is measuring. (AppleScript into TextEdit was tried first
     /// and blocks on an Automation consent prompt nobody can answer from SSH.)
+    ///
+    /// Two utterances only, each spoken to completion: spoken digits overlap
+    /// one another (a word takes longer than the second it marks) and the
+    /// operator hears several voices at once. The seconds are printed; the
+    /// speech carries the two moments that matter.
     fn countdown(instruction: &str) {
         println!();
         println!("{instruction}");
-        speak("get ready to move the mouse");
+        speak(&format!("{instruction}. ten seconds."));
         for remaining in (1..=10).rev() {
             println!("  {remaining}...");
-            if remaining <= 3 {
-                speak(&remaining.to_string());
-            }
             std::thread::sleep(Duration::from_secs(1));
         }
         println!("  NOW");
-        speak("now, move the mouse, keep moving");
+        speak("now");
     }
 
-    /// Best effort and non-blocking; a failure to speak changes nothing about
-    /// the arm.
+    /// Spoken to completion so two calls never overlap. A failure to speak
+    /// changes nothing about the arm.
     fn speak(text: &str) {
         let _ = std::process::Command::new("/usr/bin/say")
             .arg(text)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .status();
     }
 }
