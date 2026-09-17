@@ -555,8 +555,12 @@ mod probe {
         const NUMBER: &str = "2-";
         const NAME: &str = "idle_gate_refuses_after_input";
 
-        countdown("move the mouse when this says NOW, and keep moving it");
-        for attempt in 1..=5 {
+        countdown("idle arm: at NOW, wait one second, then move the mouse for three seconds");
+        // Fifteen attempts at 200 ms cover three seconds after NOW: the
+        // operator is told to wait a second before moving, the same
+        // instruction every cue gets, so the refusal can arrive anywhere in
+        // the first few seconds rather than only at once.
+        for attempt in 1..=15 {
             if let Err(reason) = wire.take_once_lease().await {
                 return Arm::unmeasurable(NUMBER, NAME, reason);
             }
@@ -618,7 +622,7 @@ mod probe {
         Arm::fail(
             NUMBER,
             NAME,
-            "five moves at 200ms spacing after the countdown were all admitted; either the \
+            "fifteen moves at 200ms spacing after the countdown were all admitted; either the \
              operator's input did not land in the window or the idle gate did not see it",
         )
     }
@@ -1354,14 +1358,17 @@ mod probe {
     /// gate the arm is measuring. (AppleScript into TextEdit was tried first
     /// and blocks on an Automation consent prompt nobody can answer from SSH.)
     ///
-    /// Two utterances only, each spoken to completion: spoken digits overlap
-    /// one another (a word takes longer than the second it marks) and the
-    /// operator hears several voices at once. The seconds are printed; the
-    /// speech carries the two moments that matter.
+    /// Two short utterances only, each spoken to completion: "get ready" and
+    /// "now". Spoken digits overlap one another (a word takes longer than the
+    /// second it marks), and a spoken instruction with numbers in it
+    /// ("wait one second, then three seconds, ten seconds") was heard as
+    /// noise. What to do at "now" is told to the operator ONCE, before the
+    /// run, and is the same for every cue: wait a second, then move the
+    /// mouse for a few seconds. The seconds are printed for the SSH reader.
     fn countdown(instruction: &str) {
         println!();
         println!("{instruction}");
-        speak(&format!("{instruction}. ten seconds."));
+        speak("get ready");
         for remaining in (1..=10).rev() {
             println!("  {remaining}...");
             std::thread::sleep(Duration::from_secs(1));
