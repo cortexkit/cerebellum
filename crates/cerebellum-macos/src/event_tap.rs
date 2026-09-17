@@ -14,6 +14,27 @@ pub struct SessionEvent {
     pub event_type: u32,
     /// `kCGEventSourceUserData`, used to recognize an observer heartbeat.
     pub marker_nonce: u64,
+    /// The event's own timestamp, nanoseconds on the same clock as
+    /// [`uptime_now_ns`]. A consumer that subtracts this from that clock at the
+    /// moment it drains the event measures how late it learned of the event
+    /// end to end (window server, tap callback, channel, its own loop), which
+    /// is the quantity a seize-latency bound is about. Time since some other
+    /// instant of the consumer's choosing is not.
+    pub timestamp_ns: u64,
+}
+
+/// Nanoseconds since boot on the clock CoreGraphics stamps events with
+/// (`CLOCK_UPTIME_RAW`; it does not advance while the machine sleeps, and
+/// neither does an event timestamp).
+#[cfg(target_os = "macos")]
+pub fn uptime_now_ns() -> u64 {
+    extern "C" {
+        fn clock_gettime_nsec_np(clock_id: u32) -> u64;
+    }
+    // <time.h>: CLOCK_UPTIME_RAW == 8 on every macOS this crate supports.
+    const CLOCK_UPTIME_RAW: u32 = 8;
+    // SAFETY: a libc call with no pointer arguments.
+    unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
 }
 
 /// Why a session event tap was not started.
@@ -261,10 +282,12 @@ mod framework {
             Some(unsafe { event.as_ref() }),
             CGEventField::EventSourceUserData,
         ) as u64;
+        let timestamp_ns = CGEvent::timestamp(Some(unsafe { event.as_ref() }));
         let _ = state.tx.send(SessionEvent {
             source_unix_process_id,
             event_type: event_type.0,
             marker_nonce,
+            timestamp_ns,
         });
         event.as_ptr()
     }
@@ -285,6 +308,7 @@ mod tests {
             source_unix_process_id: 0,
             event_type: 5,
             marker_nonce: 0,
+            timestamp_ns: 0,
         };
         let (tx, rx) = session_event_channel(2);
         assert!(tx.try_send(event).is_ok());

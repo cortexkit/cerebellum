@@ -202,13 +202,11 @@ fn observe_session_event(
     event: cerebellum_macos::SessionEvent,
     our_pid: i64,
     index: usize,
-    started: Instant,
 ) {
-    let detection_latency_ms = u32::try_from(elapsed_millis(started)).unwrap_or(u32::MAX);
     watcher.observe_sourced_input(
         SourcedInputEvent {
             source_unix_process_id: event.source_unix_process_id,
-            detection_latency_ms,
+            detection_latency_ms: detection_latency_ms(&event),
         },
         our_pid,
         index,
@@ -220,22 +218,28 @@ fn drain_session_events(
     watcher: &mut SeizeWatcher,
     our_pid: i64,
     index: usize,
-    started: Instant,
 ) {
     while let Ok(event) = tap.events().try_recv() {
-        observe_session_event(watcher, event, our_pid, index, started);
+        observe_session_event(watcher, event, our_pid, index);
     }
 }
 
-fn sourced_from_tap(
-    tap: &cerebellum_macos::SessionEventTap,
-    started: Instant,
-) -> Vec<SourcedInputEvent> {
+/// How late this loop learned of an event: the event's own timestamp against
+/// the same clock read now, so the number covers the window server, the tap
+/// callback, the channel, and this loop's own pace. Measured against the
+/// sequence start it read as the age of the sequence and exceeded every
+/// bound on a VM; the bound is about the event.
+fn detection_latency_ms(event: &cerebellum_macos::SessionEvent) -> u32 {
+    let now = cerebellum_macos::uptime_now_ns();
+    u32::try_from(now.saturating_sub(event.timestamp_ns) / 1_000_000).unwrap_or(u32::MAX)
+}
+
+fn sourced_from_tap(tap: &cerebellum_macos::SessionEventTap) -> Vec<SourcedInputEvent> {
     let mut events = Vec::new();
     while let Ok(event) = tap.events().try_recv() {
         events.push(SourcedInputEvent {
             source_unix_process_id: event.source_unix_process_id,
-            detection_latency_ms: u32::try_from(elapsed_millis(started)).unwrap_or(u32::MAX),
+            detection_latency_ms: detection_latency_ms(&event),
         });
     }
     events
@@ -262,7 +266,7 @@ fn heartbeat_observation(
         let Ok(event) = tap.events().recv_timeout(remaining) else {
             return HeartbeatObservation::Missed;
         };
-        observe_session_event(watcher, event, probe.our_pid, 0, started);
+        observe_session_event(watcher, event, probe.our_pid, 0);
         if event.source_unix_process_id == probe.our_pid && event.marker_nonce == probe.marker.nonce
         {
             return HeartbeatObservation::Seen {
@@ -325,7 +329,7 @@ fn dispatch_synthetic_globally(
                     cerebellum_macos::EventSourceStateTable::HidSystem,
                 ))
             },
-            drain: |tap: &cerebellum_macos::SessionEventTap| sourced_from_tap(tap, started),
+            drain: |tap: &cerebellum_macos::SessionEventTap| sourced_from_tap(tap),
             post_heartbeat: || {
                 let posted_at_ms = elapsed_millis(started);
                 let _ = cerebellum_macos::post_event_globally(marker_event);
@@ -368,7 +372,7 @@ fn dispatch_synthetic_globally(
                 minimum_inter_post_interval_ms,
             )));
         }
-        drain_session_events(&tap, &mut watcher, our_pid, index, started);
+        drain_session_events(&tap, &mut watcher, our_pid, index);
         if let Some(abort) = watcher.abort_decision() {
             estimator.clear_carry();
             return Err(DriverError::ObservedDispatchAborted(abort));
@@ -410,8 +414,7 @@ fn dispatch_synthetic_globally(
             Ok(event) => {
                 let sourced = SourcedInputEvent {
                     source_unix_process_id: event.source_unix_process_id,
-                    detection_latency_ms: u32::try_from(elapsed_millis(started))
-                        .unwrap_or(u32::MAX),
+                    detection_latency_ms: detection_latency_ms(&event),
                 };
                 if !event_is_ours(sourced, our_pid) {
                     hardware_seen = true;

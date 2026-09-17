@@ -57,7 +57,7 @@ pub use accessibility::{
     request_accessibility_action,
 };
 #[cfg(target_os = "macos")]
-pub use event_tap::SessionEventTap;
+pub use event_tap::{uptime_now_ns, SessionEventTap};
 #[cfg(any(target_os = "macos", test))]
 pub use event_tap::{SessionEvent, SessionEventTapError};
 #[cfg(target_os = "macos")]
