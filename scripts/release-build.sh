@@ -150,14 +150,31 @@ export CEREBELLUM_ATTENDANCE_CONTRACT_REVISION="v1"
 # requirement names that identifier and a certificate rather than a cdhash.
 export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 
-# ---------------------------------------------------------------------------
-# Not yet minted: global observed dispatch.
+# Global observed dispatch: computer.move, computer.scroll, computer.drag.
+# Session-global pointer posting at the session tap, the top containment rung
+# (global_none, tier 4), reviewed at subconscious 5a89716c
+# (docs/reviews/global-dispatch-review-v1.md) against cerebellum 1e675685,
+# from a packet run over the wire on a macOS VM under its own daemon:
+#   - global_none / tier 4 on wire and journal for all three rows;
+#   - focus TOCTOU: a target that is not frontmost is refused with no post;
+#   - idle gate: passes after 2 s of no input, refuses at 1-9 ms after a
+#     person's input;
+#   - seize mid-sequence: input from another pid (hardware, and a second
+#     process) stops the sequence at the next post, attributed, at 0 ms
+#     detection latency against a 50 ms bound, and input after the last post
+#     lets the sequence complete.
+# The review records the four defects the packet found and their fixes
+# (gate reading the age of its own posts; estimator dying with the
+# per-dispatch driver; frontmost read at 170-260 ms per post; sleep-then-drain
+# making the bound unmeetable), each with a test that reddens on the old
+# shape, and the one mutation invisible to every other assertion (tap
+# created after the idle read) as a failure line.
 #
-# CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION is deliberately listed below and
-# left unset. The implementation therefore ships inert until an external review
-# mints the revision that authorizes session-global input posting.
-# ---------------------------------------------------------------------------
-#
+# Scope: macOS global-stream pointer operations only. Windows and any non-HID
+# delivery path are v2 by policy; a seize the count discriminator fails to
+# catch is a taxonomy change, not a tuning change.
+export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
+
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
 # "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
