@@ -644,54 +644,88 @@ mod probe {
         const ONE_NAME: &str = "abort_on_hardware_input_during_sequence";
         const SEVEN: &str = "7";
         const SEVEN_NAME: &str = "abort_latency_bound";
+        // A drag is three posts 50 ms apart plus a 100 ms tail: about a quarter
+        // of a second in which a hardware event aborts it. No person can hold
+        // still for the second the idle gate requires and then move inside
+        // that window on cue. So the probe does the timing: from NOW it issues
+        // drags back to back for this long while the operator starts moving
+        // about a second in. The first hardware event then lands in one of
+        // three places -- mid-sequence (the abort this arm wants), in the tail
+        // (clears the carry), or between drags (the next one refuses
+        // not_idle) -- and with no gap between drags the mid-sequence case is
+        // reached in a good fraction of rounds. Five rounds make missing it
+        // every time unlikely; one hit is a measurement.
+        const BURST: Duration = Duration::from_secs(6);
+        const ROUNDS: u32 = 5;
 
         let mut aborts = 0u32;
         let mut worst: Option<(u32, u32)> = None;
         let mut evidence = Vec::new();
 
-        for round in 1..=3 {
+        for round in 1..=ROUNDS {
             countdown(&format!(
-                "round {round} of 3: move the mouse when this says NOW, and keep moving it"
+                "round {round} of {ROUNDS}: after now, wait one second, then move the mouse \
+                 for three seconds"
             ));
-            if let Err(reason) = wire.take_once_lease().await {
-                return (
-                    Arm::unmeasurable(ONE, ONE_NAME, reason),
-                    Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
-                );
-            }
-            let before = match journal_entries() {
-                Ok(entries) => entries,
-                Err(reason) => {
+            let burst_started = std::time::Instant::now();
+            let (mut completed, mut refused_not_idle) = (0u32, 0u32);
+            let seized = loop {
+                if burst_started.elapsed() > BURST {
+                    break None;
+                }
+                if let Err(reason) = wire.take_once_lease().await {
                     return (
                         Arm::unmeasurable(ONE, ONE_NAME, reason),
                         Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                    );
+                }
+                let before = match journal_entries() {
+                    Ok(entries) => entries,
+                    Err(reason) => {
+                        return (
+                            Arm::unmeasurable(ONE, ONE_NAME, reason),
+                            Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                        )
+                    }
+                };
+                let reply = match wire
+                    .tool_call(
+                        "computer.drag",
+                        json!({
+                            "from": "1,1",
+                            "to": "3839,2159",
+                            "button": "left",
+                            "modifiers": [],
+                        }),
                     )
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(reason) => {
+                        return (
+                            Arm::unmeasurable(ONE, ONE_NAME, reason),
+                            Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                        )
+                    }
+                };
+                match reply["outcome"].as_str() {
+                    Some("user_seized_control") => break Some(before),
+                    Some("not_idle") => refused_not_idle += 1,
+                    Some("completed") => completed += 1,
+                    other => {
+                        evidence.push(format!("round {round}: answered {other:?}"));
+                        break None;
+                    }
                 }
             };
-            let reply = match wire
-                .tool_call(
-                    "computer.drag",
-                    json!({
-                        "from": "1,1",
-                        "to": "3839,2159",
-                        "button": "left",
-                        "modifiers": [],
-                    }),
-                )
-                .await
-            {
-                Ok(reply) => reply,
-                Err(reason) => {
-                    return (
-                        Arm::unmeasurable(ONE, ONE_NAME, reason),
-                        Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
-                    )
-                }
-            };
-            if reply["outcome"] != json!("user_seized_control") {
-                evidence.push(format!("round {round}: answered {}", reply["outcome"]));
+            let Some(before) = seized else {
+                evidence.push(format!(
+                    "round {round}: no abort within {}s ({completed} completed, \
+                     {refused_not_idle} refused not_idle)",
+                    BURST.as_secs()
+                ));
                 continue;
-            }
+            };
             let record = match settled_record(&before, "computer.drag") {
                 Ok(record) => record,
                 Err(reason) => {
@@ -745,7 +779,8 @@ mod probe {
                 (Some(measured), Some(bound)) => {
                     evidence.push(format!(
                         "round {round}: wire user_seized_control, source=hardware, \
-                         detection_latency_ms={measured} bound={bound}"
+                         detection_latency_ms={measured} bound={bound} (after {completed} \
+                         completed drags)"
                     ));
                     if worst.is_none_or(|(previous, _)| measured > previous) {
                         worst = Some((measured, bound));
@@ -778,7 +813,7 @@ mod probe {
                     ONE,
                     ONE_NAME,
                     format!(
-                        "three drags issued at the countdown were never aborted ({})",
+                        "{ROUNDS} bursts of drags were never aborted mid-sequence ({})",
                         evidence.join("; ")
                     ),
                 ),
@@ -788,32 +823,25 @@ mod probe {
         let one = Arm::pass(
             ONE,
             ONE_NAME,
-            format!("{aborts} of 3 rounds aborted: {}", evidence.join("; ")),
+            format!(
+                "{aborts} of {ROUNDS} rounds aborted on hardware input; {}",
+                evidence.join("; ")
+            ),
         );
-        let Some((measured, bound)) = worst else {
-            return (
-                one,
-                Arm::unmeasurable(SEVEN, SEVEN_NAME, "no latency was recorded"),
-            );
-        };
-        let seven = if measured <= bound {
-            Arm::pass(
+        let seven = match worst {
+            Some((measured, bound)) if measured <= bound => Arm::pass(
                 SEVEN,
                 SEVEN_NAME,
                 format!(
-                    "worst of {aborts} abort(s): detection_latency_ms={measured} <= \
-                     maximum_detection_latency_ms={bound}"
+                    "worst detection_latency_ms={measured} <= bound {bound} over {aborts} aborts"
                 ),
-            )
-        } else {
-            Arm::fail(
+            ),
+            Some((measured, bound)) => Arm::fail(
                 SEVEN,
                 SEVEN_NAME,
-                format!(
-                    "worst of {aborts} abort(s): detection_latency_ms={measured} exceeds \
-                     maximum_detection_latency_ms={bound}"
-                ),
-            )
+                format!("worst detection_latency_ms={measured} exceeds bound {bound}"),
+            ),
+            None => Arm::unmeasurable(SEVEN, SEVEN_NAME, "no abort carried a latency"),
         };
         (one, seven)
     }
