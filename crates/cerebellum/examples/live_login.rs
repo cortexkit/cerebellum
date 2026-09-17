@@ -335,9 +335,10 @@ async fn present_fronts_the_window(planes: &Planes, origin: &str) -> ArmVerdict 
 
     let status = invoke_tool(planes, 21, "browser.status", json!({})).await;
     println!("browser.status after present: {status}");
-    let Some(browser_pid) = status_process_pid(&status) else {
+    let Some(browser_pid) = launched_browser_pid() else {
         return ArmVerdict::Fail(format!(
-            "browser.status does not expose the session process pid: {status}"
+            "no child of this probe carries --remote-debugging-pipe; the launched browser \
+             was not found (status: {status})"
         ));
     };
 
@@ -369,13 +370,26 @@ async fn present_fronts_the_window(planes: &Planes, origin: &str) -> ArmVerdict 
     }
 }
 
-fn status_process_pid(status: &Value) -> Option<i32> {
-    status
-        .get("pid")
-        .and_then(Value::as_i64)
-        .or_else(|| status.get("process_pid").and_then(Value::as_i64))
-        .or_else(|| status.pointer("/process/pid").and_then(Value::as_i64))
-        .and_then(|pid| i32::try_from(pid).ok())
+/// The pid of the browser this in-process harness launched.
+///
+/// `browser.status` deliberately reports no pid (its envelope is closed and a
+/// pid is not something a caller can act on), and the launcher runs in this
+/// process, so the browser is a direct child of the probe: the one child
+/// carrying the pipe flag the custody rules require.
+fn launched_browser_pid() -> Option<i32> {
+    let output = std::process::Command::new("/usr/bin/pgrep")
+        .args([
+            "-P",
+            &std::process::id().to_string(),
+            "-f",
+            "remote-debugging-pipe",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .next()
 }
 
 async fn tools_refuse_while_human_in_control(
