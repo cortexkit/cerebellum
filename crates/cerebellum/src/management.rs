@@ -17,6 +17,7 @@
 //! trip and teaches.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,15 +39,18 @@ use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindRe
 pub const OPEN_TARGET: &str = "computer.open_target";
 /// Ask a person to issue a hazard-scoped browser action grant.
 pub const OPEN_GRANT: &str = "browser.open_grant";
+/// Copy persistent encrypted login rows from the person's matching browser.
+pub const IMPORT_LOGIN: &str = "browser.import_login";
 /// Hand the route-owned browser window to the person for login.
 pub const PRESENT: &str = "browser.present";
 /// End or collect the result of a browser login handoff.
 pub const RESUME: &str = "browser.resume";
 /// Re-identify a moved or restored browser profile root without adopting profiles.
 pub const REBIND_PROFILE_ROOT: &str = "browser.rebind_profile_root";
-pub const OPERATIONS: [&str; 5] = [
+pub const OPERATIONS: [&str; 6] = [
     OPEN_TARGET,
     OPEN_GRANT,
+    IMPORT_LOGIN,
     PRESENT,
     RESUME,
     REBIND_PROFILE_ROOT,
@@ -396,6 +400,35 @@ impl ManagementPlane {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             Err("profile_registry_platform_unavailable")
+        }
+    }
+
+    /// Resolve the existing durable profile selected by the route's project identity.
+    pub fn durable_login_profile_location(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<crate::login_import::DurableProfileLocation>, &'static str> {
+        let lifecycle = self.profile_lifecycle_for_rebind()?;
+        let registry = lifecycle.registry();
+        let resolution = registry
+            .resolve_durable(project_id)
+            .map_err(|_| "profile_registry_unavailable")?;
+        match resolution {
+            crate::profile::DurableResolution::TrustworthyExisting(record) => {
+                let profile = registry
+                    .root()
+                    .open_target(Path::new(&record.target))
+                    .map_err(|_| "profile_registry_unavailable")?;
+                Ok(Some(crate::login_import::DurableProfileLocation {
+                    managed_root: registry.root().canonical_path().to_path_buf(),
+                    profile_directory: profile.canonical_path().to_path_buf(),
+                }))
+            }
+            crate::profile::DurableResolution::AffirmativeAbsence
+            | crate::profile::DurableResolution::Unavailable => Ok(None),
+            crate::profile::DurableResolution::Untrustworthy(_) => {
+                Err("profile_registry_unavailable")
+            }
         }
     }
 

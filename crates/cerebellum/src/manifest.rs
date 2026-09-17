@@ -129,6 +129,11 @@ fn management_surface() -> ProviderRole {
                  request is pending; the grant exists only if they agree.",
             ),
             (
+                crate::management::IMPORT_LOGIN,
+                "With the person's approval, copy persistent encrypted login rows from the \
+                 same configured Chromium binary into the route's closed durable profile.",
+            ),
+            (
                 crate::management::PRESENT,
                 "Front the route-owned browser and hand control to the person for login. \
                  Refuses when no session exists, the page is off-origin, or a handoff is open.",
@@ -147,10 +152,15 @@ fn management_surface() -> ProviderRole {
         .into_iter()
         .map(|(name, description)| ManagementOperation {
             name: name.to_string(),
-            // These operations return before a person answers. They report the
-            // pending request and arrange authority without performing the
-            // browser or computer action the authority may later admit.
-            kind: ManagementOperationKind::Query,
+            kind: if name == crate::management::IMPORT_LOGIN {
+                // A successful import changes the closed durable profile's
+                // cookie store after the person chooses a source browser.
+                ManagementOperationKind::Mutate
+            } else {
+                // The remaining operations report state or arrange authority;
+                // browser actions happen later on the tool surface.
+                ManagementOperationKind::Query
+            },
             // These are the operations our refusals NAME as the remedy -- a
             // caller told to "mint a covering grant" arrives here to find out
             // what that means. An empty description satisfies the compiler and
@@ -857,6 +867,7 @@ mod tests {
             vec![
                 crate::management::OPEN_TARGET,
                 crate::management::OPEN_GRANT,
+                crate::management::IMPORT_LOGIN,
                 crate::management::PRESENT,
                 crate::management::RESUME,
                 crate::management::REBIND_PROFILE_ROOT,
@@ -870,6 +881,23 @@ mod tests {
         assert!(advertised
             .iter()
             .all(|name| crate::dispatchable_management_operation(name)));
+    }
+
+    #[test]
+    fn importing_a_login_is_advertised_as_a_mutation() {
+        let manifest = build("cerebellum");
+        let Some(ProviderRole::ManagementSurface { operations, .. }) = manifest
+            .provides
+            .iter()
+            .find(|role| matches!(role, ProviderRole::ManagementSurface { .. }))
+        else {
+            panic!("expected a ManagementSurface role");
+        };
+        let import = operations
+            .iter()
+            .find(|operation| operation.name == crate::management::IMPORT_LOGIN)
+            .expect("browser.import_login is advertised");
+        assert_eq!(import.kind, ManagementOperationKind::Mutate);
     }
 
     /// Opening a target is advertised as a query.

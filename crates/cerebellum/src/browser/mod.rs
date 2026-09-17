@@ -698,7 +698,8 @@ pub fn journal_action(capability: JournalCapability) -> Option<JournalAction> {
         JournalCapability::Snapshot
         | JournalCapability::Screenshot
         | JournalCapability::WaitFor
-        | JournalCapability::Present => return None,
+        | JournalCapability::Present
+        | JournalCapability::ImportLogin => return None,
     })
 }
 
@@ -991,6 +992,35 @@ impl BrowserPlane {
             Some(close.cookie_names_added as u64),
         )
         .await
+    }
+
+    /// Record one login-import decision without cookie names or values.
+    pub async fn journal_login_import(
+        &self,
+        identity: &RouteIdentity,
+        origin: &str,
+        outcome: &str,
+        source_browser: Option<&str>,
+        rows: u64,
+    ) -> Result<(), JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        journal
+            .store
+            .as_mut()
+            .expect("an enabled journal mode opens one store")
+            .commit_login_import(
+                journal_identity(identity),
+                origin.to_string(),
+                outcome.to_string(),
+                source_browser.map(str::to_string),
+                rows,
+            )
     }
 
     async fn journal_handoff(

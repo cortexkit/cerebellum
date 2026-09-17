@@ -28,6 +28,7 @@ pub mod elicit;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
+pub mod login_import;
 pub mod management;
 pub mod manifest;
 pub mod network;
@@ -723,7 +724,10 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 pub fn dispatchable_management_operation(name: &str) -> bool {
     matches!(
         name,
-        management::OPEN_TARGET | management::OPEN_GRANT | management::REBIND_PROFILE_ROOT
+        management::OPEN_TARGET
+            | management::OPEN_GRANT
+            | management::IMPORT_LOGIN
+            | management::REBIND_PROFILE_ROOT
     ) || (matches!(name, management::PRESENT | management::RESUME)
         && browser::has_wire_dispatch_route(name))
 }
@@ -1670,16 +1674,22 @@ impl Planes {
                 ),
             )
         } else {
-            // No journal on the unconfigured branch. This plane serves nothing
-            // -- every capability refuses for want of a browser -- so opening a
-            // file on disk for a surface that cannot produce a record would be
-            // a claim about audit coverage that does not exist.
+            // The action surface is unavailable without browser configuration,
+            // but browser.import_login still journals its typed configuration
+            // refusal on the management surface.
             Arc::new(
                 BrowserPlane::new()
                     .with_result_schema_enforcement(
                         computer_capability::ResultSchemaEnforcement::Withhold,
                     )
-                    .with_shared_grants(browser_grants),
+                    .with_shared_grants(browser_grants)
+                    .with_journal_persistence(
+                        matches!(journal, JournalPersistence::Durable),
+                        journal::JournalConfig {
+                            journal_retention_bytes: BROWSER_DRIVE_JOURNAL_BYTES,
+                            journal_max_entry_bytes: BROWSER_DRIVE_JOURNAL_MAX_ENTRY_BYTES,
+                        },
+                    ),
             )
         };
         #[cfg(target_os = "macos")]
@@ -1979,7 +1989,7 @@ async fn handle_management_request(
         .await;
     };
 
-    if method == management::PRESENT {
+    if matches!(method, management::PRESENT | management::IMPORT_LOGIN) {
         if let Some(field) = params_object
             .keys()
             .filter(|field| field.as_str() != "origin")
@@ -2032,7 +2042,11 @@ async fn handle_management_request(
             )
             .await;
         }
-        let reply = present_browser_handoff(planes, &facts.identity, origin).await;
+        let reply = if method == management::IMPORT_LOGIN {
+            import_browser_login(planes, facts, writer, channel, epoch, origin).await
+        } else {
+            present_browser_handoff(planes, &facts.identity, origin).await
+        };
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
     }
 
@@ -2281,6 +2295,140 @@ async fn handle_management_request(
     }
 
     send_tool_response(writer, ver, channel, epoch, corr, reply).await
+}
+
+async fn import_browser_login(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    writer: &mpsc::Sender<Frame>,
+    channel: u16,
+    epoch: u32,
+    origin: &str,
+) -> Value {
+    let status = planes.sessions.status(
+        &facts.identity.conversation_key,
+        planes.lease_clock.as_ref(),
+        std::time::SystemTime::now(),
+    );
+    let session_open = status.get("outcome").and_then(Value::as_str) == Some("ready");
+    let durable = facts.identity.profile_disposition == ProfileDisposition::Durable;
+    if let Err(result) = login_import::profile_precondition(origin, durable, session_open) {
+        return journal_login_import_result(planes, &facts.identity, *result).await;
+    }
+    if !facts.declares_elicitation() {
+        let result = login_import::ImportResult::refusal(
+            origin,
+            "elicitation_undeclared",
+            "reconnect with a route that declares elicitation support",
+        );
+        return journal_login_import_result(planes, &facts.identity, result).await;
+    }
+    let location = match planes
+        .management
+        .durable_login_profile_location(&facts.identity.agent_project_id)
+    {
+        Ok(Some(location)) => location,
+        Ok(None) => {
+            let result = login_import::ImportResult::refusal(
+                origin,
+                "profile_not_durable",
+                "launch the durable profile once so the profile registry can mint it",
+            );
+            return journal_login_import_result(planes, &facts.identity, result).await;
+        }
+        Err(_) => {
+            let result = login_import::ImportResult::refusal(
+                origin,
+                "profile_not_durable",
+                "restore access to the durable browser profile registry, then retry",
+            );
+            return journal_login_import_result(planes, &facts.identity, result).await;
+        }
+    };
+    let Some(launch_executable) = planes
+        .browser_config
+        .as_ref()
+        .and_then(|config| config.executable_path.as_deref())
+    else {
+        let result = login_import::ImportResult::refusal(
+            origin,
+            "launch_binary_unsupported",
+            "configure a supported Chromium-family browser executable",
+        );
+        return journal_login_import_result(planes, &facts.identity, result).await;
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        let result = login_import::ImportResult::refusal(
+            origin,
+            "launch_binary_unsupported",
+            "run the module with a readable user home directory",
+        );
+        return journal_login_import_result(planes, &facts.identity, result).await;
+    };
+    let plan = match login_import::prepare_import(
+        origin,
+        &facts.identity.agent_project_id,
+        launch_executable,
+        location,
+        login_import::ImportSettings::production(&home),
+    ) {
+        login_import::PreparedImport::Ready(plan) => plan,
+        login_import::PreparedImport::Refused(result) => {
+            return journal_login_import_result(planes, &facts.identity, result).await
+        }
+    };
+
+    let ask_id = login_import::new_ask_id();
+    let question = plan.question(&ask_id, &facts.identity.agent_project_id);
+    let answer = planes
+        .elicitor
+        .ask(
+            writer,
+            channel,
+            epoch,
+            question,
+            login_import::ELICITATION_DEADLINE,
+        )
+        .await;
+    let decision = match &answer {
+        elicit::AskOutcome::Answered(body) => body.get("decision").and_then(Value::as_str),
+        elicit::AskOutcome::NoAnswer | elicit::AskOutcome::Undeliverable => None,
+    };
+    if decision.is_some_and(|value| value.starts_with("transfer:")) {
+        let status = planes.sessions.status(
+            &facts.identity.conversation_key,
+            planes.lease_clock.as_ref(),
+            std::time::SystemTime::now(),
+        );
+        if status.get("outcome").and_then(Value::as_str) == Some("ready") {
+            let result = plan.refusal("session_open", "browser.close");
+            return journal_login_import_result(planes, &facts.identity, result).await;
+        }
+    }
+    let result = plan.decide(decision);
+    journal_login_import_result(planes, &facts.identity, result).await
+}
+
+async fn journal_login_import_result(
+    planes: &Planes,
+    identity: &RouteIdentity,
+    result: login_import::ImportResult,
+) -> Value {
+    if planes
+        .browser
+        .journal_login_import(
+            identity,
+            &result.origin,
+            &result.outcome,
+            result.browser.as_deref(),
+            result.rows,
+        )
+        .await
+        .is_err()
+    {
+        return json!({"outcome":"internal_failure","reason":"journal_unavailable"});
+    }
+    result.to_value()
 }
 
 async fn present_browser_handoff(planes: &Planes, identity: &RouteIdentity, origin: &str) -> Value {
@@ -4079,6 +4227,92 @@ mod tests {
                 .await
                 .is_err(),
             "a consumer that did not declare elicitation received a question"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_import_login_params_are_exactly_closed() {
+        let cases = [
+            (
+                json!({"method": management::IMPORT_LOGIN, "params": {"origin": "https://x.com", "extra": true}}),
+                "extra",
+                "unknown_field",
+            ),
+            (
+                json!({"method": management::IMPORT_LOGIN, "params": {}}),
+                "origin",
+                "missing_field",
+            ),
+            (
+                json!({"method": management::IMPORT_LOGIN, "params": {"origin": 7}}),
+                "origin",
+                "wrong_type",
+            ),
+            (
+                json!({"method": management::IMPORT_LOGIN, "params": {"origin": "https://x.com/path"}}),
+                "origin",
+                "invalid_origin",
+            ),
+        ];
+
+        for (correlation, (request, field, reason)) in cases.into_iter().enumerate() {
+            let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+            let planes = management_bound_planes(4, 1);
+            let frame = Frame::build_with_version(
+                subc_protocol::PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                4,
+                1,
+                correlation as u64 + 100,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            handle_route_request(frame, &writer_tx, &planes)
+                .await
+                .expect("the import request is answered");
+            let response = writer_rx.recv().await.expect("an invalid-request response");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["outcome"], "invalid_request", "{body}");
+            assert_eq!(body["detail"]["field"], field, "{body}");
+            assert_eq!(body["detail"]["reason_code"], reason, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_import_login_refuses_when_elicitation_was_not_declared() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let planes = management_bound_planes(4, 1);
+        let request = json!({
+            "method": management::IMPORT_LOGIN,
+            "params": {"origin": "https://x.com"},
+        });
+        let frame = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            104,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+
+        handle_route_request(frame, &writer_tx, &planes)
+            .await
+            .expect("the import request is answered");
+        let response = writer_rx.recv().await.expect("an immediate refusal");
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["outcome"], "elicitation_undeclared", "{body}");
+        assert_eq!(
+            body["remedy"], "reconnect with a route that declares elicitation support",
+            "{body}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), writer_rx.recv())
+                .await
+                .is_err(),
+            "an undeclared elicitation question was sent"
         );
     }
 

@@ -16,8 +16,8 @@ use cerebellum::journal::snapshots::{Observation, SnapshotError, SnapshotStore};
 use cerebellum::journal::store::JournalStore;
 use cerebellum::journal::{
     Action, Capability, GoverningObservation, GrantDecision, GrantOutcome, HandoffJournalOutcome,
-    JournalConfig, JournalEntry, JournalIdentity, JournalReasonCode, NavigateWait, Outcome,
-    PolicyEventDetail, SessionKind,
+    JournalConfig, JournalEntry, JournalIdentity, JournalPayload, JournalReasonCode, NavigateWait,
+    Outcome, PolicyEventDetail, SessionKind,
 };
 
 fn identity() -> JournalIdentity {
@@ -548,6 +548,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
         (Capability::Screenshot, "browser.screenshot"),
         (Capability::WaitFor, "browser.wait_for"),
         (Capability::Present, "browser.present"),
+        (Capability::ImportLogin, "browser.import_login"),
     ];
 
     let mut seen = std::collections::BTreeSet::new();
@@ -558,7 +559,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
             "{name} is claimed by more than one capability"
         );
     }
-    assert_eq!(seen.len(), 8, "a capability was added without a name here");
+    assert_eq!(seen.len(), 9, "a capability was added without a name here");
 }
 
 #[test]
@@ -568,6 +569,15 @@ fn v3_fixture_reads_through_the_v4_reader() {
     assert_eq!(entry.format_version, "ck-browser-journal/v3");
     assert_eq!(entry.capability, Some(Capability::Snapshot));
     assert!(entry.payload.is_none());
+}
+
+#[test]
+fn v4_fixture_reads_through_the_v5_reader() {
+    let fixture = include_str!("fixtures/browser-journal-v4.jsonl");
+    let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v4");
+    assert_eq!(entry.capability, Some(Capability::Present));
+    assert!(matches!(entry.payload, Some(JournalPayload::Handoff(_))));
 }
 
 #[test]
@@ -597,17 +607,71 @@ fn handoff_records_carry_a_count_and_no_names() {
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().all(|entry| {
-        entry.format_version == "ck-browser-journal/v4"
+        entry.format_version == "ck-browser-journal/v5"
             && entry.capability == Some(Capability::Present)
             && entry.action.is_none()
     }));
-    let opened = entries[0].payload.as_ref().unwrap();
+    let Some(JournalPayload::Handoff(opened)) = entries[0].payload.as_ref() else {
+        panic!("opened entry must carry a handoff payload");
+    };
     assert_eq!(opened.outcome, HandoffJournalOutcome::Opened);
     assert_eq!(opened.cookie_names_added, None);
-    let closed = entries[1].payload.as_ref().unwrap();
+    let Some(JournalPayload::Handoff(closed)) = entries[1].payload.as_ref() else {
+        panic!("closed entry must carry a handoff payload");
+    };
     assert_eq!(closed.outcome, HandoffJournalOutcome::LoginObserved);
     assert_eq!(closed.cookie_names_added, Some(2));
     let serialized = journal.export();
     assert!(!serialized.contains("session_cookie"));
     assert!(!serialized.contains("csrf_cookie"));
+}
+
+#[test]
+fn login_import_records_count_and_no_cookie_names_or_values() {
+    const PLANTED_SECRET: &str = "ck-planted-cookie-value-4f6c";
+    let leaky_fixture = serde_json::json!({
+        "payload": {
+            "origin": "https://x.com",
+            "outcome": "transferred",
+            "browser": "chrome",
+            "rows": 1,
+            "cookie_value": PLANTED_SECRET,
+        }
+    });
+    let scanner = |bytes: &[u8]| {
+        bytes
+            .windows(PLANTED_SECRET.len())
+            .any(|window| window == PLANTED_SECRET.as_bytes())
+    };
+    assert!(
+        scanner(&serde_json::to_vec(&leaky_fixture).unwrap()),
+        "the planted secret did not land where the leak scanner looks"
+    );
+
+    let mut journal = store();
+    journal
+        .commit_login_import(
+            identity(),
+            "https://x.com".to_string(),
+            "transferred".to_string(),
+            Some("chrome".to_string()),
+            3,
+        )
+        .unwrap();
+    let export = journal.export();
+    let entry: JournalEntry = serde_json::from_str(export.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v5");
+    assert_eq!(entry.capability, Some(Capability::ImportLogin));
+    assert!(entry.action.is_none());
+    let Some(JournalPayload::LoginImport(payload)) = entry.payload else {
+        panic!("login import entry must carry a login-import payload");
+    };
+    assert_eq!(payload.origin, "https://x.com");
+    assert_eq!(payload.outcome, "transferred");
+    assert_eq!(payload.browser.as_deref(), Some("chrome"));
+    assert_eq!(payload.rows, 3);
+    assert!(!scanner(export.as_bytes()));
+    assert!(!export.contains("cookie_name"));
+    assert!(!export.contains("cookie_value"));
+    assert!(!export.contains("encrypted_value"));
 }
