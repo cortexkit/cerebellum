@@ -264,14 +264,14 @@ mod probe {
     }
 
     async fn quiet_arms(wire: &mut Wire) -> Vec<Arm> {
+        // The poke arm posts input from a second process, which the idle gate
+        // rightly counts as a person for the next second; it runs last so the
+        // arms that need a quiet machine are not measuring its residue.
+        let four = arm_four(wire).await;
+        let three = arm_three(wire).await;
+        let two_plus = arm_two_plus(wire).await;
         let (one, seven) = arm_one_and_seven_second_process(wire).await;
-        vec![
-            arm_four(wire).await,
-            arm_three(wire).await,
-            arm_two_plus(wire).await,
-            one,
-            seven,
-        ]
+        vec![four, three, two_plus, one, seven]
     }
 
     async fn hands_arms(wire: &mut Wire) -> Vec<Arm> {
@@ -287,6 +287,12 @@ mod probe {
     /// process seizing input: the same stop path a person's input takes,
     /// reachable at a chosen millisecond instead of whenever a hand lands.
     fn poke_after(ms: u64) -> ExitCode {
+        // Loading this binary costs tens of milliseconds on a VM, more than
+        // the delays being measured. The parent waits for this line before it
+        // sends the drag, so the delay counts from a moment both sides share.
+        use std::io::Write;
+        println!("ready");
+        let _ = std::io::stdout().flush();
         std::thread::sleep(Duration::from_millis(ms));
         let event = match cerebellum_macos::mouse_move_event(cerebellum_macos::EventPoint {
             x: 450.0,
@@ -334,7 +340,7 @@ mod probe {
         let mut aborts = 0u32;
         let mut worst: Option<(u32, u32)> = None;
         let mut evidence = Vec::new();
-        for poke_after_ms in [60u64, 110, 160] {
+        for poke_after_ms in [30u64, 80, 130] {
             // Let the machine go idle past the gate before each attempt; the
             // previous attempt's own posts are carried by the estimator, but
             // the poke was another process's input and clears the carry.
@@ -354,10 +360,10 @@ mod probe {
                     )
                 }
             };
-            let child = match Command::new(&probe_binary)
+            let mut child = match Command::new(&probe_binary)
                 .arg("--poke")
                 .arg(poke_after_ms.to_string())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
             {
@@ -371,6 +377,19 @@ mod probe {
                 }
             };
             let child_pid = i64::from(child.id());
+            {
+                use std::io::BufRead;
+                let stdout = child.stdout.take().expect("piped stdout");
+                let mut line = String::new();
+                let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+                if line.trim() != "ready" {
+                    let reason = format!("the poke child did not report ready (got {line:?})");
+                    return (
+                        Arm::unmeasurable(ONE, ONE_NAME, reason.clone()),
+                        Arm::unmeasurable(SEVEN, SEVEN_NAME, reason),
+                    );
+                }
+            }
             let reply = match wire
                 .tool_call(
                     "computer.drag",
@@ -391,7 +410,6 @@ mod probe {
                     )
                 }
             };
-            let mut child = child;
             let _ = child.wait();
             match reply["outcome"].as_str() {
                 Some("user_seized_control") => {}
