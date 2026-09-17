@@ -1686,6 +1686,13 @@ impl Planes {
             management,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: computer_capability::production_audit().map(|audit| {
+                // One idle estimator for the plane's lifetime: it exists to
+                // remember the previous sequence's posts, which a per-dispatch
+                // driver cannot do.
+                #[cfg(target_os = "macos")]
+                let user_idle = Arc::new(std::sync::Mutex::new(
+                    cerebellum_computer::dispatch::UserIdleEstimator::new(),
+                ));
                 Arc::new(computer_capability::ComputerPlane::with_synthetic_driver(
                     audit,
                     // Built fresh per dispatch: each platform driver caches
@@ -1696,9 +1703,11 @@ impl Planes {
                         let driver = computer_capability::NativeComputerPlatformDriver::default()
                             .without_expected_post_condition();
                         #[cfg(target_os = "macos")]
-                        let driver = driver.with_global_dispatch_review_revision(
-                            global_dispatch_review_revision.clone(),
-                        );
+                        let driver = driver
+                            .with_global_dispatch_review_revision(
+                                global_dispatch_review_revision.clone(),
+                            )
+                            .with_shared_user_idle(user_idle.clone());
                         driver
                     },
                 ))

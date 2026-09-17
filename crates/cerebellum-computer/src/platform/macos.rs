@@ -12,6 +12,7 @@ use crate::dispatch::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const MACOS_MAJOR_VERSION: u16 = 26;
@@ -110,7 +111,14 @@ pub struct MacOs26PlatformDriver {
     accessibility_trees: BTreeMap<String, CachedAccessibilityTree>,
     expected_post_condition_available: bool,
     global_dispatch_review_revision: Option<String>,
-    user_idle: UserIdleEstimator,
+    /// Shared across every driver the plane builds. The plane builds a driver
+    /// per dispatch (its accessibility cache must not outlive a process
+    /// generation), but the idle estimator's whole purpose is to remember the
+    /// PREVIOUS sequence's posts at the next sequence's start; an estimator
+    /// that dies with the request never carries, and a move followed by a
+    /// drag is refused as not_idle on the age of the move's own last post.
+    /// Measured on the VM: user_idle == hid_idle on every second action.
+    user_idle: Arc<Mutex<UserIdleEstimator>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,8 +816,16 @@ impl MacOs26PlatformDriver {
             accessibility_trees: BTreeMap::new(),
             expected_post_condition_available: true,
             global_dispatch_review_revision: None,
-            user_idle: UserIdleEstimator::new(),
+            user_idle: Arc::new(Mutex::new(UserIdleEstimator::new())),
         }
+    }
+
+    /// Share one idle estimator across drivers. The plane's driver factory
+    /// calls this with a single `Arc` so that every dispatch, each on a fresh
+    /// driver, reads and updates the same post log.
+    pub fn with_shared_user_idle(mut self, user_idle: Arc<Mutex<UserIdleEstimator>>) -> Self {
+        self.user_idle = user_idle;
+        self
     }
 
     /// Mark a request surface that cannot express an expected post-condition.
@@ -1089,7 +1105,11 @@ impl PlatformDriver for MacOs26PlatformDriver {
             ));
         }
         request.synthetic.target.validate()?;
-        dispatch_synthetic_globally(request, &mut self.user_idle)
+        let mut user_idle = self
+            .user_idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dispatch_synthetic_globally(request, &mut user_idle)
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;
@@ -1243,6 +1263,45 @@ impl PlatformDriver for MacOs26PlatformDriver {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// Two drivers from one factory share one idle estimator: what the first
+    /// sequence records, the second reads. A plane builds a driver per
+    /// dispatch, so an estimator owned by the driver would be new every time
+    /// and could never carry; this is the shape that fails under that
+    /// implementation and passes under a shared one.
+    #[test]
+    fn drivers_from_one_factory_share_the_idle_estimator() {
+        let shared = Arc::new(Mutex::new(UserIdleEstimator::new()));
+        let factory = {
+            let shared = shared.clone();
+            move || MacOs26PlatformDriver::default().with_shared_user_idle(shared.clone())
+        };
+        let last_post_at = Instant::now()
+            .checked_sub(Duration::from_millis(300))
+            .expect("clock past epoch");
+        // The first driver finishes a sequence and records it.
+        factory()
+            .user_idle
+            .lock()
+            .expect("estimator lock")
+            .sequence_finished(
+                last_post_at,
+                IdleReading::Milliseconds(5_000),
+                Duration::ZERO,
+            );
+        // The second driver, built afresh, reads that record: a raw HID idle
+        // of 320 ms is the age of our own post, and the user idle carries.
+        let user = factory()
+            .user_idle
+            .lock()
+            .expect("estimator lock")
+            .user_idle(IdleReading::Milliseconds(320), Instant::now());
+        assert_eq!(
+            user,
+            IdleReading::Milliseconds(5_300),
+            "the second driver did not see the first driver's sequence"
+        );
+    }
 
     /// A capability whose permission requirements cannot be read is suppressed,
     /// not advertised, and the process survives.
