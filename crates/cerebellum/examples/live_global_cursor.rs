@@ -704,8 +704,13 @@ mod probe {
                     .tool_call(
                         "computer.drag",
                         json!({
-                            "from": "1,1",
-                            "to": "3839,2159",
+                            // A short stroke well inside any display and below
+                            // the menu bar. The first version dragged from the
+                            // screen's top-left pixel, which is the Apple menu:
+                            // the mouse-down opened it on every round, and a
+                            // release over a menu item is not a no-op.
+                            "from": "400,400",
+                            "to": "520,460",
                             "button": "left",
                             "modifiers": [],
                         }),
