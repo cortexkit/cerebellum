@@ -607,6 +607,12 @@ mod probe {
                         ),
                     );
                 }
+                // Same rhythm as every other round: the window runs out and
+                // says "stop" before the verdict, so a pass caught on the
+                // first attempt does not shorten the gap before the next cue.
+                sleep(Duration::from_millis(200) * (15 - attempt)).await;
+                speak("stop");
+                sleep(Duration::from_secs(3)).await;
                 return Arm::pass(
                     NUMBER,
                     NAME,
@@ -619,6 +625,8 @@ mod probe {
             }
             sleep(Duration::from_millis(200)).await;
         }
+        speak("stop");
+        sleep(Duration::from_secs(3)).await;
         Arm::fail(
             NUMBER,
             NAME,
@@ -722,6 +730,14 @@ mod probe {
                     }
                 }
             };
+            // The window runs its full length whether or not an abort was
+            // caught, and ends with a spoken "stop": a round that ended the
+            // moment it caught something made the gap after "now" vary
+            // between two and ten seconds, and the operator could not tell
+            // when a round was over.
+            sleep(BURST.saturating_sub(burst_started.elapsed())).await;
+            speak("stop");
+            sleep(Duration::from_secs(3)).await;
             let Some(before) = seized else {
                 evidence.push(format!(
                     "round {round}: no abort within {}s ({completed} completed, \
