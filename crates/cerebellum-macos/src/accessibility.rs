@@ -1423,6 +1423,8 @@ mod platform {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXIsProcessTrusted() -> bool;
+        fn AXUIElementCreateSystemWide() -> CfTypeRef;
+        fn AXUIElementGetPid(element: CfTypeRef, pid: *mut c_int) -> i32;
         fn AXUIElementCreateApplication(pid: c_int) -> CfTypeRef;
         fn AXUIElementGetTypeID() -> usize;
         fn AXUIElementSetMessagingTimeout(element: CfTypeRef, timeout: f32) -> i32;
@@ -2002,6 +2004,74 @@ mod platform {
         Ok(strings)
     }
 
+    /// The unix process id of the application that holds keyboard focus,
+    /// asked of the accessibility server each call.
+    ///
+    /// This is the reading the observed dispatch loop takes before every post,
+    /// so it has to be both cheap and CURRENT. Two other sources were measured
+    /// on a VM under the daemon's attribution and rejected: System Events over
+    /// AppleScript answers correctly in 170-260 ms, most of the latency
+    /// between a person's input and the sequence stopping; NSWorkspace answers
+    /// in 31 us but from a cache that a process without a run loop never
+    /// refreshes, so it kept naming the first application it ever saw across
+    /// four switches. The system-wide accessibility element asks the server
+    /// live and costs a mach round trip.
+    ///
+    /// A focus reading, not an identity: which process the pid is right now is
+    /// the caller's generation check. `None` when there is no focused
+    /// application, when accessibility is not permitted, or when the server
+    /// answers anything but success; every one of those is a refusal for the
+    /// policy caller, never a guess.
+    pub fn focused_application_pid() -> Result<i32, FocusReadError> {
+        // SAFETY: creates a system-wide element; ownership of one retain
+        // count is returned to the caller and released by OwnedCf.
+        let system_wide = unsafe { OwnedCf::from_created(AXUIElementCreateSystemWide()) }
+            .ok_or(FocusReadError::SystemWideElementUnavailable)?;
+        let attribute = CFString::from_static_str("AXFocusedApplication");
+        let mut value = std::ptr::null();
+        // SAFETY: the element and the attribute string are retained for the
+        // call; `value` is writable storage for one returned reference.
+        let code = unsafe {
+            AXUIElementCopyAttributeValue(
+                system_wide.as_ptr(),
+                CFRetained::as_ptr(&attribute).as_ptr().cast(),
+                &mut value,
+            )
+        };
+        match code {
+            AX_ERROR_SUCCESS => {}
+            AX_ERROR_API_DISABLED => return Err(FocusReadError::NotPermitted),
+            AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NO_VALUE => {
+                return Err(FocusReadError::NoFocusedApplication)
+            }
+            code => return Err(FocusReadError::Ax { code }),
+        }
+        // SAFETY: a successful Copy returns ownership of a non-null value.
+        let focused =
+            unsafe { OwnedCf::from_created(value) }.ok_or(FocusReadError::NoFocusedApplication)?;
+        let mut pid: c_int = 0;
+        // SAFETY: `focused` is a live AXUIElement; `pid` is writable.
+        let code = unsafe { AXUIElementGetPid(focused.as_ptr(), &mut pid) };
+        if code != AX_ERROR_SUCCESS {
+            return Err(FocusReadError::Ax { code });
+        }
+        if pid <= 0 {
+            return Err(FocusReadError::NoFocusedApplication);
+        }
+        Ok(pid)
+    }
+
+    /// Why a focus reading could not be taken. Kept distinct because the
+    /// caller's remedies differ: permission is a settings change, no focused
+    /// application is a state of the session, and a code is a diagnosis.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FocusReadError {
+        SystemWideElementUnavailable,
+        NotPermitted,
+        NoFocusedApplication,
+        Ax { code: i32 },
+    }
+
     /// Whether macOS currently permits this process to read accessibility data.
     ///
     /// `AXIsProcessTrusted` is the non-prompting query. The variant taking an
@@ -2068,8 +2138,8 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 pub use platform::{
-    accessibility_is_permitted, read_accessibility_element, read_accessibility_tree,
-    request_accessibility_action,
+    accessibility_is_permitted, focused_application_pid, read_accessibility_element,
+    read_accessibility_tree, request_accessibility_action, FocusReadError,
 };
 
 #[cfg(test)]

@@ -407,27 +407,77 @@ pub fn post_event_at_hid_tap_for_measurement(event: OwnedCgEvent) -> CgEventPost
     CgEventPostCall
 }
 
-/// Read the unix process id of the frontmost application.
+/// Read the unix process id of the application that owns the topmost normal
+/// window on screen.
 ///
-/// This is a reading rather than a focus change, from the workspace's own
-/// notion of the frontmost application. It was first read by asking System
-/// Events over AppleScript, which answers the same question from the same
-/// source and costs 170-260 ms per call on a VM; the observed dispatch loop
-/// asks before every post, so that one call was most of the latency between
-/// a person's input and the sequence stopping. This is tens of microseconds.
+/// This is the reading the observed dispatch loop takes before every post,
+/// so it has to be cheap, CURRENT, and permitted under what the module
+/// already holds. Three sources were measured on a VM under the daemon's own
+/// attribution and rejected: System Events over AppleScript answers correctly
+/// in 170-260 ms, most of the latency between a person's input and the
+/// sequence stopping; NSWorkspace answers in 31 us from a cache a process
+/// without a run loop never refreshes, so it kept naming the first
+/// application it ever saw across four switches; the system-wide
+/// accessibility element's focused application answered
+/// kAXErrorCannotComplete in that process even with accessibility trusted.
+/// The window list is served live by the window server under the screen
+/// recording grant the module holds for capture, in z-order, and the first
+/// window at the normal layer belongs to the application a cursor event
+/// would reach.
 ///
-/// The pid is a focus reading, not an identity: which process that pid is
-/// right now is established by the caller's generation check, never by the
-/// running-application object this reads it from.
-///
-/// A missing frontmost application or a non-positive pid is absent so the
-/// policy caller can refuse it.
+/// A focus reading, not an identity: which process the pid is right now is
+/// the caller's generation check. `None` when the list cannot be read or has
+/// no normal-layer window; both are refusals for the policy caller.
 pub fn frontmost_process_id() -> Option<i32> {
-    use objc2_app_kit::NSWorkspace;
-    let workspace = NSWorkspace::sharedWorkspace();
-    let application = workspace.frontmostApplication()?;
-    let pid = application.processIdentifier();
-    (pid > 0).then_some(pid)
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFNumberType};
+    use objc2_core_graphics::{
+        kCGWindowLayer, kCGWindowOwnerPID, CGWindowListCopyWindowInfo, CGWindowListOption,
+    };
+    use std::ffi::c_void;
+    let windows = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    )?;
+    for index in 0..windows.count() {
+        // SAFETY: `index` is within the array's count; the element is borrowed
+        // from the array, which outlives this loop.
+        let entry = unsafe { windows.value_at_index(index) }.cast::<CFDictionary>();
+        if entry.is_null() {
+            continue;
+        }
+        // SAFETY: entries of a CGWindowList array are CFDictionary; the keys
+        // are the framework's own constants; values are borrowed.
+        let (layer, owner) = unsafe {
+            let entry = &*entry;
+            (
+                entry.value((kCGWindowLayer as *const CFString).cast::<c_void>()),
+                entry.value((kCGWindowOwnerPID as *const CFString).cast::<c_void>()),
+            )
+        };
+        let layer_number = layer.cast::<CFNumber>();
+        let owner_number = owner.cast::<CFNumber>();
+        if layer_number.is_null() || owner_number.is_null() {
+            continue;
+        }
+        let mut layer_value: i64 = -1;
+        let mut owner_value: i64 = 0;
+        // SAFETY: both values are CFNumber (the framework documents the
+        // types); the out-pointers are writable i64 storage.
+        let ok = unsafe {
+            (*layer_number).value(
+                CFNumberType::SInt64Type,
+                (&mut layer_value as *mut i64).cast::<c_void>(),
+            ) && (*owner_number).value(
+                CFNumberType::SInt64Type,
+                (&mut owner_value as *mut i64).cast::<c_void>(),
+            )
+        };
+        if !ok || layer_value != 0 {
+            continue;
+        }
+        return i32::try_from(owner_value).ok().filter(|pid| *pid > 0);
+    }
+    None
 }
 
 /// When a process was started, as kernel-sourced microseconds since the epoch.

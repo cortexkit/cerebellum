@@ -53,8 +53,8 @@ pub use accessibility::{
 // logic stay covered on Linux CI while the FFI stays where it belongs.
 #[cfg(target_os = "macos")]
 pub use accessibility::{
-    accessibility_is_permitted, read_accessibility_element, read_accessibility_tree,
-    request_accessibility_action,
+    accessibility_is_permitted, focused_application_pid, read_accessibility_element,
+    read_accessibility_tree, request_accessibility_action, FocusReadError,
 };
 #[cfg(target_os = "macos")]
 pub use event_tap::{uptime_now_ns, SessionEventTap};
