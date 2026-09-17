@@ -62,3 +62,7 @@ test = true
 [[example]]
 name = "live_launch"
 test = true
+
+[[example]]
+name = "live_login"
+test = true
