@@ -1315,13 +1315,35 @@ mod probe {
     }
 
     /// Ten seconds of warning, then the word the operator is waiting for.
+    ///
+    /// Announced in TWO places: this process's stdout, and the speaker of the
+    /// session under test through `say`. The probe is normally driven over SSH,
+    /// where the operator at the VM window cannot see stdout; speech needs no
+    /// permission and posts no input event, so it cannot itself trip the idle
+    /// gate the arm is measuring. (AppleScript into TextEdit was tried first
+    /// and blocks on an Automation consent prompt nobody can answer from SSH.)
     fn countdown(instruction: &str) {
         println!();
         println!("{instruction}");
+        speak("get ready to move the mouse");
         for remaining in (1..=10).rev() {
             println!("  {remaining}...");
+            if remaining <= 3 {
+                speak(&remaining.to_string());
+            }
             std::thread::sleep(Duration::from_secs(1));
         }
         println!("  NOW");
+        speak("now, move the mouse, keep moving");
+    }
+
+    /// Best effort and non-blocking; a failure to speak changes nothing about
+    /// the arm.
+    fn speak(text: &str) {
+        let _ = std::process::Command::new("/usr/bin/say")
+            .arg(text)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
