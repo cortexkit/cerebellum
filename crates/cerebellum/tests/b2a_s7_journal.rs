@@ -15,8 +15,9 @@ use cerebellum::journal::reservation::{
 use cerebellum::journal::snapshots::{Observation, SnapshotError, SnapshotStore};
 use cerebellum::journal::store::JournalStore;
 use cerebellum::journal::{
-    Action, Capability, GoverningObservation, GrantDecision, GrantOutcome, JournalConfig,
-    JournalIdentity, JournalReasonCode, NavigateWait, Outcome, PolicyEventDetail, SessionKind,
+    Action, Capability, GoverningObservation, GrantDecision, GrantOutcome, HandoffJournalOutcome,
+    JournalConfig, JournalEntry, JournalIdentity, JournalReasonCode, NavigateWait, Outcome,
+    PolicyEventDetail, SessionKind,
 };
 
 fn identity() -> JournalIdentity {
@@ -546,6 +547,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
         (Capability::Snapshot, "browser.snapshot"),
         (Capability::Screenshot, "browser.screenshot"),
         (Capability::WaitFor, "browser.wait_for"),
+        (Capability::Present, "browser.present"),
     ];
 
     let mut seen = std::collections::BTreeSet::new();
@@ -556,5 +558,56 @@ fn no_two_browser_capabilities_share_a_journal_name() {
             "{name} is claimed by more than one capability"
         );
     }
-    assert_eq!(seen.len(), 7, "a capability was added without a name here");
+    assert_eq!(seen.len(), 8, "a capability was added without a name here");
+}
+
+#[test]
+fn v3_fixture_reads_through_the_v4_reader() {
+    let fixture = include_str!("fixtures/browser-journal-v3.jsonl");
+    let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v3");
+    assert_eq!(entry.capability, Some(Capability::Snapshot));
+    assert!(entry.payload.is_none());
+}
+
+#[test]
+fn handoff_records_carry_a_count_and_no_names() {
+    let mut journal = store();
+    journal
+        .commit_handoff(
+            identity(),
+            "https://login.example".to_string(),
+            HandoffJournalOutcome::Opened,
+            None,
+        )
+        .unwrap();
+    journal
+        .commit_handoff(
+            identity(),
+            "https://login.example".to_string(),
+            HandoffJournalOutcome::LoginObserved,
+            Some(2),
+        )
+        .unwrap();
+
+    let entries = journal
+        .export()
+        .lines()
+        .map(|line| serde_json::from_str::<JournalEntry>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| {
+        entry.format_version == "ck-browser-journal/v4"
+            && entry.capability == Some(Capability::Present)
+            && entry.action.is_none()
+    }));
+    let opened = entries[0].payload.as_ref().unwrap();
+    assert_eq!(opened.outcome, HandoffJournalOutcome::Opened);
+    assert_eq!(opened.cookie_names_added, None);
+    let closed = entries[1].payload.as_ref().unwrap();
+    assert_eq!(closed.outcome, HandoffJournalOutcome::LoginObserved);
+    assert_eq!(closed.cookie_names_added, Some(2));
+    let serialized = journal.export();
+    assert!(!serialized.contains("session_cookie"));
+    assert!(!serialized.contains("csrf_cookie"));
 }

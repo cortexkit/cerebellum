@@ -129,6 +129,16 @@ fn management_surface() -> ProviderRole {
                  request is pending; the grant exists only if they agree.",
             ),
             (
+                crate::management::PRESENT,
+                "Front the route-owned browser and hand control to the person for login. \
+                 Refuses when no session exists, the page is off-origin, or a handoff is open.",
+            ),
+            (
+                crate::management::RESUME,
+                "Take control back from a browser login handoff and report whether login was \
+                 observed, expired, or closed by the caller. Refuses when no handoff exists.",
+            ),
+            (
                 crate::management::REBIND_PROFILE_ROOT,
                 "Ask the person to re-identify a moved or restored browser profile root. \
                  Refuses rather than adopts any profile directory the registry did not mint.",
@@ -847,9 +857,19 @@ mod tests {
             vec![
                 crate::management::OPEN_TARGET,
                 crate::management::OPEN_GRANT,
+                crate::management::PRESENT,
+                crate::management::RESUME,
                 crate::management::REBIND_PROFILE_ROOT,
             ]
         );
+        let dispatchable = crate::management::OPERATIONS
+            .into_iter()
+            .filter(|name| crate::dispatchable_management_operation(name))
+            .collect::<Vec<_>>();
+        assert_eq!(advertised, dispatchable);
+        assert!(advertised
+            .iter()
+            .all(|name| crate::dispatchable_management_operation(name)));
     }
 
     /// Opening a target is advertised as a query.

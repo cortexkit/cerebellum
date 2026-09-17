@@ -1,7 +1,7 @@
 //! Audit journal, redaction, snapshot retention, and late-event delivery.
 //!
 //! This module implements the browser plane's journal surface and the closed
-//! `ck-browser-journal/v2` entry contract. It owns durable allocation and
+//! `ck-browser-journal/v4` entry contract. It owns durable allocation and
 //! storage, reservations and transition pins, dispatch commitment, recovery,
 //! retained governing observations and snapshot pins, policy events, audit
 //! obligations, and live-session late-event delivery.
@@ -43,10 +43,10 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 
 /// The literal `format_version` carried by every journal entry.
-pub const FORMAT_VERSION: &str = "ck-browser-journal/v3";
+pub const FORMAT_VERSION: &str = "ck-browser-journal/v4";
 
 /// The export `format_version` reported by the administration export surface.
-pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v3";
+pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v4";
 
 /// The greatest sequence the allocator may hand out (`9007199254740991`).
 ///
@@ -157,6 +157,8 @@ pub enum Capability {
     Screenshot,
     #[serde(rename = "browser.wait_for")]
     WaitFor,
+    #[serde(rename = "browser.present")]
+    Present,
 }
 
 impl Capability {
@@ -169,6 +171,7 @@ impl Capability {
             Self::Snapshot => "browser.snapshot",
             Self::Screenshot => "browser.screenshot",
             Self::WaitFor => "browser.wait_for",
+            Self::Present => "browser.present",
         }
     }
 
@@ -181,6 +184,24 @@ impl Capability {
     pub fn governs_screenshot(self) -> bool {
         matches!(self, Self::ClickPoint)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffJournalOutcome {
+    Opened,
+    LoginObserved,
+    Expired,
+    ClosedByCaller,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffPayload {
+    pub origin: String,
+    pub outcome: HandoffJournalOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cookie_names_added: Option<u64>,
 }
 
 /// The eight B1 capability names that may appear as a policy-event
@@ -432,7 +453,7 @@ pub enum PolicyEventDetail {
     },
 }
 
-/// The closed `ck-browser-journal/v2` entry.
+/// The closed `ck-browser-journal/v4` entry.
 ///
 /// No additional fields are permitted (`deny_unknown_fields`). For a policy
 /// event, `capability`, `intent_redacted`, `requested_severity`,
@@ -455,6 +476,8 @@ pub struct JournalEntry {
     pub locator: Option<Locator>,
     pub snapshot_ids: Vec<String>,
     pub outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<HandoffPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
 }
@@ -551,6 +574,7 @@ mod tests {
             locator: None,
             snapshot_ids: vec![],
             outcome: Some(Outcome::InternalError),
+            payload: None,
             detail: Some(serde_json::json!({"reason_code":"journal_entry_oversize"})),
         };
         let line = entry.export_line();

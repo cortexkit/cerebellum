@@ -63,7 +63,16 @@ pub const ALL_TOOLS: [&str; 6] = [NAVIGATE, SNAPSHOT, CLICK, SCREENSHOT, CLICK_P
 /// omitted operations once returned `outcome: ok` with a fabricated `url_final`
 /// even when no browser process existed.
 pub fn has_wire_dispatch_route(name: &str) -> bool {
-    matches!(name, NAVIGATE | SNAPSHOT | CLICK | SCREENSHOT | CLICK_POINT)
+    matches!(
+        name,
+        NAVIGATE
+            | SNAPSHOT
+            | CLICK
+            | SCREENSHOT
+            | CLICK_POINT
+            | crate::management::PRESENT
+            | crate::management::RESUME
+    )
 }
 
 pub const SETTLEMENT_MS: u64 = 30_000;
@@ -124,6 +133,10 @@ pub enum BrowserError {
     },
     NoSession,
     BrowserLaunchPending,
+    HumanInControl {
+        origin: String,
+        expires_in_ms: u64,
+    },
     StaleSnapshot {
         reason_code: &'static str,
     },
@@ -181,6 +194,7 @@ impl BrowserError {
             Self::InvalidRequest { .. } => "invalid_request",
             Self::NoSession => "no_session",
             Self::BrowserLaunchPending => "browser_launch_pending",
+            Self::HumanInControl { .. } => "human_in_control",
             Self::StaleSnapshot { .. } => "stale_snapshot",
             Self::RefNotFound { .. } => "ref_not_found",
             Self::RefAmbiguous { .. } => "ref_ambiguous",
@@ -213,6 +227,7 @@ impl BrowserError {
             Self::BrowserLaunchPending => {
                 "poll browser.status until the session is ready, then retry the browser action"
             }
+            Self::HumanInControl { .. } => "browser.resume",
             Self::StaleSnapshot { .. } => {
                 "call browser.snapshot again and use only its new snapshot_id and refs"
             }
@@ -309,6 +324,7 @@ impl BrowserError {
                 json!({"reason_code":"no_session","reason":"no browser session is open"})
             }
             Self::BrowserLaunchPending => json!({"reason_code":"browser_launch_pending"}),
+            Self::HumanInControl { .. } => return None,
             Self::ElementIntercepted => json!({}),
             Self::OutsideViewportAfterScroll { refusal } => {
                 viewport_refusal_detail("outside_viewport_after_scroll", *refusal)
@@ -681,7 +697,8 @@ pub fn journal_action(capability: JournalCapability) -> Option<JournalAction> {
         },
         JournalCapability::Snapshot
         | JournalCapability::Screenshot
-        | JournalCapability::WaitFor => return None,
+        | JournalCapability::WaitFor
+        | JournalCapability::Present => return None,
     })
 }
 
@@ -937,6 +954,71 @@ impl BrowserPlane {
             .map_or(0, |store| store.unfinalized_dispatch_count())
     }
 
+    pub async fn journal_handoff_opened(
+        &self,
+        identity: &RouteIdentity,
+        origin: &str,
+    ) -> Result<(), JournalError> {
+        self.journal_handoff(
+            identity,
+            origin,
+            journal::HandoffJournalOutcome::Opened,
+            None,
+        )
+        .await
+    }
+
+    pub async fn journal_handoff_closed(
+        &self,
+        identity: &RouteIdentity,
+        close: &crate::browser_session::HandoffClose,
+    ) -> Result<(), JournalError> {
+        let outcome = match close.outcome {
+            crate::browser_session::HandoffOutcome::LoginObserved => {
+                journal::HandoffJournalOutcome::LoginObserved
+            }
+            crate::browser_session::HandoffOutcome::Expired => {
+                journal::HandoffJournalOutcome::Expired
+            }
+            crate::browser_session::HandoffOutcome::ClosedByCaller => {
+                journal::HandoffJournalOutcome::ClosedByCaller
+            }
+        };
+        self.journal_handoff(
+            identity,
+            &close.origin,
+            outcome,
+            Some(close.cookie_names_added as u64),
+        )
+        .await
+    }
+
+    async fn journal_handoff(
+        &self,
+        identity: &RouteIdentity,
+        origin: &str,
+        outcome: journal::HandoffJournalOutcome,
+        cookie_names_added: Option<u64>,
+    ) -> Result<(), JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        journal
+            .store
+            .as_mut()
+            .expect("an enabled journal mode opens one store")
+            .commit_handoff(
+                journal_identity(identity),
+                origin.to_string(),
+                outcome,
+                cookie_names_added,
+            )
+    }
+
     /// The journal as a reader sees it, for tests that drive the lifecycle.
     pub async fn journal_export_for_test(&self) -> String {
         self.journal
@@ -1135,6 +1217,21 @@ impl BrowserPlane {
         // for direct first-party callers because it serializes all CDP operations
         // for a conversation and prevents concurrent invocations from interleaving them.
         let _lane = self.lane(&identity.conversation_key).await;
+        if let Some((sessions, clock, _)) = &self.session_gate {
+            if let Some(handoff) =
+                sessions.human_in_control(&identity.conversation_key, clock.as_ref())
+            {
+                return self
+                    .result(
+                        identity,
+                        Err(BrowserError::HumanInControl {
+                            origin: handoff.origin,
+                            expires_in_ms: handoff.expires_in_ms,
+                        }),
+                    )
+                    .await;
+            }
+        }
         let start = self.state.lock().await.operations.len();
         let result = self.dispatch_inner(identity, capability, args).await;
         if let Err(error) = &result {
@@ -1302,6 +1399,14 @@ impl BrowserPlane {
                 object.insert("context".into(), context);
                 if let Some(detail) = error.detail() {
                     object.insert("detail".into(), detail);
+                }
+                if let BrowserError::HumanInControl {
+                    origin,
+                    expires_in_ms,
+                } = error
+                {
+                    object.insert("origin".into(), Value::String(origin));
+                    object.insert("expires_in_ms".into(), json!(expires_in_ms));
                 }
                 Value::Object(object)
             }
@@ -3040,8 +3145,9 @@ fn browser_result_outcome_schema() -> Value {
         "unsupported_js_dialog",
         "invalid_request",
         "no_session",
-        "browser_launch_pending",
-        "stale_snapshot",
+            "browser_launch_pending",
+            "human_in_control",
+            "stale_snapshot",
         "ref_not_found",
         "ref_ambiguous",
         "element_intercepted",
@@ -3067,6 +3173,8 @@ fn reply_schema(mut properties: Value, required: &[&str]) -> Value {
     properties.insert("remedy".into(), string_schema());
     properties.insert("detail".into(), refusal_detail_schema());
     properties.insert("context".into(), context_result_schema());
+    properties.insert("origin".into(), string_schema());
+    properties.insert("expires_in_ms".into(), integer_schema());
     let mut required = required.to_vec();
     required.extend(["outcome", "context"]);
     closed_object(properties.clone().into(), &required)
@@ -3677,6 +3785,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::PointOutsideViewport { .. } => Outcome::StaleSnapshot,
         BrowserError::NoSession
         | BrowserError::BrowserLaunchPending
+        | BrowserError::HumanInControl { .. }
         | BrowserError::Internal { .. }
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }
@@ -3720,9 +3829,12 @@ fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveErro
                 reason_code: JournalReasonCode::ConnectorFailure,
             }
         }
-        crate::browser_session::NavigationDriveError::CdpFailure => BrowserError::Internal {
-            reason_code: JournalReasonCode::CdpFailure,
-        },
+        crate::browser_session::NavigationDriveError::CdpFailure
+        | crate::browser_session::NavigationDriveError::CommandFailed { .. } => {
+            BrowserError::Internal {
+                reason_code: JournalReasonCode::CdpFailure,
+            }
+        }
     }
 }
 

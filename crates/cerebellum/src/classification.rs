@@ -307,6 +307,20 @@ pub struct AssociatedFormControl {
 }
 
 impl NonTypeClassificationRecord {
+    /// Whether this record describes a field that may receive a credential.
+    ///
+    /// This is the same direct-field predicate used by the typing path: password
+    /// inputs and the three credential autocomplete tokens. Associated controls
+    /// do not make a non-field submit button into a credential field.
+    pub fn is_credential_field(&self) -> bool {
+        self.target_password
+            || self.effective_input_type.as_deref() == Some("password")
+            || self
+                .target_autocomplete_tokens
+                .iter()
+                .any(|token| credential_token(token))
+    }
+
     pub fn validate(&self) -> Result<(), ClassificationError> {
         if self.schema != NON_TYPE_CLASSIFICATION_SCHEMA {
             return Err(ClassificationError::WrongSchema);

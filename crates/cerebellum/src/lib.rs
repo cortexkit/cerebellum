@@ -719,6 +719,15 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
     dispatchable_tool_with_browser(name, false)
 }
 
+/// Whether the management dispatcher has an explicit arm for this operation.
+pub fn dispatchable_management_operation(name: &str) -> bool {
+    matches!(
+        name,
+        management::OPEN_TARGET | management::OPEN_GRANT | management::REBIND_PROFILE_ROOT
+    ) || (matches!(name, management::PRESENT | management::RESUME)
+        && browser::has_wire_dispatch_route(name))
+}
+
 /// The dispatch predicate, exposed so a test can compare the surface reporter
 /// against it directly rather than against a copy of its rules.
 pub fn dispatchable_tool_for_test(name: &str, browser_configured: bool) -> Option<&str> {
@@ -824,7 +833,8 @@ pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<Capab
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
     if browser_configured
         && (browser_session::CONTROL_TOOLS.contains(&name)
-            || browser::has_wire_dispatch_route(name))
+            || (browser::BrowserCapability::parse(name).is_some()
+                && browser::has_wire_dispatch_route(name)))
     {
         Some(name)
     } else if computer_capability::servable(name).is_some() {
@@ -1940,10 +1950,7 @@ async fn handle_management_request(
         )
         .await;
     };
-    if !matches!(
-        method,
-        management::OPEN_TARGET | management::OPEN_GRANT | management::REBIND_PROFILE_ROOT
-    ) {
+    if !dispatchable_management_operation(method) {
         return send_route_error(
             writer,
             ver,
@@ -1971,6 +1978,80 @@ async fn handle_management_request(
         )
         .await;
     };
+
+    if method == management::PRESENT {
+        if let Some(field) = params_object
+            .keys()
+            .filter(|field| field.as_str() != "origin")
+            .min()
+        {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
+        let Some(origin_value) = params_object.get("origin") else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "origin",
+                "missing_field",
+            )
+            .await;
+        };
+        let Some(origin) = origin_value.as_str() else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "origin",
+                "wrong_type",
+            )
+            .await;
+        };
+        if crate::classification::canonical_origin(origin).as_deref() != Some(origin) {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "origin",
+                "invalid_origin",
+            )
+            .await;
+        }
+        let reply = present_browser_handoff(planes, &facts.identity, origin).await;
+        return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
+    if method == management::RESUME {
+        if let Some(field) = params_object.keys().min() {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
+        let reply = resume_browser_handoff(planes, &facts.identity).await;
+        return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
 
     enum Settlement {
         ComputerTarget,
@@ -2200,6 +2281,131 @@ async fn handle_management_request(
     }
 
     send_tool_response(writer, ver, channel, epoch, corr, reply).await
+}
+
+async fn present_browser_handoff(planes: &Planes, identity: &RouteIdentity, origin: &str) -> Value {
+    let deadline_ms = planes
+        .browser_config
+        .as_ref()
+        .map_or(30_000, |config| config.navigation_settle_deadline_ms);
+    let presented = planes.sessions.present(
+        &identity.conversation_key,
+        origin,
+        deadline_ms,
+        planes.lease_clock.as_ref(),
+    );
+    let presented = match presented {
+        Ok(presented) => presented,
+        Err(browser_session::PresentRefusal::NoSession) => {
+            return json!({"outcome":"no_session","remedy":"browser.launch"})
+        }
+        Err(browser_session::PresentRefusal::OriginMismatch { current_origin }) => {
+            return json!({
+                "outcome":"origin_mismatch",
+                "current_origin":current_origin,
+                "remedy":"browser.navigate",
+            })
+        }
+        Err(browser_session::PresentRefusal::HandoffOpen) => {
+            return json!({"outcome":"handoff_open","remedy":"browser.resume"})
+        }
+        Err(browser_session::PresentRefusal::PresentFailed { error_text }) => {
+            return json!({
+                "outcome":"present_failed",
+                "error_text":error_text,
+                "remedy":"browser.present",
+            })
+        }
+    };
+
+    if planes
+        .browser
+        .journal_handoff_opened(identity, origin)
+        .await
+        .is_err()
+    {
+        let _ = planes
+            .sessions
+            .resume(&identity.conversation_key, planes.lease_clock.as_ref());
+        return json!({"outcome":"internal_failure"});
+    }
+
+    let sessions = planes.sessions.clone();
+    let browser = Arc::clone(&planes.browser);
+    let clock = Arc::clone(&planes.lease_clock);
+    let identity = identity.clone();
+    let route_key = identity.conversation_key.clone();
+    let generation = presented.generation;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(
+                browser_session::HANDOFF_POLL_INTERVAL_MS,
+            ))
+            .await;
+            let poll_sessions = sessions.clone();
+            let poll_clock = Arc::clone(&clock);
+            let poll_route = route_key.clone();
+            let polled = tokio::task::spawn_blocking(move || {
+                poll_sessions.poll_handoff(
+                    &poll_route,
+                    generation,
+                    deadline_ms,
+                    poll_clock.as_ref(),
+                )
+            })
+            .await;
+            match polled {
+                Ok(browser_session::HandoffPollResult::Open) => {}
+                Ok(browser_session::HandoffPollResult::Closed(close)) => {
+                    let _ = browser.journal_handoff_closed(&identity, &close).await;
+                    break;
+                }
+                Ok(browser_session::HandoffPollResult::Gone) | Err(_) => break,
+            }
+        }
+    });
+
+    json!({
+        "outcome":"presented",
+        "expires_in_ms":presented.expires_in_ms,
+    })
+}
+
+#[doc(hidden)]
+pub async fn present_browser_handoff_for_test(
+    planes: &Planes,
+    identity: &RouteIdentity,
+    origin: &str,
+) -> Value {
+    present_browser_handoff(planes, identity, origin).await
+}
+
+async fn resume_browser_handoff(planes: &Planes, identity: &RouteIdentity) -> Value {
+    let close = match planes
+        .sessions
+        .resume(&identity.conversation_key, planes.lease_clock.as_ref())
+    {
+        Ok(close) => close,
+        Err(browser_session::ResumeRefusal::NoHandoff) => {
+            return json!({"outcome":"no_handoff","remedy":"browser.present"})
+        }
+    };
+    if close.should_journal {
+        let _ = planes
+            .browser
+            .journal_handoff_closed(identity, &close)
+            .await;
+    }
+    json!({
+        "outcome":"resumed",
+        "handoff":close.outcome.as_str(),
+        "origin":close.origin,
+    })
+}
+
+#[doc(hidden)]
+pub async fn resume_browser_handoff_for_test(planes: &Planes, identity: &RouteIdentity) -> Value {
+    resume_browser_handoff(planes, identity).await
 }
 
 async fn handle_control_request(

@@ -38,8 +38,19 @@ use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindRe
 pub const OPEN_TARGET: &str = "computer.open_target";
 /// Ask a person to issue a hazard-scoped browser action grant.
 pub const OPEN_GRANT: &str = "browser.open_grant";
+/// Hand the route-owned browser window to the person for login.
+pub const PRESENT: &str = "browser.present";
+/// End or collect the result of a browser login handoff.
+pub const RESUME: &str = "browser.resume";
 /// Re-identify a moved or restored browser profile root without adopting profiles.
 pub const REBIND_PROFILE_ROOT: &str = "browser.rebind_profile_root";
+pub const OPERATIONS: [&str; 5] = [
+    OPEN_TARGET,
+    OPEN_GRANT,
+    PRESENT,
+    RESUME,
+    REBIND_PROFILE_ROOT,
+];
 
 /// Read an action kind from its wire spelling.
 ///

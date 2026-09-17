@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -219,6 +219,134 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             pending_javascript_dialogs: VecDeque::new(),
             read_buffer: vec![0; READ_CHUNK_BYTES],
         }
+    }
+
+    pub fn present(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, &mut clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+
+        let fronted = self.command_response(
+            "Page.bringToFront",
+            None,
+            Some(attachment.session_id),
+            deadline,
+            None,
+            None,
+            &mut clock,
+        )?;
+        if let Some(error) = fronted.error {
+            return Err(NavigationDriveError::CommandFailed {
+                error_text: cdp_error_text(error),
+            });
+        }
+
+        // Page.bringToFront selects the tab inside Chrome. On macOS the window
+        // server may still keep another application's window above Chrome, so
+        // activate the owning target as the second, browser-wide nudge.
+        let mut params = Map::new();
+        params.insert("targetId".into(), Value::String(attachment.target_id));
+        let activated = self.command_response(
+            "Target.activateTarget",
+            Some(params),
+            None,
+            deadline,
+            None,
+            None,
+            &mut clock,
+        )?;
+        if let Some(error) = activated.error {
+            return Err(NavigationDriveError::CommandFailed {
+                error_text: cdp_error_text(error),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn cookie_names_for_origin(
+        &mut self,
+        context_key: &str,
+        origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BTreeSet<String>, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, &mut clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let mut params = Map::new();
+        params.insert(
+            "urls".into(),
+            Value::Array(vec![Value::String(origin.to_string())]),
+        );
+        let result = self.command(
+            "Network.getCookies",
+            Some(params),
+            Some(attachment.session_id),
+            deadline,
+            None,
+            &mut clock,
+        )?;
+        let cookies = result
+            .get("cookies")
+            .and_then(Value::as_array)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        cookies
+            .iter()
+            .map(|cookie| {
+                cookie
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or(NavigationDriveError::CdpFailure)
+            })
+            .collect()
+    }
+
+    pub fn main_frame_url(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<String, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.main_frame_url_with_clock(context_key, deadline_ms, &mut clock)
+    }
+
+    pub fn has_credential_field(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        let observation = self.snapshot_with_clock(
+            context_key,
+            SnapshotKind::Ax,
+            deadline_ms,
+            Some((0, "null")),
+            &mut clock,
+        )?;
+        Ok(observation.refs.iter().any(|reference| {
+            reference
+                .classification
+                .as_deref()
+                .is_some_and(NonTypeClassificationRecord::is_credential_field)
+        }))
     }
 
     pub fn navigate(
@@ -1074,6 +1202,44 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
 
         Ok(observation)
+    }
+
+    fn main_frame_url_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<String, NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let history = self.command(
+            "Page.getNavigationHistory",
+            None,
+            Some(attachment.session_id),
+            deadline,
+            None,
+            clock,
+        )?;
+        let current_index = history
+            .get("currentIndex")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        history
+            .get("entries")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.get(current_index))
+            .and_then(|entry| entry.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or(NavigationDriveError::CdpFailure)
     }
 
     fn navigate_with_clock<C: NavigationClock>(
@@ -2218,6 +2384,14 @@ where
         ax_truncated,
         refs_truncated,
     })
+}
+
+fn cdp_error_text(error: Map<String, Value>) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| Value::Object(error).to_string())
 }
 
 fn required_result_string(
@@ -3647,5 +3821,58 @@ mod tests {
 
         assert!(!tracker.settled);
         assert_eq!(tracker.lifecycle, ["navigation_started", "load"]);
+    }
+
+    #[test]
+    fn present_sends_page_bring_to_front_then_target_activate() {
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"result":{}}),
+        ];
+        let mut driver = attached_driver(frames);
+        driver.present("route-own", 100).unwrap();
+        assert_eq!(
+            driver
+                .pipe
+                .writes
+                .iter()
+                .map(|command| command["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Page.bringToFront", "Target.activateTarget"]
+        );
+        assert_eq!(driver.pipe.writes[0]["sessionId"], "session-own");
+        assert!(driver.pipe.writes[1].get("sessionId").is_none());
+        assert_eq!(driver.pipe.writes[1]["params"]["targetId"], "target-own");
+    }
+
+    #[test]
+    fn cookie_values_never_leave_the_driver() {
+        const SECRET: &str = "SECRET-9f1c";
+        let frames = [json!({
+            "id":1,
+            "sessionId":"session-own",
+            "result":{
+                "cookies":[{
+                    "name":"session",
+                    "value":SECRET,
+                    "domain":"login.example",
+                    "path":"/",
+                }]
+            }
+        })];
+        let mut driver = attached_driver(frames);
+        let names: BTreeSet<String> = driver
+            .cookie_names_for_origin("route-own", "https://login.example", 100)
+            .unwrap();
+        assert_eq!(names, BTreeSet::from(["session".to_string()]));
+        assert!(!format!("{names:?}").contains(SECRET));
+        assert!(
+            !driver
+                .pipe
+                .writes
+                .iter()
+                .any(|command| command.to_string().contains(SECRET)),
+            "a cookie value escaped into a driver command"
+        );
     }
 }

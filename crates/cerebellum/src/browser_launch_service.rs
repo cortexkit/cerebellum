@@ -817,6 +817,47 @@ struct ProductionProcess {
 }
 
 impl OwnedBrowserProcess for ProductionProcess {
+    fn present(&mut self, context_key: &str, deadline_ms: u64) -> Result<(), NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .present(context_key, deadline_ms)
+    }
+
+    fn cookie_names_for_origin(
+        &mut self,
+        context_key: &str,
+        origin: &str,
+        deadline_ms: u64,
+    ) -> Result<std::collections::BTreeSet<String>, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .cookie_names_for_origin(context_key, origin, deadline_ms)
+    }
+
+    fn main_frame_url(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<String, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .main_frame_url(context_key, deadline_ms)
+    }
+
+    fn has_credential_field(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .has_credential_field(context_key, deadline_ms)
+    }
+
     fn navigate(
         &mut self,
         context_key: &str,

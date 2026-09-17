@@ -313,6 +313,7 @@ fn build_policy_event_entry(sequence: u64, payload: &PolicyEventPayload) -> Jour
         locator: None,
         snapshot_ids: initiating_snapshot_id.into_iter().collect(),
         outcome: None,
+        payload: None,
         detail: Some(serde_json::to_value(&payload.detail).expect("closed detail serializes")),
     }
 }

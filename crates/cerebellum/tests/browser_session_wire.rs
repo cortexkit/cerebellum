@@ -168,6 +168,10 @@ struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
     hazardous_target: bool,
+    present_error: Option<&'static str>,
+    cookie_value: Option<&'static str>,
+    cookie_grows_on_poll: bool,
+    credential_field: bool,
 }
 
 impl BrowserSessionLauncher for RecordingLauncher {
@@ -182,6 +186,11 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 effects: Arc::clone(&self.effects),
                 clicked: false,
                 hazardous_target: self.hazardous_target,
+                present_error: self.present_error,
+                cookie_value: self.cookie_value,
+                cookie_grows_on_poll: self.cookie_grows_on_poll,
+                credential_field: self.credential_field,
+                cookie_reads: 0,
             }),
             cleanup: Box::new(RecordingCleanup {
                 effects: Arc::clone(&self.effects),
@@ -210,9 +219,48 @@ struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
     clicked: bool,
     hazardous_target: bool,
+    present_error: Option<&'static str>,
+    cookie_value: Option<&'static str>,
+    cookie_grows_on_poll: bool,
+    credential_field: bool,
+    cookie_reads: usize,
 }
 
 impl OwnedBrowserProcess for RecordingProcess {
+    fn present(&mut self, _: &str, _: u64) -> Result<(), NavigationDriveError> {
+        self.effects.lock().unwrap().push("Page.bringToFront");
+        if let Some(error_text) = self.present_error {
+            return Err(NavigationDriveError::CommandFailed {
+                error_text: error_text.to_string(),
+            });
+        }
+        self.effects.lock().unwrap().push("Target.activateTarget");
+        Ok(())
+    }
+
+    fn cookie_names_for_origin(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: u64,
+    ) -> Result<BTreeSet<String>, NavigationDriveError> {
+        self.cookie_reads += 1;
+        let fixture_cookie = ("session", self.cookie_value.unwrap_or_default());
+        let mut names = BTreeSet::from([fixture_cookie.0.to_string()]);
+        if self.cookie_grows_on_poll && self.cookie_reads > 1 {
+            names.insert("authenticated".to_string());
+        }
+        Ok(names)
+    }
+
+    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
+        Ok("https://landed.example/final".to_string())
+    }
+
+    fn has_credential_field(&mut self, _: &str, _: u64) -> Result<bool, NavigationDriveError> {
+        Ok(self.credential_field)
+    }
+
     fn navigate(
         &mut self,
         _: &str,
@@ -1063,4 +1111,188 @@ async fn the_production_constructor_wires_a_launcher_on_every_platform_that_has_
         std::env::consts::OS,
         if has_launcher { "wired" } else { "absent" }
     );
+}
+
+#[tokio::test]
+async fn present_fronts_then_marks_human_in_control() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, "https://landed.example").await;
+
+    let presented = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://landed.example",
+    )
+    .await;
+    assert_eq!(
+        presented,
+        json!({"outcome":"presented","expires_in_ms":600_000})
+    );
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["Page.bringToFront", "Target.activateTarget"]
+    );
+
+    let operations_before = planes.browser.operation_log().await;
+    let journal_before = planes.browser.journal_export_for_test().await;
+    let blocked = invoke_existing(&planes, 20, "browser.snapshot", json!({})).await;
+    let blocked: Value = serde_json::from_slice(&blocked.body).unwrap();
+    assert_eq!(blocked["outcome"], "human_in_control", "{blocked}");
+    assert_eq!(blocked["remedy"], "browser.resume", "{blocked}");
+    assert_eq!(blocked["origin"], "https://landed.example", "{blocked}");
+    assert!(blocked["expires_in_ms"].as_u64().unwrap() <= 600_000);
+    assert_eq!(planes.browser.operation_log().await, operations_before);
+    assert_eq!(
+        planes.browser.journal_export_for_test().await,
+        journal_before
+    );
+}
+
+#[tokio::test]
+async fn present_that_cannot_front_is_refused_not_presented() {
+    let launcher = Arc::new(RecordingLauncher {
+        present_error: Some("fronting was refused by Chrome"),
+        ..RecordingLauncher::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, "https://landed.example").await;
+
+    let reply = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://landed.example",
+    )
+    .await;
+    assert_eq!(reply["outcome"], "present_failed", "{reply}");
+    assert_eq!(reply["error_text"], "fronting was refused by Chrome");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["Page.bringToFront"]
+    );
+    assert!(
+        planes
+            .sessions
+            .human_in_control(
+                &route_identity().conversation_key,
+                planes.lease_clock.as_ref()
+            )
+            .is_none(),
+        "a failed front must not hand control away"
+    );
+}
+
+#[tokio::test]
+async fn resume_closes_by_caller_and_reports_it() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher);
+    launch_at(&planes, "https://landed.example").await;
+    let route = route_identity();
+
+    let presented =
+        cerebellum::present_browser_handoff_for_test(&planes, &route, "https://landed.example")
+            .await;
+    assert_eq!(presented["outcome"], "presented", "{presented}");
+    let resumed = cerebellum::resume_browser_handoff_for_test(&planes, &route).await;
+    assert_eq!(
+        resumed,
+        json!({
+            "outcome":"resumed",
+            "handoff":"closed_by_caller",
+            "origin":"https://landed.example",
+        })
+    );
+    let no_handoff = cerebellum::resume_browser_handoff_for_test(&planes, &route).await;
+    assert_eq!(no_handoff["outcome"], "no_handoff");
+}
+
+#[tokio::test]
+async fn cookie_values_never_leave_the_driver() {
+    const SECRET: &str = "SECRET-9f1c";
+    let launcher = Arc::new(RecordingLauncher {
+        cookie_value: Some(SECRET),
+        cookie_grows_on_poll: true,
+        credential_field: false,
+        ..RecordingLauncher::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher);
+    launch_at(&planes, "https://landed.example").await;
+    let route = route_identity();
+
+    let presented =
+        cerebellum::present_browser_handoff_for_test(&planes, &route, "https://landed.example")
+            .await;
+    assert_eq!(presented["outcome"], "presented", "{presented}");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if planes
+                .browser
+                .journal_export_for_test()
+                .await
+                .contains("login_observed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("one bounded poll observes login");
+    let resumed = cerebellum::resume_browser_handoff_for_test(&planes, &route).await;
+    assert_eq!(resumed["handoff"], "login_observed", "{resumed}");
+
+    let journal = planes.browser.journal_export_for_test().await;
+    let wire = format!("{presented}{resumed}");
+    let planted = format!(
+        "{{\"bytes\":\"{}\"}}",
+        cerebellum_core::serde_base64::encode(SECRET.as_bytes())
+    );
+    assert!(
+        base64_decoded_strings(&planted)
+            .iter()
+            .any(|text| text.contains(SECRET)),
+        "the scanner cannot find a planted secret, so absence would prove nothing"
+    );
+    for serialized in [&journal, &wire] {
+        assert!(!serialized.contains(SECRET), "cookie value leaked verbatim");
+        assert!(
+            !base64_decoded_strings(serialized)
+                .iter()
+                .any(|text| text.contains(SECRET)),
+            "cookie value leaked through an encoded field"
+        );
+    }
+}
+
+fn base64_decoded_strings(text: &str) -> Vec<String> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric()
+            || character == '+'
+            || character == '/'
+            || character == '=')
+    })
+    .filter(|token| token.len() >= 8)
+    .filter_map(|token| cerebellum_core::serde_base64::decode(token).ok())
+    .filter_map(|bytes| String::from_utf8(bytes).ok())
+    .collect()
 }

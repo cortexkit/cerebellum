@@ -19,7 +19,7 @@ use super::recovery::{
     RecoveryClassification as BrowserRecoveryClassification,
 };
 /// The browser-owned codec version used for compatibility bytes.
-pub const BROWSER_CODEC_VERSION: &str = "ck-browser-journal/v2";
+pub const BROWSER_CODEC_VERSION: &str = "ck-browser-journal/v4";
 
 /// Codec that transports pre-encoded browser bytes without inspecting them.
 #[derive(Debug, Clone, Copy, Default)]

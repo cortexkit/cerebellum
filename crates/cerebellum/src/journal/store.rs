@@ -13,7 +13,11 @@ use cerebellum_core::journal::{
 };
 
 use super::reservation::ReservationHandle;
-use super::{JournalConfig, JournalEntry, JournalError, JournalIdentity, SessionKind};
+use super::{
+    Capability, GoverningObservation, GrantDecision, HandoffJournalOutcome, HandoffPayload,
+    JournalConfig, JournalEntry, JournalError, JournalIdentity, Outcome, Phase, SessionKind,
+    FORMAT_VERSION,
+};
 
 /// Test-only fault schedule retained by the browser compatibility surface.
 #[derive(Debug, Default)]
@@ -257,6 +261,39 @@ impl JournalStore {
             .map_err(Self::map_error)?;
         self.config = config;
         Ok(())
+    }
+
+    pub fn commit_handoff(
+        &mut self,
+        identity: JournalIdentity,
+        origin: String,
+        outcome: HandoffJournalOutcome,
+        cookie_names_added: Option<u64>,
+    ) -> Result<(), JournalError> {
+        let handle = self.reserve_policy_event(&identity)?;
+        let entry = JournalEntry {
+            format_version: FORMAT_VERSION.to_string(),
+            sequence: handle.sequence(),
+            phase: Phase::Dispatched,
+            identity,
+            capability: Some(Capability::Present),
+            intent_redacted: None,
+            requested_severity: None,
+            effective_severity: None,
+            grant_decision: GrantDecision::not_reached(),
+            governing_observation: GoverningObservation::observation_not_required(),
+            action: None,
+            locator: None,
+            snapshot_ids: Vec::new(),
+            outcome: Some(Outcome::Success),
+            payload: Some(HandoffPayload {
+                origin,
+                outcome,
+                cookie_names_added,
+            }),
+            detail: None,
+        };
+        self.commit_reserved_policy(handle, entry.export_line().into_bytes())
     }
 
     pub fn commit_policy_event(&mut self, mut entry: JournalEntry) -> Result<(), JournalError> {

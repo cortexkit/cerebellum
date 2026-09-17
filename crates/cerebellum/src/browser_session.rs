@@ -1,6 +1,6 @@
 //! Route-owned browser session lifecycle, leases, and the common teardown ladder.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,12 @@ pub const BROWSER_LAUNCH: &str = "browser.launch";
 pub const BROWSER_STATUS: &str = "browser.status";
 pub const BROWSER_CLOSE: &str = "browser.close";
 pub const CONTROL_TOOLS: [&str; 3] = [BROWSER_LAUNCH, BROWSER_STATUS, BROWSER_CLOSE];
+
+/// Ten minutes gives a person time to complete password-manager and 2FA steps
+/// without leaving an unattended browser under human control indefinitely.
+pub const HANDOFF_DURATION_MS: u64 = 10 * 60 * 1_000;
+/// Poll slowly enough not to contend with the person typing in the page.
+pub const HANDOFF_POLL_INTERVAL_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +93,85 @@ impl BrowserLease {
             "idle_expires_at": render_rfc3339_millis(rendered),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffOutcome {
+    LoginObserved,
+    Expired,
+    ClosedByCaller,
+}
+
+impl HandoffOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoginObserved => "login_observed",
+            Self::Expired => "expired",
+            Self::ClosedByCaller => "closed_by_caller",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Handoff {
+    generation: u64,
+    origin: String,
+    opened_at: MonoInstant,
+    expires_at: MonoInstant,
+    opening_cookie_names: BTreeSet<String>,
+    cookie_names_added: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedHandoff {
+    handoff: Handoff,
+    outcome: HandoffOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandoffState {
+    Open(Handoff),
+    Closed(ClosedHandoff),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedHandoff {
+    pub generation: u64,
+    pub expires_in_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresentRefusal {
+    NoSession,
+    OriginMismatch { current_origin: String },
+    HandoffOpen,
+    PresentFailed { error_text: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffClose {
+    pub origin: String,
+    pub outcome: HandoffOutcome,
+    pub cookie_names_added: usize,
+    pub should_journal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffPollResult {
+    Open,
+    Closed(HandoffClose),
+    Gone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeRefusal {
+    NoHandoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanInControl {
+    pub origin: String,
+    pub expires_in_ms: u64,
 }
 
 fn render_rfc3339_millis(time: SystemTime) -> String {
@@ -195,6 +280,7 @@ pub enum NavigationDriveError {
     Unavailable,
     ConnectorFailure,
     CdpFailure,
+    CommandFailed { error_text: String },
     NavigationFailed { error_text: String },
 }
 
@@ -271,6 +357,44 @@ impl From<NavigationDriveError> for ClickPointDriveError {
 }
 
 pub trait OwnedBrowserProcess: Send {
+    /// Front the process-owned page without exposing a general CDP command seam.
+    fn present(
+        &mut self,
+        _context_key: &str,
+        _deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Read cookie names for one origin. Cookie values must be discarded inside
+    /// the concrete driver and cannot be represented by this return type.
+    fn cookie_names_for_origin(
+        &mut self,
+        _context_key: &str,
+        _origin: &str,
+        _deadline_ms: u64,
+    ) -> Result<BTreeSet<String>, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Read only the current main-frame URL.
+    fn main_frame_url(
+        &mut self,
+        _context_key: &str,
+        _deadline_ms: u64,
+    ) -> Result<String, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Report only whether the current classified page contains a credential field.
+    fn has_credential_field(
+        &mut self,
+        _context_key: &str,
+        _deadline_ms: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Drive through the process-owned CDP connection. The default keeps test
     /// and non-production process adapters explicitly non-dispatchable.
     fn navigate(
@@ -387,6 +511,8 @@ struct ReadySession {
     terminal: Option<BrowserSessionTerminalOutcome>,
     cleanup_failure: Option<CleanupStage>,
     cleanup_outcome: Option<SessionCleanupOutcome>,
+    handoff: Option<HandoffState>,
+    next_handoff_generation: u64,
     process: Option<Box<dyn OwnedBrowserProcess>>,
     cleanup: Option<Box<dyn SessionCleanup>>,
 }
@@ -657,6 +783,8 @@ impl BrowserSessions {
             terminal: None,
             cleanup_failure: None,
             cleanup_outcome: None,
+            handoff: None,
+            next_handoff_generation: 0,
             process: None,
             cleanup: None,
         });
@@ -739,6 +867,213 @@ impl BrowserSessions {
             .map(|session| session.lease.deadline())
     }
 
+    pub fn present<C: MonotonicClock>(
+        &self,
+        route_key: &str,
+        origin: &str,
+        deadline_ms: u64,
+        clock: &C,
+    ) -> Result<PresentedHandoff, PresentRefusal> {
+        let mut state = self.inner.0.lock().map_err(|_| PresentRefusal::NoSession)?;
+        let session = state
+            .routes
+            .get_mut(route_key)
+            .and_then(|route| route.active.as_mut())
+            .filter(|session| {
+                session.process.is_some()
+                    && session.terminal.is_none()
+                    && session.cleanup_failure.is_none()
+                    && clock.now() < session.lease.deadline()
+            })
+            .ok_or(PresentRefusal::NoSession)?;
+        if matches!(session.handoff, Some(HandoffState::Open(_))) {
+            return Err(PresentRefusal::HandoffOpen);
+        }
+
+        let process = session.process.as_mut().ok_or(PresentRefusal::NoSession)?;
+        let current_url = process
+            .main_frame_url(route_key, deadline_ms)
+            .map_err(|error| PresentRefusal::PresentFailed {
+                error_text: navigation_drive_error_text(error),
+            })?;
+        let current_origin = main_frame_origin(&current_url);
+        if current_origin != origin {
+            return Err(PresentRefusal::OriginMismatch { current_origin });
+        }
+        process
+            .present(route_key, deadline_ms)
+            .map_err(|error| PresentRefusal::PresentFailed {
+                error_text: navigation_drive_error_text(error),
+            })?;
+        let opening_cookie_names = process
+            .cookie_names_for_origin(route_key, origin, deadline_ms)
+            .map_err(|error| PresentRefusal::PresentFailed {
+                error_text: navigation_drive_error_text(error),
+            })?;
+
+        let opened_at = clock.now();
+        let expires_at = opened_at.saturating_add(Duration::from_millis(HANDOFF_DURATION_MS));
+        session.next_handoff_generation = session.next_handoff_generation.saturating_add(1);
+        let generation = session.next_handoff_generation;
+        session.lease.renew(clock);
+        session.handoff = Some(HandoffState::Open(Handoff {
+            generation,
+            origin: origin.to_string(),
+            opened_at,
+            expires_at,
+            opening_cookie_names,
+            cookie_names_added: 0,
+        }));
+        Ok(PresentedHandoff {
+            generation,
+            expires_in_ms: HANDOFF_DURATION_MS,
+        })
+    }
+
+    pub fn resume<C: MonotonicClock>(
+        &self,
+        route_key: &str,
+        clock: &C,
+    ) -> Result<HandoffClose, ResumeRefusal> {
+        let mut state = self.inner.0.lock().map_err(|_| ResumeRefusal::NoHandoff)?;
+        let session = state
+            .routes
+            .get_mut(route_key)
+            .and_then(|route| route.active.as_mut())
+            .ok_or(ResumeRefusal::NoHandoff)?;
+        let handoff = session.handoff.take().ok_or(ResumeRefusal::NoHandoff)?;
+        let (closed, should_journal) = match handoff {
+            HandoffState::Open(handoff) => (
+                ClosedHandoff {
+                    outcome: if clock.now() >= handoff.expires_at {
+                        HandoffOutcome::Expired
+                    } else {
+                        HandoffOutcome::ClosedByCaller
+                    },
+                    handoff,
+                },
+                true,
+            ),
+            HandoffState::Closed(closed) => (closed, false),
+        };
+        Ok(handoff_close(&closed, should_journal))
+    }
+
+    pub fn human_in_control<C: MonotonicClock>(
+        &self,
+        route_key: &str,
+        clock: &C,
+    ) -> Option<HumanInControl> {
+        let state = self.inner.0.lock().ok()?;
+        let handoff = state
+            .routes
+            .get(route_key)?
+            .active
+            .as_ref()?
+            .handoff
+            .as_ref()?;
+        match handoff {
+            HandoffState::Open(handoff) => Some(HumanInControl {
+                origin: handoff.origin.clone(),
+                expires_in_ms: remaining_ms(handoff.expires_at, clock.now()),
+            }),
+            HandoffState::Closed(closed) if closed.outcome == HandoffOutcome::Expired => {
+                Some(HumanInControl {
+                    origin: closed.handoff.origin.clone(),
+                    expires_in_ms: 0,
+                })
+            }
+            HandoffState::Closed(_) => None,
+        }
+    }
+
+    pub fn poll_handoff<C: MonotonicClock>(
+        &self,
+        route_key: &str,
+        generation: u64,
+        deadline_ms: u64,
+        clock: &C,
+    ) -> HandoffPollResult {
+        let mut state = match self.inner.0.lock() {
+            Ok(state) => state,
+            Err(_) => return HandoffPollResult::Gone,
+        };
+        let Some(session) = state
+            .routes
+            .get_mut(route_key)
+            .and_then(|route| route.active.as_mut())
+        else {
+            return HandoffPollResult::Gone;
+        };
+        let Some(HandoffState::Open(handoff)) = session.handoff.as_ref() else {
+            return HandoffPollResult::Gone;
+        };
+        if handoff.generation != generation {
+            return HandoffPollResult::Gone;
+        }
+        if clock.now() >= handoff.expires_at {
+            let HandoffState::Open(handoff) = session.handoff.take().expect("matched open handoff")
+            else {
+                unreachable!("matched open handoff changed under the session lock")
+            };
+            let closed = ClosedHandoff {
+                handoff,
+                outcome: HandoffOutcome::Expired,
+            };
+            let result = handoff_close(&closed, true);
+            session.handoff = Some(HandoffState::Closed(closed));
+            return HandoffPollResult::Closed(result);
+        }
+
+        let opening_cookie_names = handoff.opening_cookie_names.clone();
+        let origin = handoff.origin.clone();
+        session.lease.renew(clock);
+        let Some(process) = session.process.as_mut() else {
+            return HandoffPollResult::Gone;
+        };
+        let current_cookie_names =
+            match process.cookie_names_for_origin(route_key, &origin, deadline_ms) {
+                Ok(names) => names,
+                Err(_) => return HandoffPollResult::Open,
+            };
+        let main_frame_url = match process.main_frame_url(route_key, deadline_ms) {
+            Ok(url) => url,
+            Err(_) => return HandoffPollResult::Open,
+        };
+        let has_credential_field = match process.has_credential_field(route_key, deadline_ms) {
+            Ok(value) => value,
+            Err(_) => return HandoffPollResult::Open,
+        };
+        let cookie_names_added = current_cookie_names
+            .difference(&opening_cookie_names)
+            .count();
+        let observed = handoff_login_observed(
+            &opening_cookie_names,
+            &current_cookie_names,
+            has_credential_field,
+            &main_frame_url,
+            &origin,
+        );
+        let Some(HandoffState::Open(handoff)) = session.handoff.as_mut() else {
+            return HandoffPollResult::Gone;
+        };
+        handoff.cookie_names_added = cookie_names_added;
+        if !observed {
+            return HandoffPollResult::Open;
+        }
+        let HandoffState::Open(handoff) = session.handoff.take().expect("matched open handoff")
+        else {
+            unreachable!("matched open handoff changed under the session lock")
+        };
+        let closed = ClosedHandoff {
+            handoff,
+            outcome: HandoffOutcome::LoginObserved,
+        };
+        let result = handoff_close(&closed, true);
+        session.handoff = Some(HandoffState::Closed(closed));
+        HandoffPollResult::Closed(result)
+    }
+
     pub fn status<C: MonotonicClock>(
         &self,
         route_key: &str,
@@ -805,10 +1140,14 @@ impl BrowserSessions {
         else {
             return false;
         };
+        let now = clock.now();
         if session.process.is_none()
             || session.terminal.is_some()
             || session.pending_operations != 0
-            || clock.now() < session.lease.deadline()
+            || session.handoff.as_ref().is_some_and(
+                |handoff| matches!(handoff, HandoffState::Open(open) if now < open.expires_at),
+            )
+            || now < session.lease.deadline()
         {
             return false;
         }
@@ -1065,6 +1404,54 @@ impl BrowserSessions {
         }
         route.retained.push(session);
         wake.notify_all();
+    }
+}
+
+/// Login is observed only when all three independently sampled facts agree.
+pub fn handoff_login_observed(
+    opening_cookie_names: &BTreeSet<String>,
+    current_cookie_names: &BTreeSet<String>,
+    has_credential_field: bool,
+    main_frame_url: &str,
+    handoff_origin: &str,
+) -> bool {
+    current_cookie_names
+        .difference(opening_cookie_names)
+        .next()
+        .is_some()
+        && !has_credential_field
+        && main_frame_origin(main_frame_url) == handoff_origin
+}
+
+fn handoff_close(closed: &ClosedHandoff, should_journal: bool) -> HandoffClose {
+    HandoffClose {
+        origin: closed.handoff.origin.clone(),
+        outcome: closed.outcome,
+        cookie_names_added: closed.handoff.cookie_names_added,
+        should_journal,
+    }
+}
+
+fn remaining_ms(expires_at: MonoInstant, now: MonoInstant) -> u64 {
+    expires_at.as_nanos().saturating_sub(now.as_nanos()) / 1_000_000
+}
+
+fn main_frame_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "null".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    crate::classification::canonical_origin(&format!("{scheme}://{authority}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn navigation_drive_error_text(error: NavigationDriveError) -> String {
+    match error {
+        NavigationDriveError::CommandFailed { error_text }
+        | NavigationDriveError::NavigationFailed { error_text } => error_text,
+        NavigationDriveError::Unavailable => "browser driver unavailable".to_string(),
+        NavigationDriveError::ConnectorFailure => "browser connector failure".to_string(),
+        NavigationDriveError::CdpFailure => "browser CDP failure".to_string(),
     }
 }
 
@@ -1965,5 +2352,206 @@ mod tests {
             validate_close(&json!({"z": 1, "a": 2})).unwrap_err(),
             crate::capability::invalid_request("a", "unknown_field")
         );
+    }
+
+    #[derive(Clone)]
+    struct HandoffFacts {
+        cookie_names: Arc<Mutex<BTreeSet<String>>>,
+        main_frame_url: Arc<Mutex<String>>,
+        credential_field: Arc<Mutex<bool>>,
+        observations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    struct HandoffProcess(HandoffFacts);
+
+    impl OwnedBrowserProcess for HandoffProcess {
+        fn present(&mut self, _: &str, _: u64) -> Result<(), NavigationDriveError> {
+            self.0.observations.lock().unwrap().push("present");
+            Ok(())
+        }
+
+        fn cookie_names_for_origin(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<BTreeSet<String>, NavigationDriveError> {
+            self.0.observations.lock().unwrap().push("cookies");
+            Ok(self.0.cookie_names.lock().unwrap().clone())
+        }
+
+        fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
+            self.0.observations.lock().unwrap().push("url");
+            Ok(self.0.main_frame_url.lock().unwrap().clone())
+        }
+
+        fn has_credential_field(&mut self, _: &str, _: u64) -> Result<bool, NavigationDriveError> {
+            self.0.observations.lock().unwrap().push("credential");
+            Ok(*self.0.credential_field.lock().unwrap())
+        }
+
+        fn generation_matches(&self) -> bool {
+            true
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+            Ok(true)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+    }
+
+    fn handoff_session(sessions: &BrowserSessions, clock: &FakeClock) -> HandoffFacts {
+        let facts = HandoffFacts {
+            cookie_names: Arc::new(Mutex::new(BTreeSet::from(["before".to_string()]))),
+            main_frame_url: Arc::new(Mutex::new("https://login.example/account".to_string())),
+            credential_field: Arc::new(Mutex::new(true)),
+            observations: Arc::new(Mutex::new(Vec::new())),
+        };
+        let _ = sessions.acquire_launch_slot("route");
+        sessions
+            .establish_ready(
+                "route",
+                ProfileDisposition::Durable,
+                &config(),
+                clock,
+                Box::new(HandoffProcess(facts.clone())),
+                Box::new(RecordingCleanup::default()),
+            )
+            .expect("test handoff session becomes ready");
+        facts
+    }
+
+    #[test]
+    fn login_is_observed_only_when_all_three_facts_hold() {
+        let opening = BTreeSet::from(["before".to_string()]);
+        for grown in [false, true] {
+            for no_field in [false, true] {
+                for same_origin in [false, true] {
+                    let mut current = opening.clone();
+                    if grown {
+                        current.insert("authenticated".to_string());
+                    }
+                    let url = if same_origin {
+                        "https://login.example/done"
+                    } else {
+                        "https://sso.example/done"
+                    };
+                    assert_eq!(
+                        handoff_login_observed(
+                            &opening,
+                            &current,
+                            !no_field,
+                            url,
+                            "https://login.example",
+                        ),
+                        grown && no_field && same_origin,
+                        "grown={grown}, no_field={no_field}, same_origin={same_origin}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_password_step_with_2fa_pending_is_not_done() {
+        let opening = BTreeSet::from(["before".to_string()]);
+        let current = BTreeSet::from(["before".to_string(), "authenticated".to_string()]);
+        assert!(!handoff_login_observed(
+            &opening,
+            &current,
+            true,
+            "https://login.example/2fa",
+            "https://login.example",
+        ));
+    }
+
+    #[test]
+    fn an_sso_redirect_is_not_done() {
+        let opening = BTreeSet::from(["before".to_string()]);
+        let current = BTreeSet::from(["before".to_string(), "authenticated".to_string()]);
+        assert!(!handoff_login_observed(
+            &opening,
+            &current,
+            false,
+            "https://sso.example/login",
+            "https://login.example",
+        ));
+    }
+
+    #[test]
+    fn poll_reads_only_the_three_facts_in_order_and_closes_on_login() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let facts = handoff_session(&sessions, &clock);
+        let presented = sessions
+            .present("route", "https://login.example", 10, &clock)
+            .unwrap();
+        facts
+            .cookie_names
+            .lock()
+            .unwrap()
+            .insert("authenticated".to_string());
+        *facts.credential_field.lock().unwrap() = false;
+        facts.observations.lock().unwrap().clear();
+
+        let polled = sessions.poll_handoff("route", presented.generation, 10, &clock);
+        assert!(matches!(
+            polled,
+            HandoffPollResult::Closed(HandoffClose {
+                outcome: HandoffOutcome::LoginObserved,
+                cookie_names_added: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            facts.observations.lock().unwrap().as_slice(),
+            ["cookies", "url", "credential"]
+        );
+    }
+
+    #[test]
+    fn expiry_closes_and_the_next_tool_call_says_so() {
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let _ = handoff_session(&sessions, &clock);
+        sessions
+            .present("route", "https://login.example", 10, &clock)
+            .unwrap();
+        clock.advance(Duration::from_millis(HANDOFF_DURATION_MS));
+
+        let blocked = sessions
+            .human_in_control("route", &clock)
+            .expect("expired handoff remains a typed tool refusal until resume");
+        assert_eq!(blocked.expires_in_ms, 0);
+        let resumed = sessions.resume("route", &clock).unwrap();
+        assert_eq!(resumed.outcome, HandoffOutcome::Expired);
+    }
+
+    #[test]
+    fn idle_sweep_skips_a_route_with_an_open_handoff() {
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let _ = handoff_session(&sessions, &clock);
+        sessions
+            .present("route", "https://login.example", 10, &clock)
+            .unwrap();
+        clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
+        assert!(!sessions.expire_idle("route", &clock, &config()));
+
+        clock.advance(Duration::from_millis(
+            HANDOFF_DURATION_MS - config().browser_idle_timeout_ms,
+        ));
+        assert!(sessions.expire_idle("route", &clock, &config()));
     }
 }

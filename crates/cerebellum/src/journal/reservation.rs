@@ -118,6 +118,7 @@ fn identity_entry(
         locator: material.locator,
         snapshot_ids: material.snapshot_ids,
         outcome: Some(material.outcome),
+        payload: None,
         detail: Some(material.detail),
     }
 }
