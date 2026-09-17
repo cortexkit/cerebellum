@@ -280,19 +280,49 @@ mod probe {
         vec![minus, one]
     }
 
-    /// Child mode: sleep, post one mouse-move globally from THIS process, exit.
+    /// Child mode: wait for the module's heartbeat marker on a tap of our own,
+    /// sleep, post one mouse-move globally from THIS process, exit.
     ///
-    /// The tap sees it under this child's pid, which is neither the module's
-    /// nor the parent probe's, so the seize watcher classifies it as another
-    /// process seizing input: the same stop path a person's input takes,
-    /// reachable at a chosen millisecond instead of whenever a hand lands.
+    /// The tap sees the post under this child's pid, which is neither the
+    /// module's nor the parent probe's, so the seize watcher classifies it as
+    /// another process seizing input: the same stop path a person's input
+    /// takes, reachable at a chosen millisecond instead of whenever a hand
+    /// lands. The delay counts from the module's heartbeat marker rather than
+    /// from the request going out: the module's pre-dispatch work (lease,
+    /// audit reservation with an fsync) took 100-200 ms on the VM, so a delay
+    /// from the request landed before the idle read and was refused not_idle
+    /// instead of stopping anything. The marker is the first event the module
+    /// posts after that read, and post 0 follows it within a millisecond.
     fn poke_after(ms: u64) -> ExitCode {
-        // Loading this binary costs tens of milliseconds on a VM, more than
-        // the delays being measured. The parent waits for this line before it
-        // sends the drag, so the delay counts from a moment both sides share.
         use std::io::Write;
+        let tap = match cerebellum_macos::SessionEventTap::listen(256) {
+            Ok(tap) => tap,
+            Err(error) => {
+                eprintln!("poke: could not create a session tap: {error:?}");
+                return ExitCode::from(1);
+            }
+        };
+        let own_pid = i64::from(std::process::id());
         println!("ready");
         let _ = std::io::stdout().flush();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                eprintln!("poke: no heartbeat marker from another process within 5 s");
+                return ExitCode::from(3);
+            }
+            match tap.events().recv_timeout(remaining) {
+                Ok(event) if event.marker_nonce != 0 && event.source_unix_process_id != own_pid => {
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    eprintln!("poke: the tap stopped delivering");
+                    return ExitCode::from(3);
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(ms));
         let event = match cerebellum_macos::mouse_move_event(cerebellum_macos::EventPoint {
             x: 450.0,
@@ -340,7 +370,9 @@ mod probe {
         let mut aborts = 0u32;
         let mut worst: Option<(u32, u32)> = None;
         let mut evidence = Vec::new();
-        for poke_after_ms in [30u64, 80, 130] {
+        // From the heartbeat: post 0 at ~1 ms, post 1 at ~51, post 2 at ~101,
+        // tail to ~201. Two delays inside the sequence, one in the tail.
+        for poke_after_ms in [20u64, 70, 150] {
             // Let the machine go idle past the gate before each attempt; the
             // previous attempt's own posts are carried by the estimator, but
             // the poke was another process's input and clears the carry.
@@ -413,6 +445,17 @@ mod probe {
             let _ = child.wait();
             match reply["outcome"].as_str() {
                 Some("user_seized_control") => {}
+                Some("completed") if poke_after_ms > 101 => {
+                    // Landed after the last post: the sequence was already
+                    // complete, and a stop would have been wrong. What it must
+                    // do instead is clear the carry, which the next attempt's
+                    // idle read shows.
+                    evidence.push(format!(
+                        "poke at {poke_after_ms}ms (tail): completed, as a post-sequence event \
+                         should"
+                    ));
+                    continue;
+                }
                 other => {
                     evidence.push(format!("poke at {poke_after_ms}ms: answered {other:?}"));
                     continue;
