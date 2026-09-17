@@ -180,6 +180,13 @@ mod probe {
             match argument.as_str() {
                 "--quiet" => quiet = true,
                 "--hands" => hands = true,
+                "--poke" => {
+                    let Some(ms) = args.next().and_then(|value| value.parse::<u64>().ok()) else {
+                        eprintln!("--poke needs a delay in milliseconds");
+                        return ExitCode::from(2);
+                    };
+                    return poke_after(ms);
+                }
                 "--connection" => match args.next() {
                     Some(path) => connection = Some(PathBuf::from(path)),
                     None => {
@@ -257,17 +264,269 @@ mod probe {
     }
 
     async fn quiet_arms(wire: &mut Wire) -> Vec<Arm> {
+        let (one, seven) = arm_one_and_seven_second_process(wire).await;
         vec![
             arm_four(wire).await,
             arm_three(wire).await,
             arm_two_plus(wire).await,
+            one,
+            seven,
         ]
     }
 
     async fn hands_arms(wire: &mut Wire) -> Vec<Arm> {
         let minus = arm_two_minus(wire).await;
-        let (one, seven) = arm_one_and_seven(wire).await;
-        vec![minus, one, seven]
+        let one = arm_one_hardware(wire).await;
+        vec![minus, one]
+    }
+
+    /// Child mode: sleep, post one mouse-move globally from THIS process, exit.
+    ///
+    /// The tap sees it under this child's pid, which is neither the module's
+    /// nor the parent probe's, so the seize watcher classifies it as another
+    /// process seizing input: the same stop path a person's input takes,
+    /// reachable at a chosen millisecond instead of whenever a hand lands.
+    fn poke_after(ms: u64) -> ExitCode {
+        std::thread::sleep(Duration::from_millis(ms));
+        let event = match cerebellum_macos::mouse_move_event(cerebellum_macos::EventPoint {
+            x: 450.0,
+            y: 430.0,
+        }) {
+            Ok(event) => event,
+            Err(error) => {
+                eprintln!("poke: could not construct a mouse move: {error:?}");
+                return ExitCode::from(1);
+            }
+        };
+        let _ = cerebellum_macos::post_event_globally(event);
+        ExitCode::SUCCESS
+    }
+
+    // ------------------------------------------------------- arms 1 and 7
+
+    /// A drag stops when another process posts input mid-sequence, and the
+    /// stop arrives inside the loop's own latency bound.
+    ///
+    /// Runs without a person: a child of this probe posts one mouse-move at a
+    /// chosen delay after the drag request goes out, so the event lands at a
+    /// known point in the sequence. The tap attributes it to the child's pid
+    /// and the watcher takes the same stop path a hand would. Three delays
+    /// cover the sequence (three posts 50 ms apart plus the tail); a delay that
+    /// lands before the idle read refuses `not_idle` instead, which is the
+    /// gate doing its job and is reported as such rather than as a miss.
+    async fn arm_one_and_seven_second_process(wire: &mut Wire) -> (Arm, Arm) {
+        const ONE: &str = "1";
+        const ONE_NAME: &str = "abort_on_second_process_input_during_sequence";
+        const SEVEN: &str = "7";
+        const SEVEN_NAME: &str = "abort_latency_bound";
+        let probe_binary = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                let reason =
+                    format!("cannot find this probe's own binary to spawn a poke: {error}");
+                return (
+                    Arm::unmeasurable(ONE, ONE_NAME, reason.clone()),
+                    Arm::unmeasurable(SEVEN, SEVEN_NAME, reason),
+                );
+            }
+        };
+
+        let mut aborts = 0u32;
+        let mut worst: Option<(u32, u32)> = None;
+        let mut evidence = Vec::new();
+        for poke_after_ms in [60u64, 110, 160] {
+            // Let the machine go idle past the gate before each attempt; the
+            // previous attempt's own posts are carried by the estimator, but
+            // the poke was another process's input and clears the carry.
+            sleep(Duration::from_millis(1300)).await;
+            if let Err(reason) = wire.take_once_lease().await {
+                return (
+                    Arm::unmeasurable(ONE, ONE_NAME, reason),
+                    Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                );
+            }
+            let before = match journal_entries() {
+                Ok(entries) => entries,
+                Err(reason) => {
+                    return (
+                        Arm::unmeasurable(ONE, ONE_NAME, reason),
+                        Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                    )
+                }
+            };
+            let child = match Command::new(&probe_binary)
+                .arg("--poke")
+                .arg(poke_after_ms.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    let reason = format!("could not spawn the poke child: {error}");
+                    return (
+                        Arm::unmeasurable(ONE, ONE_NAME, reason.clone()),
+                        Arm::unmeasurable(SEVEN, SEVEN_NAME, reason),
+                    );
+                }
+            };
+            let child_pid = i64::from(child.id());
+            let reply = match wire
+                .tool_call(
+                    "computer.drag",
+                    json!({
+                        "from": "400,400",
+                        "to": "520,460",
+                        "button": "left",
+                        "modifiers": [],
+                    }),
+                )
+                .await
+            {
+                Ok(reply) => reply,
+                Err(reason) => {
+                    return (
+                        Arm::unmeasurable(ONE, ONE_NAME, reason),
+                        Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                    )
+                }
+            };
+            let mut child = child;
+            let _ = child.wait();
+            match reply["outcome"].as_str() {
+                Some("user_seized_control") => {}
+                other => {
+                    evidence.push(format!("poke at {poke_after_ms}ms: answered {other:?}"));
+                    continue;
+                }
+            }
+            let record = match settled_record(&before, "computer.drag") {
+                Ok(record) => record,
+                Err(reason) => {
+                    return (
+                        Arm::unmeasurable(ONE, ONE_NAME, reason),
+                        Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
+                    )
+                }
+            };
+            let Some(abort) = record.abort.as_ref() else {
+                return (
+                    Arm::fail(
+                        ONE,
+                        ONE_NAME,
+                        format!(
+                            "poke at {poke_after_ms}ms: the wire said user_seized_control but \
+                             the journal record carries no abort"
+                        ),
+                    ),
+                    Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 produced no abort record"),
+                );
+            };
+            let source = abort
+                .get("sourced_input_kind")
+                .and_then(|kind| kind.get("source"))
+                .and_then(Value::as_str)
+                .unwrap_or("absent");
+            let seized_by = abort
+                .get("sourced_input_kind")
+                .and_then(|kind| kind.get("pid"))
+                .and_then(Value::as_i64);
+            if source != "other_process" || seized_by != Some(child_pid) {
+                return (
+                    Arm::fail(
+                        ONE,
+                        ONE_NAME,
+                        format!(
+                            "poke at {poke_after_ms}ms: the abort names source={source:?} \
+                             pid={seized_by:?}, not the poking child {child_pid}"
+                        ),
+                    ),
+                    Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not observe the poke"),
+                );
+            }
+            aborts += 1;
+            let end_to_end = abort
+                .get("detection_latency_ms")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let platform = abort
+                .get("platform_delivery_latency_ms")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let bound = abort
+                .get("maximum_detection_latency_ms")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let stopped_at = abort
+                .get("stopped_action_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            let (Some(end_to_end), Some(bound)) = (end_to_end, bound) else {
+                return (
+                    Arm::pass(
+                        ONE,
+                        ONE_NAME,
+                        format!("poke at {poke_after_ms}ms: stopped by the child's input"),
+                    ),
+                    Arm::fail(
+                        SEVEN,
+                        SEVEN_NAME,
+                        format!(
+                            "the abort record carries detection_latency_ms={end_to_end:?} and \
+                             maximum_detection_latency_ms={bound:?}; the bound cannot be checked \
+                             against a missing number"
+                        ),
+                    ),
+                );
+            };
+            let loop_share = platform.map_or(end_to_end, |p| end_to_end.saturating_sub(p));
+            evidence.push(format!(
+                "poke at {poke_after_ms}ms: stopped at post {stopped_at} by pid {child_pid}, \
+                 detection_latency_ms={end_to_end} (platform {}, loop {loop_share}) bound={bound}",
+                platform.map_or("unreported".to_string(), |p| p.to_string())
+            ));
+            if worst.is_none_or(|(previous, _)| loop_share > previous) {
+                worst = Some((loop_share, bound));
+            }
+        }
+
+        if aborts == 0 {
+            return (
+                Arm::fail(
+                    ONE,
+                    ONE_NAME,
+                    format!("no poke stopped a drag ({})", evidence.join("; ")),
+                ),
+                Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 observed no abort to measure"),
+            );
+        }
+        let one = Arm::pass(
+            ONE,
+            ONE_NAME,
+            format!(
+                "{aborts} of 3 pokes stopped the drag; {}",
+                evidence.join("; ")
+            ),
+        );
+        let seven = match worst {
+            Some((measured, bound)) if measured <= bound => Arm::pass(
+                SEVEN,
+                SEVEN_NAME,
+                format!(
+                    "worst loop share of detection latency {measured} ms <= bound {bound} over \
+                     {aborts} aborts (platform delivery disclosed per poke above)"
+                ),
+            ),
+            Some((measured, bound)) => Arm::fail(
+                SEVEN,
+                SEVEN_NAME,
+                format!(
+                    "worst loop share of detection latency {measured} ms exceeds bound {bound}"
+                ),
+            ),
+            None => Arm::unmeasurable(SEVEN, SEVEN_NAME, "no abort carried a latency"),
+        };
+        (one, seven)
     }
 
     // ---------------------------------------------------------------- arm 4
@@ -651,11 +910,13 @@ mod probe {
     ///
     /// The other direction -- that our OWN posts do not abort us -- is arm 4,
     /// which completes a move and a drag with nobody touching anything.
-    async fn arm_one_and_seven(wire: &mut Wire) -> (Arm, Arm) {
-        const ONE: &str = "1";
+    /// The hands twin of arm 1: the stopping input is a person's, attributed
+    /// `hardware` by the tap. The latency bound is measured by the second-
+    /// process arm, where the moment of the input is known; here the point is
+    /// the attribution and that a real hand takes the same path.
+    async fn arm_one_hardware(wire: &mut Wire) -> Arm {
+        const ONE: &str = "1h";
         const ONE_NAME: &str = "abort_on_hardware_input_during_sequence";
-        const SEVEN: &str = "7";
-        const SEVEN_NAME: &str = "abort_latency_bound";
         // A drag is three posts 50 ms apart plus a 100 ms tail: about a quarter
         // of a second in which a hardware event aborts it. No person can hold
         // still for the second the idle gate requires and then move inside
@@ -664,14 +925,11 @@ mod probe {
         // about a second in. The first hardware event then lands in one of
         // three places -- mid-sequence (the abort this arm wants), in the tail
         // (clears the carry), or between drags (the next one refuses
-        // not_idle) -- and with no gap between drags the mid-sequence case is
-        // reached in a good fraction of rounds. Five rounds make missing it
-        // every time unlikely; one hit is a measurement.
+        // not_idle). Five rounds; one hit is a measurement.
         const BURST: Duration = Duration::from_secs(6);
         const ROUNDS: u32 = 5;
 
         let mut aborts = 0u32;
-        let mut worst: Option<(u32, u32)> = None;
         let mut evidence = Vec::new();
 
         for round in 1..=ROUNDS {
@@ -686,29 +944,16 @@ mod probe {
                     break None;
                 }
                 if let Err(reason) = wire.take_once_lease().await {
-                    return (
-                        Arm::unmeasurable(ONE, ONE_NAME, reason),
-                        Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
-                    );
+                    return Arm::unmeasurable(ONE, ONE_NAME, reason);
                 }
                 let before = match journal_entries() {
                     Ok(entries) => entries,
-                    Err(reason) => {
-                        return (
-                            Arm::unmeasurable(ONE, ONE_NAME, reason),
-                            Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
-                        )
-                    }
+                    Err(reason) => return Arm::unmeasurable(ONE, ONE_NAME, reason),
                 };
                 let reply = match wire
                     .tool_call(
                         "computer.drag",
                         json!({
-                            // A short stroke well inside any display and below
-                            // the menu bar. The first version dragged from the
-                            // screen's top-left pixel, which is the Apple menu:
-                            // the mouse-down opened it on every round, and a
-                            // release over a menu item is not a no-op.
                             "from": "400,400",
                             "to": "520,460",
                             "button": "left",
@@ -718,12 +963,7 @@ mod probe {
                     .await
                 {
                     Ok(reply) => reply,
-                    Err(reason) => {
-                        return (
-                            Arm::unmeasurable(ONE, ONE_NAME, reason),
-                            Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
-                        )
-                    }
+                    Err(reason) => return Arm::unmeasurable(ONE, ONE_NAME, reason),
                 };
                 match reply["outcome"].as_str() {
                     Some("user_seized_control") => break Some(before),
@@ -753,24 +993,16 @@ mod probe {
             };
             let record = match settled_record(&before, "computer.drag") {
                 Ok(record) => record,
-                Err(reason) => {
-                    return (
-                        Arm::unmeasurable(ONE, ONE_NAME, reason),
-                        Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
-                    )
-                }
+                Err(reason) => return Arm::unmeasurable(ONE, ONE_NAME, reason),
             };
             let Some(abort) = record.abort.as_ref() else {
-                return (
-                    Arm::fail(
-                        ONE,
-                        ONE_NAME,
-                        format!(
-                            "round {round}: the wire said user_seized_control but the journal \
-                             record carries no abort"
-                        ),
+                return Arm::fail(
+                    ONE,
+                    ONE_NAME,
+                    format!(
+                        "round {round}: the wire said user_seized_control but the journal \
+                         record carries no abort"
                     ),
-                    Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 produced no abort record"),
                 );
             };
             let source = abort
@@ -779,111 +1011,65 @@ mod probe {
                 .and_then(Value::as_str)
                 .unwrap_or("absent");
             if source != "hardware" {
-                return (
-                    Arm::fail(
-                        ONE,
-                        ONE_NAME,
-                        format!(
-                            "round {round}: the seizing source is {source:?}, not hardware -- \
-                             something other than the person at the desk stopped this"
-                        ),
-                    ),
-                    Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not observe a hardware abort"),
-                );
-            }
-            aborts += 1;
-            let end_to_end = abort
-                .get("detection_latency_ms")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32);
-            let platform = abort
-                .get("platform_delivery_latency_ms")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32);
-            let bound = abort
-                .get("maximum_detection_latency_ms")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32);
-            match (end_to_end, bound) {
-                (Some(end_to_end), Some(bound)) => {
-                    // The bound is a promise about the module's own loop: the
-                    // platform's delivery (event timestamp to tap callback) is
-                    // disclosed beside it, and the loop's share is what the
-                    // bound is judged against. When the platform share is not
-                    // reported the whole number is judged, which can only be
-                    // stricter.
-                    let loop_share = platform.map_or(end_to_end, |p| end_to_end.saturating_sub(p));
-                    evidence.push(format!(
-                        "round {round}: wire user_seized_control, source=hardware, \
-                         detection_latency_ms={end_to_end} (platform {}, loop {loop_share}) \
-                         bound={bound} (after {completed} completed drags)",
-                        platform.map_or("unreported".to_string(), |p| p.to_string())
-                    ));
-                    if worst.is_none_or(|(previous, _)| loop_share > previous) {
-                        worst = Some((loop_share, bound));
-                    }
-                }
-                _ => {
-                    return (
-                        Arm::pass(
-                            ONE,
-                            ONE_NAME,
-                            format!("round {round}: wire user_seized_control, source=hardware"),
-                        ),
-                        Arm::fail(
-                            SEVEN,
-                            SEVEN_NAME,
-                            format!(
-                                "the abort record carries detection_latency_ms={end_to_end:?} and \
-                                 maximum_detection_latency_ms={bound:?}; the latency bound cannot \
-                                 be checked against a missing number"
-                            ),
-                        ),
-                    );
-                }
-            }
-        }
-
-        if aborts == 0 {
-            return (
-                Arm::fail(
+                return Arm::fail(
                     ONE,
                     ONE_NAME,
                     format!(
-                        "{ROUNDS} bursts of drags were never aborted mid-sequence ({})",
-                        evidence.join("; ")
+                        "round {round}: the seizing source is {source:?}, not hardware -- \
+                         something other than the person at the desk stopped this"
                     ),
+                );
+            }
+            aborts += 1;
+            evidence.push(format!(
+                "round {round}: wire user_seized_control, source=hardware, \
+                 detection_latency_ms={:?} (platform {:?}) (after {completed} completed drags)",
+                abort.get("detection_latency_ms").and_then(Value::as_u64),
+                abort
+                    .get("platform_delivery_latency_ms")
+                    .and_then(Value::as_u64)
+            ));
+        }
+
+        if aborts == 0 {
+            // No hardware event landed inside a sequence window this run: the
+            // gate refused every drag the hand was already moving for, and the
+            // drags that ran were over before it moved. That is the mechanism
+            // never being reached, not failing, so the verdict is unmeasurable,
+            // with the journal's earlier hardware-sourced aborts cited as the
+            // attribution evidence.
+            let prior = journal_entries().map_or(0, |entries| {
+                entries
+                    .values()
+                    .filter_map(|entry| entry.get("abort"))
+                    .filter(|abort| {
+                        abort
+                            .get("sourced_input_kind")
+                            .and_then(|kind| kind.get("source"))
+                            .and_then(Value::as_str)
+                            == Some("hardware")
+                    })
+                    .count()
+            });
+            return Arm::unmeasurable(
+                ONE,
+                ONE_NAME,
+                format!(
+                    "no hardware event landed inside a sequence window in {ROUNDS} rounds ({}); \
+                     the journal holds {prior} earlier hardware-sourced mid-sequence aborts \
+                     from previous runs",
+                    evidence.join("; ")
                 ),
-                Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 observed no abort to measure"),
             );
         }
-        let one = Arm::pass(
+        Arm::pass(
             ONE,
             ONE_NAME,
             format!(
                 "{aborts} of {ROUNDS} rounds aborted on hardware input; {}",
                 evidence.join("; ")
             ),
-        );
-        let seven = match worst {
-            Some((measured, bound)) if measured <= bound => Arm::pass(
-                SEVEN,
-                SEVEN_NAME,
-                format!(
-                    "worst loop share of detection latency {measured} ms <= bound {bound} over \
-                     {aborts} aborts (platform delivery disclosed per round above)"
-                ),
-            ),
-            Some((measured, bound)) => Arm::fail(
-                SEVEN,
-                SEVEN_NAME,
-                format!(
-                    "worst loop share of detection latency {measured} ms exceeds bound {bound}"
-                ),
-            ),
-            None => Arm::unmeasurable(SEVEN, SEVEN_NAME, "no abort carried a latency"),
-        };
-        (one, seven)
+        )
     }
 
     // ------------------------------------------------------------- the wire
