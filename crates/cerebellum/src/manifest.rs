@@ -706,6 +706,20 @@ pub fn browser_evidence_eligibility_sha256() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn both_roles_declare_the_same_concurrency() {
+        let manifest = super::build("cerebellum");
+        let tool_concurrency = match &manifest.provides[0] {
+            super::ProviderRole::ToolProvider { concurrency, .. } => concurrency,
+            _ => panic!("first role must be the tool provider"),
+        };
+        let management_concurrency = match &manifest.provides[1] {
+            super::ProviderRole::ManagementSurface { concurrency, .. } => concurrency,
+            _ => panic!("second role must be the management surface"),
+        };
+        assert_eq!(tool_concurrency, management_concurrency);
+    }
+
     /// A dirty tree names no commit.
     ///
     /// The rule this fences is that a sha is a claim about WHICH BYTES are
@@ -1048,7 +1062,7 @@ mod tests {
         let ProviderRole::ToolProvider { tools, .. } = &common_only.provides[0] else {
             panic!("expected tool provider");
         };
-        // Three controls, navigate, and screenshot. Screenshot needs no
+        // Three controls, navigate, screenshot, and their flat adapter. Screenshot needs no
         // extraction evidence because it runs none of the logic that evidence
         // attests: it captures pixels and reads viewport geometry, where
         // snapshot and click turn a page into structured data and address a
@@ -1056,9 +1070,9 @@ mod tests {
         // be wrong about a corpus it never consults.
         assert_eq!(
             tools.len(),
-            6,
-            "three controls, navigate, the extraction-free capture, and the \
-             coordinate click whose mapping is verified against a live browser"
+            7,
+            "three controls, navigate, the extraction-free capture, the coordinate \
+             click whose mapping is verified against a live browser, and browser_use"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
 
@@ -1073,9 +1087,9 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            8,
-            "three controls, navigate, screenshot, snapshot, click, and the \
-             coordinate click"
+            9,
+            "three controls, navigate, screenshot, snapshot, click, the coordinate \
+             click, and browser_use"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
         let serialized = serialize_with_browser_plane_pins(

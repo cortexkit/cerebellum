@@ -895,6 +895,8 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "browser.click",
         "browser.screenshot",
         "browser.click_point",
+        "browser_use",
+        "computer_use",
     ] {
         assert!(
             registered.contains(&expected),
@@ -918,13 +920,13 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "the daemon's catalogue offers {withheld}, which has no dispatch route: {registered:?}"
     );
 
-    // The sibling test asserts this catalogue carries exactly one tool when no
+    // The sibling test asserts this catalogue carries exactly two tools when no
     // browser is configured. Asserting the count here too is what makes the two
     // tests measure a DIFFERENCE rather than each measuring its own world.
     assert_eq!(
         registered.len(),
-        9,
-        "expected the eight browser tools plus computer.wait: {registered:?}"
+        11,
+        "expected eight browser tools, both flat adapters, and computer.wait: {registered:?}"
     );
 
     // Close the client before the daemon and module guards are dropped so the

@@ -2845,6 +2845,15 @@ async fn handle_tool_request(
     } else {
         None
     };
+    if let Some(flat_tools::FlatDispatch::Management { method, params }) = translated.as_ref() {
+        let mut management_frame = frame.clone();
+        management_frame.body = serde_json::to_vec(&json!({
+            "method": method,
+            "params": params,
+        }))
+        .expect("flat management request serializes");
+        return handle_management_request(management_frame, writer, &accepted_facts, planes).await;
+    }
     let (name, arguments) = match translated.as_ref() {
         Some(flat_tools::FlatDispatch::Computer {
             capability,
@@ -2854,6 +2863,7 @@ async fn handle_tool_request(
             capability,
             arguments,
         }) => (capability.as_str(), arguments),
+        Some(flat_tools::FlatDispatch::Management { .. }) => unreachable!("returned above"),
         None => (name, arguments),
     };
 
@@ -3707,6 +3717,104 @@ mod tests {
         assert_eq!(error.code, "capability_not_admitted");
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn folded_management_actions_match_the_management_route_on_the_same_bind() {
+        let cases = [
+            (
+                flat_tools::COMPUTER_USE,
+                "open_target",
+                management::OPEN_TARGET,
+                json!({"bundle_identity":"com.example.App","action_kind":"compose"}),
+            ),
+            (
+                flat_tools::BROWSER_USE,
+                "open_grant",
+                management::OPEN_GRANT,
+                json!({"origins":["https://example.com"],"hazards":[]}),
+            ),
+            (
+                flat_tools::BROWSER_USE,
+                "present",
+                management::PRESENT,
+                json!({"origin":"https://example.com"}),
+            ),
+            (
+                flat_tools::BROWSER_USE,
+                "resume",
+                management::RESUME,
+                json!({}),
+            ),
+            (
+                flat_tools::BROWSER_USE,
+                "import_login",
+                management::IMPORT_LOGIN,
+                json!({"origin":"https://example.com"}),
+            ),
+        ];
+
+        for (flat_name, action, method, params) in cases {
+            let channel = 23;
+            let epoch = 4;
+            let mut planes = management_bound_planes(channel, epoch);
+            planes.browser_config = Some(browser_surface_config());
+            planes.management = Arc::new(ManagementPlane::new(Arc::new(OneRunning)));
+            let facts = AcceptedBindFacts::from_bind(
+                &bind_identity_for_test(),
+                Some(Principal::Direct),
+                Some(&json!({
+                    "agentProjectId": "test-project",
+                    "sessionKind": "primary",
+                    "effectiveCapabilityScope": ["*"]
+                })),
+                None,
+                &subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "cerebellum".into(),
+                },
+            );
+            planes.routes.insert(channel, epoch, facts.clone());
+
+            let mut flat_arguments = params.clone();
+            flat_arguments["action"] = json!(action);
+            let flat_frame = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                101,
+                serde_json::to_vec(&json!({
+                    "name": flat_name,
+                    "arguments": flat_arguments,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let management_frame = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                102,
+                serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(2);
+            handle_tool_request(flat_frame, &tx, &planes).await.unwrap();
+            handle_management_request(management_frame, &tx, &facts, &planes)
+                .await
+                .unwrap();
+            let flat_reply: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+            let management_reply: Value =
+                serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+            assert_eq!(flat_reply, management_reply, "{action} diverged");
+            if action == "import_login" {
+                assert_eq!(flat_reply["outcome"], "elicitation_undeclared");
+            }
+        }
+    }
+
     fn browser_surface_config() -> BrowserConfig {
         BrowserConfig {
             executable_path: None,
@@ -3814,6 +3922,20 @@ mod tests {
     /// so the answer it eventually gets should be a fixture rather than a
     /// property of the desk it runs on.
     struct NothingRunning;
+
+    #[cfg(target_os = "macos")]
+    struct OneRunning;
+
+    #[cfg(target_os = "macos")]
+    impl management::TargetResolver for OneRunning {
+        fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+            TargetResolution::Resolved(cerebellum_computer::platform::ProcessGrant {
+                pid: 4242,
+                bundle_identity: bundle_identity.to_string(),
+                process_generation_evidence: "test-generation".to_string(),
+            })
+        }
+    }
 
     impl management::TargetResolver for NothingRunning {
         fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
