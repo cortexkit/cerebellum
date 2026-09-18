@@ -2317,7 +2317,13 @@ async fn unsettled_navigation_keeps_its_observed_main_frame_status() {
             ],
             json!({"frameId":"main"}),
         ))),
-        20,
+        // One deadline covers attach, the enables, Page.navigate and the settle
+        // wait, and `not_settled` is only reached by running it out, so the
+        // test costs this long. 20 ms let the setup commands miss the window
+        // under a loaded gate and answer cdp_failure instead; 300 ms is the
+        // smallest budget that survived the full gate with the whole
+        // workspace testing beside it.
+        300,
     );
     plane.open_context(route.clone()).await.unwrap();
 
