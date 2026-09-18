@@ -32,11 +32,7 @@ const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAA
 
 fn identity() -> RouteIdentity {
     RouteIdentity::from_bind(
-        &subc_protocol::BindIdentity {
-            project_root: "/tmp/b1-s3".into(),
-            harness: "test".into(),
-            session: "b1-s3-session".into(),
-        },
+        &subc_protocol::BindIdentity::new("/tmp/b1-s3", "test", "b1-s3-session"),
         &Some(subc_protocol::Principal::Direct),
     )
 }

@@ -1272,11 +1272,11 @@ fn route_request(channel: u16, epoch: u32, corr: u64, body: Value) -> Frame {
 }
 
 fn probe_identity() -> BindIdentity {
-    BindIdentity {
-        project_root: std::env::temp_dir().join("ck-live-login"),
-        harness: "probe".to_string(),
-        session: "live-login-probe".to_string(),
-    }
+    BindIdentity::new(
+        std::env::temp_dir().join("ck-live-login"),
+        "probe",
+        "live-login-probe".to_string(),
+    )
 }
 
 fn probe_project_id() -> String {

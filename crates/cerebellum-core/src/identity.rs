@@ -501,11 +501,7 @@ mod tests {
     }
 
     fn bind_identity(project_root: &str, session: &str) -> BindIdentity {
-        BindIdentity {
-            project_root: PathBuf::from(project_root),
-            harness: "opencode".to_string(),
-            session: session.to_string(),
-        }
+        BindIdentity::new(project_root, "opencode", session)
     }
 
     fn facts(project: &str, kind: &str) -> Value {
@@ -612,6 +608,29 @@ mod tests {
         );
         assert_eq!(route.agent_project_id, "pj-accepted");
         assert_eq!(route.conversation_key, "conversation-1");
+    }
+
+    /// `BindIdentity.project_id` (subc-protocol 0.20) is relayed by the daemon
+    /// verbatim from the caller and is not attested. The durable-profile
+    /// authority is the carrier-stamped `agentProjectId` in the admission
+    /// facts; a caller-supplied id on the bind identity must neither become
+    /// the route's project id nor count as attested provenance. A regression
+    /// that read the new field here would let any bound caller name the
+    /// durable profile it wants to open.
+    #[test]
+    fn a_caller_supplied_bind_identity_project_id_is_not_attested_provenance() {
+        let mut bind = bind_identity("/caller/project", "conversation-1");
+        bind.project_id = Some("pj-caller-claimed".to_string());
+
+        let route = RouteIdentity::from_accepted_bind(&bind, &Some(Principal::Direct), None);
+        assert_ne!(route.agent_project_id, "pj-caller-claimed");
+
+        let accepted =
+            AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None, &tool_route());
+        assert!(
+            !accepted.agent_project_id_attested,
+            "a project id on the bind identity is caller-chosen and must not read as attested"
+        );
     }
 
     #[test]

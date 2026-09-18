@@ -76,11 +76,7 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
 
 fn route_identity() -> RouteIdentity {
     RouteIdentity::from_bind(
-        &BindIdentity {
-            project_root: "/test/project".into(),
-            harness: "test".to_string(),
-            session: "test-session".to_string(),
-        },
+        &BindIdentity::new("/test/project", "test", "test-session".to_string()),
         &Some(Principal::Direct),
     )
 }

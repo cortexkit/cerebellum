@@ -3995,11 +3995,7 @@ mod tests {
 
     fn identity() -> RouteIdentity {
         RouteIdentity::from_bind(
-            &subc_protocol::BindIdentity {
-                project_root: "/tmp/project".into(),
-                harness: "test".into(),
-                session: "conversation".into(),
-            },
+            &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
             &Some(subc_protocol::Principal::Direct),
         )
     }

@@ -122,11 +122,7 @@ async fn first_party_route_bind_is_acked() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "opencode".to_string(),
-            session: "session-0001".to_string(),
-        },
+        identity: BindIdentity::new("/tmp/project", "opencode", "session-0001"),
         principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
         admission_facts: Some(json!({"schema": 1, "verified_class": "member"})),
@@ -168,11 +164,7 @@ async fn ineligible_principal_receives_transport_rejection() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "opencode".to_string(),
-            session: "session-0001".to_string(),
-        },
+        identity: BindIdentity::new("/tmp/project", "opencode", "session-0001"),
         principal: Some(Principal::Reserved {
             module_id: "subc-mcp".to_string(),
         }),
@@ -212,6 +204,39 @@ async fn ineligible_principal_receives_transport_rejection() {
 }
 
 /// An absent principal is also rejected (fail-closed backstop).
+/// A control op this build does not know (subc's drain notice will be one, on
+/// channel 0 at drain start) must be answered and survived. Before this fence
+/// the parse error propagated out of the module loop, so the first unknown
+/// control frame ended the module; a drain notice would have produced an
+/// instant exit instead of a graceful stop.
+#[tokio::test]
+async fn an_unknown_control_op_is_answered_and_the_loop_survives() {
+    let (tx, mut rx) = mpsc::channel(4);
+    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        11,
+        serde_json::to_vec(
+            &json!({"op": "module.draining", "reason": "upgrade", "deadline_ms": 30000}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    cerebellum::handle_control_request_for_test(frame, &tx, &health_state)
+        .await
+        .expect("an unknown control op is not a module error");
+
+    let response = rx.recv().await.expect("a reply on the control channel");
+    assert_eq!(response.header.channel, 0);
+    assert_eq!(response.header.corr, 11);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["code"], "unknown_control_op");
+}
 #[tokio::test]
 async fn absent_principal_is_rejected() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
@@ -223,11 +248,7 @@ async fn absent_principal_is_rejected() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "opencode".to_string(),
-            session: "session-0001".to_string(),
-        },
+        identity: BindIdentity::new("/tmp/project", "opencode", "session-0001"),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -530,16 +551,8 @@ async fn session_kind_matrix_resolves_profile_disposition() {
 async fn distinct_agent_project_ids_resolve_to_distinct_profiles() {
     use cerebellum_core::identity::RouteIdentity;
 
-    let identity_a = BindIdentity {
-        project_root: PathBuf::from("/tmp/project-a"),
-        harness: "opencode".to_string(),
-        session: "session-1".to_string(),
-    };
-    let identity_b = BindIdentity {
-        project_root: PathBuf::from("/tmp/project-b"),
-        harness: "opencode".to_string(),
-        session: "session-1".to_string(),
-    };
+    let identity_a = BindIdentity::new("/tmp/project-a", "opencode", "session-1");
+    let identity_b = BindIdentity::new("/tmp/project-b", "opencode", "session-1");
     let route_a = RouteIdentity::from_bind(&identity_a, &None);
     let route_b = RouteIdentity::from_bind(&identity_b, &None);
     assert_ne!(
@@ -606,11 +619,11 @@ async fn accepted_bind_facts_drive_profile_resolution() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity {
-            project_root: PathBuf::from("/tmp/request-body-project"),
-            harness: "opencode".to_string(),
-            session: "conversation-subagent".to_string(),
-        },
+        identity: BindIdentity::new(
+            "/tmp/request-body-project",
+            "opencode",
+            "conversation-subagent",
+        ),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Some(json!({
@@ -683,11 +696,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "opencode".to_string(),
-            session: "conversation-scoped".to_string(),
-        },
+        identity: BindIdentity::new("/tmp/project", "opencode", "conversation-scoped"),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Some(json!({
@@ -1153,11 +1162,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
             target: RouteTarget::ToolProvider {
                 module_id: MODULE_ID.to_string(),
             },
-            identity: BindIdentity {
-                project_root: PathBuf::from("/tmp"),
-                harness: "conformance".to_string(),
-                session: "conversation-live".to_string(),
-            },
+            identity: BindIdentity::new("/tmp", "conformance", "conversation-live"),
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -1217,11 +1222,11 @@ async fn feature_gated_identity_observer_records_resolved_facts() {
 
     let _ = take_test_observations();
     let identity = RouteIdentity::from_accepted_bind(
-        &BindIdentity {
-            project_root: PathBuf::from("/tmp/observer-project"),
-            harness: "conformance".to_string(),
-            session: "observer-conversation".to_string(),
-        },
+        &BindIdentity::new(
+            "/tmp/observer-project",
+            "conformance",
+            "observer-conversation",
+        ),
         &Some(Principal::Direct),
         Some(&json!({
             "agentProjectId": "pj-observer",

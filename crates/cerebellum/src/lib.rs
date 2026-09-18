@@ -2580,8 +2580,26 @@ async fn handle_control_request(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    let request =
-        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        // A control body this build does not recognise is answered on the
+        // control channel and the loop goes on. Propagating the parse error
+        // would end `module_loop`, which turns every future daemon-side
+        // control op (a drain notice, for one) into an instant module exit,
+        // the opposite of what an advisory notice asks for.
+        Err(error) => {
+            let frame = build_error_frame(
+                frame.header.ver,
+                0,
+                0,
+                frame.header.corr,
+                "unknown_control_op",
+                &format!("cerebellum does not recognise this control request: {error}"),
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            return send(writer, frame).await;
+        }
+    };
     let response_body = match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -3393,11 +3411,8 @@ pub async fn handle_control_request_for_test_with_bindings(
 /// Older fixtures invoke only the data-plane helper, so this lets them exercise
 /// the real bound-route path without weakening the production handler.
 fn install_test_bind(route_bindings: &Arc<RouteBindings>, frame: &Frame) {
-    let identity = subc_protocol::BindIdentity {
-        project_root: PathBuf::from("/test/project"),
-        harness: "test".to_string(),
-        session: "test-session".to_string(),
-    };
+    let identity =
+        subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string());
     route_bindings.insert(
         frame.header.channel,
         frame.header.epoch,
@@ -3428,11 +3443,8 @@ pub fn install_browser_test_bind(
     epoch: u32,
     browser_control_operations: &[&str],
 ) {
-    let identity = subc_protocol::BindIdentity {
-        project_root: PathBuf::from("/test/project"),
-        harness: "test".to_string(),
-        session: "test-session".to_string(),
-    };
+    let identity =
+        subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string());
     route_bindings.insert(
         channel,
         epoch,
@@ -3458,11 +3470,11 @@ pub fn install_browser_compatibility_test_bind(
     channel: u16,
     epoch: u32,
 ) {
-    let identity = subc_protocol::BindIdentity {
-        project_root: PathBuf::from("/caller/chosen/project"),
-        harness: "test".to_string(),
-        session: "test-session".to_string(),
-    };
+    let identity = subc_protocol::BindIdentity::new(
+        "/caller/chosen/project",
+        "test",
+        "test-session".to_string(),
+    );
     route_bindings.insert(
         channel,
         epoch,
@@ -4596,11 +4608,7 @@ mod tests {
     }
 
     fn bind_identity_for_test() -> subc_protocol::BindIdentity {
-        subc_protocol::BindIdentity {
-            project_root: PathBuf::from("/test/project"),
-            harness: "test".to_string(),
-            session: "test-session".to_string(),
-        }
+        subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string())
     }
 
     /// Planes whose only route is bound to the management surface.

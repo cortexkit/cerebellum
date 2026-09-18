@@ -1157,11 +1157,11 @@ mod macos_probe {
     }
 
     fn probe_identity() -> BindIdentity {
-        BindIdentity {
-            project_root: std::env::temp_dir().join("ck-live-native-click"),
-            harness: "probe".to_string(),
-            session: CONVERSATION.to_string(),
-        }
+        BindIdentity::new(
+            std::env::temp_dir().join("ck-live-native-click"),
+            "probe",
+            CONVERSATION.to_string(),
+        )
     }
 }
 

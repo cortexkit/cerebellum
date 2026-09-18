@@ -362,11 +362,11 @@ async fn bind_management_route(
         target: RouteTarget::ManagementSurface {
             module_id: "cerebellum".to_string(),
         },
-        identity: BindIdentity {
-            project_root: PathBuf::from("/tmp/profile-root-rebind-project"),
-            harness: "opencode".to_string(),
-            session: "profile-root-rebind-conversation".to_string(),
-        },
+        identity: BindIdentity::new(
+            PathBuf::from("/tmp/profile-root-rebind-project"),
+            "opencode".to_string(),
+            "profile-root-rebind-conversation".to_string(),
+        ),
         principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({

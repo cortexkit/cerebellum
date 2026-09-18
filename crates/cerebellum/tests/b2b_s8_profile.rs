@@ -101,11 +101,7 @@ fn absent_session_kind_is_refused_rather_than_defaulted() {
 
 fn bind_with_attested_project_and_no_session_kind() -> AcceptedBindFacts {
     AcceptedBindFacts::from_bind(
-        &BindIdentity {
-            project_root: std::path::PathBuf::from("/tmp/project"),
-            harness: "opencode".to_string(),
-            session: "s8-conversation".to_string(),
-        },
+        &BindIdentity::new("/tmp/project", "opencode", "s8-conversation"),
         Some(Principal::Direct),
         Some(&serde_json::json!({
             "agentProjectId": "s8-project",

@@ -1201,11 +1201,11 @@ mod probe {
             // a consent question, and every pointer action needs one.
             let request = ClientControlRequest::RouteOpen {
                 target: target.clone(),
-                identity: BindIdentity {
-                    project_root: PathBuf::from("/tmp"),
-                    harness: "live_global_cursor".to_string(),
-                    session: "live-global-cursor-probe".to_string(),
-                },
+                identity: BindIdentity::new(
+                    "/tmp",
+                    "live_global_cursor",
+                    "live-global-cursor-probe",
+                ),
                 consumer_identity: None,
                 consumer_capabilities: Some(vec!["elicitation".to_string()]),
                 admission_facts: None,
