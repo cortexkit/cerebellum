@@ -28,7 +28,7 @@ use crate::browser_launch::{
     BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
     LaunchAttestationRecord, LaunchProfileIdentity, LaunchRouteIdentity,
     OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
-    OrphanProfileCustodyFailure, ProfileBoundLaunch, VerifiedExecutableIdentity,
+    OrphanProfileCustodyFailure, ProfileBoundLaunch,
 };
 use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
@@ -190,7 +190,6 @@ impl ProductionLaunchService {
             return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}));
         }
 
-        record_profile_admission(accepted, browser_session_id, executable, &expected_identity)?;
         // Three distinct failures follow, and a caller's next move differs for
         // each: a data root that cannot be resolved is an environment problem,
         // a registry that will not open is profile state, and custody locks
@@ -1265,47 +1264,6 @@ fn stamped_context(accepted: &AcceptedBindFacts) -> Result<StampedBindContext, (
     .map_err(|_| ())
 }
 
-fn record_profile_admission(
-    accepted: &AcceptedBindFacts,
-    browser_session_id: &str,
-    executable: &Path,
-    identity: &VerifiedExecutableIdentity,
-) -> Result<(), Value> {
-    let path = cerebellum_core::journal::journal_data_path("browser-launch-admission.jsonl")
-        .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?;
-    let directory = path
-        .parent()
-        .ok_or_else(|| json!({"outcome": "profile_storage_unavailable"}))?;
-    std::fs::create_dir_all(directory)
-        .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?;
-    let record = json!({
-        "browser_session_id": browser_session_id,
-        "principal": accepted.principal.as_ref().map(|principal| format!("{principal:?}")),
-        "conversation_key": accepted.identity.conversation_key,
-        "agent_project_id": accepted.identity.agent_project_id,
-        "session_kind": accepted.identity.session_kind,
-        "profile_disposition": accepted.identity.profile_disposition,
-        "executable_path": path_bytes(executable),
-        "verified_executable_identity": identity,
-    });
-    let mut bytes = serde_json::to_vec(&record).map_err(|error| {
-        json!({
-            "outcome": "internal_failure",
-            "stage": "admission_record_serialization",
-            "detail": format!("{error:?}"),
-        })
-    })?;
-    bytes.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|_| json!({"outcome": "profile_storage_unavailable"}))
-}
-
 fn map_readiness_error(error: AttestedReadinessError) -> Value {
     match error {
         AttestedReadinessError::AttestedLaunch(
@@ -2026,10 +1984,11 @@ mod orphan_recovery_tests {
                 canonical_profile_path: path_bytes(&root.join("profiles/profile-1")),
                 disposition: ProfileDisposition::Durable,
             },
-            verified_executable_identity: VerifiedExecutableIdentity::CodeSignedFile {
-                signing_identifier: "com.example.browser".to_string(),
-                slice_code_hashes: std::collections::BTreeSet::from(["abc123".to_string()]),
-            },
+            verified_executable_identity:
+                crate::browser_launch::VerifiedExecutableIdentity::CodeSignedFile {
+                    signing_identifier: "com.example.browser".to_string(),
+                    slice_code_hashes: std::collections::BTreeSet::from(["abc123".to_string()]),
+                },
             launch_vector: VerifiedLaunchVector {
                 executable: b"/Applications/Browser".to_vec(),
                 arguments: Vec::new(),
