@@ -83,6 +83,12 @@ to contain `unsafe`, so everything above them holds `#![forbid(unsafe_code)]`.
 `docs/` holds the charter and acceptance records. `scripts/` holds the
 verification gate, the release build, and the mutation-testing harness.
 
+## Contributing
+
+Open an issue first (`bug` or `design discussion`) and wait for a go before
+sending a pull request; a PR without one is asked for the issue. Details in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
