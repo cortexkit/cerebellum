@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 use subc_protocol::manifest::{ExecutionMode, Tool};
 
@@ -64,6 +66,52 @@ fn describe_computer_field(name: &str, schema: &mut Value) {
     };
     if let Some(object) = schema.as_object_mut() {
         object.insert("description".into(), Value::String(description.into()));
+    }
+}
+
+/// Write "Required for: a, b." into each property's description from the
+/// per-action `required` conditions. The conditional blocks are the machine
+/// truth, but a host that rebuilds the root schema from bare properties
+/// (OpenCode's plugin tool definition does) drops root-level `allOf`, so
+/// the model would see no requirement at all. Descriptions survive that
+/// rebuild byte for byte; this keeps the two in step from one source.
+fn annotate_required_actions(properties: &mut Map<String, Value>, conditions: &[Value]) {
+    let mut requiring: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for condition in conditions {
+        let Some(action) = condition["if"]["properties"]["action"]["const"].as_str() else {
+            continue;
+        };
+        for field in condition["then"]["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(field) = field.as_str() {
+                requiring
+                    .entry(field.to_string())
+                    .or_default()
+                    .push(action.to_string());
+            }
+        }
+    }
+    for (name, actions) in requiring {
+        let Some(schema) = properties.get_mut(&name) else {
+            continue;
+        };
+        // A property with two shapes (`target`: an element for click, a
+        // label for the input actions) names its actions per branch in the
+        // branch text itself; a union note here would claim both shapes for
+        // every action.
+        if schema.get("oneOf").is_some() {
+            continue;
+        }
+        let note = format!(" Required for: {}.", actions.join(", "));
+        match schema.get_mut("description") {
+            Some(Value::String(text)) => text.push_str(&note),
+            _ => {
+                schema["description"] = json!(note.trim_start());
+            }
+        }
     }
 }
 
@@ -166,13 +214,13 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
         .expect("computer.click has an element target schema");
     element_target.insert(
         "description".into(),
-        json!("Accessibility element target used only by click."),
+        json!("Accessibility element target. Required for: click."),
     );
     properties.insert(
         "target".into(),
         json!({"oneOf":[
             Value::Object(element_target),
-            {"type":"string","description":"Recorded target label used by type, keys, and scroll; the target lease selects the process."}
+            {"type":"string","description":"Recorded target label; the target lease selects the process. Required for: type, keys, scroll."}
         ]}),
     );
     actions.push(json!("open_target"));
@@ -188,6 +236,7 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
         "if":{"properties":{"action":{"const":"open_target"}}},
         "then":{"required":["bundle_identity","action_kind"]}
     }));
+    annotate_required_actions(&mut properties, &conditions);
     properties.insert(
         "action".into(),
         json!({"type":"string","enum":actions,"description":"Admitted computer action to perform."}),
@@ -324,6 +373,7 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
         "point".into(),
         point_schema("Pixel in the echoed screenshot; it is meaningful only with that image's required width and height."),
     );
+    annotate_required_actions(&mut properties, &conditions);
     properties.insert(
         "action".into(),
         json!({"type":"string","enum":actions,"description":"Admitted browser action to perform."}),
