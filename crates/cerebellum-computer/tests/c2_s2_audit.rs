@@ -209,7 +209,7 @@ fn preparation_refusal_reports_admitted_artifact_before_live_token() {
     );
     assert_eq!(
         audit.custody().read_artifact(&artifact_id),
-        Some(vec![1, 2, 3])
+        Ok(Some(vec![1, 2, 3]))
     );
 }
 
@@ -239,8 +239,11 @@ fn terminal_closure_deletes_unpinned_artifact_but_preserves_audit_descriptor() {
     audit
         .finalize_rejected(handle, b"refused".to_vec())
         .unwrap();
-    assert_eq!(audit.custody().read_artifact(&artifact_id), None);
-    assert!(audit.custody().capture_descriptor(&artifact_id).is_some());
+    assert_eq!(audit.custody().read_artifact(&artifact_id), Ok(None));
+    assert!(audit
+        .custody()
+        .capture_descriptor(&artifact_id)
+        .is_ok_and(|d| d.is_some()));
     let record = audit.read_obligation_audit(handle.sequence()).unwrap();
     assert_eq!(
         record.terminal_kind.map(ComputerTerminalKind::from),
@@ -287,18 +290,18 @@ fn pin_survives_terminal_closure_until_release_and_journal_purge() {
     audit.finalize_rejected(handle, b"done".to_vec()).unwrap();
     assert_eq!(
         audit.custody().read_artifact(&artifact_id),
-        Some(vec![7, 7])
+        Ok(Some(vec![7, 7]))
     );
     audit.journal_purge();
     assert_eq!(
         audit.custody().read_artifact(&artifact_id),
-        Some(vec![7, 7])
+        Ok(Some(vec![7, 7]))
     );
     assert_eq!(
         audit.release_capture(&pin),
         cerebellum_computer::capture_custody::CaptureReleaseResult::Released
     );
-    assert_eq!(audit.custody().read_artifact(&artifact_id), None);
+    assert_eq!(audit.custody().read_artifact(&artifact_id), Ok(None));
 }
 
 #[test]
@@ -471,7 +474,7 @@ fn successful_dispatch_lifecycle_records_material_and_rejects_recommitment() {
         Some(ComputerTerminalKind::FinalizedCommitted)
     );
     assert_eq!(record.severity_inputs, Some(expected_severity_inputs));
-    assert_eq!(audit.custody().read_artifact(&artifact_id), None);
+    assert_eq!(audit.custody().read_artifact(&artifact_id), Ok(None));
     let finalized_entry =
         ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
     assert_eq!(finalized_entry["phase"], json!("finalized"));

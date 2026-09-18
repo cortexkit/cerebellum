@@ -1150,50 +1150,52 @@ impl CaptureCustody {
         Ok(())
     }
 
-    pub fn artifact_obligation_id(&self, artifact_id: &str) -> Option<ActionObligationId> {
-        self.storage.state.lock().ok().and_then(|state| {
-            state
-                .artifacts
-                .get(artifact_id)
-                .map(|record| record.obligation_id)
-        })
+    // The readers below answer `Err(CustodyUnavailable)` when the state lock
+    // is poisoned, the same fact the admission and pin paths refuse on. They
+    // used to fold that into `None`, which a caller reads as "this artifact
+    // is not in custody", a remedy (take the capture again) that cannot help
+    // when the store itself is unusable; every later call would fail the
+    // same way and look like a fresh loss each time.
+    pub fn artifact_obligation_id(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<ActionObligationId>, CustodyUnavailable> {
+        let state = self.storage.state.lock().map_err(|_| CustodyUnavailable)?;
+        Ok(state
+            .artifacts
+            .get(artifact_id)
+            .map(|record| record.obligation_id))
     }
 
-    pub fn capture_descriptor(&self, artifact_id: &str) -> Option<CaptureDescriptor> {
-        self.storage.state.lock().ok().and_then(|state| {
-            state
-                .artifacts
-                .get(artifact_id)
-                .map(|record| record.descriptor.clone())
-        })
+    pub fn capture_descriptor(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<CaptureDescriptor>, CustodyUnavailable> {
+        let state = self.storage.state.lock().map_err(|_| CustodyUnavailable)?;
+        Ok(state
+            .artifacts
+            .get(artifact_id)
+            .map(|record| record.descriptor.clone()))
     }
 
-    pub fn read_artifact(&self, artifact_id: &str) -> Option<Vec<u8>> {
-        self.storage.state.lock().ok().and_then(|state| {
-            state.artifacts.get(artifact_id).and_then(|record| {
-                if record.readable {
-                    record.bytes.clone()
-                } else {
-                    None
-                }
-            })
-        })
+    pub fn read_artifact(&self, artifact_id: &str) -> Result<Option<Vec<u8>>, CustodyUnavailable> {
+        let state = self.storage.state.lock().map_err(|_| CustodyUnavailable)?;
+        Ok(state.artifacts.get(artifact_id).and_then(|record| {
+            if record.readable {
+                record.bytes.clone()
+            } else {
+                None
+            }
+        }))
     }
 
-    pub fn artifact_readable(&self, artifact_id: &str) -> bool {
-        self.storage
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .artifacts
-                    .get(artifact_id)
-                    .map(|record| record.readable)
-            })
-            .unwrap_or(false)
+    pub fn artifact_readable(&self, artifact_id: &str) -> Result<bool, CustodyUnavailable> {
+        let state = self.storage.state.lock().map_err(|_| CustodyUnavailable)?;
+        Ok(state
+            .artifacts
+            .get(artifact_id)
+            .is_some_and(|record| record.readable))
     }
-
     pub fn terminal_cursor(&self) -> u64 {
         self.storage
             .state
@@ -1531,3 +1533,56 @@ pub type CaptureArtifact = PixelArtifact;
 pub type CapturePrepareCause = CapturePrepareRefusalCause;
 pub type CaptureAdmissionCause = CaptureRefusedCause;
 pub type CapturePinCause = CapturePinRefusalCause;
+
+#[cfg(test)]
+mod reader_availability_tests {
+    use super::*;
+
+    fn custody() -> (CaptureCustody, Arc<Mutex<CustodyState>>) {
+        let storage = InMemoryCustodyStorage::new();
+        let state = Arc::clone(&storage.state);
+        let bounds = CustodyBounds {
+            maximum_verification_duration_ms: 100,
+            maximum_pin_lifetime_ms: 50,
+            maximum_concurrently_pinned_artifacts: 4,
+            maximum_total_pinned_artifact_bytes: 10_000,
+            maximum_custody_attachment_bytes: 2_000,
+        };
+        let custody =
+            CaptureCustody::new(bounds, InMemoryGrantAuthority::default(), storage).unwrap();
+        (custody, state)
+    }
+
+    /// An unknown artifact on a healthy store is absent: `Ok(None)` and
+    /// `Ok(false)`, the answer a caller retries a capture on.
+    #[test]
+    fn an_unknown_artifact_on_a_healthy_store_is_absent() {
+        let (custody, _) = custody();
+        assert_eq!(custody.artifact_obligation_id("nope"), Ok(None));
+        assert_eq!(custody.capture_descriptor("nope"), Ok(None));
+        assert_eq!(custody.read_artifact("nope"), Ok(None));
+        assert_eq!(custody.artifact_readable("nope"), Ok(false));
+    }
+
+    /// A poisoned store is unavailable, not empty. The wrong implementation
+    /// (`lock().ok()` folded into the absent arm) answers exactly what the
+    /// test above expects, so this is the case that tells the two apart: a
+    /// thread panics while holding the state lock, and every reader must
+    /// say the store is unusable rather than that the artifact is missing.
+    #[test]
+    fn a_poisoned_store_is_unavailable_not_absent() {
+        let (custody, state) = custody();
+        let poison = std::thread::spawn(move || {
+            let _held = state.lock().unwrap();
+            panic!("poison the custody state lock on purpose");
+        });
+        assert!(poison.join().is_err(), "the poisoning thread must panic");
+        assert_eq!(
+            custody.artifact_obligation_id("nope"),
+            Err(CustodyUnavailable)
+        );
+        assert_eq!(custody.capture_descriptor("nope"), Err(CustodyUnavailable));
+        assert_eq!(custody.read_artifact("nope"), Err(CustodyUnavailable));
+        assert_eq!(custody.artifact_readable("nope"), Err(CustodyUnavailable));
+    }
+}

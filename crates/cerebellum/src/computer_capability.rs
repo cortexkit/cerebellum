@@ -1165,12 +1165,25 @@ where
         // assumed because admission is the step that makes the pixels
         // accountable, and a reply carrying an image custody never took is
         // indistinguishable from a correct one at the wire.
-        if !audit.custody().artifact_readable(&artifact_id) {
-            let _ = audit.finalize_rejected(handle, b"capture-not-retained".to_vec());
-            return json!({
-                "outcome": "capture_not_retained",
-                "detail": "the capture was not retained by custody",
-            });
+        match audit.custody().artifact_readable(&artifact_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = audit.finalize_rejected(handle, b"capture-not-retained".to_vec());
+                return json!({
+                    "outcome": "capture_not_retained",
+                    "detail": "the capture was not retained by custody",
+                });
+            }
+            // A poisoned custody lock is a module fault, not a lost capture:
+            // taking the picture again cannot help, and saying so keeps the
+            // caller from retrying into the same wall.
+            Err(cerebellum_computer::capture_custody::CustodyUnavailable) => {
+                let _ = audit.finalize_rejected(handle, b"custody-unavailable".to_vec());
+                return json!({
+                    "outcome": "custody_unavailable",
+                    "detail": "capture custody is unavailable in this module process; report the fault and do not retry the capture",
+                });
+            }
         }
 
         let dispatch = TypedCaptureDispatch::new(

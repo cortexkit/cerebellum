@@ -1004,7 +1004,7 @@ mod gate_tests {
         );
 
         assert_eq!(audit.consume_terminal_transitions(), 1);
-        assert_eq!(audit.custody().read_artifact(&artifact_id), None);
+        assert_eq!(audit.custody().read_artifact(&artifact_id), Ok(None));
     }
 }
 
@@ -1611,10 +1611,18 @@ where
         expires_at: u64,
         now: u64,
     ) -> Result<String, crate::capture_custody::CapturePinRefused> {
-        let Some(obligation_id) = self.custody.artifact_obligation_id(artifact_id) else {
-            return Err(crate::capture_custody::CapturePinRefused {
-                cause: CapturePinRefusalCause::ArtifactUnavailable,
-            });
+        let obligation_id = match self.custody.artifact_obligation_id(artifact_id) {
+            Ok(Some(obligation_id)) => obligation_id,
+            Ok(None) => {
+                return Err(crate::capture_custody::CapturePinRefused {
+                    cause: CapturePinRefusalCause::ArtifactUnavailable,
+                })
+            }
+            Err(crate::capture_custody::CustodyUnavailable) => {
+                return Err(crate::capture_custody::CapturePinRefused {
+                    cause: CapturePinRefusalCause::CustodyUnavailable,
+                })
+            }
         };
         let Some(metadata) = self.reservations.get(&obligation_id).cloned() else {
             return Err(crate::capture_custody::CapturePinRefused {
@@ -1645,11 +1653,20 @@ where
         let pending = self
             .custody
             .prepare_pin(artifact_id, grant_id, expires_at, now)?;
-        let Some(descriptor) = self.custody.capture_descriptor(artifact_id) else {
-            let _ = self.custody.abort_pin(&pending);
-            return Err(crate::capture_custody::CapturePinRefused {
-                cause: CapturePinRefusalCause::ArtifactUnavailable,
-            });
+        let descriptor = match self.custody.capture_descriptor(artifact_id) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => {
+                let _ = self.custody.abort_pin(&pending);
+                return Err(crate::capture_custody::CapturePinRefused {
+                    cause: CapturePinRefusalCause::ArtifactUnavailable,
+                });
+            }
+            Err(crate::capture_custody::CustodyUnavailable) => {
+                let _ = self.custody.abort_pin(&pending);
+                return Err(crate::capture_custody::CapturePinRefused {
+                    cause: CapturePinRefusalCause::CustodyUnavailable,
+                });
+            }
         };
         let attachment = match CaptureCustody::attachment_bytes(
             artifact_id,
