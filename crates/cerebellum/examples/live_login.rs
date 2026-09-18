@@ -503,12 +503,17 @@ fn verify_handoff_journal(
                 "journal entry carried fixture page text {fixture_marker}: {serialized}"
             ));
         }
-        if serialized.contains("cookie_name") || serialized.contains("encrypted_value") {
+        // The close record legitimately carries `cookie_names_added`, a count.
+        // A leak would carry the names themselves (a list under a plural key)
+        // or an encrypted value; the count's own key must not trip the scan.
+        if serialized.contains("\"cookie_names\"") || serialized.contains("encrypted_value") {
             return Err(format!(
                 "journal entry carried a cookie name or value: {serialized}"
             ));
         }
-        if entry.capability != Some(Capability::Present) {
+        if entry.capability != Some(Capability::Present)
+            || entry.identity.conversation_key != probe_conversation_key()
+        {
             continue;
         }
         let Some(JournalPayload::Handoff(payload)) = entry.payload.as_ref() else {
@@ -640,11 +645,14 @@ async fn run_import_arms(config: BrowserConfig, origin: &str) -> bool {
         hand_off_is_returned_to_the_caller(&planes, origin, cookies_path.as_deref()).await,
     );
 
-    let import_journal = planes.browser.journal_export_for_test().await;
     passed &= report_arm(
         "session_open_is_refused",
         session_open_is_refused(&planes, origin).await,
     );
+    // Exported after the refusal arm on purpose: a refused import is journaled
+    // under its code, and the window must show that record beside the two
+    // answered ones.
+    let import_journal = planes.browser.journal_export_for_test().await;
     passed &= report_arm(
         "import_login_journal",
         verify_import_journal_arm(&import_journal, &journal_before_import, origin),
@@ -964,15 +972,33 @@ fn verify_import_journal_arm(export: &str, before: &str, origin: &str) -> ArmVer
 }
 
 fn verify_import_journal(entries: &[JournalEntry], origin: &str) -> Result<String, String> {
+    let this_run = probe_conversation_key();
     let mut denied = 0usize;
     let mut hand_off = 0usize;
+    // The session-open arm runs before this check and its refusal is
+    // journaled under its own code: a refused import is still an import
+    // someone asked for, and the record says why nothing moved.
+    let mut session_open = 0usize;
     for entry in entries {
         let serialized = serde_json::to_string(entry)
             .map_err(|error| format!("could not serialize journal entry: {error}"))?;
-        if serialized.contains("cookie_name") || serialized.contains("encrypted_value") {
-            return Err(format!(
-                "import journal entry carried a cookie name or value: {serialized}"
-            ));
+        // The import record carries a row COUNT. The names GitHub actually
+        // sets are the positive markers a leak would have to carry, and they
+        // are real on any host whose Chrome holds a GitHub login, so their
+        // absence here is an assertion about the record and not about the
+        // scanner's vocabulary.
+        for leak in [
+            "\"cookie_names\"",
+            "encrypted_value",
+            "_octo",
+            "logged_in",
+            "user_session",
+        ] {
+            if serialized.contains(leak) {
+                return Err(format!(
+                    "import journal entry carried a cookie name or value ({leak}): {serialized}"
+                ));
+            }
         }
         if entry.capability != Some(Capability::ImportLogin) {
             continue;
@@ -986,7 +1012,7 @@ fn verify_import_journal(entries: &[JournalEntry], origin: &str) -> Result<Strin
         else {
             continue;
         };
-        if recorded_origin != origin {
+        if recorded_origin != origin || entry.identity.conversation_key != this_run {
             continue;
         }
         if *rows != 0 {
@@ -997,17 +1023,22 @@ fn verify_import_journal(entries: &[JournalEntry], origin: &str) -> Result<Strin
         match outcome.as_str() {
             "denied" => denied += 1,
             "hand_off" => hand_off += 1,
+            "session_open" => session_open += 1,
             other => {
                 return Err(format!("unexpected import journal outcome {other}"));
             }
         }
     }
-    if denied != 1 || hand_off != 1 {
+    if denied != 1 || hand_off != 1 || session_open != 1 {
         return Err(format!(
-            "expected one denied and one hand_off import_login record, got denied={denied} hand_off={hand_off}"
+            "expected one denied, one hand_off and one session_open import_login record, \
+             got denied={denied} hand_off={hand_off} session_open={session_open}"
         ));
     }
-    Ok("journal import_login denied + hand_off, rows=0, no cookie names".to_string())
+    Ok(
+        "journal import_login denied + hand_off + session_open refusal, rows=0, no cookie names"
+            .to_string(),
+    )
 }
 
 struct ImportExchange {
@@ -1271,11 +1302,21 @@ fn route_request(channel: u16, epoch: u32, corr: u64, body: Value) -> Frame {
     .unwrap()
 }
 
+/// The conversation key carries a per-process nonce. The probe drives the
+/// DURABLE journal, so records from every earlier run are in the same file,
+/// and the store opens lazily on the first reservation: a baseline export
+/// taken before the first op is empty and a line-count filter then counts
+/// all of history. Filtering by this run's own key is the discriminator
+/// that does not depend on when the store opened.
+fn probe_conversation_key() -> String {
+    format!("live-login-probe-{}", std::process::id())
+}
+
 fn probe_identity() -> BindIdentity {
     BindIdentity::new(
         std::env::temp_dir().join("ck-live-login"),
         "probe",
-        "live-login-probe".to_string(),
+        probe_conversation_key(),
     )
 }
 
