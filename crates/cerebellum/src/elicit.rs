@@ -55,6 +55,16 @@ impl AskOutcome {
     }
 }
 
+/// The reserved `decision` a consent carrier sends when it asked a person and
+/// nobody answered inside the deadline. It is not an option offered to the
+/// person (never in a `requestedSchema` enum); it is the carrier's word for
+/// silence, and it maps to [`AskOutcome::NoAnswer`] so the journal records
+/// that nobody replied rather than that someone said no. A carrier that
+/// collapsed its timeout into `deny` would make every unattended prompt look
+/// like a refusal, which is the pestering-versus-retry distinction this enum
+/// exists to keep.
+pub const NO_ANSWER_DECISION: &str = "no_answer";
+
 /// The questions this module has outstanding.
 pub struct Elicitor {
     lane: AskLane<oneshot::Sender<Value>>,
@@ -84,11 +94,23 @@ impl Elicitor {
         writer: &mpsc::Sender<Frame>,
         channel: u16,
         epoch: u32,
-        body: Value,
+        mut body: Value,
         deadline: Duration,
     ) -> AskOutcome {
         let correlation = self.lane.next_correlation();
         let (tx, rx) = oneshot::channel();
+
+        // The deadline this module enforces is written into the question
+        // itself, so the carrier can show the person how long they have and
+        // stop waiting when this side already has. Stamped here rather than
+        // by each question builder so the number on the wire is the number
+        // the timeout below uses, not a copy that can drift.
+        if let Some(params) = body.get_mut("params").and_then(Value::as_object_mut) {
+            params.insert(
+                "deadline_ms".to_string(),
+                Value::from(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)),
+            );
+        }
 
         // Registered BEFORE the frame is sent. The opposite order leaves a
         // window in which the answer arrives with nothing recorded to receive
@@ -120,7 +142,13 @@ impl Elicitor {
         }
 
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(answer)) => AskOutcome::Answered(answer),
+            Ok(Ok(answer)) => {
+                if answer.get("decision").and_then(Value::as_str) == Some(NO_ANSWER_DECISION) {
+                    AskOutcome::NoAnswer
+                } else {
+                    AskOutcome::Answered(answer)
+                }
+            }
             // The sender was dropped, which happens when the question is
             // forgotten without an answer. Nobody replied.
             Ok(Err(_)) => {
@@ -201,6 +229,63 @@ mod tests {
             AskOutcome::Answered(json!({"decision": "allow"}))
         );
         assert_eq!(elicitor.outstanding(), 0, "an answered question was kept");
+    }
+
+    /// The deadline the module enforces rides in the question, so the carrier
+    /// can show it and stop at it; a question without `params` gets none.
+    #[tokio::test]
+    async fn the_question_carries_the_deadline_the_module_enforces() {
+        let elicitor = Arc::new(Elicitor::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        let asking = {
+            let elicitor = Arc::clone(&elicitor);
+            tokio::spawn(async move {
+                elicitor
+                    .ask(
+                        &tx,
+                        7,
+                        1,
+                        json!({"method": "elicitation/create", "params": {"message": "?"}}),
+                        Duration::from_millis(4321),
+                    )
+                    .await
+            })
+        };
+        let frame = rx.recv().await.expect("the question is sent");
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["params"]["deadline_ms"], json!(4321));
+        assert_eq!(
+            body["params"]["message"],
+            json!("?"),
+            "the rest of params is untouched"
+        );
+        assert!(elicitor.deliver(7, frame.header.corr, json!({"decision": "deny"})));
+        asking.await.unwrap();
+    }
+
+    /// A carrier that asked a person and heard nothing says `no_answer`; that
+    /// is silence, not a refusal. `deny` stays an answer so the two are never
+    /// confused in the journal.
+    #[tokio::test]
+    async fn a_carrier_reported_no_answer_is_silence_not_a_refusal() {
+        for (decision, expected) in [
+            (NO_ANSWER_DECISION, AskOutcome::NoAnswer),
+            ("deny", AskOutcome::Answered(json!({"decision": "deny"}))),
+        ] {
+            let elicitor = Arc::new(Elicitor::new());
+            let (tx, mut rx) = mpsc::channel(4);
+            let asking = {
+                let elicitor = Arc::clone(&elicitor);
+                tokio::spawn(async move {
+                    elicitor
+                        .ask(&tx, 7, 1, json!({"params": {}}), Duration::from_secs(5))
+                        .await
+                })
+            };
+            let frame = rx.recv().await.expect("the question is sent");
+            assert!(elicitor.deliver(7, frame.header.corr, json!({"decision": decision})));
+            assert_eq!(asking.await.unwrap(), expected, "decision {decision}");
+        }
     }
 
     /// A question nobody answers ends at its deadline as not-answered.
