@@ -25,6 +25,7 @@ pub mod connector_evidence;
 pub mod coordinate;
 pub mod custody;
 pub mod elicit;
+pub mod flat_tools;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
@@ -555,10 +556,18 @@ pub fn build_manifest_with_computer_plane(
     else {
         return manifest;
     };
-    for declaration in advertised_computer_declarations(&declarations, context, &outcomes) {
+    let advertised = advertised_computer_declarations(&declarations, context, &outcomes);
+    let admitted_names = advertised
+        .iter()
+        .map(|declaration| declaration.capability_id.clone())
+        .collect::<Vec<_>>();
+    for declaration in advertised {
         if let Some(tool) = computer_tool(&declaration.capability_id) {
             tools.push(tool);
         }
+    }
+    if let Some(tool) = flat_tools::computer_tool(&admitted_names) {
+        tools.push(tool);
     }
     manifest
 }
@@ -647,12 +656,19 @@ fn serialize_manifest_with_computer_plane_configured(
         else {
             return serde_json::to_value(manifest).expect("module manifest serializes");
         };
-        tools.extend(
-            manifest::browser_control_tools()
-                .into_iter()
-                .chain(manifest::browser_wire_tools())
-                .filter(|tool| dispatchable_tool_with_browser(&tool.name, true).is_some()),
-        );
+        let browser_tools = manifest::browser_control_tools()
+            .into_iter()
+            .chain(manifest::browser_wire_tools())
+            .filter(|tool| dispatchable_tool_with_browser(&tool.name, true).is_some())
+            .collect::<Vec<_>>();
+        let admitted_names = browser_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        tools.extend(browser_tools);
+        if let Some(tool) = flat_tools::browser_tool(&admitted_names) {
+            tools.push(tool);
+        }
     }
     let mut value = serde_json::to_value(manifest).expect("module manifest serializes");
     // WHO CAN SEE THIS: a person, not the daemon.
@@ -819,6 +835,7 @@ pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<Capab
     }
     let known_browser_name = browser_session::CONTROL_TOOLS.contains(&name)
         || browser::ALL_TOOLS.contains(&name)
+        || name == flat_tools::BROWSER_USE
         || name == crate::browser_type::BROWSER_TYPE_TOOL;
     if !known_browser_name {
         return Some(CapabilityWithheld::Unknown);
@@ -836,12 +853,13 @@ pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<Capab
 
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
     if browser_configured
-        && (browser_session::CONTROL_TOOLS.contains(&name)
+        && (name == flat_tools::BROWSER_USE
+            || browser_session::CONTROL_TOOLS.contains(&name)
             || (browser::BrowserCapability::parse(name).is_some()
                 && browser::has_wire_dispatch_route(name)))
     {
         Some(name)
-    } else if computer_capability::servable(name).is_some() {
+    } else if name == flat_tools::COMPUTER_USE || computer_capability::servable(name).is_some() {
         // A computer capability is dispatchable when this module can serve it,
         // which is a property of the code rather than of the host. Whether it is
         // ADVERTISED depends further on the audit gate and on this being macOS;
@@ -2792,6 +2810,53 @@ async fn handle_tool_request(
         .await;
     };
 
+    let translated = if name == flat_tools::COMPUTER_USE {
+        match flat_tools::translate_computer(arguments) {
+            Ok(dispatch) => Some(dispatch),
+            Err(error) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &error.field,
+                    error.reason,
+                )
+                .await
+            }
+        }
+    } else if name == flat_tools::BROWSER_USE {
+        match flat_tools::translate_browser(arguments) {
+            Ok(dispatch) => Some(dispatch),
+            Err(error) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &error.field,
+                    error.reason,
+                )
+                .await
+            }
+        }
+    } else {
+        None
+    };
+    let (name, arguments) = match translated.as_ref() {
+        Some(flat_tools::FlatDispatch::Computer {
+            capability,
+            arguments,
+        })
+        | Some(flat_tools::FlatDispatch::Browser {
+            capability,
+            arguments,
+        }) => (capability.as_str(), arguments),
+        None => (name, arguments),
+    };
+
     if browser_session::CONTROL_TOOLS.contains(&name) {
         let result = if accepted_facts.allows_control_operation(name) {
             handle_browser_control(name, arguments, &accepted_facts, planes).await
@@ -3609,6 +3674,37 @@ mod tests {
         // browser.type stays out on the credential-surface policy, which no
         // measurement changes.
         assert!(!dispatchable.contains("browser.type"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn withheld_actions_are_refused_by_the_adapter_too() {
+        let request = json!({
+            "name": flat_tools::COMPUTER_USE,
+            "arguments": {
+                "action": "click",
+                "target": {"by": "identifier", "identifier": "save"}
+            }
+        });
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let health = Arc::new(HealthState::new());
+        handle_tool_request_for_test_admitting(frame, &tx, &health, &[])
+            .await
+            .unwrap();
+        let reply = rx.recv().await.expect("one refusal");
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "capability_not_admitted");
     }
 
     fn browser_surface_config() -> BrowserConfig {

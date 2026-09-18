@@ -387,9 +387,11 @@ pub fn build_with_browser_plane_pins(
 ) -> ModuleManifest {
     let mut manifest = build_with_browser_config(module_id, true);
     let Some(pins) = pins else {
+        append_browser_flat_tool(&mut manifest);
         return manifest;
     };
     if pins.validate().is_err() || !common_artifacts_eligible {
+        append_browser_flat_tool(&mut manifest);
         return manifest;
     }
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
@@ -419,7 +421,21 @@ pub fn build_with_browser_plane_pins(
             schema,
         });
     }
+    append_browser_flat_tool(&mut manifest);
     manifest
+}
+
+fn append_browser_flat_tool(manifest: &mut ModuleManifest) {
+    let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.get_mut(0) else {
+        return;
+    };
+    let admitted = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(tool) = crate::flat_tools::browser_tool(&admitted) {
+        tools.push(tool);
+    }
 }
 
 /// Serialize the standard manifest and its single top-level browser-plane

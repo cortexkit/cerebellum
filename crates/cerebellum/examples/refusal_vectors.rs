@@ -41,6 +41,8 @@ async fn main() {
         "computer.drag",
         "computer.screenshot",
         "computer.wait",
+        "computer_use",
+        "browser_use",
         "browser.launch",
         "browser.navigate",
         "browser.snapshot",

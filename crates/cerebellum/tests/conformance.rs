@@ -791,9 +791,11 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     // release gates can enable `computer.wait` without external attestations.
     // Other computer rows remain suppressed because their required compile-time
     // attestations are still unbound.
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name, "computer.wait");
     assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
+    assert_eq!(tools[1].name, "computer_use");
+    assert_eq!(tools[1].execution_mode, ExecutionMode::Unfenceable);
 
     let route = open_live_route(&mut client, 2).await;
 

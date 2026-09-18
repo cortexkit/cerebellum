@@ -28,6 +28,8 @@ fn accepted_facts() -> BindFacts {
         effective_capability_scope: Some(vec![
             "browser.launch".to_string(),
             "browser.navigate".to_string(),
+            "browser_use".to_string(),
+            "computer_use".to_string(),
         ]),
         provenance: "daemon_attested_spec_a".to_string(),
     }
