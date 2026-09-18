@@ -1163,12 +1163,45 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
             }
         })
     });
-    let connection_result =
-        run_connection(&mut read_half, write_half, &config, planes.clone()).await;
+    let connection_result = serve_until_disconnect(
+        &mut read_half,
+        write_half,
+        &config,
+        planes,
+        browser_config.as_ref(),
+        idle_enforcer,
+    )
+    .await;
+
+    connection_result
+}
+
+/// Serve the daemon connection and, once it ends for any reason, close every
+/// browser session before returning.
+///
+/// The daemon does not send a GOODBYE or a drain when it is cut (a
+/// `launchctl bootout` kills it with no handler); a module learns by EOF. The
+/// graceful stop this module gives its browsers therefore hangs off the
+/// connection ending, not off any notice, and that ordering is the fact this
+/// function exists to make testable: whatever ended the connection, the
+/// sessions are torn down before the result is reported.
+async fn serve_until_disconnect<R, W>(
+    read_half: &mut R,
+    write_half: W,
+    config: &ModuleConfig,
+    planes: Planes,
+    browser_config: Option<&BrowserConfig>,
+    idle_enforcer: Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), ModuleError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let connection_result = run_connection(read_half, write_half, config, planes.clone()).await;
     if let Some(enforcer) = idle_enforcer {
         enforcer.abort();
     }
-    if let Some(browser) = browser_config.as_ref() {
+    if let Some(browser) = browser_config {
         planes.sessions.teardown_all(browser);
     }
 
@@ -4898,6 +4931,141 @@ mod connection_liveness_tests {
         .expect("writer failure must end the connection while the read remains parked");
         let error = result.expect_err("the writer failure must be reported");
         assert_eq!(error.to_string(), "writer-side sentinel");
+    }
+
+    /// A cut daemon sends no GOODBYE and no drain; the module learns by EOF.
+    /// The graceful stop its browsers get hangs off the connection ending, so
+    /// this drives the production tail of `run` with a peer that simply goes
+    /// away and asserts that every session is torn down with the shutdown
+    /// outcome before the result is reported. `teardown_all` in isolation is
+    /// covered elsewhere; this is the property that EOF reaches it.
+    #[tokio::test]
+    async fn daemon_eof_reaches_browser_teardown_before_the_result_is_reported() {
+        use crate::browser_session::{
+            BrowserSessionTerminalOutcome, CleanupStage, OwnedBrowserProcess,
+            ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
+        };
+        use cerebellum_core::clock::FakeClock;
+        use std::sync::Mutex;
+
+        struct ExitingProcess;
+        impl OwnedBrowserProcess for ExitingProcess {
+            fn generation_matches(&self) -> bool {
+                true
+            }
+            fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+                Ok(())
+            }
+            fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+                Ok(true)
+            }
+            fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+                unreachable!("graceful exit was already observed")
+            }
+            fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+                Ok(())
+            }
+        }
+        struct RecordingFinalizer(Arc<Mutex<Vec<BrowserSessionTerminalOutcome>>>);
+        impl SessionCleanup for RecordingFinalizer {
+            fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
+                self.0.lock().unwrap().push(outcome);
+            }
+            fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+                Ok(SessionCleanupOutcome::Complete)
+            }
+        }
+
+        let browser = BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 10,
+            termination_grace_period_ms: 10,
+            browser_idle_timeout_ms: 100,
+            browser_exit_observation_deadline_ms: 10,
+            navigation_settle_deadline_ms: 10,
+        };
+        let config = connection_test_config();
+        let planes = Planes::with_browser_config(
+            Arc::new(HealthState::with_config(config.health)),
+            Some(browser.clone()),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let clock = FakeClock::new();
+        for route in ["route-a", "route-b"] {
+            let _ = planes.sessions.acquire_launch_slot(route);
+            planes
+                .sessions
+                .establish_ready(
+                    route,
+                    cerebellum_core::identity::ProfileDisposition::Durable,
+                    &browser,
+                    &clock,
+                    Box::new(ExitingProcess),
+                    Box::new(RecordingFinalizer(Arc::clone(&outcomes))),
+                )
+                .expect("establish a ready session");
+        }
+
+        // The peer plays the daemon up to the point that matters: it answers
+        // HELLO so the loop is serving, then its end is dropped with no frame
+        // and no goodbye, which is what a daemon cut looks like from here: a
+        // clean EOF on the read half.
+        let (daemon_end, module_end) = tokio::io::duplex(64 * 1024);
+        let (mut module_read, module_write) = tokio::io::split(module_end);
+        tokio::spawn(async move {
+            let (mut daemon_read, mut daemon_write) = tokio::io::split(daemon_end);
+            let hello = subc_transport::read_frame(&mut daemon_read)
+                .await
+                .expect("the module's HELLO is readable")
+                .expect("the module sends HELLO first");
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::HelloAck,
+                Flags::new(false, Priority::Passive, false),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&json!({
+                    "negotiated_ver": PROTOCOL_VERSION,
+                    "subc_ops": [],
+                    "subc_capabilities": [],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            subc_transport::write_frame(&mut daemon_write, &ack)
+                .await
+                .expect("HELLO_ACK is written");
+            // Both halves drop here: the daemon is gone.
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_until_disconnect(
+                &mut module_read,
+                module_write,
+                &config,
+                planes.clone(),
+                Some(&browser),
+                None,
+            ),
+        )
+        .await
+        .expect("EOF must end the connection");
+        assert!(result.is_ok(), "a clean EOF is not an error: {result:?}");
+
+        let outcomes = outcomes.lock().unwrap();
+        assert_eq!(
+            outcomes.as_slice(),
+            [
+                BrowserSessionTerminalOutcome::ModuleShutdown,
+                BrowserSessionTerminalOutcome::ModuleShutdown
+            ],
+            "both sessions must be torn down with the shutdown outcome by the time the \
+             connection result is reported"
+        );
     }
 
     #[test]
