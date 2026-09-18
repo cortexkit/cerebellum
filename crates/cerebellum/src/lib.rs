@@ -1931,18 +1931,26 @@ async fn handle_frame(
             if planes.draining.load(std::sync::atomic::Ordering::Acquire) {
                 let (reason, deadline_ms) =
                     planes.drain_notice.get().expect("drain notice published");
+                // The structured facts ride in `detail`: a consumer decodes
+                // `ErrorBody { code, message, detail }` and drops keys it does
+                // not know, so top-level extras would never reach it.
                 let refusal = Frame::build_with_version(
                     frame.header.ver,
                     FrameType::Error,
-                    frame.header.flags,
+                    control_flags(),
                     frame.header.channel,
                     frame.header.epoch,
                     frame.header.corr,
-                    serde_json::to_vec(&json!({
-                        "code": "module_draining", "reason": reason, "deadline_ms": deadline_ms,
-                        "message": "retry after the module restarts",
-                        "remedy": "retry after the module restarts"
-                    }))
+                    serde_json::to_vec(&ErrorBody {
+                        code: "module_draining".to_string(),
+                        message: "the module is draining for a restart; retry after it is back"
+                            .to_string(),
+                        detail: Some(json!({
+                            "reason": reason,
+                            "deadline_ms": deadline_ms,
+                            "remedy": "retry after the module restarts",
+                        })),
+                    })
                     .map_err(ModuleError::Json)?,
                 )
                 .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -5849,8 +5857,12 @@ mod drain_tests {
         handle_frame(invalid, &tx, &planes).await.unwrap();
         let refusal: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
         assert_eq!(refusal["code"], "module_draining");
-        assert_eq!(refusal["reason"], "restart");
-        assert_eq!(refusal["deadline_ms"], 123);
+        assert_eq!(refusal["detail"]["reason"], "restart");
+        assert_eq!(refusal["detail"]["deadline_ms"], 123);
+        assert_eq!(
+            refusal["detail"]["remedy"],
+            "retry after the module restarts"
+        );
         assert_eq!(count(&planes), 1);
         release.send(()).unwrap();
         let reply = rx.recv().await.unwrap();
