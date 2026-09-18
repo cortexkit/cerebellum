@@ -1034,7 +1034,13 @@ async fn start_live_daemon_with_browser(
     .expect("write isolated subc daemon configuration");
     let daemon_config = subc_core::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_daemon_config_path(&daemon_config_path)
-        .expect("load isolated subc daemon configuration");
+        .expect("load isolated subc daemon configuration")
+        // The daemon captures each child's stderr into a run directory it
+        // resolves from ITS OWN environment, and this daemon runs inside the
+        // test binary, whose HOME is the real one. Without this the module's
+        // stderr lands in the operator's live run dir; SUBC found
+        // `cerebellum.stderr.log` there. Point it at the isolated home.
+        .with_capture_logs_dir(home.join(".local").join("share").join("cortexkit").join("run").join("logs"));
     let task = tokio::spawn(subc_core::bootstrap::run_with_config(daemon_config));
 
     // Same reasoning as `wait_for_cerebellum_catalog`: this is a startup race
