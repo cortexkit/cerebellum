@@ -1181,10 +1181,8 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 ///
 /// The daemon does not send a GOODBYE or a drain when it is cut (a
 /// `launchctl bootout` kills it with no handler); a module learns by EOF. The
-/// graceful stop this module gives its browsers therefore hangs off the
-/// connection ending, not off any notice, and that ordering is the fact this
-/// function exists to make testable: whatever ended the connection, the
-/// sessions are torn down before the result is reported.
+/// graceful stop therefore also runs on connection ending, even without a
+/// drain notice. Sessions are torn down before the result is reported.
 async fn serve_until_disconnect<R, W>(
     read_half: &mut R,
     write_half: W,
@@ -1567,6 +1565,10 @@ where
     }
 }
 
+#[cfg(test)]
+type RouteTestHandler =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 /// The long-lived state a running module serves requests from.
 ///
 /// Bundled rather than passed separately because these travel together
@@ -1574,7 +1576,11 @@ where
 /// need the same set, and threading them one by one meant every new one touched
 /// every signature in the chain.
 pub struct Planes {
+    #[cfg(test)]
+    route_test_handler: Option<RouteTestHandler>,
     pub health: Arc<HealthState>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    drain_notice: Arc<std::sync::OnceLock<(subc_protocol::RouteCloseReason, u64)>>,
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
     pub browser_config: Option<BrowserConfig>,
@@ -1790,6 +1796,10 @@ impl Planes {
                     .into_iter()
                     .collect(),
             ),
+            #[cfg(test)]
+            route_test_handler: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
         }
     }
@@ -1813,7 +1823,11 @@ pub fn test_admitted_computer_capabilities() -> Arc<std::collections::BTreeSet<S
 impl Clone for Planes {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(test)]
+            route_test_handler: self.route_test_handler.clone(),
             health: Arc::clone(&self.health),
+            draining: self.draining.clone(),
+            drain_notice: self.drain_notice.clone(),
             routes: Arc::clone(&self.routes),
             browser: Arc::clone(&self.browser),
             browser_config: self.browser_config.clone(),
@@ -1873,6 +1887,26 @@ async fn handle_frame(
             }
             Ok(true)
         }
+        FrameType::Push if frame.header.channel == 0 => {
+            if let Ok(subc_protocol::session::ModuleControlCommand::Draining {
+                reason,
+                deadline_ms,
+            }) = serde_json::from_slice(&frame.body)
+            {
+                if planes.drain_notice.set((reason, deadline_ms)).is_ok() {
+                    planes
+                        .draining
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    // Spend the drain window flushing profiles, not waiting for the
+                    // deadline. It is only an upper bound, never a scheduled start.
+                    if let Some(config) = planes.browser_config.clone() {
+                        let sessions = planes.sessions.clone();
+                        tokio::task::spawn_blocking(move || sessions.teardown_all(&config));
+                    }
+                }
+            }
+            Ok(true)
+        }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
             if let Some(facts) = planes
@@ -1894,9 +1928,36 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request => {
+            if planes.draining.load(std::sync::atomic::Ordering::Acquire) {
+                let (reason, deadline_ms) =
+                    planes.drain_notice.get().expect("drain notice published");
+                let refusal = Frame::build_with_version(
+                    frame.header.ver,
+                    FrameType::Error,
+                    frame.header.flags,
+                    frame.header.channel,
+                    frame.header.epoch,
+                    frame.header.corr,
+                    serde_json::to_vec(&json!({
+                        "code": "module_draining", "reason": reason, "deadline_ms": deadline_ms,
+                        "message": "retry after the module restarts",
+                        "remedy": "retry after the module restarts"
+                    }))
+                    .map_err(ModuleError::Json)?,
+                )
+                .map_err(|e| ModuleError::Message(e.to_string()))?;
+                send(writer, refusal).await?;
+                return Ok(true);
+            }
+            let guard = planes.health.enter_request();
             let writer = writer.clone();
             let planes = planes.clone();
             tokio::spawn(async move {
+                let _guard = guard;
+                #[cfg(test)]
+                if let Some(handler) = &planes.route_test_handler {
+                    handler().await;
+                }
                 let _ = handle_route_request(frame, &writer, &planes).await;
             });
             Ok(true)
@@ -4355,6 +4416,9 @@ mod tests {
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_notice: Arc::new(std::sync::OnceLock::new()),
+            route_test_handler: None,
             elicitor: Arc::clone(&elicitor),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -4402,6 +4466,9 @@ mod tests {
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_notice: Arc::new(std::sync::OnceLock::new()),
+            route_test_handler: None,
             elicitor: Arc::clone(&elicitor),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -4599,6 +4666,10 @@ mod tests {
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+            #[cfg(test)]
+            route_test_handler: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
         };
         planes.routes.insert(
@@ -4645,7 +4716,7 @@ mod tests {
     }
 
     /// Planes whose only route is bound to the management surface.
-    fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
+    pub(super) fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
         let planes = Planes {
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
@@ -4659,6 +4730,10 @@ mod tests {
             management: test_management_plane(),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+            #[cfg(test)]
+            route_test_handler: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
         };
         planes.routes.insert(
@@ -4941,6 +5016,20 @@ mod connection_liveness_tests {
     /// covered elsewhere; this is the property that EOF reaches it.
     #[tokio::test]
     async fn daemon_eof_reaches_browser_teardown_before_the_result_is_reported() {
+        shutdown_connection(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn draining_starts_browser_teardown_before_eof() {
+        shutdown_connection(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_draining_does_not_tear_down_twice() {
+        shutdown_connection(true, true).await;
+    }
+
+    async fn shutdown_connection(drain: bool, twice: bool) {
         use crate::browser_session::{
             BrowserSessionTerminalOutcome, CleanupStage, OwnedBrowserProcess,
             ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
@@ -5008,41 +5097,89 @@ mod connection_liveness_tests {
         }
 
         // The peer plays the daemon up to the point that matters: it answers
-        // HELLO so the loop is serving, then its end is dropped with no frame
-        // and no goodbye, which is what a daemon cut looks like from here: a
-        // clean EOF on the read half.
+        // HELLO so the loop is serving, optionally drains while still connected,
+        // then drops its end without a goodbye to exercise the EOF tail.
         let (daemon_end, module_end) = tokio::io::duplex(64 * 1024);
         let (mut module_read, module_write) = tokio::io::split(module_end);
-        tokio::spawn(async move {
-            let (mut daemon_read, mut daemon_write) = tokio::io::split(daemon_end);
-            let hello = subc_transport::read_frame(&mut daemon_read)
-                .await
-                .expect("the module's HELLO is readable")
-                .expect("the module sends HELLO first");
-            assert_eq!(hello.header.ty, FrameType::Hello);
-            let ack = Frame::build_with_version(
-                PROTOCOL_VERSION,
-                FrameType::HelloAck,
-                Flags::new(false, Priority::Passive, false),
-                0,
-                0,
-                hello.header.corr,
-                serde_json::to_vec(&json!({
-                    "negotiated_ver": PROTOCOL_VERSION,
-                    "subc_ops": [],
-                    "subc_capabilities": [],
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            subc_transport::write_frame(&mut daemon_write, &ack)
-                .await
-                .expect("HELLO_ACK is written");
-            // Both halves drop here: the daemon is gone.
-        });
+        let observed_planes = planes.clone();
+        let observed_outcomes = outcomes.clone();
+        let peer =
+            tokio::spawn(async move {
+                let (mut daemon_read, mut daemon_write) = tokio::io::split(daemon_end);
+                let hello = subc_transport::read_frame(&mut daemon_read)
+                    .await
+                    .expect("the module's HELLO is readable")
+                    .expect("the module sends HELLO first");
+                assert_eq!(hello.header.ty, FrameType::Hello);
+                let ack = Frame::build_with_version(
+                    PROTOCOL_VERSION,
+                    FrameType::HelloAck,
+                    Flags::new(false, Priority::Passive, false),
+                    0,
+                    0,
+                    hello.header.corr,
+                    serde_json::to_vec(&json!({
+                        "negotiated_ver": PROTOCOL_VERSION,
+                        "subc_ops": [],
+                        "subc_capabilities": [],
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                subc_transport::write_frame(&mut daemon_write, &ack)
+                    .await
+                    .expect("HELLO_ACK is written");
+                if drain {
+                    let notice =
+                        |deadline| {
+                            Frame::build_with_version(PROTOCOL_VERSION, FrameType::Push,
+                    control_flags(), 0, 0, 0, serde_json::to_vec(&json!({
+                        "op":"module.draining", "reason":"restart", "deadline_ms":deadline
+                    })).unwrap()).unwrap()
+                        };
+                    subc_transport::write_frame(&mut daemon_write, &notice(123))
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if observed_outcomes.lock().unwrap().len() == 2 {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("drain must finalize browsers before EOF");
+                    if twice {
+                        subc_transport::write_frame(&mut daemon_write, &notice(456))
+                            .await
+                            .unwrap();
+                        let ping = Frame::build_with_version(
+                            PROTOCOL_VERSION,
+                            FrameType::Ping,
+                            control_flags(),
+                            0,
+                            0,
+                            99,
+                            vec![],
+                        )
+                        .unwrap();
+                        subc_transport::write_frame(&mut daemon_write, &ping)
+                            .await
+                            .unwrap();
+                        let pong = subc_transport::read_frame(&mut daemon_read)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(pong.header.ty, FrameType::Pong);
+                        assert_eq!(observed_planes.drain_notice.get().unwrap().1, 123);
+                    }
+                }
+                // Dropping the daemon read and write halves delivers EOF to the module.
+            });
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             serve_until_disconnect(
                 &mut module_read,
                 module_write,
@@ -5056,6 +5193,7 @@ mod connection_liveness_tests {
         .expect("EOF must end the connection");
         assert!(result.is_ok(), "a clean EOF is not an error: {result:?}");
 
+        peer.await.expect("daemon assertions passed");
         let outcomes = outcomes.lock().unwrap();
         assert_eq!(
             outcomes.as_slice(),
@@ -5590,5 +5728,151 @@ mod dispatch_idle_tests {
         drop(writer_io);
         drop(wake_tx);
         let _ = loop_task.await;
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    fn planes() -> Planes {
+        Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            None,
+            JournalPersistence::Isolated,
+        )
+    }
+
+    fn frame(ty: FrameType, channel: u16, body: Value) -> Frame {
+        Frame::build_with_version(
+            PROTOCOL_VERSION,
+            ty,
+            control_flags(),
+            channel,
+            1,
+            7,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn draining() -> Frame {
+        frame(
+            FrameType::Push,
+            0,
+            json!({"op":"module.draining", "reason":"restart", "deadline_ms":123}),
+        )
+    }
+
+    fn count(planes: &Planes) -> u64 {
+        let ModuleControlResponse::HealthCheck {
+            metrics: Some(metrics),
+            ..
+        } = planes.health.report()
+        else {
+            panic!("health reply")
+        };
+        metrics["inFlightActions"].as_u64().unwrap()
+    }
+
+    async fn await_count(planes: &Planes, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while count(planes) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request accounting settles");
+    }
+
+    fn hold(planes: &mut Planes) -> tokio::sync::oneshot::Sender<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let rx = std::sync::Mutex::new(Some(rx));
+        planes.route_test_handler = Some(Arc::new(move || {
+            let rx = rx.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                rx.await.unwrap();
+            })
+        }));
+        tx
+    }
+
+    #[tokio::test]
+    async fn in_flight_gauge_counts_live_route_requests() {
+        let mut planes = planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        let one = hold(&mut planes);
+        handle_frame(frame(FrameType::Request, 1, json!({})), &tx, &planes)
+            .await
+            .unwrap();
+        let oldest = planes.health.oldest_in_flight_instant().unwrap();
+        let two = hold(&mut planes);
+        handle_frame(frame(FrameType::Request, 2, json!({})), &tx, &planes)
+            .await
+            .unwrap();
+        assert_eq!(count(&planes), 2);
+        assert_eq!(planes.health.oldest_in_flight_instant(), Some(oldest));
+        one.send(()).unwrap();
+        rx.recv().await.unwrap();
+        await_count(&planes, 1).await;
+        assert!(planes.health.oldest_in_flight_instant().unwrap() >= oldest);
+        two.send(()).unwrap();
+        rx.recv().await.unwrap();
+        await_count(&planes, 0).await;
+        assert_eq!(planes.health.oldest_in_flight_instant(), None);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_still_releases_its_in_flight_slot() {
+        let mut planes = planes();
+        planes.route_test_handler = Some(Arc::new(|| Box::pin(async { panic!("handler panic") })));
+        let (tx, _rx) = mpsc::channel(8);
+        handle_frame(frame(FrameType::Request, 1, json!({})), &tx, &planes)
+            .await
+            .unwrap();
+        assert_eq!(count(&planes), 1);
+        await_count(&planes, 0).await;
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_new_requests_and_lets_in_flight_finish() {
+        let mut planes = super::tests::management_bound_planes(1, 1);
+        let (tx, mut rx) = mpsc::channel(8);
+        let release = hold(&mut planes);
+        handle_frame(frame(FrameType::Request, 1, json!({"method": management::OPEN_TARGET, "params": {"bundle_identity":"com.example.Nothing", "action_kind":"observe"}})), &tx, &planes)
+            .await
+            .unwrap();
+        handle_frame(draining(), &tx, &planes).await.unwrap();
+        planes.route_test_handler = None;
+        let mut invalid = frame(FrameType::Request, 2, json!({}));
+        invalid.body = b"invalid JSON".to_vec();
+        handle_frame(invalid, &tx, &planes).await.unwrap();
+        let refusal: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(refusal["code"], "module_draining");
+        assert_eq!(refusal["reason"], "restart");
+        assert_eq!(refusal["deadline_ms"], 123);
+        assert_eq!(count(&planes), 1);
+        release.send(()).unwrap();
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(reply.header.channel, 1);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(body["outcome"], "not_running");
+        await_count(&planes, 0).await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_control_push_is_ignored() {
+        let planes = planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(handle_frame(
+            frame(FrameType::Push, 0, json!({"op":"future.op"})),
+            &tx,
+            &planes
+        )
+        .await
+        .unwrap());
+        assert!(rx.try_recv().is_err());
+        assert!(!planes.draining.load(std::sync::atomic::Ordering::Acquire));
     }
 }

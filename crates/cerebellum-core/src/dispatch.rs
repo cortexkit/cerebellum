@@ -39,6 +39,8 @@ const ABSENT: u64 = u64::MAX;
 /// health lane reads them without a lock.
 #[derive(Debug)]
 pub struct DispatchTimingState {
+    in_flight: AtomicU64,
+    live: std::sync::Mutex<(u64, std::collections::BTreeMap<u64, MonoInstant>)>,
     /// Latest heartbeat instant, in nanoseconds since the clock epoch.
     heartbeat_nanos: AtomicU64,
     /// Oldest queued-action enqueue instant, or [`ABSENT`] when the queue is
@@ -56,10 +58,34 @@ impl DispatchTimingState {
     /// before making the module externally visible).
     pub fn new(clock: &impl crate::clock::MonotonicClock) -> Self {
         Self {
+            in_flight: AtomicU64::new(0),
+            live: std::sync::Mutex::new((0, std::collections::BTreeMap::new())),
             heartbeat_nanos: AtomicU64::new(clock.now().as_nanos()),
             oldest_queued_nanos: AtomicU64::new(ABSENT),
             oldest_in_flight_nanos: AtomicU64::new(ABSENT),
         }
+    }
+
+    /// Register before spawning so health checks count a request even before its
+    /// task is first polled.
+    pub fn enter(
+        self: &std::sync::Arc<Self>,
+        clock: &impl crate::clock::MonotonicClock,
+    ) -> InFlightGuard {
+        let mut live = self.live.lock().expect("in-flight lock poisoned");
+        let ticket = live.0;
+        live.0 += 1;
+        live.1.insert(ticket, clock.now());
+        self.set_oldest_in_flight(live.1.first_key_value().map(|(_, instant)| *instant));
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard {
+            timing: self.clone(),
+            ticket,
+        }
+    }
+
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// Refresh the heartbeat instant to `clock.now()`. Called by the dispatch
@@ -116,5 +142,22 @@ impl DispatchTimingState {
         } else {
             Some(MonoInstant::from_nanos(v))
         }
+    }
+}
+
+/// Removes a request from in-flight accounting on completion, cancellation, or
+/// panic. Health checks read the published atomics without acquiring the map lock.
+pub struct InFlightGuard {
+    timing: std::sync::Arc<DispatchTimingState>,
+    ticket: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut live = self.timing.live.lock().expect("in-flight lock poisoned");
+        live.1.remove(&self.ticket);
+        self.timing
+            .set_oldest_in_flight(live.1.first_key_value().map(|(_, instant)| *instant));
+        self.timing.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }

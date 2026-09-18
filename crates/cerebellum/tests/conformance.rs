@@ -1555,3 +1555,58 @@ fn every_advertised_browser_tool_is_dispatchable_and_no_other_is() {
         }
     }
 }
+
+#[tokio::test]
+async fn busy_signal_is_declared_and_anchored_to_a_gauge_the_health_report_emits() {
+    use subc_protocol::manifest::{SelfSignalEffect, SelfSignalKind, SignalAnchor};
+    let manifest = manifest::build(MODULE_ID);
+    let signals = manifest.self_signals.expect("self-signals declared");
+    assert_eq!(signals.len(), 3);
+    for name in [
+        "dispatch_heartbeat_restamp",
+        "browser_session_idle_sweep",
+        "route_requests_in_flight",
+    ] {
+        assert_eq!(
+            signals.iter().filter(|signal| signal.name == name).count(),
+            1
+        );
+    }
+    let signal = signals
+        .iter()
+        .find(|signal| signal.name == "route_requests_in_flight")
+        .unwrap();
+    assert_eq!(signal.kind, SelfSignalKind::Busy);
+    assert_eq!(signal.effect, SelfSignalEffect::Observe);
+    assert!(signal.cadence.is_none());
+    let SignalAnchor::HealthGauges { gauges } = &signal.anchored_to else {
+        panic!("health gauge anchor")
+    };
+    assert_eq!(gauges, &["inFlightActions"]);
+    let (tx, mut rx) = mpsc::channel(8);
+    let request = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
+    )
+    .unwrap();
+    let health = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    cerebellum::handle_control_request_for_test(request, &tx, &health)
+        .await
+        .unwrap();
+    let reply = rx.recv().await.unwrap();
+    let ModuleControlResponse::HealthCheck {
+        metrics: Some(metrics),
+        ..
+    } = serde_json::from_slice(&reply.body).unwrap()
+    else {
+        panic!("health reply")
+    };
+    for gauge in gauges {
+        assert_eq!(metrics[gauge].as_u64(), Some(0));
+    }
+}

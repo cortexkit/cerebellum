@@ -267,6 +267,15 @@ fn attestable_commit(rev: &str, tree: &str) -> Option<String> {
 fn self_signals() -> Vec<SelfSignalDeclaration> {
     vec![
         SelfSignalDeclaration {
+            name: "route_requests_in_flight".to_string(),
+            kind: SelfSignalKind::Busy,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::HealthGauges { gauges: vec!["inFlightActions".to_string()] },
+            cadence: None,
+            domain: None,
+            note: Some("A non-zero reading holds back shutdown while a synthetic input sequence or browser action is mid-flight.".to_string()),
+        },
+        SelfSignalDeclaration {
             name: "dispatch_heartbeat_restamp".to_string(),
             kind: SelfSignalKind::Heartbeat,
             // Observe: it re-stamps an atomic so an idle module does not read as

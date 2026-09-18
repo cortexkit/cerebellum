@@ -51,7 +51,7 @@ pub struct HealthState {
     config: HealthConfig,
     /// The dispatch timing atomics: heartbeat, oldest queued, oldest
     /// in-flight.
-    timing: DispatchTimingState,
+    timing: std::sync::Arc<DispatchTimingState>,
     /// Whether the dispatch loop has ever stamped a heartbeat (0 = no, 1 =
     /// yes). A module that has never ticked is healthy (it just started and
     /// the heartbeat was initialized at construction).
@@ -70,7 +70,7 @@ impl HealthState {
     /// config file at boot). The heartbeat is stamped at construction.
     pub fn with_config(config: HealthConfig) -> Self {
         let clock = SystemClock::new();
-        let timing = DispatchTimingState::new(&clock);
+        let timing = std::sync::Arc::new(DispatchTimingState::new(&clock));
         Self {
             clock,
             config,
@@ -104,6 +104,11 @@ impl HealthState {
     /// comparable).
     pub fn clock(&self) -> &SystemClock {
         &self.clock
+    }
+
+    /// Hold this guard for the entire route request, including writing its reply.
+    pub fn enter_request(&self) -> crate::dispatch::InFlightGuard {
+        self.timing.enter(&self.clock)
     }
 
     /// Stamp the dispatch heartbeat. Called at the top of every loop turn so a
@@ -193,6 +198,7 @@ impl HealthState {
         };
 
         let metrics = serde_json::json!({
+            "inFlightActions": self.timing.in_flight(),
             "heartbeatAgeSecs": ages.heartbeat_age.as_secs(),
             "oldestQueuedAgeSecs": ages.oldest_queued_age.map(|d| d.as_secs()).unwrap_or(0),
             "oldestInFlightAgeSecs": ages.oldest_in_flight_age.map(|d| d.as_secs()).unwrap_or(0),
