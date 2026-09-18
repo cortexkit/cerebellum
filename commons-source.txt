@@ -11,4 +11,4 @@
 # for c in cortexkit-store-types; do
 # echo "$(git -C ../commons rev-parse HEAD:crates/$c) $c"
 # done > commons-source.txt
-af52e618d03090c2b265659b14193069794bb4d7 cortexkit-store-types
+6676798778308ecee47e02486203e706630d8e00 cortexkit-store-types
