@@ -100,6 +100,8 @@ dependencies = [
  "subc-transport",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -932,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.18.12"
+version = "0.18.14"
 dependencies = [
  "base64",
  "cortexkit-log",

@@ -950,6 +950,25 @@ async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo
     start_live_daemon_with_browser(false).await
 }
 
+/// Give the in-process daemon somewhere to say what it saw.
+///
+/// `bootstrap::run_with_config` installs no tracing subscriber (a library must
+/// not fight the host's), and `tracing` discards every event when none is
+/// installed, so a daemon booted by these tests emits nothing: a bind the
+/// daemon refused and a bind it never received read identically. The test
+/// writer keeps the lines under libtest's capture, so they surface only when a
+/// test fails, beside the client-side string that was previously the only
+/// evidence that could exist.
+fn install_daemon_trace_subscriber() {
+    static SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+    SUBSCRIBER.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+    });
+}
+
 /// Start the real daemon, optionally giving the spawned module a browser
 /// configuration in its isolated home.
 ///
@@ -960,6 +979,7 @@ async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo
 async fn start_live_daemon_with_browser(
     browser: bool,
 ) -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
+    install_daemon_trace_subscriber();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock must be after the Unix epoch")
