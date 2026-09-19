@@ -19,14 +19,14 @@ use std::sync::OnceLock;
 //               what each one accepts.
 //
 // Changing what a capability accepts bumps the REVISION only, which is why
-// these currently read /v1 and -v8: the v2-v8 cutovers changed nested request
+// these currently read /v1 and -v9: the v2-v9 cutovers changed nested request
 // and result schemas or action annotations inside rows whose shape was unchanged.
 // A reviewer read the mismatch as a mistake before finding both fields in the
 // artifact, so it is stated here rather than left to be re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v8";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v9";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v8.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v9.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -34,7 +34,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "39061e07424d404695e0da6b06e6ce732a60136361267d77562ad276c9b95906";
+    "9018f851fa4af09a2b23d2675b14b9e11398c5cf4cfca20f51172dd609e7980c";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {

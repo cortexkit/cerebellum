@@ -13,7 +13,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v8.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v9.json");
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 const SYNTHETIC_CAPABILITIES: [&str; 5] = [
     "computer.type",
@@ -34,7 +34,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v8");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v9");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -118,7 +118,7 @@ fn every_synthetic_row_declares_all_refusal_fields_without_requiring_them() {
 
 #[test]
 fn v8_only_adds_refusal_fields_to_the_five_synthetic_rows() {
-    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let mut before = recreated_v8();
     before["revision"] = json!("computer_action_vocabulary-v7");
     for row in before["rows"].as_array_mut().expect("rows") {
         let capability = row["capability_id"]
@@ -448,4 +448,34 @@ fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
         .map(|item| item.capability_id.as_str())
         .collect();
     assert_eq!(ids.len(), 8);
+}
+
+fn recreated_v8() -> Value {
+    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    before["revision"] = json!("computer_action_vocabulary-v8");
+    for row in before["rows"].as_array_mut().expect("rows") {
+        let capability = row["capability_id"].as_str().unwrap().to_owned();
+        if SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
+            row["result_schema"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("posts_returned");
+        }
+        if matches!(capability.as_str(), "computer.move" | "computer.drag") {
+            row["result_schema"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("containment_rung");
+        }
+    }
+    before
+}
+
+#[test]
+fn v9_only_adds_sequence_counts_and_missing_containment_rungs() {
+    let bytes = canonical_json_bytes(&recreated_v8()).unwrap();
+    assert_eq!(
+        hex_digest(&bytes),
+        "39061e07424d404695e0da6b06e6ce732a60136361267d77562ad276c9b95906"
+    );
 }
