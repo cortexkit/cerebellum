@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.18.10"
+version = "0.18.12"
 dependencies = [
  "base64",
  "cortexkit-log",
