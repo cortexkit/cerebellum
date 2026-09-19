@@ -729,7 +729,7 @@ where
         self.finish_reply(served_capability, reply)
     }
 
-    /// Poll one accessibility predicate until it settles or its deadline passes.
+    /// Poll one accessibility predicate until it settles, expires, or is cancelled.
     async fn serve_wait<C: MonotonicClock>(
         &self,
         arguments: &Value,
@@ -740,7 +740,7 @@ where
             Err(refusal) => return wait_indeterminate_reply(None, refusal),
         };
         let ServeContext {
-            cancel: _,
+            cancel,
             grantee,
             identity: _,
             management,
@@ -764,7 +764,9 @@ where
             match tokio::task::spawn_blocking(move || {
                 let mut poller =
                     PlatformPredicatePoller::new(NativeComputerPlatformDriver::default(), grant);
-                wait_until_predicate(&mut poller, predicate, timeout_ms)
+                wait_until_predicate(&mut poller, predicate, timeout_ms, &|| {
+                    cancel.is_cancelled()
+                })
             })
             .await
             {
@@ -777,7 +779,7 @@ where
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = grant;
+            let _ = (grant, cancel);
             wait_indeterminate_reply(
                 Some(parsed.predicate),
                 json!({"reason": "scoped_accessibility_read_unsupported"}),
@@ -1518,9 +1520,12 @@ fn wait_wire_reply(result: WaitResult) -> Value {
         WaitOutcome::Settled => "predicate_satisfied",
         WaitOutcome::TimedOut => "timeout",
         WaitOutcome::Indeterminate => "indeterminate",
+        WaitOutcome::Cancelled => "cancelled",
     };
     json!({
         "outcome": outcome,
+        // Every polled outcome reports the engine's actual scoped-read count.
+        "attempts": result.attempts,
         "evidence": serde_json::to_string(&result.evidence)
             .expect("the closed wait evidence type serializes"),
         "settle_path": "poll_with_deadline",
@@ -3889,6 +3894,37 @@ mod cancel_wire_tests {
             element: AccessibilityElementName::identifier("element-1"),
             expected: true,
         }
+    }
+
+    fn cancelled_wait_reply() -> Value {
+        wait_wire_reply(WaitResult {
+            outcome: WaitOutcome::Cancelled,
+            evidence: WaitEvidence::Cancelled {
+                predicate: wait_predicate(),
+                readback: ObservedElement::absent(),
+            },
+            attempts: 2,
+        })
+    }
+
+    #[test]
+    fn a_cancelled_wait_is_not_reported_as_indeterminate() {
+        let reply = cancelled_wait_reply();
+        assert_eq!(reply["outcome"], "cancelled");
+        let evidence: Value = serde_json::from_str(reply["evidence"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["status"], "cancelled");
+        assert!(evidence.get("reason").is_none());
+    }
+
+    #[test]
+    fn a_cancelled_wait_reply_reports_the_returned_attempt_count() {
+        assert_eq!(cancelled_wait_reply()["attempts"], 2);
+    }
+
+    #[test]
+    fn the_cancelled_wait_reply_survives_withholding() {
+        validate_capability_result("computer.wait", &cancelled_wait_reply())
+            .expect("cancelled wait reply violates its frozen schema");
     }
 
     /// Every OTHER row's success reply must survive withholding too.

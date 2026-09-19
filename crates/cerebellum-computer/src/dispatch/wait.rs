@@ -37,6 +37,10 @@ pub enum WaitEvidence {
         predicate: PostCondition,
         readback: ObservedElement,
     },
+    Cancelled {
+        predicate: PostCondition,
+        readback: ObservedElement,
+    },
     Indeterminate {
         predicate: PostCondition,
         readback: Option<ObservedElement>,
@@ -44,12 +48,13 @@ pub enum WaitEvidence {
     },
 }
 
-/// The three terminal states exposed by the v5 wire contract.
+/// Terminal states exposed by the wait wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     Settled,
     TimedOut,
     Indeterminate,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,11 +157,16 @@ fn readback_failure_reason(error: &DriverError) -> &'static str {
     }
 }
 
-/// Poll one shared predicate until it settles, times out, or cannot be read.
+/// Poll one shared predicate until it settles, times out, cannot be read, or is cancelled.
+///
+/// Cancellation is observed before each read and before sleeping. A cancel during
+/// a read therefore waits at most one in-flight scoped read (500 ms), not another
+/// polling interval. A cancel during sleep waits at most the 50 ms interval.
 pub fn wait_until_predicate<P: PredicatePoller>(
     poller: &mut P,
     predicate: PostCondition,
     timeout_ms: u64,
+    cancelled: &dyn Fn() -> bool,
 ) -> WaitResult {
     let timeout = Duration::from_millis(timeout_ms);
     let maximum_attempts = timeout_ms
@@ -170,6 +180,9 @@ pub fn wait_until_predicate<P: PredicatePoller>(
     // if a faulty clock or sleeper stops advancing. The elapsed-time checks are
     // still authoritative when a scoped read consumes part of the deadline.
     for _ in 0..maximum_attempts {
+        if cancelled() {
+            return cancelled_result(predicate, last_readback, attempts);
+        }
         if attempts > 0 && poller.elapsed() >= timeout {
             return timed_out(predicate, last_readback, attempts);
         }
@@ -225,10 +238,28 @@ pub fn wait_until_predicate<P: PredicatePoller>(
             return timed_out(predicate, last_readback, attempts);
         }
         let remaining = timeout.saturating_sub(poller.elapsed());
+        if cancelled() {
+            return cancelled_result(predicate, last_readback, attempts);
+        }
         poller.sleep(remaining.min(Duration::from_millis(WAIT_POLL_INTERVAL_MS)));
     }
 
     timed_out(predicate, last_readback, attempts)
+}
+
+fn cancelled_result(
+    predicate: PostCondition,
+    readback: ObservedElement,
+    attempts: u64,
+) -> WaitResult {
+    WaitResult {
+        outcome: WaitOutcome::Cancelled,
+        evidence: WaitEvidence::Cancelled {
+            predicate,
+            readback,
+        },
+        attempts,
+    }
 }
 
 fn timed_out(predicate: PostCondition, readback: ObservedElement, attempts: u64) -> WaitResult {
@@ -244,16 +275,18 @@ fn timed_out(predicate: PostCondition, readback: ObservedElement, attempts: u64)
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
     use super::*;
-    use crate::platform::AccessibilityElementName;
+    use crate::platform::{process_event::never_cancelled, AccessibilityElementName};
 
     struct FakePoller {
         elapsed: Duration,
         reads: VecDeque<Result<ObservedElement, String>>,
         repeat: Result<ObservedElement, String>,
-        read_count: u64,
+        read_count: Rc<Cell<u64>>,
+        sleep_count: u64,
+        cancel_on_sleep: Option<Rc<Cell<bool>>>,
         advance_sleep: bool,
     }
 
@@ -263,7 +296,9 @@ mod tests {
                 elapsed: Duration::ZERO,
                 reads: VecDeque::new(),
                 repeat: readback,
-                read_count: 0,
+                read_count: Rc::new(Cell::new(0)),
+                sleep_count: 0,
+                cancel_on_sleep: None,
                 advance_sleep: true,
             }
         }
@@ -279,13 +314,17 @@ mod tests {
             _predicate: &PostCondition,
             _deadline_ms: u32,
         ) -> Result<ObservedElement, String> {
-            self.read_count += 1;
+            self.read_count.set(self.read_count.get() + 1);
             self.reads
                 .pop_front()
                 .unwrap_or_else(|| self.repeat.clone())
         }
 
         fn sleep(&mut self, duration: Duration) {
+            self.sleep_count += 1;
+            if let Some(cancelled) = &self.cancel_on_sleep {
+                cancelled.set(true);
+            }
             if self.advance_sleep {
                 self.elapsed += duration;
             }
@@ -309,8 +348,12 @@ mod tests {
 
     #[test]
     fn wait_engine_consumes_post_condition_directly_without_a_second_predicate_type() {
-        let shared_vocabulary: fn(&mut FakePoller, PostCondition, u64) -> WaitResult =
-            wait_until_predicate::<FakePoller>;
+        let shared_vocabulary: fn(
+            &mut FakePoller,
+            PostCondition,
+            u64,
+            &dyn Fn() -> bool,
+        ) -> WaitResult = wait_until_predicate::<FakePoller>;
         let _ = shared_vocabulary;
     }
 
@@ -320,7 +363,7 @@ mod tests {
         let readback = observed_focus(true);
         let mut poller = FakePoller::repeating(Ok(readback.clone()));
 
-        let result = wait_until_predicate(&mut poller, predicate.clone(), 1_000);
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 1_000, &never_cancelled);
 
         assert_eq!(result.outcome, WaitOutcome::Settled);
         assert_eq!(result.attempts, 1);
@@ -339,7 +382,7 @@ mod tests {
         let readback = observed_focus(false);
         let mut poller = FakePoller::repeating(Ok(readback.clone()));
 
-        let result = wait_until_predicate(&mut poller, predicate.clone(), 100);
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 100, &never_cancelled);
 
         assert_eq!(result.outcome, WaitOutcome::TimedOut);
         assert_eq!(
@@ -356,7 +399,7 @@ mod tests {
         let predicate = focused("AXTextField", "Account");
         let mut poller = FakePoller::repeating(Err("target_not_inspectable".to_string()));
 
-        let result = wait_until_predicate(&mut poller, predicate.clone(), 100);
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 100, &never_cancelled);
 
         assert_eq!(result.outcome, WaitOutcome::Indeterminate);
         assert_eq!(
@@ -367,6 +410,100 @@ mod tests {
                 reason: "target_not_inspectable".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn a_cancelled_wait_stops_before_the_next_read() {
+        let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let reads = poller.read_count.clone();
+        let result = wait_until_predicate(
+            &mut poller,
+            focused("AXTextField", "Account"),
+            1_000,
+            &|| reads.get() >= 2,
+        );
+        assert_eq!(result.outcome, WaitOutcome::Cancelled);
+        assert_eq!(result.attempts, 2);
+        assert_eq!(poller.read_count.get(), 2);
+    }
+
+    #[test]
+    fn a_wait_cancelled_before_the_first_read_reads_nothing() {
+        let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let result = wait_until_predicate(
+            &mut poller,
+            focused("AXTextField", "Account"),
+            1_000,
+            &|| true,
+        );
+        assert_eq!(result.outcome, WaitOutcome::Cancelled);
+        assert_eq!(result.attempts, 0);
+        assert_eq!(poller.read_count.get(), 0);
+        assert_eq!(poller.sleep_count, 0);
+    }
+
+    #[test]
+    fn a_cancel_during_sleep_stops_before_another_read() {
+        let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let cancelled = Rc::new(Cell::new(false));
+        poller.cancel_on_sleep = Some(cancelled.clone());
+        let result = wait_until_predicate(
+            &mut poller,
+            focused("AXTextField", "Account"),
+            1_000,
+            &|| cancelled.get(),
+        );
+        assert_eq!(result.outcome, WaitOutcome::Cancelled);
+        assert_eq!(result.attempts, 1);
+        assert_eq!(poller.read_count.get(), 1);
+    }
+
+    #[test]
+    fn a_cancel_during_read_does_not_pay_another_poll_interval() {
+        let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let reads = poller.read_count.clone();
+        let result = wait_until_predicate(
+            &mut poller,
+            focused("AXTextField", "Account"),
+            1_000,
+            &|| reads.get() >= 2,
+        );
+        assert_eq!(result.outcome, WaitOutcome::Cancelled);
+        assert_eq!(poller.sleep_count, 1);
+        assert_eq!(poller.elapsed, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_cancelled_wait_carries_the_last_observed_state() {
+        let predicate = focused("AXTextField", "Account");
+        let readback = observed_focus(false);
+        let mut poller = FakePoller::repeating(Ok(readback.clone()));
+        poller.reads.push_back(Ok(ObservedElement::absent()));
+        let reads = poller.read_count.clone();
+        let result =
+            wait_until_predicate(&mut poller, predicate.clone(), 1_000, &|| reads.get() >= 2);
+        assert_eq!(
+            result.evidence,
+            WaitEvidence::Cancelled {
+                predicate,
+                readback
+            }
+        );
+    }
+
+    #[test]
+    fn a_wait_with_no_canceller_polls_to_its_timeout() {
+        let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let result = wait_until_predicate(
+            &mut poller,
+            focused("AXTextField", "Account"),
+            100,
+            &never_cancelled,
+        );
+        assert_eq!(result.outcome, WaitOutcome::TimedOut);
+        assert_eq!(result.attempts, 2);
+        assert_eq!(poller.read_count.get(), 2);
+        assert_eq!(poller.elapsed, Duration::from_millis(100));
     }
 
     #[test]
@@ -392,9 +529,9 @@ mod tests {
         let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
         poller.advance_sleep = false;
 
-        let result = wait_until_predicate(&mut poller, predicate, 100);
+        let result = wait_until_predicate(&mut poller, predicate, 100, &never_cancelled);
 
         assert_eq!(result.outcome, WaitOutcome::TimedOut);
-        assert_eq!(poller.read_count, 4);
+        assert_eq!(poller.read_count.get(), 4);
     }
 }
