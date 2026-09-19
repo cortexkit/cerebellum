@@ -147,6 +147,49 @@ fn main() {
     // the one place a global post appears in this repository, it is diagnostic,
     // and it is why it lives in a probe rather than in the driver.
     let post_globally = std::env::var("CEREBELLUM_PROBE_POST_GLOBAL").is_ok();
+    // Stamp the window-routing fields before posting to the pid.
+    //
+    // The August run of this probe posted pointer events carrying NO routing
+    // fields and measured nothing arriving, which was read as "the public
+    // per-process path cannot carry pointer events". Reading trycua/cua's
+    // driver showed their own public fallback stamps a set of integer fields
+    // first -- windowNumber and the two window-under-pointer fields, plus the
+    // target pid, which their comment attributes to Chromium's synthetic-event
+    // filter. So what August measured was an UNROUTED event, which is a
+    // narrower fact. This arm separates the two.
+    //
+    // The setter is public CoreGraphics. The field NUMBERS are undocumented,
+    // which is why this lives in a probe and not in the driver: a measurement
+    // is allowed to use an undocumented constant, a shipped path needs a
+    // decision about depending on one.
+    //
+    // What this arm deliberately does NOT do is stamp a window-LOCAL point.
+    // cua does that through a SkyLight private symbol, and the question worth
+    // answering first is whether the public surface alone suffices. A negative
+    // result here means "public fields alone are not enough", not "the public
+    // path cannot do it" -- the difference is one more private symbol.
+    let window_routed = std::env::var("CEREBELLUM_PROBE_WINDOW_ROUTED").is_ok();
+    let routed_window = if window_routed {
+        match target_window(target) {
+            Some(window) => {
+                println!(
+                    "routing to window {} at ({}, {}) {}x{}",
+                    window.window_id, window.x, window.y, window.width, window.height
+                );
+                Some(window.window_id)
+            }
+            None => {
+                eprintln!(
+                    "PROBE FAILED: no on-screen window found for pid {target}, so there is no \
+                     window number to route to."
+                );
+                quit_textedit();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     // The HID tap resets the hardware idle table and the session tap does not
     // (measured with global_input_truth). An idleness gate can only read that
     // table if global posts enter at the session tap -- provided they still
@@ -165,6 +208,9 @@ fn main() {
         }
     );
     for event in events {
+        if let Some(window_id) = routed_window {
+            stamp_window_routing(event.as_ref(), window_id, target);
+        }
         if post_globally {
             objc2_core_graphics::CGEvent::post(
                 if at_session_tap {
@@ -218,6 +264,14 @@ fn main() {
                 text.trim()
             );
         }
+        _ if window_routed => {
+            println!(
+                "VERDICT: NO SELECTION WITH WINDOW ROUTING. The public integer fields alone do \
+                 not carry a pointer sequence to a background window. That is narrower than \
+                 \"the public path cannot\": the remaining untested difference is the window-LOCAL \
+                 point, which cua stamps through a private SkyLight symbol."
+            );
+        }
         _ => {
             println!(
                 "VERDICT: NO SELECTION. Either the sequence did not arrive, or it arrived without \
@@ -229,6 +283,58 @@ fn main() {
 
     quit_textedit();
     let _ = std::fs::remove_file(&path);
+}
+
+/// The largest on-screen window owned by `pid`.
+///
+/// Largest rather than first: an application owns several windows at once and
+/// the document window is the one a drag is aimed at, while the others are
+/// panels and toolbars that happen to enumerate earlier.
+#[cfg(target_os = "macos")]
+fn target_window(pid: i32) -> Option<cerebellum_macos::RawWindow> {
+    cerebellum_macos::enumerate_windows(std::time::Duration::from_secs(3))
+        .ok()?
+        .into_iter()
+        .filter(|window| window.owner_pid == pid as u32 && window.on_screen)
+        .max_by(|left, right| {
+            (left.width * left.height)
+                .partial_cmp(&(right.width * right.height))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Stamp the fields an AppKit window uses to route a mouse event it receives.
+///
+/// Field numbers are undocumented; the setter is public. Taken from cua's
+/// public fallback path and named here so a reader is not left with bare
+/// integers. The pid field carries their comment's reason: Chromium filters
+/// synthetic events on it.
+#[cfg(target_os = "macos")]
+fn stamp_window_routing(event: &objc2_core_graphics::CGEvent, window_id: u32, pid: i32) {
+    use objc2_core_graphics::{CGEvent, CGEventField};
+
+    const CLICK_STATE: u32 = 1;
+    const BUTTON_NUMBER: u32 = 3;
+    const SUBTYPE: u32 = 7;
+    const TARGET_PID: u32 = 40;
+    const WINDOW_NUMBER: u32 = 51;
+    const CLICK_GROUP: u32 = 58;
+    const WINDOW_UNDER_POINTER: u32 = 91;
+    const WINDOW_UNDER_POINTER_THAT_CAN_HANDLE: u32 = 92;
+
+    let window = i64::from(window_id);
+    for (field, value) in [
+        (CLICK_STATE, 1_i64),
+        (BUTTON_NUMBER, 0),
+        (SUBTYPE, 3),
+        (TARGET_PID, i64::from(pid)),
+        (WINDOW_NUMBER, window),
+        (CLICK_GROUP, window),
+        (WINDOW_UNDER_POINTER, window),
+        (WINDOW_UNDER_POINTER_THAT_CAN_HANDLE, window),
+    ] {
+        CGEvent::set_integer_value_field(Some(event), CGEventField(field), value);
+    }
 }
 
 #[cfg(target_os = "macos")]
