@@ -3881,7 +3881,76 @@ mod cancel_wire_tests {
     use cerebellum_computer::capture_custody::{
         CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
     };
+    use cerebellum_computer::dispatch::post_condition::ObservedElement;
     use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
+
+    fn wait_predicate() -> PostCondition {
+        PostCondition::ElementEnabledIs {
+            element: AccessibilityElementName::identifier("element-1"),
+            expected: true,
+        }
+    }
+
+    /// Every OTHER row's success reply must survive withholding too.
+    ///
+    /// The synthetic case above was found after it shipped; these three are the
+    /// same question asked of the rows that were not implicated, so a future
+    /// mint cannot break one of them quietly. Each builder is driven at its own
+    /// production entry point rather than through a hand-written literal: a
+    /// fixture that states the reply cannot notice the builder diverging from
+    /// the schema, which is the whole defect class.
+    #[test]
+    fn every_observing_and_click_success_reply_survives_withholding() {
+        let screenshot = screenshot_wire_reply(json!({
+            "outcome": "captured",
+            "windows": [],
+            "bytes": 1234,
+            "value": "pixels-that-must-not-reach-the-wire",
+        }));
+        assert!(
+            screenshot.get("value").is_none(),
+            "the capture payload must be stripped before validation"
+        );
+        validate_capability_result("computer.screenshot", &screenshot)
+            .expect("screenshot success reply violates its frozen schema");
+
+        for (outcome, evidence) in [
+            (
+                WaitOutcome::Settled,
+                WaitEvidence::Settled {
+                    predicate: wait_predicate(),
+                    readback: ObservedElement::absent(),
+                },
+            ),
+            (
+                WaitOutcome::TimedOut,
+                WaitEvidence::TimedOut {
+                    predicate: wait_predicate(),
+                    readback: ObservedElement::absent(),
+                },
+            ),
+        ] {
+            let wait = wait_wire_reply(WaitResult {
+                outcome,
+                evidence,
+                attempts: 1,
+            });
+            validate_capability_result("computer.wait", &wait)
+                .expect("wait success reply violates its frozen schema");
+        }
+        validate_capability_result(
+            "computer.wait",
+            &wait_indeterminate_reply(Some(wait_predicate()), json!("target_unreadable")),
+        )
+        .expect("wait indeterminate reply violates its frozen schema");
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        for requested in [None, Some(EffectStatus::EffectObserved)] {
+            let click = click_wire_envelope(click_wire_reply("semantic_element", 0, requested));
+            validate_capability_result("computer.click", &click)
+                .expect("click success reply violates its frozen schema");
+        }
+    }
 
     /// Every synthetic row's SUCCESS reply must survive withholding.
     ///
