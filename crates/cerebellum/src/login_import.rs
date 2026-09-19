@@ -677,20 +677,41 @@ fn sqlite_uri(path: &Path) -> String {
 /// alone drops the one thing that lets SQLite undo a commit caught half-way,
 /// so the journal is copied with the store, and any WAL sidecars a differently
 /// configured browser might keep; opening the copy afterwards rolls a hot
-/// journal back to the last committed state. The journal is taken before the
-/// store so a commit that lands between the two copies is one the journal
-/// still covers; that ordering matters only under a concurrent writer, which
-/// the tests cannot stage, so it is a reasoned choice rather than a proven
-/// one. A copy that SQLite still reports as damaged (the copy straddled a
-/// commit the journal no longer covers) is refused as an error, which the
-/// caller reports as unreadable rather than as a count or a transfer of rows
-/// nobody can decrypt.
+/// journal back to the last committed state.
+///
+/// A plain copy of a file another process is writing is a snapshot of nothing
+/// in particular, and a hot journal covers only the commit it was written for.
+/// So the store is read twice and the copy is accepted only when both reads
+/// agree byte for byte: a commit landing during the copy changes the bytes
+/// between reads and the copy is retried. The browser batches cookie writes
+/// seconds apart, so a retry converges; a store that will not hold still is
+/// refused. That check is what the tests cannot stage (it needs a writer
+/// racing the copy), so it is reasoned rather than proven; the journal
+/// rollback and the damage refusal below are the fenced halves. A copy that
+/// SQLite still reports as damaged is refused as an error, which the caller
+/// reports as unreadable rather than as a count or a transfer of rows nobody
+/// can decrypt.
 fn copy_store_private(sqlite_program: &Path, source: &Path, destination: &Path) -> io::Result<()> {
     let journal = sidecar_path(source, "-journal");
     if journal.exists() {
         copy_private(&journal, &sidecar_path(destination, "-journal"))?;
     }
     copy_private(source, destination)?;
+    let mut attempts = 0;
+    loop {
+        let again = fs::read(source)?;
+        if again == fs::read(destination)? {
+            break;
+        }
+        attempts += 1;
+        if attempts == 3 {
+            return Err(io::Error::other(
+                "the cookie store kept changing while it was being copied",
+            ));
+        }
+        fs::remove_file(destination)?;
+        copy_private(source, destination)?;
+    }
     for suffix in ["-wal", "-shm"] {
         let sidecar = sidecar_path(source, suffix);
         if sidecar.exists() {
