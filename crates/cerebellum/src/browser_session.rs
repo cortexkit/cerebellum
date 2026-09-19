@@ -37,6 +37,7 @@ pub enum BrowserSessionTerminalOutcome {
     RouteUnbound,
     ModuleShutdown,
     CleanupFailure,
+    StartupIndeterminate,
 }
 
 impl BrowserSessionTerminalOutcome {
@@ -50,6 +51,7 @@ impl BrowserSessionTerminalOutcome {
             Self::RouteUnbound => "route_unbound",
             Self::ModuleShutdown => "module_shutdown",
             Self::CleanupFailure => "cleanup_failure",
+            Self::StartupIndeterminate => "startup_indeterminate",
         }
     }
 }

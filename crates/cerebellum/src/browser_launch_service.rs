@@ -1266,6 +1266,17 @@ fn stamped_context(accepted: &AcceptedBindFacts) -> Result<StampedBindContext, (
 
 fn map_readiness_error(error: AttestedReadinessError) -> Value {
     match error {
+        // Preserve the startup failure as well as the journal error so callers know why
+        // launch failed and that its record may remain open. Other cleanup stages keep
+        // their existing generic payload, which does not include the primary failure.
+        AttestedReadinessError::Readiness(
+            crate::browser_launch_readiness::LaunchReadinessError::CleanupFailed {
+                primary,
+                stage: crate::browser_launch_readiness::ReadinessCleanupStage::JournalFinalization,
+            },
+        ) => {
+            json!({"outcome": "internal_failure", "stage": "journal_finalization", "primary": primary})
+        }
         AttestedReadinessError::AttestedLaunch(
             AttestedLaunchError::ExecutableIdentityMismatch {
                 claim_kind,
@@ -2166,4 +2177,32 @@ mod linux_orphan_recovery_tests {
         child.kill().expect("clean up mismatch fixture");
         let _ = child.wait();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn journal_finalization_refusal_preserves_primary_startup_payload() {
+    use crate::browser_launch_readiness::{
+        LaunchReadinessError, ProfileStartupCause, ProfileStartupIndeterminate,
+        ReadinessCleanupStage,
+    };
+    let value = map_readiness_error(AttestedReadinessError::Readiness(
+        LaunchReadinessError::CleanupFailed {
+            primary: Some(ProfileStartupIndeterminate::new(
+                ProfileStartupCause::DeadlineExpired,
+            )),
+            stage: ReadinessCleanupStage::JournalFinalization,
+        },
+    ));
+    assert_eq!(
+        value,
+        json!({
+            "outcome": "internal_failure", "stage": "journal_finalization",
+            "primary": { "outcome": "profile_startup_indeterminate", "cause": "deadline_expired",
+                "ambiguity": "indeterminate_startup_failure", "possible_reasons": [
+                    "external_profile_holder", "profile_unopenable_or_corrupt", "browser_startup_failure",
+                    "invalid_browser_invocation", "platform_or_sandbox_denial"
+                ] }
+        })
+    );
 }

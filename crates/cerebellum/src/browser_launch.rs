@@ -22,7 +22,8 @@ pub use crate::browser_launch_readiness::*;
 
 const GENERATION_SLOT: &str = "browser.launch.generation";
 const ATTESTATION_SLOT: &str = "browser.launch.attestation";
-const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v2";
+const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v3";
+const V2_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v2";
 const LEGACY_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v1";
 
 /// Exact route facts authorized for one launch attempt.
@@ -419,6 +420,8 @@ pub struct LaunchSessionCompletion {
     pub format_version: String,
     pub launch_attempt_id: String,
     pub terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::browser_launch_readiness::ProfileStartupIndeterminate>,
 }
 
 impl LaunchSessionCompletion {
@@ -430,6 +433,7 @@ impl LaunchSessionCompletion {
             format_version: LAUNCH_CODEC_VERSION.to_string(),
             launch_attempt_id: launch_attempt_id.to_string(),
             terminal_outcome,
+            failure: None,
         }
     }
 }
@@ -578,6 +582,12 @@ pub enum AttestedLaunchError {
 /// Journal operations needed by the ordering state machine.
 pub trait LaunchJournalPort {
     type Handle;
+
+    fn finalize_startup_failure(
+        &mut self,
+        launch_attempt_id: &str,
+        failure: &crate::browser_launch_readiness::ProfileStartupIndeterminate,
+    ) -> Result<(), CoreJournalError>;
 
     fn record_intent(
         &mut self,
@@ -946,12 +956,22 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
         launch_attempt_id: &str,
         terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome,
     ) -> Result<(), CoreJournalError> {
+        self.finalize_completion(LaunchSessionCompletion::new(
+            launch_attempt_id,
+            terminal_outcome,
+        ))
+    }
+
+    fn finalize_completion(
+        &mut self,
+        completion: LaunchSessionCompletion,
+    ) -> Result<(), CoreJournalError> {
+        let launch_attempt_id = &completion.launch_attempt_id;
         let token = self
             .dispatched
             .get(launch_attempt_id)
             .copied()
             .ok_or(CoreJournalError::InvalidHandle)?;
-        let completion = LaunchSessionCompletion::new(launch_attempt_id, terminal_outcome);
         let bytes = serde_json::to_vec(&completion).map_err(|_| CoreJournalError::CodecFailed)?;
         self.core.finalize_dispatched(
             token,
@@ -990,7 +1010,9 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                 .filter(|intent| {
                     matches!(
                         intent.format_version.as_str(),
-                        LAUNCH_CODEC_VERSION | LEGACY_LAUNCH_CODEC_VERSION
+                        LAUNCH_CODEC_VERSION
+                            | V2_LAUNCH_CODEC_VERSION
+                            | LEGACY_LAUNCH_CODEC_VERSION
                     )
                 });
             let attested_generation = if classification
@@ -1145,6 +1167,19 @@ impl DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage> {
 }
 
 impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
+    fn finalize_startup_failure(
+        &mut self,
+        launch_attempt_id: &str,
+        failure: &crate::browser_launch_readiness::ProfileStartupIndeterminate,
+    ) -> Result<(), CoreJournalError> {
+        let mut completion = LaunchSessionCompletion::new(
+            launch_attempt_id,
+            crate::browser_session::BrowserSessionTerminalOutcome::StartupIndeterminate,
+        );
+        completion.failure = Some(failure.clone());
+        self.finalize_completion(completion)
+    }
+
     type Handle = LaunchIntentHandle;
 
     fn record_intent(
@@ -1870,6 +1905,15 @@ mod tests {
     }
 
     impl LaunchJournalPort for RecordingJournal {
+        fn finalize_startup_failure(
+            &mut self,
+            _: &str,
+            _: &crate::browser_launch_readiness::ProfileStartupIndeterminate,
+        ) -> Result<(), CoreJournalError> {
+            self.events.push("startup_finalized");
+            Ok(())
+        }
+
         type Handle = ();
 
         fn record_intent(
@@ -2201,6 +2245,62 @@ mod tests {
             .commit_attestation(&mut handle, &attestation)
             .expect("commit attestation");
         (sequence, attestation)
+    }
+
+    #[test]
+    fn a_handshake_failure_after_attestation_closes_the_journal_attempt() {
+        use crate::browser_launch_readiness::{tests::fail_after_attestation, ProfileStartupCause};
+        let mut journal = reopened_dispatched_journal(InMemoryJournalStorage::new());
+        fail_after_attestation(&mut journal);
+        assert!(journal.active_launch_attempts().unwrap().is_empty());
+        assert!(journal.dispatched.is_empty());
+        let completion = terminal_completion(&journal, 1);
+        assert_eq!(
+            completion.terminal_outcome.as_str(),
+            "startup_indeterminate"
+        );
+        assert_eq!(
+            completion.failure.unwrap().cause,
+            ProfileStartupCause::DeadlineExpired
+        );
+    }
+
+    #[test]
+    fn a_startup_failure_record_is_not_an_orphan_on_the_next_start() {
+        let storage = InMemoryJournalStorage::new();
+        let mut journal = reopened_dispatched_journal(storage.clone());
+        crate::browser_launch_readiness::tests::fail_after_attestation(&mut journal);
+        drop(journal);
+        let mut journal = reopened_dispatched_journal(storage);
+        assert!(journal.active_launch_attempts().unwrap().is_empty());
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(None), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+        assert!(
+            recover_browser_launches(&mut journal, &mut process, &mut custody)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(process.observation_calls, 0);
+        assert!(custody.releases.is_empty());
+    }
+
+    #[test]
+    fn v2_completion_fixture_reads_through_the_v3_reader() {
+        let completion: LaunchSessionCompletion =
+            serde_json::from_str(include_str!("../tests/fixtures/launch-completion-v2.json"))
+                .unwrap();
+        assert_eq!(
+            completion.format_version,
+            "ck-browser-launch-attestation/v2"
+        );
+        assert_eq!(completion.launch_attempt_id, "fixture-v2-session");
+        assert_eq!(
+            completion.terminal_outcome,
+            crate::browser_session::BrowserSessionTerminalOutcome::Closed
+        );
+        assert_eq!(completion.failure, None);
+        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v3");
     }
 
     fn terminal_completion(
@@ -2847,6 +2947,7 @@ mod tests {
             format_version: LAUNCH_CODEC_VERSION.to_string(),
             launch_attempt_id: request.launch_attempt_id.clone(),
             terminal_outcome: crate::browser_session::BrowserSessionTerminalOutcome::ModuleShutdown,
+            failure: None,
         };
         assert_eq!(journal.core.active_reserved_bytes(), 0);
         assert_ne!(journal.core.retained_bytes(), 0);

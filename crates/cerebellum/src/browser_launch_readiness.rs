@@ -59,7 +59,7 @@ const POSSIBLE_REASONS: [StartupPossibleReason; 5] = [
 /// The complete public failure payload. Possible reasons are deliberately fixed
 /// rather than selected from observations because this layer cannot distinguish
 /// profile contention from other startup failures.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileStartupIndeterminate {
     outcome: String,
     pub cause: ProfileStartupCause,
@@ -68,7 +68,7 @@ pub struct ProfileStartupIndeterminate {
 }
 
 impl ProfileStartupIndeterminate {
-    fn new(cause: ProfileStartupCause) -> Self {
+    pub(crate) fn new(cause: ProfileStartupCause) -> Self {
         Self {
             outcome: "profile_startup_indeterminate".to_string(),
             cause,
@@ -311,6 +311,7 @@ impl FailedLaunchRollback for NoopFailedLaunchRollback {
 pub enum ReadinessCleanupStage {
     Reap,
     Rollback,
+    JournalFinalization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,8 +496,23 @@ where
             return Err(AttestedReadinessError::AttestedLaunch(primary));
         }
     };
-    complete_pipe_handshake(released, pipe, deadline_ms, clock, rollback)
-        .map_err(AttestedReadinessError::Readiness)
+    let result = complete_pipe_handshake(released, pipe, deadline_ms, clock, rollback);
+    // Keep the journal attempt open unless the child was reaped and profile rollback
+    // succeeded: recovery still owns unresolved process or profile cleanup.
+    if let Err(LaunchReadinessError::ProfileStartupIndeterminate(failure)) = &result {
+        if journal
+            .finalize_startup_failure(&request.launch_attempt_id, failure)
+            .is_err()
+        {
+            return Err(AttestedReadinessError::Readiness(
+                LaunchReadinessError::CleanupFailed {
+                    primary: Some(failure.clone()),
+                    stage: ReadinessCleanupStage::JournalFinalization,
+                },
+            ));
+        }
+    }
+    result.map_err(AttestedReadinessError::Readiness)
 }
 
 #[cfg(unix)]
@@ -533,7 +549,7 @@ impl CdpPipeIo for UnixCdpPipe {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1116,9 +1132,137 @@ mod tests {
         );
     }
 
+    struct SuccessfulLauncher;
+
+    impl BarredProcessLauncher for SuccessfulLauncher {
+        type Process = FakeBarredProcess;
+        fn spawn_barred(
+            &mut self,
+            _: &AttestedLaunchRequest,
+        ) -> Result<Self::Process, PlatformLaunchError> {
+            Ok(FakeBarredProcess)
+        }
+    }
+
+    pub(crate) fn fail_after_attestation<J: LaunchJournalPort>(
+        journal: &mut J,
+    ) -> AttestedReadinessError {
+        let events = EventLog::new();
+        run_failed_launch(journal, events)
+    }
+
+    fn run_failed_launch<J: LaunchJournalPort>(
+        journal: &mut J,
+        events: EventLog,
+    ) -> AttestedReadinessError {
+        launch_attested_to_readiness_with(
+            journal,
+            &mut SuccessfulLauncher,
+            &launch_request(),
+            FakePipe::new([ReadAction::WouldBlock], events.clone()),
+            deadline_ms(3),
+            &mut FakeClock { now: instant() },
+            &mut RecordingRollback { events },
+        )
+        .err()
+        .expect("handshake must fail")
+    }
+
+    struct FinalizationJournal {
+        events: EventLog,
+        refuse: bool,
+    }
+
+    impl LaunchJournalPort for FinalizationJournal {
+        type Handle = ();
+        fn record_intent(&mut self, _: &AuthorizedLaunchIntent) -> Result<(), CoreJournalError> {
+            Ok(())
+        }
+        fn record_generation(
+            &mut self,
+            _: &mut (),
+            _: &LaunchGenerationRecord,
+        ) -> Result<(), CoreJournalError> {
+            Ok(())
+        }
+        fn commit_attestation(
+            &mut self,
+            _: &mut (),
+            _: &LaunchAttestationRecord,
+        ) -> Result<(), CoreJournalError> {
+            Ok(())
+        }
+        fn record_identity_mismatch(
+            &mut self,
+            _: &mut (),
+            _: &LaunchIdentityMismatchRecord,
+        ) -> Result<(), CoreJournalError> {
+            panic!("identity matches")
+        }
+        fn finalize_startup_failure(
+            &mut self,
+            id: &str,
+            failure: &ProfileStartupIndeterminate,
+        ) -> Result<(), CoreJournalError> {
+            assert_eq!(id, launch_request().launch_attempt_id);
+            assert_eq!(failure.cause, ProfileStartupCause::DeadlineExpired);
+            self.events.push("journal_closed");
+            if self.refuse {
+                Err(CoreJournalError::StorageUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_runs_before_the_journal_is_closed() {
+        let events = EventLog::new();
+        let mut journal = FinalizationJournal {
+            events: events.clone(),
+            refuse: false,
+        };
+        run_failed_launch(&mut journal, events.clone());
+        let log = events.snapshot();
+        let rollback = log
+            .iter()
+            .position(|event| *event == "rollback_completed")
+            .expect("rollback");
+        let closed = log
+            .iter()
+            .position(|event| *event == "journal_closed")
+            .expect("finalization");
+        assert!(rollback < closed, "{log:?}");
+    }
+
+    #[test]
+    fn a_journal_finalization_failure_is_a_cleanup_failure_not_silence() {
+        let mut journal = FinalizationJournal {
+            events: EventLog::new(),
+            refuse: true,
+        };
+        assert_eq!(
+            fail_after_attestation(&mut journal),
+            AttestedReadinessError::Readiness(LaunchReadinessError::CleanupFailed {
+                primary: Some(ProfileStartupIndeterminate::new(
+                    ProfileStartupCause::DeadlineExpired
+                )),
+                stage: ReadinessCleanupStage::JournalFinalization,
+            })
+        );
+    }
+
     struct FailingIntentJournal;
 
     impl LaunchJournalPort for FailingIntentJournal {
+        fn finalize_startup_failure(
+            &mut self,
+            _: &str,
+            _: &ProfileStartupIndeterminate,
+        ) -> Result<(), CoreJournalError> {
+            panic!("finalization cannot follow failed intent")
+        }
+
         type Handle = ();
 
         fn record_intent(
@@ -1255,6 +1399,14 @@ mod live_chrome_test {
     struct PassingJournal;
 
     impl LaunchJournalPort for PassingJournal {
+        fn finalize_startup_failure(
+            &mut self,
+            _: &str,
+            _: &ProfileStartupIndeterminate,
+        ) -> Result<(), CoreJournalError> {
+            panic!("successful live handshake must not finalize startup failure")
+        }
+
         type Handle = ();
 
         fn record_intent(
