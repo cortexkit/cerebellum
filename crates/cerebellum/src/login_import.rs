@@ -542,7 +542,7 @@ fn chromium_presence(
 ) -> io::Result<(u64, u64)> {
     let temporary = PrivateTempDir::new("presence")?;
     let copied = temporary.path().join("Cookies");
-    copy_private(source_store, &copied)?;
+    copy_store_private(sqlite_program, source_store, &copied)?;
     let query = format!(
         "SELECT COALESCE(SUM(CASE WHEN has_expires = 1 THEN 1 ELSE 0 END),0) || '|' || COALESCE(SUM(CASE WHEN has_expires = 0 THEN 1 ELSE 0 END),0) FROM cookies WHERE host_key IN ({});",
         sql_values(domains)
@@ -563,7 +563,7 @@ fn transfer_store(
 ) -> io::Result<u64> {
     let temporary = PrivateTempDir::new("transfer")?;
     let pruned = temporary.path().join("Cookies");
-    copy_private(source_store, &pruned)?;
+    copy_store_private(sqlite_program, source_store, &pruned)?;
     sqlite_write(
         sqlite_program,
         &pruned,
@@ -634,13 +634,10 @@ fn cookie_columns(sqlite_program: &Path, store: &Path) -> io::Result<Vec<String>
 }
 
 fn sqlite_read(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
-    let uri = sqlite_uri(store);
-    sqlite(
-        program,
-        Some(OsStr::new("-readonly")),
-        OsStr::new(&uri),
-        sql,
-    )
+    // Not `-readonly`: every store this reads is a private copy or the route's
+    // own closed profile store, and a read-only connection cannot roll back a
+    // hot journal, so it would refuse the one copy that most needs recovering.
+    sqlite(program, None, store.as_os_str(), sql)
 }
 
 fn sqlite_write(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
@@ -660,8 +657,60 @@ fn sqlite(program: &Path, mode: Option<&OsStr>, store: &OsStr, sql: &str) -> io:
     String::from_utf8(output.stdout).map_err(|_| io::Error::other("SQLite returned non-UTF-8"))
 }
 
+/// The URI form of a store path for `ATTACH`, which needs a URI to carry a
+/// path with unusual characters. No `immutable=1`: that flag tells SQLite the
+/// file cannot change, so it skips hot-journal and WAL recovery and answers
+/// from whatever bytes are on disk, which for a store copied from under a
+/// running browser is the last checkpointed state or a half-applied commit,
+/// returned without error. The copies here are private, so nothing holds a
+/// lock on them and the flag buys nothing it does not cost.
 fn sqlite_uri(path: &Path) -> String {
-    format!("file:{}?immutable=1", path.to_string_lossy())
+    format!("file:{}", path.to_string_lossy())
+}
+
+/// Copy a Chromium cookie store into a private directory as a consistent
+/// database, not merely as a file.
+///
+/// A running browser holds its stores open with a rollback journal in
+/// truncate mode (`<store>-journal`, zero bytes between transactions, the
+/// pre-images of a transaction in flight otherwise). Copying the main file
+/// alone drops the one thing that lets SQLite undo a commit caught half-way,
+/// so the journal is copied with the store, and any WAL sidecars a differently
+/// configured browser might keep; opening the copy afterwards rolls a hot
+/// journal back to the last committed state. The journal is taken before the
+/// store so a commit that lands between the two copies is one the journal
+/// still covers; that ordering matters only under a concurrent writer, which
+/// the tests cannot stage, so it is a reasoned choice rather than a proven
+/// one. A copy that SQLite still reports as damaged (the copy straddled a
+/// commit the journal no longer covers) is refused as an error, which the
+/// caller reports as unreadable rather than as a count or a transfer of rows
+/// nobody can decrypt.
+fn copy_store_private(sqlite_program: &Path, source: &Path, destination: &Path) -> io::Result<()> {
+    let journal = sidecar_path(source, "-journal");
+    if journal.exists() {
+        copy_private(&journal, &sidecar_path(destination, "-journal"))?;
+    }
+    copy_private(source, destination)?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sidecar_path(source, suffix);
+        if sidecar.exists() {
+            copy_private(&sidecar, &sidecar_path(destination, suffix))?;
+        }
+    }
+    // The CLI reports a damaged page either as a non-"ok" verdict or by
+    // failing outright; both are the same answer here.
+    match sqlite_read(sqlite_program, destination, "PRAGMA quick_check;") {
+        Ok(verdict) if verdict.trim() == "ok" => Ok(()),
+        Ok(_) | Err(_) => Err(io::Error::other(
+            "the copied cookie store is not consistent",
+        )),
+    }
+}
+
+fn sidecar_path(store: &Path, suffix: &str) -> PathBuf {
+    let mut name = store.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn parse_count(value: &str) -> io::Result<u64> {
@@ -1076,6 +1125,176 @@ mod tests {
         assert!(!String::from_utf8(rendered)
             .unwrap()
             .contains("encrypted_value"));
+    }
+
+    /// Presence is read from a private copy of the store, and Chromium keeps a
+    /// zero-byte rollback journal beside an idle store. The journal must ride
+    /// along with the copy (a hot one is what makes the copy consistent), and
+    /// an idle one must not change the answer.
+    #[test]
+    fn an_idle_journal_beside_the_store_rides_with_the_copy_and_hides_nothing() {
+        let root = TestRoot::new("idle-journal");
+        let application_support = root.path().join("Application Support");
+        let chrome = source("chrome", "Google Chrome", root.path());
+        let store = cookie_store(&application_support, &chrome);
+        create_store(
+            &store,
+            &[Cookie {
+                host: ".x.com",
+                name: "session",
+                path: "/",
+                persistent: true,
+                encrypted: b"secret",
+            }],
+        );
+        fs::write(sidecar_path(&store, "-journal"), b"").unwrap();
+        let (persistent, session) =
+            chromium_presence(Path::new(SQLITE_PROGRAM), &store, &[".x.com".to_string()]).unwrap();
+        assert_eq!((persistent, session), (1, 0));
+    }
+
+    /// The journal is the half of the copy that makes it a snapshot: a browser
+    /// killed or copied mid-commit leaves a hot journal holding the pre-images
+    /// of the pages it was rewriting, and SQLite undoes the commit from it on
+    /// the next open. A copy that carries the store without the journal would
+    /// read the half-applied pages as truth. The fixture builds that journal by
+    /// hand from the page as it stood before a second row was added, so the
+    /// copy must roll back to one row while the file alone says two.
+    #[test]
+    fn a_hot_journal_rides_with_the_copy_and_rolls_the_store_back() {
+        let root = TestRoot::new("hot-journal");
+        let application_support = root.path().join("Application Support");
+        let chrome = source("chrome", "Google Chrome", root.path());
+        let store = cookie_store(&application_support, &chrome);
+        let cookie = |name: &'static str| Cookie {
+            host: ".x.com",
+            name,
+            path: "/",
+            persistent: true,
+            encrypted: b"secret",
+        };
+        create_store(&store, &[cookie("first")]);
+        let read = |sql: &str| {
+            sqlite_read(Path::new(SQLITE_PROGRAM), &store, sql)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let page_size: usize = read("PRAGMA page_size;").parse().unwrap();
+        let page_count: u32 = read("PRAGMA page_count;").parse().unwrap();
+        let leaf: usize = read("SELECT rootpage FROM sqlite_master WHERE name = 'cookies';")
+            .parse()
+            .unwrap();
+        let before = fs::read(&store).unwrap();
+        let pre_image = &before[(leaf - 1) * page_size..leaf * page_size];
+
+        // The second row lands on the same leaf page; the journal written
+        // below is exactly what SQLite would have written before touching it.
+        sqlite_write(
+            Path::new(SQLITE_PROGRAM),
+            &store,
+            "INSERT INTO cookies(host_key,name,path,has_expires,encrypted_value,value) \
+             VALUES('.x.com','second','/',1,X'00','');",
+        )
+        .unwrap();
+        assert_eq!(read("PRAGMA page_count;"), page_count.to_string());
+        assert_eq!(read("SELECT COUNT(*) FROM cookies;"), "2");
+
+        let nonce: u32 = 0x5eed_1234;
+        let sector: usize = 512;
+        let mut journal = Vec::new();
+        journal.extend_from_slice(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]);
+        journal.extend_from_slice(&1u32.to_be_bytes());
+        journal.extend_from_slice(&nonce.to_be_bytes());
+        journal.extend_from_slice(&page_count.to_be_bytes());
+        journal.extend_from_slice(&(sector as u32).to_be_bytes());
+        journal.extend_from_slice(&(page_size as u32).to_be_bytes());
+        journal.resize(sector, 0);
+        journal.extend_from_slice(&(leaf as u32).to_be_bytes());
+        journal.extend_from_slice(pre_image);
+        let mut checksum = nonce;
+        let mut offset = page_size - 200;
+        while offset > 0 {
+            checksum = checksum.wrapping_add(u32::from(pre_image[offset]));
+            offset = offset.saturating_sub(200);
+        }
+        journal.extend_from_slice(&checksum.to_be_bytes());
+        fs::write(sidecar_path(&store, "-journal"), &journal).unwrap();
+
+        let (persistent, _) =
+            chromium_presence(Path::new(SQLITE_PROGRAM), &store, &[".x.com".to_string()]).unwrap();
+        assert_eq!(
+            persistent, 1,
+            "the copy must be read through the rolled-back journal, not the file as found"
+        );
+    }
+
+    /// A copy taken while the browser was mid-write is not a snapshot of
+    /// anything. The tear here lands on a page the cookie query never reads,
+    /// so the count alone would come back looking right; the consistency
+    /// check on the whole copy is what turns it into a refusal, and the caller
+    /// reports unreadable rather than a number.
+    #[test]
+    fn a_torn_copy_is_refused_even_where_the_cookie_rows_still_read() {
+        let root = TestRoot::new("torn-copy");
+        let application_support = root.path().join("Application Support");
+        let chrome = source("chrome", "Google Chrome", root.path());
+        let store = cookie_store(&application_support, &chrome);
+        create_store(
+            &store,
+            &[Cookie {
+                host: ".x.com",
+                name: "session",
+                path: "/",
+                persistent: true,
+                encrypted: b"secret",
+            }],
+        );
+        // A second table on its own page, then that page zeroed: the cookies
+        // b-tree is intact, the file is not.
+        sqlite_write(
+            Path::new(SQLITE_PROGRAM),
+            &store,
+            "CREATE TABLE meta(k TEXT); INSERT INTO meta VALUES('m');",
+        )
+        .unwrap();
+        let page_size: u64 = sqlite_read(Path::new(SQLITE_PROGRAM), &store, "PRAGMA page_size;")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let meta_page: u64 = sqlite_read(
+            Path::new(SQLITE_PROGRAM),
+            &store,
+            "SELECT rootpage FROM sqlite_master WHERE name = 'meta';",
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+        let mut bytes = fs::read(&store).unwrap();
+        let start = usize::try_from((meta_page - 1) * page_size).unwrap();
+        let end = usize::try_from(meta_page * page_size).unwrap();
+        bytes[start..end].fill(0);
+        fs::write(&store, &bytes).unwrap();
+        assert_eq!(
+            sqlite_read(
+                Path::new(SQLITE_PROGRAM),
+                &store,
+                "SELECT COUNT(*) FROM cookies WHERE has_expires = 1;"
+            )
+            .unwrap()
+            .trim(),
+            "1",
+            "the fixture must leave the cookie rows readable, or it proves nothing about the check"
+        );
+
+        let error = chromium_presence(Path::new(SQLITE_PROGRAM), &store, &[".x.com".to_string()])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the copied cookie store is not consistent"
+        );
     }
 
     #[test]
