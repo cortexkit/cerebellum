@@ -2516,14 +2516,26 @@ async fn handle_management_request(
             let outcome = elicitor
                 .ask(&writer, channel, epoch, question.body, question.deadline)
                 .await;
+            // Whether a person was ever shown this question. A carrier that
+            // could not reach anyone leaves the caller's remedy unsatisfiable,
+            // so the fact is carried into settlement rather than flattened into
+            // "no answer arrived" with the two other ways that happens.
+            let put_to_a_person = !matches!(outcome, elicit::AskOutcome::NotPutToAnyone);
             let answer = match outcome {
                 elicit::AskOutcome::Answered(body) => Some(body),
-                elicit::AskOutcome::NoAnswer | elicit::AskOutcome::Undeliverable => None,
+                elicit::AskOutcome::NoAnswer
+                | elicit::AskOutcome::NotPutToAnyone
+                | elicit::AskOutcome::Undeliverable => None,
             };
             match settlement {
                 Settlement::ComputerTarget => {
                     management_plane
-                        .settle(&question.ask_id, answer.as_ref(), lease_clock.as_ref())
+                        .settle_target(
+                            &question.ask_id,
+                            answer.as_ref(),
+                            put_to_a_person,
+                            lease_clock.as_ref(),
+                        )
                         .await;
                 }
                 Settlement::BrowserGrant => {
@@ -2649,7 +2661,11 @@ async fn complete_login_import(
         .await;
     let decision = match &answer {
         elicit::AskOutcome::Answered(body) => body.get("decision").and_then(Value::as_str),
-        elicit::AskOutcome::NoAnswer | elicit::AskOutcome::Undeliverable => None,
+        // None of the three permits a transfer, and they are listed rather than
+        // wildcarded so a future outcome has to be decided about here.
+        elicit::AskOutcome::NoAnswer
+        | elicit::AskOutcome::NotPutToAnyone
+        | elicit::AskOutcome::Undeliverable => None,
     };
     if decision.is_some_and(|value| value.starts_with("transfer:")) {
         let status = planes.sessions.status(

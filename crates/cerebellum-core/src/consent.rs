@@ -357,6 +357,18 @@ impl ConsentLeases {
     /// answer to something: an answer to an ask this store does not hold is
     /// either a late reply to one already resolved, or an answer to a question it
     /// never posed, and neither may create authority.
+    /// The key an outstanding ask belongs to, if it is still outstanding.
+    ///
+    /// Exposed so a caller settling an ask can record something ABOUT that
+    /// target: the key is the only identity a later request for the same thing
+    /// will arrive under, and it is gone once the ask is settled.
+    pub fn pending_key(&self, ask_id: &str) -> Option<LeaseKey> {
+        self.pending
+            .iter()
+            .find(|(_, pending)| pending.ask_id == ask_id)
+            .map(|(key, _)| key.clone())
+    }
+
     pub fn settle<C: MonotonicClock>(
         &mut self,
         ask_id: &str,

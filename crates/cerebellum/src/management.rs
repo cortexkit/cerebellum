@@ -222,6 +222,15 @@ pub struct ManagementPlane {
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
     profile_lifecycle: Option<Arc<ProfileLifecycle>>,
     pending_profile_root_rebinds: Mutex<BTreeMap<String, PendingProfileRootRebind>>,
+    /// Targets whose last consent question reached no person, by the ask that
+    /// was never put.
+    ///
+    /// Kept so the NEXT request for the same target can say what became of the
+    /// previous one. Without it every attempt looks identical to the first and
+    /// the caller is told to await an answer that was never solicited. Not a
+    /// refusal and not a cache of one: the question is still put each time,
+    /// because a person who becomes reachable should simply be asked.
+    unreached: Mutex<BTreeMap<LeaseKey, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +256,7 @@ impl ManagementPlane {
             pending_browser_grants: Mutex::new(BTreeMap::new()),
             profile_lifecycle: None,
             pending_profile_root_rebinds: Mutex::new(BTreeMap::new()),
+            unreached: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -619,6 +629,23 @@ impl ManagementPlane {
             let mut leases = self.leases.lock().await;
             leases.open(key.clone(), clock, new_ask_id)
         };
+        // What became of the last question about this target, when the carrier
+        // told us nobody was shown it. Carried into the pending replies below so
+        // a caller can tell "the person has not answered yet" from "no person
+        // was ever asked", which have opposite remedies and, without this, look
+        // identical on the wire.
+        let unreached = self.unreached.lock().await.get(&key).cloned();
+        let previous_request = |reply: &mut Value| {
+            if let (Some(ask_id), Some(object)) = (unreached.as_ref(), reply.as_object_mut()) {
+                object.insert(
+                    "previous_request".into(),
+                    json!({
+                        "ask_id": ask_id,
+                        "disposition": "not_put_to_anyone",
+                    }),
+                );
+            }
+        };
 
         match opening {
             Opening::AlreadyHeld(lease) => {
@@ -645,15 +672,16 @@ impl ManagementPlane {
             // Already being asked: the caller waits for that answer. Putting the
             // question again would show the user a second prompt for something
             // already on their screen.
-            Opening::AlreadyAsking(pending) => (
-                json!({
+            Opening::AlreadyAsking(pending) => {
+                let mut reply = json!({
                     "outcome": "consent_pending",
                     "bundle_identity": bundle_identity,
                     "ask_id": pending.ask_id,
                     "remedy": "ask again once the request has been answered",
-                }),
-                None,
-            ),
+                });
+                previous_request(&mut reply);
+                (reply, None)
+            }
             Opening::AskNeeded(pending) => {
                 if !can_relay_to_a_person {
                     // Nobody can be asked, so nothing can be granted. Reported
@@ -682,15 +710,14 @@ impl ManagementPlane {
                     body: consent_question(&pending.ask_id, bundle_identity, action_kind),
                     deadline: CONSENT_DEADLINE,
                 };
-                (
-                    json!({
-                        "outcome": "consent_pending",
-                        "bundle_identity": bundle_identity,
-                        "ask_id": pending.ask_id,
-                        "remedy": "ask again once the request has been answered",
-                    }),
-                    Some(question),
-                )
+                let mut reply = json!({
+                    "outcome": "consent_pending",
+                    "bundle_identity": bundle_identity,
+                    "ask_id": pending.ask_id,
+                    "remedy": "ask again once the request has been answered",
+                });
+                previous_request(&mut reply);
+                (reply, Some(question))
             }
         }
     }
@@ -706,9 +733,41 @@ impl ManagementPlane {
         answer: Option<&Value>,
         clock: &C,
     ) -> bool {
+        self.settle_target(ask_id, answer, true, clock).await
+    }
+
+    /// Settle a consent question, recording whether a person ever saw it.
+    ///
+    /// `put_to_a_person` false means the carrier reported that it could reach
+    /// nobody. That grants nothing either way, so it does not change this
+    /// answer -- it changes what the NEXT request for the same target is told,
+    /// which is the difference between waiting for a person and waiting for one
+    /// who was never asked.
+    pub async fn settle_target<C: MonotonicClock>(
+        &self,
+        ask_id: &str,
+        answer: Option<&Value>,
+        put_to_a_person: bool,
+        clock: &C,
+    ) -> bool {
         let granted = answer.and_then(|answer| grant_from_answer(answer, clock));
         let mut leases = self.leases.lock().await;
-        leases.settle(ask_id, granted, clock).is_some()
+        // Read before settling, because settling removes the pending ask and
+        // with it the only link from this ask to the target it was about.
+        let key = leases.pending_key(ask_id);
+        let settled = leases.settle(ask_id, granted, clock).is_some();
+        drop(leases);
+        if let Some(key) = key {
+            let mut unreached = self.unreached.lock().await;
+            if put_to_a_person {
+                // Someone was asked, whatever they said or did not say, so any
+                // earlier report that nobody could be reached is now stale.
+                unreached.remove(&key);
+            } else {
+                unreached.insert(key, ask_id.to_string());
+            }
+        }
+        settled
     }
 
     /// Whether a lease currently admits an action, without spending one.
@@ -1351,6 +1410,104 @@ mod tests {
         let (expired, question) = open(&plane, &clock).await;
         assert_eq!(expired["outcome"], "consent_pending");
         assert!(question.is_some(), "an expired lease did not ask again");
+    }
+
+    /// A question nobody was shown is reported as such on the next request.
+    ///
+    /// The two ways a consent goes unanswered look identical on the wire
+    /// otherwise, and their remedies are opposite: a person who ignored a
+    /// prompt may answer the next one, while a question that reached nobody
+    /// will not be answered however many times it is asked. A caller told to
+    /// "ask again once the request has been answered" about a question no one
+    /// was ever offered is in a loop -- which is exactly what a live consumer
+    /// hit, its carrier reporting that no head session existed to consent.
+    #[tokio::test]
+    async fn a_question_that_reached_nobody_is_named_on_the_next_request() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let (first, question) = open(&plane, &clock).await;
+        assert_eq!(first["outcome"], "consent_pending");
+        assert!(question.is_some());
+        assert!(
+            first.get("previous_request").is_none(),
+            "a first request has no previous one to report"
+        );
+        let unreached_ask = first["ask_id"].as_str().unwrap().to_string();
+
+        // The carrier reports it could put the question to no one.
+        plane
+            .settle_target(&unreached_ask, None, false, &clock)
+            .await;
+
+        // The question is still put -- a person who becomes reachable should
+        // simply be asked -- but the caller is told about the one that was not.
+        let (again, question) = open(&plane, &clock).await;
+        assert_eq!(again["outcome"], "consent_pending");
+        assert!(question.is_some(), "a reachable person would not be asked");
+        assert_eq!(again["previous_request"]["ask_id"], unreached_ask);
+        assert_eq!(
+            again["previous_request"]["disposition"],
+            "not_put_to_anyone"
+        );
+    }
+
+    /// Silence from a person who WAS asked is not reported as unreached.
+    ///
+    /// The distinction is the whole point: if every unanswered question were
+    /// reported this way, the field would mean "not answered yet" and the
+    /// caller would be no better off than with the timing.
+    #[tokio::test]
+    async fn silence_from_someone_who_was_asked_is_not_reported_as_unreached() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let (first, _) = open(&plane, &clock).await;
+        let ask_id = first["ask_id"].as_str().unwrap().to_string();
+
+        // Asked, and nobody replied inside the deadline.
+        plane.settle_target(&ask_id, None, true, &clock).await;
+
+        let (again, _) = open(&plane, &clock).await;
+        assert_eq!(again["outcome"], "consent_pending");
+        assert!(
+            again.get("previous_request").is_none(),
+            "silence from a person who was asked was reported as nobody asked"
+        );
+    }
+
+    /// Reaching someone clears an earlier report that nobody was reachable.
+    #[tokio::test]
+    async fn reaching_a_person_clears_the_earlier_unreached_report() {
+        let plane = plane(one_instance());
+        let clock = FakeClock::new();
+
+        let (first, _) = open(&plane, &clock).await;
+        let unreached_ask = first["ask_id"].as_str().unwrap().to_string();
+        plane
+            .settle_target(&unreached_ask, None, false, &clock)
+            .await;
+
+        let (second, _) = open(&plane, &clock).await;
+        assert_eq!(second["previous_request"]["ask_id"], unreached_ask);
+        let answered_ask = second["ask_id"].as_str().unwrap().to_string();
+
+        // This one reached a person, who refused. Nothing is granted, but the
+        // earlier report is now stale and must not keep being made.
+        plane
+            .settle_target(
+                &answered_ask,
+                Some(&json!({"decision": "deny"})),
+                true,
+                &clock,
+            )
+            .await;
+
+        let (third, _) = open(&plane, &clock).await;
+        assert!(
+            third.get("previous_request").is_none(),
+            "a stale unreached report survived reaching a person"
+        );
     }
 
     /// A refusal grants nothing, and the next request asks afresh.

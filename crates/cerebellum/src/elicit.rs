@@ -43,6 +43,16 @@ pub enum AskOutcome {
     /// from a reply that said no, and a reply that says no is inside
     /// [`Self::Answered`] because reading it is the asker's job.
     NoAnswer,
+    /// The carrier said it could not put the question to any person.
+    ///
+    /// Separate from [`Self::NoAnswer`] because the remedies are opposite. A
+    /// person who ignored a prompt may answer the next one, so asking again is
+    /// reasonable; a question nobody was ever shown will not be answered however
+    /// many times it is asked, and telling a caller to retry is a loop. The two
+    /// were indistinguishable here until a live consumer sent the silence word
+    /// for the no-person case and a caller was told to wait for an answer that
+    /// had never been solicited.
+    NotPutToAnyone,
     /// The question never left, so nobody had the chance to answer.
     ///
     /// Distinct from silence because this is our side failing rather than
@@ -69,6 +79,18 @@ impl AskOutcome {
 /// like a refusal, which is the pestering-versus-retry distinction this enum
 /// exists to keep.
 pub const NO_ANSWER_DECISION: &str = "no_answer";
+
+/// The reserved `decision` a carrier sends when it could not put the question
+/// to any person at all: no one was reachable to be asked.
+///
+/// Distinct from [`NO_ANSWER_DECISION`], which means a person WAS asked and
+/// stayed silent. A carrier that sends the silence word for this case makes a
+/// caller wait on an answer nobody was ever offered the chance to give, and the
+/// remedy it is handed -- ask again once this has been answered -- can never be
+/// satisfied. A word this module does not recognise is read as silence rather
+/// than as consent, so a carrier may start sending this one without waiting for
+/// anything on this side.
+pub const NOT_PUT_TO_ANYONE_DECISION: &str = "not_put_to_anyone";
 
 /// The questions this module has outstanding.
 pub struct Elicitor {
@@ -149,13 +171,11 @@ impl Elicitor {
         }
 
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(answer)) => {
-                if answer.get("decision").and_then(Value::as_str) == Some(NO_ANSWER_DECISION) {
-                    AskOutcome::NoAnswer
-                } else {
-                    AskOutcome::Answered(answer)
-                }
-            }
+            Ok(Ok(answer)) => match answer.get("decision").and_then(Value::as_str) {
+                Some(NO_ANSWER_DECISION) => AskOutcome::NoAnswer,
+                Some(NOT_PUT_TO_ANYONE_DECISION) => AskOutcome::NotPutToAnyone,
+                _ => AskOutcome::Answered(answer),
+            },
             // The sender was dropped, which happens when the question is
             // forgotten without an answer. Nobody replied.
             Ok(Err(_)) => {
@@ -270,14 +290,22 @@ mod tests {
         asking.await.unwrap();
     }
 
-    /// A carrier that asked a person and heard nothing says `no_answer`; that
-    /// is silence, not a refusal. `deny` stays an answer so the two are never
-    /// confused in the journal.
+    /// A carrier that asked a person and heard nothing says `no_answer`; one
+    /// that reached nobody says `not_put_to_anyone`. They are different facts
+    /// with opposite remedies, and `deny` stays an answer so none of the three
+    /// is ever confused with the others in the journal.
     #[tokio::test]
     async fn a_carrier_reported_no_answer_is_silence_not_a_refusal() {
         for (decision, expected) in [
             (NO_ANSWER_DECISION, AskOutcome::NoAnswer),
+            (NOT_PUT_TO_ANYONE_DECISION, AskOutcome::NotPutToAnyone),
             ("deny", AskOutcome::Answered(json!({"decision": "deny"}))),
+            // A word from a newer carrier than this module: read as an answer
+            // that permits nothing, never as consent.
+            (
+                "some_future_word",
+                AskOutcome::Answered(json!({"decision": "some_future_word"})),
+            ),
         ] {
             let elicitor = Arc::new(Elicitor::new());
             let (tx, mut rx) = mpsc::channel(4);
