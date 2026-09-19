@@ -150,10 +150,17 @@ cp "$STAGE/$DEPLOYED_NAME" "$FLEET_STAGING/$CARD"
 }
 
 echo
-echo "==> staged $STAGE/$DEPLOYED_NAME"
+# The DECLARED path leads, because that is the only one a placement gate can
+# read as a declaration. Naming the build directory first invited placing from
+# a path with no manifest beside it, where the gate falls back to inferring
+# currency from mtime -- a guess that has shipped a stale binary elsewhere in
+# this fleet. The build directory is still printed, as provenance rather than
+# as the thing to place.
+echo "==> staged $FLEET_STAGING/$CARD"
+echo "    declared in: $FLEET_STAGING/$DEPLOYED_NAME.current"
+echo "    built at:    $STAGE/$DEPLOYED_NAME  (same bytes, provenance only)"
 echo "    rev:         $HEAD_REV"
-echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar $DEPLOYED_NAME.sha256)"
-echo "    card:        $FLEET_STAGING/$CARD  (declared in $DEPLOYED_NAME.current)"
+echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar beside both copies)"
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
 echo
