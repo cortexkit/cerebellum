@@ -106,17 +106,14 @@ fn main() {
             x: text_frame.0 + 6.0,
             y,
         };
-        let to = cerebellum_macos::EventPoint {
-            x: text_frame.0 + text_frame.2 - 12.0,
-            y,
-        };
-        // Below the text: dragging here places the caret and leaves nothing
-        // selected, which is how each trial starts from a known state without
-        // needing a keystroke.
-        let blank = cerebellum_macos::EventPoint {
-            x: text_frame.0 + 6.0,
-            y: text_frame.1 + text_frame.3 - 10.0,
-        };
+        // Each trial drags a DIFFERENT WIDTH across the same line, so a trial
+        // that fires always changes the selection to something the previous one
+        // could not have left behind. Two attempts to clear the selection
+        // between trials failed -- a zero-length drag and a short drag over the
+        // empty region below the text both left the previous selection standing
+        // -- and each time the run refused rather than reporting a trial it
+        // could not attribute. Making success DISTINGUISHABLE is cheaper than
+        // making the state clean, and it removes a step that can fail quietly.
         let post_all = |events: [cerebellum_macos::OwnedCgEvent; 3], set: FieldSet| {
             for event in events {
                 stamp_field_set(event.as_ref(), window.window_id, target, set);
@@ -129,59 +126,89 @@ fn main() {
             sleep(Duration::from_millis(600));
         };
 
+        // An UNSTAMPED drag is the reliable way to put the target in a known
+        // state, and trial one proves it every run. So each stamped trial is
+        // preceded by one, and the outcome is read as the difference between a
+        // known full-line selection and what the stamped drag leaves:
+        //
+        //     still the full line  -> the stamped events did nothing
+        //     a shorter prefix     -> they arrived AND dragged
+        //     nothing selected     -> they arrived as a CLICK rather than a drag
+        //
+        // The third is why "no selection" cannot be read as "no delivery": a
+        // click is a delivered event that selects nothing, and the first two
+        // versions of this bisect could not tell it from silence.
+        let full_width = text_frame.2 - 18.0;
         let mut results = Vec::new();
         for (label, set) in [
-            ("1 no stamps", FieldSet::None),
             ("2 public fields", FieldSet::Public),
             ("3 undocumented fields", FieldSet::Undocumented),
+            ("4 window stamps only", FieldSet::WindowOnly),
+            ("5 pid stamp only", FieldSet::PidOnly),
         ] {
-            let Ok(clear) = cerebellum_macos::mouse_drag_events(blank, blank) else {
-                eprintln!("PROBE FAILED: could not build the clearing drag");
+            let Ok(setup) = cerebellum_macos::mouse_drag_events(
+                from,
+                cerebellum_macos::EventPoint {
+                    x: text_frame.0 + 6.0 + full_width,
+                    y,
+                },
+            ) else {
+                eprintln!("PROBE FAILED: could not build the setup drag for {label}");
                 quit_textedit();
                 std::process::exit(1);
             };
-            post_all(clear, FieldSet::None);
-            let before = read_selected_text().unwrap_or_default();
-            if !before.trim().is_empty() {
+            post_all(setup, FieldSet::None);
+            let established = read_selected_text().unwrap_or_default();
+            if established.trim().is_empty() {
+                // Measured after the undocumented-stamp trial: an unstamped
+                // drag that works every other time selects nothing here. The
+                // likeliest reading is that a trial whose events do not arrive
+                // intact leaves the target's drag state inconsistent -- a
+                // button believed down, or a sequence half seen. Whatever the
+                // cause, the setup is the instrument's own precondition, so the
+                // run stops rather than attributing the next trial's silence to
+                // its stamps. A trial after a broken one needs its own launch.
                 eprintln!(
-                    "PROBE FAILED: trial {label} started with {before:?} still selected, so its \
-                     result could not be told from the previous one."
+                    "PROBE FAILED: the unstamped setup drag for {label} selected nothing, so this \
+                     run cannot measure anything. A preceding trial may have left the target's \
+                     drag state inconsistent; run this trial in its own launch."
                 );
                 quit_textedit();
                 std::process::exit(1);
             }
 
-            let Ok(events) = cerebellum_macos::mouse_drag_events(from, to) else {
+            let Ok(events) = cerebellum_macos::mouse_drag_events(
+                from,
+                cerebellum_macos::EventPoint {
+                    x: text_frame.0 + 6.0 + 120.0,
+                    y,
+                },
+            ) else {
                 eprintln!("PROBE FAILED: could not build the drag for trial {label}");
                 quit_textedit();
                 std::process::exit(1);
             };
             post_all(events, set);
             let selected = read_selected_text().unwrap_or_default();
-            println!("TRIAL {label}: selected {selected:?}");
-            results.push((label, !selected.trim().is_empty()));
+            let outcome = if selected == established {
+                "DID NOTHING"
+            } else if selected.trim().is_empty() {
+                "ARRIVED AS A CLICK"
+            } else {
+                "ARRIVED AND DRAGGED"
+            };
+            println!("TRIAL {label}: selected {selected:?} -> {outcome}");
+            results.push((label, outcome));
         }
 
         quit_textedit();
         let _ = std::fs::remove_file(&path);
         match results.as_slice() {
-            [(_, false), ..] => println!(
-                "VERDICT: VOID. Trial one carries no stamps and still selected nothing, so this \
-                 probe cannot measure anything today and the other trials say nothing."
-            ),
-            [_, (_, true), (_, true)] => println!(
-                "VERDICT: NEITHER HALF BREAKS THE EVENT. Both stamped trials selected, so the \
-                 earlier failure was not the stamping and is worth re-measuring."
-            ),
-            [_, (_, public_ok), (_, undocumented_ok)] => println!(
-                "VERDICT: public fields {}, undocumented fields {}. The half that selected \
-                 NOTHING is the one that breaks the event.",
-                if *public_ok { "SURVIVED" } else { "BROKE IT" },
-                if *undocumented_ok {
-                    "SURVIVED"
-                } else {
-                    "BROKE IT"
-                }
+            [(_, public), (_, undocumented), (_, window_only), (_, pid_only)] => println!(
+                "VERDICT: public {public}; undocumented {undocumented}; window stamps only \
+                 {window_only}; pid stamp only {pid_only}. DID NOTHING names the stamp that \
+                 breaks the event; ARRIVED AS A CLICK reached the target and lost the drag, \
+                 which is a different defect and not a delivery failure."
             ),
             _ => println!("VERDICT: incomplete trial set"),
         }
@@ -459,6 +486,10 @@ enum FieldSet {
     None,
     Public,
     Undocumented,
+    /// The four window-addressing stamps, without the one that names a process.
+    WindowOnly,
+    /// The process stamp alone.
+    PidOnly,
     All,
 }
 
@@ -496,6 +527,8 @@ fn stamp_field_set(event: &objc2_core_graphics::CGEvent, window_id: u32, pid: i3
         FieldSet::None => {}
         FieldSet::Public => apply(&public),
         FieldSet::Undocumented => apply(&undocumented),
+        FieldSet::WindowOnly => apply(&undocumented[1..]),
+        FieldSet::PidOnly => apply(&undocumented[..1]),
         FieldSet::All => {
             apply(&public);
             apply(&undocumented);
