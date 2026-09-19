@@ -126,3 +126,43 @@ impl MonotonicClock for FakeClock {
         self.instant()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Two clocks never agree about one lease, so a module must keep ONE.
+    ///
+    /// `SystemClock`'s epoch is fixed per instance, so instants from two of them
+    /// are not comparable even though the type system says they are: a lease
+    /// stamped by one reads as long expired to the other. That was the mechanism
+    /// behind a live defect where `computer.open_target` answered `already_held`
+    /// with ten minutes remaining while every computer action refused
+    /// `no_lease` -- a remedy loop, because the refusal's remedy was the call
+    /// that had just succeeded. It stayed invisible while the module's uptime was
+    /// under the grant window and was total past it, which is why every live
+    /// probe had passed: each ran minutes after a restart.
+    #[test]
+    fn two_system_clocks_disagree_about_the_same_moment() {
+        let first = SystemClock::new();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = SystemClock::new();
+
+        let from_first = first.now();
+        let from_second = second.now();
+        assert!(
+            from_second < from_first,
+            "the later clock must read a smaller instant for the same moment: \
+             {from_second:?} against {from_first:?}"
+        );
+        // The gap is the size of the error: a lease minted on `second` and
+        // checked against `first` loses exactly this much of its life, and a
+        // module up longer than the grant loses all of it.
+        let gap = Duration::from_nanos(from_first.as_nanos() - from_second.as_nanos());
+        assert!(
+            gap >= Duration::from_millis(15),
+            "the epochs must differ by roughly the delay between them, not {gap:?}"
+        );
+    }
+}

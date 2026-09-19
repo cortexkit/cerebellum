@@ -53,7 +53,6 @@ pub use cerebellum_computer as computer;
 
 use crate::elicit::{Elicitor, SharedElicitor};
 use crate::management::ManagementPlane;
-use cerebellum_core::clock::SystemClock;
 use cerebellum_core::identity::RouteSurface;
 use socket2::{SockRef, TcpKeepalive};
 use subc_protocol::session::{
@@ -2344,7 +2343,10 @@ async fn handle_management_request(
             .await;
         };
         let grantee = facts.identity.agent_project_id.clone();
-        let clock = SystemClock::default();
+        // The module's one lease clock. A fresh SystemClock here would carry a
+        // different epoch from every later check, so this answer and the
+        // authority check would disagree about the same lease.
+        let clock = planes.lease_clock.as_ref();
         let (reply, question) = planes
             .management
             .open_target(
@@ -2352,7 +2354,7 @@ async fn handle_management_request(
                 bundle_identity,
                 action_kind,
                 facts.declares_elicitation(),
-                &clock,
+                clock,
             )
             .await;
         (reply, question, Settlement::ComputerTarget)
@@ -2503,6 +2505,12 @@ async fn handle_management_request(
         // pending, so nothing is waiting on the question here.
         let elicitor = Arc::clone(&planes.elicitor);
         let management_plane = Arc::clone(&planes.management);
+        // The module's one lease clock, carried into the task rather than made
+        // there. SystemClock's epoch is per INSTANCE, so a clock constructed
+        // here would stamp the lease's expiry on an epoch nothing else shares:
+        // the grant would read as live to whoever used that same throwaway and
+        // as long expired to every checker on the shared clock.
+        let lease_clock = Arc::clone(&planes.lease_clock);
         let writer = writer.clone();
         tokio::spawn(async move {
             let outcome = elicitor
@@ -2515,7 +2523,7 @@ async fn handle_management_request(
             match settlement {
                 Settlement::ComputerTarget => {
                     management_plane
-                        .settle(&question.ask_id, answer.as_ref(), &SystemClock::default())
+                        .settle(&question.ask_id, answer.as_ref(), lease_clock.as_ref())
                         .await;
                 }
                 Settlement::BrowserGrant => {
