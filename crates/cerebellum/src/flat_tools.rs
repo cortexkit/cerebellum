@@ -60,7 +60,17 @@ fn describe_computer_field(name: &str, schema: &mut Value) {
         "region" => "Optional rectangle in target-window pixels; invalid or unavailable regions are refused with a remedy.",
         "scope" => "Capture target windows (default) or the display.",
         "include_cursor" => "Whether to include the cursor; defaults to false.",
-        "predicate" => "Condition to poll before returning; timeout replies say the condition was not observed.",
+        // The outcomes are named here because the two failure words mean opposite
+        // things and a reader who conflates them draws the wrong conclusion: a
+        // timeout is evidence the condition did not hold, while indeterminate
+        // means the target could not be inspected at all and carries no evidence
+        // either way. A caller that treats indeterminate as "not there" is the
+        // absent-versus-cannot-look defect, one layer up from the wire.
+        "predicate" => {
+            "Condition to poll for before returning. The reply says predicate_satisfied when it held, \
+             timeout when it was checked and never held, or indeterminate when the target could not \
+             be read at all, which is not evidence that the condition is false."
+        }
         "timeout_ms" => "Maximum wait in milliseconds.",
         _ => return,
     };
