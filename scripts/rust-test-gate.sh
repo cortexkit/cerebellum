@@ -192,22 +192,58 @@ check_sibling_matches_declaration() {
 
 # One sibling, one declaration file. Same format for every sibling so a new
 # one is a line in the caller above, never a second copy of this loop.
+#
+# The pin is compared against the sibling's PUBLISHED head as well as its
+# working tree, because those answer different questions and only one of them
+# is what CI will clone. A subtree that exists only in the producer's working
+# tree passes a HEAD comparison and fails on the runner, and the failure that
+# arrives there is `generated files untouched by the build` -- a message about
+# our own lock being rewritten, naming nothing about the sibling. That cost two
+# separate investigations on 2026-09-19, one here and one at the producer, for
+# a bump held unpushed for about an hour.
+#
+# So the two mismatches get different words, because the remedy differs: a pin
+# matching an unpushed subtree means WAIT for the producer to push (repinning
+# would pin content no consumer can fetch), while matching neither means repin.
 check_one_sibling() {
   local name="$1" declaration="$2" sibling drift=0
   sibling="$(dirname "$0")/../../$name"
   [ -f "$declaration" ] || { echo "    no $name declaration to check against" >&2; return 1; }
   [ -d "$sibling" ] || { echo "    sibling checkout missing at $sibling" >&2; return 1; }
+  local upstream
+  upstream="$(sibling_published_ref "$sibling")"
   while read -r declared crate; do
     case "$declared" in ""|\#*) continue ;; esac
     [ -z "$crate" ] && continue
-    local actual
+    local actual published
     actual="$(git -C "$sibling" rev-parse "HEAD:crates/$crate" 2>/dev/null || echo missing)"
+    published="$(git -C "$sibling" rev-parse "$upstream:crates/$crate" 2>/dev/null || echo unknown)"
     if [ "$actual" != "$declared" ]; then
       echo "    $name/$crate: declared $declared, sibling has $actual" >&2
+      drift=1
+    elif [ "$published" != "$declared" ] && [ "$published" != unknown ]; then
+      echo "    $name/$crate: declared $declared matches the sibling's working tree" >&2
+      echo "      but $upstream has $published -- the subtree is UNPUSHED, so CI" >&2
+      echo "      cannot fetch what this pin names. Wait for the producer to push;" >&2
+      echo "      do not repin." >&2
       drift=1
     fi
   done < "$declaration"
   return "$drift"
+}
+
+# The remote-tracking ref to compare against, or the sibling's own HEAD when
+# there is none. An offline or remoteless checkout must not fail this phase for
+# a reason that has nothing to do with the pins: with no upstream to read, the
+# published question is unanswerable rather than answered no.
+sibling_published_ref() {
+  local sibling="$1" upstream
+  upstream="$(git -C "$sibling" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  if [ -n "$upstream" ] && git -C "$sibling" rev-parse --verify --quiet "$upstream" >/dev/null; then
+    printf '%s' "$upstream"
+  else
+    printf 'HEAD'
+  fi
 }
 
 run_phase "sibling matches the declared revisions" \
