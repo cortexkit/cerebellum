@@ -720,7 +720,9 @@ mod macos_probe {
         let mut audit = cerebellum::computer_capability::production_audit()
             .map_err(|error| format!("production audit unavailable: {error}"))?;
         let action_obligation_id = audit.journal().next_sequence();
-        let report = Dispatcher::new(driver)
+        let probe_single_action_has_no_interrupt =
+            cerebellum_computer::platform::process_event::never_cancelled;
+        let report = Dispatcher::new(driver, &probe_single_action_has_no_interrupt)
             .dispatch(&mut audit, identity, request)
             .map_err(|error| {
                 let typed = serde_json::to_string(&error).unwrap_or_else(|_| format!("{error:?}"));

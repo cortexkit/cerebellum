@@ -1463,10 +1463,12 @@ pub trait PlatformDriver {
     fn dispatch_per_pid(
         &mut self,
         request: SyntheticDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError>;
     fn dispatch_global(
         &mut self,
         request: GlobalDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError>;
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)
@@ -1544,6 +1546,7 @@ impl PlatformDriver for UnsupportedPlatformDriver {
     fn dispatch_per_pid(
         &mut self,
         _request: SyntheticDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         Err(DriverError::Unsupported("per-process synthetic dispatch"))
     }
@@ -1551,6 +1554,7 @@ impl PlatformDriver for UnsupportedPlatformDriver {
     fn dispatch_global(
         &mut self,
         _request: GlobalDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         Err(DriverError::Unsupported("global synthetic dispatch"))
     }
@@ -1648,6 +1652,7 @@ impl PlatformDriver for PlatformNeutralTestDriver {
     fn dispatch_per_pid(
         &mut self,
         _request: SyntheticDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         panic!("test driver must not execute platform operations")
     }
@@ -1655,6 +1660,7 @@ impl PlatformDriver for PlatformNeutralTestDriver {
     fn dispatch_global(
         &mut self,
         _request: GlobalDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         panic!("test driver must not execute platform operations")
     }

@@ -300,6 +300,11 @@ pub enum DispatchError {
         pid: u32,
     },
     SyntheticUnavailable,
+    /// A caller interrupted the action; the count and recovery come from the sequence.
+    Cancelled {
+        posts_returned: u64,
+        held_state: HeldStateDisposition,
+    },
     /// A per-process synthetic sequence stopped mid-flight.
     ///
     /// Not folded into `SyntheticUnavailable`: a sequence that stopped after
@@ -373,6 +378,10 @@ mod reason_code_tests {
             },
             DispatchError::WindowVisibilityUnknown { pid: 41 },
             DispatchError::SyntheticUnavailable,
+            DispatchError::Cancelled {
+                posts_returned: 0,
+                held_state: HeldStateDisposition::NoneHeld,
+            },
             DispatchError::SyntheticSequenceFailed {
                 posts_returned: 1,
                 refusal: ProcessEventRefusal::ProcessGone,
@@ -437,6 +446,7 @@ impl DispatchError {
             Self::WindowVisibilityUnknown { .. } => "window_visibility_unknown",
             Self::SyntheticUnavailable => "synthetic_unavailable",
             Self::SyntheticSequenceFailed { .. } => "synthetic_sequence_failed",
+            Self::Cancelled { .. } => "cancelled",
             Self::EnvelopeUnrecognized => "envelope_unrecognized",
             Self::UnsupportedMode => "unsupported_mode",
             Self::ObserverUnavailable => "observer_unavailable",
@@ -466,8 +476,8 @@ impl fmt::Display for DispatchError {
 }
 impl std::error::Error for DispatchError {}
 
-#[derive(Debug)]
-pub struct Dispatcher<D> {
+pub struct Dispatcher<'a, D> {
+    cancelled: &'a dyn Fn() -> bool,
     driver: D,
     trace: Vec<DispatchPhase>,
     last_observed_abort: Option<AbortDecision>,
@@ -498,10 +508,11 @@ impl ActuationAuditState {
     }
 }
 
-impl<D> Dispatcher<D> {
-    pub fn new(driver: D) -> Self {
+impl<'a, D> Dispatcher<'a, D> {
+    pub fn new(driver: D, cancelled: &'a dyn Fn() -> bool) -> Self {
         Self {
             driver,
+            cancelled,
             trace: Vec::new(),
             last_observed_abort: None,
         }
@@ -528,7 +539,7 @@ impl<D> Dispatcher<D> {
     }
 }
 
-impl<D: PlatformDriver> Dispatcher<D> {
+impl<D: PlatformDriver> Dispatcher<'_, D> {
     pub fn dispatch<R, T, S>(
         &mut self,
         audit: &mut ComputerAudit<R, T, S>,
@@ -1085,7 +1096,7 @@ impl<D: PlatformDriver> Dispatcher<D> {
                     .as_deref_mut()
                     .ok_or(DispatchError::AuditUnavailable)?;
                 Self::commit_audit_intent(audit, state, &intent)?;
-                let result = match self.driver.dispatch_per_pid(synthetic) {
+                let result = match self.driver.dispatch_per_pid(synthetic, self.cancelled) {
                     Ok(result) => {
                         Self::finalize_audit_outcome(
                             audit,
@@ -1104,6 +1115,14 @@ impl<D: PlatformDriver> Dispatcher<D> {
                         // refusal would tell the caller nothing happened when a
                         // key or button may still be down in the target.
                         let refusal = match error {
+                            DriverError::SyntheticDispatchFailed(failure)
+                                if failure.refusal == ProcessEventRefusal::Cancelled =>
+                            {
+                                DispatchError::Cancelled {
+                                    posts_returned: failure.posts_returned,
+                                    held_state: failure.held_state,
+                                }
+                            }
                             DriverError::SyntheticDispatchFailed(failure) => {
                                 DispatchError::SyntheticSequenceFailed {
                                     posts_returned: failure.posts_returned,
@@ -1116,9 +1135,18 @@ impl<D: PlatformDriver> Dispatcher<D> {
                         Self::finalize_audit_outcome(
                             audit,
                             state,
-                            &ActuationOutcome::Refused {
-                                refusal: refusal.clone(),
-                                abort: None,
+                            &match &refusal {
+                                DispatchError::Cancelled {
+                                    posts_returned,
+                                    held_state,
+                                } => ActuationOutcome::Cancelled {
+                                    posts_returned: *posts_returned,
+                                    held_state: *held_state,
+                                },
+                                _ => ActuationOutcome::Refused {
+                                    refusal: refusal.clone(),
+                                    abort: None,
+                                },
                             },
                         )?;
                         return Err(refusal);
@@ -1134,14 +1162,17 @@ impl<D: PlatformDriver> Dispatcher<D> {
                 let token = once_dispatch_token.ok_or(DispatchError::AttendanceUnavailable)?;
                 let state = audit_state.ok_or(DispatchError::AuditUnavailable)?;
                 Self::commit_audit_intent(audit, state, &intent)?;
-                let result = match self.driver.dispatch_global(GlobalDispatchRequest {
-                    synthetic,
-                    once_dispatch_token: token,
-                    maximum_seize_detection_latency_ms: request
-                        .row
-                        .maximum_seize_detection_latency_ms,
-                    minimum_inter_post_interval_ms: request.row.minimum_inter_post_interval_ms,
-                }) {
+                let result = match self.driver.dispatch_global(
+                    GlobalDispatchRequest {
+                        synthetic,
+                        once_dispatch_token: token,
+                        maximum_seize_detection_latency_ms: request
+                            .row
+                            .maximum_seize_detection_latency_ms,
+                        minimum_inter_post_interval_ms: request.row.minimum_inter_post_interval_ms,
+                    },
+                    self.cancelled,
+                ) {
                     Ok(result) => {
                         Self::finalize_audit_outcome(
                             audit,
@@ -1151,6 +1182,23 @@ impl<D: PlatformDriver> Dispatcher<D> {
                             },
                         )?;
                         result
+                    }
+                    Err(DriverError::SyntheticDispatchFailed(failure))
+                        if failure.refusal == ProcessEventRefusal::Cancelled =>
+                    {
+                        let refusal = DispatchError::Cancelled {
+                            posts_returned: failure.posts_returned,
+                            held_state: failure.held_state,
+                        };
+                        Self::finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Cancelled {
+                                posts_returned: failure.posts_returned,
+                                held_state: failure.held_state,
+                            },
+                        )?;
+                        return Err(refusal);
                     }
                     Err(DriverError::ObservedDispatchAborted(abort)) => {
                         self.last_observed_abort = Some(abort);
@@ -1333,7 +1381,7 @@ impl From<ContainmentRefusal> for DispatchError {
 
 // Keep these public aliases so downstream integrations can use the dispatch
 // controller and result types without importing the internal modules that define them.
-pub type DispatchController<D> = Dispatcher<D>;
+pub type DispatchController<'a, D> = Dispatcher<'a, D>;
 pub type DispatchOutcome = DispatchReport;
 pub type DispatchSequenceOutcome = SequenceDispatchReport;
 pub type ExpectedPredicate = ExpectedPostCondition;

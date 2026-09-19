@@ -79,6 +79,7 @@ impl PostCallFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum ProcessEventRefusal {
+    Cancelled,
     ProcessGone,
     ProcessReplaced {
         expected_start_time_micros: u64,
@@ -164,39 +165,87 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
     target: ProcessEventTarget,
     steps: Vec<SyntheticStep<T::Event>>,
     transport: &mut T,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<SequencePostReport, SequencePostFailure> {
-    let mut release_for_press: Vec<Option<usize>> = vec![None; steps.len()];
+    post_guarded_event_sequence(steps, cancelled, |_, event, _recovery| match event {
+        Some(event) => route_event_to_process(target, event, transport).map(|(_, checks)| checks),
+        None => Ok(0),
+    })
+    .map_err(|failure| SequencePostFailure {
+        posts_returned: failure.posts_returned,
+        refusal: failure.refusal.unwrap_or(ProcessEventRefusal::Cancelled),
+        held_state: failure.held_state,
+    })
+}
+
+/// An explicit observer for probes and callers with no interrupt source.
+pub fn never_cancelled() -> bool {
+    false
+}
+
+/// A sequence stop retains both the main post count and paired-release recovery.
+/// A missing refusal means the caller cancelled, not a transport error or timeout.
+pub struct GuardedSequenceFailure<F> {
+    pub posts_returned: u64,
+    pub refusal: Option<F>,
+    pub held_state: HeldStateDisposition,
+}
+
+/// Shared by per-process and global sequences. Cancellation precedes the
+/// callback's generation check; recovery bypasses cancellation so a held input
+/// can be released. A `None` event lets the callback wait between posts before
+/// cancellation is checked; `Some` must check generation then post without a
+/// blocking preparation step. Recovery must still enforce identity.
+pub fn post_guarded_event_sequence<E, F>(
+    steps: Vec<SyntheticStep<E>>,
+    cancelled: &dyn Fn() -> bool,
+    mut post: impl FnMut(usize, Option<E>, bool) -> Result<u64, F>,
+) -> Result<SequencePostReport, GuardedSequenceFailure<F>> {
+    // Outer Some marks a press; inner None means its release is unavailable.
+    // Self-contained steps must not be mistaken for unmatched held presses.
+    let mut release_for_press: Vec<Option<Option<usize>>> = vec![None; steps.len()];
     let mut unmatched_presses: Vec<usize> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         match step.role {
-            SyntheticStepRole::Press => unmatched_presses.push(index),
+            SyntheticStepRole::Press => {
+                release_for_press[index] = Some(None);
+                unmatched_presses.push(index);
+            }
             SyntheticStepRole::Release => {
                 if let Some(press) = unmatched_presses.pop() {
-                    release_for_press[press] = Some(index);
+                    release_for_press[press] = Some(Some(index));
                 }
             }
             SyntheticStepRole::SelfContained => {}
         }
     }
 
-    let mut steps: Vec<Option<SyntheticStep<T::Event>>> = steps.into_iter().map(Some).collect();
+    let mut steps: Vec<Option<SyntheticStep<E>>> = steps.into_iter().map(Some).collect();
     let mut posts_returned = 0_u64;
     let mut generation_verifications = 0_u64;
     for index in 0..steps.len() {
+        let preparation = post(index, None, false);
+        if preparation.is_err() || cancelled() {
+            let held_state = recover_held_state(&release_for_press, &mut steps, index, &mut post);
+            return Err(GuardedSequenceFailure {
+                posts_returned,
+                refusal: preparation.err(),
+                held_state,
+            });
+        }
         let step = match steps[index].take() {
             Some(step) => step,
             None => continue,
         };
-        let routed = route_event_to_process(target, step.event, transport);
-        if let Ok((_, verifications)) = &routed {
+        let routed = post(index, Some(step.event), false);
+        if let Ok(verifications) = &routed {
             generation_verifications += verifications;
         }
         if let Err(refusal) = routed {
-            let held_state =
-                recover_held_state(target, &release_for_press, &mut steps, index, transport);
-            return Err(SequencePostFailure {
+            let held_state = recover_held_state(&release_for_press, &mut steps, index, &mut post);
+            return Err(GuardedSequenceFailure {
                 posts_returned,
-                refusal,
+                refusal: Some(refusal),
                 held_state,
             });
         }
@@ -211,19 +260,17 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
 /// Release whatever the posted steps left held, and say how that went.
 ///
 /// A press posted before the failure is still held when its paired release
-/// never posted: the release either comes after the failed step or was the
-/// failed step itself. Only a release AFTER the failed step is still in hand;
-/// the failed step's own event was consumed by its routing attempt.
-fn recover_held_state<T: PerProcessEventTransport>(
-    target: ProcessEventTarget,
-    release_for_press: &[Option<usize>],
-    steps: &mut [Option<SyntheticStep<T::Event>>],
+/// never posted. Cancellation leaves the current event in hand, including a
+/// release at that boundary; a failed routing attempt consumes its event.
+fn recover_held_state<E, F>(
+    release_for_press: &[Option<Option<usize>>],
+    steps: &mut [Option<SyntheticStep<E>>],
     failed_index: usize,
-    transport: &mut T,
+    post: &mut impl FnMut(usize, Option<E>, bool) -> Result<u64, F>,
 ) -> HeldStateDisposition {
     let mut release_indices: Vec<usize> = Vec::new();
     let mut unrecoverable = false;
-    for (_press, release) in release_for_press.iter().enumerate().take(failed_index) {
+    for release in release_for_press.iter().take(failed_index).flatten() {
         let still_held = match release {
             Some(release) => *release >= failed_index,
             None => true,
@@ -232,7 +279,7 @@ fn recover_held_state<T: PerProcessEventTransport>(
             continue;
         }
         match release {
-            Some(release) if *release > failed_index => release_indices.push(*release),
+            Some(release) if steps[*release].is_some() => release_indices.push(*release),
             _ => unrecoverable = true,
         }
     }
@@ -245,7 +292,7 @@ fn recover_held_state<T: PerProcessEventTransport>(
             Some(step) => step,
             None => continue,
         };
-        match route_event_to_process(target, step.event, transport) {
+        match post(index, Some(step.event), true) {
             Ok(_) => released_posts += 1,
             Err(_) => unrecoverable = true,
         }
@@ -270,7 +317,7 @@ fn recover_held_state<T: PerProcessEventTransport>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationVerified;
 
-fn require_exact_generation(
+pub(crate) fn require_exact_generation(
     target: ProcessEventTarget,
     reading: ProcessGenerationReading,
 ) -> Result<GenerationVerified, ProcessEventRefusal> {
@@ -703,7 +750,7 @@ mod tests {
             ],
         );
 
-        let report = post_event_sequence(target(), drag_steps(), &mut transport)
+        let report = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect("a fully routed sequence completes");
 
         assert_eq!(report.posts_returned, 3);
@@ -756,7 +803,7 @@ mod tests {
             ],
         );
 
-        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect_err("a replaced target stops the sequence");
 
         assert_eq!(
@@ -794,7 +841,7 @@ mod tests {
             ],
         );
 
-        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect_err("a failed post stops the sequence");
 
         assert_eq!(
@@ -819,7 +866,7 @@ mod tests {
         let post_failure = PostCallFailure::new("framework call failed");
         let mut transport = posting_transport([current(), current()], [Err(post_failure.clone())]);
 
-        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect_err("the failed first post stops the sequence");
 
         assert_eq!(
@@ -852,7 +899,7 @@ mod tests {
             ],
         );
 
-        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect_err("the failed release stops the sequence");
 
         // The press posted and its release may not have landed; nothing may
@@ -886,7 +933,7 @@ mod tests {
             ],
         );
 
-        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect_err("the failed drag move stops the sequence");
 
         // The release was attempted but refused before posting — correctly,
@@ -926,7 +973,7 @@ mod tests {
             ],
         );
 
-        let failure = post_event_sequence(target(), drag_steps(), &mut transport)
+        let failure = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
             .expect_err("the failed drag move stops the sequence");
 
         // The press posted, the move's post failed, and the recovery release's
@@ -942,5 +989,145 @@ mod tests {
             }
         );
         assert_eq!(transport.post_count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct CountingTransport<'a> {
+        returned: &'a Cell<u64>,
+        events: Vec<u8>,
+        checks: u64,
+        observer_calls: Option<&'a Cell<u64>>,
+        observers_before_posts: Vec<u64>,
+    }
+    impl PerProcessEventTransport for CountingTransport<'_> {
+        type Event = u8;
+        fn process_generation(&mut self, _: u32) -> ProcessGenerationReading {
+            self.checks += 1;
+            ProcessGenerationReading::Started(123)
+        }
+        fn window_server_visibility(&mut self, _: u32) -> WindowServerVisibility {
+            WindowServerVisibility::Visible
+        }
+        fn post_to_pid(&mut self, _: u32, event: u8) -> Result<PostCallMade, PostCallFailure> {
+            self.events.push(event);
+            if let Some(calls) = self.observer_calls {
+                self.observers_before_posts.push(calls.get());
+            }
+            self.returned.set(self.returned.get() + 1);
+            Ok(PostCallMade::public_core_graphics())
+        }
+    }
+
+    #[test]
+    fn a_cancelled_sequence_stops_at_the_next_post_boundary() {
+        let returned = Cell::new(0);
+        let mut transport = CountingTransport {
+            returned: &returned,
+            events: vec![],
+            checks: 0,
+            observer_calls: None,
+            observers_before_posts: vec![],
+        };
+        let observer_calls = Cell::new(0);
+        transport.observer_calls = Some(&observer_calls);
+        let steps = (0..5)
+            .map(|event| SyntheticStep {
+                event,
+                role: SyntheticStepRole::SelfContained,
+            })
+            .collect();
+        let failure = post_event_sequence(
+            ProcessEventTarget {
+                pid: 10,
+                start_time_micros: 123,
+            },
+            steps,
+            &mut transport,
+            &|| {
+                observer_calls.set(observer_calls.get() + 1);
+                returned.get() >= 2
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.posts_returned, 2);
+        assert_eq!(failure.refusal, ProcessEventRefusal::Cancelled);
+        assert_eq!(transport.events, [0, 1]);
+        assert_eq!(failure.held_state, HeldStateDisposition::NoneHeld);
+        assert_eq!(transport.checks, 4);
+        assert_eq!(
+            transport.observers_before_posts,
+            [1, 2],
+            "cancellation must be checked BEFORE every post, not after it"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_sequence_releases_what_it_was_holding() {
+        let returned = Cell::new(0);
+        let mut transport = CountingTransport {
+            returned: &returned,
+            events: vec![],
+            checks: 0,
+            observer_calls: None,
+            observers_before_posts: vec![],
+        };
+        let steps = vec![
+            SyntheticStep {
+                event: 0,
+                role: SyntheticStepRole::Press,
+            },
+            SyntheticStep {
+                event: 1,
+                role: SyntheticStepRole::Release,
+            },
+        ];
+        let failure = post_event_sequence(
+            ProcessEventTarget {
+                pid: 10,
+                start_time_micros: 123,
+            },
+            steps,
+            &mut transport,
+            &|| returned.get() >= 1,
+        )
+        .unwrap_err();
+        assert_eq!(failure.posts_returned, 1);
+        assert_eq!(
+            failure.held_state,
+            HeldStateDisposition::Released { posts_returned: 1 }
+        );
+        assert_eq!(transport.events, [0, 1]);
+    }
+
+    #[test]
+    fn cancellation_after_the_last_post_is_completion() {
+        let returned = Cell::new(0);
+        let mut transport = CountingTransport {
+            returned: &returned,
+            events: vec![],
+            checks: 0,
+            observer_calls: None,
+            observers_before_posts: vec![],
+        };
+        let steps = vec![SyntheticStep {
+            event: 0,
+            role: SyntheticStepRole::SelfContained,
+        }];
+        let report = post_event_sequence(
+            ProcessEventTarget {
+                pid: 10,
+                start_time_micros: 123,
+            },
+            steps,
+            &mut transport,
+            &|| returned.get() >= 1,
+        )
+        .unwrap();
+        assert_eq!(report.posts_returned, 1);
     }
 }

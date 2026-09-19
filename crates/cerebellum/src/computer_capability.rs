@@ -449,6 +449,7 @@ pub struct ServeContext<'a, C: MonotonicClock> {
     /// identity a request can choose is a permission granted to whoever asks for
     /// it. This type cannot check that, which is why it is said here.
     pub grantee: &'a str,
+    pub cancel: crate::CancelHandle,
     pub identity: JournalIdentity,
     pub management: &'a Arc<ManagementPlane>,
     pub clock: &'a C,
@@ -498,7 +499,7 @@ where
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
-    audit: Mutex<ComputerAudit<R, T, S>>,
+    audit: Arc<Mutex<ComputerAudit<R, T, S>>>,
     capture: Mutex<Option<ScopedCaptureController<B>>>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
@@ -509,9 +510,9 @@ where
 impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
 where
     B: CaptureBackend + Send,
-    R: Redactor + Send,
-    T: SeverityTaxonomy + Send,
-    S: JournalStorage + Send,
+    R: Redactor + Send + 'static,
+    T: SeverityTaxonomy + Send + 'static,
+    S: JournalStorage + Send + 'static,
 {
     pub fn new(audit: ComputerAudit<R, T, S>) -> Self {
         Self::with_result_schema_enforcement(audit, ResultSchemaEnforcement::DetectOnly)
@@ -538,10 +539,10 @@ where
 impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
 where
     B: CaptureBackend + Send,
-    R: Redactor + Send,
-    T: SeverityTaxonomy + Send,
-    S: JournalStorage + Send,
-    D: PlatformDriver,
+    R: Redactor + Send + 'static,
+    T: SeverityTaxonomy + Send + 'static,
+    S: JournalStorage + Send + 'static,
+    D: PlatformDriver + 'static,
 {
     /// Construct a plane whose input actions dispatch through the driver this
     /// factory builds.
@@ -579,7 +580,7 @@ where
         make_synthetic_driver: Arc<dyn Fn() -> D + Send + Sync>,
     ) -> Self {
         Self {
-            audit: Mutex::new(audit),
+            audit: Arc::new(Mutex::new(audit)),
             capture: Mutex::new(None),
             result_schema_enforcement,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
@@ -739,6 +740,7 @@ where
             Err(refusal) => return wait_indeterminate_reply(None, refusal),
         };
         let ServeContext {
+            cancel: _,
             grantee,
             identity: _,
             management,
@@ -796,6 +798,7 @@ where
         };
 
         let ServeContext {
+            cancel: _,
             grantee,
             identity,
             management,
@@ -892,7 +895,12 @@ where
         request.semantic = Some(click_semantic_request(&parsed, element));
 
         let mut audit = self.audit.lock().await;
-        match Dispatcher::new(driver).dispatch(&mut audit, identity, request) {
+        match Dispatcher::new(
+            driver,
+            &cerebellum_computer::platform::process_event::never_cancelled,
+        )
+        .dispatch(&mut audit, identity, request)
+        {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
                     return dispatch_refusal(DispatchError::AuditUnavailable, unreadable_subtrees);
@@ -919,6 +927,7 @@ where
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Value {
         let ServeContext {
+            cancel: _,
             grantee,
             identity,
             management,
@@ -1248,6 +1257,7 @@ where
         };
 
         let ServeContext {
+            cancel,
             grantee,
             identity,
             management,
@@ -1386,10 +1396,18 @@ where
             request = request.with_once_dispatch_token(token);
         }
 
-        let mut audit = self.audit.lock().await;
-        match Dispatcher::new((self.make_synthetic_driver)())
-            .dispatch(&mut audit, identity, request)
-        {
+        // Posting is synchronous and may take seconds. Keep the frame reader
+        // runnable even on a single-thread runtime so Cancel can set the signal.
+        let audit = self.audit.clone();
+        let make_driver = self.make_synthetic_driver.clone();
+        let dispatched = tokio::task::spawn_blocking(move || {
+            let mut audit = audit.blocking_lock();
+            Dispatcher::new(make_driver(), &|| cancel.is_cancelled())
+                .dispatch(&mut audit, identity, request)
+        })
+        .await
+        .unwrap_or(Err(DispatchError::Platform));
+        match dispatched {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
                     return synthetic_dispatch_refusal(&DispatchError::AuditUnavailable);
@@ -2349,6 +2367,21 @@ fn synthetic_point_from_wire(
 /// stopped -- is in the audit record the dispatcher finalised before this
 /// answer.
 fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
+    if let DispatchError::Cancelled {
+        posts_returned,
+        held_state,
+    } = refusal
+    {
+        return json!({
+            "outcome": "cancelled", "posts_returned": posts_returned,
+            "reason": match held_state {
+                HeldStateDisposition::NoneHeld => "caller_interrupted_none_held",
+                HeldStateDisposition::Released { .. } => "caller_interrupted_held_input_released",
+                HeldStateDisposition::Unknown => "caller_interrupted_held_state_unknown",
+            },
+            "remedy": "the action was interrupted by the caller; no retry is implied",
+        });
+    }
     let outcome = match refusal {
         DispatchError::SyntheticSequenceFailed {
             held_state: HeldStateDisposition::Unknown,
@@ -2357,16 +2390,19 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
         DispatchError::SyntheticSequenceFailed { .. } => "dispatch_failed",
         other => other.reason_code(),
     };
-    json!({"outcome": outcome})
+    let mut reply = json!({"outcome": outcome});
+    if let DispatchError::SyntheticSequenceFailed { posts_returned, .. } = refusal {
+        reply["posts_returned"] = json!(posts_returned);
+    }
+    reply
 }
 
 /// Give every synthetic-input outcome the result envelope its vocabulary row
 /// declares.
 ///
 /// The three focus-delivered rows declare `outcome`, `containment_rung` and
-/// `effect_status`. `computer.move` and `computer.drag` declare no rung:
-/// their delivery is coordinate-addressed and always records the weakest one,
-/// so carrying the field would assert a distinction the row does not make.
+/// `effect_status`. Move and drag also permit an optional containment rung;
+/// preserve it when dispatch measured one without inventing it on refusals.
 /// `detail` is an implementation diagnostic and is stripped here rather than
 /// shipped. The five rows declare `field`, `reason`, `remedy`, and `chord` so
 /// a refusal tells callers what failed and how to continue.
@@ -2392,8 +2428,6 @@ fn synthetic_wire_envelope(mut reply: Value, carries_containment_rung: bool) -> 
         object
             .entry("containment_rung")
             .or_insert_with(|| Value::String("global_none".to_string()));
-    } else {
-        object.remove("containment_rung");
     }
     object.remove("detail");
     reply
@@ -2816,6 +2850,7 @@ mod click_vocabulary_v3_tests {
         fn dispatch_per_pid(
             &mut self,
             _request: cerebellum_computer::platform::SyntheticDispatchRequest,
+            _cancelled: &dyn Fn() -> bool,
         ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
             Err(DriverError::Unsupported(
                 "test does not dispatch synthetic input",
@@ -2825,6 +2860,7 @@ mod click_vocabulary_v3_tests {
         fn dispatch_global(
             &mut self,
             _request: cerebellum_computer::platform::GlobalDispatchRequest,
+            _cancelled: &dyn Fn() -> bool,
         ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
             Err(DriverError::Unsupported(
                 "test does not dispatch synthetic input",
@@ -3806,5 +3842,97 @@ mod startup_reconciliation_tests {
              follows: a crash-orphaned actuation stays orphaned, and the entry \
              recording that a press may have landed is never resolved by anyone."
         );
+    }
+}
+
+#[cfg(test)]
+mod cancel_wire_tests {
+    use super::*;
+    use cerebellum_computer::audit::redaction::ExcludeApplicationText;
+    use cerebellum_computer::capture::InMemoryCaptureBackend;
+    use cerebellum_computer::capture_custody::{
+        CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+    };
+    use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
+
+    #[tokio::test]
+    async fn the_cancel_reply_carries_posts_returned_through_withholding() {
+        let custody = CaptureCustody::new(
+            CustodyBounds {
+                maximum_verification_duration_ms: 100,
+                maximum_pin_lifetime_ms: 100,
+                maximum_concurrently_pinned_artifacts: 2,
+                maximum_total_pinned_artifact_bytes: 1000,
+                maximum_custody_attachment_bytes: 1000,
+            },
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .unwrap();
+        let audit = ComputerAudit::new(
+            ExcludeApplicationText,
+            cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+            JournalConfig {
+                journal_retention_bytes: 20000,
+                journal_max_entry_bytes: 4000,
+            },
+            InMemoryJournalStorage::default(),
+            custody,
+        )
+        .unwrap();
+        let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
+            ComputerPlane::with_result_schema_enforcement(audit, ResultSchemaEnforcement::Withhold);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for capability in [
+            ComputerCapability::Type,
+            ComputerCapability::Keys,
+            ComputerCapability::Scroll,
+            ComputerCapability::Move,
+            ComputerCapability::Drag,
+        ] {
+            let reply = synthetic_wire_envelope(
+                synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                    posts_returned: 2,
+                    held_state: HeldStateDisposition::Released { posts_returned: 1 },
+                }),
+                matches!(
+                    capability,
+                    ComputerCapability::Type
+                        | ComputerCapability::Keys
+                        | ComputerCapability::Scroll
+                ),
+            );
+            match plane.finish_reply(capability, reply) {
+                Ok(reply) => crate::send_tool_response(&tx, 1, 7, 1, 42, reply)
+                    .await
+                    .unwrap(),
+                Err(error) => crate::send_route_error(
+                    &tx,
+                    1,
+                    7,
+                    1,
+                    42,
+                    "computer_result_schema_violation",
+                    &error.to_string(),
+                )
+                .await
+                .unwrap(),
+            }
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(
+                frame.header.ty,
+                subc_protocol::FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&frame.body)
+            );
+            let wire: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(wire["outcome"], "cancelled");
+            assert_eq!(wire["posts_returned"], 2);
+            assert_eq!(wire["reason"], "caller_interrupted_held_input_released");
+            assert_eq!(
+                wire["remedy"],
+                "the action was interrupted by the caller; no retry is implied"
+            );
+        }
     }
 }

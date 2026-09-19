@@ -222,6 +222,7 @@ struct RecordingDriver {
     /// An exact stop decision for the global path to return, when a test needs
     /// to name the numbers rather than accept the ones this driver derives.
     global_abort: Option<AbortDecision>,
+    cancellation_posts: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for RecordingDriver {
@@ -272,6 +273,7 @@ impl Default for RecordingDriver {
             dispatch_probe: None,
             panic_during_semantic_dispatch: false,
             global_abort: None,
+            cancellation_posts: None,
         }
     }
 }
@@ -314,13 +316,36 @@ impl PlatformDriver for RecordingDriver {
     fn dispatch_per_pid(
         &mut self,
         _request: SyntheticDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+        if let Some(posts) = &self.cancellation_posts {
+            use cerebellum_computer::platform::process_event::*;
+            let steps = (0..5)
+                .map(|event| SyntheticStep {
+                    event,
+                    role: SyntheticStepRole::SelfContained,
+                })
+                .collect();
+            let failure = post_guarded_event_sequence(steps, cancelled, |_, event, _| {
+                if event.is_some() {
+                    posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok::<_, ProcessEventRefusal>(2)
+            })
+            .expect_err("script must be cancelled");
+            return Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+                posts_returned: failure.posts_returned,
+                refusal: failure.refusal.unwrap_or(ProcessEventRefusal::Cancelled),
+                held_state: failure.held_state,
+            }));
+        }
         self.per_pid_calls += 1;
         Ok(self.per_pid_result.clone())
     }
     fn dispatch_global(
         &mut self,
         request: GlobalDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
         if let Some(abort) = self.global_abort {
             return Err(DriverError::ObservedDispatchAborted(abort));
@@ -508,7 +533,10 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
         }),
         ..RecordingDriver::default()
     };
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let report = dispatcher
         .dispatch(
             &mut audit(),
@@ -550,7 +578,10 @@ fn press_and_cancel_reach_the_same_audited_semantic_platform_path() {
             FrozenDispatchRow::for_capability("computer.click").unwrap(),
             action,
         );
-        let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+        let mut dispatcher = Dispatcher::new(
+            RecordingDriver::default(),
+            &cerebellum_computer::platform::process_event::never_cancelled,
+        );
         let mut audit = audit();
 
         let report = dispatcher
@@ -587,9 +618,12 @@ fn semantic_delivery_cannot_report_a_non_semantic_rung() {
     let mut request =
         semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
     request.identity = None;
-    let report = Dispatcher::new(RecordingDriver::default())
-        .dispatch(&mut audit(), audit_identity(), request)
-        .expect("semantic delivery has element-scoped containment without structural evidence");
+    let report = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    )
+    .dispatch(&mut audit(), audit_identity(), request)
+    .expect("semantic delivery has element-scoped containment without structural evidence");
 
     assert_eq!(
         report.delivery_primitive,
@@ -608,9 +642,12 @@ fn semantic_reply_and_journal_use_the_same_containment_rung() {
         semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
     request.identity = None;
     let mut audit = audit();
-    let report = Dispatcher::new(RecordingDriver::default())
-        .dispatch(&mut audit, audit_identity(), request)
-        .expect("semantic delivery is recorded before returning its report");
+    let report = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    )
+    .dispatch(&mut audit, audit_identity(), request)
+    .expect("semantic delivery is recorded before returning its report");
 
     assert_eq!(
         report.delivery_primitive,
@@ -663,7 +700,10 @@ fn mode_and_delivery_primitive_are_not_substituted() {
         0,
     )
     .with_synthetic(SyntheticAction::type_text("x"));
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     assert_eq!(
         dispatcher.dispatch(&mut audit(), audit_identity(), request),
         Err(DispatchError::EnvelopeUnrecognized)
@@ -691,7 +731,10 @@ fn mode_and_delivery_primitive_are_not_substituted() {
     )
     .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0));
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     assert_eq!(
         dispatcher.dispatch(&mut audit(), audit_identity(), request),
         Err(DispatchError::AttendanceUnavailable)
@@ -727,7 +770,10 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
     .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0))
     .with_once_dispatch_token(once_dispatch_token());
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit();
     let sequence = dispatcher
         .dispatch_sequence(&mut audit, &audit_identity(), [request])
@@ -818,7 +864,10 @@ fn an_observed_abort_journals_its_numbers_while_the_wire_reply_carries_none() {
     .with_focus_plan(FocusCheckPlan::immediate(0))
     .with_once_dispatch_token(once_dispatch_token());
 
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit();
     let refusal = dispatcher
         .dispatch(&mut audit, audit_identity(), request)
@@ -879,7 +928,10 @@ fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
         x: 10.0,
         y: 20.0,
     }));
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let report = dispatcher
         .dispatch(&mut audit(), audit_identity(), request)
         .unwrap();
@@ -963,7 +1015,10 @@ fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one()
     )
     .with_synthetic(SyntheticAction::type_text("x"));
     let mut audit = audit();
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let report = dispatcher
         .dispatch(&mut audit, audit_identity(), request)
         .expect("per-pid delivery succeeds against the recording driver");
@@ -1034,9 +1089,12 @@ fn a_hoisted_generation_check_cannot_earn_atomic_per_pid_binding() {
     let mut driver = RecordingDriver::default();
     driver.per_pid_result.delivery_generation_verifications = 3;
 
-    let report = Dispatcher::new(driver)
-        .dispatch(&mut audit(), audit_identity(), request)
-        .expect("global-none authorization records a non-atomic delivery honestly");
+    let report = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    )
+    .dispatch(&mut audit(), audit_identity(), request)
+    .expect("global-none authorization records a non-atomic delivery honestly");
     let delivery_identity = report
         .containment
         .identity
@@ -1097,7 +1155,10 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         0,
     )
     .with_synthetic(SyntheticAction::type_text("x"));
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     assert!(dispatcher
         .dispatch(&mut audit(), audit_identity(), valid_request)
         .is_ok());
@@ -1324,7 +1385,10 @@ fn seize_latency_must_fit_between_observed_posts() {
     .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(1))
     .with_once_dispatch_token(once_dispatch_token());
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let result = dispatcher
         .dispatch_sequence(&mut audit(), &audit_identity(), [first, second])
         .unwrap();
@@ -1344,7 +1408,10 @@ fn unsupported_semantic_path_reaches_the_caller_without_a_synthetic_retry() {
     };
     let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
         .with_synthetic(SyntheticAction::type_text("x"));
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit();
 
     let refusal = dispatcher
@@ -1398,7 +1465,10 @@ fn observed_focus_mismatch_prevents_the_global_post() {
     .with_synthetic(SyntheticAction::type_text("x"))
     .with_focus_plan(FocusCheckPlan::immediate(0))
     .with_once_dispatch_token(once_dispatch_token());
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     assert_eq!(
         dispatcher.dispatch(&mut audit(), audit_identity(), request),
         Err(DispatchError::TargetFocusMismatch)
@@ -1412,7 +1482,10 @@ fn unavailable_effect_observer_is_one_indeterminate_status() {
         effect: Err(DriverError::Unsupported("effect")),
         ..RecordingDriver::default()
     };
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let report = dispatcher
         .dispatch(
             &mut audit(),
@@ -1434,7 +1507,10 @@ fn fronting_downgrade_does_not_forfeit_semantic_delivery_containment() {
         ..RecordingDriver::default()
     };
     let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let report = dispatcher
         .dispatch(&mut audit(), audit_identity(), request)
         .unwrap();
@@ -1481,7 +1557,10 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
         )
         .with_synthetic(SyntheticAction::type_text("x"));
 
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let report = dispatcher
         .dispatch(&mut audit(), audit_identity(), request)
         .unwrap();
@@ -1517,7 +1596,10 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
             SEMANTIC_CANCEL_ACTION,
         )
         .with_synthetic(SyntheticAction::type_text("x"));
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit();
 
     let refusal = dispatcher
@@ -1565,7 +1647,10 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
 /// screen happened to satisfy the condition.
 #[test]
 fn the_effect_is_observed_in_the_authorised_application() {
-    let mut dispatcher = Dispatcher::new(RecordingDriver::default());
+    let mut dispatcher = Dispatcher::new(
+        RecordingDriver::default(),
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     dispatcher
         .dispatch(
             &mut audit(),
@@ -1715,7 +1800,10 @@ fn every_semantic_refusal_reaches_the_caller_with_its_remedy_payload() {
             semantic_result: Err(driver_error),
             ..RecordingDriver::default()
         };
-        let mut dispatcher = Dispatcher::new(driver);
+        let mut dispatcher = Dispatcher::new(
+            driver,
+            &cerebellum_computer::platform::process_event::never_cancelled,
+        );
         let mut audit = audit();
         let refusal = dispatcher
             .dispatch(
@@ -1757,7 +1845,10 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
             },
             SEMANTIC_PRESS_ACTION,
         );
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit_with_storage(storage);
 
     dispatcher
@@ -1817,7 +1908,10 @@ fn partial_action_tree_disclosure_reaches_caller_and_decoded_audit_entry() {
         }),
         ..RecordingDriver::default()
     };
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit();
 
     let report = dispatcher
@@ -1848,7 +1942,10 @@ fn a_crash_between_intent_and_outcome_remains_indeterminate_and_is_not_retried()
         panic_during_semantic_dispatch: true,
         ..RecordingDriver::default()
     };
-    let mut dispatcher = Dispatcher::new(driver);
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
     let mut audit = audit_with_storage(storage);
 
     let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1879,4 +1976,55 @@ fn a_crash_between_intent_and_outcome_remains_indeterminate_and_is_not_retried()
     assert_eq!(entry["phase"], json!("recovery_terminal"));
     assert_eq!(entry["classification"], json!("indeterminate"));
     assert!(entry.get("completed_result").is_none());
+}
+
+#[test]
+fn a_cancelled_dispatch_is_finalized_as_cancelled() {
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver = RecordingDriver {
+        cancellation_posts: Some(posts.clone()),
+        ..RecordingDriver::default()
+    };
+    let request = DispatchRequest::new(
+        FrozenDispatchRow::for_capability("computer.type").unwrap(),
+        DispatchMode::Background,
+        target(),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element: AccessibilityElementName::identifier("element-1"),
+                expected: true,
+            },
+        ),
+        background_attendance(),
+        0,
+    )
+    .with_synthetic(SyntheticAction::type_text("abcde"));
+    let mut audit = audit();
+    let cancelled = || posts.load(std::sync::atomic::Ordering::SeqCst) >= 2;
+    let refusal = Dispatcher::new(driver, &cancelled)
+        .dispatch(&mut audit, audit_identity(), request)
+        .unwrap_err();
+    assert_eq!(
+        refusal,
+        DispatchError::Cancelled {
+            posts_returned: 2,
+            held_state: HeldStateDisposition::NoneHeld
+        }
+    );
+    assert_eq!(audit.journal().unfinalized_dispatch_count(), 0);
+    let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+        &audit.journal().export_bytes(),
+    )
+    .unwrap();
+    assert_eq!(entry["phase"], "finalized");
+    let outcome: cerebellum_computer::audit::ActuationOutcome =
+        serde_json::from_value(decode_embedded_json(&entry["completed_result"])).unwrap();
+    assert_eq!(
+        outcome,
+        cerebellum_computer::audit::ActuationOutcome::Cancelled {
+            posts_returned: 2,
+            held_state: HeldStateDisposition::NoneHeld
+        }
+    );
 }

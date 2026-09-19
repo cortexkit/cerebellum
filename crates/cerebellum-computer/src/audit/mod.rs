@@ -728,6 +728,13 @@ pub struct ActuationIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ActuationOutcome {
+    /// The caller interrupted a live action. Unlike
+    /// `ComputerRecoveryAction::Cancelled`, this is an observed action outcome,
+    /// not a startup recovery lifecycle classification.
+    Cancelled {
+        posts_returned: u64,
+        held_state: crate::platform::process_event::HeldStateDisposition,
+    },
     HandlerReturned {
         /// Subtrees omitted from the accessibility tree used for the actuation.
         unreadable_subtrees: u64,

@@ -1592,6 +1592,73 @@ where
 type RouteTestHandler =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
+/// A caller-owned interrupt signal; firing it never aborts the task that must
+/// release held input and finalize the journal.
+#[derive(Clone, Debug)]
+pub struct CancelHandle(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelHandle {
+    pub fn pending() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    pub fn for_uninterruptible_probe() -> Self {
+        Self::pending()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+type RequestKey = (u16, u32, u64);
+type RequestCancelMap = std::collections::BTreeMap<RequestKey, CancelHandle>;
+
+#[derive(Clone, Default)]
+struct RequestCancellations(Arc<std::sync::Mutex<RequestCancelMap>>);
+
+struct RequestCancellationGuard {
+    registry: RequestCancellations,
+    key: (u16, u32, u64),
+    handle: CancelHandle,
+}
+
+impl RequestCancellations {
+    fn register(&self, key: (u16, u32, u64)) -> RequestCancellationGuard {
+        let handle = CancelHandle::pending();
+        self.0.lock().unwrap().insert(key, handle.clone());
+        RequestCancellationGuard {
+            registry: self.clone(),
+            key,
+            handle,
+        }
+    }
+    fn get(&self, key: (u16, u32, u64)) -> Option<CancelHandle> {
+        self.0.lock().unwrap().get(&key).cloned()
+    }
+    fn cancel_route(&self, channel: u16, epoch: u32) {
+        for ((c, e, _), handle) in self.0.lock().unwrap().iter() {
+            if (*c, *e) == (channel, epoch) {
+                handle.cancel();
+            }
+        }
+    }
+}
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        let mut registry = self.registry.0.lock().unwrap();
+        // A reused correlation must not be removed by the older task's drop.
+        if registry
+            .get(&self.key)
+            .is_some_and(|handle| Arc::ptr_eq(&handle.0, &self.handle.0))
+        {
+            registry.remove(&self.key);
+        }
+    }
+}
+
 /// The long-lived state a running module serves requests from.
 ///
 /// Bundled rather than passed separately because these travel together
@@ -1602,6 +1669,7 @@ pub struct Planes {
     #[cfg(test)]
     route_test_handler: Option<RouteTestHandler>,
     pub health: Arc<HealthState>,
+    cancellations: RequestCancellations,
     draining: Arc<std::sync::atomic::AtomicBool>,
     drain_notice: Arc<std::sync::OnceLock<(subc_protocol::RouteCloseReason, u64)>>,
     pub routes: Arc<RouteBindings>,
@@ -1823,6 +1891,7 @@ impl Planes {
             route_test_handler: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
+            cancellations: RequestCancellations::default(),
             elicitor: Arc::new(Elicitor::new()),
         }
     }
@@ -1849,6 +1918,7 @@ impl Clone for Planes {
             #[cfg(test)]
             route_test_handler: self.route_test_handler.clone(),
             health: Arc::clone(&self.health),
+            cancellations: self.cancellations.clone(),
             draining: self.draining.clone(),
             drain_notice: self.drain_notice.clone(),
             routes: Arc::clone(&self.routes),
@@ -1932,6 +2002,9 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            planes
+                .cancellations
+                .cancel_route(frame.header.channel, frame.header.epoch);
             if let Some(facts) = planes
                 .routes
                 .remove(frame.header.channel, frame.header.epoch)
@@ -1943,6 +2016,23 @@ async fn handle_frame(
                         config,
                     );
                 }
+            }
+            Ok(true)
+        }
+        FrameType::Cancel => {
+            match (
+                frame.header.channel,
+                planes.cancellations.get((
+                    frame.header.channel,
+                    frame.header.epoch,
+                    frame.header.corr,
+                )),
+            ) {
+                (0, _) => {}
+                (_, Some(handle)) => handle.cancel(),
+                // Replies commonly win the race. Unknown or late correlations
+                // are explicitly ignored without a reply, error, or log.
+                (_, None) => {}
             }
             Ok(true)
         }
@@ -1980,6 +2070,11 @@ async fn handle_frame(
                 send(writer, refusal).await?;
                 return Ok(true);
             }
+            let cancellation = planes.cancellations.register((
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+            ));
             let guard = planes.health.enter_request();
             let writer = writer.clone();
             let planes = planes.clone();
@@ -1988,6 +2083,7 @@ async fn handle_frame(
                 if let Some(handler) = &planes.route_test_handler {
                     handler().await;
                 }
+                let _cancellation = cancellation;
                 let _ = handle_route_request(frame, &writer, &planes).await;
             }));
             Ok(true)
@@ -3087,6 +3183,10 @@ async fn handle_tool_request(
                 servable,
                 arguments,
                 computer_capability::ServeContext {
+                    cancel: planes
+                        .cancellations
+                        .get((channel, epoch, corr))
+                        .expect("route request registered before spawn"),
                     // The durable agent identity, taken from the accepted bind
                     // rather than from the request: an identity a caller could
                     // choose is a lease granted to whoever asks for it.
@@ -3650,7 +3750,7 @@ pub async fn handle_tool_request_for_test_with_planes(
     planes: &Planes,
 ) -> Result<(), ModuleError> {
     install_test_bind(&planes.routes, &frame);
-    handle_tool_request(frame, writer, planes).await
+    handle_tool_request_for_test_with_existing_planes(frame, writer, planes).await
 }
 
 pub async fn handle_tool_request_for_test_with_existing_planes(
@@ -3658,6 +3758,14 @@ pub async fn handle_tool_request_for_test_with_existing_planes(
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
+    // Direct handler tests bypass the frame reader. Register their cancellation
+    // entry until the handler finishes, just as production does before spawning
+    // the request, rather than letting a missing entry mean never cancellable.
+    let _cancellation = planes.cancellations.register((
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    ));
     handle_tool_request(frame, writer, planes).await
 }
 
@@ -3674,7 +3782,7 @@ pub async fn handle_tool_request_for_test(
     {
         planes.computer_admitted = test_admitted_computer_capabilities();
     }
-    handle_tool_request(frame, writer, &planes).await
+    handle_tool_request_for_test_with_existing_planes(frame, writer, &planes).await
 }
 
 /// Drive one tool request with an explicit admitted set.
@@ -3697,7 +3805,7 @@ pub async fn handle_tool_request_for_test_admitting(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = admitted;
-    handle_tool_request(frame, writer, &planes).await
+    handle_tool_request_for_test_with_existing_planes(frame, writer, &planes).await
 }
 
 /// Like [`handle_tool_request_for_test_admitting`] on a host with NO browser
@@ -3721,7 +3829,7 @@ pub async fn handle_tool_request_for_test_unconfigured_browser(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = admitted;
-    handle_tool_request(frame, writer, &planes).await
+    handle_tool_request_for_test_with_existing_planes(frame, writer, &planes).await
 }
 
 pub async fn handle_tool_request_for_test_with_bindings(
@@ -3736,7 +3844,7 @@ pub async fn handle_tool_request_for_test_with_bindings(
     {
         planes.computer_admitted = test_admitted_computer_capabilities();
     }
-    handle_tool_request(frame, writer, &planes).await
+    handle_tool_request_for_test_with_existing_planes(frame, writer, &planes).await
 }
 
 #[cfg(test)]
@@ -4464,6 +4572,7 @@ mod tests {
         .unwrap();
 
         let planes = Planes {
+            cancellations: RequestCancellations::default(),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health,
@@ -4514,6 +4623,7 @@ mod tests {
         .unwrap();
 
         let planes = Planes {
+            cancellations: RequestCancellations::default(),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
@@ -4714,6 +4824,7 @@ mod tests {
     async fn an_unsupported_surface_is_refused_by_name() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = Planes {
+            cancellations: RequestCancellations::default(),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
@@ -4778,6 +4889,7 @@ mod tests {
     /// Planes whose only route is bound to the management surface.
     pub(super) fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
         let planes = Planes {
+            cancellations: RequestCancellations::default(),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
@@ -6020,5 +6132,108 @@ mod drain_tests {
         .unwrap());
         assert!(rx.try_recv().is_err());
         assert!(!planes.draining.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod cancel_frame_tests {
+    use super::*;
+
+    fn planes() -> Planes {
+        Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        )
+    }
+
+    fn frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {
+        Frame::build(ty, control_flags(), channel, epoch, corr, b"{}".to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancel_for_an_unknown_corr_is_ignored_by_name() {
+        let planes = planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        for channel in [0, 7] {
+            assert!(
+                handle_frame(frame(FrameType::Cancel, channel, 1, 42), &tx, &planes)
+                    .await
+                    .unwrap()
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        assert!(handle_frame(frame(FrameType::Ping, 0, 0, 43), &tx, &planes)
+            .await
+            .unwrap());
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Pong);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_after_the_reply_does_not_disturb_the_next_request() {
+        let planes = planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(frame(FrameType::Request, 7, 1, 42), &tx, &planes)
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.corr, 42);
+        tokio::task::yield_now().await;
+        assert!(planes.cancellations.get((7, 1, 42)).is_none());
+        handle_frame(frame(FrameType::Cancel, 7, 1, 42), &tx, &planes)
+            .await
+            .unwrap();
+        handle_frame(frame(FrameType::Request, 7, 1, 43), &tx, &planes)
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.corr, 43);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_close_cancels_every_request_on_that_route() {
+        let mut planes = planes();
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let parked = resume.clone();
+        planes.route_test_handler = Some(Arc::new(move || {
+            let parked = parked.clone();
+            Box::pin(async move {
+                parked.notified().await;
+            })
+        }));
+        let (tx, _rx) = mpsc::channel(8);
+        for (channel, epoch, corr) in [(7, 1, 42), (7, 1, 43), (7, 2, 44), (8, 1, 45)] {
+            handle_frame(
+                frame(FrameType::Request, channel, epoch, corr),
+                &tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+        }
+        let first = planes.cancellations.get((7, 1, 42)).unwrap();
+        let second = planes.cancellations.get((7, 1, 43)).unwrap();
+        let other_epoch = planes.cancellations.get((7, 2, 44)).unwrap();
+        let other_channel = planes.cancellations.get((8, 1, 45)).unwrap();
+        handle_frame(frame(FrameType::Cancel, 7, 1, 42), &tx, &planes)
+            .await
+            .unwrap();
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        handle_frame(frame(FrameType::Goodbye, 7, 1, 0), &tx, &planes)
+            .await
+            .unwrap();
+        assert!(second.is_cancelled());
+        assert!(!other_epoch.is_cancelled());
+        assert!(!other_channel.is_cancelled());
+        tokio::task::yield_now().await;
+        resume.notify_waiters();
+        tokio::task::yield_now().await;
+        assert!(planes.cancellations.0.lock().unwrap().is_empty());
     }
 }

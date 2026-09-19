@@ -46,6 +46,7 @@ enum DispatchedCall {
 #[derive(Debug)]
 struct Shared {
     calls: Vec<DispatchedCall>,
+    interrupt_after_two: Option<Arc<tokio::sync::Notify>>,
     per_pid: Result<DispatchResult, DriverError>,
     global: Result<DispatchResult, DriverError>,
 }
@@ -54,6 +55,7 @@ impl Shared {
     fn handle() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             calls: Vec::new(),
+            interrupt_after_two: None,
             per_pid: Ok(DispatchResult {
                 accepted_by_platform: true,
                 effect_status: EffectStatus::EffectIndeterminate,
@@ -116,15 +118,43 @@ impl PlatformDriver for SyntheticDriver {
     fn dispatch_per_pid(
         &mut self,
         request: SyntheticDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         let mut shared = self.0.lock().unwrap();
         shared.calls.push(DispatchedCall::PerPid(request));
+        if let Some(posted) = shared.interrupt_after_two.clone() {
+            drop(shared);
+            use cerebellum_computer::platform::process_event::*;
+            let steps = (0..5)
+                .map(|event| SyntheticStep {
+                    event,
+                    role: SyntheticStepRole::SelfContained,
+                })
+                .collect();
+            let failure = post_guarded_event_sequence(steps, cancelled, |_, event, _| {
+                if event == Some(1) {
+                    posted.notify_one();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !cancelled() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                Ok::<_, ProcessEventRefusal>(2)
+            })
+            .expect_err("caller cancellation reached the synchronous sequence");
+            return Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+                posts_returned: failure.posts_returned,
+                refusal: failure.refusal.unwrap_or(ProcessEventRefusal::Cancelled),
+                held_state: failure.held_state,
+            }));
+        }
         shared.per_pid.clone()
     }
 
     fn dispatch_global(
         &mut self,
         request: cerebellum_computer::platform::GlobalDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         let mut shared = self.0.lock().unwrap();
         shared.calls.push(DispatchedCall::Global(request.synthetic));
@@ -220,6 +250,7 @@ async fn serve(
             servable(name).expect("the capability is servable"),
             &arguments,
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management,
@@ -406,13 +437,12 @@ async fn computer_move_dispatches_through_the_global_path_while_observed() {
         reply,
         json!({
             "outcome": "completed",
+            "containment_rung": "global_none",
             "containment_forfeited_because": "coordinate_addressed",
             "target_fronted": false,
             "effect_status": "effect_indeterminate",
         }),
-        "the move row declares no containment rung, so the reply still says WHY \
-         -- a caller reading an absent rung cannot otherwise tell a \
-         coordinate-addressed row from a failed one"
+        "the move row reports the measured rung and why it was forfeited"
     );
     let calls = dispatched_calls(&shared);
     let [DispatchedCall::Global(request)] = &calls[..] else {
@@ -476,6 +506,7 @@ async fn withholding_mode_preserves_move_once_grant_remedy() {
             servable("computer.move").expect("move is servable"),
             &move_request(),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -722,6 +753,7 @@ async fn withholding_mode_preserves_keys_invalid_request_diagnostics() {
             servable("computer.keys").expect("keys is servable"),
             &keys_request(&["a", "b"]),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -758,13 +790,12 @@ async fn computer_drag_dispatches_its_drag_events_through_observed_global_input(
         reply,
         json!({
             "outcome": "completed",
+            "containment_rung": "global_none",
             "containment_forfeited_because": "coordinate_addressed",
             "target_fronted": false,
             "effect_status": "effect_indeterminate",
         }),
-        "the drag row declares no containment rung, so the reply still says WHY \
-         -- a caller reading an absent rung cannot otherwise tell a \
-         coordinate-addressed row from a failed one"
+        "the drag row reports the measured rung and why it was forfeited"
     );
     let calls = dispatched_calls(&shared);
     let [DispatchedCall::Global(request)] = &calls[..] else {
@@ -909,6 +940,7 @@ async fn an_unknown_held_state_reaches_the_caller_unflattened() {
         reply,
         json!({
             "outcome": "held_state_unknown",
+            "posts_returned": 2,
             "containment_rung": "global_none",
             // Present even on a refusal: false here means nothing established
             // that the target was fronted, which is not the same claim as the
@@ -1106,4 +1138,43 @@ fn base64_of(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn a_single_thread_runtime_can_interrupt_a_posting_computer_action() {
+    let shared = Shared::handle();
+    let posted = Arc::new(tokio::sync::Notify::new());
+    shared.lock().unwrap().interrupt_after_two = Some(posted.clone());
+    let plane = plane_with(&shared);
+    let clock = FakeClock::new();
+    let management = management_leased(ActionKind::Compose, &clock).await;
+    let cancel = cerebellum::CancelHandle::pending();
+    let arguments = json!({"target":"editor", "text":"abcde", "replace_selection": false});
+    let serving = plane.serve(
+        servable("computer.type").unwrap(),
+        &arguments,
+        ServeContext {
+            cancel: cancel.clone(),
+            grantee: GRANTEE,
+            identity: identity(),
+            management: &management,
+            clock: &clock,
+            now_ms: 10,
+        },
+        |_| InMemoryCaptureBackend::default(),
+    );
+    let interrupt = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), posted.notified())
+            .await
+            .expect("the cancel never reached the loop: the action did not signal its second post; check fixture admission and synchronous dispatch scheduling");
+        cancel.cancel();
+    };
+    let (reply, ()) = tokio::join!(serving, interrupt);
+    let reply = reply.unwrap();
+    assert_eq!(reply["outcome"], "cancelled");
+    assert_eq!(reply["posts_returned"], 2);
+    assert_eq!(
+        plane.obligation_lifecycle(1).await,
+        Some(LifecycleState::Finalized)
+    );
 }

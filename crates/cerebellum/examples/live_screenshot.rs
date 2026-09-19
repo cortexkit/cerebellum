@@ -104,6 +104,7 @@ fn main() {
                 servable("computer.screenshot").expect("screenshot is servable"),
                 &json!({ "scope": "target_windows", "include_cursor": false }),
                 ServeContext {
+                    cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                     grantee,
                     identity: JournalIdentity {
                         principal: "prefrontal-core".to_string(),

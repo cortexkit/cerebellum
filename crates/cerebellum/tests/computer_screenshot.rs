@@ -88,6 +88,7 @@ async fn a_screenshot_without_a_lease_is_refused_with_the_recipe() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &request(),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &management(),
@@ -121,6 +122,7 @@ async fn whole_display_capture_is_refused() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "display", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &management(),
@@ -150,6 +152,7 @@ async fn asking_for_the_cursor_is_an_invalid_request() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": true }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &management(),
@@ -182,6 +185,7 @@ async fn waiting_reports_an_unreadable_authorized_target_as_indeterminate() {
                 "timeout_ms": 250,
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &management(),
@@ -216,6 +220,7 @@ async fn declared_screenshot_refusal_leaves_no_result_schema_finding() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": true }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &management(),
@@ -244,6 +249,7 @@ async fn withholding_mode_permits_a_declared_refusal() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": true }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &management(),
@@ -281,6 +287,7 @@ async fn a_failed_capture_is_still_recorded() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &request(),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,
@@ -326,6 +333,7 @@ async fn runtime_journal_save_failure_prevents_capture() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &request(),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,
@@ -371,6 +379,7 @@ async fn a_request_without_region_captures_the_whole_window() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,
@@ -474,6 +483,7 @@ async fn a_region_request_returns_the_named_window_rows() {
                 "region": { "x_px": 10, "y_px": 20, "width_px": 30, "height_px": 16 }
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,
@@ -546,6 +556,7 @@ async fn a_null_region_request_is_rejected_as_the_wrong_type() {
                 "region": null
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,
@@ -586,6 +597,7 @@ async fn a_target_with_no_capturable_window_says_so() {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,
@@ -740,6 +752,7 @@ async fn a_region_outside_the_window_is_refused() {
                 "region": { "x_px": 70, "y_px": 20, "width_px": 30, "height_px": 16 }
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: "pj-example",
                 identity: identity(),
                 management: &leased_management(&clock).await,

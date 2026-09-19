@@ -973,6 +973,8 @@ impl PlatformDriver for WindowsPlatformDriver {
     fn dispatch_per_pid(
         &mut self,
         _request: SyntheticDispatchRequest,
+        // Windows synthetic delivery is unsupported; no post loop can ignore an interrupt.
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         Err(DriverError::Unsupported(
             "Windows per-process synthetic dispatch",
@@ -982,6 +984,8 @@ impl PlatformDriver for WindowsPlatformDriver {
     fn dispatch_global(
         &mut self,
         _request: GlobalDispatchRequest,
+        // Windows synthetic delivery is unsupported; no post loop can ignore an interrupt.
+        _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         Err(DriverError::Unsupported(
             "Windows global synthetic dispatch",

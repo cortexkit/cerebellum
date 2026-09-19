@@ -169,6 +169,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
                 "region": null,
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -192,6 +193,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "display", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -212,6 +214,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "all_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -244,6 +247,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -264,6 +268,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -284,6 +289,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &request(),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -306,6 +312,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -329,6 +336,7 @@ async fn served_screenshot_replies() -> Vec<Value> {
             servable("computer.screenshot").expect("screenshot is servable"),
             &json!({ "scope": "target_windows", "include_cursor": false }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -371,6 +379,7 @@ async fn served_synthetic_replies() -> Vec<(&'static str, Value)> {
                 servable(capability_id).expect("synthetic capability is servable"),
                 &arguments,
                 ServeContext {
+                    cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                     grantee: GRANTEE,
                     identity: identity(),
                     management: &management,
@@ -406,6 +415,7 @@ async fn served_wait_replies() -> Vec<Value> {
                 "timeout_ms": 250,
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -432,6 +442,7 @@ async fn served_click_replies() -> Vec<Value> {
             servable("computer.click").expect("click is servable"),
             &json!({}),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
@@ -469,6 +480,7 @@ async fn served_click_replies() -> Vec<Value> {
                 "modifiers": [],
             }),
             ServeContext {
+                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,

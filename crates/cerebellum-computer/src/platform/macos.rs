@@ -166,6 +166,7 @@ const WINDOW_LIST_READ_TIMEOUT: Duration = Duration::from_millis(1_000);
 fn dispatch_synthetic_to_pid(
     request: &SyntheticDispatchRequest,
     transport: &mut impl PerProcessEventTransport<Event = cerebellum_macos::OwnedCgEvent>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<DispatchResult, DriverError> {
     // The grant records the kernel start time of the process it was made
     // for. That reading is what separates the granted process from a
@@ -183,7 +184,7 @@ fn dispatch_synthetic_to_pid(
         pid: request.target.pid,
         start_time_micros,
     };
-    let report = post_event_sequence(target, steps, transport)
+    let report = post_event_sequence(target, steps, transport, cancelled)
         .map_err(DriverError::SyntheticDispatchFailed)?;
     Ok(DispatchResult {
         // The post calls returned, and that is ALL this says: the post call
@@ -303,6 +304,7 @@ fn heartbeat_observation(
 fn dispatch_synthetic_globally(
     request: GlobalDispatchRequest,
     estimator: &mut UserIdleEstimator,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<DispatchResult, DriverError> {
     let GlobalDispatchRequest {
         synthetic,
@@ -378,10 +380,22 @@ fn dispatch_synthetic_globally(
         return Err(DriverError::ObservedDispatchAborted(abort));
     }
 
-    let mut posts_returned = 0_u64;
     let target_pid = synthetic.target.pid;
-    for (index, step) in steps.into_iter().enumerate() {
-        if index > 0 {
+    let target = ProcessEventTarget {
+        pid: target_pid,
+        start_time_micros: synthetic
+            .target
+            .process_generation_evidence
+            .parse()
+            .map_err(|_| {
+                DriverError::InvalidRequest(
+                    "process generation evidence is not a kernel start time",
+                )
+            })?,
+    };
+    let mut identity_transport = MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT);
+    let sequence = post_global_sequence(steps, cancelled, |index, event, recovery| {
+        if event.is_none() && index > 0 {
             // Wait out the inter-post interval ON the tap, not beside it: a
             // sleep followed by a drain detects an event that lands just after
             // a post only when the sleep ends, so the measured detection
@@ -408,10 +422,27 @@ fn dispatch_synthetic_globally(
                 }
             }
         }
-        drain_session_events(&tap, &mut watcher, our_pid, index);
-        if let Some(abort) = watcher.abort_decision() {
-            estimator.clear_carry();
-            return Err(DriverError::ObservedDispatchAborted(abort));
+        let Some(event) = event else {
+            drain_session_events(&tap, &mut watcher, our_pid, index);
+            if let Some(abort) = watcher.abort_decision() {
+                estimator.clear_carry();
+                return Err(DriverError::ObservedDispatchAborted(abort));
+            }
+            return Ok(0);
+        };
+        super::process_event::require_exact_generation(
+            target,
+            identity_transport.process_generation(target_pid),
+        )
+        .map_err(|_| DriverError::Unsupported("global target generation changed"))?;
+        if recovery {
+            if cerebellum_macos::frontmost_process_id() != i32::try_from(target_pid).ok() {
+                return Err(DriverError::Unsupported(
+                    "global release target is no longer frontmost",
+                ));
+            }
+            let _ = cerebellum_macos::post_event_globally(event);
+            return Ok(1);
         }
         let result = dispatch_observed_post_in_order(
             &mut watcher,
@@ -419,12 +450,11 @@ fn dispatch_synthetic_globally(
             probe,
             |_| heartbeat,
             || cerebellum_macos::frontmost_process_id() == i32::try_from(target_pid).ok(),
-            || cerebellum_macos::post_event_globally(step.event),
+            || cerebellum_macos::post_event_globally(event),
         );
         match result {
             Ok(_) => {
                 watcher.take_post_slot();
-                posts_returned = posts_returned.saturating_add(1);
                 last_post_at = Instant::now();
             }
             Err(
@@ -439,7 +469,15 @@ fn dispatch_synthetic_globally(
                 return Err(observed_abort_error(&watcher));
             }
         }
-    }
+        Ok(1)
+    });
+    let posts_returned = match sequence {
+        Ok(report) => report.posts_returned,
+        Err(failure) => {
+            estimator.clear_carry();
+            return Err(failure);
+        }
+    };
 
     let tail_until = observed_tail_deadline(last_post_at);
     let mut hardware_seen = false;
@@ -1108,14 +1146,16 @@ impl PlatformDriver for MacOs26PlatformDriver {
     fn dispatch_per_pid(
         &mut self,
         request: SyntheticDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         request.target.validate()?;
         let mut transport = MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT);
-        dispatch_synthetic_to_pid(&request, &mut transport)
+        dispatch_synthetic_to_pid(&request, &mut transport, cancelled)
     }
     fn dispatch_global(
         &mut self,
         request: GlobalDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         if self
             .global_dispatch_review_revision
@@ -1131,7 +1171,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             .user_idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        dispatch_synthetic_globally(request, &mut user_idle)
+        dispatch_synthetic_globally(request, &mut user_idle, cancelled)
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;
@@ -2439,7 +2479,11 @@ mod cached_element_tests {
             action: SyntheticAction,
             transport: &mut RecordingTransport,
         ) -> Result<DispatchResult, DriverError> {
-            dispatch_synthetic_to_pid(&request(action), transport)
+            dispatch_synthetic_to_pid(
+                &request(action),
+                transport,
+                &super::super::process_event::never_cancelled,
+            )
         }
 
         #[test]
@@ -2694,7 +2738,11 @@ mod cached_element_tests {
             let mut transport = RecordingTransport::succeeding(4);
 
             assert_eq!(
-                dispatch_synthetic_to_pid(&request, &mut transport),
+                dispatch_synthetic_to_pid(
+                    &request,
+                    &mut transport,
+                    &super::super::process_event::never_cancelled
+                ),
                 Err(DriverError::InvalidRequest(
                     "process generation evidence is not a kernel start time"
                 ))
@@ -2706,9 +2754,13 @@ mod cached_element_tests {
         fn dispatch_global_is_refused_by_the_unbound_review_key() {
             let mut driver = MacOs26PlatformDriver::default();
             let refusal = driver
-                .dispatch_global(global_request(SyntheticAction::move_pointer(
-                    SyntheticPoint { x: 0.0, y: 0.0 },
-                )))
+                .dispatch_global(
+                    global_request(SyntheticAction::move_pointer(SyntheticPoint {
+                        x: 0.0,
+                        y: 0.0,
+                    })),
+                    &super::super::process_event::never_cancelled,
+                )
                 .expect_err("an unbound global review key refuses dispatch");
 
             assert_eq!(
@@ -2717,5 +2769,67 @@ mod cached_element_tests {
                 "the refusal must name the missing release gate"
             );
         }
+    }
+}
+
+/// The global sequence owns recovery as well as cancellation: its event poster
+/// is injected so a release can be proved without holding the desktop's button.
+fn post_global_sequence<E>(
+    steps: Vec<super::process_event::SyntheticStep<E>>,
+    cancelled: &dyn Fn() -> bool,
+    post: impl FnMut(usize, Option<E>, bool) -> Result<u64, DriverError>,
+) -> Result<super::process_event::SequencePostReport, DriverError> {
+    super::process_event::post_guarded_event_sequence(steps, cancelled, post).map_err(|failure| {
+        failure.refusal.unwrap_or({
+            DriverError::SyntheticDispatchFailed(super::process_event::SequencePostFailure {
+                posts_returned: failure.posts_returned,
+                refusal: super::process_event::ProcessEventRefusal::Cancelled,
+                held_state: failure.held_state,
+            })
+        })
+    })
+}
+
+#[cfg(test)]
+mod global_cancellation_tests {
+    use super::super::process_event::{HeldStateDisposition, SyntheticStep, SyntheticStepRole};
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_cancelled_global_drag_releases_the_desktop_button() {
+        let returned = Cell::new(0);
+        let mut posted = Vec::new();
+        let steps = vec![
+            SyntheticStep {
+                event: "press",
+                role: SyntheticStepRole::Press,
+            },
+            SyntheticStep {
+                event: "move",
+                role: SyntheticStepRole::SelfContained,
+            },
+            SyntheticStep {
+                event: "release",
+                role: SyntheticStepRole::Release,
+            },
+        ];
+        let failure = post_global_sequence(steps, &|| returned.get() == 1, |_, event, recovery| {
+            if let Some(event) = event {
+                posted.push((event, recovery));
+                returned.set(returned.get() + 1);
+            }
+            Ok(1)
+        })
+        .unwrap_err();
+        let DriverError::SyntheticDispatchFailed(failure) = failure else {
+            panic!("not a sequence cancellation")
+        };
+        assert_eq!(failure.posts_returned, 1);
+        assert_eq!(
+            failure.held_state,
+            HeldStateDisposition::Released { posts_returned: 1 }
+        );
+        assert_eq!(posted, [("press", false), ("release", true)]);
     }
 }
