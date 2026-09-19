@@ -35,10 +35,21 @@ fn main() {
     use std::time::Duration;
 
     const SEEDED: &str = "CEREBELLUM DRAG PROBE SELECT THIS LINE";
+    // One line per trial, so a readback says WHICH trial selected it. Clearing a
+    // selection between trials needs input of its own, and a second drag over
+    // the same line returns the same text whether it fired or not -- the
+    // ambiguity the distinct lines remove.
+    // One line, dragged by every trial at the SAME y the single-drag arm uses
+    // and has proven. An earlier version put each trial on its own line to make
+    // the readback self-identifying, and the line height was a guess: two
+    // trials landed on the same line and the third could not be told from a
+    // leftover selection. Clearing between trials is the cheaper certainty.
+    const BISECT_SEED: &str = "CEREBELLUM BISECT PROBE SELECT THIS LINE";
+    let bisect = std::env::var("CEREBELLUM_PROBE_FIELD_BISECT").is_ok();
 
     let path = std::env::temp_dir().join("ck-unfocused-pointer.txt");
     let _ = std::fs::remove_file(&path);
-    std::fs::write(&path, SEEDED).expect("seed the probe file");
+    std::fs::write(&path, if bisect { BISECT_SEED } else { SEEDED }).expect("seed the probe file");
 
     let launched = Command::new("/usr/bin/open")
         .args(["-a", "TextEdit"])
@@ -70,6 +81,112 @@ fn main() {
         std::process::exit(1);
     };
     println!("text area frame: {text_frame:?}");
+
+    if bisect {
+        // Which stamp breaks the event, in ONE launch.
+        //
+        // Every trial posts GLOBALLY with the target FRONTMOST, which is the
+        // configuration a working drag cannot fail in -- so a trial that
+        // selects nothing was broken by its own stamps rather than by
+        // delivery. Trial one carries no stamps and MUST select; if it does
+        // not, the probe is broken and no other trial means anything.
+        //
+        // Each trial drags a different line and the seeded text names itself,
+        // so the readback says which trial produced it without clearing the
+        // selection in between -- clearing would need input of its own, and a
+        // repeat drag over one line returns the same text whether it fired or
+        // not.
+        let Some(window) = target_window(target) else {
+            eprintln!("PROBE FAILED: no on-screen window for pid {target}");
+            quit_textedit();
+            std::process::exit(1);
+        };
+        let y = text_frame.1 + 12.0;
+        let from = cerebellum_macos::EventPoint {
+            x: text_frame.0 + 6.0,
+            y,
+        };
+        let to = cerebellum_macos::EventPoint {
+            x: text_frame.0 + text_frame.2 - 12.0,
+            y,
+        };
+        // Below the text: dragging here places the caret and leaves nothing
+        // selected, which is how each trial starts from a known state without
+        // needing a keystroke.
+        let blank = cerebellum_macos::EventPoint {
+            x: text_frame.0 + 6.0,
+            y: text_frame.1 + text_frame.3 - 10.0,
+        };
+        let post_all = |events: [cerebellum_macos::OwnedCgEvent; 3], set: FieldSet| {
+            for event in events {
+                stamp_field_set(event.as_ref(), window.window_id, target, set);
+                objc2_core_graphics::CGEvent::post(
+                    objc2_core_graphics::CGEventTapLocation::HIDEventTap,
+                    Some(event.as_ref()),
+                );
+                sleep(Duration::from_millis(80));
+            }
+            sleep(Duration::from_millis(600));
+        };
+
+        let mut results = Vec::new();
+        for (label, set) in [
+            ("1 no stamps", FieldSet::None),
+            ("2 public fields", FieldSet::Public),
+            ("3 undocumented fields", FieldSet::Undocumented),
+        ] {
+            let Ok(clear) = cerebellum_macos::mouse_drag_events(blank, blank) else {
+                eprintln!("PROBE FAILED: could not build the clearing drag");
+                quit_textedit();
+                std::process::exit(1);
+            };
+            post_all(clear, FieldSet::None);
+            let before = read_selected_text().unwrap_or_default();
+            if !before.trim().is_empty() {
+                eprintln!(
+                    "PROBE FAILED: trial {label} started with {before:?} still selected, so its \
+                     result could not be told from the previous one."
+                );
+                quit_textedit();
+                std::process::exit(1);
+            }
+
+            let Ok(events) = cerebellum_macos::mouse_drag_events(from, to) else {
+                eprintln!("PROBE FAILED: could not build the drag for trial {label}");
+                quit_textedit();
+                std::process::exit(1);
+            };
+            post_all(events, set);
+            let selected = read_selected_text().unwrap_or_default();
+            println!("TRIAL {label}: selected {selected:?}");
+            results.push((label, !selected.trim().is_empty()));
+        }
+
+        quit_textedit();
+        let _ = std::fs::remove_file(&path);
+        match results.as_slice() {
+            [(_, false), ..] => println!(
+                "VERDICT: VOID. Trial one carries no stamps and still selected nothing, so this \
+                 probe cannot measure anything today and the other trials say nothing."
+            ),
+            [_, (_, true), (_, true)] => println!(
+                "VERDICT: NEITHER HALF BREAKS THE EVENT. Both stamped trials selected, so the \
+                 earlier failure was not the stamping and is worth re-measuring."
+            ),
+            [_, (_, public_ok), (_, undocumented_ok)] => println!(
+                "VERDICT: public fields {}, undocumented fields {}. The half that selected \
+                 NOTHING is the one that breaks the event.",
+                if *public_ok { "SURVIVED" } else { "BROKE IT" },
+                if *undocumented_ok {
+                    "SURVIVED"
+                } else {
+                    "BROKE IT"
+                }
+            ),
+            _ => println!("VERDICT: incomplete trial set"),
+        }
+        return;
+    }
 
     // Put something else in front. Without this the probe measures delivery to a
     // FOCUSED application, which an ordinary global post achieves too.
@@ -327,6 +444,26 @@ fn target_window(pid: i32) -> Option<cerebellum_macos::RawWindow> {
 /// synthetic events on it.
 #[cfg(target_os = "macos")]
 fn stamp_window_routing(event: &objc2_core_graphics::CGEvent, window_id: u32, pid: i32) {
+    stamp_field_set(event, window_id, pid, FieldSet::All);
+}
+
+/// Which stamps to apply.
+///
+/// Split along the line that matters for a bisect: the three fields Quartz
+/// documents against the ones taken from another project's source. A drag that
+/// survives one and not the other says which half breaks it, in one run rather
+/// than eight.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq)]
+enum FieldSet {
+    None,
+    Public,
+    Undocumented,
+    All,
+}
+
+#[cfg(target_os = "macos")]
+fn stamp_field_set(event: &objc2_core_graphics::CGEvent, window_id: u32, pid: i32, set: FieldSet) {
     use objc2_core_graphics::{CGEvent, CGEventField};
 
     const CLICK_STATE: u32 = 1;
@@ -338,18 +475,31 @@ fn stamp_window_routing(event: &objc2_core_graphics::CGEvent, window_id: u32, pi
     const WINDOW_UNDER_POINTER: u32 = 91;
     const WINDOW_UNDER_POINTER_THAT_CAN_HANDLE: u32 = 92;
 
+    if set == FieldSet::None {
+        return;
+    }
     let window = i64::from(window_id);
-    for (field, value) in [
-        (CLICK_STATE, 1_i64),
-        (BUTTON_NUMBER, 0),
-        (SUBTYPE, 3),
+    let public = [(CLICK_STATE, 1_i64), (BUTTON_NUMBER, 0), (SUBTYPE, 3)];
+    let undocumented = [
         (TARGET_PID, i64::from(pid)),
         (WINDOW_NUMBER, window),
         (CLICK_GROUP, window),
         (WINDOW_UNDER_POINTER, window),
         (WINDOW_UNDER_POINTER_THAT_CAN_HANDLE, window),
-    ] {
-        CGEvent::set_integer_value_field(Some(event), CGEventField(field), value);
+    ];
+    let apply = |pairs: &[(u32, i64)]| {
+        for (field, value) in pairs {
+            CGEvent::set_integer_value_field(Some(event), CGEventField(*field), *value);
+        }
+    };
+    match set {
+        FieldSet::None => {}
+        FieldSet::Public => apply(&public),
+        FieldSet::Undocumented => apply(&undocumented),
+        FieldSet::All => {
+            apply(&public);
+            apply(&undocumented);
+        }
     }
 }
 
