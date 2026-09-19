@@ -139,28 +139,102 @@ check_no_mutation_in_progress() {
 run_phase "no mutation left in the working tree" \
   check_no_mutation_in_progress
 
-# Phase 0a: say so, loudly, if Cargo.lock already differs from HEAD before any
-# cargo command in this gate runs. NOT a refusal -- a deliberate absorb is
-# exactly this state -- but a statement made while the operator is still
-# looking. Measured against this repo's history: eleven commits carry a subc
-# version bump under a message about something else, every one the same
-# mechanism (an unflagged cargo run rewrote the lock, `git add -A` took it).
-# Phase 6 cannot see those: it compares the tree before the BUILD to after,
-# and a lock rewritten by an earlier cargo run is already in the "before".
-# Only a comparison against HEAD is anchored to something the operator
-# decided. Every cargo command below carries --locked, so this gate itself
-# is a reader; the rewrite, if any, happened before it started.
-report_lock_drift_from_head() {
-  local drift
-  drift="$(git diff --stat HEAD -- Cargo.lock 2>/dev/null)"
-  if [ -n "$drift" ]; then
-    echo "    NOTE: Cargo.lock differs from HEAD before this gate ran anything:" >&2
-    git diff HEAD -- Cargo.lock | grep -E '^[-+]version|^[-+]name' | paste - - - - 2>/dev/null | sed 's/^/      /' >&2
-    echo "    Commit it as its own lock change, or restore it --" >&2
-    echo "    do NOT let it ride in a commit about something else (git add by path)." >&2
+# The remote-tracking ref to compare against, or the sibling's own HEAD when
+# there is none. An offline or remoteless checkout must not fail this phase for
+# a reason that has nothing to do with the pins: with no upstream to read, the
+# published question is unanswerable rather than answered no.
+sibling_published_ref() {
+  local sibling="$1" upstream
+  upstream="$(git -C "$sibling" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  if [ -n "$upstream" ] && git -C "$sibling" rev-parse --verify --quiet "$upstream" >/dev/null; then
+    printf '%s' "$upstream"
+  else
+    printf 'HEAD'
   fi
 }
-report_lock_drift_from_head
+
+# Phase 0a: refuse if Cargo.lock already differs from HEAD before any cargo
+# command in this gate runs, and say which of the two states it is.
+#
+# Both states end in a CI red if the gate proceeds, which is why this refuses
+# rather than notes. Measured against this repo's history: eleven commits carry
+# a subc version bump under a message about something else, every one the same
+# mechanism (an unflagged cargo run rewrote the lock, `git add -A` took it).
+# The later check that the build rewrote no generated file cannot see those: it
+# compares the tree before the BUILD to after, and a lock rewritten by an
+# earlier cargo run is already in the "before", so it reads as pre-existing work
+# in progress and is ignored by design. That is how a stale lock reached CI on
+# 2026-09-19 and was refused there instead, a whole round trip later. Only a comparison against HEAD is anchored to something the
+# operator decided. Every cargo command below carries --locked, so this gate
+# itself is a reader; the rewrite, if any, happened before it started.
+#
+# The states need opposite remedies, and the discriminator is the one the
+# sibling-pin check below also applies: whether the sibling version the lock now
+# names is PUBLISHED. Published means the bump is real and committing the absorb
+# is the only correct outcome. Unpublished means the producer's working tree is
+# ahead of what any consumer can fetch, so the lock must be restored and the
+# producer told -- committing it would pin a version CI cannot resolve.
+check_lock_matches_head() {
+  local drift
+  drift="$(git diff --stat HEAD -- Cargo.lock 2>/dev/null)"
+  [ -n "$drift" ] || return 0
+  echo "    Cargo.lock differs from HEAD before this gate ran anything:" >&2
+  local unpublished=0 name version published
+  while read -r name version; do
+    [ -n "$name" ] || continue
+    published="$(sibling_version "$name" published)"
+    local worktree
+    worktree="$(sibling_version "$name" worktree)"
+    if [ "$published" = not-a-path-dep ]; then
+      echo "      $name $version -- registry crate; commit or restore it" >&2
+      echo "        deliberately, never inside a commit about something else." >&2
+    elif [ "$version" = "$published" ]; then
+      echo "      $name $version -- PUBLISHED; commit this absorb as its own" >&2
+      echo "        lock change (git add Cargo.lock by path), then re-run." >&2
+    elif [ "$version" = "$worktree" ]; then
+      echo "      $name $version -- UNPUBLISHED: the sibling's working tree" >&2
+      echo "        has it, the published sibling has $published. Restore" >&2
+      echo "        the lock and tell the producer; committing this pins a" >&2
+      echo "        version CI cannot fetch." >&2
+      unpublished=1
+    else
+      echo "      $name $version -- STALE: the sibling publishes $published and" >&2
+      echo "        its working tree has $worktree. Run cargo update -p $name" >&2
+      echo "        and commit the absorb." >&2
+    fi
+  done <<EOF
+$(git diff HEAD -- Cargo.lock | awk '/^ name = /{gsub(/"/,"",$3); n=$3} /^\+version/{gsub(/"/,"",$3); if (n != "") print n, $3}')
+EOF
+  if [ "$unpublished" -eq 1 ]; then
+    echo "    Refusing: at least one moved version is not published." >&2
+  else
+    echo "    Refusing: a lock change must be a commit, not a working-tree state." >&2
+  fi
+  return 1
+}
+
+# The version a sibling PUBLISHES for a crate, or `not-a-path-dep` when no
+# sibling owns it. Read from the sibling's upstream ref rather than its working
+# tree, because the working tree is exactly what cannot be trusted here.
+sibling_version() {
+  local crate="$1" mode="$2" sibling ref
+  for sibling in "$(dirname "$0")/../../subconscious" "$(dirname "$0")/../../commons"; do
+    [ -d "$sibling" ] || continue
+    git -C "$sibling" cat-file -e "HEAD:crates/$crate/Cargo.toml" 2>/dev/null || continue
+    if [ "$mode" = published ]; then
+      ref="$(sibling_published_ref "$sibling")"
+    else
+      ref=HEAD
+    fi
+    git -C "$sibling" show "$ref:crates/$crate/Cargo.toml" 2>/dev/null \
+      | awk -F'"' '/^version/ { print $2; exit }'
+    return 0
+  done
+  printf 'not-a-path-dep'
+}
+
+run_phase "the committed Cargo.lock is the one on disk" \
+  check_lock_matches_head
 
 # Phase 0b: refuse to certify against a sibling that is not the one this commit
 # declares. The workspace takes subc-* by PATH, so the crates compiled here come
@@ -230,20 +304,6 @@ check_one_sibling() {
     fi
   done < "$declaration"
   return "$drift"
-}
-
-# The remote-tracking ref to compare against, or the sibling's own HEAD when
-# there is none. An offline or remoteless checkout must not fail this phase for
-# a reason that has nothing to do with the pins: with no upstream to read, the
-# published question is unanswerable rather than answered no.
-sibling_published_ref() {
-  local sibling="$1" upstream
-  upstream="$(git -C "$sibling" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-  if [ -n "$upstream" ] && git -C "$sibling" rev-parse --verify --quiet "$upstream" >/dev/null; then
-    printf '%s' "$upstream"
-  else
-    printf 'HEAD'
-  fi
 }
 
 run_phase "sibling matches the declared revisions" \
