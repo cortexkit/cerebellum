@@ -234,6 +234,71 @@ impl TargetResolver for MutableTargetResolver {
 /// failure branch. That gap let an artifact built with no bytes and zero
 /// dimensions ship, which custody refused on the first real capture.
 #[allow(dead_code)]
+/// Captures, then reports a window change old enough to make the next
+/// enumeration incomplete.
+///
+/// The completeness signal is not a property a backend states; it is derived
+/// from how long ago a window change was observed against the controller's
+/// re-enumeration bound. So the only way to drive it from outside is to hand
+/// back a change with a stale timestamp, which is what a real host does when
+/// the window list moved while nobody was looking.
+pub struct StaleReenumerationBackend {
+    pub inner: CapturingBackend,
+    pub change_observed_at_ms: u64,
+    pub polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CaptureBackend for StaleReenumerationBackend {
+    fn screen_recording_liveness(&self) -> cerebellum_computer::platform::PermissionLiveness {
+        self.inner.screen_recording_liveness()
+    }
+
+    fn enumerate_windows(
+        &mut self,
+        target: &ProcessGrant,
+    ) -> Result<Vec<EnumeratedWindow>, BackendError> {
+        self.inner.enumerate_windows(target)
+    }
+
+    fn poll_window_change(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<cerebellum_computer::capture::WindowChange>, BackendError> {
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(cerebellum_computer::capture::WindowChange {
+            kind: cerebellum_computer::capture::WindowChangeKind::Created,
+            observed_at_ms: self.change_observed_at_ms,
+        }))
+    }
+
+    fn capture_window(
+        &mut self,
+        request: &cerebellum_computer::capture::WindowCaptureRequest,
+    ) -> Result<cerebellum_computer::capture::WindowCaptureFrame, BackendError> {
+        self.inner.capture_window(request)
+    }
+
+    fn capture_display(
+        &mut self,
+        request: &cerebellum_computer::capture::BroadDisplayCaptureRequest,
+    ) -> Result<cerebellum_computer::capture::CaptureArtifact, BackendError> {
+        self.inner.capture_display(request)
+    }
+
+    fn begin_teardown(
+        &mut self,
+    ) -> Result<cerebellum_computer::capture::BackendTeardownProgress, BackendError> {
+        self.inner.begin_teardown()
+    }
+
+    fn poll_teardown(
+        &mut self,
+        elapsed_ms: u64,
+    ) -> Result<cerebellum_computer::capture::BackendTeardownProgress, BackendError> {
+        self.inner.poll_teardown(elapsed_ms)
+    }
+}
+
 pub struct CapturingBackend {
     pub windows: Vec<EnumeratedWindow>,
     pub png: Vec<u8>,

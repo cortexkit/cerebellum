@@ -38,7 +38,7 @@ fn action_name(capability: &str) -> Option<&str> {
 
 fn computer_vocabulary() -> Value {
     serde_json::from_slice(include_bytes!(
-        "../../cerebellum-computer/resources/computer_action_vocabulary-v10.json"
+        "../../cerebellum-computer/resources/computer_action_vocabulary-v11.json"
     ))
     .expect("the digest-pinned computer vocabulary is valid JSON")
 }

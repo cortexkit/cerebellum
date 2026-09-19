@@ -21,7 +21,7 @@ use cerebellum_core::journal::{IoDiagnostic, StorageError};
 use serde_json::{json, Value};
 use support::computer::{
     audit, failing_audit, grant, identity, leased_management, management, request,
-    CapturingBackend, Fixed, RefusingBackend,
+    CapturingBackend, Fixed, RefusingBackend, StaleReenumerationBackend,
 };
 
 #[test]
@@ -360,6 +360,84 @@ async fn runtime_journal_save_failure_prevents_capture() {
     assert!(!backend_built.load(Ordering::SeqCst));
 }
 
+/// A short window list says so on the wire, through the serving path.
+///
+/// The in-module tests build this reply by hand, which proves the word mapping
+/// and the schema but NOT that the handler reads the value it measured -- a
+/// mutation deleting the field from the production reply left them all green.
+/// So this drives `serve` twice against a backend that reports a window change
+/// old enough to exceed the re-enumeration bound, which is how a real host
+/// produces an incomplete enumeration, and asserts the caller is told.
+#[tokio::test]
+async fn a_short_window_list_is_disclosed_to_the_caller() {
+    let clock = FakeClock::new();
+    let plane = ComputerPlane::new(audit());
+    let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4, 5, 6, 7, 8];
+    let management = leased_management(&clock).await;
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let windows = vec![EnumeratedWindow {
+        window_id: "window-1".to_string(),
+        owner_identity: grant(),
+        owner_identity_verified: true,
+        frame: WindowFrame {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        },
+        accessibility_root: None,
+    }];
+
+    let mut last = Value::Null;
+    // The first capture enumerates because nothing has been enumerated yet, so
+    // it cannot be incomplete. The second consults the change the backend
+    // reports, and that is the one under test.
+    for now_ms in [10_u64, 900_000] {
+        let backend_windows = windows.clone();
+        let backend_png = png.clone();
+        let backend_polls = std::sync::Arc::clone(&polls);
+        last = plane
+            .serve(
+                servable("computer.screenshot").expect("screenshot is servable"),
+                &json!({ "scope": "target_windows", "include_cursor": false }),
+                ServeContext {
+                    cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
+                    grantee: "pj-example",
+                    identity: identity(),
+                    management: &management,
+                    clock: &clock,
+                    now_ms,
+                },
+                move |_| StaleReenumerationBackend {
+                    inner: CapturingBackend {
+                        windows: backend_windows,
+                        png: backend_png,
+                    },
+                    // Observed at the very start, so by the second capture the
+                    // interval since is far past any re-enumeration bound.
+                    change_observed_at_ms: 0,
+                    polls: backend_polls,
+                },
+            )
+            .await
+            .expect("the capture reply passes result-schema validation");
+    }
+
+    assert!(
+        polls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the window-change poll never ran, so nothing could have been incomplete"
+    );
+    assert_eq!(
+        last["outcome"], "captured",
+        "capture did not succeed: {last}"
+    );
+    assert_eq!(
+        last["windows_enumeration"], "incomplete",
+        "a stale re-enumeration was not disclosed to the caller: {last}"
+    );
+}
+
 /// A request without `region` still captures the whole window and is returned.
 ///
 /// The artifact handed to custody carries the encoded bytes and the dimensions
@@ -576,6 +654,11 @@ async fn a_null_region_request_is_rejected_as_the_wrong_type() {
         json!({
             "outcome": "invalid_request",
             "windows": [],
+            // A refusal enumerated nothing, so it claims nothing about
+            // completeness. Pinned because this assertion states the WHOLE
+            // refusal shape, and a disclosure that starts appearing on refusals
+            // unnoticed is how a caller learns to ignore it.
+            "windows_enumeration": "unknown",
             "field": "region",
             "reason": "wrong_type"
         })

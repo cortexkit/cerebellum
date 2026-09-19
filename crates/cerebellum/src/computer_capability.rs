@@ -183,9 +183,32 @@ fn screenshot_wire_reply(mut reply: Value) -> Value {
     object
         .entry("windows")
         .or_insert_with(|| Value::Array(Vec::new()));
+    // Defaulted to the WEAKEST claim, not the convenient one. A reply that
+    // never enumerated -- every refusal -- has no completeness to report, and
+    // "unknown" says so; the capturing path overwrites it with what it
+    // measured. Defaulting to "complete" would be the fabricated claim, since
+    // it would assert a property of a window list that was never built.
+    object
+        .entry("windows_enumeration")
+        .or_insert_with(|| Value::String("unknown".to_string()));
     object.remove("value");
     object.remove("detail");
     reply
+}
+
+/// How complete the window list behind a capture was, in the wire's words.
+///
+/// `Unknown` is its own value rather than folded into either boolean: a module
+/// that could not determine completeness is making a different claim from one
+/// that determined the list was short, and a caller's remedy differs between
+/// them.
+fn windows_enumeration_word(value: cerebellum_computer::capture::LeakageValue) -> &'static str {
+    use cerebellum_computer::capture::LeakageValue;
+    match value {
+        LeakageValue::Absent => "complete",
+        LeakageValue::Present => "incomplete",
+        LeakageValue::Unknown => "unknown",
+    }
 }
 
 /// Give every click outcome the mandatory action-result envelope.
@@ -1230,6 +1253,12 @@ where
         json!({
             "outcome": "captured",
             "windows": windows,
+            // Measured rather than defaulted. Without it a caller asking for
+            // target_windows cannot tell a complete list from a short one, and
+            // a short one is what a partial window enumeration produces.
+            "windows_enumeration": windows_enumeration_word(
+                captured.window_enumeration_incomplete(),
+            ),
         })
     }
 
@@ -3935,6 +3964,67 @@ mod cancel_wire_tests {
     /// production entry point rather than through a hand-written literal: a
     /// fixture that states the reply cannot notice the builder diverging from
     /// the schema, which is the whole defect class.
+    /// The disclosure survives the enforcement layer, carrying the value it
+    /// measured rather than the default.
+    ///
+    /// Aimed at the schema rather than at the builder: a field the builder sets
+    /// correctly and the enforcement layer strips before it reaches a caller
+    /// looks exactly like a field nobody set, and that failure has shipped from
+    /// here before. So the assertion is on the reply AFTER withholding, and on
+    /// a value that is NOT the default, since a default surviving proves only
+    /// that something named "windows_enumeration" got through.
+    #[test]
+    fn an_incomplete_window_list_says_so_on_the_wire() {
+        let reply = screenshot_wire_reply(json!({
+            "outcome": "captured",
+            "windows": [],
+            "windows_enumeration": windows_enumeration_word(
+                cerebellum_computer::capture::LeakageValue::Present,
+            ),
+        }));
+        assert_eq!(reply["windows_enumeration"], "incomplete");
+        assert_eq!(
+            validate_capability_result("computer.screenshot", &reply),
+            Ok(()),
+            "the disclosure is not declared by the schema that is enforced"
+        );
+    }
+
+    /// A reply that never enumerated says unknown, and never "complete".
+    ///
+    /// The weakest claim is the safe default here: a refusal has no window list
+    /// to describe, and claiming a complete one would be asserting a property
+    /// of something that was never built.
+    #[test]
+    fn a_reply_that_never_enumerated_claims_nothing_about_completeness() {
+        let refusal = screenshot_wire_reply(json!({
+            "outcome": "not_running",
+            "bundle_identity": "com.apple.TextEdit",
+            "remedy": "start the application, then ask again",
+        }));
+        assert_eq!(refusal["windows_enumeration"], "unknown");
+        assert_eq!(
+            validate_capability_result("computer.screenshot", &refusal),
+            Ok(())
+        );
+    }
+
+    /// Each leakage value maps to exactly one word, asserted as literal pairs.
+    ///
+    /// Written out rather than looped over the enum, because a loop derives its
+    /// expectation from the thing under test and would keep passing if two
+    /// values collapsed onto one word.
+    #[test]
+    fn each_completeness_value_has_its_own_word() {
+        use cerebellum_computer::capture::LeakageValue;
+        assert_eq!(windows_enumeration_word(LeakageValue::Absent), "complete");
+        assert_eq!(
+            windows_enumeration_word(LeakageValue::Present),
+            "incomplete"
+        );
+        assert_eq!(windows_enumeration_word(LeakageValue::Unknown), "unknown");
+    }
+
     #[test]
     fn every_observing_and_click_success_reply_survives_withholding() {
         let screenshot = screenshot_wire_reply(json!({

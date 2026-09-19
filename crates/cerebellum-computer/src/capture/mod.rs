@@ -53,6 +53,27 @@ impl CaptureLeakageFlag {
 
 /// Every field is public so a journal adapter can serialize the exact closed
 /// vocabulary without converting through an unbounded string-keyed map.
+///
+/// ONE OF THESE REACHES A CALLER, and the other four are recorded here with the
+/// reason they do not, so the next reader does not rediscover the question.
+/// The test each was measured against: does its value change what a caller
+/// should believe about the array they were handed?
+///
+///   cursor_composited        cannot move: `include_cursor` is refused unless
+///                            false before a capture is attempted.
+///   display_dependent_...    cannot move: capture is per-window through a
+///                            desktop-independent filter by construction.
+///   self_windows_included    cannot move on the same construction: the filter
+///                            is scoped to the granted target's window.
+///   sharing_type_bypass_...  constant `Present`, a standing property of the
+///                            platform rather than of any one capture.
+///   window_enumeration_...   MOVES, and changes the meaning of the reply: a
+///                            caller asking for target_windows cannot
+///                            otherwise tell a complete list from a short one.
+///                            Exposed as `windows_enumeration` from v11.
+///
+/// Exposing all five would hand a caller four fields of "still fine" and train
+/// them to skip the block, which costs more than it discloses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureLeakageReport {
     pub cursor_composited: LeakageValue,
@@ -122,12 +143,6 @@ impl CaptureLeakageReport {
                 (flag, value)
             })
             .collect()
-    }
-
-    pub fn is_scoped_safe(&self) -> bool {
-        self.cursor_composited == LeakageValue::Absent
-            && self.display_dependent_composition == LeakageValue::Absent
-            && self.window_enumeration_incomplete != LeakageValue::Unknown
     }
 }
 
@@ -575,14 +590,6 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         })
     }
 
-    /// Alias with an explicit frame-oriented name for stream adapters.
-    pub fn capture_scoped_frame(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<ScopedCaptureResult, CaptureError> {
-        self.capture_scoped(now_ms)
-    }
-
     fn ensure_capture_permission(&mut self, now_ms: u64) -> Result<(), CaptureError> {
         self.backend
             .platform_support()
@@ -758,10 +765,6 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         Ok(())
     }
 
-    pub fn revoke_broad_display(&mut self) {
-        self.broad_display_grant = None;
-    }
-
     pub fn capture_display(
         &mut self,
         request: BroadDisplayCaptureRequest,
@@ -869,10 +872,6 @@ impl InMemoryCaptureBackend {
 
     pub fn set_window_artifact(&mut self, window_id: impl Into<String>, artifact: CaptureArtifact) {
         self.artifacts.insert(window_id.into(), artifact);
-    }
-
-    pub fn set_display_artifact(&mut self, artifact: CaptureArtifact) {
-        self.display_artifact = artifact;
     }
 
     pub fn set_teardown_behavior(&mut self, behavior: TeardownBehavior) {

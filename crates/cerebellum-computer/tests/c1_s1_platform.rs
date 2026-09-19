@@ -14,7 +14,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v10.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v11.json");
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 const SYNTHETIC_CAPABILITIES: [&str; 5] = [
     "computer.type",
@@ -35,7 +35,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v10");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v11");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -551,7 +551,11 @@ fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
 }
 
 fn recreated_v9() -> Value {
-    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    // Built from v10 rather than from the shipped artifact, because the chain
+    // subtracts one revision at a time. Starting from v11 would leave this
+    // revision's addition standing and quietly change what every older digest
+    // below is compared against.
+    let mut before = recreated_v10();
     before["revision"] = historical_revision(9);
     let wait = before["rows"]
         .as_array_mut()
@@ -570,6 +574,43 @@ fn recreated_v9() -> Value {
         .unwrap()
         .retain(|v| v != "cancelled");
     before
+}
+
+/// v11 without its one addition: the window-enumeration disclosure.
+fn recreated_v10() -> Value {
+    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    before["revision"] = historical_revision(10);
+    let screenshot = before["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.screenshot")
+        .unwrap();
+    screenshot["result_schema"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("windows_enumeration");
+    screenshot["result_schema"]["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|v| v != "windows_enumeration");
+    before
+}
+
+/// v11 adds the window-enumeration disclosure and nothing else.
+///
+/// The digest on the right is v10's, measured before the mint. Subtracting the
+/// one field must reproduce it exactly: if anything else moved -- a
+/// description reworded, a row reordered, a number reformatted -- this fails,
+/// which is the point of stating a revision's change as a subtraction rather
+/// than as prose.
+#[test]
+fn v11_only_adds_the_window_enumeration_disclosure() {
+    let bytes = canonical_json_bytes(&recreated_v10()).unwrap();
+    assert_eq!(
+        hex_digest(&bytes),
+        "27b891258a29e2a392e971597901636137648febe3c0c40dc3718d7a4f44fd2a"
+    );
 }
 
 #[test]
