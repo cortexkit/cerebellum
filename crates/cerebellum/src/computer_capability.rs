@@ -1432,16 +1432,15 @@ where
                 // condition denied the rung: absence is unambiguous here because
                 // target_fronted is always present, so a caller can tell a build
                 // that reports these from one that does not.
-                let mut reply = json!({
-                    "outcome": "completed",
-                    "containment_rung": DispatchContainmentRung::as_str(containment_rung),
-                    "target_fronted": report.containment.fronting_stable,
-                    "effect_status": effect_status_name(report.effect.status),
-                });
-                if let Some(reason) = report.containment.forfeiture_reason {
-                    reply["containment_forfeited_because"] = json!(reason.as_str());
-                }
-                reply
+                synthetic_success_reply(
+                    DispatchContainmentRung::as_str(containment_rung),
+                    report.containment.fronting_stable,
+                    effect_status_name(report.effect.status),
+                    report
+                        .containment
+                        .forfeiture_reason
+                        .map(|reason| reason.as_str()),
+                )
             }
             Err(refusal) => synthetic_dispatch_refusal(&refusal),
         }
@@ -2406,6 +2405,35 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
 /// `detail` is an implementation diagnostic and is stripped here rather than
 /// shipped. The five rows declare `field`, `reason`, `remedy`, and `chord` so
 /// a refusal tells callers what failed and how to continue.
+/// Build the reply for a synthetic action that completed.
+///
+/// Extracted from its one production call site so a test can assert the exact
+/// shape this surface emits against the frozen result schema. The two had no
+/// common point before, and that gap shipped: `computer.move` and
+/// `computer.drag` emit `containment_rung` like every other synthetic row, but
+/// the v8 schema declared it only on the other three, and withholding mode
+/// REJECTS an undeclared property rather than dropping it -- so a move that
+/// really moved the cursor came back to the caller as a schema violation. v9
+/// declares it on all five; `every_synthetic_success_reply_survives_withholding`
+/// is what keeps the builder and the schema from parting again.
+fn synthetic_success_reply(
+    containment_rung: &str,
+    target_fronted: bool,
+    effect_status: &str,
+    forfeiture_reason: Option<&str>,
+) -> Value {
+    let mut reply = json!({
+        "outcome": "completed",
+        "containment_rung": containment_rung,
+        "target_fronted": target_fronted,
+        "effect_status": effect_status,
+    });
+    if let Some(reason) = forfeiture_reason {
+        reply["containment_forfeited_because"] = json!(reason);
+    }
+    reply
+}
+
 fn synthetic_wire_envelope(mut reply: Value, carries_containment_rung: bool) -> Value {
     let object = reply
         .as_object_mut()
@@ -3854,6 +3882,52 @@ mod cancel_wire_tests {
         CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
     };
     use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
+
+    /// Every synthetic row's SUCCESS reply must survive withholding.
+    ///
+    /// This is the arm the v8 mint lacked. The builder emits `containment_rung`
+    /// for all five rows; v8 declared it on three; withholding REJECTS an
+    /// undeclared property rather than dropping it, so a `computer.move` that
+    /// moved the cursor answered the caller with a schema violation. Asserting
+    /// the refusal shapes is not enough — a refusal carries a different key set
+    /// than a success, so the success path can be wrong while every refusal
+    /// test stays green.
+    #[test]
+    fn every_synthetic_success_reply_survives_withholding() {
+        for capability in [
+            ComputerCapability::Type,
+            ComputerCapability::Keys,
+            ComputerCapability::Scroll,
+            ComputerCapability::Move,
+            ComputerCapability::Drag,
+        ] {
+            for forfeiture in [None, Some("identity_unavailable")] {
+                let reply = synthetic_wire_envelope(
+                    synthetic_success_reply(
+                        "pid_structural",
+                        true,
+                        "effect_indeterminate",
+                        forfeiture,
+                    ),
+                    matches!(
+                        capability,
+                        ComputerCapability::Type
+                            | ComputerCapability::Keys
+                            | ComputerCapability::Scroll
+                    ),
+                );
+                assert!(
+                    reply.get("containment_rung").is_some(),
+                    "{capability:?} success must state its rung"
+                );
+                validate_capability_result(capability.capability_id(), &reply).unwrap_or_else(
+                    |error| {
+                        panic!("{capability:?} success reply violates its frozen schema: {error}")
+                    },
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn the_cancel_reply_carries_posts_returned_through_withholding() {
