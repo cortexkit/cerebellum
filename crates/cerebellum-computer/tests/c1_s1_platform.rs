@@ -6,7 +6,8 @@ use cerebellum_computer::platform::{
     validate_vocabulary, validate_vocabulary_digests, CapabilityAdvertisementContext,
     ImmutableReleaseInputs, PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport,
     PermissionProbeResult, PermissionService, SemanticActionIntent, SemanticActionPlatform,
-    StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_SHA256,
+    StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION,
+    COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 #[cfg(target_os = "macos")]
 use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
@@ -42,6 +43,100 @@ fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
         computed_vocabulary_sha256(),
         COMPUTER_ACTION_VOCABULARY_SHA256
     );
+}
+
+#[test]
+fn every_repository_vocabulary_mirror_names_the_current_revision() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    // Git enumerates repository inputs, including new untracked files. Its ignore
+    // rules exclude build outputs and local state, which are not source mirrors.
+    // No source directory, extension, or individual mirror is exempted.
+    let listing = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("enumerate repository files");
+    assert!(
+        listing.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing = String::from_utf8(listing.stdout).expect("UTF-8 repository paths");
+    let paths: BTreeSet<_> = listing
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
+    // Assemble the search token so the scanner does not mistake its own pattern
+    // for an artifact reference with a missing revision number.
+    let prefix = concat!("computer_action_vocabulary", "-v").as_bytes();
+    let mut mirrors = BTreeSet::new();
+    let mut references = 0;
+    let mut stale = Vec::new();
+    for path in paths {
+        let bytes = match std::fs::read(root.join(path)) {
+            Ok(bytes) => bytes,
+            // An unstaged deletion still appears in the index but is no longer
+            // a live mirror; the next mint intentionally removes the old artifact.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("cannot inspect {path}: {error}"),
+        };
+        for (offset, _) in bytes
+            .windows(prefix.len())
+            .enumerate()
+            .filter(|(_, window)| *window == prefix)
+        {
+            mirrors.insert(path);
+            references += 1;
+            let end = offset
+                + prefix.len()
+                + bytes[offset + prefix.len()..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+            let found = &bytes[offset..end];
+            if found != COMPUTER_ACTION_VOCABULARY_REVISION.as_bytes() {
+                let line = bytes[..offset]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count()
+                    + 1;
+                stale.push(format!("{path}:{line}: {}", String::from_utf8_lossy(found)));
+            }
+        }
+    }
+    assert!(
+        !mirrors.is_empty(),
+        "repository scan found no vocabulary mirrors"
+    );
+    println!(
+        "{} mirror files, {references} revision references: {mirrors:?}",
+        mirrors.len()
+    );
+    assert!(
+        stale.is_empty(),
+        "vocabulary mirrors must name {COMPUTER_ACTION_VOCABULARY_REVISION}:\n{}",
+        stale.join("\n")
+    );
+}
+
+// Historical digest tests reconstruct old documents, not live artifact mirrors.
+// Build their revision labels from the shared stem rather than embedding stale
+// artifact names that would be indistinguishable from forgotten live references.
+fn historical_revision(revision: u32) -> Value {
+    let (stem, _) = COMPUTER_ACTION_VOCABULARY_REVISION
+        .rsplit_once("-v")
+        .unwrap();
+    json!(format!("{stem}-v{revision}"))
 }
 
 #[test]
@@ -119,7 +214,7 @@ fn every_synthetic_row_declares_all_refusal_fields_without_requiring_them() {
 #[test]
 fn v8_only_adds_refusal_fields_to_the_five_synthetic_rows() {
     let mut before = recreated_v8();
-    before["revision"] = json!("computer_action_vocabulary-v7");
+    before["revision"] = historical_revision(7);
     for row in before["rows"].as_array_mut().expect("rows") {
         let capability = row["capability_id"]
             .as_str()
@@ -457,7 +552,7 @@ fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
 
 fn recreated_v9() -> Value {
     let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
-    before["revision"] = json!("computer_action_vocabulary-v9");
+    before["revision"] = historical_revision(9);
     let wait = before["rows"]
         .as_array_mut()
         .unwrap()
@@ -488,7 +583,7 @@ fn v10_only_adds_wait_cancellation_and_read_counts() {
 
 fn recreated_v8() -> Value {
     let mut before = recreated_v9();
-    before["revision"] = json!("computer_action_vocabulary-v8");
+    before["revision"] = historical_revision(8);
     for row in before["rows"].as_array_mut().expect("rows") {
         let capability = row["capability_id"].as_str().unwrap().to_owned();
         if SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
