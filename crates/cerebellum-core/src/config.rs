@@ -5,8 +5,8 @@
 //!
 //! - `health.dispatch_heartbeat_stale_ms` (default `2000`): the heartbeat age
 //!   above which dispatch is considered impaired.
-//! - `health.action_age_stale_ms` (default `30000`): applied independently to
-//!   the oldest queued-action age and the oldest in-flight-action age.
+//! - `health.queue_age_stale_ms` (default `30000`): applied to
+//!   the oldest queued-action age only. The caller supplies the in-flight bound.
 //!
 //! An absent `health` object or absent member uses the stated default. When
 //! `health` is present it must be an object whose only accepted members are
@@ -24,9 +24,8 @@ use std::time::Duration;
 /// Default heartbeat staleness threshold: 2 seconds.
 pub const DEFAULT_DISPATCH_HEARTBEAT_STALE_MS: u64 = 2000;
 
-/// Default action-age staleness threshold: 30 seconds, applied independently to
-/// queued and in-flight ages.
-pub const DEFAULT_ACTION_AGE_STALE_MS: u64 = 30000;
+/// Default queue-age staleness threshold: 30 seconds.
+pub const DEFAULT_QUEUE_AGE_STALE_MS: u64 = 30000;
 
 /// A configuration error. Returned by [`parse_config`] for any malformed or
 /// out-of-range `health` value. The error is deterministic: the same input
@@ -64,6 +63,7 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.reason {
             ConfigReason::HealthNotObject => write!(f, "health: expected a JSON object"),
+            ConfigReason::UnknownMember(m) if m == "action_age_stale_ms" => write!(f, "health.action_age_stale_ms was renamed to health.queue_age_stale_ms; it now budgets the oldest queued age only"),
             ConfigReason::UnknownMember(m) => write!(f, "health: unknown member `{m}`"),
             ConfigReason::NotInteger => write!(f, "{}: expected a positive integer", self.field),
             ConfigReason::NotPositive => {
@@ -84,21 +84,23 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The parsed health configuration: two independent positive-integer
-/// millisecond thresholds.
+/// Health thresholds: two parsed budgets and one caller-derived execution bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthConfig {
     /// Heartbeat age staleness threshold in milliseconds.
     pub dispatch_heartbeat_stale_ms: u64,
-    /// Action (queued and in-flight) age staleness threshold in milliseconds.
-    pub action_age_stale_ms: u64,
+    /// Queued age staleness threshold in milliseconds.
+    pub queue_age_stale_ms: u64,
+    /// Caller-derived execution age bound; not a configuration-file key.
+    pub in_flight_age_stale_ms: u64,
 }
 
 impl HealthConfig {
     /// The default configuration: heartbeat 2000 ms, action age 30000 ms.
     pub const DEFAULT: Self = Self {
         dispatch_heartbeat_stale_ms: DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
-        action_age_stale_ms: DEFAULT_ACTION_AGE_STALE_MS,
+        queue_age_stale_ms: DEFAULT_QUEUE_AGE_STALE_MS,
+        in_flight_age_stale_ms: DEFAULT_QUEUE_AGE_STALE_MS,
     };
 
     /// Heartbeat staleness threshold as a [`Duration`].
@@ -106,10 +108,14 @@ impl HealthConfig {
         Duration::from_millis(self.dispatch_heartbeat_stale_ms)
     }
 
-    /// Action-age staleness threshold as a [`Duration`], applied independently
-    /// to queued and in-flight ages.
-    pub fn action_age_threshold(&self) -> Duration {
-        Duration::from_millis(self.action_age_stale_ms)
+    /// Execution-age staleness threshold as a [`Duration`].
+    pub fn in_flight_age_threshold(&self) -> Duration {
+        Duration::from_millis(self.in_flight_age_stale_ms)
+    }
+
+    /// Queue-age staleness threshold as a [`Duration`].
+    pub fn queue_age_threshold(&self) -> Duration {
+        Duration::from_millis(self.queue_age_stale_ms)
     }
 }
 
@@ -195,7 +201,7 @@ fn parse_health(value: &serde_json::Value) -> Result<HealthConfig, ConfigError> 
     // Reject unknown members before reading thresholds so the failure is
     // deterministic and surfaces the offending key rather than silently
     // ignoring it.
-    const ACCEPTED: &[&str] = &["dispatch_heartbeat_stale_ms", "action_age_stale_ms"];
+    const ACCEPTED: &[&str] = &["dispatch_heartbeat_stale_ms", "queue_age_stale_ms"];
     for (key, _v) in obj {
         if !ACCEPTED.contains(&key.as_str()) {
             return Err(ConfigError {
@@ -209,14 +215,15 @@ fn parse_health(value: &serde_json::Value) -> Result<HealthConfig, ConfigError> 
         Some(v) => parse_positive_ms(v, "dispatch_heartbeat_stale_ms")?,
         None => DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
     };
-    let action_age_stale_ms = match obj.get("action_age_stale_ms") {
-        Some(v) => parse_positive_ms(v, "action_age_stale_ms")?,
-        None => DEFAULT_ACTION_AGE_STALE_MS,
+    let queue_age_stale_ms = match obj.get("queue_age_stale_ms") {
+        Some(v) => parse_positive_ms(v, "queue_age_stale_ms")?,
+        None => DEFAULT_QUEUE_AGE_STALE_MS,
     };
 
     Ok(HealthConfig {
         dispatch_heartbeat_stale_ms,
-        action_age_stale_ms,
+        queue_age_stale_ms,
+        in_flight_age_stale_ms: DEFAULT_QUEUE_AGE_STALE_MS,
     })
 }
 
@@ -294,14 +301,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_old_key_is_refused_by_name_with_the_new_one_in_the_message() {
+        let error = parse_config(r#"{"health":{"action_age_stale_ms":30000}}"#).unwrap_err();
+        assert_eq!(error.to_string(), "health.action_age_stale_ms was renamed to health.queue_age_stale_ms; it now budgets the oldest queued age only");
+        assert!(parse_config(r#"{"health":{"in_flight_age_stale_ms":30000}}"#).is_err());
+    }
+
+    #[test]
     fn defaults_are_2000_and_30000() {
         assert_eq!(DEFAULT_DISPATCH_HEARTBEAT_STALE_MS, 2000);
-        assert_eq!(DEFAULT_ACTION_AGE_STALE_MS, 30000);
+        assert_eq!(DEFAULT_QUEUE_AGE_STALE_MS, 30000);
         assert_eq!(
             HealthConfig::DEFAULT,
             HealthConfig {
                 dispatch_heartbeat_stale_ms: 2000,
-                action_age_stale_ms: 30000,
+                queue_age_stale_ms: 30000,
+                in_flight_age_stale_ms: 30000,
             }
         );
     }
@@ -323,25 +338,25 @@ mod tests {
         // Configuring heartbeat leaves action age at default.
         let cfg = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": 5000}}"#).unwrap();
         assert_eq!(cfg.health.dispatch_heartbeat_stale_ms, 5000);
-        assert_eq!(cfg.health.action_age_stale_ms, DEFAULT_ACTION_AGE_STALE_MS);
+        assert_eq!(cfg.health.queue_age_stale_ms, DEFAULT_QUEUE_AGE_STALE_MS);
 
         // Configuring action age leaves heartbeat at default.
-        let cfg = parse_config(r#"{"health": {"action_age_stale_ms": 70000}}"#).unwrap();
+        let cfg = parse_config(r#"{"health": {"queue_age_stale_ms": 70000}}"#).unwrap();
         assert_eq!(
             cfg.health.dispatch_heartbeat_stale_ms,
             DEFAULT_DISPATCH_HEARTBEAT_STALE_MS
         );
-        assert_eq!(cfg.health.action_age_stale_ms, 70000);
+        assert_eq!(cfg.health.queue_age_stale_ms, 70000);
     }
 
     #[test]
     fn non_default_positive_integer_thresholds() {
         let cfg = parse_config(
-            r#"{"health": {"dispatch_heartbeat_stale_ms": 3000, "action_age_stale_ms": 45000}}"#,
+            r#"{"health": {"dispatch_heartbeat_stale_ms": 3000, "queue_age_stale_ms": 45000}}"#,
         )
         .unwrap();
         assert_eq!(cfg.health.dispatch_heartbeat_stale_ms, 3000);
-        assert_eq!(cfg.health.action_age_stale_ms, 45000);
+        assert_eq!(cfg.health.queue_age_stale_ms, 45000);
     }
 
     #[test]
@@ -350,12 +365,12 @@ mod tests {
             // line comment
             "health": {
                 "dispatch_heartbeat_stale_ms": 1234, /* block */
-                "action_age_stale_ms": 5678,
+                "queue_age_stale_ms": 5678,
             }
         }"#;
         let cfg = parse_config(text).unwrap();
         assert_eq!(cfg.health.dispatch_heartbeat_stale_ms, 1234);
-        assert_eq!(cfg.health.action_age_stale_ms, 5678);
+        assert_eq!(cfg.health.queue_age_stale_ms, 5678);
     }
 
     #[test]
@@ -391,7 +406,7 @@ mod tests {
         let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": 0}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotPositive);
 
-        let err = parse_config(r#"{"health": {"action_age_stale_ms": 0}}"#).unwrap_err();
+        let err = parse_config(r#"{"health": {"queue_age_stale_ms": 0}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotPositive);
     }
 
@@ -400,7 +415,7 @@ mod tests {
         let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": -1}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotPositive);
 
-        let err = parse_config(r#"{"health": {"action_age_stale_ms": -30000}}"#).unwrap_err();
+        let err = parse_config(r#"{"health": {"queue_age_stale_ms": -30000}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotPositive);
     }
 
@@ -410,7 +425,7 @@ mod tests {
             parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": 2000.5}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotInteger);
 
-        let err = parse_config(r#"{"health": {"action_age_stale_ms": 30000.0}}"#).unwrap_err();
+        let err = parse_config(r#"{"health": {"queue_age_stale_ms": 30000.0}}"#).unwrap_err();
         // 30000.0 parses as f64 in serde_json, so it is NotInteger (not an
         // integer form).
         assert_eq!(err.reason, ConfigReason::NotInteger);
@@ -422,7 +437,7 @@ mod tests {
             parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": "2000"}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotInteger);
 
-        let err = parse_config(r#"{"health": {"action_age_stale_ms": true}}"#).unwrap_err();
+        let err = parse_config(r#"{"health": {"queue_age_stale_ms": true}}"#).unwrap_err();
         assert_eq!(err.reason, ConfigReason::NotInteger);
 
         let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": null}}"#).unwrap_err();

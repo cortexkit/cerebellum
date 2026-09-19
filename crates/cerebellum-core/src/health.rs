@@ -88,7 +88,8 @@ impl HealthState {
     ) -> Self {
         Self::with_config(HealthConfig {
             dispatch_heartbeat_stale_ms: heartbeat_threshold.as_millis() as u64,
-            action_age_stale_ms: oldest_action_threshold.as_millis() as u64,
+            queue_age_stale_ms: oldest_action_threshold.as_millis() as u64,
+            in_flight_age_stale_ms: oldest_action_threshold.as_millis() as u64,
         })
     }
 
@@ -164,10 +165,13 @@ impl HealthState {
     /// The wire-visible response is `ModuleControlResponse::HealthCheck {
     /// status, detail, metrics }`, and `metrics` retains the established keys
     /// (`heartbeatAgeSecs`, `oldestQueuedAgeSecs`, `oldestInFlightAgeSecs`,
-    /// `heartbeatThresholdSecs`, `oldestActionThresholdSecs`) expected by
+    /// `heartbeatThresholdSecs`, `queueAgeThresholdSecs`, `inFlightAgeThresholdSecs`) expected by
     /// health-check clients.
     pub fn report(&self) -> ModuleControlResponse {
-        let ages = self.compute_ages();
+        self.report_ages(self.compute_ages())
+    }
+
+    fn report_ages(&self, ages: HealthAges) -> ModuleControlResponse {
         let status = classify(&ages, &self.config);
 
         let detail = if status == HealthStatus::Degraded {
@@ -179,12 +183,12 @@ impl HealthState {
                 ));
             }
             if let Some(q) = ages.oldest_queued_age {
-                if q > self.config.action_age_threshold() {
+                if q > self.config.queue_age_threshold() {
                     reasons.push(format!("oldest queued action {}s stale", q.as_secs()));
                 }
             }
             if let Some(f) = ages.oldest_in_flight_age {
-                if f > self.config.action_age_threshold() {
+                if f > self.config.in_flight_age_threshold() {
                     reasons.push(format!("oldest in-flight action {}s stale", f.as_secs()));
                 }
             }
@@ -199,11 +203,13 @@ impl HealthState {
 
         let metrics = serde_json::json!({
             "inFlightActions": self.timing.in_flight(),
+            "awaitingConsent": self.timing.awaiting_consent(),
             "heartbeatAgeSecs": ages.heartbeat_age.as_secs(),
             "oldestQueuedAgeSecs": ages.oldest_queued_age.map(|d| d.as_secs()).unwrap_or(0),
             "oldestInFlightAgeSecs": ages.oldest_in_flight_age.map(|d| d.as_secs()).unwrap_or(0),
             "heartbeatThresholdSecs": self.config.heartbeat_threshold().as_secs(),
-            "oldestActionThresholdSecs": self.config.action_age_threshold().as_secs(),
+            "queueAgeThresholdSecs": self.config.queue_age_threshold().as_secs(),
+            "inFlightAgeThresholdSecs": self.config.in_flight_age_threshold().as_secs(),
         });
 
         ModuleControlResponse::HealthCheck {
@@ -303,7 +309,7 @@ pub fn health_check_with_clock(state: &HealthState, clock: &impl MonotonicClock)
 /// are not applicable and never degrade health.
 pub fn classify(ages: &HealthAges, config: &HealthConfig) -> HealthStatus {
     let heartbeat_threshold = config.heartbeat_threshold();
-    let action_threshold = config.action_age_threshold();
+    let action_threshold = config.queue_age_threshold();
 
     if ages.heartbeat_age > heartbeat_threshold {
         return HealthStatus::Degraded;
@@ -314,7 +320,7 @@ pub fn classify(ages: &HealthAges, config: &HealthConfig) -> HealthStatus {
         }
     }
     if let Some(f) = ages.oldest_in_flight_age {
-        if f > action_threshold {
+        if f > config.in_flight_age_threshold() {
             return HealthStatus::Degraded;
         }
     }
@@ -325,6 +331,96 @@ pub fn classify(ages: &HealthAges, config: &HealthConfig) -> HealthStatus {
 mod tests {
     use super::*;
     use crate::clock::FakeClock;
+
+    #[test]
+    fn queue_and_in_flight_ages_have_separate_thresholds() {
+        let state = HealthState::with_config(HealthConfig {
+            queue_age_stale_ms: 10_000,
+            in_flight_age_stale_ms: 50_000,
+            ..HealthConfig::default()
+        });
+        for (queued, flight, expected, reason) in [
+            (
+                11,
+                40,
+                HealthStatus::Degraded,
+                Some("oldest queued action 11s stale"),
+            ),
+            (
+                9,
+                51,
+                HealthStatus::Degraded,
+                Some("oldest in-flight action 51s stale"),
+            ),
+            (9, 40, HealthStatus::Ok, None),
+        ] {
+            let ModuleControlResponse::HealthCheck { status, detail, .. } =
+                state.report_ages(HealthAges {
+                    heartbeat_age: Duration::ZERO,
+                    oldest_queued_age: Some(Duration::from_secs(queued)),
+                    oldest_in_flight_age: Some(Duration::from_secs(flight)),
+                })
+            else {
+                panic!("health report")
+            };
+            assert_eq!(status, expected);
+            assert_eq!(detail.as_deref(), reason);
+        }
+    }
+
+    fn metrics(state: &HealthState) -> serde_json::Value {
+        let ModuleControlResponse::HealthCheck {
+            metrics: Some(metrics),
+            ..
+        } = state.report()
+        else {
+            panic!("health report")
+        };
+        metrics
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl MonotonicClock for SharedClock {
+        fn now(&self) -> crate::clock::MonoInstant {
+            crate::clock::MonoInstant::from_nanos(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn a_request_parked_on_consent_leaves_the_busy_gauge() {
+        let state = HealthState::new();
+        let clock = SharedClock::default();
+        let first = state.timing.enter(&clock);
+        let second = state.timing.enter(&clock);
+        clock.0.store(10, Ordering::SeqCst);
+        let park_time = clock.now();
+        let parked = first.park_on_consent();
+        assert_eq!(metrics(&state)["inFlightActions"], 1);
+        assert_eq!(metrics(&state)["awaitingConsent"], 1);
+        clock.0.store(100, Ordering::SeqCst);
+        drop(parked);
+        assert_eq!(metrics(&state)["inFlightActions"], 2);
+        assert_eq!(metrics(&state)["awaitingConsent"], 0);
+        // The older second request still owns the oldest age after the first resumes.
+        assert_eq!(state.oldest_in_flight_instant().unwrap().as_nanos(), 0);
+        drop(second);
+        assert!(state.oldest_in_flight_instant().unwrap() > park_time);
+        drop(first);
+        assert_eq!(metrics(&state)["inFlightActions"], 0);
+    }
+
+    #[test]
+    fn a_request_parked_on_consent_does_not_age_the_in_flight_gauge() {
+        let state = HealthState::new();
+        let mut clock = FakeClock::new();
+        let guard = state.timing.enter(&clock);
+        let _parked = guard.park_on_consent();
+        clock.advance(Duration::from_secs(301));
+        let report = health_check_with_clock(&state, &clock);
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(report.ages.oldest_in_flight_age, None);
+    }
 
     #[test]
     fn fresh_module_is_healthy() {
@@ -345,7 +441,8 @@ mod tests {
         // clock for determinism (no real sleeps).
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 100,
-            action_age_stale_ms: 30000,
+            queue_age_stale_ms: 30000,
+            in_flight_age_stale_ms: 30000,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -363,7 +460,8 @@ mod tests {
     fn degraded_when_heartbeat_exceeds_threshold() {
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 50,
-            action_age_stale_ms: 30000,
+            queue_age_stale_ms: 30000,
+            in_flight_age_stale_ms: 30000,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -378,7 +476,8 @@ mod tests {
     fn degraded_when_oldest_queued_exceeds_threshold() {
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 60000,
-            action_age_stale_ms: 50,
+            queue_age_stale_ms: 50,
+            in_flight_age_stale_ms: 50,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -399,7 +498,8 @@ mod tests {
     fn degraded_when_oldest_in_flight_exceeds_threshold() {
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 60000,
-            action_age_stale_ms: 50,
+            queue_age_stale_ms: 50,
+            in_flight_age_stale_ms: 50,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -417,7 +517,8 @@ mod tests {
     fn clearing_oldest_action_restores_healthy() {
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 60000,
-            action_age_stale_ms: 50,
+            queue_age_stale_ms: 50,
+            in_flight_age_stale_ms: 50,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -445,7 +546,8 @@ mod tests {
         // the overall status when within thresholds.
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 60000,
-            action_age_stale_ms: 60000,
+            queue_age_stale_ms: 60000,
+            in_flight_age_stale_ms: 60000,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -472,7 +574,8 @@ mod tests {
         // the threshold without re-stamping.
         let cfg = HealthConfig {
             dispatch_heartbeat_stale_ms: 50,
-            action_age_stale_ms: 30000,
+            queue_age_stale_ms: 30000,
+            in_flight_age_stale_ms: 30000,
         };
         let clock = FakeClock::new();
         let state = HealthState::with_config(cfg);
@@ -499,7 +602,9 @@ mod tests {
                     "oldestQueuedAgeSecs",
                     "oldestInFlightAgeSecs",
                     "heartbeatThresholdSecs",
-                    "oldestActionThresholdSecs",
+                    "queueAgeThresholdSecs",
+                    "inFlightAgeThresholdSecs",
+                    "awaitingConsent",
                 ] {
                     assert!(obj.contains_key(key), "metrics include {key}");
                 }

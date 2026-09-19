@@ -313,7 +313,9 @@ async fn health_check_returns_insulated_report() {
                 "oldestQueuedAgeSecs",
                 "oldestInFlightAgeSecs",
                 "heartbeatThresholdSecs",
-                "oldestActionThresholdSecs",
+                "queueAgeThresholdSecs",
+                "inFlightAgeThresholdSecs",
+                "awaitingConsent",
             ] {
                 assert!(obj.contains_key(key), "metrics include {key}");
             }

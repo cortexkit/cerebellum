@@ -19,6 +19,11 @@ use serde_json::Value;
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use tokio::sync::{mpsc, oneshot};
 
+tokio::task_local! {
+    // Detached pending replies have no route guard; inline asks inherit this scope.
+    pub(crate) static ROUTE_GUARD: Arc<cerebellum_core::dispatch::InFlightGuard>;
+}
+
 /// How a question ended.
 ///
 /// The two unanswered outcomes are separate because only one is a fault. A
@@ -97,6 +102,8 @@ impl Elicitor {
         mut body: Value,
         deadline: Duration,
     ) -> AskOutcome {
+        let guard = ROUTE_GUARD.try_with(Arc::clone).ok();
+        let _parked = guard.as_ref().map(|guard| guard.park_on_consent());
         let correlation = self.lane.next_correlation();
         let (tx, rx) = oneshot::channel();
 

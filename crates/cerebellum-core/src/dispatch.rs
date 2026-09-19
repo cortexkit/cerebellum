@@ -40,6 +40,7 @@ const ABSENT: u64 = u64::MAX;
 #[derive(Debug)]
 pub struct DispatchTimingState {
     in_flight: AtomicU64,
+    awaiting_consent: AtomicU64,
     live: std::sync::Mutex<(u64, std::collections::BTreeMap<u64, MonoInstant>)>,
     /// Latest heartbeat instant, in nanoseconds since the clock epoch.
     heartbeat_nanos: AtomicU64,
@@ -59,6 +60,7 @@ impl DispatchTimingState {
     pub fn new(clock: &impl crate::clock::MonotonicClock) -> Self {
         Self {
             in_flight: AtomicU64::new(0),
+            awaiting_consent: AtomicU64::new(0),
             live: std::sync::Mutex::new((0, std::collections::BTreeMap::new())),
             heartbeat_nanos: AtomicU64::new(clock.now().as_nanos()),
             oldest_queued_nanos: AtomicU64::new(ABSENT),
@@ -70,18 +72,24 @@ impl DispatchTimingState {
     /// task is first polled.
     pub fn enter(
         self: &std::sync::Arc<Self>,
-        clock: &impl crate::clock::MonotonicClock,
+        clock: &(impl crate::clock::MonotonicClock + Clone + Send + Sync + 'static),
     ) -> InFlightGuard {
         let mut live = self.live.lock().expect("in-flight lock poisoned");
         let ticket = live.0;
         live.0 += 1;
         live.1.insert(ticket, clock.now());
-        self.set_oldest_in_flight(live.1.first_key_value().map(|(_, instant)| *instant));
+        self.set_oldest_in_flight(live.1.values().copied().min());
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         InFlightGuard {
             timing: self.clone(),
             ticket,
+            clock: Box::new(clock.clone()),
+            state: std::sync::Mutex::new(ExecutionState::Executing),
         }
+    }
+
+    pub fn awaiting_consent(&self) -> u64 {
+        self.awaiting_consent.load(Ordering::SeqCst)
     }
 
     pub fn in_flight(&self) -> u64 {
@@ -150,6 +158,54 @@ impl DispatchTimingState {
 pub struct InFlightGuard {
     timing: std::sync::Arc<DispatchTimingState>,
     ticket: u64,
+    clock: Box<dyn crate::clock::MonotonicClock + Send + Sync>,
+    state: std::sync::Mutex<ExecutionState>,
+}
+
+#[derive(PartialEq, Eq)]
+enum ExecutionState {
+    Executing,
+    AwaitingConsent,
+}
+
+impl InFlightGuard {
+    /// Suspend execution accounting while a person decides. The borrowed token
+    /// prevents the request guard from being destroyed before accounting resumes.
+    pub fn park_on_consent(&self) -> ConsentParked<'_> {
+        let mut state = self.state.lock().expect("request state lock poisoned");
+        assert!(
+            *state == ExecutionState::Executing,
+            "request already parked"
+        );
+        let mut live = self.timing.live.lock().expect("in-flight lock poisoned");
+        live.1.remove(&self.ticket);
+        self.timing
+            .set_oldest_in_flight(live.1.values().copied().min());
+        self.timing.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.timing.awaiting_consent.fetch_add(1, Ordering::SeqCst);
+        *state = ExecutionState::AwaitingConsent;
+        ConsentParked { guard: self }
+    }
+}
+
+/// Dropping this token starts a fresh execution interval, including on cancellation.
+pub struct ConsentParked<'a> {
+    guard: &'a InFlightGuard,
+}
+
+impl Drop for ConsentParked<'_> {
+    fn drop(&mut self) {
+        let guard = self.guard;
+        let mut state = guard.state.lock().expect("request state lock poisoned");
+        let mut live = guard.timing.live.lock().expect("in-flight lock poisoned");
+        live.1.insert(guard.ticket, guard.clock.now());
+        guard
+            .timing
+            .set_oldest_in_flight(live.1.values().copied().min());
+        guard.timing.awaiting_consent.fetch_sub(1, Ordering::SeqCst);
+        guard.timing.in_flight.fetch_add(1, Ordering::SeqCst);
+        *state = ExecutionState::Executing;
+    }
 }
 
 impl Drop for InFlightGuard {
@@ -157,7 +213,14 @@ impl Drop for InFlightGuard {
         let mut live = self.timing.live.lock().expect("in-flight lock poisoned");
         live.1.remove(&self.ticket);
         self.timing
-            .set_oldest_in_flight(live.1.first_key_value().map(|(_, instant)| *instant));
-        self.timing.in_flight.fetch_sub(1, Ordering::SeqCst);
+            .set_oldest_in_flight(live.1.values().copied().min());
+        match *self.state.get_mut().expect("request state lock poisoned") {
+            ExecutionState::Executing => {
+                self.timing.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            ExecutionState::AwaitingConsent => {
+                self.timing.awaiting_consent.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 }

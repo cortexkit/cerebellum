@@ -1441,7 +1441,7 @@ where
     }
 }
 
-const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedWait {

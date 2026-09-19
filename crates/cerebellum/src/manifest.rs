@@ -273,7 +273,7 @@ fn self_signals() -> Vec<SelfSignalDeclaration> {
             anchored_to: SignalAnchor::HealthGauges { gauges: vec!["inFlightActions".to_string()] },
             cadence: None,
             domain: None,
-            note: Some("A non-zero reading holds back shutdown while a synthetic input sequence or browser action is mid-flight.".to_string()),
+            note: Some("A non-zero reading holds back shutdown while a synthetic input sequence or browser action is mid-flight. Requests parked on a consent prompt are not counted. computer.open_target and browser.open_grant reply pending and finish consent on a detached task; browser.import_login holds its request and parks while awaiting consent.".to_string()),
         },
         SelfSignalDeclaration {
             name: "dispatch_heartbeat_restamp".to_string(),

@@ -106,6 +106,24 @@ pub enum BrowserSurface {
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
 pub use wire::{build_error_frame, control_flags};
 
+// Absorbs scheduling delay and the pipe handshake's own bounded steps.
+const IN_FLIGHT_MARGIN_MS: u64 = 5_000;
+
+fn derive_in_flight_age_stale_ms(browser: Option<&BrowserConfig>) -> u64 {
+    let mut cap = computer_capability::MAX_WAIT_TIMEOUT_MS;
+    if let Some(browser) = browser {
+        cap = cap
+            .max(browser.navigation_settle_deadline_ms)
+            .max(browser.launch_handshake_deadline_ms)
+            .max(
+                browser
+                    .termination_grace_period_ms
+                    .saturating_add(browser.browser_exit_observation_deadline_ms),
+            );
+    }
+    cap.saturating_add(IN_FLIGHT_MARGIN_MS)
+}
+
 const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
@@ -1115,7 +1133,12 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
 
-    let health_state = Arc::new(HealthState::with_config(config.health));
+    let mut health_config = config.health;
+    health_config.in_flight_age_stale_ms = derive_in_flight_age_stale_ms(match &config.browser {
+        BrowserSurface::Available(browser) => Some(browser),
+        _ => None,
+    });
+    let health_state = Arc::new(HealthState::with_config(health_config));
     let browser_config = match &config.browser {
         BrowserSurface::Available(browser) => Some(browser.clone()),
         BrowserSurface::NotConfigured | BrowserSurface::Refused(_) => None,
@@ -1960,14 +1983,13 @@ async fn handle_frame(
             let guard = planes.health.enter_request();
             let writer = writer.clone();
             let planes = planes.clone();
-            tokio::spawn(async move {
-                let _guard = guard;
+            tokio::spawn(elicit::ROUTE_GUARD.scope(Arc::new(guard), async move {
                 #[cfg(test)]
                 if let Some(handler) = &planes.route_test_handler {
                     handler().await;
                 }
                 let _ = handle_route_request(frame, &writer, &planes).await;
-            });
+            }));
             Ok(true)
         }
         _ => Ok(true),
@@ -2498,6 +2520,17 @@ async fn import_browser_login(
         }
     };
 
+    complete_login_import(planes, facts, writer, channel, epoch, plan).await
+}
+
+async fn complete_login_import(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    writer: &mpsc::Sender<Frame>,
+    channel: u16,
+    epoch: u32,
+    plan: login_import::LoginImportPlan,
+) -> Value {
     let ask_id = login_import::new_ask_id();
     let question = plan.question(&ask_id, &facts.identity.agent_project_id);
     let answer = planes
@@ -3929,6 +3962,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn in_flight_bound_derives_from_the_longest_declared_cap() {
+        let mut config = browser_surface_config();
+        config.navigation_settle_deadline_ms = 45_000;
+        assert_eq!(derive_in_flight_age_stale_ms(None), 35_000);
+        assert_eq!(derive_in_flight_age_stale_ms(Some(&config)), 50_000);
+        assert!(
+            derive_in_flight_age_stale_ms(Some(&config)) > computer_capability::MAX_WAIT_TIMEOUT_MS
+        );
+        assert!(
+            derive_in_flight_age_stale_ms(Some(&config)) > config.navigation_settle_deadline_ms
+        );
+        config.launch_handshake_deadline_ms = 60_000;
+        assert_eq!(derive_in_flight_age_stale_ms(Some(&config)), 65_000);
+        config.termination_grace_period_ms = 40_000;
+        config.browser_exit_observation_deadline_ms = 40_000;
+        assert_eq!(derive_in_flight_age_stale_ms(Some(&config)), 85_000);
+    }
+
     fn browser_surface_config() -> BrowserConfig {
         BrowserConfig {
             executable_path: None,
@@ -4989,7 +5041,8 @@ mod connection_liveness_tests {
             module_id: DEFAULT_MODULE_ID.into(),
             health: HealthConfig {
                 dispatch_heartbeat_stale_ms: 100,
-                action_age_stale_ms: 30_000,
+                queue_age_stale_ms: 30_000,
+                in_flight_age_stale_ms: 30_000,
             },
             browser: BrowserSurface::NotConfigured,
         }
@@ -5338,7 +5391,8 @@ mod dispatch_idle_tests {
     fn test_health_config() -> HealthConfig {
         HealthConfig {
             dispatch_heartbeat_stale_ms: 100,
-            action_age_stale_ms: 30000,
+            queue_age_stale_ms: 30000,
+            in_flight_age_stale_ms: 30000,
         }
     }
 
@@ -5870,6 +5924,86 @@ mod drain_tests {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
         assert_eq!(body["outcome"], "not_running");
+        await_count(&planes, 0).await;
+    }
+
+    #[tokio::test]
+    async fn drain_does_not_wait_on_a_person() {
+        let mut planes = super::tests::management_bound_planes(1, 1);
+        let root =
+            std::env::temp_dir().join(format!("consent-drain-{}", login_import::new_ask_id()));
+        assert!(!root.exists());
+        let executable = root.join("browser");
+        let login_import::PreparedImport::Ready(plan) = login_import::prepare_import(
+            "https://example.com",
+            "project",
+            &executable,
+            login_import::DurableProfileLocation {
+                managed_root: root.clone(),
+                profile_directory: root.join("profile"),
+            },
+            login_import::ImportSettings::for_test(
+                root.join("sqlite"),
+                root.join("data"),
+                root.join("cookies"),
+                vec![login_import::BrowserSource {
+                    id: "chrome",
+                    display_name: "Chrome",
+                    data_directory: "chrome".into(),
+                    executable: executable.clone(),
+                }],
+            ),
+        ) else {
+            panic!("prepared import")
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let inputs = std::sync::Mutex::new(Some((plan, result_tx)));
+        let admitted_planes = planes.clone();
+        let writer = tx.clone();
+        // Start at import_login's prepared-plan boundary to avoid reading the
+        // operator's cookie stores. Admission and consent use the real route task.
+        planes.route_test_handler = Some(Arc::new(move || {
+            let (plan, result_tx) = inputs.lock().unwrap().take().unwrap();
+            let planes = admitted_planes.clone();
+            let writer = writer.clone();
+            Box::pin(async move {
+                let facts = planes.routes.get(1, 1).unwrap();
+                let result = complete_login_import(&planes, &facts, &writer, 1, 1, plan).await;
+                result_tx.send(result).unwrap();
+            })
+        }));
+        handle_frame(
+            frame(
+                FrameType::Request,
+                1,
+                json!({"method":"browser.import_login", "params":{"origin":"https://example.com"}}),
+            ),
+            &tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let question = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(question.header.ty, FrameType::Request);
+        assert_eq!(count(&planes), 0);
+        handle_frame(draining(), &tx, &planes).await.unwrap();
+        assert_eq!(count(&planes), 0);
+        let mut answer = frame(FrameType::Response, 1, json!({"decision":"deny"}));
+        answer.header.corr = question.header.corr;
+        handle_frame(answer, &tx, &planes).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), result_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["outcome"], "denied");
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         await_count(&planes, 0).await;
     }
 

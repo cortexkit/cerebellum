@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use cerebellum_core::clock::{FakeClock, MonotonicClock};
 use cerebellum_core::config::{
-    parse_config, ConfigReason, HealthConfig, DEFAULT_ACTION_AGE_STALE_MS,
-    DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
+    parse_config, ConfigReason, HealthConfig, DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
+    DEFAULT_QUEUE_AGE_STALE_MS,
 };
 use cerebellum_core::health::{health_check_with_clock, HealthState};
 use subc_protocol::session::HealthStatus;
@@ -159,7 +159,8 @@ fn default_in_flight_age_boundaries() {
 fn non_default_heartbeat_threshold_boundaries() {
     let cfg = HealthConfig {
         dispatch_heartbeat_stale_ms: 5000,
-        action_age_stale_ms: DEFAULT_ACTION_AGE_STALE_MS,
+        queue_age_stale_ms: DEFAULT_QUEUE_AGE_STALE_MS,
+        in_flight_age_stale_ms: DEFAULT_QUEUE_AGE_STALE_MS,
     };
     let (state, clock) = fresh_state(cfg);
     let mut clock2 = clock.clone();
@@ -181,10 +182,11 @@ fn non_default_heartbeat_threshold_boundaries() {
 }
 
 #[test]
-fn non_default_action_age_threshold_boundaries() {
+fn non_default_queue_age_threshold_boundaries() {
     let cfg = HealthConfig {
         dispatch_heartbeat_stale_ms: DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
-        action_age_stale_ms: 10000,
+        queue_age_stale_ms: 10000,
+        in_flight_age_stale_ms: 10000,
     };
     // Queued boundary.
     let (state, clock) = fresh_state(cfg);
@@ -238,23 +240,23 @@ fn configuring_one_threshold_leaves_the_other_at_default() {
     // Configure heartbeat only; action age stays at default.
     let cfg = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": 8000}}"#).unwrap();
     assert_eq!(cfg.health.dispatch_heartbeat_stale_ms, 8000);
-    assert_eq!(cfg.health.action_age_stale_ms, DEFAULT_ACTION_AGE_STALE_MS);
+    assert_eq!(cfg.health.queue_age_stale_ms, DEFAULT_QUEUE_AGE_STALE_MS);
 
     // Configure action age only; heartbeat stays at default.
-    let cfg = parse_config(r#"{"health": {"action_age_stale_ms": 90000}}"#).unwrap();
+    let cfg = parse_config(r#"{"health": {"queue_age_stale_ms": 90000}}"#).unwrap();
     assert_eq!(
         cfg.health.dispatch_heartbeat_stale_ms,
         DEFAULT_DISPATCH_HEARTBEAT_STALE_MS
     );
-    assert_eq!(cfg.health.action_age_stale_ms, 90000);
+    assert_eq!(cfg.health.queue_age_stale_ms, 90000);
 
     // Both configured independently.
     let cfg = parse_config(
-        r#"{"health": {"dispatch_heartbeat_stale_ms": 3000, "action_age_stale_ms": 60000}}"#,
+        r#"{"health": {"dispatch_heartbeat_stale_ms": 3000, "queue_age_stale_ms": 60000}}"#,
     )
     .unwrap();
     assert_eq!(cfg.health.dispatch_heartbeat_stale_ms, 3000);
-    assert_eq!(cfg.health.action_age_stale_ms, 60000);
+    assert_eq!(cfg.health.queue_age_stale_ms, 60000);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +268,7 @@ fn configuring_one_threshold_leaves_the_other_at_default() {
 fn zero_threshold_fails_deterministically() {
     let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": 0}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotPositive);
-    let err = parse_config(r#"{"health": {"action_age_stale_ms": 0}}"#).unwrap_err();
+    let err = parse_config(r#"{"health": {"queue_age_stale_ms": 0}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotPositive);
 }
 
@@ -274,7 +276,7 @@ fn zero_threshold_fails_deterministically() {
 fn negative_threshold_fails_deterministically() {
     let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": -1}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotPositive);
-    let err = parse_config(r#"{"health": {"action_age_stale_ms": -30000}}"#).unwrap_err();
+    let err = parse_config(r#"{"health": {"queue_age_stale_ms": -30000}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotPositive);
 }
 
@@ -282,7 +284,7 @@ fn negative_threshold_fails_deterministically() {
 fn fractional_threshold_fails_deterministically() {
     let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": 2000.5}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotInteger);
-    let err = parse_config(r#"{"health": {"action_age_stale_ms": 30000.0}}"#).unwrap_err();
+    let err = parse_config(r#"{"health": {"queue_age_stale_ms": 30000.0}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotInteger);
 }
 
@@ -290,7 +292,7 @@ fn fractional_threshold_fails_deterministically() {
 fn non_numeric_threshold_fails_deterministically() {
     let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": "2000"}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotInteger);
-    let err = parse_config(r#"{"health": {"action_age_stale_ms": true}}"#).unwrap_err();
+    let err = parse_config(r#"{"health": {"queue_age_stale_ms": true}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotInteger);
     let err = parse_config(r#"{"health": {"dispatch_heartbeat_stale_ms": null}}"#).unwrap_err();
     assert_eq!(err.reason, ConfigReason::NotInteger);
@@ -622,7 +624,9 @@ fn report_carries_pinned_metric_keys_and_status() {
                 "oldestQueuedAgeSecs",
                 "oldestInFlightAgeSecs",
                 "heartbeatThresholdSecs",
-                "oldestActionThresholdSecs",
+                "queueAgeThresholdSecs",
+                "inFlightAgeThresholdSecs",
+                "awaitingConsent",
             ] {
                 assert!(obj.contains_key(key), "metrics include {key}");
             }
@@ -639,13 +643,13 @@ fn report_carries_pinned_metric_keys_and_status() {
 #[test]
 fn with_config_uses_parsed_thresholds() {
     let cfg = parse_config(
-        r#"{"health": {"dispatch_heartbeat_stale_ms": 3000, "action_age_stale_ms": 60000}}"#,
+        r#"{"health": {"dispatch_heartbeat_stale_ms": 3000, "queue_age_stale_ms": 60000}}"#,
     )
     .unwrap()
     .health;
     let state = HealthState::with_config(cfg);
     assert_eq!(state.config().dispatch_heartbeat_stale_ms, 3000);
-    assert_eq!(state.config().action_age_stale_ms, 60000);
+    assert_eq!(state.config().queue_age_stale_ms, 60000);
 
     // The thresholds flow through to classification: a 3000ms heartbeat age
     // is healthy (exactly at threshold), 3001ms is degraded.
