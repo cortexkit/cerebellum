@@ -32,6 +32,7 @@ subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
 subc-control = { path = "../subconscious/crates/subc-control" }
 subc-core = { path = "../subconscious/crates/subc-core" }
+subc-daemon = { path = "../subconscious/crates/subc-daemon" }
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # The fleet commons, a second sibling beside subconscious, for the daemon-
 # aligned home resolvers (`resolve_data_home` / `resolve_config_home`). One

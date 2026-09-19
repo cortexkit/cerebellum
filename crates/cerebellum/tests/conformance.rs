@@ -845,7 +845,7 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
 }
 
 struct LiveDaemonGuard {
-    task: Option<JoinHandle<Result<(), subc_core::bootstrap::BootstrapError>>>,
+    task: Option<JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>>,
     directory: PathBuf,
 }
 
@@ -1063,7 +1063,7 @@ async fn start_live_daemon_with_browser(
         .unwrap(),
     )
     .expect("write isolated subc daemon configuration");
-    let daemon_config = subc_core::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
+    let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_daemon_config_path(&daemon_config_path)
         .expect("load isolated subc daemon configuration")
         // The daemon captures each child's stderr into a run directory it
@@ -1078,7 +1078,7 @@ async fn start_live_daemon_with_browser(
                 .join("run")
                 .join("logs"),
         );
-    let task = tokio::spawn(subc_core::bootstrap::run_with_config(daemon_config));
+    let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
 
     // Same reasoning as `wait_for_cerebellum_catalog`: this is a startup race
     // against a real daemon process, not a network operation, so the bound is

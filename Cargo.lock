@@ -95,6 +95,7 @@ dependencies = [
  "socket2",
  "subc-control",
  "subc-core",
+ "subc-daemon",
  "subc-jsonc",
  "subc-protocol",
  "subc-transport",
