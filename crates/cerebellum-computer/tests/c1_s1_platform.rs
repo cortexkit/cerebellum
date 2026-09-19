@@ -13,7 +13,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v9.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v10.json");
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 const SYNTHETIC_CAPABILITIES: [&str; 5] = [
     "computer.type",
@@ -34,7 +34,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v9");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v10");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -241,7 +241,7 @@ fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
 }
 
 #[test]
-fn click_query_and_wait_settle_markers_are_closed_to_v8_values() {
+fn click_query_and_wait_settle_markers_are_closed_to_v10_values() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows");
     let click = rows
@@ -294,7 +294,12 @@ fn click_query_and_wait_settle_markers_are_closed_to_v8_values() {
         .contains(&json!("unreadable_subtrees")));
     assert_eq!(
         wait["result_schema"]["properties"]["outcome"]["enum"],
-        json!(["predicate_satisfied", "timeout", "indeterminate"])
+        json!([
+            "predicate_satisfied",
+            "timeout",
+            "indeterminate",
+            "cancelled"
+        ])
     );
     assert_eq!(
         wait["result_schema"]["properties"]["settle_path"]["enum"],
@@ -450,8 +455,39 @@ fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
     assert_eq!(ids.len(), 8);
 }
 
-fn recreated_v8() -> Value {
+fn recreated_v9() -> Value {
     let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    before["revision"] = json!("computer_action_vocabulary-v9");
+    let wait = before["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.wait")
+        .unwrap();
+    let properties = wait["result_schema"]["properties"].as_object_mut().unwrap();
+    properties.remove("attempts");
+    properties["outcome"]
+        .as_object_mut()
+        .unwrap()
+        .remove("description");
+    properties["outcome"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|v| v != "cancelled");
+    before
+}
+
+#[test]
+fn v10_only_adds_wait_cancellation_and_read_counts() {
+    let bytes = canonical_json_bytes(&recreated_v9()).unwrap();
+    assert_eq!(
+        hex_digest(&bytes),
+        "9018f851fa4af09a2b23d2675b14b9e11398c5cf4cfca20f51172dd609e7980c"
+    );
+}
+
+fn recreated_v8() -> Value {
+    let mut before = recreated_v9();
     before["revision"] = json!("computer_action_vocabulary-v8");
     for row in before["rows"].as_array_mut().expect("rows") {
         let capability = row["capability_id"].as_str().unwrap().to_owned();
