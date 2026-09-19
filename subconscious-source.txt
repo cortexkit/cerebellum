@@ -16,5 +16,5 @@
 # echo "$(git -C ../subconscious rev-parse HEAD:crates/$c) $c"
 # done > subconscious-source.txt
 80a4340074ad0d61fdab39abdedc3a41d05a0828 subc-protocol
-6a28520104f1f1defe2bca9ecf7f00d1e4bd6fc3 subc-transport
-acfc384a6d5667d472b7a0f93476e8c7e9234d37 subc-jsonc
+73dccbc77bd6a87bc04f3384e2a3e18769479463 subc-transport
+8fddfc6e870f344be7c029b0922a01d8042e8cd6 subc-jsonc
