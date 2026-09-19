@@ -3178,15 +3178,34 @@ async fn handle_tool_request(
                 .await;
             }
         };
+        // Every production request registers its cancellation entry before the
+        // task that reaches here is spawned, so the absent case is a module bug
+        // rather than anything a caller can cause. It is a refusal and not an
+        // `expect` because the invariant lives at a DIFFERENT call site than the
+        // one that depends on it: a second entry point added later would satisfy
+        // the compiler, panic in a spawned task, and leave an indeterminate
+        // audit record instead of saying what was wrong. Refusing also cannot be
+        // mistaken for the other repair: handing out a never-cancels handle here
+        // would make the request uninterruptible and look like success.
+        let Some(cancel) = planes.cancellations.get((channel, epoch, corr)) else {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "request_not_interruptible",
+                "this request was not registered for interruption before dispatch; \
+                 it was refused rather than served without a way to stop it",
+            )
+            .await;
+        };
         let result = plane
             .serve(
                 servable,
                 arguments,
                 computer_capability::ServeContext {
-                    cancel: planes
-                        .cancellations
-                        .get((channel, epoch, corr))
-                        .expect("route request registered before spawn"),
+                    cancel,
                     // The durable agent identity, taken from the accepted bind
                     // rather than from the request: an identity a caller could
                     // choose is a lease granted to whoever asks for it.
@@ -6235,5 +6254,49 @@ mod cancel_frame_tests {
         resume.notify_waiters();
         tokio::task::yield_now().await;
         assert!(planes.cancellations.0.lock().unwrap().is_empty());
+    }
+
+    /// A request that reaches the computer plane without a cancellation entry is
+    /// refused rather than served without a way to stop it.
+    ///
+    /// Production registers before spawning and both test entry points go
+    /// through the same registration, so this state takes calling the handler
+    /// directly to construct at all. That is the point: the invariant is held at
+    /// a DIFFERENT call site than the one relying on it, so the day a second
+    /// entry point forgets it, this says so on the wire rather than panicking
+    /// inside a spawned task, where the only trace would be an indeterminate
+    /// audit record.
+    // macOS-only: the computer plane's admission field is target-gated, so on a
+    // host without it this request is answered `unknown_method` long before the
+    // check under test, and the assertion would pass for the wrong reason.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_unregistered_request_is_refused_rather_than_served_uninterruptibly() {
+        let mut planes = planes();
+        let route_bindings = Arc::new(RouteBindings::new());
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            7,
+            1,
+            42,
+            serde_json::to_vec(&json!({"name": "computer.wait", "arguments": {}})).unwrap(),
+        )
+        .unwrap();
+        install_test_bind(&route_bindings, &request);
+        planes.routes = route_bindings;
+        #[cfg(target_os = "macos")]
+        {
+            planes.computer_admitted = test_admitted_computer_capabilities();
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+
+        // Deliberately NOT registered: the only way to reach the state.
+        handle_tool_request(request, &tx, &planes).await.unwrap();
+
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "request_not_interruptible");
     }
 }
