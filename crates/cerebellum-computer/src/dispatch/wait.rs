@@ -175,6 +175,10 @@ pub fn wait_until_predicate<P: PredicatePoller>(
         .saturating_add(2);
     let mut attempts = 0_u64;
     let mut last_readback = ObservedElement::absent();
+    // Why the last read failed, kept so a wait that never manages one read can
+    // say which obstacle it kept hitting rather than reporting a bare timeout.
+    let mut last_read_failure: Option<String> = None;
+    let mut ever_read = false;
 
     // The attempt bound is derived from the deadline and remains a second guard
     // if a faulty clock or sleeper stops advancing. The elapsed-time checks are
@@ -184,7 +188,13 @@ pub fn wait_until_predicate<P: PredicatePoller>(
             return cancelled_result(predicate, last_readback, attempts);
         }
         if attempts > 0 && poller.elapsed() >= timeout {
-            return timed_out(predicate, last_readback, attempts);
+            return deadline_result(
+                predicate,
+                last_readback,
+                attempts,
+                ever_read,
+                last_read_failure,
+            );
         }
         let remaining = timeout.saturating_sub(poller.elapsed());
         let read_budget_ms = u64::try_from(remaining.as_millis())
@@ -195,17 +205,30 @@ pub fn wait_until_predicate<P: PredicatePoller>(
             &predicate,
             u32::try_from(read_budget_ms).expect("the scoped read cap fits u32"),
         ) {
-            Ok(observed) => observed,
+            Ok(observed) => {
+                ever_read = true;
+                last_read_failure = None;
+                observed
+            }
+            // A FAILED READ IS NOT A VERDICT. This is a polling primitive, and
+            // the commonest reason a scoped read fails is that the element is
+            // not there yet: searching a large tree for something absent cannot
+            // exit early, so it spends the whole read budget and reports the
+            // deadline. Returning here made `computer.wait` one-shot in
+            // practice -- measured against Finder, an `element_present` wait for
+            // an element that did not exist ended `indeterminate` after a single
+            // attempt, which is precisely the case the capability exists to
+            // serve. So the reason is remembered and the loop keeps polling;
+            // only a wait that reaches its deadline without ever completing a
+            // read reports that it could not look.
             Err(reason) => {
-                return WaitResult {
-                    outcome: WaitOutcome::Indeterminate,
-                    evidence: WaitEvidence::Indeterminate {
-                        predicate,
-                        readback: None,
-                        reason,
-                    },
-                    attempts,
+                last_read_failure = Some(reason);
+                if poller.elapsed() >= timeout {
+                    break;
                 }
+                let remaining = timeout.saturating_sub(poller.elapsed());
+                poller.sleep(remaining.min(Duration::from_millis(WAIT_POLL_INTERVAL_MS)));
+                continue;
             }
         };
 
@@ -235,7 +258,13 @@ pub fn wait_until_predicate<P: PredicatePoller>(
         }
 
         if poller.elapsed() >= timeout {
-            return timed_out(predicate, last_readback, attempts);
+            return deadline_result(
+                predicate,
+                last_readback,
+                attempts,
+                ever_read,
+                last_read_failure,
+            );
         }
         let remaining = timeout.saturating_sub(poller.elapsed());
         if cancelled() {
@@ -244,7 +273,40 @@ pub fn wait_until_predicate<P: PredicatePoller>(
         poller.sleep(remaining.min(Duration::from_millis(WAIT_POLL_INTERVAL_MS)));
     }
 
-    timed_out(predicate, last_readback, attempts)
+    deadline_result(
+        predicate,
+        last_readback,
+        attempts,
+        ever_read,
+        last_read_failure,
+    )
+}
+
+/// What a wait that ran out of time should say.
+///
+/// A wait that never completed a single read cannot claim the condition was
+/// unmet; it can only say it could not look, and name what stopped it. One
+/// place decides that, because the loop can reach its deadline at three
+/// different points and they must not disagree.
+fn deadline_result(
+    predicate: PostCondition,
+    last_readback: ObservedElement,
+    attempts: u64,
+    ever_read: bool,
+    last_read_failure: Option<String>,
+) -> WaitResult {
+    match last_read_failure {
+        Some(reason) if !ever_read => WaitResult {
+            outcome: WaitOutcome::Indeterminate,
+            evidence: WaitEvidence::Indeterminate {
+                predicate,
+                readback: None,
+                reason,
+            },
+            attempts,
+        },
+        _ => timed_out(predicate, last_readback, attempts),
+    }
 }
 
 fn cancelled_result(
@@ -291,6 +353,23 @@ mod tests {
     }
 
     impl FakePoller {
+        /// Answer a scripted sequence of reads, then repeat the last one.
+        fn scripted(reads: Vec<Result<ObservedElement, String>>) -> Self {
+            let repeat = reads
+                .last()
+                .cloned()
+                .expect("a scripted poller needs at least one read");
+            Self {
+                elapsed: Duration::ZERO,
+                reads: reads.into(),
+                repeat,
+                read_count: Rc::new(Cell::new(0)),
+                sleep_count: 0,
+                cancel_on_sleep: None,
+                advance_sleep: true,
+            }
+        }
+
         fn repeating(readback: Result<ObservedElement, String>) -> Self {
             Self {
                 elapsed: Duration::ZERO,
@@ -391,6 +470,55 @@ mod tests {
                 predicate,
                 readback,
             }
+        );
+    }
+
+    /// A read that fails is not an answer, and a wait that stops on one is not
+    /// a wait.
+    ///
+    /// Measured on the running module against Finder: an `element_present` wait
+    /// for an element that did not exist ended `indeterminate` after ONE
+    /// attempt, because searching a large tree for something absent cannot exit
+    /// early and so spends the whole scoped-read budget. That is the case the
+    /// capability exists to serve -- wait for a thing to appear -- and it was
+    /// the one case it could not serve.
+    #[test]
+    fn a_failing_read_is_retried_until_the_predicate_can_be_evaluated() {
+        let predicate = focused("AXTextField", "Account");
+        let mut poller = FakePoller::scripted(vec![
+            Err("read_deadline_exceeded".to_string()),
+            Err("read_deadline_exceeded".to_string()),
+            Ok(ObservedElement {
+                present: true,
+                focused: Some(true),
+                enabled: None,
+                value: None,
+            }),
+        ]);
+
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 10_000, &never_cancelled);
+
+        assert_eq!(result.outcome, WaitOutcome::Settled);
+        assert_eq!(
+            result.attempts, 3,
+            "the two failed reads must be attempts, not the end of the wait"
+        );
+    }
+
+    /// The distinction the retry must not erase: a wait that never managed a
+    /// read says so, rather than reporting the condition unmet.
+    #[test]
+    fn a_wait_that_never_reads_names_the_obstacle_rather_than_timing_out() {
+        let predicate = focused("AXTextField", "Account");
+        let mut poller = FakePoller::repeating(Err("target_not_inspectable".to_string()));
+
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 100, &never_cancelled);
+
+        assert_eq!(result.outcome, WaitOutcome::Indeterminate);
+        assert!(
+            result.attempts > 1,
+            "it must keep trying rather than give up on the first failure, got {}",
+            result.attempts
         );
     }
 
