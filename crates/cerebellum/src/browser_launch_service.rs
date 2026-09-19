@@ -1490,7 +1490,14 @@ mod executable_identity_launch_tests {
 
     impl UnsignedExecutable {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
+            // NOT under `std::env::temp_dir()`. Measured on macOS 27.0: these
+            // exact bytes under `$TMPDIR` make `codesign -d` never return,
+            // while the same bytes under `/tmp` answer instantly -- the
+            // system-policy evaluation that applies to the per-user temp
+            // directory does not apply here. Left in `$TMPDIR`, this fixture
+            // measured the host's `syspolicyd` instead of our refusal path, and
+            // it hung the whole suite indefinitely rather than failing.
+            let path = Path::new("/tmp").join(format!(
                 "ck-unsigned-browser-{}-{}",
                 std::process::id(),
                 SystemTime::now()

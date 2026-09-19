@@ -107,7 +107,11 @@ fn verify_code_signed_executable(
     path: &Path,
     expected: &str,
 ) -> Result<VerifiedExecutableIdentity, Value> {
-    let whole_file = read_signing_details(verifier, path, None)?;
+    // One deadline for the whole verification rather than one per read: the
+    // number of reads is the file's slice count, so a per-read budget would let
+    // a universal binary multiply it by four.
+    let deadline = std::time::Instant::now() + VERIFIER_DEADLINE;
+    let whole_file = read_signing_details(verifier, path, None, deadline)?;
     let Some(architectures) = whole_file
         .format
         .as_deref()
@@ -122,7 +126,7 @@ fn verify_code_signed_executable(
     let mut signing_identifier: Option<String> = None;
     let mut slice_code_hashes = BTreeSet::new();
     for architecture in &architectures {
-        let slice = read_signing_details(verifier, path, Some(architecture))?;
+        let slice = read_signing_details(verifier, path, Some(architecture), deadline)?;
         let (Some(identifier), Some(code_hash)) = (slice.identifier, slice.code_hash) else {
             return Err(identity_unverifiable("verifier_failed"));
         };
@@ -173,25 +177,76 @@ struct SigningDetails {
     code_hash: Option<String>,
 }
 
+/// How long the whole identity verification may spend inside the verifier.
+///
+/// A healthy `codesign -d` answers in tens of milliseconds. The bound exists
+/// because the verifier is a SUBPROCESS WHOSE LATENCY IS NOT OURS: measured on
+/// macOS 27.0, `codesign -d` on an unsigned file under `$TMPDIR` never returns
+/// while the identical bytes under `/tmp` answer instantly, with `syspolicyd`
+/// burning CPU throughout. Unbounded, that hangs a browser launch forever --
+/// and it did hang this crate's own suite indefinitely, which is how it was
+/// found. A refusal that arrives is worth more than a verdict that never does.
+#[cfg(target_os = "macos")]
+const VERIFIER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the deadline is checked while the verifier runs.
+#[cfg(target_os = "macos")]
+const VERIFIER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Run the verifier once, for the whole file or for one architecture slice.
+///
+/// Bounded by `deadline`, shared across every read of one verification. On
+/// expiry the child is killed and, if it does not die promptly, ABANDONED
+/// rather than waited on: a verifier blocked in the kernel on system policy
+/// evaluation does not answer a signal either, and blocking here to reap it
+/// would reintroduce exactly the hang this bound exists to remove. The process
+/// is already leaked in that case by anything that gives up on it; what changes
+/// is that this caller no longer waits with it.
 #[cfg(target_os = "macos")]
 fn read_signing_details(
     verifier: &Path,
     path: &Path,
     architecture: Option<&str>,
+    deadline: std::time::Instant,
 ) -> Result<SigningDetails, Value> {
     let mut command = std::process::Command::new(verifier);
     command.args(["-d", "--verbose=4"]);
     if let Some(architecture) = architecture {
         command.args(["--arch", architecture]);
     }
-    let output = command.arg(path).output().map_err(|error| {
-        identity_unverifiable(if error.kind() == std::io::ErrorKind::NotFound {
-            "verifier_missing"
-        } else {
-            "verifier_failed"
-        })
-    })?;
+    let mut child = command
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            identity_unverifiable(if error.kind() == std::io::ErrorKind::NotFound {
+                "verifier_missing"
+            } else {
+                "verifier_failed"
+            })
+        })?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Best effort, in this order: ask it to die, give it one
+                    // poll interval to do so, then leave. Reaping is not worth
+                    // a second unbounded wait.
+                    let _ = child.kill();
+                    std::thread::sleep(VERIFIER_POLL_INTERVAL);
+                    let _ = child.try_wait();
+                    return Err(identity_unverifiable("verifier_timed_out"));
+                }
+                std::thread::sleep(VERIFIER_POLL_INTERVAL);
+            }
+            Err(_) => return Err(identity_unverifiable("verifier_failed")),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|_| identity_unverifiable("verifier_failed"))?;
     if !output.status.success() {
         return Err(identity_unverifiable("verifier_failed"));
     }
@@ -371,6 +426,48 @@ mod tests {
             "identity-that-cannot-match-the-system-shell",
         )
         .expect_err("the system shell must not match the deliberately different identity")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_verifier_that_never_answers_times_out_rather_than_hanging() {
+        // A fake verifier that outlives any sane deadline, so the bound is
+        // measured rather than assumed. Using a real wedged codesign would
+        // make this test depend on the host's system-policy daemon, which is
+        // the condition that motivated the bound and cannot be staged.
+        let directory = std::env::temp_dir().join(format!(
+            "ck-slow-verifier-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("create slow verifier directory");
+        let verifier = directory.join("codesign");
+        std::fs::write(&verifier, "#!/bin/sh\nsleep 600\n").expect("write slow verifier");
+        let mut permissions = std::fs::metadata(&verifier)
+            .expect("read slow verifier metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&verifier, permissions).expect("make slow verifier executable");
+
+        let started = std::time::Instant::now();
+        let refusal =
+            verify_code_signed_executable(&verifier, Path::new("/bin/sh"), "com.apple.sh")
+                .expect_err("a verifier that never answers cannot establish an identity");
+        let elapsed = started.elapsed();
+
+        assert_eq!(refusal["outcome"], "identity_unverifiable");
+        assert_eq!(refusal["reason"], "verifier_timed_out");
+        assert_ne!(refusal["reason"], "verifier_failed");
+        // The bound is the point: an unbounded read returns only when the child
+        // does, which for the condition this guards is never.
+        assert!(
+            elapsed < VERIFIER_DEADLINE * 2,
+            "the read returned after {elapsed:?}, which is not bounded by the deadline"
+        );
+        std::fs::remove_dir_all(&directory).expect("remove slow verifier directory");
     }
 
     #[cfg(target_os = "macos")]
