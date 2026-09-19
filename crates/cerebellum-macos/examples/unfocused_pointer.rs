@@ -168,6 +168,20 @@ fn main() {
     // answering first is whether the public surface alone suffices. A negative
     // result here means "public fields alone are not enough", not "the public
     // path cannot do it" -- the difference is one more private symbol.
+    // MEASURED, and it is why this arm cannot be read on its own. On this desk
+    // on 2026-09-20, all three with the target FRONTMOST so delivery is not in
+    // question:
+    //
+    //     no stamps, posted globally       -> selects the line
+    //     stamps,    posted globally       -> selects NOTHING
+    //     stamps,    posted to the pid     -> selects NOTHING
+    //
+    // The first two differ only by the stamps, so the stamps break the event
+    // rather than routing it. Which field does it is not yet known; the pid
+    // field (40) on a globally posted event is the first suspect, since it
+    // tells the window server the event belongs to one process. Until that is
+    // bisected, a negative from this arm is a fact about the stamping and not
+    // about per-process pointer delivery.
     let window_routed = std::env::var("CEREBELLUM_PROBE_WINDOW_ROUTED").is_ok();
     let routed_window = if window_routed {
         match target_window(target) {
@@ -266,10 +280,12 @@ fn main() {
         }
         _ if window_routed => {
             println!(
-                "VERDICT: NO SELECTION WITH WINDOW ROUTING. The public integer fields alone do \
-                 not carry a pointer sequence to a background window. That is narrower than \
-                 \"the public path cannot\": the remaining untested difference is the window-LOCAL \
-                 point, which cua stamps through a private SkyLight symbol."
+                "VERDICT: NO SELECTION WITH WINDOW ROUTING -- AND THAT IS NOT A DELIVERY FINDING. \
+                 Measured on this desk 2026-09-20: the same stamped sequence posted GLOBALLY to a \
+                 FRONTMOST target also selects nothing, while the identical sequence WITHOUT the \
+                 stamps selects the line. So the stamping breaks the event before delivery is \
+                 reached, and a negative here says nothing about whether a per-process post can \
+                 carry a pointer. Bisect the fields before reading this arm as an answer."
             );
         }
         _ => {
