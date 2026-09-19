@@ -130,10 +130,30 @@ esac
   exit 1
 }
 
+# The fleet staging card. The placement gate reads `ck-<module>.current` to
+# learn which staged artifact the owner is handing over; without it the gate
+# infers the card from mtime, which nearly placed a superseded binary once.
+# One line, shasum-shaped (sha256, card name, UTC stamp), overwritten on every
+# stage so a superseded card is superseded here too. The card itself is copied
+# beside it and its digest re-read from those bytes at rest, so the line
+# describes the file the gate will open rather than the one this script built.
+FLEET_STAGING="$HOME/.local/share/cortexkit/staging"
+CARD="$DEPLOYED_NAME.$(printf '%s' "$HEAD_REV" | cut -c1-8)"
+mkdir -p "$FLEET_STAGING"
+cp "$STAGE/$DEPLOYED_NAME" "$FLEET_STAGING/$CARD"
+(cd "$FLEET_STAGING" && shasum -a 256 "$CARD" > "$CARD.sha256" \
+  && shasum -a 256 -c "$CARD.sha256" >/dev/null \
+  && [ "$(cut -d' ' -f1 "$CARD.sha256")" = "$(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")" ] \
+  && printf '%s  %s  %s\n' "$(cut -d' ' -f1 "$CARD.sha256")" "$CARD" "$(date -u +%Y%m%dT%H%M%SZ)" > "$DEPLOYED_NAME.current") || {
+  echo "REFUSING: the fleet staging card does not match the staged bytes" >&2
+  exit 1
+}
+
 echo
 echo "==> staged $STAGE/$DEPLOYED_NAME"
 echo "    rev:         $HEAD_REV"
 echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar $DEPLOYED_NAME.sha256)"
+echo "    card:        $FLEET_STAGING/$CARD  (declared in $DEPLOYED_NAME.current)"
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
 echo

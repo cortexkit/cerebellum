@@ -124,14 +124,18 @@ for example in crates/*/examples/*.rs; do
 
   # The declaration must name THIS example and enable tests for it. Reading the
   # block rather than grepping for the name separately, so a test = true meant
-  # for a different example cannot satisfy this one.
-  if ! awk -v want="$name" '
+  # for a different example cannot satisfy this one. The verdict is compared as
+  # a value rather than piped into grep -q: a status-deciding pipeline whose
+  # last stage can close early inverts under pipefail the day the producer
+  # outgrows the pipe buffer, and a value comparison cannot.
+  verdict="$(awk -v want="$name" '
       /^\[\[example\]\]/ { in_block = 1; found_name = 0; found_test = 0; next }
       /^\[/ && !/^\[\[example\]\]/ { in_block = 0 }
       in_block && $0 ~ "name[[:space:]]*=[[:space:]]*\"" want "\"" { found_name = 1 }
       in_block && $0 ~ /test[[:space:]]*=[[:space:]]*true/ { found_test = 1 }
       found_name && found_test { print "ok"; exit }
-    ' "$manifest" | grep -q ok; then
+    ' "$manifest")"
+  if [ "$verdict" != ok ]; then
     echo "example tests never run: $example has tests, but $manifest does not declare"
     echo "  [[example]] name = \"$name\" with test = true"
     example_failed=1
