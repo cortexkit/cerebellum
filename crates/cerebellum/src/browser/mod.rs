@@ -1280,15 +1280,15 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, CapabilityResultValidationError> {
         let reply = self.dispatch(identity, capability, args).await;
-        self.finish_reply(capability, reply)
+        self.finish_reply(capability.name(), reply)
     }
 
-    fn finish_reply(
+    pub(crate) fn finish_reply(
         &self,
-        capability: BrowserCapability,
+        capability_id: &str,
         reply: Value,
     ) -> Result<Value, CapabilityResultValidationError> {
-        match validate_browser_result(capability.name(), &reply) {
+        match validate_browser_result(capability_id, &reply) {
             Ok(()) => Ok(reply),
             Err(error) => {
                 let mut findings = self
@@ -3049,12 +3049,31 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             request_schema: json!({"type":"object","properties":{"deadline_ms":{"type":"integer","minimum":0,"maximum":30000}},"additionalProperties":false}),
             result_schema: wait_for_result_schema(),
         },
+        BrowserToolDefinition {
+            name: crate::browser_session::BROWSER_LAUNCH,
+            description: "Launch the route-owned browser session.",
+            request_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            result_schema: browser_launch_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: crate::browser_session::BROWSER_STATUS,
+            description: "Report the route-owned browser session state.",
+            request_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            result_schema: browser_status_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: crate::browser_session::BROWSER_CLOSE,
+            description: "Close and reap the route-owned browser session.",
+            request_schema: json!({"type":"object","properties":{"browser_session_id":{"type":"string","minLength":1}},"required":["browser_session_id"],"additionalProperties":false}),
+            result_schema: browser_close_result_schema(),
+        },
     ]
 }
 
 pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
     browser_tool_definitions()
         .into_iter()
+        .filter(|definition| BrowserCapability::parse(definition.name).is_some())
         .map(|definition| {
             (
                 definition.name,
@@ -3267,6 +3286,111 @@ fn wait_for_result_schema() -> Value {
             "inflight_count":integer_schema(),
         }),
         &[],
+    )
+}
+
+fn enum_schema(values: &[&str]) -> Value {
+    json!({"type":"string","enum":values})
+}
+
+fn browser_lease_result_schema() -> Value {
+    closed_object(
+        json!({
+            "idle_expires_at":string_schema(),
+            "idle_timeout_ms":integer_schema(),
+        }),
+        &["idle_expires_at", "idle_timeout_ms"],
+    )
+}
+
+fn invalid_request_detail_result_schema() -> Value {
+    closed_object(
+        json!({
+            "field":string_schema(),
+            "reason_code":string_schema(),
+        }),
+        &["field", "reason_code"],
+    )
+}
+
+fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Value {
+    let properties = properties
+        .as_object_mut()
+        .expect("browser control result properties are objects");
+    properties.insert("outcome".into(), enum_schema(outcomes));
+    properties.insert("detail".into(), invalid_request_detail_result_schema());
+    closed_object(properties.clone().into(), &["outcome"])
+}
+
+fn browser_launch_result_schema() -> Value {
+    browser_control_result_schema(
+        &[
+            "launched",
+            "browser_session_exists",
+            "no_profile",
+            "executable_missing",
+            "browser_launch_unsupported",
+            "internal_failure",
+            "launch_cancelled",
+            "cleanup_failure",
+            "invalid_request",
+        ],
+        json!({
+            "browser_session_id":string_schema(),
+            "profile_disposition":enum_schema(&["none", "durable", "disposable"]),
+            "platform":string_schema(),
+            "expected_path":string_schema(),
+            "reason":string_schema(),
+            "executable_identity_checkpoints":enum_schema(&["before_spawn_and_after_exec", "after_exec_only"]),
+            "lease":browser_lease_result_schema(),
+            "stage":string_schema(),
+            "reason_code":string_schema(),
+        }),
+    )
+}
+
+fn browser_status_result_schema() -> Value {
+    browser_control_result_schema(
+        &[
+            "ready",
+            "no_session",
+            "terminal",
+            "cleanup_failure",
+            "durable_state_at_risk",
+            "invalid_request",
+        ],
+        json!({
+            "browser_session_id":string_schema(),
+            "profile_disposition":enum_schema(&["durable", "disposable"]),
+            "lease":browser_lease_result_schema(),
+            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete"]),
+            "terminal_outcome":enum_schema(&["closed", "browser_crashed", "connector_failure", "cdp_failure", "idle_expired", "route_unbound", "module_shutdown", "cleanup_failure", "startup_indeterminate"]),
+            "failed_signals":string_array_schema(),
+        }),
+    )
+}
+
+fn browser_close_result_schema() -> Value {
+    browser_control_result_schema(
+        &[
+            "closed",
+            "browser_crashed",
+            "connector_failure",
+            "cdp_failure",
+            "idle_expired",
+            "route_unbound",
+            "module_shutdown",
+            "cleanup_failure",
+            "startup_indeterminate",
+            "browser_session_not_found",
+            "durable_state_at_risk",
+            "invalid_request",
+        ],
+        json!({
+            "browser_session_id":string_schema(),
+            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete"]),
+            "failed_signals":string_array_schema(),
+        }),
     )
 }
 
@@ -4517,7 +4641,7 @@ mod tests {
             .expect("navigate reply is an object")
             .insert("not_declared".into(), json!(true));
         let error = plane
-            .finish_reply(BrowserCapability::Navigate, undeclared)
+            .finish_reply(NAVIGATE, undeclared)
             .expect_err("an undeclared reply field is withheld");
         assert!(matches!(
             error,
@@ -4537,7 +4661,7 @@ mod tests {
             .expect("navigate reply is an object")
             .insert("http_status".into(), json!("200"));
         let error = plane
-            .finish_reply(BrowserCapability::Navigate, wrong_type)
+            .finish_reply(NAVIGATE, wrong_type)
             .expect_err("a wrong-typed reply field is withheld");
         assert!(matches!(
             error,

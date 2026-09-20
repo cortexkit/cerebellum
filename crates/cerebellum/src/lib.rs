@@ -3141,12 +3141,37 @@ async fn handle_tool_request(
     };
 
     if browser_session::CONTROL_TOOLS.contains(&name) {
-        let result = if accepted_facts.allows_control_operation(name) {
-            handle_browser_control(name, arguments, &accepted_facts, planes).await
-        } else {
-            json!({"outcome": "authorization_denied"})
+        if !accepted_facts.allows_control_operation(name) {
+            return send_tool_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                json!({"outcome": "authorization_denied"}),
+            )
+            .await;
+        }
+        let result = handle_browser_control(name, arguments, &accepted_facts, planes).await;
+        return match planes.browser.finish_reply(name, result) {
+            Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!(
+                        "the capability reply violated its frozen result schema ({error}); the \
+                         operation may already have completed, so do not retry it based on this \
+                         response"
+                    ),
+                )
+                .await
+            }
         };
-        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
     }
 
     // Routed by which plane serves the capability, before the browser handler

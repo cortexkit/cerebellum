@@ -19,6 +19,9 @@ use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
 };
 use cerebellum::{BrowserConfig, BrowserSurface, Planes};
+use cerebellum_computer::platform::vocabulary::{
+    CapabilityResultValidationError, CapabilityResultViolation,
+};
 use cerebellum_core::health::HealthState;
 use cerebellum_core::identity::RouteIdentity;
 use serde_json::{json, Value};
@@ -207,6 +210,21 @@ impl BrowserSessionLauncher for RecoveryFailedLauncher {
         Err(json!({
             "outcome": "internal_failure",
             "reason_code": "browser_launch_recovery_failed",
+        }))
+    }
+}
+
+struct UndeclaredReplyLauncher;
+
+impl BrowserSessionLauncher for UndeclaredReplyLauncher {
+    fn launch(
+        &self,
+        _: &cerebellum_core::identity::AcceptedBindFacts,
+        _: &str,
+    ) -> Result<LaunchedBrowser, Value> {
+        Err(json!({
+            "outcome": "internal_failure",
+            "undeclared_at_the_dispatch_site": true,
         }))
     }
 }
@@ -790,6 +808,42 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
         ["snapshot"],
         "hazard refusal dispatched input"
     );
+}
+
+#[tokio::test]
+async fn wire_launch_withholds_undeclared_launcher_reply_at_the_dispatch_site() {
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(UndeclaredReplyLauncher));
+
+    let response = invoke(&planes, 1, "browser.launch", json!({})).await;
+    assert_eq!(response.header.ty, FrameType::Error);
+    let error: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(error.code, "computer_result_schema_violation");
+    assert!(error.message.contains("undeclared_at_the_dispatch_site"));
+}
+
+#[test]
+fn browser_control_outcome_vocabularies_reject_undeclared_words() {
+    for capability_id in ["browser.launch", "browser.status", "browser.close"] {
+        let error = cerebellum::browser::validate_browser_result(
+            capability_id,
+            &json!({"outcome": "new_undeclared_outcome"}),
+        )
+        .expect_err("an undeclared browser-control outcome must be refused");
+        assert!(matches!(
+            error,
+            CapabilityResultValidationError::ReplyViolations {
+                ref violations,
+                ..
+            } if violations == &[CapabilityResultViolation::EnumMismatch {
+                path: "$.outcome".into(),
+            }]
+        ));
+    }
 }
 
 #[tokio::test]
