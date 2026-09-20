@@ -1468,108 +1468,160 @@ mod tests {
         // correct. Searching for a stable window is also what keeps this fence
         // covering anything -- stopping at the first candidate turned it into
         // a permanent skip on any desk with an animating window in front.
-        let mut stable = None;
+        // BRACKET THE MEASUREMENT, do not merely precede it. Two identical
+        // captures taken before the cropped one say the window was still a
+        // moment ago; they say nothing about whether it changed during the
+        // comparison, and a terminal with a blinking cursor changes twice a
+        // second. That is what made this fence pass at one hour and fail at
+        // the next while the capture path was correct throughout: the full and
+        // the half were two pictures of different desks.
+        //
+        // So take full, half, full, and require the two fulls to agree. The
+        // control now spans the thing it is controlling for.
+        let mut measured = None;
         for candidate in windows
             .iter()
             .filter(|w| w.on_screen && w.width >= 256.0 && w.height >= 256.0)
             .take(12)
         {
-            let Ok(first) = capture_window(candidate.window_id, Duration::from_secs(10), None)
+            let Ok(before) = capture_window(candidate.window_id, Duration::from_secs(10), None)
             else {
                 continue;
             };
-            let Ok(again) = capture_window(candidate.window_id, Duration::from_secs(10), None)
+            let rect = Some(CaptureSourceRect {
+                x: 0.0,
+                y: 0.0,
+                width: candidate.width,
+                height: candidate.height / 2.0,
+            });
+            let Ok(half) = capture_window(candidate.window_id, Duration::from_secs(10), rect)
             else {
                 continue;
             };
-            if first.bgra == again.bgra {
-                stable = Some((candidate, first));
+            let Ok(after) = capture_window(candidate.window_id, Duration::from_secs(10), None)
+            else {
+                continue;
+            };
+            if before.bgra == after.bgra {
+                measured = Some((candidate, before, half));
                 break;
             }
         }
-        let Some((window, full)) = stable else {
+        let Some((window, full, half)) = measured else {
             eprintln!(
-                "SKIPPED: no on-screen window at least 256x256 held still across two identical \
-                 captures, so none can support a comparison between different ones."
+                "SKIPPED: no on-screen window at least 256x256 held still across the whole \
+                 measurement, so no full capture describes the same desk as the cropped one."
             );
             return;
         };
-        let Ok(half) = capture_window(
-            window.window_id,
-            Duration::from_secs(10),
-            Some(CaptureSourceRect {
-                x: 0.0,
-                y: 0.0,
-                width: window.width,
-                height: window.height / 2.0,
-            }),
-        ) else {
-            eprintln!("SKIPPED: the half-window capture failed.");
-            return;
-        };
+        let _ = window;
 
-        let row = |src: &[u8], width: usize, y: usize| -> Vec<u8> {
-            src[y * width * 4..(y + 1) * width * 4].to_vec()
-        };
-
-        // WHICH row of the window did the capture end on? Asking only whether
-        // it is nearer the halfway row than the last row is too weak, and this
-        // test has already been fooled by it: an out-of-bounds rect is CLAMPED
-        // by the framework, so a wrong offset still returns a crop -- just the
-        // wrong one -- and "is this a crop" answers yes. Locating the row makes
-        // the assertion name the region rather than its shape.
-        let expected = half.height - 1;
-
-        // SELF-CHECK THE INSTRUMENT BEFORE TRUSTING IT. Locating a row only
-        // means something in a window whose rows differ from each other. A
-        // window with a large flat region has many near-identical rows, and the
-        // winner among them turns on rendering noise.
-        if !rows_are_placeable(&full.bgra, full.width, full.height, expected) {
-            eprintln!(
-                "SKIPPED: this window cannot be measured -- a row taken FROM the full capture \
-                 cannot be located back at its own position, so its rows do not differ enough \
-                 to place anything."
-            );
-            return;
-        }
-
-        let last_output_row = row(&half.bgra, half.width, expected);
-        let landed_on = best_matching_row(&full.bgra, full.width, full.height, &last_output_row);
-
-        // CAN THIS WINDOW DISCRIMINATE AT ALL, under the APPROXIMATE matching
-        // used above? The placeability check answers a weaker question: it
-        // locates an EXACT copy of a row, which succeeds whenever no other row
-        // is byte-identical. The comparison that matters comes from a resampled
-        // capture, so it is never exact, and a window whose rows differ only
-        // slightly can locate an exact row perfectly and still put an
-        // approximate one anywhere.
+        // COMPARE WHOLE BLOCKS, NOT ONE ROW. Locating a single resampled row
+        // by its nearest match reads a terminal wrong: most of its rows are
+        // near-blank, so a blank row from the crop matched a different blank
+        // row two thirds down the window at less than half the distance to its
+        // true position. The verdict was confident, decisive by every margin
+        // this test applied, and about the instrument rather than the
+        // framework -- the crop was correct throughout.
         //
-        // So compare the two distances that decide the verdict. If the row this
-        // landed on is barely better than the row expected, the window is not
-        // answering the question -- and a verdict drawn from evidence that
-        // cannot discriminate is the defect this test exists to catch, one
-        // level up.
-        if landed_on.abs_diff(expected) > 1 {
-            let to_landed = row_distance(&last_output_row, &row(&full.bgra, full.width, landed_on));
-            let to_expected =
-                row_distance(&last_output_row, &row(&full.bgra, full.width, expected));
-            if !margin_is_decisive(to_landed, to_expected) {
-                eprintln!(
-                    "SKIPPED: this window cannot discriminate rows -- the best match at {landed_on} \
-                     ({to_landed}) is not meaningfully closer than the expected row at {expected} \
-                     ({to_expected}), so locating a resampled row here decides nothing."
-                );
-                return;
-            }
+        // The placeability self-check above cannot catch that, and says so in
+        // its own comment: it locates an EXACT copy of a row, which succeeds
+        // whenever no two rows are byte-identical, while the row that decides
+        // the verdict is resampled and therefore never exact. Uniqueness under
+        // exact matching does not imply uniqueness under approximate matching.
+        //
+        // Summing over every row removes the ambiguity rather than trying to
+        // qualify it: one blank row matches many, but six hundred rows in
+        // sequence match one place. The offsets are searched instead of the
+        // two hypotheses being named, because a rect applied in the WRONG
+        // COORDINATE SPACE is clamped into a valid crop at some other offset
+        // -- so "is this the top crop or the whole window" answers yes to a
+        // crop starting seventy rows down, which is the exact defect this test
+        // exists to catch.
+        let sample = |src: &[u8], width: usize, y: usize| -> Vec<u8> {
+            // Every eighth pixel: enough signal to place a block, little
+            // enough work to search every offset in a debug build.
+            (0..width)
+                .step_by(8)
+                .flat_map(|x| src[(y * width + x) * 4..(y * width + x) * 4 + 4].to_vec())
+                .collect()
+        };
+        let block_distance = |offset: usize| -> u64 {
+            (0..half.height)
+                .step_by(8)
+                .map(|y| {
+                    row_distance(
+                        &sample(&half.bgra, half.width, y),
+                        &sample(&full.bgra, full.width, y + offset),
+                    )
+                })
+                .sum()
+        };
+
+        // TWO HYPOTHESES, NOT AN ARGMIN OVER ALL OF THEM. Everything above
+        // this line went through four instruments in one sitting -- nearest
+        // row, nearest row with a placeability check, nearest row with a
+        // decisive-margin check, block argmin with a discrimination guard --
+        // and every one of them answered a question slightly different from
+        // the one being asked, then dressed the difference as a verdict or an
+        // excuse. The argmin versions all shared one flaw: they asked WHERE
+        // the output sits, which requires the minimum to stand out from every
+        // other offset, and then needed a guard to decide whether it stood out
+        // enough. That guard is what returned green on the defect.
+        //
+        // The question is narrower than that, and asking it narrowly needs no
+        // guard: does the output sit at the TOP, better than it sits anywhere
+        // else? Two numbers, and the comparison between them is the verdict.
+        // A tie means this window cannot answer, which is a property of the
+        // window and stated as a skip.
+        //
+        // The one-row tolerance is resampling: the crop and the full capture
+        // are resampled independently, so the true alignment can score better
+        // a row off. Offsets within three rows of the top belong to the top
+        // hypothesis; everything from four rows down is the alternative.
+        let at_top = (0..=1).map(block_distance).min().expect("two offsets");
+        let (elsewhere_at, elsewhere) = (4..=(full.height - half.height))
+            .map(|offset| (offset, block_distance(offset)))
+            .min_by_key(|(_, distance)| *distance)
+            .expect("the window is taller than the half it was cropped to");
+
+        // A SCALE IS NOT AN OFFSET, so name it separately: reading the full
+        // window at every second row is what the output would hold if the rect
+        // were ignored and the window squeezed into the requested size.
+        let at_scale: u64 = (0..half.height)
+            .step_by(8)
+            .map(|y| {
+                row_distance(
+                    &sample(&half.bgra, half.width, y),
+                    &sample(&full.bgra, full.width, y * full.height / half.height),
+                )
+            })
+            .sum();
+
+        // Within a quarter of each other, the two hypotheses are not being
+        // separated by this window's content.
+        if at_top.max(elsewhere) * 4 <= at_top.min(elsewhere) * 5 {
+            eprintln!(
+                "SKIPPED: this window cannot separate the hypotheses -- the output matches the \
+                 top ({at_top}) about as well as it matches {elsewhere_at} rows down \
+                 ({elsewhere}), so its content places nothing."
+            );
+            return;
         }
-        // Resampling moves the best match by a row at most; anything further is
-        // a different region, not a rounding artefact.
+
         assert!(
-            landed_on.abs_diff(expected) <= 1,
-            "the source rect returned the wrong region: the last row of a capture requesting \
-             the window's top half matches window row {landed_on}, not row {expected}. A rect \
-             outside the window's own coordinate space is clamped rather than refused, so this \
-             is what an offset applied in the wrong space looks like"
+            at_top < elsewhere,
+            "the source rect returned the wrong region: the output of a capture requesting the \
+             window's top half matches the window {elsewhere_at} rows down ({elsewhere}) better \
+             than it matches the top ({at_top}). A rect outside the window's own coordinate \
+             space is clamped into some other region rather than refused, so an offset applied \
+             in the wrong space looks exactly like this"
+        );
+        assert!(
+            at_scale >= at_top.saturating_mul(2),
+            "the source rect was ignored: the output matches the whole window squeezed into the \
+             requested size (distance {at_scale}) about as well as it matches the top crop \
+             ({at_top})"
         );
     }
 
