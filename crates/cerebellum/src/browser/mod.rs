@@ -2987,19 +2987,6 @@ impl BrowserPlane {
     pub async fn record_subresource_policy_event(&self, _identity: &RouteIdentity) {}
 }
 
-/// Route-independent helper for callers that already have a BrowserPlane.
-pub async fn handle_tool(
-    plane: &BrowserPlane,
-    identity: &RouteIdentity,
-    name: &str,
-    args: &Value,
-) -> Result<Value, CapabilityResultValidationError> {
-    match BrowserCapability::parse(name) {
-        Some(capability) => plane.serve(identity, capability, args).await,
-        None => Ok(json!({"outcome":"unknown_method"})),
-    }
-}
-
 fn severity_schema() -> Value {
     json!({"type":"object","properties":{"tier":{"type":"integer","minimum":1,"maximum":5},"credential":{"type":"boolean"},"financial":{"type":"boolean"}},"required":["tier","credential","financial"],"additionalProperties":false})
 }

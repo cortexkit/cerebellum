@@ -67,7 +67,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-pub use browser::{handle_tool as handle_browser_tool, BrowserCapability, BrowserPlane};
+pub use browser::{BrowserCapability, BrowserPlane};
 pub use browser_config::{BrowserConfig, BrowserConfigError};
 pub use browser_type::{
     browser_type_dispatch_eligible, browser_type_eligibility, browser_type_geometry_eligible,
@@ -3304,28 +3304,32 @@ async fn handle_tool_request(
         };
     }
 
+    // ADMISSION AT THE TOP OF THIS FUNCTION ALREADY MADE THIS PARSE TOTAL, and
+    // that is the problem with leaving the branch to something else: the
+    // invariant lives in `dispatchable_tool_with_browser`, a different function
+    // in a different part of this file, and a change there resurrects this arm
+    // for whoever is reading THAT code. So this answers rather than delegating,
+    // and it answers the SAME route-level envelope the admission check sends --
+    // a resurrection then returns the reply the wire already documents instead
+    // of a second spelling nobody tests.
+    //
+    // It used to call `browser::handle_tool`, which re-parsed the name it had
+    // just been told does not parse and could therefore only ever return a
+    // reply BODY of `{"outcome": "unknown_method"}` -- no `context`, which
+    // `reply_schema` makes required, so it would have failed its own schema had
+    // anything validated it. That helper is gone; nothing else called it.
     let Some(capability) = browser::BrowserCapability::parse(name) else {
-        let result =
-            browser::handle_tool(browser_plane, &accepted_facts.identity, name, arguments).await;
-        return match result {
-            Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
-            Err(error) => {
-                send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    browser::RESULT_SCHEMA_VIOLATION_CODE,
-                    &format!(
-                        "the capability reply violated its frozen result schema ({error}); the \
-                         operation may already have completed, so do not retry it based on this \
-                         response"
-                    ),
-                )
-                .await
-            }
-        };
+        let withheld = CapabilityWithheld::Unknown;
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            withheld.reason_code(),
+            &format!("'{name}' is not served here: {}", withheld.remedy()),
+        )
+        .await;
     };
     let result = browser_plane
         .serve(&accepted_facts.identity, capability, arguments)
