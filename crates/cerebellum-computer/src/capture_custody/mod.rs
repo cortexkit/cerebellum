@@ -1408,6 +1408,22 @@ pub enum AccessibilityRedactionError {
 /// Redact every field before constructing the only retained envelope.  When the
 /// path is not selected, the successful result is intentionally atomic and does
 /// not return any snapshot-derived bytes.
+///
+/// UNREACHED FROM PRODUCTION as of this writing: nothing in `crates/cerebellum`
+/// constructs an `AccessibilitySnapshot`, so the only callers are tests.  It is
+/// kept rather than deleted because the order here is a decision and not an
+/// implementation: every field is redacted BEFORE any envelope exists, so a
+/// field that cannot be redacted aborts while there are no bytes to leak.  An
+/// author wiring accessibility text into the journal in a hurry would naturally
+/// build the envelope first and redact into it, which passes the raw value
+/// through on the failure path.
+///
+/// The comment above can go stale the day production does construct a snapshot,
+/// so the decision itself is pinned by tests named for it rather than by this
+/// paragraph: `a_field_that_cannot_be_redacted_refuses_rather_than_passing_the_value_through`
+/// and `accessibility_path_is_atomic_when_not_selected_and_bounded_when_durable`
+/// in `crates/cerebellum-computer/tests/c2_s2_audit.rs`.  Those survive the
+/// rewiring, the rewrite, and this note being wrong.
 pub fn redact_accessibility_snapshot<R: Redactor>(
     snapshot: AccessibilitySnapshot,
     schema: &AccessibilitySchema,
