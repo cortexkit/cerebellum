@@ -58,6 +58,16 @@ async fn main() {
     }
 }
 
+// The consent relay, shared by every probe that answers its own elicitation.
+//
+// Declared at the file's top level rather than inside the probe module: a
+// `#[path]` on a mod nested in an inline module resolves against
+// `examples/<inline-mod-name>/`, a directory that does not exist, and POSIX
+// will not resolve `..` out of a missing component.
+#[cfg(target_os = "macos")]
+#[path = "support/consent_relay.rs"]
+mod consent_relay;
+
 #[cfg(target_os = "macos")]
 mod macos_probe {
     use std::process::Command;
@@ -86,6 +96,8 @@ mod macos_probe {
         BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
     };
     use tokio::sync::mpsc;
+
+    use super::consent_relay::elicit_and_answer;
 
     use super::display_value_changed;
 
@@ -986,64 +998,6 @@ mod macos_probe {
         })
         .await
         .map_err(|_| "target consent answer did not mint authority".to_string())?
-    }
-
-    async fn elicit_and_answer(
-        planes: &Planes,
-        opening: Frame,
-        answer_body: Value,
-        label: &str,
-    ) -> Result<Value, String> {
-        let (writer, mut frames) = mpsc::channel(8);
-        cerebellum::handle_frame_for_test(opening, &writer, planes)
-            .await
-            .map_err(|error| format!("{label} request failed: {error}"))?;
-
-        let mut reply = None;
-        let mut question = None;
-        loop {
-            let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
-                .await
-                .map_err(|_| format!("{label} reply or question timed out"))?
-                .ok_or_else(|| format!("{label} relay closed"))?;
-            let body: Value = serde_json::from_slice(&frame.body)
-                .map_err(|error| format!("{label} frame was not JSON: {error}"))?;
-            if frame.header.ty == FrameType::Request {
-                question = Some((frame, body));
-            } else {
-                reply = Some(body);
-            }
-            if let Some(reply) = reply.as_ref() {
-                if reply["outcome"] != "consent_pending" || question.is_some() {
-                    break;
-                }
-            }
-        }
-        let reply = reply.ok_or_else(|| format!("{label} returned no reply"))?;
-        println!("{label} open: {reply}");
-        if reply["outcome"] != "consent_pending" {
-            println!("{label} elicitation: not opened for this typed outcome");
-            return Ok(reply);
-        }
-
-        let (question_frame, question) =
-            question.ok_or_else(|| format!("{label} returned no elicitation question"))?;
-        println!("{label} question: {question}");
-        println!("{label} answer: {answer_body}");
-        let answer = Frame::build_with_version(
-            PROTOCOL_VERSION,
-            FrameType::Response,
-            Flags::new(false, Priority::Interactive, false),
-            question_frame.header.channel,
-            question_frame.header.epoch,
-            question_frame.header.corr,
-            serde_json::to_vec(&answer_body).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        cerebellum::handle_frame_for_test(answer, &writer, planes)
-            .await
-            .map_err(|error| format!("{label} answer failed: {error}"))?;
-        Ok(reply)
     }
 
     async fn bind_routes(planes: &Planes) -> Result<(), String> {
