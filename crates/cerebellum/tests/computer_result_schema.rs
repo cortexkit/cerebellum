@@ -555,3 +555,54 @@ async fn served_reply_divergence_inventory_is_empty() {
         "every artifact-owned result divergence must be removed"
     );
 }
+
+/// An undeclared property inside a `windows` element is a violation.
+///
+/// Until v12 it was not, and the reason is worth stating where the fence is:
+/// `computer.screenshot.windows` was declared `{"type": "array"}` with no
+/// `items`, and BOTH layers treated that as nothing to check. Artifact
+/// validation accepted the array as closed, and enforcement walked elements
+/// only when it had a schema for them, so every element of the one array a
+/// caller reads after asking for `target_windows` passed unchecked -- in
+/// Withhold mode, on a row that reads as closed.
+///
+/// Two assertions rather than one: the element must reject what it does not
+/// declare AND accept what it does, because a schema that refuses everything
+/// would pass the first on its own.
+#[test]
+fn an_undeclared_property_inside_a_window_element_is_withheld() {
+    let element = json!({
+        "window_id": "window-1",
+        "width_px": 30,
+        "height_px": 16,
+        "image_png_b64": "AAAA",
+    });
+    let mut reply = json!({
+        "outcome": "captured",
+        "windows": [element.clone()],
+        "windows_enumeration": "complete",
+    });
+
+    validate_capability_result("computer.screenshot", &reply)
+        .expect("the declared element shape is accepted");
+
+    reply["windows"][0]
+        .as_object_mut()
+        .expect("a window element is an object")
+        .insert(
+            "screen_text".into(),
+            json!("whatever the window was showing"),
+        );
+    let error = validate_capability_result("computer.screenshot", &reply)
+        .expect_err("an undeclared element property is withheld");
+    assert!(
+        matches!(
+            error,
+            CapabilityResultValidationError::ReplyViolations { ref violations, .. }
+                if violations == &[CapabilityResultViolation::UndeclaredProperty {
+                    path: "$.windows[0].screen_text".into()
+                }]
+        ),
+        "expected one undeclared-property violation naming the element path, got {error:?}"
+    );
+}

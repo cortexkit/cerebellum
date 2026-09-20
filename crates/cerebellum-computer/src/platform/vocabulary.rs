@@ -24,9 +24,9 @@ use std::sync::OnceLock;
 // A reviewer read the mismatch as a mistake before finding both fields in the
 // artifact, so it is stated here rather than left to be re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v11";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v12";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v11.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v12.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -34,7 +34,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "053e41a737daf472412987b745ef056c07ab8808b1b8bcd65c526ab9e6beaba4";
+    "a820c3519c72bdedf0c7604f8f30531411d4538345e63fc160835aabcb422bfa";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -700,9 +700,23 @@ fn validate_runtime_result_schema(
             }
         }
         "array" => {
-            if let Some(items) = object.get("items") {
-                validate_runtime_result_schema(items, &format!("{path}[]"))?;
-            }
+            // REQUIRED, not optional. An array with no `items` is a hole in the
+            // closed-schema guarantee rather than a schema with nothing to say:
+            // enforcement walks elements only when it has a schema for them, so
+            // an undeclared array passes every element unchecked while the row
+            // reads as closed. `computer.screenshot.windows` was exactly that
+            // until v12 -- the one array a caller reads after asking for
+            // target_windows, with its element shape unvalidated.
+            //
+            // The browser plane has always required it. Two validators for one
+            // rule is how they came to disagree, and the weaker one guarded the
+            // artifact with the hole.
+            let items = object.get("items").ok_or_else(|| {
+                CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path}.items is missing"
+                ))
+            })?;
+            validate_runtime_result_schema(items, &format!("{path}[]"))?;
         }
         _ => {}
     }
@@ -835,20 +849,16 @@ fn collect_result_violations(
             }
         }
         "array" => {
-            if let Some(items) = object.get("items") {
-                for (index, value) in result
-                    .as_array()
-                    .expect("the result type was checked above")
-                    .iter()
-                    .enumerate()
-                {
-                    collect_result_violations(
-                        items,
-                        value,
-                        &format!("{path}[{index}]"),
-                        violations,
-                    );
-                }
+            let items = object
+                .get("items")
+                .expect("cached array schemas have items");
+            for (index, value) in result
+                .as_array()
+                .expect("the result type was checked above")
+                .iter()
+                .enumerate()
+            {
+                collect_result_violations(items, value, &format!("{path}[{index}]"), violations);
             }
         }
         _ => {}
@@ -858,8 +868,8 @@ fn collect_result_violations(
 /// Check a served capability reply against the digest-pinned result schema.
 ///
 /// The artifact is parsed and checked once per process. Each call then walks the
-/// reply once, without cloning it; arrays with no `items` schema need no element
-/// traversal. An unknown capability or an unsupported schema keyword fails
+/// reply once, without cloning it. An unknown capability or an unsupported
+/// schema keyword fails
 /// closed rather than silently weakening the contract.
 pub fn validate_capability_result(
     capability_id: &str,

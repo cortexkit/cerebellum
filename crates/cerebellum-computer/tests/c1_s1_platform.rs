@@ -14,7 +14,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v11.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v12.json");
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 const SYNTHETIC_CAPABILITIES: [&str; 5] = [
     "computer.type",
@@ -35,7 +35,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[test]
 fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v11");
+    assert_eq!(validated.revision, "computer_action_vocabulary-v12");
     assert_eq!(validated.row_count, 8);
     assert_eq!(validated.row_count, 8, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
@@ -576,9 +576,26 @@ fn recreated_v9() -> Value {
     before
 }
 
+/// v12 without its one addition: the element shape of the `windows` array.
+fn recreated_v11() -> Value {
+    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    before["revision"] = historical_revision(11);
+    let screenshot = before["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.screenshot")
+        .unwrap();
+    screenshot["result_schema"]["properties"]["windows"]
+        .as_object_mut()
+        .unwrap()
+        .remove("items");
+    before
+}
+
 /// v11 without its one addition: the window-enumeration disclosure.
 fn recreated_v10() -> Value {
-    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let mut before: Value = recreated_v11();
     before["revision"] = historical_revision(10);
     let screenshot = before["rows"]
         .as_array_mut()
@@ -610,6 +627,19 @@ fn v11_only_adds_the_window_enumeration_disclosure() {
     assert_eq!(
         hex_digest(&bytes),
         "27b891258a29e2a392e971597901636137648febe3c0c40dc3718d7a4f44fd2a"
+    );
+}
+
+/// v12 declares the element shape of `windows` and nothing else.
+///
+/// The digest on the right is v11's, measured before the mint. Subtracting the
+/// one `items` schema must reproduce it exactly.
+#[test]
+fn v12_only_declares_the_windows_element_shape() {
+    let bytes = canonical_json_bytes(&recreated_v11()).unwrap();
+    assert_eq!(
+        hex_digest(&bytes),
+        "053e41a737daf472412987b745ef056c07ab8808b1b8bcd65c526ab9e6beaba4"
     );
 }
 

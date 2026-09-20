@@ -1,6 +1,6 @@
 //! The frozen vocabulary and the code that decides the same things must agree.
 //!
-//! Several fields in `computer_action_vocabulary-v11.json` state a rule that a
+//! Several fields in `computer_action_vocabulary-v12.json` state a rule that a
 //! hand-written function also states. Validation checks those fields are
 //! PRESENT and never reads them, so the two statements can drift apart with
 //! nothing failing: the file is the contract and the function is what runs.
@@ -26,7 +26,7 @@ use cerebellum_computer::{
 };
 use serde_json::Value;
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v11.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v12.json");
 
 /// These frozen fields have no per-capability code counterpart to compare.
 ///
@@ -391,7 +391,7 @@ fn the_two_required_audit_obligations_are_not_interchangeable() {
 #[test]
 fn scroll_declares_a_semantic_path_that_no_action_implements() {
     let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/computer_action_vocabulary-v11.json"
+        "../resources/computer_action_vocabulary-v12.json"
     ))
     .expect("the frozen vocabulary parses");
     let scroll = vocabulary["rows"]
@@ -518,7 +518,7 @@ fn semantic_support_is_claimed_only_where_an_action_implements_it() {
     const IMPLEMENTED_SEMANTIC_PATHS: [&str; 1] = ["ax_press"];
 
     let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/computer_action_vocabulary-v11.json"
+        "../resources/computer_action_vocabulary-v12.json"
     ))
     .expect("the frozen vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows is an array");
@@ -640,7 +640,7 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
     );
 
     let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/computer_action_vocabulary-v11.json"
+        "../resources/computer_action_vocabulary-v12.json"
     ))
     .expect("the frozen vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows is an array");
