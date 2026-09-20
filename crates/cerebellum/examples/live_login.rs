@@ -61,6 +61,14 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
+// The consent relay, shared with the computer-plane probes. These two carried
+// a byte-identical copy whose frame pump was a fixed two-iteration loop, which
+// assumes every request opens an elicitation: a capability answering without
+// one left the second recv waiting until its own timeout, reported as "the
+// consent question was not prompt" about a question that was never owed.
+#[path = "support/consent_relay.rs"]
+mod consent_relay;
+
 #[cfg(target_os = "macos")]
 const MACOS_CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 #[cfg(target_os = "linux")]
@@ -1177,7 +1185,6 @@ async fn bind_route(
 
 async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
     let grant_count_before = planes.management.browser_grant_count().await;
-    let (writer, mut frames) = mpsc::channel(8);
     let opening = route_request(
         MANAGEMENT_CHANNEL,
         MANAGEMENT_EPOCH,
@@ -1193,42 +1200,16 @@ async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
             }
         }),
     );
-    cerebellum::handle_frame_for_test(opening, &writer, planes)
-        .await
-        .unwrap();
-
-    let mut pending = None;
-    let mut question = None;
-    for _ in 0..2 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
-            .await
-            .expect("the grant reply and consent question are prompt")
-            .expect("the consent relay remains open");
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        if frame.header.ty == FrameType::Request {
-            question = Some((frame, body));
-        } else {
-            pending = Some(body);
-        }
-    }
-    let pending = pending.expect("browser.open_grant returns consent_pending");
-    assert_eq!(pending["outcome"], "consent_pending", "{pending}");
-    let (question_frame, question) = question.expect("the relay receives a consent question");
-    println!("consent question: {question}");
-
-    let answer = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        FrameType::Response,
-        Flags::new(false, Priority::Interactive, false),
-        question_frame.header.channel,
-        question_frame.header.epoch,
-        question_frame.header.corr,
-        serde_json::to_vec(&json!({"decision": "allow"})).unwrap(),
+    let pending = consent_relay::elicit_and_answer(
+        planes,
+        opening,
+        json!({"decision": "allow"}),
+        "browser.open_grant",
     )
-    .unwrap();
-    cerebellum::handle_frame_for_test(answer, &writer, planes)
-        .await
-        .unwrap();
+    .await
+    .expect("the grant request and its consent question complete");
+    assert_eq!(pending["outcome"], "consent_pending", "{pending}");
+
     tokio::time::timeout(Duration::from_secs(2), async {
         while planes.management.browser_grant_count().await <= grant_count_before {
             tokio::task::yield_now().await;
