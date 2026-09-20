@@ -3354,6 +3354,43 @@ fn validate_runtime_result_schema(
     let schema_type = schema_types
         .first()
         .expect("a result schema with types is nonempty");
+
+    // A KEYWORD THAT DOES NOT APPLY TO THE DECLARED TYPE IS A SILENT NO-OP, and
+    // silence is the whole problem: enforcement reads only the keywords it knows
+    // for the type in hand, so a misspelled `requried` or a `pattern` on a string
+    // constrains nothing while reading, to its author, as a constraint. These
+    // schemas are built by `json!` in this file rather than loaded from a pinned
+    // artifact, so nothing else would catch the typo.
+    //
+    // The FIRST declared type decides, and that is exact rather than a
+    // shortcut: `schema_types` refuses `array` or `object` inside a list of
+    // more than one, so a multi-type schema is all scalars and every branch
+    // below would answer identically. A `.any()` over the list would imply a
+    // generality the loader does not permit.
+    //
+    // The computer plane has had this check since it was written; this side
+    // did not, which is the mirror of the array-items hole that side had until
+    // v12. Two validators for one rule diverge in BOTH directions.
+    for keyword in object.keys() {
+        let applicable = match schema_type.as_str() {
+            "object" => matches!(
+                keyword.as_str(),
+                "additionalProperties"
+                    | "description"
+                    | "enum"
+                    | "properties"
+                    | "required"
+                    | "type"
+            ),
+            "array" => matches!(keyword.as_str(), "description" | "enum" | "items" | "type"),
+            _ => matches!(keyword.as_str(), "description" | "enum" | "type"),
+        };
+        if !applicable {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.{keyword} does not apply to result type {schema_type}"
+            )));
+        }
+    }
     if object
         .get("description")
         .is_some_and(|description| !description.is_string())
@@ -4412,6 +4449,62 @@ mod tests {
                 json!({"vendor":"cloudflare","evidence":"cf-mitigated: challenge"}),
             );
         assert!(validate_browser_result(NAVIGATE, &present).is_ok());
+    }
+
+    /// A composite keyword on the WRONG composite type is refused, not ignored.
+    ///
+    /// Two checks already stood here and neither covered this: an unknown
+    /// keyword is refused by name, and an object-or-array keyword on a SCALAR
+    /// is refused. What fell between them is a known keyword valid for one
+    /// composite type sitting on the other -- `required` on an array, `items`
+    /// on an object. Enforcement reads only the keywords it knows for the type
+    /// in hand, so those constrain nothing while reading, to their author, as
+    /// constraints. These schemas are built by `json!` in this file, so nothing
+    /// else would catch it.
+    ///
+    /// Both arms on purpose: the shipped schemas pass, which says the check can
+    /// come back clean, and the gap case fails, which says it is looking. The
+    /// nullable arm keeps the check honest about multi-type schemas, which the
+    /// loader permits for SCALARS ONLY -- it refuses `array` or `object` inside
+    /// a list of more than one -- so reading the first type is the whole rule
+    /// and a nullable string must still pass.
+    #[test]
+    fn a_composite_keyword_on_the_wrong_composite_type_is_refused() {
+        validate_runtime_result_schema(&navigate_result_schema(), "$")
+            .expect("the shipped navigate schema uses only applicable keywords");
+
+        let required_on_an_array = json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "required": ["outcome"],
+        });
+        let error = validate_runtime_result_schema(&required_on_an_array, "$")
+            .expect_err("required on an array is refused rather than ignored");
+        assert!(
+            matches!(
+                error,
+                CapabilityResultValidationError::MalformedArtifact(ref message)
+                    if message.contains("required") && message.contains("does not apply")
+            ),
+            "expected the refusal to name the keyword, got {error:?}"
+        );
+
+        let items_on_an_object = json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false,
+            "items": { "type": "string" },
+        });
+        validate_runtime_result_schema(&items_on_an_object, "$")
+            .expect_err("items on an object is refused");
+
+        let nullable_string = json!({
+            "type": ["string", "null"],
+            "description": "a value the page may not have",
+        });
+        validate_runtime_result_schema(&nullable_string, "$")
+            .expect("a nullable string carrying only scalar keywords is accepted");
     }
 
     #[test]
