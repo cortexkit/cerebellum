@@ -200,34 +200,6 @@ impl ComputerDescriptorCodec {
         ComputerPlaneDescriptor::decode(bytes)
     }
 
-    pub fn encoded_len(&self, descriptor: &ComputerPlaneDescriptor) -> u64 {
-        // All three values are closed enum labels, so the exact JSON length can
-        // be computed without allocating or serializing a descriptor.
-        let capability = match descriptor.capability {
-            ComputerCapability::Click => "click",
-            ComputerCapability::Type => "type",
-            ComputerCapability::Keys => "keys",
-            ComputerCapability::Scroll => "scroll",
-            ComputerCapability::Move => "move",
-            ComputerCapability::Drag => "drag",
-            ComputerCapability::Screenshot => "screenshot",
-            ComputerCapability::Wait => "wait",
-        };
-        let containment = match descriptor.containment_rung {
-            ContainmentRung::SemanticElement => "semantic_element",
-            ContainmentRung::PidStructural => "pid_structural",
-            ContainmentRung::GlobalNone => "global_none",
-        };
-        let observation = match descriptor.observation {
-            ObservationState::HumanObserved => "human_observed",
-            ObservationState::HumanUnobserved => "human_unobserved",
-        };
-        (r#"{"capability":"","containment_rung":"","observation":""}"#.len()
-            + capability.len()
-            + containment.len()
-            + observation.len()) as u64
-    }
-
     pub const fn codec_id(&self) -> &'static str {
         Self::CODEC_ID
     }
@@ -1119,14 +1091,6 @@ impl fmt::Display for DescriptorError {
 
 impl std::error::Error for DescriptorError {}
 
-/// Canonical capability map used by conformance tests and release tooling.
-pub fn capability_map() -> BTreeMap<&'static str, ActionKind> {
-    ComputerCapability::ALL
-        .into_iter()
-        .map(|capability| (capability.capability_id(), capability.action_kind()))
-        .collect()
-}
-
 // Short aliases keep the vocabulary readable at call sites without creating a
 // second type or a second mapping table.
 pub use action_effect_class as map_action_kind_to_effect_class;
@@ -1827,117 +1791,5 @@ where
 
     pub fn journal_purge(&mut self) -> cerebellum_core::journal::PurgeReport {
         self.journal.purge()
-    }
-}
-
-use crate::capture_custody::{
-    redact_accessibility_snapshot, AccessibilityRedactionError, AccessibilityRedactionOutcome,
-    AccessibilityRedactionPath, AccessibilitySchema, AccessibilitySnapshot,
-};
-use cerebellum_core::journal::RedactionUnavailable;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessibilityDispatchError {
-    Redaction(AccessibilityRedactionError),
-    Journal(JournalError),
-}
-
-/// Route a structured accessibility capture through the one redactor bound to
-/// this journal.  A non-selected success becomes a terminal rejection without
-/// attaching snapshot bytes; a selected success returns only after its opaque
-/// envelope is attached durably.  Any redaction failure records the reduced
-/// `redaction_unavailable` terminal instead of silently dropping the attempt.
-impl<R, T, S> ComputerAudit<R, T, S>
-where
-    R: Redactor,
-    T: SeverityTaxonomy,
-    S: JournalStorage,
-{
-    #[allow(clippy::too_many_arguments)]
-    pub fn redact_accessibility(
-        &mut self,
-        handle: ReservationHandle,
-        snapshot: AccessibilitySnapshot,
-        schema: &AccessibilitySchema,
-        redactor_id: impl Into<String>,
-        max_field_bytes: usize,
-        max_descriptor_bytes: usize,
-        path: AccessibilityRedactionPath,
-    ) -> Result<AccessibilityRedactionOutcome, AccessibilityDispatchError> {
-        let bound = JournalBoundRedactor {
-            journal: &self.journal,
-        };
-        let outcome = redact_accessibility_snapshot(
-            snapshot,
-            schema,
-            &bound,
-            redactor_id,
-            max_field_bytes,
-            max_descriptor_bytes,
-            path,
-        );
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.journal
-                    .finalize_reduced(
-                        handle,
-                        cerebellum_core::journal::JournalReason::RedactionUnavailable,
-                    )
-                    .map_err(AccessibilityDispatchError::Journal)?;
-                self.consume_terminal_transitions();
-                return Err(AccessibilityDispatchError::Redaction(error));
-            }
-        };
-        match &outcome {
-            AccessibilityRedactionOutcome::SuccessNotSelected => {
-                self.journal
-                    .finalize_rejected(
-                        handle,
-                        RejectionMaterial {
-                            rejection_material: b"success_not_selected".to_vec(),
-                        },
-                    )
-                    .map_err(AccessibilityDispatchError::Journal)?;
-                self.consume_terminal_transitions();
-            }
-            AccessibilityRedactionOutcome::PendingSuccess {
-                descriptor_bytes, ..
-            } => {
-                self.journal
-                    .attach_obligation_material(
-                        handle,
-                        "computer.accessibility",
-                        0,
-                        descriptor_bytes.clone(),
-                    )
-                    .map_err(AccessibilityDispatchError::Journal)?;
-            }
-        }
-        Ok(outcome)
-    }
-}
-
-struct JournalBoundRedactor<'a, R, T, S>
-where
-    R: Redactor,
-    T: SeverityTaxonomy,
-    S: JournalStorage,
-{
-    journal: &'a cerebellum_core::journal::JournalBinding<ComputerJournalCodec, R, T, S>,
-}
-
-impl<R, T, S> Redactor for JournalBoundRedactor<'_, R, T, S>
-where
-    R: Redactor,
-    T: SeverityTaxonomy,
-    S: JournalStorage,
-{
-    fn available(&self) -> bool {
-        self.journal.redactor_available()
-    }
-
-    fn redact(&self, input: &str, max_bytes: usize) -> Result<String, RedactionUnavailable> {
-        self.journal.redact(input, max_bytes)
     }
 }
