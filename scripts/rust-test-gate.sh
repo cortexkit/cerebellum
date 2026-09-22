@@ -394,17 +394,38 @@ run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
 # install or keep in step. An operator who already has a real cross-gcc
 # configured keeps it: these are only set when unset.
 # Directory probe, not exit status -- see the Windows loop below for why.
-if [ -d "$(rustc --print target-libdir --target x86_64-unknown-linux-gnu 2>/dev/null)" ]; then
-  if [ -z "${CC_x86_64_unknown_linux_gnu:-}" ] && command -v zig >/dev/null 2>&1; then
-    CC_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-cc.sh"
-    AR_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-ar.sh"
-    export CC_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
-  fi
-  run_phase "cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
-    cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
-else
+#
+# A MISSING CROSS COMPILER IS NAMED HERE, NOT DISCOVERED INSIDE A BUILD SCRIPT.
+# Without one, cargo runs anyway and libsqlite3-sys's build script dies looking
+# for `x86_64-linux-gnu-gcc`, twenty lines into its own environment dump: a red
+# gate whose subject is a third-party crate when the actual fault is this
+# host's toolchain. So the absence gets the same treatment as an absent target
+# (skipped, named, with the remedy), because CI builds Linux natively and is
+# where this verdict binds either way.
+# Every phase this host could not run, collected for the verdict line. A skip
+# printed only mid-log is invisible to anyone who reads the last line, which is
+# the line this script tells them to read.
+not_verified=
+linux_cc_ready=
+if [ -n "${CC_x86_64_unknown_linux_gnu:-}" ]; then
+  linux_cc_ready=1
+elif command -v zig >/dev/null 2>&1; then
+  CC_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-cc.sh"
+  AR_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-ar.sh"
+  export CC_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
+  linux_cc_ready=1
+fi
+if [ ! -d "$(rustc --print target-libdir --target x86_64-unknown-linux-gnu 2>/dev/null)" ]; then
   printf '==> SKIPPED: the linux target is not installed, so cross-platform lint did not run\n'
   printf '    install it with: rustup target add x86_64-unknown-linux-gnu\n'
+  not_verified="$not_verified; linux lint (target not installed)"
+elif [ -z "$linux_cc_ready" ]; then
+  printf '==> SKIPPED: no C compiler for x86_64-unknown-linux-gnu, so cross-platform lint did not run\n'
+  printf '    ring and libsqlite3-sys compile C; install zig, or set CC_x86_64_unknown_linux_gnu\n'
+  not_verified="$not_verified; linux lint (no C cross-compiler)"
+else
+  run_phase "cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
+    cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
 fi
 
 # Windows: LIBRARY targets only, deliberately.
@@ -435,6 +456,7 @@ for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
       cargo clippy --workspace --target "$windows_target" --quiet -- -D warnings
   else
     printf '==> SKIPPED: %s is not installed, so that windows build was not checked\n' "$windows_target"
+    not_verified="$not_verified; $windows_target build (target not installed)"
     printf '    install it with: rustup target add %s\n' "$windows_target"
   fi
 done
@@ -492,7 +514,15 @@ run_phase "generated files untouched by the build" \
 # as success: `cargo fmt` announces a problem with a diff and no error word at
 # all. A phase that fails never reaches this line, so its ABSENCE is as
 # meaningful as its presence.
-echo "GATE PASSED: all phases green"
+# "All phases green" is only true when every phase RAN. A skipped phase is not a
+# green one, and the one-line verdict is where a reader decides whether they are
+# done, so it names what this host did not check rather than rounding it away.
+# The "GATE PASSED" prefix is unchanged: callers match on it.
+if [ -z "$not_verified" ]; then
+  echo "GATE PASSED: all phases green"
+else
+  echo "GATE PASSED: every phase that ran is green; NOT VERIFIED on this host: ${not_verified#; }"
+fi
 
 # WHAT THIS GATE DID NOT DO, printed on success because that is when it is
 # forgotten. It runs TESTS on this host only, and lints the Linux target without
