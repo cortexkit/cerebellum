@@ -2438,6 +2438,11 @@ impl BrowserPlane {
         let expected_classification = classification.ok();
         let origin = source_origin;
         let driven = tokio::task::spawn_blocking(move || {
+            // Lock order: this callback runs inside the driver call, while the
+            // session's driver lock is held, and it takes the browser state
+            // lock. So nothing may call into the browser sessions (status,
+            // admission, driver calls, close or teardown) while holding the
+            // browser state lock; that would take the two in the other order.
             let mut input_dispatched = |event| {
                 let operation = match event {
                     crate::browser_session::BrowserInputEvent::Press(_) => Operation::CdpInputPress,
@@ -2801,6 +2806,8 @@ impl BrowserPlane {
         let state = Arc::clone(&self.state);
         let route_key = identity.conversation_key.clone();
         let driven = tokio::task::spawn_blocking(move || {
+            // Same lock order as the classified click: this callback holds
+            // the session's driver lock when it takes the browser state lock.
             let mut input_dispatched = |event| {
                 let operation = match event {
                     crate::browser_session::BrowserInputEvent::Press(_) => Operation::CdpInputPress,
