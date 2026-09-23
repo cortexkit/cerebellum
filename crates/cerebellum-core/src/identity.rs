@@ -217,6 +217,68 @@ impl RouteSurface {
     }
 }
 
+/// Why a route's attested facts do not admit a control operation.
+///
+/// One variant per REMEDY rather than per condition, because the remedy is
+/// what a refused caller acts on. Two unattested facts with the same cause get
+/// one variant: a route opened by anything other than the daemon's configured
+/// admission carrier carries no admission facts at all, and naming only the
+/// first missing fact would read as a carrier that stamped some and dropped one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOperationRefusal {
+    /// Neither fact is attested: the route did not come through the carrier.
+    AdmissionFactsAbsent,
+    /// Session kind is attested and project id is not: the carrier dropped it.
+    AgentProjectIdUnattested,
+    /// Project id is attested and session kind is not: the carrier dropped it.
+    SessionKindUnattested,
+    /// Both facts are attested and the carrier did not grant this operation.
+    OperationNotGranted,
+}
+
+impl ControlOperationRefusal {
+    /// Every variant, for callers that declare the reply vocabulary.
+    pub const ALL: [Self; 4] = [
+        Self::AdmissionFactsAbsent,
+        Self::AgentProjectIdUnattested,
+        Self::SessionKindUnattested,
+        Self::OperationNotGranted,
+    ];
+
+    /// The wire reason code.
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::AdmissionFactsAbsent => "admission_facts_absent",
+            Self::AgentProjectIdUnattested => "agent_project_id_unattested",
+            Self::SessionKindUnattested => "session_kind_unattested",
+            Self::OperationNotGranted => "operation_not_granted",
+        }
+    }
+
+    /// What the refused caller does next.
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::AdmissionFactsAbsent => {
+                "this route carries no admission facts: they are stamped only when the daemon's \
+                 configured admission carrier opens the route, so a route opened any other way \
+                 cannot perform control operations; call through the carrier"
+            }
+            Self::AgentProjectIdUnattested => {
+                "the admission carrier stamped this route without agentProjectId; a caller cannot \
+                 supply it, so report this to whoever operates the carrier"
+            }
+            Self::SessionKindUnattested => {
+                "the admission carrier stamped this route without sessionKind; a caller cannot \
+                 supply it, so report this to whoever operates the carrier"
+            }
+            Self::OperationNotGranted => {
+                "the admission carrier did not grant this operation on this route; its \
+                 browserControlOperations list must include it"
+            }
+        }
+    }
+}
+
 /// Facts retained after a route bind has passed principal admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedBindFacts {
@@ -284,12 +346,32 @@ impl AcceptedBindFacts {
     /// Whether daemon-attested bind facts admit this control operation. Caller
     /// request fields cannot substitute for missing identity or authority facts.
     pub fn allows_control_operation(&self, operation: &str) -> bool {
-        self.agent_project_id_attested
-            && self.session_kind_attested
-            && self
-                .control_operations
-                .iter()
-                .any(|allowed| allowed == operation)
+        self.control_operation_refusal(operation).is_none()
+    }
+
+    /// Which attested fact fails to admit this control operation, if any.
+    ///
+    /// Three independent facts decide admission, and a single boolean hides the
+    /// one thing a refused caller needs: whether to change how the route is
+    /// opened, or report a defect in whatever opened it. Without a reason on
+    /// the reply, the only record of which fact failed is the daemon's log,
+    /// which a caller cannot read.
+    pub fn control_operation_refusal(&self, operation: &str) -> Option<ControlOperationRefusal> {
+        match (self.agent_project_id_attested, self.session_kind_attested) {
+            (false, false) => return Some(ControlOperationRefusal::AdmissionFactsAbsent),
+            (false, true) => return Some(ControlOperationRefusal::AgentProjectIdUnattested),
+            (true, false) => return Some(ControlOperationRefusal::SessionKindUnattested),
+            (true, true) => {}
+        }
+        if self
+            .control_operations
+            .iter()
+            .any(|allowed| allowed == operation)
+        {
+            None
+        } else {
+            Some(ControlOperationRefusal::OperationNotGranted)
+        }
     }
 
     /// Whether the accepted scope permits a capability. This uses only facts
@@ -672,6 +754,62 @@ mod tests {
             );
             assert!(!accepted.allows_control_operation("browser.launch"));
         }
+    }
+
+    /// Each refusal names the fact that failed, as a literal wire code.
+    ///
+    /// The expected codes are written out rather than read back through
+    /// `reason_code`, so a mapping that swapped two codes fails here instead of
+    /// agreeing with itself. The no-facts case is the one a directly opened
+    /// route produces, and it must not be reported as a carrier that dropped a
+    /// single fact.
+    #[test]
+    fn a_control_refusal_names_the_fact_that_failed() {
+        let bind = bind_identity("/caller/project", "conversation-1");
+        let refusal = |facts: Option<serde_json::Value>| {
+            AcceptedBindFacts::from_bind(
+                &bind,
+                Some(Principal::Direct),
+                facts.as_ref(),
+                None,
+                &tool_route(),
+            )
+            .control_operation_refusal("browser.status")
+            .map(ControlOperationRefusal::reason_code)
+        };
+        let granted = serde_json::json!(["browser.status"]);
+
+        assert_eq!(refusal(None), Some("admission_facts_absent"));
+        assert_eq!(
+            refusal(Some(serde_json::json!({
+                "sessionKind": "primary",
+                "browserControlOperations": granted,
+            }))),
+            Some("agent_project_id_unattested")
+        );
+        assert_eq!(
+            refusal(Some(serde_json::json!({
+                "agentProjectId": "pj-accepted",
+                "browserControlOperations": granted,
+            }))),
+            Some("session_kind_unattested")
+        );
+        assert_eq!(
+            refusal(Some(serde_json::json!({
+                "agentProjectId": "pj-accepted",
+                "sessionKind": "primary",
+                "browserControlOperations": ["browser.launch"],
+            }))),
+            Some("operation_not_granted")
+        );
+        assert_eq!(
+            refusal(Some(serde_json::json!({
+                "agentProjectId": "pj-accepted",
+                "sessionKind": "primary",
+                "browserControlOperations": granted,
+            }))),
+            None
+        );
     }
 
     #[test]

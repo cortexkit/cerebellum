@@ -3141,18 +3141,18 @@ async fn handle_tool_request(
     };
 
     if browser_session::CONTROL_TOOLS.contains(&name) {
-        if !accepted_facts.allows_control_operation(name) {
-            return send_tool_response(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                json!({"outcome": "authorization_denied"}),
-            )
-            .await;
-        }
-        let result = handle_browser_control(name, arguments, &accepted_facts, planes).await;
+        // The admission refusal is a reply of this capability like any other,
+        // so it goes through the same boundary. A refusal returned from above
+        // `finish_reply` is never checked against the declared vocabulary, and
+        // it is the reply a caller on a misconfigured route receives first.
+        let result = match accepted_facts.control_operation_refusal(name) {
+            Some(refusal) => json!({
+                "outcome": "authorization_denied",
+                "reason": refusal.reason_code(),
+                "remedy": refusal.remedy(),
+            }),
+            None => handle_browser_control(name, arguments, &accepted_facts, planes).await,
+        };
         return match planes.browser.finish_reply(name, result) {
             Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
             Err(error) => {
@@ -3801,6 +3801,35 @@ pub fn install_browser_compatibility_test_bind(
     );
 }
 
+/// A route opened directly, with no admission facts at all.
+///
+/// The shape a daemon produces when anything other than its configured
+/// admission carrier opens the route.
+#[doc(hidden)]
+pub fn install_browser_direct_test_bind(
+    route_bindings: &Arc<RouteBindings>,
+    channel: u16,
+    epoch: u32,
+) {
+    let identity = subc_protocol::BindIdentity::new(
+        "/caller/chosen/project",
+        "test",
+        "test-session".to_string(),
+    );
+    route_bindings.insert(
+        channel,
+        epoch,
+        AcceptedBindFacts::from_bind(
+            &identity,
+            Some(subc_protocol::Principal::Direct),
+            None,
+            None,
+            &subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".to_string(),
+            },
+        ),
+    );
+}
 #[cfg(test)]
 pub fn browser_plane_with_shared_grants_for_test(
     grants: Arc<tokio::sync::Mutex<crate::authorization::GrantStore>>,

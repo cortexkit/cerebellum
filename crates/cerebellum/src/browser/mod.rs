@@ -3304,8 +3304,23 @@ fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Va
     let properties = properties
         .as_object_mut()
         .expect("browser control result properties are objects");
-    properties.insert("outcome".into(), enum_schema(outcomes));
+    // Every control operation can be refused at admission, before its own
+    // outcomes apply, so the refusal belongs to all three vocabularies rather
+    // than to whichever of them first happened to be exercised.
+    let mut outcomes = outcomes.to_vec();
+    outcomes.push("authorization_denied");
+    properties.insert("outcome".into(), enum_schema(&outcomes));
     properties.insert("detail".into(), invalid_request_detail_result_schema());
+    properties.insert("remedy".into(), string_schema());
+    // `browser.launch` already carries a free-form `reason` for its own
+    // refusals; the other two get the closed admission vocabulary.
+    properties.entry("reason").or_insert_with(|| {
+        let codes: Vec<&str> = cerebellum_core::identity::ControlOperationRefusal::ALL
+            .iter()
+            .map(|refusal| refusal.reason_code())
+            .collect();
+        enum_schema(&codes)
+    });
     closed_object(properties.clone().into(), &["outcome"])
 }
 

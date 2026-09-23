@@ -957,11 +957,12 @@ async fn operation_authority_refusal_precedes_parameter_validation_and_effects()
     let response = invoke_existing(&planes, 1, "browser.launch", Value::Null).await;
     assert_eq!(response.header.ty, FrameType::Response);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body, json!({"outcome": "authorization_denied"}));
+    assert_eq!(body["outcome"], "authorization_denied", "{body}");
+    assert_eq!(body["reason"], "operation_not_granted", "{body}");
     let valid_response = invoke_existing(&planes, 2, "browser.launch", json!({})).await;
     assert_eq!(
-        serde_json::from_slice::<Value>(&valid_response.body).unwrap(),
-        json!({"outcome": "authorization_denied"})
+        serde_json::from_slice::<Value>(&valid_response.body).unwrap()["reason"],
+        "operation_not_granted"
     );
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
     assert_eq!(
@@ -987,10 +988,9 @@ async fn missing_operation_authority_has_no_launch_effects() {
     cerebellum::install_browser_test_bind(&planes.routes, 9, 3, &[]);
 
     let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
-    assert_eq!(
-        serde_json::from_slice::<Value>(&response.body).unwrap(),
-        json!({"outcome": "authorization_denied"})
-    );
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["outcome"], "authorization_denied", "{body}");
+    assert_eq!(body["reason"], "operation_not_granted", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
@@ -1008,8 +1008,54 @@ async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
 
     let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
     let body: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body, json!({"outcome": "authorization_denied"}));
+    assert_eq!(body["outcome"], "authorization_denied", "{body}");
+    assert_eq!(body["reason"], "agent_project_id_unattested", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+/// A route opened without the admission carrier is refused with the reason
+/// and remedy that say so, through the declared reply contract.
+///
+/// A daemon opens a route with no admission facts whenever anything other
+/// than its configured carrier opens it, which makes this the refusal a
+/// misconfigured caller meets first. Driven through the real dispatch for all
+/// three control operations, because the refusal sits in front of all of them
+/// and each has its own schema.
+///
+/// The reply is a `Response` rather than an `Error` frame, and that half is the
+/// contract check: had the reply bypassed its schema or fallen outside it,
+/// enforcement would have answered `computer_result_schema_violation` instead.
+#[tokio::test]
+async fn a_route_opened_without_the_carrier_is_refused_with_a_reason_through_the_contract() {
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    cerebellum::install_browser_direct_test_bind(&planes.routes, 9, 3);
+
+    for (corr, name, arguments) in [
+        (1, "browser.status", json!({})),
+        (2, "browser.launch", json!({})),
+        (3, "browser.close", json!({"browser_session_id": "absent"})),
+    ] {
+        let response = invoke_existing(&planes, corr, name, arguments).await;
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "{name}: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["outcome"], "authorization_denied", "{name}: {body}");
+        assert_eq!(body["reason"], "admission_facts_absent", "{name}: {body}");
+        assert!(
+            body["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains("admission carrier")),
+            "{name}: the remedy must say how to get a route that carries facts: {body}"
+        );
+    }
 }
 
 #[tokio::test]
