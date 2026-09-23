@@ -16,6 +16,11 @@ const POSIX_SPAWN_SETSIGDEF: c_short = 0x0004;
 const POSIX_SPAWN_SETSIGMASK: c_short = 0x0008;
 const POSIX_SPAWN_START_SUSPENDED: c_short = 0x0080;
 const POSIX_SPAWN_CLOEXEC_DEFAULT: c_short = 0x4000;
+const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
+/// Where the target's standard descriptors point. The file-actions object
+/// copies the path, so it need not outlive the spawn.
+const NULL_DEVICE: &std::ffi::CStr = c"/dev/null";
 const F_DUPFD_CLOEXEC: c_int = 67;
 const F_SETFD: c_int = 2;
 const FD_CLOEXEC: c_int = 1;
@@ -53,6 +58,10 @@ const SIG_IGN: usize = 1;
 const SIG_ERR: usize = usize::MAX;
 #[cfg(test)]
 const WNOHANG: c_int = 1;
+#[cfg(test)]
+const F_GETFL: c_int = 3;
+#[cfg(test)]
+const O_ACCMODE: c_int = 3;
 const PROC_PIDLISTFDS: c_int = 1;
 const CF_NUMBER_SINT32_TYPE: c_int = 3;
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -177,6 +186,13 @@ extern "C" {
     fn posix_spawn_file_actions_addinherit_np(
         actions: *mut PosixSpawnFileActions,
         fd: c_int,
+    ) -> c_int;
+    fn posix_spawn_file_actions_addopen(
+        actions: *mut PosixSpawnFileActions,
+        fd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: u16,
     ) -> c_int;
     fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
@@ -464,11 +480,16 @@ impl Drop for ReleasedChild {
 
 /// Spawn an executable suspended before its first user-space instruction.
 ///
-/// The target inherits descriptors 0, 1, 2 and the two CDP descriptors, mapped
-/// to Chromium's fixed descriptors 3 and 4. `POSIX_SPAWN_CLOEXEC_DEFAULT` closes
-/// every other descriptor rather than relying on unrelated code to have marked
-/// its descriptors close-on-exec. Its signal mask starts empty and all inherited
-/// ignored dispositions start at their defaults.
+/// The target receives `/dev/null` on descriptors 0 (read-only), 1 and 2
+/// (write-only), and the two CDP descriptors mapped to Chromium's fixed
+/// descriptors 3 and 4. It does not inherit this process's standard streams:
+/// the daemon captures this module's stderr into a file that must stay empty
+/// unless this module itself printed, and a browser's own logging (which can
+/// carry page-derived text) would otherwise land there.
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT` closes every other descriptor rather than
+/// relying on unrelated code to have marked its descriptors close-on-exec. Its
+/// signal mask starts empty and all inherited ignored dispositions start at
+/// their defaults.
 pub fn spawn_barred(
     executable: &Path,
     arguments: &[OsString],
@@ -764,7 +785,17 @@ fn prepare_spawn(
     if status == 0 {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, response_source, 4) };
     }
-    for fd in 0..=4 {
+    // Standard descriptors are opened fresh on /dev/null in the child rather
+    // than inherited, so nothing the browser prints reaches this process's own
+    // streams. Descriptors a file action opens survive CLOEXEC_DEFAULT.
+    for (fd, flags) in [(0, O_RDONLY), (1, O_WRONLY), (2, O_WRONLY)] {
+        if status == 0 {
+            status = unsafe {
+                posix_spawn_file_actions_addopen(&mut actions, fd, NULL_DEVICE.as_ptr(), flags, 0)
+            };
+        }
+    }
+    for fd in 3..=4 {
         if status == 0 {
             status = unsafe { posix_spawn_file_actions_addinherit_np(&mut actions, fd) };
         }
@@ -1244,6 +1275,145 @@ mod tests {
         );
         let disposition = unsafe { signal(SIGUSR1, std::ptr::null()) } as usize;
         fs::write(report, format!("{mask}\n{disposition}\n")).expect("write observed signal state");
+    }
+
+    /// Written by the observer to its own stdout and stderr. Its presence in a
+    /// stream the launching process can read is the leak under test.
+    const STDIO_MARKER: &str = "cerebellum-stdio-leak-marker";
+
+    /// Run the stdio helper with piped standard streams and return what the
+    /// observer reported about its descriptors plus everything that reached the
+    /// helper's stdout and stderr.
+    ///
+    /// The helper is a separate process so that its fd 1 and 2 are pipes this
+    /// test reads, standing in for the daemon's capture of the module's stderr.
+    /// `mode` chooses how the helper launches the observer: `barred` goes
+    /// through `spawn_barred`, `inherited` uses a plain `Command` that inherits
+    /// the helper's streams and so must visibly leak.
+    fn observe_standard_streams(name: &str, mode: &str) -> (String, String, String) {
+        let directory = TestDirectory::new(name);
+        let report = directory.join("stdio");
+        let helper = std::env::current_exe().expect("test executable");
+        let output = Command::new(helper)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("launch::tests::stdio_parent_launches_observer")
+            .env("CEREBELLUM_STDIO_REPORT", &report)
+            .env("CEREBELLUM_STDIO_SPAWN", mode)
+            // A pipe rather than /dev/null, so the inherited control cannot
+            // read as /dev/null on fd 0 by accident.
+            .stdin(std::process::Stdio::piped())
+            .output()
+            .expect("run stdio parent helper");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdio helper failed: {}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        let report = fs::read_to_string(report).expect("observer wrote its descriptor report");
+        (report, stdout, stderr)
+    }
+
+    #[test]
+    fn the_target_writes_its_standard_streams_to_dev_null() {
+        let _serial = serialize_launch_fixtures();
+        let (report, stdout, stderr) = observe_standard_streams("stdio-barred", "barred");
+        assert!(
+            !stderr.contains(STDIO_MARKER),
+            "the target's stderr reached the launcher's stderr: {stderr:?}"
+        );
+        assert!(
+            !stdout.contains(STDIO_MARKER),
+            "the target's stdout reached the launcher's stdout: {stdout:?}"
+        );
+        // Access mode 0 is O_RDONLY, 1 is O_WRONLY.
+        assert_eq!(report, "0 null 0\n1 null 1\n2 null 1\n");
+    }
+
+    /// The positive control for the test above: an observer that does inherit
+    /// the helper's streams is seen to deliver the marker, so the absence
+    /// asserted above is not a capture that could never see anything.
+    #[test]
+    fn an_inheriting_child_is_seen_to_leak_the_marker() {
+        let _serial = serialize_launch_fixtures();
+        let (report, stdout, stderr) = observe_standard_streams("stdio-inherited", "inherited");
+        assert!(stderr.contains(STDIO_MARKER), "stderr capture: {stderr:?}");
+        assert!(stdout.contains(STDIO_MARKER), "stdout capture: {stdout:?}");
+        assert!(
+            report.contains("1 other") && report.contains("2 other"),
+            "inherited pipes read as /dev/null: {report:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "launched by the standard-stream tests"]
+    fn stdio_parent_launches_observer() {
+        let Some(report) = std::env::var_os("CEREBELLUM_STDIO_REPORT") else {
+            return;
+        };
+        let mode = std::env::var("CEREBELLUM_STDIO_SPAWN").expect("spawn mode");
+        let executable = std::env::current_exe().expect("test executable");
+        let observer = [
+            OsString::from("--ignored"),
+            OsString::from("--exact"),
+            OsString::from("launch::tests::stdio_observer_reports_own_descriptors"),
+        ];
+        match mode.as_str() {
+            "barred" => {
+                let (command_read, _command_write, _response_read, response_write) =
+                    cdp_descriptors();
+                spawn_barred(
+                    &executable,
+                    &observer,
+                    &[(OsString::from("CEREBELLUM_STDIO_REPORT"), report)],
+                    command_read.as_raw_fd(),
+                    response_write.as_raw_fd(),
+                )
+                .expect("spawn barred stdio observer")
+                .release()
+                .expect("release stdio observer")
+                .wait()
+                .expect("reap stdio observer");
+            }
+            "inherited" => {
+                let status = Command::new(&executable)
+                    .args(&observer)
+                    .env("CEREBELLUM_STDIO_REPORT", report)
+                    .status()
+                    .expect("run inheriting stdio observer");
+                assert!(status.success(), "inheriting observer failed: {status}");
+            }
+            other => panic!("unknown spawn mode {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "launched by the stdio parent helper"]
+    fn stdio_observer_reports_own_descriptors() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let Some(report) = std::env::var_os("CEREBELLUM_STDIO_REPORT") else {
+            return;
+        };
+        let null = fs::metadata("/dev/null").expect("stat /dev/null");
+        let mut lines = String::new();
+        for fd in 0..=2 {
+            // SAFETY: fd is open for the life of this process; ManuallyDrop
+            // keeps the borrowed File from closing it.
+            let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+            let metadata = file.metadata().expect("fstat standard descriptor");
+            let is_null = metadata.file_type().is_char_device() && metadata.rdev() == null.rdev();
+            let access = unsafe { fcntl(fd, F_GETFL) } & O_ACCMODE;
+            let kind = if is_null { "null" } else { "other" };
+            lines.push_str(&format!("{fd} {kind} {access}\n"));
+        }
+        fs::write(report, lines).expect("write descriptor report");
+        // Raw writes, because the test harness captures print! output.
+        let marker = format!("{STDIO_MARKER}\n");
+        write_all_raw(1, marker.as_bytes()).expect("write marker to stdout");
+        write_all_raw(2, marker.as_bytes()).expect("write marker to stderr");
     }
 
     #[test]

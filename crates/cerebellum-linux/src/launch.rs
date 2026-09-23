@@ -68,6 +68,8 @@ pub enum SpawnError {
     InvalidEnvironment,
     InvalidDescriptor,
     DuplicateDescriptor(io::ErrorKind),
+    /// `/dev/null` could not be opened for the target's standard descriptors.
+    NullDevice(io::ErrorKind),
     Fork(io::ErrorKind),
     Ptrace(io::ErrorKind),
     Signal(io::ErrorKind),
@@ -255,6 +257,12 @@ impl Drop for ReleasedChild {
 }
 
 /// Spawn an executable stopped after exec, with CDP descriptors at 3 and 4.
+///
+/// Descriptors 0 (read-only), 1 and 2 (write-only) point at `/dev/null`
+/// instead of this process's standard streams: the daemon captures this
+/// module's stderr into a file that must stay empty unless this module itself
+/// printed, and a browser's own logging (which can carry page-derived text)
+/// would otherwise land there.
 pub fn spawn_barred(
     executable: &Path,
     arguments: &[OsString],
@@ -303,7 +311,31 @@ pub fn spawn_barred(
     // Sources above fd 4 avoid a dup2 ordering collision when callers happen
     // to provide descriptors 3 and 4 in the opposite order.
     let command_source = duplicate_descriptor(cdp_command_read_fd)?;
-    let response_source = duplicate_descriptor(cdp_response_write_fd)?;
+    let response_source = match duplicate_descriptor(cdp_response_write_fd) {
+        Ok(fd) => fd,
+        Err(error) => {
+            close_descriptors(&[command_source]);
+            return Err(error);
+        }
+    };
+    // Opened here rather than in the child, which may make only
+    // async-signal-safe calls between fork and exec. Like the CDP sources they
+    // sit above fd 4, so the child's dup2 onto 0..=4 never overwrites a source
+    // it has yet to copy.
+    let null_read = match open_null_device(libc::O_RDONLY) {
+        Ok(fd) => fd,
+        Err(error) => {
+            close_descriptors(&[command_source, response_source]);
+            return Err(error);
+        }
+    };
+    let null_write = match open_null_device(libc::O_WRONLY) {
+        Ok(fd) => fd,
+        Err(error) => {
+            close_descriptors(&[command_source, response_source, null_read]);
+            return Err(error);
+        }
+    };
     // Read this before fork: post-fork code must do only async-signal-safe work.
     let descriptor_limit = descriptor_limit();
     let real_time_min = libc::SIGRTMIN();
@@ -313,12 +345,16 @@ pub fn spawn_barred(
     // before execve or _exit, avoiding allocator and runtime state after fork.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(SpawnError::Fork(io::Error::last_os_error().kind()));
+        let error = io::Error::last_os_error().kind();
+        close_descriptors(&[command_source, response_source, null_read, null_write]);
+        return Err(SpawnError::Fork(error));
     }
     if pid == 0 {
         child_exec(
             command_source,
             response_source,
+            null_read,
+            null_write,
             descriptor_limit,
             executable.as_ptr(),
             argv.as_ptr(),
@@ -328,11 +364,8 @@ pub fn spawn_barred(
         );
     }
 
-    // SAFETY: these are parent-owned duplicates; the child has its own copies.
-    unsafe {
-        libc::close(command_source);
-        libc::close(response_source);
-    }
+    // These are parent-owned duplicates; the child has its own copies.
+    close_descriptors(&[command_source, response_source, null_read, null_write]);
 
     let status = wait_for_status_spawn(pid, libc::WUNTRACED)?;
     if !is_stopped(status) || stop_signal(status) != libc::SIGSTOP {
@@ -549,6 +582,8 @@ fn terminate_exact_generation_with(
 fn child_exec(
     command_source: RawFd,
     response_source: RawFd,
+    null_read: RawFd,
+    null_write: RawFd,
     descriptor_limit: RawFd,
     executable: *const c_char,
     argv: *const *const c_char,
@@ -562,6 +597,14 @@ fn child_exec(
             || libc::dup2(response_source, CDP_RESPONSE_FD) < 0
         {
             libc::_exit(110);
+        }
+        // The target's standard streams go to /dev/null, never to the
+        // launcher's own stdout and stderr.
+        if libc::dup2(null_read, libc::STDIN_FILENO) < 0
+            || libc::dup2(null_write, libc::STDOUT_FILENO) < 0
+            || libc::dup2(null_write, libc::STDERR_FILENO) < 0
+        {
+            libc::_exit(116);
         }
         for fd in 5..descriptor_limit {
             libc::close(fd);
@@ -615,6 +658,29 @@ fn duplicate_descriptor(fd: RawFd) -> Result<RawFd, SpawnError> {
         ));
     }
     Ok(duplicate)
+}
+
+/// Open `/dev/null` close-on-exec at a descriptor above 4.
+fn open_null_device(access: c_int) -> Result<RawFd, SpawnError> {
+    // SAFETY: the path is a C string literal and open retains no pointer.
+    let opened = unsafe { libc::open(c"/dev/null".as_ptr(), access | libc::O_CLOEXEC) };
+    if opened < 0 {
+        return Err(SpawnError::NullDevice(io::Error::last_os_error().kind()));
+    }
+    // A process started with a closed standard descriptor gets that low
+    // number back from open; move it above 4 like the CDP sources.
+    let moved = duplicate_descriptor(opened);
+    close_descriptors(&[opened]);
+    moved
+}
+
+fn close_descriptors(descriptors: &[RawFd]) {
+    for &fd in descriptors {
+        // SAFETY: each descriptor is owned by the caller and not used again.
+        unsafe {
+            libc::close(fd);
+        }
+    }
 }
 
 fn descriptor_limit() -> RawFd {
@@ -1333,6 +1399,150 @@ mod tests {
             own_generation_match(other_boot),
             GenerationMatch::GoneOrReplaced
         );
+    }
+
+    /// Written by the observer to its own stdout and stderr. Its presence in a
+    /// stream the launching process can read is the leak under test.
+    const STDIO_MARKER: &str = "cerebellum-stdio-leak-marker";
+
+    /// Run the stdio helper with piped standard streams and return what the
+    /// observer reported about its descriptors plus everything that reached the
+    /// helper's stdout and stderr.
+    ///
+    /// The helper is a separate process so that its fd 1 and 2 are pipes this
+    /// test reads, standing in for the daemon's capture of the module's stderr.
+    /// `mode` chooses how the helper launches the observer: `barred` goes
+    /// through `spawn_barred`, `inherited` uses a plain `Command` that inherits
+    /// the helper's streams and so must visibly leak.
+    fn observe_standard_streams(name: &str, mode: &str) -> (String, String, String) {
+        let report =
+            std::env::temp_dir().join(format!("cerebellum-linux-{name}-{}", std::process::id()));
+        let _ = fs::remove_file(&report);
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("launch::tests::stdio_parent_launches_observer")
+            .env("CEREBELLUM_STDIO_REPORT", &report)
+            .env("CEREBELLUM_STDIO_SPAWN", mode)
+            // A pipe rather than /dev/null, so the inherited control cannot
+            // read as /dev/null on fd 0 by accident.
+            .stdin(std::process::Stdio::piped())
+            .output()
+            .expect("run stdio parent helper");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdio helper failed: {}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        let contents = fs::read_to_string(&report).expect("observer wrote its descriptor report");
+        let _ = fs::remove_file(report);
+        (contents, stdout, stderr)
+    }
+
+    #[test]
+    fn the_target_writes_its_standard_streams_to_dev_null() {
+        let (report, stdout, stderr) = observe_standard_streams("stdio-barred", "barred");
+        assert!(
+            !stderr.contains(STDIO_MARKER),
+            "the target's stderr reached the launcher's stderr: {stderr:?}"
+        );
+        assert!(
+            !stdout.contains(STDIO_MARKER),
+            "the target's stdout reached the launcher's stdout: {stdout:?}"
+        );
+        // Access mode 0 is O_RDONLY, 1 is O_WRONLY.
+        assert_eq!(report, "0 null 0\n1 null 1\n2 null 1\n");
+    }
+
+    /// The positive control for the test above: an observer that does inherit
+    /// the helper's streams is seen to deliver the marker, so the absence
+    /// asserted above is not a capture that could never see anything.
+    #[test]
+    fn an_inheriting_child_is_seen_to_leak_the_marker() {
+        let (report, stdout, stderr) = observe_standard_streams("stdio-inherited", "inherited");
+        assert!(stderr.contains(STDIO_MARKER), "stderr capture: {stderr:?}");
+        assert!(stdout.contains(STDIO_MARKER), "stdout capture: {stdout:?}");
+        assert!(
+            report.contains("1 other") && report.contains("2 other"),
+            "inherited pipes read as /dev/null: {report:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "launched by the standard-stream tests"]
+    fn stdio_parent_launches_observer() {
+        let Some(report) = std::env::var_os("CEREBELLUM_STDIO_REPORT") else {
+            return;
+        };
+        let mode = std::env::var("CEREBELLUM_STDIO_SPAWN").expect("spawn mode");
+        let executable = std::env::current_exe().expect("test executable");
+        let observer = [
+            OsString::from("--ignored"),
+            OsString::from("--exact"),
+            OsString::from("launch::tests::stdio_observer_reports_own_descriptors"),
+        ];
+        match mode.as_str() {
+            "barred" => {
+                let (command_read, _command_write) = pipe();
+                let (_response_read, response_write) = pipe();
+                spawn_barred(
+                    &executable,
+                    &observer,
+                    &[(OsString::from("CEREBELLUM_STDIO_REPORT"), report)],
+                    command_read.as_raw_fd(),
+                    response_write.as_raw_fd(),
+                )
+                .expect("spawn barred stdio observer")
+                .release()
+                .expect("release stdio observer")
+                .wait()
+                .expect("reap stdio observer");
+            }
+            "inherited" => {
+                let status = Command::new(&executable)
+                    .args(&observer)
+                    .env("CEREBELLUM_STDIO_REPORT", report)
+                    .status()
+                    .expect("run inheriting stdio observer");
+                assert!(status.success(), "inheriting observer failed: {status}");
+            }
+            other => panic!("unknown spawn mode {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "launched by the stdio parent helper"]
+    fn stdio_observer_reports_own_descriptors() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let Some(report) = std::env::var_os("CEREBELLUM_STDIO_REPORT") else {
+            return;
+        };
+        let null = fs::metadata("/dev/null").expect("stat /dev/null");
+        let mut lines = String::new();
+        for fd in 0..=2 {
+            // SAFETY: fd is open for the life of this process; ManuallyDrop
+            // keeps the borrowed File from closing it.
+            let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+            let metadata = file.metadata().expect("fstat standard descriptor");
+            let is_null = metadata.file_type().is_char_device() && metadata.rdev() == null.rdev();
+            // SAFETY: F_GETFL reads the flags of a live descriptor.
+            let access = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE;
+            let kind = if is_null { "null" } else { "other" };
+            lines.push_str(&format!("{fd} {kind} {access}\n"));
+        }
+        fs::write(report, lines).expect("write descriptor report");
+        // Raw writes, because the test harness captures print! output.
+        let marker = format!("{STDIO_MARKER}\n");
+        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            // SAFETY: the buffer is live for the duration of the call. The
+            // length is checked so a partial marker cannot silently weaken
+            // the positive control.
+            let written = unsafe { libc::write(fd, marker.as_ptr().cast(), marker.len()) };
+            assert_eq!(written, marker.len() as isize, "write marker to fd {fd}");
+        }
     }
 
     #[test]
