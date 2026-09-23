@@ -66,7 +66,10 @@ mod live {
                 return ExitCode::from(1);
             }
         };
-        println!("root: {}", lifecycle.registry().root().canonical_path().display());
+        println!(
+            "root: {}",
+            lifecycle.registry().root().canonical_path().display()
+        );
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
@@ -151,7 +154,11 @@ mod live {
         println!("reply: {reply}");
         let Some((question_frame, question_body)) = question else {
             // Nothing to rebind (already bound) or a refusal: the reply says which.
-            return ExitCode::from(if reply["outcome"] == "consent_pending" { 1 } else { 0 });
+            return ExitCode::from(if reply["outcome"] == "consent_pending" {
+                1
+            } else {
+                0
+            });
         };
         println!(
             "question: {}",
