@@ -677,14 +677,15 @@ impl CaptureFs for HostFs {
     }
 }
 
+#[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
 }
 
 #[cfg(unix)]
@@ -1587,7 +1588,7 @@ impl Record {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support;
+pub mod test_support;
 
 #[cfg(test)]
 mod tests;

@@ -681,7 +681,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            12
+            13
         );
         let partial_browser = browser_tool(&browser_names[1..]).unwrap();
         assert!(!partial_browser.schema["properties"]["action"]["enum"]
