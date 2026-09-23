@@ -1488,10 +1488,11 @@ impl BrowserSessionLauncher for PoisonedRegistryLauncher {
             panic!("poison the registry fixture lock");
         })
         .join();
-        let refusal =
+        let Err(refusal) =
             cerebellum::browser_session::refuse_poisoned(lock.lock(), "profile_registry_lock")
-                .err()
-                .expect("the fixture lock was poisoned");
+        else {
+            panic!("the fixture lock was not poisoned");
+        };
         Err(refusal)
     }
 }
