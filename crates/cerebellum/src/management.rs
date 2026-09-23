@@ -87,13 +87,26 @@ pub fn action_kind_to_wire(kind: ActionKind) -> &'static str {
     }
 }
 
-/// How long a consent question may stay unanswered before it stops being one.
+/// How long a consent question for control of an application may stay
+/// unanswered before it stops being one.
 ///
-/// Long enough for a person to notice a prompt and decide; short enough that an
-/// abandoned question does not sit outstanding indefinitely. Its expiry is a
-/// definite not-granted rather than an unfinished wait — the caller has long
-/// since been told the request is pending, so nothing is blocked on it.
+/// Kept short on purpose: this lease hands the agent the screen, and its
+/// window starts when the person answers. A person answering a stale question
+/// long after the agent asked may not be watching when the agent acts. Its
+/// expiry is a definite not-granted rather than an unfinished wait; the caller
+/// has long since been told the request is pending, so nothing is blocked on
+/// it.
 const CONSENT_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long a question the person usually answers from a phone may stay open:
+/// a browser grant, or re-identifying the profile root.
+///
+/// Both are scoped decisions that change nothing until answered, and the agent
+/// is only waiting, so the deadline is sized to how long a person takes to
+/// notice a phone prompt rather than to a desk session. Measured: an operator
+/// answered a grant after about 12 minutes, after a 5-minute deadline had
+/// already expired it.
+const PHONE_CONSENT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// How long a granted lease lasts when the user allows one.
 ///
@@ -344,7 +357,7 @@ impl ManagementPlane {
                 &disclosed_hazards_wire,
                 severity,
             ),
-            deadline: CONSENT_DEADLINE,
+            deadline: PHONE_CONSENT_DEADLINE,
         };
         Ok((
             json!({
@@ -502,7 +515,7 @@ impl ManagementPlane {
         let question = Question {
             ask_id: ask_id.clone(),
             body: profile_root_rebind_question(&ask_id, &root_path, &preview),
-            deadline: CONSENT_DEADLINE,
+            deadline: PHONE_CONSENT_DEADLINE,
         };
         (
             json!({
@@ -813,6 +826,56 @@ fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
     }
 }
 
+/// The consent question's text, written for the person answering, often on a
+/// phone. It states what the grant allows and, just as plainly, what it still
+/// refuses, because that is what the person is deciding. The structured
+/// `origins`, `hazards` and `severity_ceiling` beside it stay the exact scope.
+fn browser_grant_message(origins: &[String], hazards: &[String]) -> String {
+    // Each hazard class unlocks submitting one kind of form. Listed in a fixed
+    // order so the sentence does not change with the order a caller sent them.
+    const FORM_KINDS: [(&str, &str); 3] = [
+        ("credential_form_submit", "sign-in forms"),
+        ("financial_form_submit", "payment forms"),
+        (
+            "unverified_form_contents",
+            "forms whose purpose it couldn't check",
+        ),
+    ];
+    let (allowed, refused): (Vec<(&str, &str)>, Vec<(&str, &str)>) = FORM_KINDS
+        .into_iter()
+        .partition(|(class, _)| hazards.iter().any(|hazard| hazard == class));
+    let allowed: Vec<&str> = allowed.into_iter().map(|(_, kind)| kind).collect();
+    let refused: Vec<&str> = refused.into_iter().map(|(_, kind)| kind).collect();
+
+    let mut message = format!(
+        "Let this agent use its own browser on {}? It can open and read pages there \
+         and click ordinary buttons and links.",
+        join_words(
+            &origins.iter().map(String::as_str).collect::<Vec<_>>(),
+            "and"
+        )
+    );
+    if !allowed.is_empty() {
+        message.push_str(&format!(
+            " It can also submit {}.",
+            join_words(&allowed, "and")
+        ));
+    }
+    if !refused.is_empty() {
+        message.push_str(&format!(" It can't submit {}.", join_words(&refused, "or")));
+    }
+    message
+}
+
+/// `a`, `a and b`, `a, b and c`, with the given final conjunction.
+fn join_words(items: &[&str], conjunction: &str) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [head @ .., last] => format!("{} {conjunction} {last}", head.join(", ")),
+    }
+}
+
 fn browser_grant_severity_value(severity: Severity) -> Value {
     json!({
         "tier": severity.tier,
@@ -828,23 +891,13 @@ fn browser_grant_question(
     hazards: &[String],
     severity: Severity,
 ) -> Value {
-    let origins_text = origins.join(", ");
-    let hazards_text = hazards.join(", ");
     let severity_value = browser_grant_severity_value(severity);
     json!({
         "jsonrpc": "2.0",
         "id": ask_id,
         "method": "elicitation/create",
         "params": {
-            "message": format!(
-                "Allow this agent to perform browser actions on origins [{origins_text}]? \
-                 Disclosed hazard classes: [{hazards_text}]. Severity ceiling: {} (tier {}; \
-                 credential={}; financial={}).",
-                severity_value["name"].as_str().unwrap_or_default(),
-                severity.tier,
-                severity.credential,
-                severity.financial,
-            ),
+            "message": browser_grant_message(origins, hazards),
             // These values are the exact scope that an affirmative answer mints.
             // Keeping them beside the prose lets a relay render structured scope
             // without translating or reconstructing the grant.
@@ -1199,19 +1252,18 @@ mod tests {
             question.body["params"]["severity_ceiling"],
             reply["severity_ceiling"]
         );
-        let message = question.body["params"]["message"].as_str().unwrap();
-        for scope in [
-            "https://login.example",
-            "https://pay.example",
-            "credential_form_submit",
-            "financial_form_submit",
-            "mutate_durable",
-        ] {
-            assert!(
-                message.contains(scope),
-                "question omitted {scope}: {message}"
-            );
-        }
+        // The prose is for the person; the structured fields above are the
+        // scope. It must say what the grant allows AND what it still refuses.
+        assert_eq!(
+            question.body["params"]["message"],
+            "Let this agent use its own browser on https://login.example and \
+             https://pay.example? It can open and read pages there and click ordinary \
+             buttons and links. It can also submit sign-in forms and payment forms. \
+             It can't submit forms whose purpose it couldn't check."
+        );
+        // Answered from a phone, so its deadline is the phone one, not the
+        // five minutes an application-control question gets.
+        assert_eq!(question.deadline, Duration::from_secs(30 * 60));
 
         assert!(
             plane
@@ -1232,6 +1284,26 @@ mod tests {
             ])
         );
         assert_eq!(grant.severity, Severity::new(MUTATE_DURABLE, true, true));
+    }
+
+    #[tokio::test]
+    async fn a_grant_with_no_hazards_says_which_forms_it_still_refuses() {
+        let plane = plane(TargetResolution::NotRunning);
+        let (_, question) = plane
+            .open_browser_grant(
+                "conversation",
+                vec!["https://example.com".to_string()],
+                vec![],
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            question.unwrap().body["params"]["message"],
+            "Let this agent use its own browser on https://example.com? It can open and \
+             read pages there and click ordinary buttons and links. It can't submit \
+             sign-in forms, payment forms or forms whose purpose it couldn't check."
+        );
     }
 
     #[tokio::test]
@@ -1386,8 +1458,15 @@ mod tests {
 
         // And nothing is left pending, so a later request asks afresh rather
         // than joining a question that was never put.
-        let (again, _) = open(&plane, &clock).await;
+        let (again, question) = open(&plane, &clock).await;
         assert_eq!(again["outcome"], "consent_pending");
+        // Control of an application stays on the short deadline: its lease
+        // starts when the person answers, and a stale answer should not hand
+        // over the screen when they may no longer be watching.
+        assert_eq!(
+            question.expect("a question is put").deadline,
+            Duration::from_secs(300)
+        );
     }
 
     /// An allowed answer mints the lease, and a later request is already held.
