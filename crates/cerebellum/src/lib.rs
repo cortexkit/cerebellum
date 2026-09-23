@@ -3409,6 +3409,7 @@ async fn handle_browser_control(
                     })
                 }
                 browser_session::LaunchSlot::Acquired { browser_session_id } => browser_session_id,
+                browser_session::LaunchSlot::Refused(refusal) => return refusal,
             };
             let launch = if let Some(service) = planes.launch_service.clone() {
                 let accepted = accepted.clone();

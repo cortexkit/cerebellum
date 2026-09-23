@@ -186,6 +186,9 @@ pub enum BrowserError {
     Internal {
         reason_code: JournalReasonCode,
     },
+    /// The browser session table's lock is poisoned, so whether a session
+    /// exists is unknown and no browser action can be admitted.
+    SessionStateUnavailable,
 }
 
 impl BrowserError {
@@ -212,6 +215,7 @@ impl BrowserError {
             Self::NotSettled { .. } => "not_settled",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
+            Self::SessionStateUnavailable => "internal_failure",
         }
     }
     /// Tell a caller which action can change this refusal, or explicitly when none exists.
@@ -271,6 +275,9 @@ impl BrowserError {
             Self::Internal { .. } => {
                 "report this module failure with detail.reason_code and do not assume the action completed"
             }
+            Self::SessionStateUnavailable => {
+                "no caller remedy: report this module failure with its stage; the browser session state is unreadable until the module restarts"
+            }
         }
     }
 
@@ -324,7 +331,7 @@ impl BrowserError {
                 json!({"reason_code":"no_session","reason":"no browser session is open"})
             }
             Self::BrowserLaunchPending => json!({"reason_code":"browser_launch_pending"}),
-            Self::HumanInControl { .. } => return None,
+            Self::HumanInControl { .. } | Self::SessionStateUnavailable => return None,
             Self::ElementIntercepted => json!({}),
             Self::OutsideViewportAfterScroll { refusal } => {
                 viewport_refusal_detail("outside_viewport_after_scroll", *refusal)
@@ -1430,6 +1437,12 @@ impl BrowserPlane {
                 if let Some(detail) = error.detail() {
                     object.insert("detail".into(), detail);
                 }
+                if let BrowserError::SessionStateUnavailable = error {
+                    object.insert(
+                        "stage".into(),
+                        Value::String(crate::browser_session::BROWSER_SESSION_LOCK_STAGE.into()),
+                    );
+                }
                 if let BrowserError::HumanInControl {
                     origin,
                     expires_in_ms,
@@ -1501,6 +1514,9 @@ impl BrowserPlane {
                 }
                 crate::browser_session::DispatchAdmission::NoSession => {
                     return Err(BrowserError::NoSession)
+                }
+                crate::browser_session::DispatchAdmission::StateUnavailable => {
+                    return Err(BrowserError::SessionStateUnavailable)
                 }
             }
         } else if matches!(
@@ -3197,7 +3213,8 @@ fn browser_result_outcome_schema() -> Value {
         "navigation_failed",
         "not_settled",
         "browser_crashed",
-        "internal_error"
+        "internal_error",
+        "internal_failure"
     ]})
 }
 
@@ -3211,6 +3228,10 @@ fn reply_schema(mut properties: Value, required: &[&str]) -> Value {
     properties.insert("context".into(), context_result_schema());
     properties.insert("origin".into(), string_schema());
     properties.insert("expires_in_ms".into(), integer_schema());
+    properties.insert(
+        "stage".into(),
+        enum_schema(&[crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
+    );
     let mut required = required.to_vec();
     required.extend(["outcome", "context"]);
     closed_object(properties.clone().into(), &required)
@@ -3360,12 +3381,13 @@ fn browser_status_result_schema() -> Value {
             "cleanup_failure",
             "durable_state_at_risk",
             "invalid_request",
+            "internal_failure",
         ],
         json!({
             "browser_session_id":string_schema(),
             "profile_disposition":enum_schema(&["durable", "disposable"]),
             "lease":browser_lease_result_schema(),
-            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete"]),
+            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
             "terminal_outcome":enum_schema(&["closed", "browser_crashed", "connector_failure", "cdp_failure", "idle_expired", "route_unbound", "module_shutdown", "cleanup_failure", "startup_indeterminate"]),
             "failed_signals":string_array_schema(),
         }),
@@ -3387,10 +3409,11 @@ fn browser_close_result_schema() -> Value {
             "browser_session_not_found",
             "durable_state_at_risk",
             "invalid_request",
+            "internal_failure",
         ],
         json!({
             "browser_session_id":string_schema(),
-            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete"]),
+            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
             "failed_signals":string_array_schema(),
         }),
     )
@@ -3980,6 +4003,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::BrowserLaunchPending
         | BrowserError::HumanInControl { .. }
         | BrowserError::Internal { .. }
+        | BrowserError::SessionStateUnavailable
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }
         | BrowserError::NavigationFailed { .. }

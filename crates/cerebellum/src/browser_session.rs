@@ -1,7 +1,7 @@
 //! Route-owned browser session lifecycle, leases, and the common teardown ladder.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LockResult, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotObservation};
@@ -19,6 +19,45 @@ pub const BROWSER_LAUNCH: &str = "browser.launch";
 pub const BROWSER_STATUS: &str = "browser.status";
 pub const BROWSER_CLOSE: &str = "browser.close";
 pub const CONTROL_TOOLS: [&str; 3] = [BROWSER_LAUNCH, BROWSER_STATUS, BROWSER_CLOSE];
+
+/// Stage named in the refusal a caller receives when the session table's lock
+/// was poisoned by a thread that panicked while holding it.
+pub const BROWSER_SESSION_LOCK_STAGE: &str = "browser_session_lock";
+
+/// The one refusal shape for an internal failure at a named stage.
+///
+/// It carries no free-text detail. The only text available is the poison
+/// error's Display, which says nothing the stage does not, and the closed
+/// control-reply schemas declare `detail` as the invalid-request object, so a
+/// string there would get the whole reply withheld as a schema violation.
+pub fn internal_failure_reply(stage: &'static str) -> Value {
+    json!({"outcome": "internal_failure", "stage": stage})
+}
+
+// A poisoned lock means some thread panicked while holding it, so the table
+// behind it may be partly updated. The two helpers below are the only ways
+// this module takes such a lock, and which one a site uses depends on what it
+// is for:
+//
+// - A site that answers a caller REFUSES with `internal_failure_reply`. The
+//   caller gets a reply it can act on instead of a panicked request task, which
+//   it would only see as a hang until its own timeout.
+// - A site that stops or cleans up browsers (teardown, idle expiry, exit
+//   observation, and the waits inside them) RECOVERS the guard and carries on.
+//   Stopping a browser is the safe direction: refusing to tear down after a
+//   panic leaves browser processes running and profiles locked, which is worse
+//   than proceeding over a table that may be partly stale.
+
+/// Take a lock for a site that answers a caller, refusing if it is poisoned.
+pub fn refuse_poisoned<T>(result: LockResult<T>, stage: &'static str) -> Result<T, Value> {
+    result.map_err(|_| internal_failure_reply(stage))
+}
+
+/// Take a lock for a site that stops or cleans up browsers, recovering it if
+/// it is poisoned.
+fn recover_poisoned<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Ten minutes gives a person time to complete password-manager and 2FA steps
 /// without leaving an unattended browser under human control indefinitely.
@@ -575,14 +614,24 @@ pub struct BrowserSessions {
 }
 
 pub enum LaunchSlot {
-    Acquired { browser_session_id: String },
-    Occupied { browser_session_id: String },
+    Acquired {
+        browser_session_id: String,
+    },
+    Occupied {
+        browser_session_id: String,
+    },
+    /// The session table could not be read; the value is the reply to send.
+    Refused(Value),
 }
 
 pub enum DispatchAdmission {
     Accepted(OperationGuard),
     LaunchPending,
     NoSession,
+    /// The session table's lock is poisoned, so whether a session exists is
+    /// unknown. Distinct from `NoSession`, whose remedy (launch one) would be
+    /// wrong when a session may well exist.
+    StateUnavailable,
 }
 
 pub struct OperationGuard {
@@ -740,16 +789,18 @@ impl OperationGuard {
             return;
         }
         let (lock, wake) = &*self.sessions.inner;
-        if let Ok(mut state) = lock.lock() {
-            if let Some(session) = state
-                .routes
-                .get_mut(&self.route_key)
-                .and_then(|route| route.active.as_mut())
-            {
-                session.pending_operations = session.pending_operations.saturating_sub(1);
-            }
-            wake.notify_all();
+        // Recovered rather than skipped: teardown waits for this count to reach
+        // zero, so skipping the release on a poisoned lock would stall every
+        // later teardown of this route forever.
+        let mut state = recover_poisoned(lock.lock());
+        if let Some(session) = state
+            .routes
+            .get_mut(&self.route_key)
+            .and_then(|route| route.active.as_mut())
+        {
+            session.pending_operations = session.pending_operations.saturating_sub(1);
         }
+        wake.notify_all();
         self.finished = true;
     }
 }
@@ -762,7 +813,10 @@ impl Drop for OperationGuard {
 
 impl BrowserSessions {
     pub fn acquire_launch_slot(&self, route_key: &str) -> LaunchSlot {
-        let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+        let mut state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
+            Ok(state) => state,
+            Err(refusal) => return LaunchSlot::Refused(refusal),
+        };
         let route = state.routes.entry(route_key.to_string()).or_default();
         if let Some(active) = route.active.as_ref() {
             return LaunchSlot::Occupied {
@@ -795,7 +849,7 @@ impl BrowserSessions {
     }
 
     pub fn abandon_launch_slot(&self, route_key: &str) {
-        let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+        let mut state = recover_poisoned(self.inner.0.lock());
         if let Some(route) = state.routes.get_mut(route_key) {
             route.active = None;
         }
@@ -828,35 +882,41 @@ impl BrowserSessions {
 
     #[doc(hidden)]
     pub fn wait_until_terminal_for_test(&self, route_key: &str) {
-        let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+        let mut state = recover_poisoned(self.inner.0.lock());
         while state
             .routes
             .get(route_key)
             .and_then(|route| route.active.as_ref())
             .is_some_and(|session| session.terminal.is_none())
         {
-            state = self
-                .inner
-                .1
-                .wait(state)
-                .expect("browser session lock poisoned");
+            state = recover_poisoned(self.inner.1.wait(state));
         }
     }
 
+    /// Wait for another thread's teardown of this route to finish. This joins
+    /// a teardown, so it recovers a poisoned lock like the teardown does.
     pub fn wait_until_inactive(&self, route_key: &str) {
-        let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+        let mut state = recover_poisoned(self.inner.0.lock());
         while state
             .routes
             .get(route_key)
             .and_then(|route| route.active.as_ref())
             .is_some()
         {
-            state = self
-                .inner
-                .1
-                .wait(state)
-                .expect("browser session lock poisoned");
+            state = recover_poisoned(self.inner.1.wait(state));
         }
+    }
+
+    /// Poison the session table's lock by panicking on a thread that holds it,
+    /// so tests can drive every entry point over a poisoned lock.
+    #[doc(hidden)]
+    pub fn poison_for_test(&self) {
+        let sessions = self.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = sessions.inner.0.lock();
+            panic!("poisoning the browser session lock for a test");
+        })
+        .join();
     }
 
     #[doc(hidden)]
@@ -1087,7 +1147,10 @@ impl BrowserSessions {
         clock: &C,
         wall_now: SystemTime,
     ) -> Value {
-        let state = self.inner.0.lock().expect("browser session lock poisoned");
+        let state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
+            Ok(state) => state,
+            Err(refusal) => return refusal,
+        };
         let Some(route) = state.routes.get(route_key) else {
             return json!({"outcome": "no_session"});
         };
@@ -1106,7 +1169,9 @@ impl BrowserSessions {
         route_key: &str,
         clock: &C,
     ) -> DispatchAdmission {
-        let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+        let Ok(mut state) = self.inner.0.lock() else {
+            return DispatchAdmission::StateUnavailable;
+        };
         let Some(session) = state
             .routes
             .get_mut(route_key)
@@ -1139,7 +1204,7 @@ impl BrowserSessions {
         config: &BrowserConfig,
     ) -> bool {
         let (lock, _) = &*self.inner;
-        let mut state = lock.lock().expect("browser session lock poisoned");
+        let mut state = recover_poisoned(lock.lock());
         let Some(session) = state
             .routes
             .get_mut(route_key)
@@ -1169,11 +1234,7 @@ impl BrowserSessions {
     }
 
     pub fn observe_exits_all(&self, config: &BrowserConfig) {
-        let route_keys = self
-            .inner
-            .0
-            .lock()
-            .expect("browser session lock poisoned")
+        let route_keys = recover_poisoned(self.inner.0.lock())
             .routes
             .iter()
             .filter_map(|(route_key, route)| {
@@ -1200,11 +1261,7 @@ impl BrowserSessions {
     }
 
     pub fn expire_all<C: MonotonicClock>(&self, clock: &C, config: &BrowserConfig) {
-        let route_keys = self
-            .inner
-            .0
-            .lock()
-            .expect("browser session lock poisoned")
+        let route_keys = recover_poisoned(self.inner.0.lock())
             .routes
             .keys()
             .cloned()
@@ -1221,7 +1278,10 @@ impl BrowserSessions {
         config: &BrowserConfig,
     ) -> Value {
         let terminalizer = {
-            let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+            let mut state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
+                Ok(state) => state,
+                Err(refusal) => return refusal,
+            };
             let Some(route) = state.routes.get_mut(route_key) else {
                 return json!({"outcome": "browser_session_not_found"});
             };
@@ -1255,21 +1315,27 @@ impl BrowserSessions {
         if terminalizer {
             self.finish_teardown(route_key, BrowserSessionTerminalOutcome::Closed, config);
         } else {
-            let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+            let mut state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
+                Ok(state) => state,
+                Err(refusal) => return refusal,
+            };
             while state
                 .routes
                 .get(route_key)
                 .and_then(|route| route.active.as_ref())
                 .is_some()
             {
-                state = self
-                    .inner
-                    .1
-                    .wait(state)
-                    .expect("browser session lock poisoned");
+                state = match refuse_poisoned(self.inner.1.wait(state), BROWSER_SESSION_LOCK_STAGE)
+                {
+                    Ok(state) => state,
+                    Err(refusal) => return refusal,
+                };
             }
         }
-        let state = self.inner.0.lock().expect("browser session lock poisoned");
+        let state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
+            Ok(state) => state,
+            Err(refusal) => return refusal,
+        };
         state
             .routes
             .get(route_key)
@@ -1285,7 +1351,7 @@ impl BrowserSessions {
         config: &BrowserConfig,
     ) {
         {
-            let mut state = self.inner.0.lock().expect("browser session lock poisoned");
+            let mut state = recover_poisoned(self.inner.0.lock());
             let Some(session) = state
                 .routes
                 .get_mut(route_key)
@@ -1299,11 +1365,7 @@ impl BrowserSessions {
     }
 
     pub fn teardown_all(&self, config: &BrowserConfig) {
-        let keys = self
-            .inner
-            .0
-            .lock()
-            .expect("browser session lock poisoned")
+        let keys = recover_poisoned(self.inner.0.lock())
             .routes
             .keys()
             .cloned()
@@ -1329,14 +1391,14 @@ impl BrowserSessions {
     ) {
         let (lock, wake) = &*self.inner;
         let (browser_session_id, terminal_outcome, mut process, mut cleanup) = {
-            let mut state = lock.lock().expect("browser session lock poisoned");
+            let mut state = recover_poisoned(lock.lock());
             while state
                 .routes
                 .get(route_key)
                 .and_then(|route| route.active.as_ref())
                 .is_some_and(|session| session.pending_operations != 0)
             {
-                state = wake.wait(state).expect("browser session lock poisoned");
+                state = recover_poisoned(wake.wait(state));
             }
             let Some(session) = state
                 .routes
@@ -1352,7 +1414,7 @@ impl BrowserSessions {
                 .and_then(|route| route.active.as_ref())
                 .is_some_and(|session| session.process.is_none())
             {
-                state = wake.wait(state).expect("browser session lock poisoned");
+                state = recover_poisoned(wake.wait(state));
             }
             let Some(session) = state
                 .routes
@@ -1370,7 +1432,7 @@ impl BrowserSessions {
                     .and_then(|route| route.active.as_ref())
                     .is_some()
                 {
-                    state = wake.wait(state).expect("browser session lock poisoned");
+                    state = recover_poisoned(wake.wait(state));
                 }
                 return;
             };
@@ -1388,7 +1450,7 @@ impl BrowserSessions {
             cleanup.after_reap()
         });
 
-        let mut state = lock.lock().expect("browser session lock poisoned");
+        let mut state = recover_poisoned(lock.lock());
         let Some(route) = state.routes.get_mut(route_key) else {
             return;
         };
@@ -1399,7 +1461,9 @@ impl BrowserSessions {
         {
             return;
         }
-        let mut session = route.active.take().expect("matched active session");
+        let Some(mut session) = route.active.take() else {
+            return;
+        };
         session.process = Some(process);
         session.cleanup = cleanup;
         match outcome {
@@ -2125,6 +2189,7 @@ mod tests {
         let id = match sessions.acquire_launch_slot("route") {
             LaunchSlot::Acquired { browser_session_id } => browser_session_id,
             LaunchSlot::Occupied { .. } => panic!("first launch slot was occupied"),
+            LaunchSlot::Refused(refusal) => panic!("first launch slot was refused: {refusal}"),
         };
         let close_sessions = sessions.clone();
         let close_id = id.clone();
@@ -2591,5 +2656,112 @@ mod tests {
             HANDOFF_DURATION_MS - config().browser_idle_timeout_ms,
         ));
         assert!(sessions.expire_idle("route", &clock, &config()));
+    }
+
+    fn lock_refusal() -> Value {
+        json!({"outcome": "internal_failure", "stage": "browser_session_lock"})
+    }
+
+    /// Run `body` on its own thread and fail rather than hang if it never
+    /// finishes: over a poisoned lock the likely failure is a wait that never
+    /// wakes, not a panic.
+    fn finishes_within(body: impl FnOnce() + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            body();
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "did not finish over the poisoned session lock"
+        );
+    }
+
+    #[test]
+    fn poisoned_lock_refuses_every_caller_facing_entry_point_with_the_named_stage() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (id, process, _) = ready_session(&sessions, &clock, true);
+        sessions.poison_for_test();
+
+        assert_eq!(sessions.status("route", &clock, UNIX_EPOCH), lock_refusal());
+        assert_eq!(sessions.close("route", &id, &config()), lock_refusal());
+        match sessions.acquire_launch_slot("another-route") {
+            LaunchSlot::Refused(refusal) => assert_eq!(refusal, lock_refusal()),
+            LaunchSlot::Acquired { .. } | LaunchSlot::Occupied { .. } => {
+                panic!("a launch slot was granted over a poisoned session lock")
+            }
+        }
+        assert!(matches!(
+            sessions.accept_dispatch("route", &clock),
+            DispatchAdmission::StateUnavailable
+        ));
+        // A refused close must not have started a teardown it then abandoned.
+        assert!(process.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_lock_idle_sweep_still_stops_the_expired_session() {
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let (_, process, cleanup) = ready_session(&sessions, &clock, true);
+        clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
+        sessions.poison_for_test();
+
+        let sweeping = sessions.clone();
+        finishes_within(move || {
+            sweeping.observe_exits_all(&config());
+            sweeping.expire_all(&clock, &config());
+        });
+        assert_eq!(
+            process.lock().unwrap().as_slice(),
+            ["graceful", "grace_wait", "force", "reap"]
+        );
+        assert_eq!(cleanup.lock().unwrap().as_slice(), ["cleanup"]);
+    }
+
+    #[test]
+    fn poisoned_lock_shutdown_teardown_still_stops_every_session() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (_, first, first_cleanup) = ready_session_on(&sessions, "route-a", &clock, true);
+        let (_, second, second_cleanup) = ready_session_on(&sessions, "route-b", &clock, true);
+        sessions.poison_for_test();
+
+        let tearing_down = sessions.clone();
+        finishes_within(move || tearing_down.teardown_all(&config()));
+        for (process, cleanup) in [(first, first_cleanup), (second, second_cleanup)] {
+            assert_eq!(
+                process.lock().unwrap().as_slice(),
+                ["graceful", "grace_wait", "force", "reap"]
+            );
+            assert_eq!(cleanup.lock().unwrap().as_slice(), ["cleanup"]);
+        }
+    }
+
+    #[test]
+    fn operation_released_over_a_poisoned_lock_does_not_stall_teardown() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (_, process, _) = ready_session(&sessions, &clock, true);
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        sessions.poison_for_test();
+        operation.finish();
+
+        let tearing_down = sessions.clone();
+        finishes_within(move || {
+            tearing_down.teardown_route(
+                "route",
+                BrowserSessionTerminalOutcome::RouteUnbound,
+                &config(),
+            )
+        });
+        assert_eq!(
+            process.lock().unwrap().as_slice(),
+            ["graceful", "grace_wait", "force", "reap"]
+        );
     }
 }

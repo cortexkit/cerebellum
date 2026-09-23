@@ -1392,3 +1392,121 @@ fn base64_decoded_strings(text: &str) -> Vec<String> {
     .filter_map(|bytes| String::from_utf8(bytes).ok())
     .collect()
 }
+
+fn session_lock_refusal() -> Value {
+    json!({"outcome": "internal_failure", "stage": "browser_session_lock"})
+}
+
+async fn response_body(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Value {
+    let response = invoke(planes, corr, name, arguments).await;
+    // An Error frame here would mean the refusal was withheld as a schema
+    // violation instead of reaching the caller.
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "{name}: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    serde_json::from_slice(&response.body).unwrap()
+}
+
+#[tokio::test]
+async fn poisoned_session_lock_refuses_status_close_and_launch_through_the_wire() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    let launched = response_body(&planes, 1, "browser.launch", json!({})).await;
+    assert_eq!(launched["outcome"], "launched", "{launched}");
+    let browser_session_id = launched["browser_session_id"].as_str().unwrap().to_string();
+    planes.sessions.poison_for_test();
+
+    assert_eq!(
+        response_body(&planes, 2, "browser.status", json!({})).await,
+        session_lock_refusal()
+    );
+    assert_eq!(
+        response_body(
+            &planes,
+            3,
+            "browser.close",
+            json!({"browser_session_id": browser_session_id}),
+        )
+        .await,
+        session_lock_refusal()
+    );
+    assert_eq!(
+        response_body(&planes, 4, "browser.launch", json!({})).await,
+        session_lock_refusal()
+    );
+    assert_eq!(
+        *launcher.launches.lock().unwrap(),
+        1,
+        "a launch was attempted over a poisoned session lock"
+    );
+}
+
+#[tokio::test]
+async fn poisoned_session_lock_refuses_a_browser_action_through_the_wire() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, "https://page.example").await;
+    grant_browser(&planes, "https://page.example", Vec::new()).await;
+    planes.sessions.poison_for_test();
+
+    let refused = response_body(&planes, 20, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(refused["outcome"], "internal_failure", "{refused}");
+    assert_eq!(refused["stage"], "browser_session_lock", "{refused}");
+    assert!(
+        launcher.effects.lock().unwrap().is_empty(),
+        "a snapshot reached CDP over a poisoned session lock"
+    );
+}
+
+/// A launcher whose own lock was poisoned, refusing the way the production
+/// launcher does for its profile registry lock.
+struct PoisonedRegistryLauncher;
+
+impl BrowserSessionLauncher for PoisonedRegistryLauncher {
+    fn launch(
+        &self,
+        _: &cerebellum_core::identity::AcceptedBindFacts,
+        _: &str,
+    ) -> Result<LaunchedBrowser, Value> {
+        let lock = Arc::new(Mutex::new(()));
+        let poisoned = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock();
+            panic!("poison the registry fixture lock");
+        })
+        .join();
+        let refusal =
+            cerebellum::browser_session::refuse_poisoned(lock.lock(), "profile_registry_lock")
+                .err()
+                .expect("the fixture lock was poisoned");
+        Err(refusal)
+    }
+}
+
+#[tokio::test]
+async fn poisoned_profile_registry_lock_launch_refusal_reaches_the_caller_not_a_schema_violation() {
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(PoisonedRegistryLauncher));
+
+    assert_eq!(
+        response_body(&planes, 1, "browser.launch", json!({})).await,
+        json!({"outcome": "internal_failure", "stage": "profile_registry_lock"})
+    );
+}

@@ -62,13 +62,7 @@ fn map_poisoned_mutex<T>(
     result: Result<T, std::sync::PoisonError<T>>,
     stage: &'static str,
 ) -> Result<T, Value> {
-    result.map_err(|error| {
-        json!({
-            "outcome": "internal_failure",
-            "stage": stage,
-            "detail": error.to_string(),
-        })
-    })
+    crate::browser_session::refuse_poisoned(result, stage)
 }
 
 const BROWSER_LAUNCH_RECOVERY_FAILED: &str = "browser_launch_recovery_failed";
@@ -1607,11 +1601,37 @@ mod executable_identity_launch_tests {
             Ok(_) => panic!("poisoned lock was recovered"),
             Err(refusal) => refusal,
         };
-        assert_eq!(refusal["outcome"], "internal_failure");
-        assert_eq!(refusal["stage"], "profile_registry_lock");
         assert_eq!(
-            refusal["detail"],
-            "poisoned lock: another task failed inside"
+            refusal,
+            json!({"outcome": "internal_failure", "stage": "profile_registry_lock"})
+        );
+    }
+
+    /// A launch refusal is only useful if it reaches the caller. The wire
+    /// boundary withholds any reply its closed schema does not declare, and
+    /// browser.launch declares `detail` as the invalid-request object, so the
+    /// free-text `detail` this refusal used to carry got it withheld as a
+    /// schema violation instead of delivered.
+    #[test]
+    fn poisoned_profile_registry_lock_refusal_passes_the_launch_reply_schema() {
+        let lock = Arc::new(Mutex::new(()));
+        let poisoned_lock = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_lock.lock();
+            panic!("poison the fixture lock");
+        })
+        .join();
+
+        let Err(refusal) = map_poisoned_mutex(lock.lock(), "profile_registry_lock") else {
+            panic!("poisoned lock was recovered");
+        };
+        assert_eq!(
+            crate::browser::validate_browser_result(
+                crate::browser_session::BROWSER_LAUNCH,
+                &refusal
+            ),
+            Ok(()),
+            "{refusal}"
         );
     }
 }

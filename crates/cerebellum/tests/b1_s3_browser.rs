@@ -215,6 +215,7 @@ fn plane_with_process(
         LaunchSlot::Occupied { browser_session_id } => {
             panic!("unexpected occupied launch slot {browser_session_id}")
         }
+        LaunchSlot::Refused(refusal) => panic!("unexpected launch slot refusal {refusal}"),
     };
     let clock = Arc::new(SystemClock::new());
     let config = BrowserConfig {
@@ -2079,6 +2080,7 @@ async fn navigation_while_launch_is_pending_still_names_no_open_session() {
         LaunchSlot::Occupied { browser_session_id } => {
             panic!("unexpected occupied launch slot {browser_session_id}")
         }
+        LaunchSlot::Refused(refusal) => panic!("unexpected launch slot refusal {refusal}"),
     }
     let plane = BrowserPlane::with_session_gate(sessions, Arc::new(SystemClock::new()), 100)
         .with_grants_installed(navigation_grants());
