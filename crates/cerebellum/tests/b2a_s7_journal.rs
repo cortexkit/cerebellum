@@ -549,6 +549,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
         (Capability::WaitFor, "browser.wait_for"),
         (Capability::Present, "browser.present"),
         (Capability::ImportLogin, "browser.import_login"),
+        (Capability::CaptureLogin, "browser.capture_login"),
     ];
 
     let mut seen = std::collections::BTreeSet::new();
@@ -559,7 +560,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
             "{name} is claimed by more than one capability"
         );
     }
-    assert_eq!(seen.len(), 9, "a capability was added without a name here");
+    assert_eq!(seen.len(), 10, "a capability was added without a name here");
 }
 
 #[test]
@@ -607,7 +608,7 @@ fn handoff_records_carry_a_count_and_no_names() {
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().all(|entry| {
-        entry.format_version == "ck-browser-journal/v5"
+        entry.format_version == "ck-browser-journal/v6"
             && entry.capability == Some(Capability::Present)
             && entry.action.is_none()
     }));
@@ -660,7 +661,7 @@ fn login_import_records_count_and_no_cookie_names_or_values() {
         .unwrap();
     let export = journal.export();
     let entry: JournalEntry = serde_json::from_str(export.trim()).unwrap();
-    assert_eq!(entry.format_version, "ck-browser-journal/v5");
+    assert_eq!(entry.format_version, "ck-browser-journal/v6");
     assert_eq!(entry.capability, Some(Capability::ImportLogin));
     assert!(entry.action.is_none());
     let Some(JournalPayload::LoginImport(payload)) = entry.payload else {
@@ -691,4 +692,30 @@ fn v5_fixture_reads_back_byte_for_byte() {
         Some(JournalPayload::LoginImport(_))
     ));
     assert_eq!(entry.export_line(), fixture);
+}
+
+#[test]
+fn login_capture_records_decode_as_their_own_payload() {
+    use cerebellum::journal::LoginCapturePayload;
+
+    let mut journal = store();
+    let payload = LoginCapturePayload {
+        origin: "https://app.factory.ai".to_string(),
+        holder: "reserved:insula".to_string(),
+        credential_id: "cookie:factory.ai:work".to_string(),
+        bytes: 42,
+        outcome: "captured".to_string(),
+        deletion_succeeded: Some(true),
+    };
+    journal
+        .commit_login_capture(identity(), payload.clone())
+        .unwrap();
+    let export = journal.export();
+    let entry: JournalEntry = serde_json::from_str(export.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v6");
+    assert_eq!(entry.capability, Some(Capability::CaptureLogin));
+    assert!(entry.action.is_none());
+    // Untagged payloads decode as the first shape that fits; a capture must
+    // not be mistaken for a handoff or an import on the way back in.
+    assert_eq!(entry.payload, Some(JournalPayload::LoginCapture(payload)));
 }

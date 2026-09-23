@@ -706,7 +706,8 @@ pub fn journal_action(capability: JournalCapability) -> Option<JournalAction> {
         | JournalCapability::Screenshot
         | JournalCapability::WaitFor
         | JournalCapability::Present
-        | JournalCapability::ImportLogin => return None,
+        | JournalCapability::ImportLogin
+        | JournalCapability::CaptureLogin => return None,
     })
 }
 
@@ -1028,6 +1029,28 @@ impl BrowserPlane {
                 source_browser.map(str::to_string),
                 rows,
             )
+    }
+
+    /// Record one login-capture attempt. The payload type has no field that
+    /// could carry a cookie name or value.
+    pub async fn journal_login_capture(
+        &self,
+        identity: &RouteIdentity,
+        payload: journal::LoginCapturePayload,
+    ) -> Result<(), JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        match journal.store.as_mut() {
+            Some(store) => store.commit_login_capture(journal_identity(identity), payload),
+            // An enabled mode that opened no store is a journal that cannot
+            // record; the caller refuses rather than acting unrecorded.
+            None => Err(JournalError::internal_failure()),
+        }
     }
 
     async fn journal_handoff(

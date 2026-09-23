@@ -1,7 +1,7 @@
 //! Audit journal, redaction, snapshot retention, and late-event delivery.
 //!
 //! This module implements the browser plane's journal surface and the closed
-//! `ck-browser-journal/v5` entry contract. It owns durable allocation and
+//! `ck-browser-journal/v6` entry contract. It owns durable allocation and
 //! storage, reservations and transition pins, dispatch commitment, recovery,
 //! retained governing observations and snapshot pins, policy events, audit
 //! obligations, and live-session late-event delivery.
@@ -43,10 +43,10 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 
 /// The literal `format_version` carried by every journal entry.
-pub const FORMAT_VERSION: &str = "ck-browser-journal/v5";
+pub const FORMAT_VERSION: &str = "ck-browser-journal/v6";
 
 /// The export `format_version` reported by the administration export surface.
-pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v5";
+pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v6";
 
 /// The greatest sequence the allocator may hand out (`9007199254740991`).
 ///
@@ -161,6 +161,11 @@ pub enum Capability {
     Present,
     #[serde(rename = "browser.import_login")]
     ImportLogin,
+    // Added in v6. A capture holds a cookie value for the first time in this
+    // module, so each attempt is recorded -- never the value or a cookie name,
+    // only who will hold the login, for which site, and how it ended.
+    #[serde(rename = "browser.capture_login")]
+    CaptureLogin,
 }
 
 impl Capability {
@@ -175,6 +180,7 @@ impl Capability {
             Self::WaitFor => "browser.wait_for",
             Self::Present => "browser.present",
             Self::ImportLogin => "browser.import_login",
+            Self::CaptureLogin => "browser.capture_login",
         }
     }
 
@@ -217,11 +223,34 @@ pub struct LoginImportPayload {
     pub rows: u64,
 }
 
+/// One `browser.capture_login` attempt. Carries no cookie name or value: the
+/// byte count is the only fact recorded about the captured header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginCapturePayload {
+    /// The origin of the login page the person was handed.
+    pub origin: String,
+    /// The principal that will hold the captured login.
+    pub holder: String,
+    /// The vault id the operator is told to store it under.
+    pub credential_id: String,
+    /// Length of the captured request header, zero when nothing was captured.
+    pub bytes: u64,
+    /// `captured`, `no_login_observed`, `expired`, `cancelled`, or
+    /// `refused:<reason>`.
+    pub outcome: String,
+    /// Whether the throwaway profile was deleted. Absent when the attempt
+    /// ended before any profile directory existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_succeeded: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JournalPayload {
     Handoff(HandoffPayload),
     LoginImport(LoginImportPayload),
+    LoginCapture(LoginCapturePayload),
 }
 
 /// The eight B1 capability names that may appear as a policy-event
@@ -473,7 +502,7 @@ pub enum PolicyEventDetail {
     },
 }
 
-/// The closed `ck-browser-journal/v5` entry.
+/// The closed `ck-browser-journal/v6` entry.
 ///
 /// No additional fields are permitted (`deny_unknown_fields`). For a policy
 /// event, `capability`, `intent_redacted`, `requested_severity`,
