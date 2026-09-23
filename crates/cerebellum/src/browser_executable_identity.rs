@@ -543,7 +543,15 @@ mod tests {
     fn fake_verifier(name: &str, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir().join(format!(
+        // Under /tmp, not `std::env::temp_dir()`. On macOS 27 a newly written
+        // executable in the per-user temporary directory goes through system
+        // policy evaluation, and that can block the exec itself, before the
+        // verifier's deadline starts counting. Measured: a test using this
+        // fixture ran past 60 s against a 5 s deadline and failed as
+        // `verifier_timed_out`, and a codesign read of a file there never
+        // returned. `UnsignedExecutable` in browser_launch_service.rs uses
+        // /tmp for the same reason.
+        let directory = std::path::Path::new("/tmp").join(format!(
             "cerebellum-fake-verifier-{name}-{}",
             std::process::id()
         ));
