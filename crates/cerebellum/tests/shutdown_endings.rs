@@ -211,11 +211,25 @@ impl Drop for Harness {
 
 impl Harness {
     async fn start(close_ms: u64) -> Self {
+        // Tests run in parallel and start within the same microsecond often
+        // enough that a timestamp alone collides: two harnesses then share one
+        // directory, the second connection file overwrites the first, and both
+        // children dial the second listener. One child is served by the wrong
+        // harness, the other times out waiting for server proof, and the first
+        // harness never sees a connection. The process id and a per-process
+        // counter make the name unique, and `create_dir` (not `_all`) refuses
+        // a directory that already exists rather than sharing it.
+        static HARNESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = HARNESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after the epoch")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("cerebellum-endings-{nonce}"));
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-endings-{}-{sequence}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create a harness directory nobody else holds");
         let home = directory.join("home");
         std::fs::create_dir_all(&home).expect("create isolated home");
         let markers = directory.join("markers.txt");
