@@ -12,6 +12,12 @@ const COORDINATION_FILE: &str = ".coordination.lock";
 const JOURNAL_FILE: &str = "custody-events.jsonl";
 /// Version 2 added `supervisor_boot_id`. When present, `supervisor_start_time`
 /// holds clock ticks since that boot rather than epoch microseconds.
+///
+/// Every platform writes v2, and a build from before v2 refuses a v2 lock as an
+/// invalid record. So rolling this module back past v2 while a lock exists (a
+/// browser session open, or a lock left by a crash) refuses launches on that
+/// profile until the lock file is removed. Locks exist only while a session
+/// holds a profile, so a rollback with no browser running is unaffected.
 const LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v2";
 /// Written before the boot ID existed: the start time is always epoch microseconds.
 const V1_LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v1";
