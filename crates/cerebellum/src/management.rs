@@ -841,11 +841,15 @@ fn browser_grant_message(origins: &[String], hazards: &[String]) -> String {
             "forms whose purpose it couldn't check",
         ),
     ];
-    let (allowed, refused): (Vec<(&str, &str)>, Vec<(&str, &str)>) = FORM_KINDS
-        .into_iter()
-        .partition(|(class, _)| hazards.iter().any(|hazard| hazard == class));
-    let allowed: Vec<&str> = allowed.into_iter().map(|(_, kind)| kind).collect();
-    let refused: Vec<&str> = refused.into_iter().map(|(_, kind)| kind).collect();
+    let mut allowed: Vec<&str> = Vec::new();
+    let mut refused: Vec<&str> = Vec::new();
+    for (class, kind) in FORM_KINDS {
+        if hazards.iter().any(|hazard| hazard == class) {
+            allowed.push(kind);
+        } else {
+            refused.push(kind);
+        }
+    }
 
     let mut message = format!(
         "Let this agent use its own browser on {}? It can open and read pages there \
