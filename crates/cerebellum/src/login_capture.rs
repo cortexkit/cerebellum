@@ -54,6 +54,9 @@ pub const CAPTURE_ROOT_NAME: &str = "ck-cerebellum-capture";
 /// exists because a subprocess's latency is not ours to promise.
 pub const TOOL_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How often a capture waiting on the person checks whether it was cancelled.
+const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 const ALLOW_DECISION: &str = "allow";
 const DENY_DECISION: &str = "deny";
 const MAX_ACCOUNT_BYTES: usize = 128;
@@ -981,7 +984,26 @@ impl CaptureModule {
             return record.ended("cancelled", None);
         }
         let question = consent_question(request, self.env.file_lifetime);
-        let answer = (call.ask)(question, crate::login_import::ELICITATION_DEADLINE).await;
+        // The question can wait minutes for a person, so a cancel is watched
+        // for alongside it rather than only after it ends.
+        let answer = {
+            let asked = (call.ask)(question, crate::login_import::ELICITATION_DEADLINE);
+            tokio::pin!(asked);
+            let check = self.env.poll_interval.min(CANCEL_CHECK_INTERVAL);
+            loop {
+                tokio::select! {
+                    answer = &mut asked => break Some(answer),
+                    () = tokio::time::sleep(check) => {
+                        if (call.cancelled)() {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        let Some(answer) = answer else {
+            return record.ended("cancelled", None);
+        };
         if (call.cancelled)() {
             return record.ended("cancelled", None);
         }

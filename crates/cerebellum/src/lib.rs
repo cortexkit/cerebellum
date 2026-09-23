@@ -5037,6 +5037,289 @@ mod tests {
         );
     }
 
+    /// Planes whose management route declares elicitation, with the capture
+    /// module running on the fixture's fakes and an in-memory journal.
+    fn capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        );
+        planes.capture = Arc::clone(&fixture.module);
+        let admission = json!({
+            "agentProjectId": "test-project",
+            "sessionKind": "primary",
+            "effectiveCapabilityScope": ["*"],
+        });
+        planes.routes.insert(
+            4,
+            1,
+            AcceptedBindFacts::from_bind(
+                &bind_identity_for_test(),
+                Some(Principal::Direct),
+                Some(&admission),
+                Some(&["elicitation".to_string()]),
+                &subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+        planes
+    }
+
+    fn capture_request_frame(correlation: u64, params: Value) -> Frame {
+        Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            correlation,
+            serde_json::to_vec(&json!({
+                "method": management::CAPTURE_LOGIN,
+                "params": params,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn ollama_capture_params() -> Value {
+        json!({
+            "credential_domain": "ollama.com",
+            "account": "work",
+            "fetch_url": "https://ollama.com/settings",
+            "login_url": "https://ollama.com/signin",
+        })
+    }
+
+    async fn next_frame(rx: &mut mpsc::Receiver<Frame>) -> Frame {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the capture answers promptly")
+            .expect("the writer stays open")
+    }
+
+    /// Through the production frame dispatcher and the Withhold reply boundary:
+    /// the planted cookie value reaches the capture file, and is absent from
+    /// the question put to the person, the wire reply, and every decoded
+    /// journal entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_login_keeps_the_value_out_of_the_reply_the_journal_and_the_ask() {
+        use login_capture::test_support::{contains_bytes, fixture, PLANTED_VALUE};
+
+        let fixture = fixture();
+        let planes = capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        handle_frame(
+            capture_request_frame(301, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+
+        let question = next_frame(&mut writer_rx).await;
+        assert_eq!(question.header.ty, FrameType::Request);
+        let asked: Value = serde_json::from_slice(&question.body).unwrap();
+        assert_eq!(
+            asked["params"]["message"],
+            "insula will hold a copy of your ollama.com login"
+        );
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow"}),
+        ));
+        let reply = next_frame(&mut writer_rx).await;
+        assert_eq!(reply.header.corr, 301);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "captured", "{body}");
+
+        // Positive control: the scanner finds the value where it was planted.
+        let files = fixture.fs.files();
+        assert_eq!(files.len(), 1);
+        assert!(contains_bytes(&files[0].1, PLANTED_VALUE));
+
+        assert!(
+            !contains_bytes(&question.body, PLANTED_VALUE),
+            "the ask leaked it"
+        );
+        assert!(
+            !contains_bytes(&reply.body, PLANTED_VALUE),
+            "the reply leaked it"
+        );
+        let export = planes.browser.journal_export_for_test().await;
+        let entries = export
+            .lines()
+            .map(|line| serde_json::from_str::<journal::JournalEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "{export}");
+        let Some(journal::JournalPayload::LoginCapture(payload)) = &entries[0].payload else {
+            panic!("a capture is journaled with its own payload: {export}");
+        };
+        assert_eq!(payload.outcome, "captured");
+        assert_eq!(payload.holder, "reserved:insula");
+        assert_eq!(payload.credential_id, "cookie:ollama.com:work");
+        assert_eq!(payload.bytes, files[0].1.len() as u64);
+        assert_eq!(payload.deletion_succeeded, Some(true));
+        for entry in &entries {
+            let decoded = serde_json::to_vec(entry).unwrap();
+            assert!(
+                !contains_bytes(&decoded, PLANTED_VALUE),
+                "the journal leaked it"
+            );
+            assert!(
+                !contains_bytes(&decoded, "csrf"),
+                "the journal named a cookie"
+            );
+        }
+    }
+
+    /// The reply leaves only after the throwaway profile is gone. The fake
+    /// deletion is slow, so a reply sent ahead of it arrives while the profile
+    /// still exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_reply_is_sent_only_after_the_profile_is_deleted() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        *fixture.fs.removal_delay.lock().unwrap() = Duration::from_millis(200);
+        let planes = capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        handle_frame(
+            capture_request_frame(302, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let question = next_frame(&mut writer_rx).await;
+        planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow"}),
+        );
+        let reply = next_frame(&mut writer_rx).await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "captured", "{body}");
+        let placement = fixture.launcher.placements.lock().unwrap()[0].clone();
+        assert!(
+            !fixture.fs.exists(placement.profile_directory()),
+            "the reply was sent while the throwaway profile still existed"
+        );
+        assert!(fixture
+            .events
+            .snapshot()
+            .contains(&"profile_deleted".to_string()));
+    }
+
+    /// A cancel frame for the request, arriving while the question is open,
+    /// ends the capture with nothing written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_frame_ends_a_capture_waiting_on_consent() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        handle_frame(
+            capture_request_frame(303, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let question = next_frame(&mut writer_rx).await;
+        assert_eq!(question.header.ty, FrameType::Request);
+        let cancel = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Cancel,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            303,
+            Vec::new(),
+        )
+        .unwrap();
+        handle_frame(cancel, &writer_tx, &planes).await.unwrap();
+        let reply = next_frame(&mut writer_rx).await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "cancelled", "{body}");
+        assert!(fixture.fs.contents().is_empty());
+        assert_eq!(
+            fixture
+                .launcher
+                .launches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_login_params_are_exactly_closed() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = capture_planes(&fixture);
+        let mut missing_account = ollama_capture_params();
+        missing_account.as_object_mut().unwrap().remove("account");
+        let mut extra = ollama_capture_params();
+        extra["holder"] = json!("someone-else");
+        for (correlation, (params, field, reason)) in [
+            (missing_account, "account", "missing_field"),
+            (extra, "holder", "unknown_field"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+            handle_route_request(
+                capture_request_frame(310 + correlation as u64, params),
+                &writer_tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+            let body: Value =
+                serde_json::from_slice(&next_frame(&mut writer_rx).await.body).unwrap();
+            assert_eq!(body["outcome"], "invalid_request", "{body}");
+            assert_eq!(body["detail"]["field"], field, "{body}");
+            assert_eq!(body["detail"]["reason_code"], reason, "{body}");
+        }
+        assert!(fixture.events.snapshot().is_empty());
+    }
+
+    /// The capture reply schema is closed at the module's own boundary: an
+    /// undeclared field or a missing outcome is withheld rather than sent.
+    #[test]
+    fn the_capture_reply_boundary_withholds_what_the_schema_does_not_declare() {
+        let planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        );
+        assert!(planes
+            .browser
+            .finish_reply(
+                management::CAPTURE_LOGIN,
+                json!({"outcome": "captured", "cookie": "x"})
+            )
+            .is_err());
+        assert!(planes
+            .browser
+            .finish_reply(management::CAPTURE_LOGIN, json!({"path": "/tmp/x"}))
+            .is_err());
+        assert!(planes
+            .browser
+            .finish_reply(management::CAPTURE_LOGIN, json!({"outcome": "made_up"}))
+            .is_err());
+        assert!(planes
+            .browser
+            .finish_reply(management::CAPTURE_LOGIN, json!({"outcome": "cancelled"}))
+            .is_ok());
+    }
+
     /// A route bound to a surface this module does not serve is refused as such.
     ///
     /// Not served as either of the surfaces it does: answering from an envelope

@@ -247,6 +247,9 @@ fn a_tool_that_never_answers_times_out() {
 #[tokio::test]
 async fn the_profile_is_deleted_before_the_capture_returns() {
     let fixture = fixture();
+    // Held inside the deletion so that a deletion moved off the return path
+    // would still be running when the check below looks.
+    *fixture.fs.removal_delay.lock().unwrap() = Duration::from_millis(50);
     let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
     assert_eq!(outcome.reply["outcome"], "captured");
     let placement = fixture.launcher.placements.lock().unwrap()[0].clone();
@@ -686,6 +689,36 @@ async fn a_cancel_during_the_handoff_writes_nothing_and_deletes_the_profile() {
     nothing_captured(&fixture);
     assert!(fixture.events.contains_prefix("browser_closed"));
     assert!(fixture.events.contains_prefix("profile_deleted"));
+}
+
+/// A cancel that arrives while the question is still open ends the capture
+/// without waiting for the person, and nothing is placed or launched.
+#[tokio::test]
+async fn a_cancel_while_the_question_is_open_ends_the_capture() {
+    let fixture = fixture();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raise = Arc::clone(&cancelled);
+    let facts = accepted();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.module.run(
+            &ollama(),
+            CaptureCall {
+                accepted: &facts,
+                declares_elicitation: true,
+                ask: move |_: Value, _: Duration| {
+                    raise.store(true, Ordering::SeqCst);
+                    std::future::pending::<AskOutcome>()
+                },
+                cancelled: move || cancelled.load(Ordering::SeqCst),
+            },
+        ),
+    )
+    .await
+    .expect("the cancel ended the wait on the person");
+    assert_eq!(outcome.reply["outcome"], "cancelled");
+    assert!(fixture.fs.contents().is_empty());
+    assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
