@@ -1412,8 +1412,21 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // A dedicated target makes ownership explicit. Selecting an arbitrary
         // pre-existing tab would let one route drive a page whose custody was
         // never established for that route.
+        //
+        // `background: true` keeps the user's frontmost application in front.
+        // Measured on macOS 27 with Chrome 153 (2026-09-23), sampling the
+        // frontmost app every 100 ms: a browser launched with
+        // `--no-startup-window` that then creates a foreground target (or is
+        // handed a startup window, or launched via `open -g` / `open -g -j`)
+        // takes focus within 0.4 s; creating the target with
+        // `background: true` opens one on-screen window and focus never moves.
+        // `newWindow: true` alongside it measured the same, so it is left out:
+        // with no startup window Chrome must open a window for this target
+        // anyway, and omitting it avoids a second window when one already
+        // exists. `browser.present` is the deliberate way to front the page.
         let mut create_params = Map::new();
         create_params.insert("url".into(), Value::String("about:blank".into()));
+        create_params.insert("background".into(), Value::Bool(true));
         let created = self.command(
             "Target.createTarget",
             Some(create_params),
@@ -4513,6 +4526,40 @@ mod tests {
 
         assert!(!tracker.settled);
         assert_eq!(tracker.lifecycle, ["navigation_started", "load"]);
+    }
+
+    #[test]
+    fn route_page_is_created_as_a_background_target() {
+        let frames = [
+            json!({"id":1,"result":{"targetId":"target-own"}}),
+            json!({"id":2,"result":{"sessionId":"session-own"}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{}}),
+        ];
+        let mut driver = driver(frames);
+        let mut tracker = Tracker::default();
+        driver
+            .navigate_for_test(
+                "route-own",
+                "https://requested.example/",
+                NavigationWait::None,
+                100,
+                &mut tracker,
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+
+        // A foreground target steals focus from the user's frontmost app;
+        // the page must be created in the background.
+        let create = driver
+            .pipe
+            .writes
+            .iter()
+            .find(|write| write["method"] == "Target.createTarget")
+            .expect("a Target.createTarget command");
+        assert_eq!(create["params"]["url"], "about:blank");
+        assert_eq!(create["params"]["background"], true);
     }
 
     #[test]

@@ -137,7 +137,8 @@ pub enum RegistrationError {
 /// and they are listed here first because the list otherwise reads as evidence
 /// that browser traffic is routed through one. `browser_launch_service` builds
 /// its argument vector from `--remote-debugging-pipe`, `--user-data-dir`,
-/// `--no-first-run` and `--no-default-browser-check`. It passes no
+/// `--crash-dumps-dir`, `--no-first-run`, `--no-default-browser-check` and
+/// `--no-startup-window`. It passes no
 /// `--proxy-server`, so a launched browser reaches the network directly, and
 /// refusing the arguments that would DISABLE a proxy forbids turning off
 /// something nobody turned on.

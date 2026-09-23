@@ -782,6 +782,14 @@ pub fn browser_launch_arguments(
         )),
         OsString::from("--no-first-run"),
         OsString::from("--no-default-browser-check"),
+        // Chrome's own startup window opens in the foreground and takes focus
+        // from the user's frontmost application (measured on macOS 27 with
+        // Chrome 153: at 3.7 s after launch). Without it the browser runs with
+        // no window until navigation creates the route's page as a background
+        // target, which opens a visible window without taking focus. The
+        // readiness handshake is `Browser.getVersion` and needs no page. The
+        // flag has the same meaning for Chromium on Linux.
+        OsString::from("--no-startup-window"),
     ]
 }
 
@@ -1858,6 +1866,7 @@ mod executable_identity_launch_tests {
                 OsString::from("--crash-dumps-dir=/tmp/probe-profile/crash"),
                 OsString::from("--no-first-run"),
                 OsString::from("--no-default-browser-check"),
+                OsString::from("--no-startup-window"),
             ]
         );
     }
