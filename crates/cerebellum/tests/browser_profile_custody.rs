@@ -16,9 +16,10 @@ use cerebellum::profile::{
     ProfileOutcome, ProfileState, RegistryConfig, UntrustworthyRegistryReason,
 };
 use cerebellum::profile_custody::{
-    classify_supervisor_start_time, read_record_if_present, ProfileCustodyAcquisition,
-    ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey,
-    ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks, ProfileCustodyRelease,
+    classify_supervisor_start_time, current_supervisor_generation, read_record_if_present,
+    KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyEvent,
+    ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLockError,
+    ProfileCustodyLockRecord, ProfileCustodyLocks, ProfileCustodyRelease, StartTimeStability,
     SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
 };
 use serde_json::{json, Value};
@@ -453,11 +454,19 @@ fn a_recycled_pid_with_a_different_start_time_is_not_the_recorded_process() {
     let recorded = generation(61, 6100);
     let recycled = generation(61, 6200);
     assert_eq!(
-        classify_supervisor_start_time(recorded, Some(recorded.start_time)),
+        classify_supervisor_start_time(
+            recorded,
+            Some(recorded.start_time),
+            StartTimeStability::ClockStable
+        ),
         SupervisorLiveness::Live
     );
     assert_eq!(
-        classify_supervisor_start_time(recorded, Some(recycled.start_time)),
+        classify_supervisor_start_time(
+            recorded,
+            Some(recycled.start_time),
+            StartTimeStability::ClockStable
+        ),
         SupervisorLiveness::NotLive
     );
     let key = ProfileCustodyKey::durable("project-1");
@@ -1190,4 +1199,59 @@ fn every_wire_outcome_is_structurally_profile_uuid_free() {
     for outcome in outcomes {
         assert_no_profile_uuid(&outcome.as_json());
     }
+}
+
+/// A live pid with a different start time is ambiguous where the reading moves
+/// with the wall clock, and ambiguity must refuse rather than break the lock.
+///
+/// `NotLive` is the authority to seize a profile, so reading a clock step as a
+/// dead holder would hand a live holder's profile to a second process and
+/// journal it as a legitimate stale break. The same mismatch under a
+/// clock-stable reading can only be reuse, and there it still breaks. An absent
+/// pid is a gone holder under either reading.
+#[test]
+fn a_start_time_mismatch_refuses_where_the_reading_moves_with_the_clock() {
+    let recorded = generation(61, 6100);
+    let moved = Some(6100 + 7_201_000_000);
+    assert_eq!(
+        classify_supervisor_start_time(recorded, moved, StartTimeStability::MovesWithWallClock),
+        SupervisorLiveness::Unavailable
+    );
+    assert_eq!(
+        classify_supervisor_start_time(recorded, moved, StartTimeStability::ClockStable),
+        SupervisorLiveness::NotLive
+    );
+    for stability in [
+        StartTimeStability::ClockStable,
+        StartTimeStability::MovesWithWallClock,
+    ] {
+        assert_eq!(
+            classify_supervisor_start_time(recorded, None, stability),
+            SupervisorLiveness::NotLive,
+            "a pid no process holds is a gone holder under {stability:?}"
+        );
+        assert_eq!(
+            classify_supervisor_start_time(recorded, Some(recorded.start_time), stability),
+            SupervisorLiveness::Live,
+        );
+    }
+}
+
+/// The production probe recognises the running supervisor it recorded.
+///
+/// Drives the real `KernelSupervisorLiveness` against this process's own
+/// generation, on whatever platform runs the suite. The recording side and the
+/// observing side are written separately per platform, and they can drift: on
+/// Linux the recording arm was wired while the observing arm still answered
+/// `Unavailable` for everything, so a lock left by a crashed supervisor could
+/// never be judged stale and wedged its profile for good. A platform whose
+/// probe cannot read back what its supervisor records fails here.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_production_probe_reads_back_the_generation_this_supervisor_records() {
+    let own = current_supervisor_generation().expect("this platform records a supervisor");
+    assert_eq!(
+        KernelSupervisorLiveness.observe(own),
+        SupervisorLiveness::Live
+    );
 }

@@ -16,7 +16,8 @@ pub use holder_lock::{
     FilesystemProfileCustodyJournal, HolderId, KernelSupervisorLiveness, ProfileCustodyAcquisition,
     ProfileCustodyClaim, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
     ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks,
-    ProfileCustodyRelease, SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
+    ProfileCustodyRelease, StartTimeStability, SupervisorGeneration, SupervisorLiveness,
+    SupervisorLivenessProbe,
 };
 
 /// The caller-visible reason for an unavailable profile-storage operation.

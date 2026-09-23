@@ -114,16 +114,45 @@ pub trait SupervisorLivenessProbe {
     fn stale_evidence_recorded(&self) {}
 }
 
-/// Compare the recorded generation to a kernel-observed start time. Absence means
-/// no process currently holds the pid; a different start time means the pid was
-/// recycled for another process.
+/// Whether a platform's start-time reading survives a wall-clock step.
+///
+/// It decides what a live pid with a DIFFERENT start time means. macOS stores
+/// the start time in the kernel at creation, so a difference can only be PID
+/// reuse. Linux has no stored start time: the reading is `btime` plus ticks
+/// since boot, and the kernel recomputes `btime` as realtime minus monotonic
+/// on every read, so stepping the clock moves the start time of a process that
+/// never changed. There a difference is either reuse or a clock step, and the
+/// reading cannot tell which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartTimeStability {
+    /// Recorded at creation and never recomputed.
+    ClockStable,
+    /// Derived from the current wall clock on every read.
+    MovesWithWallClock,
+}
+
+/// Compare the recorded generation to a kernel-observed start time.
+///
+/// Absence means no process holds the pid, so the holder is gone. A different
+/// start time is reuse where the reading is clock-stable, and AMBIGUOUS where
+/// it is not -- and ambiguity must not break the lock, because `NotLive` is not
+/// a refusal but the authority to seize: a clock step would hand a live
+/// holder's profile to a second process, and the journal would record it as a
+/// legitimate stale break. The cost of `Unavailable` is that a genuinely
+/// reused pid holds the profile until the reusing process exits, and that
+/// refusal names its reason where a seizure would not.
 pub fn classify_supervisor_start_time(
     recorded: SupervisorGeneration,
     observed_start_time: Option<u64>,
+    stability: StartTimeStability,
 ) -> SupervisorLiveness {
     match observed_start_time {
         Some(start_time) if start_time == recorded.start_time => SupervisorLiveness::Live,
-        Some(_) | None => SupervisorLiveness::NotLive,
+        Some(_) => match stability {
+            StartTimeStability::ClockStable => SupervisorLiveness::NotLive,
+            StartTimeStability::MovesWithWallClock => SupervisorLiveness::Unavailable,
+        },
+        None => SupervisorLiveness::NotLive,
     }
 }
 
@@ -138,10 +167,18 @@ impl SupervisorLivenessProbe for KernelSupervisorLiveness {
         {
             match cerebellum_macos::process_start_time(generation.pid) {
                 cerebellum_macos::ProcessStartTime::Started(start_time) => {
-                    classify_supervisor_start_time(generation, Some(start_time))
+                    classify_supervisor_start_time(
+                        generation,
+                        Some(start_time),
+                        StartTimeStability::ClockStable,
+                    )
                 }
                 cerebellum_macos::ProcessStartTime::NoSuchProcess => {
-                    classify_supervisor_start_time(generation, None)
+                    classify_supervisor_start_time(
+                        generation,
+                        None,
+                        StartTimeStability::ClockStable,
+                    )
                 }
                 cerebellum_macos::ProcessStartTime::NotPermitted
                 | cerebellum_macos::ProcessStartTime::LayoutMismatch
@@ -152,7 +189,39 @@ impl SupervisorLivenessProbe for KernelSupervisorLiveness {
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        // Linux records a supervisor's start time (see
+        // `current_supervisor_generation`) and must read it back the same way,
+        // or every lock a crashed supervisor leaves behind answers
+        // `Unavailable` forever and wedges that profile. The reading moves with
+        // the wall clock, so a mismatch stays ambiguous rather than stale.
+        #[cfg(target_os = "linux")]
+        {
+            match cerebellum_linux::process_start_time(generation.pid) {
+                cerebellum_linux::ProcessStartTime::Started(start_time) => {
+                    classify_supervisor_start_time(
+                        generation,
+                        Some(start_time),
+                        StartTimeStability::MovesWithWallClock,
+                    )
+                }
+                cerebellum_linux::ProcessStartTime::NoSuchProcess => {
+                    classify_supervisor_start_time(
+                        generation,
+                        None,
+                        StartTimeStability::MovesWithWallClock,
+                    )
+                }
+                cerebellum_linux::ProcessStartTime::NotPermitted
+                | cerebellum_linux::ProcessStartTime::StatReadFailed
+                | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
+                | cerebellum_linux::ProcessStartTime::LayoutMismatch
+                | cerebellum_linux::ProcessStartTime::NoStartTime => {
+                    SupervisorLiveness::Unavailable
+                }
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = generation;
             SupervisorLiveness::Unavailable

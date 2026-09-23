@@ -32,7 +32,7 @@ use cerebellum::browser_config::BrowserConfig;
 use cerebellum::browser_launch::{LINUX_EXEC_CHAIN_HOP_LIMIT, LINUX_EXEC_CHAIN_PROBE_WINDOW};
 use cerebellum::management;
 use cerebellum::profile_custody::{
-    classify_supervisor_start_time, read_record_if_present, SupervisorLiveness,
+    classify_supervisor_start_time, read_record_if_present, StartTimeStability, SupervisorLiveness,
 };
 use cerebellum::Planes;
 use cerebellum_core::health::HealthState;
@@ -910,7 +910,11 @@ fn check_custody_residue(
         })?;
         match (
             observed,
-            classify_supervisor_start_time(supervisor, observed),
+            classify_supervisor_start_time(
+                supervisor,
+                observed,
+                StartTimeStability::MovesWithWallClock,
+            ),
         ) {
             (None, SupervisorLiveness::NotLive) => {
                 return Err(format!(
@@ -930,14 +934,18 @@ fn check_custody_residue(
                     start_time,
                 ));
             }
-            (Some(start_time), SupervisorLiveness::NotLive) => {
+            // A live pid whose start time moved is NOT evidence of reuse on
+            // Linux: the reading is recomputed from the wall clock, so a clock
+            // step since the lock was written produces the same difference.
+            (Some(start_time), SupervisorLiveness::Unavailable) => {
                 return Err(format!(
-                    "refusing: stale custody residue at {}: recorded pid {} start time {}; live reading: pid {} start time {} (PID reuse). Next step: inspect the stale lock, then remove or move it aside only after confirming no live holder before rerunning the probe.",
+                    "refusing: custody lock at {} names recorded pid {} start time {}; live reading: pid {} start time {}. That is either PID reuse or a wall-clock step since the lock was written, and this reading cannot tell which. Next step: check whether pid {} is a cerebellum supervisor before touching the lock.",
                     lock_path.display(),
                     supervisor.pid,
                     supervisor.start_time,
                     supervisor.pid,
                     start_time,
+                    supervisor.pid,
                 ));
             }
             _ => unreachable!("supervisor liveness classification matches its observation"),
