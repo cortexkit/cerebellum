@@ -3431,6 +3431,158 @@ mod tests {
         }
     }
 
+    /// A browser call on one route must not stall another route.
+    ///
+    /// Route A enters a screenshot that blocks until A's kill switch fires,
+    /// standing in for a navigate waiting out a slow page under an operator's
+    /// long settle deadline. While A is blocked, route B asks for its status,
+    /// is admitted for an operation, and makes a driver call. Each of those
+    /// should finish promptly, well before A is released.
+    ///
+    /// Today every driver call holds the one registry-wide lock for the whole
+    /// call, so B waits until A is released (after `A_HOLD`). The test prints
+    /// what B measured so a run with `--ignored` shows the size of the stall.
+    #[test]
+    #[ignore = "known stall: every browser driver call holds the registry-wide session lock \
+                for its whole CDP call, so route B waits behind route A; un-ignore once \
+                driver calls no longer hold that lock"]
+    fn a_blocked_driver_call_on_one_route_does_not_stall_another_route() {
+        const A_HOLD: Duration = Duration::from_millis(1_000);
+        const PROMPT: Duration = Duration::from_millis(100);
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+
+        let a_switch = Arc::new(KillSwitch::default());
+        let (a_entered, a_call_entered) = std::sync::mpsc::channel();
+        let _ = sessions.acquire_launch_slot("route-a");
+        sessions
+            .establish_ready(
+                "route-a",
+                ProfileDisposition::Durable,
+                &config(),
+                &clock,
+                Box::new(StuckCallProcess {
+                    switch: Arc::clone(&a_switch),
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    entered: a_entered,
+                }),
+                Box::new(RecordingCleanup::default()),
+            )
+            .unwrap();
+
+        // B's switch is fired up front, so its screenshot reaches the driver
+        // and returns `CdpFailure` at once. That error, unlike `Unavailable`,
+        // proves the call got past the session checks into B's own browser.
+        let b_switch = Arc::new(KillSwitch::default());
+        *b_switch.killed.lock().unwrap() = true;
+        let (b_entered, _b_call_entered) = std::sync::mpsc::channel();
+        let _ = sessions.acquire_launch_slot("route-b");
+        sessions
+            .establish_ready(
+                "route-b",
+                ProfileDisposition::Durable,
+                &config(),
+                &clock,
+                Box::new(StuckCallProcess {
+                    switch: Arc::clone(&b_switch),
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    entered: b_entered,
+                }),
+                Box::new(RecordingCleanup::default()),
+            )
+            .unwrap();
+
+        let DispatchAdmission::Accepted(mut a_operation) =
+            sessions.accept_dispatch("route-a", &clock)
+        else {
+            panic!("route A's ready session refused dispatch");
+        };
+        let a_caller = std::thread::spawn(move || {
+            let result = a_operation.screenshot("context", 0, 3_600_000, false);
+            a_operation.finish();
+            result
+        });
+        a_call_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("route A's call is in progress");
+
+        // B's status and B's operation run on separate threads, both started
+        // while A is blocked, so each one's wait is measured on its own rather
+        // than the operation's wait hiding behind the status's.
+        let (b_done, b_finished) = std::sync::mpsc::channel();
+        let status_sessions = sessions.clone();
+        let status_clock = clock.clone();
+        let status_done = b_done.clone();
+        let b_status = std::thread::spawn(move || {
+            let started = Instant::now();
+            let status = status_sessions.status("route-b", &status_clock, UNIX_EPOCH);
+            let finished_at = Instant::now();
+            let _ = status_done.send(());
+            (status, finished_at - started, finished_at)
+        });
+        let call_sessions = sessions.clone();
+        let call_clock = clock.clone();
+        let b_call = std::thread::spawn(move || {
+            let started = Instant::now();
+            let DispatchAdmission::Accepted(mut operation) =
+                call_sessions.accept_dispatch("route-b", &call_clock)
+            else {
+                panic!("route B's ready session refused dispatch");
+            };
+            let call = operation.screenshot("context", 0, 10, false);
+            let finished_at = Instant::now();
+            operation.finish();
+            let _ = b_done.send(());
+            (call.err(), finished_at - started, finished_at)
+        });
+
+        // Give B up to `A_HOLD` to finish on its own, then release A whatever
+        // happened, so the test always ends.
+        let deadline = Instant::now() + A_HOLD;
+        for _ in 0..2 {
+            let _ = b_finished.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        let a_released_at = Instant::now();
+        *a_switch.killed.lock().unwrap() = true;
+        a_switch.wake.notify_all();
+        let (status, status_took, status_finished_at) = b_status.join().unwrap();
+        let (call_error, call_took, call_finished_at) = b_call.join().unwrap();
+        assert_eq!(
+            a_caller.join().unwrap().err(),
+            Some(NavigationDriveError::CdpFailure),
+            "route A's call ends only when its switch fires"
+        );
+        let relative_to_release = |finished_at: Instant| {
+            if finished_at < a_released_at {
+                "before"
+            } else {
+                "after"
+            }
+        };
+        eprintln!(
+            "route B while route A was blocked for {A_HOLD:?}: status took {status_took:?} \
+             (finished {} A was released); admission plus driver call took {call_took:?} \
+             (finished {} A was released)",
+            relative_to_release(status_finished_at),
+            relative_to_release(call_finished_at),
+        );
+
+        assert_eq!(status["outcome"], "ready");
+        assert_eq!(
+            call_error,
+            Some(NavigationDriveError::CdpFailure),
+            "route B's call reached route B's own browser"
+        );
+        assert!(
+            status_took < PROMPT && status_finished_at < a_released_at,
+            "route B's status waited {status_took:?} behind route A's call"
+        );
+        assert!(
+            call_took < PROMPT && call_finished_at < a_released_at,
+            "route B's admission and driver call waited {call_took:?} behind route A's call"
+        );
+    }
+
     /// The shutdown cap is for shutdown only: an idle expiry still gives the
     /// browser the whole configured grace, however long.
     #[test]
