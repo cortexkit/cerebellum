@@ -646,7 +646,7 @@ impl GrantStore {
         let floor = request.action.floor();
         request.requested_severity.validate()?;
         if request.requested_severity.tier < floor.tier {
-            return Err(AuthorizationError::SeverityBelowFloor);
+            return Err(AuthorizationError::SeverityBelowFloor { required: computed });
         }
         let effective = request.requested_severity.maximum(computed);
         let grant = self.select_covering_grant_for_hazards(
@@ -816,7 +816,7 @@ pub fn effective_severity(
     let (computed, _) = computed_required_severity(action, classification)?;
     let floor = action.floor();
     if requested.tier < floor.tier {
-        return Err(AuthorizationError::SeverityBelowFloor);
+        return Err(AuthorizationError::SeverityBelowFloor { required: computed });
     }
     Ok(requested.maximum(computed))
 }
@@ -985,7 +985,12 @@ impl DecisionBindings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationError {
     InvalidSeverityTier,
-    SeverityBelowFloor,
+    /// The requested tier is under the action's floor. `required` is the
+    /// severity this target computes to (never below the floor), so a caller
+    /// learns what to ask for without probing tier by tier.
+    SeverityBelowFloor {
+        required: Severity,
+    },
     NoGrant,
     OriginScope {
         attempted_origin: String,

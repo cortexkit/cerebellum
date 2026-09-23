@@ -155,7 +155,7 @@ fn snapshot_observation(
             backend_identity: Some(BackendNodeIdentity::new("target", "frame-main", 42).unwrap()),
             raw_role: Some("button".into()),
             raw_name: Some("Sign in".into()),
-            classification: Some(Box::new(classification)),
+            classification: Ok(Box::new(classification)),
         }],
         ax_truncated: false,
         refs_truncated: false,

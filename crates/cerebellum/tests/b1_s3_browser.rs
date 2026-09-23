@@ -17,6 +17,7 @@ use cerebellum::browser_session::{
     OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, ViewportRefusal,
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
+use cerebellum::classification::ClassificationUnavailable;
 use cerebellum::coordinate::{
     encode_base64, InputRect, ScreenshotPayload, TransformInputs, ViewportObservation,
 };
@@ -155,7 +156,7 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
                 backend_identity: None,
                 raw_role: None,
                 raw_name: None,
-                classification: None,
+                classification: Err(ClassificationUnavailable::NotCaptured),
             }],
             4096,
         )
@@ -1054,7 +1055,7 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
                 ),
                 raw_role: Some(record.role.clone()),
                 raw_name: Some(record.name.clone()),
-                classification: None,
+                classification: Err(ClassificationUnavailable::NotCaptured),
             })
         })
         .collect();
@@ -2462,7 +2463,7 @@ async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> S
                 ),
                 raw_role: Some("button".into()),
                 raw_name: Some("Save".into()),
-                classification: None,
+                classification: Err(ClassificationUnavailable::NotCaptured),
             }],
             4096,
         )

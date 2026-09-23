@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::authorization::{AuthorizationRequest, GrantStore, HazardClass, Severity};
+use crate::classification::ClassificationUnavailable;
 use crate::computer_capability::ResultSchemaEnforcement;
 use crate::coordinate::{
     capture_screenshot, map_pixel_to_css, validate_png_base64_dimensions, CoordinateError,
@@ -169,6 +170,15 @@ pub enum BrowserError {
     },
     HazardNotDisclosed {
         missing: HazardClass,
+        /// Why the target had no classification, when that is what made the
+        /// hazard unverified. `None` for a classified target.
+        classification_unavailable: Option<ClassificationUnavailable>,
+    },
+    /// The requested severity is under the action's floor. `required` is the
+    /// value the authorization check computed for this target.
+    SeverityBelowFloor {
+        required: crate::authorization::Severity,
+        classification_unavailable: Option<ClassificationUnavailable>,
     },
     NavigationPolicyRejected {
         reason_code: &'static str,
@@ -194,7 +204,7 @@ pub enum BrowserError {
 impl BrowserError {
     fn outcome(&self) -> &'static str {
         match self {
-            Self::InvalidRequest { .. } => "invalid_request",
+            Self::InvalidRequest { .. } | Self::SeverityBelowFloor { .. } => "invalid_request",
             Self::NoSession => "no_session",
             Self::BrowserLaunchPending => "browser_launch_pending",
             Self::HumanInControl { .. } => "human_in_control",
@@ -226,6 +236,9 @@ impl BrowserError {
             }
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
+            }
+            Self::SeverityBelowFloor { .. } => {
+                "resubmit with detail.required as the severity; a grant must cover that severity for this target"
             }
             Self::NoSession => "call browser.launch, then retry the browser action",
             Self::BrowserLaunchPending => {
@@ -313,9 +326,28 @@ impl BrowserError {
                 "attempted_origin":attempted_origin,
                 "granted_origins":granted_origins,
             }),
-            Self::HazardNotDisclosed { missing } => {
-                json!({"reason":"hazard_not_disclosed","missing_hazard":missing.as_str()})
-            }
+            Self::HazardNotDisclosed {
+                missing,
+                classification_unavailable,
+            } => with_classification_unavailable(
+                json!({"reason":"hazard_not_disclosed","missing_hazard":missing.as_str()}),
+                classification_unavailable.as_ref(),
+            ),
+            Self::SeverityBelowFloor {
+                required,
+                classification_unavailable,
+            } => with_classification_unavailable(
+                json!({
+                    "field":"severity",
+                    "reason_code":"severity_below_floor",
+                    "required":{
+                        "tier":required.tier,
+                        "credential":required.credential,
+                        "financial":required.financial,
+                    },
+                }),
+                classification_unavailable.as_ref(),
+            ),
             Self::NotSettled {
                 url_final,
                 lifecycle,
@@ -342,6 +374,26 @@ impl BrowserError {
             Self::BrowserCrashed => json!({"reason_code":"browser_crashed"}),
         })
     }
+}
+
+/// Name the reason a click target was unclassified beside the refusal it
+/// caused, so a caller can tell a page this module could not read from a form
+/// it actually found.
+fn with_classification_unavailable(
+    mut detail: Value,
+    reason: Option<&ClassificationUnavailable>,
+) -> Value {
+    if let (Some(reason), Some(object)) = (reason, detail.as_object_mut()) {
+        object.insert(
+            "classification_unavailable".into(),
+            Value::from(reason.reason_code()),
+        );
+        object.insert(
+            "classification_unavailable_facts".into(),
+            Value::Object(reason.facts()),
+        );
+    }
+    detail
 }
 
 fn browser_click_result(outcome: crate::browser_session::BrowserClickOutcome) -> Value {
@@ -2256,13 +2308,10 @@ impl BrowserPlane {
             });
         }
         bounded_string(object, "intent", 0, 512)?;
+        // The floor is enforced by authorization below, which is also where the
+        // target's required severity is computed; refusing there lets the
+        // refusal carry that exact value instead of a second estimate.
         let requested_severity = parse_severity(object)?;
-        if requested_severity.tier < 2 {
-            return Err(BrowserError::InvalidRequest {
-                field: "severity".into(),
-                reason_code: "severity_below_floor",
-            });
-        }
         let (backend_identity, classification, document_epoch, source_origin) = {
             let mut state = self.state.lock().await;
             let context = state
@@ -2292,7 +2341,7 @@ impl BrowserPlane {
             };
             (
                 backend_identity,
-                record.classification.as_deref().cloned(),
+                record.classification.clone().map(|record| *record),
                 snapshot.document_epoch,
                 snapshot.source_origin.clone(),
             )
@@ -2302,22 +2351,23 @@ impl BrowserPlane {
             .session_gate
             .as_ref()
             .map(|(_, _, deadline_ms)| *deadline_ms);
-        // Snapshot capture stores either validated form facts or `None` when the
-        // DOM could not be classified. Authorization treats `None` as the distinct
-        // unverified-form hazard. Before mouse input, `click_classified` recomputes
-        // the record and refuses if it differs from this snapshot-time value.
+        // Snapshot capture stores either validated form facts or the named
+        // reason the DOM could not be classified. Authorization treats any such
+        // reason as the distinct unverified-form hazard, and the refusal names
+        // it. Before mouse input, `click_classified` recomputes the record and
+        // refuses if it differs from this snapshot-time value.
 
         let authorization = {
             let grants = self.grants.lock().await;
             let request = match classification.as_ref() {
-                Some(classification) => AuthorizationRequest::click(
+                Ok(classification) => AuthorizationRequest::click(
                     &identity.conversation_key,
                     requested_severity,
                     snapshot_id,
                     &identity.agent_project_id,
                     classification,
                 ),
-                None => AuthorizationRequest::click_unverified(
+                Err(_) => AuthorizationRequest::click_unverified(
                     &identity.conversation_key,
                     requested_severity,
                     snapshot_id,
@@ -2334,7 +2384,22 @@ impl BrowserPlane {
         };
         if let Err(error) = authorization {
             self.unpin_snapshot(identity, snapshot_id).await;
-            return Err(map_authorization_error(error));
+            let mut error = map_authorization_error(error);
+            if let (
+                BrowserError::HazardNotDisclosed {
+                    classification_unavailable,
+                    ..
+                }
+                | BrowserError::SeverityBelowFloor {
+                    classification_unavailable,
+                    ..
+                },
+                Err(reason),
+            ) = (&mut error, &classification)
+            {
+                *classification_unavailable = Some(reason.clone());
+            }
+            return Err(error);
         }
 
         let reservation = self.reserve(identity, BrowserCapability::Click).await;
@@ -2370,7 +2435,7 @@ impl BrowserPlane {
         };
         let state = Arc::clone(&self.state);
         let route_key = identity.conversation_key.clone();
-        let expected_classification = classification;
+        let expected_classification = classification.ok();
         let origin = source_origin;
         let driven = tokio::task::spawn_blocking(move || {
             let mut input_dispatched = |event| {
@@ -2611,13 +2676,9 @@ impl BrowserPlane {
         let addressed_width = required_signed_integer(object, "image_width_px")?;
         let addressed_height = required_signed_integer(object, "image_height_px")?;
         bounded_string(object, "intent", 0, 512)?;
+        // As in `click`: authorization enforces the floor and reports the
+        // severity it computed for this action.
         let requested_severity = parse_severity(object)?;
-        if requested_severity.tier < 2 {
-            return Err(BrowserError::InvalidRequest {
-                field: "severity".into(),
-                reason_code: "severity_below_floor",
-            });
-        }
         let (position, source_origin) = {
             let mut state = self.state.lock().await;
             let context = state
@@ -3182,6 +3243,17 @@ fn refusal_detail_schema() -> Value {
             "bytes":integer_schema(),
             "bound_bytes":integer_schema(),
             "missing_hazard":string_schema(),
+            "required":closed_object(json!({"tier":integer_schema(),"credential":boolean_schema(),"financial":boolean_schema()}), &["tier", "credential", "financial"]),
+            "classification_unavailable":string_schema(),
+            "classification_unavailable_facts":closed_object(json!({
+                "index":integer_schema(),
+                "field":string_schema(),
+                "node_id":integer_schema(),
+                "backend_node_id":integer_schema(),
+                "length":integer_schema(),
+                "position":integer_schema(),
+                "classifier_error":string_schema(),
+            }), &[]),
             "url_final":nullable_string_schema(),
             "lifecycle":string_array_schema(),
             "inflight_count":integer_schema(),
@@ -4047,12 +4119,15 @@ fn map_authorization_error(error: crate::authorization::AuthorizationError) -> B
             granted_origins,
         },
         crate::authorization::AuthorizationError::HazardNotDisclosed(missing) => {
-            BrowserError::HazardNotDisclosed { missing }
+            BrowserError::HazardNotDisclosed {
+                missing,
+                classification_unavailable: None,
+            }
         }
-        crate::authorization::AuthorizationError::SeverityBelowFloor => {
-            BrowserError::InvalidRequest {
-                field: "severity".into(),
-                reason_code: "severity_below_floor",
+        crate::authorization::AuthorizationError::SeverityBelowFloor { required } => {
+            BrowserError::SeverityBelowFloor {
+                required,
+                classification_unavailable: None,
             }
         }
         crate::authorization::AuthorizationError::SeverityUnclassifiable => {
@@ -4082,7 +4157,9 @@ fn origin_from_url(url: &str) -> String {
 }
 fn journal_outcome(error: &BrowserError) -> Outcome {
     match error {
-        BrowserError::InvalidRequest { .. } => Outcome::InvalidRequest,
+        BrowserError::InvalidRequest { .. } | BrowserError::SeverityBelowFloor { .. } => {
+            Outcome::InvalidRequest
+        }
         BrowserError::AuthorizationDenied { .. }
         | BrowserError::AuthorizationOriginScope { .. }
         | BrowserError::HazardNotDisclosed { .. } => Outcome::Denied,
@@ -4318,6 +4395,7 @@ mod tests {
                 &identity,
                 Err(BrowserError::HazardNotDisclosed {
                     missing: HazardClass::CredentialFormSubmit,
+                    classification_unavailable: None,
                 }),
             )
             .await;
@@ -4445,9 +4523,19 @@ mod tests {
                 "hazard_not_disclosed",
                 BrowserError::HazardNotDisclosed {
                     missing: HazardClass::CredentialFormSubmit,
+                    classification_unavailable: None,
                 },
                 "hazard_not_disclosed",
                 "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
+            ),
+            (
+                "severity_below_floor",
+                BrowserError::SeverityBelowFloor {
+                    required: Severity::new(2, false, false),
+                    classification_unavailable: None,
+                },
+                "invalid_request",
+                "resubmit with detail.required as the severity; a grant must cover that severity for this target",
             ),
             (
                 "navigation_policy_rejected",

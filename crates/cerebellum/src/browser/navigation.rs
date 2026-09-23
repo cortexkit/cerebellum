@@ -14,8 +14,8 @@ use crate::browser_session::{
 };
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
 use crate::classification::{
-    self, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
-    NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
+    self, AssociatedFormControlInput, ClassificationUnavailable, ElementClassificationInput,
+    NodeIdentityInput, NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
 };
 use crate::coordinate::{InputRect, TransformInputs, ViewportObservation};
 use crate::snapshot_store::{
@@ -398,7 +398,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             reference
                 .classification
                 .as_deref()
-                .is_some_and(NonTypeClassificationRecord::is_credential_field)
+                .is_ok_and(NonTypeClassificationRecord::is_credential_field)
         }))
     }
 
@@ -554,10 +554,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         context_key: &str,
         identity: &BackendNodeIdentity,
         document_epoch: u64,
-        current_origin: &str,
+        document_url: &str,
         deadline_ms: u64,
         clock: &mut C,
-    ) -> Result<Option<NonTypeClassificationRecord>, NavigationDriveError> {
+    ) -> Result<Result<NonTypeClassificationRecord, ClassificationUnavailable>, NavigationDriveError>
+    {
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
@@ -567,21 +568,25 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             context_key,
             identity,
             document_epoch,
-            current_origin,
+            document_url,
             deadline,
             clock,
         )
     }
 
+    /// Classify one click target. The outer error is a transport failure that
+    /// ends the action; the inner one is a named reason the target could not be
+    /// classified, which authorization treats as the strongest hazard.
     fn classify_click_before<C: NavigationClock>(
         &mut self,
         context_key: &str,
         identity: &BackendNodeIdentity,
         document_epoch: u64,
-        current_origin: &str,
+        document_url: &str,
         deadline: Instant,
         clock: &mut C,
-    ) -> Result<Option<NonTypeClassificationRecord>, NavigationDriveError> {
+    ) -> Result<Result<NonTypeClassificationRecord, ClassificationUnavailable>, NavigationDriveError>
+    {
         let attachment = self
             .attachment
             .clone()
@@ -589,18 +594,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 attachment.context_key == context_key && attachment.target_id == identity.target_id
             })
             .ok_or(NavigationDriveError::CdpFailure)?;
-        if identity.frame_id.is_empty() || current_origin.is_empty() {
-            return Ok(None);
-        }
-        let Some(nodes) = self.flattened_dom_nodes_before(&attachment, deadline, clock)? else {
-            return Ok(None);
+        let current_origin = match document_origin(document_url) {
+            Ok(origin) => origin,
+            Err(reason) => return Ok(Err(reason)),
         };
-        Ok(build_non_type_classification(
-            &nodes,
-            identity,
-            document_epoch,
-            current_origin,
-        ))
+        let nodes = self.flattened_dom_nodes_before(&attachment, deadline, clock)?;
+        Ok(nodes.and_then(|nodes| {
+            build_non_type_classification(&nodes, identity, document_epoch, &current_origin)
+        }))
     }
 
     fn flattened_dom_nodes_before<C: NavigationClock>(
@@ -608,7 +609,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         attachment: &AttachedTarget,
         deadline: Instant,
         clock: &mut C,
-    ) -> Result<Option<Vec<RawDomNode>>, NavigationDriveError> {
+    ) -> Result<Result<Vec<RawDomNode>, ClassificationUnavailable>, NavigationDriveError> {
         let enabled = self.command_response(
             "DOM.enable",
             None,
@@ -619,7 +620,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             clock,
         )?;
         if enabled.error.is_some() || enabled.result.is_none() {
-            return Ok(None);
+            return Ok(Err(ClassificationUnavailable::DomEnableRefused));
         }
         let mut params = Map::new();
         params.insert("depth".into(), Value::Number((-1).into()));
@@ -634,9 +635,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             clock,
         )?;
         if response.error.is_some() {
-            return Ok(None);
+            return Ok(Err(ClassificationUnavailable::FlattenedDocumentRefused));
         }
-        Ok(response.result.as_ref().and_then(parse_flattened_dom_nodes))
+        Ok(response
+            .result
+            .as_ref()
+            .ok_or(ClassificationUnavailable::FlattenedNodesMissing)
+            .and_then(parse_flattened_dom_nodes))
     }
 
     fn click_with_clock<C: NavigationClock>(
@@ -801,7 +806,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     clock,
                 )
                 .map_err(ClickDriveError::Navigation)?;
-            if actual.as_ref() != expected {
+            // Any unavailable classification matches an unavailable snapshot:
+            // both were authorized as the strongest hazard, so a different
+            // reason for the same unknown does not change what was approved.
+            if actual.as_ref().ok() != expected {
                 return Err(ClickDriveError::ClassificationChanged);
             }
         }
@@ -1201,24 +1209,27 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             },
         )?;
 
-        if let Some((document_epoch, current_origin)) = classification_context {
-            if let Some(nodes) = self
-                .flattened_dom_nodes_before(&attachment, deadline, clock)
-                .ok()
-                .flatten()
-            {
-                for reference in &mut observation.refs {
-                    reference.classification =
-                        reference.backend_identity.as_ref().and_then(|identity| {
-                            build_non_type_classification(
-                                &nodes,
-                                identity,
-                                document_epoch,
-                                current_origin,
-                            )
-                            .map(Box::new)
-                        });
+        if let Some((document_epoch, document_url)) = classification_context {
+            // One DOM read serves every ref. A failure here leaves each ref
+            // with the same named reason rather than failing the snapshot:
+            // the refs are still observable, only their form facts are not.
+            let projection = document_origin(document_url).and_then(|origin| {
+                match self.flattened_dom_nodes_before(&attachment, deadline, clock) {
+                    Ok(nodes) => nodes.map(|nodes| (origin, nodes)),
+                    Err(_) => Err(ClassificationUnavailable::DomReadFailed),
                 }
+            });
+            for reference in &mut observation.refs {
+                let Some(identity) = reference.backend_identity.as_ref() else {
+                    continue;
+                };
+                reference.classification = match &projection {
+                    Ok((origin, nodes)) => {
+                        build_non_type_classification(nodes, identity, document_epoch, origin)
+                            .map(Box::new)
+                    }
+                    Err(reason) => Err(reason.clone()),
+                };
             }
         }
 
@@ -1764,34 +1775,67 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     }
 }
 
-fn parse_flattened_dom_nodes(result: &Map<String, Value>) -> Option<Vec<RawDomNode>> {
-    let values = result.get("nodes")?.as_array()?;
+fn parse_flattened_dom_nodes(
+    result: &Map<String, Value>,
+) -> Result<Vec<RawDomNode>, ClassificationUnavailable> {
+    let values = result
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or(ClassificationUnavailable::FlattenedNodesMissing)?;
     let mut nodes = Vec::with_capacity(values.len());
-    for value in values {
-        let object = value.as_object()?;
-        if object.get("nodeType")?.as_u64()? != 1 {
+    for (index, value) in values.iter().enumerate() {
+        let field_invalid = |field| ClassificationUnavailable::NodeFieldInvalid { index, field };
+        let object = value
+            .as_object()
+            .ok_or(ClassificationUnavailable::NodeNotObject { index })?;
+        if object
+            .get("nodeType")
+            .and_then(Value::as_u64)
+            .ok_or(field_invalid("nodeType"))?
+            != 1
+        {
             continue;
         }
-        let node_id = object.get("nodeId")?.as_u64().filter(|id| *id > 0)?;
-        let backend_node_id = object.get("backendNodeId")?.as_u64().filter(|id| *id > 0)?;
+        let node_id = object
+            .get("nodeId")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(field_invalid("nodeId"))?;
+        let backend_node_id = object
+            .get("backendNodeId")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(field_invalid("backendNodeId"))?;
         let local_name = object
             .get("localName")
             .and_then(Value::as_str)
-            .or_else(|| object.get("nodeName").and_then(Value::as_str))?
+            .or_else(|| object.get("nodeName").and_then(Value::as_str))
+            .ok_or(field_invalid("localName"))?
             .to_ascii_lowercase();
         // DOM.getFlattenedDocument supplies the complete attribute array for
         // element nodes. Missing it makes security-relevant facts unavailable,
         // so the entire projection becomes an unknown classification.
-        let attribute_values = object.get("attributes")?.as_array()?.clone();
+        let attribute_values = object
+            .get("attributes")
+            .and_then(Value::as_array)
+            .ok_or(ClassificationUnavailable::AttributesMissing { node_id })?;
         if attribute_values.len() % 2 != 0 {
-            return None;
+            return Err(ClassificationUnavailable::AttributesOddLength {
+                node_id,
+                length: attribute_values.len(),
+            });
         }
+        let attribute_text = |position: usize| {
+            attribute_values[position]
+                .as_str()
+                .ok_or(ClassificationUnavailable::AttributeNotString { node_id, position })
+        };
         let mut attributes = HashMap::new();
-        for pair in attribute_values.as_chunks::<2>().0 {
-            let name = pair[0].as_str()?.to_ascii_lowercase();
-            let value = pair[1].as_str()?.to_string();
+        for pair in 0..attribute_values.len() / 2 {
+            let name = attribute_text(pair * 2)?.to_ascii_lowercase();
+            let value = attribute_text(pair * 2 + 1)?.to_string();
             if attributes.insert(name, value).is_some() {
-                return None;
+                return Err(ClassificationUnavailable::DuplicateAttribute { node_id });
             }
         }
         let assigned_slot_backend_node_id = object
@@ -1812,7 +1856,37 @@ fn parse_flattened_dom_nodes(result: &Map<String, Value>) -> Option<Vec<RawDomNo
             assigned_slot_backend_node_id,
         });
     }
-    Some(nodes)
+    Ok(nodes)
+}
+
+/// The origin the classifier compares activation destinations against.
+///
+/// Callers hold the document's URL (`https://example.com/`), and the
+/// classifier accepts only a bare origin (`https://example.com`). Passing the
+/// URL through made every classification on a page with a path fail as an
+/// invalid origin, which authorization then read as an unverified form.
+fn document_origin(document_url: &str) -> Result<String, ClassificationUnavailable> {
+    classification::canonical_origin_from_url(document_url)
+        .or_else(|| classification::canonical_origin(document_url))
+        .ok_or(ClassificationUnavailable::DocumentOriginUnavailable)
+}
+
+/// Classify one element of a document captured with
+/// `DOM.getFlattenedDocument {depth: -1, pierce: true}`, exactly as the
+/// snapshot path does. `document_url` is the page's URL as the browser
+/// reports it; `result` is the command's `result` object.
+///
+/// Public so a host-browser probe can run the production classification over
+/// a live capture without driving a whole browser session.
+pub fn classify_flattened_document(
+    result: &Map<String, Value>,
+    target: &BackendNodeIdentity,
+    document_epoch: u64,
+    document_url: &str,
+) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
+    let origin = document_origin(document_url)?;
+    let nodes = parse_flattened_dom_nodes(result)?;
+    build_non_type_classification(&nodes, target, document_epoch, &origin)
 }
 
 fn build_non_type_classification(
@@ -1820,21 +1894,26 @@ fn build_non_type_classification(
     target_identity: &BackendNodeIdentity,
     document_epoch: u64,
     current_origin: &str,
-) -> Option<NonTypeClassificationRecord> {
-    let by_node_id = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| (node.node_id, index))
-        .collect::<HashMap<_, _>>();
-    let by_backend_id = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| (node.backend_node_id, index))
-        .collect::<HashMap<_, _>>();
-    if by_node_id.len() != nodes.len() || by_backend_id.len() != nodes.len() {
-        return None;
+) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
+    let mut by_node_id = HashMap::with_capacity(nodes.len());
+    let mut by_backend_id = HashMap::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        if by_node_id.insert(node.node_id, index).is_some() {
+            return Err(ClassificationUnavailable::DuplicateNodeId {
+                node_id: node.node_id,
+            });
+        }
+        if by_backend_id.insert(node.backend_node_id, index).is_some() {
+            return Err(ClassificationUnavailable::DuplicateBackendNodeId {
+                backend_node_id: node.backend_node_id,
+            });
+        }
     }
-    let target_index = *by_backend_id.get(&target_identity.backend_node_id)?;
+    let target_index = *by_backend_id.get(&target_identity.backend_node_id).ok_or(
+        ClassificationUnavailable::TargetNotInDocument {
+            backend_node_id: target_identity.backend_node_id,
+        },
+    )?;
     let context = DomClassificationContext {
         nodes,
         by_node_id: &by_node_id,
@@ -1843,20 +1922,20 @@ fn build_non_type_classification(
         frame_id: &target_identity.frame_id,
         current_origin,
     };
-    let target = context.element(target_index, true)?;
+    let target = context.element(target_index, true);
     let mut input = NonTypeClassificationInput::new(document_epoch, target, current_origin);
     let mut current = target_index;
     let mut visited = HashSet::from([current]);
     while let Some(parent) = context.composed_parent(current) {
         if !visited.insert(parent) {
-            return None;
+            return Err(ClassificationUnavailable::ComposedParentCycle {
+                node_id: nodes[parent].node_id,
+            });
         }
-        input
-            .composed_ancestors
-            .push(context.element(parent, true)?);
+        input.composed_ancestors.push(context.element(parent, true));
         current = parent;
     }
-    classification::classify_click(&input).ok()
+    classification::classify_click(&input).map_err(ClassificationUnavailable::ClassifierRejected)
 }
 
 struct DomClassificationContext<'a> {
@@ -1943,12 +2022,10 @@ impl DomClassificationContext<'_> {
         false
     }
 
-    fn element(
-        &self,
-        index: usize,
-        include_label_control: bool,
-    ) -> Option<ElementClassificationInput> {
-        let node = self.nodes.get(index)?;
+    /// Every index reaching here came from `by_node_id` / `by_backend_id`,
+    /// which were built from `nodes` itself, so indexing cannot miss.
+    fn element(&self, index: usize, include_label_control: bool) -> ElementClassificationInput {
+        let node = &self.nodes[index];
         let kind = target_kind(&node.local_name);
         let mut element = ElementClassificationInput::new(self.identity(index), kind)
             .disabled(node.attributes.contains_key("disabled"));
@@ -1995,12 +2072,12 @@ impl DomClassificationContext<'_> {
         }
         if node.local_name == "label" && include_label_control {
             if let Some(control) = self.label_control(index) {
-                element = element.label_for(self.element(control, false)?);
+                element = element.label_for(self.element(control, false));
             } else {
                 element.is_label = true;
             }
         }
-        Some(element)
+        element
     }
 
     fn activation_destination(&self, index: usize) -> Option<String> {
@@ -2317,7 +2394,7 @@ where
                         backend_identity: Some(backend_identity),
                         raw_role: Some(role.clone()),
                         raw_name: Some(name.clone()),
-                        classification: None,
+                        classification: Err(ClassificationUnavailable::NotCaptured),
                     });
                     *nth = nth.saturating_add(1);
                     reference = Some(ref_name);
@@ -2958,7 +3035,547 @@ mod tests {
             "nodeName": "BUTTON",
             "localName": "button"
         }]});
-        assert!(parse_flattened_dom_nodes(result.as_object().unwrap()).is_none());
+        assert_eq!(
+            parse_flattened_dom_nodes(result.as_object().unwrap()),
+            Err(ClassificationUnavailable::AttributesMissing { node_id: 1 })
+        );
+    }
+
+    /// A page URL with a path: the shape a session's navigation tracker
+    /// records and the snapshot path hands to classification. Fixtures that
+    /// passed a bare origin here are how a URL-shaped input went unnoticed.
+    const PAGE_URL: &str = "https://login.example/account";
+
+    /// `DOM.getFlattenedDocument` of a loopback page holding a same-origin
+    /// link, a cross-origin link, a relative link, a plain button and a login
+    /// form, captured from headless Chrome by `examples/classify_live.rs`.
+    const LOOPBACK_CAPTURE: &str = include_str!("fixtures/loopback_flattened_document.json");
+
+    /// Drive the production snapshot path over an AX tree of a root (backend
+    /// 10) and one button (backend 60, ref `e2`) in `frame-main`, answering the
+    /// DOM reads with `dom_frames`.
+    fn snapshot_refs(dom_frames: Vec<Value>, context: Option<(u64, &str)>) -> Vec<RefRecord> {
+        let mut frames = vec![
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Login", &["button"], 10, Some("frame-main"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
+                ax_node("button","button","Sign in", &[], 60, None),
+            ]}}),
+        ];
+        frames.extend(dom_frames);
+        let mut driver = attached_driver(frames);
+        driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Ax,
+                1_000,
+                context,
+                &mut FakeClock::new(),
+            )
+            .expect("the AX tree is coherent")
+            .refs
+    }
+
+    fn dom_enabled() -> Value {
+        json!({"id":4,"sessionId":"session-own","result":{}})
+    }
+
+    fn dom_frames(nodes: Value) -> Vec<Value> {
+        vec![
+            dom_enabled(),
+            json!({"id":5,"sessionId":"session-own","result":{"nodes":nodes}}),
+        ]
+    }
+
+    /// Retain `refs` on a plane that withholds any reply its schema does not
+    /// declare, then click ref `e2` through the serving boundary. The grant
+    /// covers the page at tier 4 and discloses no hazard.
+    async fn click_reply(refs: Vec<RefRecord>, severity: Value) -> Value {
+        let route = cerebellum_core::identity::RouteIdentity::from_bind(
+            &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
+            &Some(subc_protocol::Principal::Direct),
+        );
+        let grants =
+            crate::authorization::GrantStore::new([crate::authorization::ActionGrant::new(
+                "classification-test-grant",
+                1,
+                route.conversation_key.clone(),
+                crate::authorization::Severity::new(4, false, false),
+                ["https://login.example"],
+            )]);
+        let plane = crate::browser::BrowserPlane::with_grants(grants)
+            .with_result_schema_enforcement(
+                crate::computer_capability::ResultSchemaEnforcement::Withhold,
+            );
+        plane.open_context(route.clone()).await.unwrap();
+        plane
+            .same_document_url(
+                &route,
+                PAGE_URL,
+                crate::snapshot_store::SameDocumentChange::ReplaceState,
+            )
+            .await
+            .unwrap();
+        let retained = plane
+            .retain_text_snapshot(&route, SnapshotKind::Ax, &[], None, refs, 4096)
+            .await
+            .unwrap();
+        plane
+            .serve(
+                &route,
+                crate::browser::BrowserCapability::Click,
+                &json!({
+                    "ref": "e2",
+                    "snapshot_id": retained["snapshot_id"],
+                    "intent": "press the target",
+                    "severity": severity,
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the click reply broke its declared schema: {error:?}"))
+    }
+
+    #[tokio::test]
+    async fn each_unavailable_classification_names_its_cause_on_the_click_refusal() {
+        use ClassificationUnavailable as Unavailable;
+
+        let html = flattened_dom_node(1, None, 10, "html", &[]);
+        let button = flattened_dom_node(2, Some(1), 60, "button", &["type", "submit"]);
+        let button_with = |attributes: Value| {
+            let mut node = button.clone();
+            node["attributes"] = attributes;
+            node
+        };
+        let button_without = |fields: &[&str]| {
+            let mut node = button.clone();
+            for field in fields {
+                node.as_object_mut().unwrap().remove(*field);
+            }
+            node
+        };
+        let refused = |id: u64| json!({"id":id,"sessionId":"session-own","error":{"code":-32000,"message":"refused"}});
+        let page = Some((7, PAGE_URL));
+
+        // Each fixture breaks exactly one step, and the expected facts are
+        // written out rather than derived, so a neighbouring variant, a
+        // generic reason, or no reason at all each fail a different case.
+        let cases: Vec<(Vec<Value>, Option<(u64, &str)>, Unavailable, Value)> = vec![
+            (vec![], None, Unavailable::NotCaptured, json!({})),
+            (
+                vec![],
+                Some((7, "about:blank")),
+                Unavailable::DocumentOriginUnavailable,
+                json!({}),
+            ),
+            (
+                vec![refused(4)],
+                page,
+                Unavailable::DomEnableRefused,
+                json!({}),
+            ),
+            (
+                vec![dom_enabled(), refused(5)],
+                page,
+                Unavailable::FlattenedDocumentRefused,
+                json!({}),
+            ),
+            // No answer to getFlattenedDocument: the read runs out of time.
+            (
+                vec![dom_enabled()],
+                page,
+                Unavailable::DomReadFailed,
+                json!({}),
+            ),
+            (
+                vec![
+                    dom_enabled(),
+                    json!({"id":5,"sessionId":"session-own","result":{}}),
+                ],
+                page,
+                Unavailable::FlattenedNodesMissing,
+                json!({}),
+            ),
+            (
+                dom_frames(json!([html.clone(), 5])),
+                page,
+                Unavailable::NodeNotObject { index: 1 },
+                json!({"index":1}),
+            ),
+            (
+                dom_frames(json!([html.clone(), button_without(&["nodeType"])])),
+                page,
+                Unavailable::NodeFieldInvalid {
+                    index: 1,
+                    field: "nodeType",
+                },
+                json!({"index":1,"field":"nodeType"}),
+            ),
+            (
+                dom_frames(json!([html.clone(), button_without(&["nodeId"])])),
+                page,
+                Unavailable::NodeFieldInvalid {
+                    index: 1,
+                    field: "nodeId",
+                },
+                json!({"index":1,"field":"nodeId"}),
+            ),
+            (
+                dom_frames(json!([html.clone(), button_without(&["backendNodeId"])])),
+                page,
+                Unavailable::NodeFieldInvalid {
+                    index: 1,
+                    field: "backendNodeId",
+                },
+                json!({"index":1,"field":"backendNodeId"}),
+            ),
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    button_without(&["localName", "nodeName"])
+                ])),
+                page,
+                Unavailable::NodeFieldInvalid {
+                    index: 1,
+                    field: "localName",
+                },
+                json!({"index":1,"field":"localName"}),
+            ),
+            (
+                dom_frames(json!([html.clone(), button_without(&["attributes"])])),
+                page,
+                Unavailable::AttributesMissing { node_id: 2 },
+                json!({"node_id":2}),
+            ),
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    button_with(json!(["type", "submit", "disabled"]))
+                ])),
+                page,
+                Unavailable::AttributesOddLength {
+                    node_id: 2,
+                    length: 3,
+                },
+                json!({"node_id":2,"length":3}),
+            ),
+            (
+                dom_frames(json!([html.clone(), button_with(json!(["type", 5]))])),
+                page,
+                Unavailable::AttributeNotString {
+                    node_id: 2,
+                    position: 1,
+                },
+                json!({"node_id":2,"position":1}),
+            ),
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    button_with(json!(["type", "submit", "TYPE", "button"]))
+                ])),
+                page,
+                Unavailable::DuplicateAttribute { node_id: 2 },
+                json!({"node_id":2}),
+            ),
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    button.clone(),
+                    flattened_dom_node(2, Some(1), 70, "span", &[]),
+                ])),
+                page,
+                Unavailable::DuplicateNodeId { node_id: 2 },
+                json!({"node_id":2}),
+            ),
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    button.clone(),
+                    flattened_dom_node(3, Some(1), 60, "span", &[]),
+                ])),
+                page,
+                Unavailable::DuplicateBackendNodeId {
+                    backend_node_id: 60,
+                },
+                json!({"backend_node_id":60}),
+            ),
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    flattened_dom_node(2, Some(1), 70, "button", &[]),
+                ])),
+                page,
+                Unavailable::TargetNotInDocument {
+                    backend_node_id: 60,
+                },
+                json!({"backend_node_id":60}),
+            ),
+            // The root names the button as its parent, so walking up from the
+            // button comes back to it.
+            (
+                dom_frames(json!([
+                    flattened_dom_node(1, Some(2), 10, "html", &[]),
+                    button.clone(),
+                ])),
+                page,
+                Unavailable::ComposedParentCycle { node_id: 2 },
+                json!({"node_id":2}),
+            ),
+            // A complete projection whose link has no host: the classifier
+            // itself refuses the destination.
+            (
+                dom_frames(json!([
+                    html.clone(),
+                    flattened_dom_node(2, Some(1), 60, "a", &["href", "https://"]),
+                ])),
+                page,
+                Unavailable::ClassifierRejected(
+                    classification::ClassificationError::InvalidDestination,
+                ),
+                json!({"classifier_error":"invalid_destination"}),
+            ),
+        ];
+
+        for (dom, context, expected, expected_facts) in cases {
+            let code = expected.reason_code();
+            let refs = snapshot_refs(dom, context);
+            assert_eq!(
+                refs[1].classification,
+                Err(expected.clone()),
+                "snapshot classification for the {code} fixture"
+            );
+
+            let reply = click_reply(
+                refs,
+                json!({"tier": 2, "credential": false, "financial": false}),
+            )
+            .await;
+            assert_eq!(reply["outcome"], "hazard_not_disclosed", "{code}: {reply}");
+            assert_eq!(
+                reply["detail"]["missing_hazard"], "unverified_form_contents",
+                "{code}: {reply}"
+            );
+            assert_eq!(
+                reply["detail"]["classification_unavailable"], code,
+                "{code}: {reply}"
+            );
+            assert_eq!(
+                reply["detail"]["classification_unavailable_facts"], expected_facts,
+                "{code}: {reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_captured_loopback_page_classifies_links_and_buttons_and_keeps_the_login_hazard() {
+        use crate::authorization::{
+            computed_required_severity, target_hazards, Action, HazardClass, Severity,
+        };
+
+        let capture: Value = serde_json::from_str(LOOPBACK_CAPTURE).unwrap();
+        let document_url = capture["document_url"].as_str().unwrap();
+        // The capture keeps the URL the browser reported, path included, which
+        // is the shape that used to make every target unclassifiable.
+        assert_ne!(
+            classification::canonical_origin(document_url).as_deref(),
+            Some(document_url),
+            "the fixture must hold a URL, not a bare origin: {document_url}"
+        );
+        let result = capture["result"].as_object().unwrap();
+        let classify = |element_id: &str| {
+            let backend_node_id = result["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| {
+                    node["attributes"].as_array().is_some_and(|attributes| {
+                        attributes
+                            .chunks(2)
+                            .any(|pair| pair[0] == "id" && pair[1] == element_id)
+                    })
+                })
+                .and_then(|node| node["backendNodeId"].as_u64())
+                .unwrap_or_else(|| panic!("#{element_id} is in the capture"));
+            let identity = BackendNodeIdentity::new(
+                capture["target_id"].as_str().unwrap(),
+                capture["frame_id"].as_str().unwrap(),
+                backend_node_id,
+            )
+            .unwrap();
+            classify_flattened_document(result, &identity, 1, document_url)
+                .unwrap_or_else(|reason| panic!("#{element_id} did not classify: {reason}"))
+        };
+        let required = |record: &NonTypeClassificationRecord| {
+            computed_required_severity(Action::Click, Some(record))
+                .unwrap()
+                .0
+        };
+        let hazards = |record: &NonTypeClassificationRecord| {
+            target_hazards(Action::Click, Some(record)).unwrap()
+        };
+
+        for element_id in ["same", "relative", "plain"] {
+            let record = classify(element_id);
+            assert!(hazards(&record).is_empty(), "#{element_id}: {record:?}");
+            assert_eq!(
+                required(&record),
+                Severity::new(2, false, false),
+                "#{element_id}"
+            );
+        }
+
+        // A classified cross-origin link still requires tier 4, because
+        // activating it leaves the origin the grant was asked for.
+        let cross = classify("cross");
+        assert!(hazards(&cross).is_empty(), "{cross:?}");
+        assert_eq!(
+            cross.activation_destination_origin.as_deref(),
+            Some("https://cross-origin.invalid")
+        );
+        assert_eq!(required(&cross), Severity::new(4, false, false));
+
+        let submit = classify("submit");
+        assert!(submit.activation_invokes_form_submit);
+        assert_eq!(
+            hazards(&submit),
+            BTreeSet::from([HazardClass::CredentialFormSubmit])
+        );
+        assert_eq!(required(&submit), Severity::new(4, true, false));
+    }
+
+    #[tokio::test]
+    async fn a_click_below_the_floor_reports_the_severity_authorization_computed() {
+        let html = flattened_dom_node(1, None, 10, "html", &[]);
+        let below_floor = json!({"tier": 1, "credential": false, "financial": false});
+
+        // A classified cross-origin link: its computed requirement (tier 4)
+        // differs from both the floor (2) and the unclassified maximum, so
+        // only the value authorization computed matches.
+        let refs = snapshot_refs(
+            dom_frames(json!([
+                html,
+                flattened_dom_node(
+                    2,
+                    Some(1),
+                    60,
+                    "a",
+                    &["href", "https://elsewhere.example/x"]
+                ),
+            ])),
+            Some((7, PAGE_URL)),
+        );
+        let record = *refs[1].classification.clone().expect("the link classifies");
+        let (computed, _) = crate::authorization::computed_required_severity(
+            crate::authorization::Action::Click,
+            Some(&record),
+        )
+        .unwrap();
+        assert_eq!(
+            computed,
+            crate::authorization::Severity::new(4, false, false)
+        );
+        let reply = click_reply(refs.clone(), below_floor.clone()).await;
+        assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+        assert_eq!(
+            reply["detail"]["reason_code"], "severity_below_floor",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["detail"]["required"],
+            json!({"tier": computed.tier, "credential": computed.credential, "financial": computed.financial}),
+            "{reply}"
+        );
+        assert!(
+            reply["detail"].get("classification_unavailable").is_none(),
+            "{reply}"
+        );
+
+        // The same link at the floor passes authorization and stops only for
+        // want of a browser session: an ordinary link is no longer refused as
+        // an unverified form.
+        let reply = click_reply(
+            refs,
+            json!({"tier": 2, "credential": false, "financial": false}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "no_session", "{reply}");
+
+        // An unclassified target computes the strongest requirement, and the
+        // refusal names why it was unclassified.
+        let refs = snapshot_refs(vec![], Some((7, "about:blank")));
+        let reply = click_reply(refs, below_floor).await;
+        assert_eq!(
+            reply["detail"]["reason_code"], "severity_below_floor",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["detail"]["required"],
+            json!({"tier": 4, "credential": true, "financial": true}),
+            "{reply}"
+        );
+        assert_eq!(
+            reply["detail"]["classification_unavailable"], "document_origin_unavailable",
+            "{reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_point_click_below_the_floor_reports_the_severity_authorization_computed() {
+        let route = cerebellum_core::identity::RouteIdentity::from_bind(
+            &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
+            &Some(subc_protocol::Principal::Direct),
+        );
+        let plane = crate::browser::BrowserPlane::new().with_result_schema_enforcement(
+            crate::computer_capability::ResultSchemaEnforcement::Withhold,
+        );
+        plane.open_context(route.clone()).await.unwrap();
+        let view = ViewportObservation::new(
+            0,
+            TransformInputs::from_values(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+        );
+        let retained = plane
+            .retain_screenshot(
+                &route,
+                crate::coordinate::ScreenshotPayload::new(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+                    1,
+                    1,
+                ),
+                view,
+                view,
+                false,
+            )
+            .await
+            .unwrap();
+        let (computed, _) = crate::authorization::computed_required_severity(
+            crate::authorization::Action::ClickPoint,
+            None,
+        )
+        .unwrap();
+        let reply = plane
+            .serve(
+                &route,
+                crate::browser::BrowserCapability::ClickPoint,
+                &json!({
+                    "snapshot_id": retained["snapshot_id"],
+                    "x_px": 0,
+                    "y_px": 0,
+                    "image_width_px": 1,
+                    "image_height_px": 1,
+                    "intent": "press the pixel",
+                    "severity": {"tier": 1, "credential": false, "financial": false},
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the reply broke its declared schema: {error:?}"));
+        assert_eq!(
+            reply["detail"]["reason_code"], "severity_below_floor",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["detail"]["required"],
+            json!({"tier": computed.tier, "credential": computed.credential, "financial": computed.financial}),
+            "{reply}"
+        );
     }
 
     #[test]
@@ -3060,7 +3677,7 @@ mod tests {
                     &mut FakeClock::new(),
                 )
                 .unwrap(),
-            None
+            Err(ClassificationUnavailable::DomEnableRefused)
         );
     }
 

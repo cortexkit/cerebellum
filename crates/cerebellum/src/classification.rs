@@ -476,6 +476,48 @@ pub enum ClassificationError {
     Serialization,
 }
 
+impl ClassificationError {
+    /// Stable snake_case name for this rejection, safe to show a caller.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::WrongSchema => "wrong_schema",
+            Self::MissingIdentity { .. } => "missing_identity",
+            Self::IdentityInputOutOfBounds { .. } => "identity_input_out_of_bounds",
+            Self::IdentityStringMalformed { .. } => "identity_string_malformed",
+            Self::StringOutOfBounds { .. } => "string_out_of_bounds",
+            Self::CollectionOutOfBounds { .. } => "collection_out_of_bounds",
+            Self::AggregateTokenLimit => "aggregate_token_limit",
+            Self::InvalidToken { .. } => "invalid_token",
+            Self::RequiredTierOutOfBounds => "required_tier_out_of_bounds",
+            Self::InvalidOrigin { .. } => "invalid_origin",
+            Self::InvalidDestination => "invalid_destination",
+            Self::CanonicalRecordOutOfBounds => "canonical_record_out_of_bounds",
+            Self::DerivedFieldMismatch => "derived_field_mismatch",
+            Self::Serialization => "serialization",
+        }
+    }
+
+    /// The record or input field the rejection names, when it names one.
+    pub fn field(&self) -> Option<&'static str> {
+        match self {
+            Self::MissingIdentity { field }
+            | Self::IdentityInputOutOfBounds { field }
+            | Self::IdentityStringMalformed { field }
+            | Self::StringOutOfBounds { field }
+            | Self::CollectionOutOfBounds { field }
+            | Self::InvalidToken { field }
+            | Self::InvalidOrigin { field } => Some(field),
+            Self::WrongSchema
+            | Self::AggregateTokenLimit
+            | Self::RequiredTierOutOfBounds
+            | Self::InvalidDestination
+            | Self::CanonicalRecordOutOfBounds
+            | Self::DerivedFieldMismatch
+            | Self::Serialization => None,
+        }
+    }
+}
+
 impl fmt::Display for ClassificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
@@ -483,6 +525,142 @@ impl fmt::Display for ClassificationError {
 }
 
 impl std::error::Error for ClassificationError {}
+
+/// Why a click target has no classification record.
+///
+/// Authorization treats every one of these the same way: the target might
+/// submit a form nobody inspected, so it requires the strongest disclosure.
+/// The distinction exists for the caller and for diagnosis. Without it, "the
+/// DOM projection could not be read" and "the classifier refused this page's
+/// origin" produce the same refusal, and nobody can tell which one happened.
+///
+/// Each variant names exactly one cause and carries only structural facts
+/// (positions, CDP node ids, field names), never page text or URLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassificationUnavailable {
+    /// The observation was captured without asking for form facts.
+    NotCaptured,
+    /// The document URL yields no origin the classifier accepts, for example
+    /// `about:blank`, a non-HTTP scheme, or a URL carrying credentials.
+    DocumentOriginUnavailable,
+    /// `DOM.enable` answered with an error or with no result.
+    DomEnableRefused,
+    /// `DOM.getFlattenedDocument` answered with an error.
+    FlattenedDocumentRefused,
+    /// Reading the DOM failed at the transport level (for example, no answer
+    /// before the deadline).
+    DomReadFailed,
+    /// The flattened document has no `nodes` array.
+    FlattenedNodesMissing,
+    /// The entry at `index` in `nodes` is not an object.
+    NodeNotObject { index: usize },
+    /// The entry at `index` lacks, or has an unusable, `field`.
+    NodeFieldInvalid { index: usize, field: &'static str },
+    /// Element `node_id` has no `attributes` array.
+    AttributesMissing { node_id: u64 },
+    /// Element `node_id` has an attribute array that is not name/value pairs.
+    AttributesOddLength { node_id: u64, length: usize },
+    /// Element `node_id` has a non-string entry at `position` in its
+    /// attribute array.
+    AttributeNotString { node_id: u64, position: usize },
+    /// Element `node_id` names the same attribute twice, so which value the
+    /// browser uses is unknown.
+    DuplicateAttribute { node_id: u64 },
+    /// Two elements share `node_id`.
+    DuplicateNodeId { node_id: u64 },
+    /// Two elements share `backend_node_id`.
+    DuplicateBackendNodeId { backend_node_id: u64 },
+    /// The clicked element is not among the document's elements.
+    TargetNotInDocument { backend_node_id: u64 },
+    /// Walking up from the target revisits element `node_id`.
+    ComposedParentCycle { node_id: u64 },
+    /// The DOM projection was complete and the classifier refused it.
+    ClassifierRejected(ClassificationError),
+}
+
+impl ClassificationUnavailable {
+    /// Stable snake_case name for this cause, carried to the caller.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::NotCaptured => "not_captured",
+            Self::DocumentOriginUnavailable => "document_origin_unavailable",
+            Self::DomEnableRefused => "dom_enable_refused",
+            Self::FlattenedDocumentRefused => "flattened_document_refused",
+            Self::DomReadFailed => "dom_read_failed",
+            Self::FlattenedNodesMissing => "flattened_nodes_missing",
+            Self::NodeNotObject { .. } => "node_not_object",
+            Self::NodeFieldInvalid { .. } => "node_field_invalid",
+            Self::AttributesMissing { .. } => "attributes_missing",
+            Self::AttributesOddLength { .. } => "attributes_odd_length",
+            Self::AttributeNotString { .. } => "attribute_not_string",
+            Self::DuplicateAttribute { .. } => "duplicate_attribute",
+            Self::DuplicateNodeId { .. } => "duplicate_node_id",
+            Self::DuplicateBackendNodeId { .. } => "duplicate_backend_node_id",
+            Self::TargetNotInDocument { .. } => "target_not_in_document",
+            Self::ComposedParentCycle { .. } => "composed_parent_cycle",
+            Self::ClassifierRejected(_) => "classifier_rejected",
+        }
+    }
+
+    /// The identifying facts of this cause as a JSON object. Keys are drawn
+    /// from a fixed set so a reply schema can declare every one of them.
+    pub fn facts(&self) -> serde_json::Map<String, Value> {
+        let mut facts = serde_json::Map::new();
+        match self {
+            Self::NotCaptured
+            | Self::DocumentOriginUnavailable
+            | Self::DomEnableRefused
+            | Self::FlattenedDocumentRefused
+            | Self::DomReadFailed
+            | Self::FlattenedNodesMissing => {}
+            Self::NodeNotObject { index } => {
+                facts.insert("index".into(), Value::from(*index));
+            }
+            Self::NodeFieldInvalid { index, field } => {
+                facts.insert("index".into(), Value::from(*index));
+                facts.insert("field".into(), Value::from(*field));
+            }
+            Self::AttributesMissing { node_id } | Self::DuplicateAttribute { node_id } => {
+                facts.insert("node_id".into(), Value::from(*node_id));
+            }
+            Self::AttributesOddLength { node_id, length } => {
+                facts.insert("node_id".into(), Value::from(*node_id));
+                facts.insert("length".into(), Value::from(*length));
+            }
+            Self::AttributeNotString { node_id, position } => {
+                facts.insert("node_id".into(), Value::from(*node_id));
+                facts.insert("position".into(), Value::from(*position));
+            }
+            Self::DuplicateNodeId { node_id } | Self::ComposedParentCycle { node_id } => {
+                facts.insert("node_id".into(), Value::from(*node_id));
+            }
+            Self::DuplicateBackendNodeId { backend_node_id }
+            | Self::TargetNotInDocument { backend_node_id } => {
+                facts.insert("backend_node_id".into(), Value::from(*backend_node_id));
+            }
+            Self::ClassifierRejected(error) => {
+                facts.insert("classifier_error".into(), Value::from(error.code()));
+                if let Some(field) = error.field() {
+                    facts.insert("field".into(), Value::from(field));
+                }
+            }
+        }
+        facts
+    }
+}
+
+impl fmt::Display for ClassificationUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason_code())?;
+        let facts = self.facts();
+        if !facts.is_empty() {
+            write!(f, " {}", Value::Object(facts))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ClassificationUnavailable {}
 
 /// Classify a non-type action target.  Point-click uses the same function after
 /// its topmost hit-test has selected the `target` node.
@@ -885,7 +1063,9 @@ pub fn canonical_origin(value: &str) -> Option<String> {
     })
 }
 
-fn canonical_origin_from_url(value: &str) -> Option<String> {
+/// The canonical origin of an absolute http(s) URL, dropping its path, query
+/// and fragment. Returns `None` for anything `canonical_origin` would refuse.
+pub fn canonical_origin_from_url(value: &str) -> Option<String> {
     let (scheme, rest) = value.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
     canonical_origin(&format!("{scheme}://{authority}"))

@@ -127,8 +127,12 @@ pub struct RefRecord {
     pub raw_role: Option<String>,
     pub raw_name: Option<String>,
     /// Form facts captured from the same document epoch as this reference.
-    /// Absence is an unknown classification, not an assertion that no hazard exists.
-    pub classification: Option<Box<crate::classification::NonTypeClassificationRecord>>,
+    /// An error is an unknown classification with its named cause, not an
+    /// assertion that no hazard exists.
+    pub classification: Result<
+        Box<crate::classification::NonTypeClassificationRecord>,
+        crate::classification::ClassificationUnavailable,
+    >,
 }
 
 impl RefRecord {
@@ -777,7 +781,9 @@ mod tests {
                     backend_identity: None,
                     raw_role: None,
                     raw_name: None,
-                    classification: None,
+                    classification: Err(
+                        crate::classification::ClassificationUnavailable::NotCaptured,
+                    ),
                 }],
             })
             .unwrap();

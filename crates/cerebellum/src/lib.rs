@@ -4896,7 +4896,7 @@ mod tests {
                         ),
                         raw_role: Some("button".to_string()),
                         raw_name: Some("Sign in".to_string()),
-                        classification: Some(Box::new(classification)),
+                        classification: Ok(Box::new(classification)),
                     },
                     crate::snapshot_store::RefRecord {
                         captured: crate::snapshot_store::SnapshotRef::new(
@@ -4910,7 +4910,9 @@ mod tests {
                         ),
                         raw_role: Some("button".to_string()),
                         raw_name: Some("Continue".to_string()),
-                        classification: None,
+                        classification: Err(
+                            crate::classification::ClassificationUnavailable::NotCaptured,
+                        ),
                     },
                 ],
                 4096,
