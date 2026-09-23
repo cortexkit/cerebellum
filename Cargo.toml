@@ -33,8 +33,8 @@ subc-transport = { path = "../subconscious/crates/subc-transport" }
 # Test-only: the in-process daemon the live tests boot, and the client control
 # types they speak to it. Taken from crates.io at a fixed version so the lock
 # moves on them only when this repo chooses, not whenever the sibling does.
-subc-control = "0.17.1"
-subc-daemon = "0.20.21"
+subc-control = "0.18.0"
+subc-daemon = "0.20.23"
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # The fleet commons, a second sibling beside subconscious, for the daemon-
 # aligned home resolvers (`resolve_data_home` / `resolve_config_home`). One
