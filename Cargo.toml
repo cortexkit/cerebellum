@@ -16,10 +16,10 @@ members = [
 # no-op capability (`browser.status`). No browser, no CDP, no profile storage
 # — those are Spec B.
 #
-# The subc wire contract crates are PATH dependencies on the sibling
-# subconscious monorepo (same arrangement AFT and ck-quota use):
-# subc-protocol/subc-transport are the module-facing wire; subc-core is a
-# dev-only dep for the in-process daemon used in end-to-end conformance tests.
+# The subc wire contract crates (subc-protocol, subc-transport, subc-jsonc) are
+# PATH dependencies on the sibling subconscious monorepo, pinned by subtree in
+# subconscious-source.txt. The test harness's daemon and client control crates
+# come from crates.io instead; see the patch section at the end of this file.
 [workspace.dependencies]
 # The subc wire contract crates are PATH dependencies on the sibling subconscious
 # monorepo (same arrangement AFT and ck-quota use). The paths are RELATIVE, so
@@ -30,9 +30,11 @@ members = [
 # reason.
 subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-control = { path = "../subconscious/crates/subc-control" }
-subc-core = { path = "../subconscious/crates/subc-core" }
-subc-daemon = { path = "../subconscious/crates/subc-daemon" }
+# Test-only: the in-process daemon the live tests boot, and the client control
+# types they speak to it. Taken from crates.io at a fixed version so the lock
+# moves on them only when this repo chooses, not whenever the sibling does.
+subc-control = "0.17.1"
+subc-daemon = "0.20.21"
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # The fleet commons, a second sibling beside subconscious, for the daemon-
 # aligned home resolvers (`resolve_data_home` / `resolve_config_home`). One
@@ -47,3 +49,15 @@ sha2 = "0.10"
 socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false }
+
+# The test harness takes subc-daemon and subc-control from crates.io, so the
+# lock moves on the daemon only when this repo chooses. Those published crates
+# depend on the wire crates by version, and the test code hands wire types
+# between them and this module, so the wire crates must be ONE copy: this
+# patch points the registry's wire crates at the same sibling path the module
+# builds against. Without it cargo links two subc-protocols and every type
+# crossing between them fails to match.
+[patch.crates-io]
+subc-protocol = { path = "../subconscious/crates/subc-protocol" }
+subc-transport = { path = "../subconscious/crates/subc-transport" }
+subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }

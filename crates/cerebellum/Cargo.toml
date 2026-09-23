@@ -43,13 +43,12 @@ cerebellum-linux = { path = "../cerebellum-linux" }
 
 [dev-dependencies]
 subc-control = { workspace = true }
-subc-core = { workspace = true }
 # The in-process daemon the live tests boot moved out of subc-core when the
 # publishable daemon package was split off; the harness follows the code.
 subc-daemon = { workspace = true }
 # The in-process daemon the live tests boot emits tracing events and installs
 # no subscriber of its own; without one here, every daemon-side line is
-# discarded before it exists. Both crates are already in the graph via subc-core.
+# discarded before it exists. Both crates are already in the graph via subc-daemon.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
