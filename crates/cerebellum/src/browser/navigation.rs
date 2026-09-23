@@ -3336,7 +3336,27 @@ mod tests {
         ];
 
         for (dom, context, expected, expected_facts) in cases {
-            let code = expected.reason_code();
+            // Written out rather than read from `reason_code`, so a code that
+            // drifts to a generic name is caught on the wire.
+            let code = match &expected {
+                Unavailable::NotCaptured => "not_captured",
+                Unavailable::DocumentOriginUnavailable => "document_origin_unavailable",
+                Unavailable::DomEnableRefused => "dom_enable_refused",
+                Unavailable::FlattenedDocumentRefused => "flattened_document_refused",
+                Unavailable::DomReadFailed => "dom_read_failed",
+                Unavailable::FlattenedNodesMissing => "flattened_nodes_missing",
+                Unavailable::NodeNotObject { .. } => "node_not_object",
+                Unavailable::NodeFieldInvalid { .. } => "node_field_invalid",
+                Unavailable::AttributesMissing { .. } => "attributes_missing",
+                Unavailable::AttributesOddLength { .. } => "attributes_odd_length",
+                Unavailable::AttributeNotString { .. } => "attribute_not_string",
+                Unavailable::DuplicateAttribute { .. } => "duplicate_attribute",
+                Unavailable::DuplicateNodeId { .. } => "duplicate_node_id",
+                Unavailable::DuplicateBackendNodeId { .. } => "duplicate_backend_node_id",
+                Unavailable::TargetNotInDocument { .. } => "target_not_in_document",
+                Unavailable::ComposedParentCycle { .. } => "composed_parent_cycle",
+                Unavailable::ClassifierRejected(_) => "classifier_rejected",
+            };
             let refs = snapshot_refs(dom, context);
             assert_eq!(
                 refs[1].classification,
