@@ -4539,7 +4539,11 @@ mod launch_outcome_schema_tests {
             R::LockContentionWithoutOwnerProof,
             R::MalformedRegistry,
             R::UnsupportedRegistrySchema,
-            R::ManagedRootIdentityChanged,
+            R::ManagedRootInodeChanged,
+            R::ManagedRootBirthTimeChanged,
+            R::ManagedRootPathChanged,
+            R::ManagedRootIdentityPredatesFacts,
+            R::ManagedRootBirthTimeUnavailable,
             R::IntegrityMismatch,
             R::InvalidRegistryIdentity,
             R::NonCanonicalTarget,
@@ -4558,7 +4562,11 @@ mod launch_outcome_schema_tests {
                 R::LockContentionWithoutOwnerProof
                 | R::MalformedRegistry
                 | R::UnsupportedRegistrySchema
-                | R::ManagedRootIdentityChanged
+                | R::ManagedRootInodeChanged
+                | R::ManagedRootBirthTimeChanged
+                | R::ManagedRootPathChanged
+                | R::ManagedRootIdentityPredatesFacts
+                | R::ManagedRootBirthTimeUnavailable
                 | R::IntegrityMismatch
                 | R::InvalidRegistryIdentity
                 | R::NonCanonicalTarget
@@ -4612,9 +4620,9 @@ mod launch_outcome_schema_tests {
             }
         }
         // One rendering each for busy, grant, storage and internal failure,
-        // fourteen untrusted-root reasons, and three cleanup stages: 21. A
+        // eighteen untrusted-root reasons, and three cleanup stages: 25. A
         // lower count means a rendering was dropped from the check.
-        assert_eq!(checked, 21);
+        assert_eq!(checked, 25);
     }
 
     /// Platform launch refusals reach the caller through the launch service's

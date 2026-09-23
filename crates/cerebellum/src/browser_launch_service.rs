@@ -2621,7 +2621,7 @@ mod launch_refusal_schema_tests {
             RegistryError::UnknownField("/profiles/0000-uuid".to_string()),
             RegistryError::UnsupportedState,
             RegistryError::Conflict,
-            RegistryError::Untrustworthy(UntrustworthyRegistryReason::ManagedRootIdentityChanged),
+            RegistryError::Untrustworthy(UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts),
             RegistryError::Untrustworthy(UntrustworthyRegistryReason::MalformedRegistry),
             RegistryError::InvalidTransition,
         ];
@@ -2662,7 +2662,7 @@ mod launch_refusal_schema_tests {
     #[test]
     fn an_untrusted_registry_at_open_keeps_its_typed_outcome_and_remedy() {
         let reply = ProductionProfileLifecycleError::Registry(RegistryError::Untrustworthy(
-            UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+            UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
         ))
         .into_launch_refusal();
         assert_eq!(
