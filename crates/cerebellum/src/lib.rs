@@ -4761,17 +4761,22 @@ mod tests {
             question["params"]["hazards"],
             json!(["credential_form_submit", "unverified_form_contents"])
         );
+        // The person must be told, in words they can act on, what the grant
+        // unlocks: each disclosed hazard names the kind of form it allows.
         let message = question["params"]["message"].as_str().unwrap();
         for disclosed in [
             "https://requested.example",
-            "credential_form_submit",
-            "unverified_form_contents",
+            "It can also submit sign-in forms and forms whose purpose it couldn't check.",
+            "It can't submit payment forms.",
         ] {
             assert!(
                 message.contains(disclosed),
                 "question omitted {disclosed}: {question}"
             );
         }
+        // A grant is usually answered from a phone, so the deadline the
+        // question carries on the wire is the 30-minute one.
+        assert_eq!(question["params"]["deadline_ms"], json!(1_800_000));
 
         let answer = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
