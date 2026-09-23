@@ -47,13 +47,16 @@ pub const PRESENT: &str = "browser.present";
 pub const RESUME: &str = "browser.resume";
 /// Re-identify a moved or restored browser profile root without adopting profiles.
 pub const REBIND_PROFILE_ROOT: &str = "browser.rebind_profile_root";
-pub const OPERATIONS: [&str; 6] = [
+/// Capture a fresh login in a throwaway profile, for the operator to store.
+pub const CAPTURE_LOGIN: &str = "browser.capture_login";
+pub const OPERATIONS: [&str; 7] = [
     OPEN_TARGET,
     OPEN_GRANT,
     IMPORT_LOGIN,
     PRESENT,
     RESUME,
     REBIND_PROFILE_ROOT,
+    CAPTURE_LOGIN,
 ];
 
 /// Read an action kind from its wire spelling.

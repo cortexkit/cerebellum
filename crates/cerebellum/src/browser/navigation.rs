@@ -319,6 +319,59 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .collect()
     }
 
+    /// The request `Cookie:` header Chrome would send to `url`, in the order
+    /// CDP returns the cookies. Only `browser.capture_login` reads values, and
+    /// only through the capture browser; the header type cannot be formatted
+    /// or serialized, so the value cannot leave through an error or a reply.
+    pub fn cookie_request_header_for_url(
+        &mut self,
+        context_key: &str,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<
+        Result<crate::login_capture::CookieHeader, crate::login_capture::CookieHeaderError>,
+        NavigationDriveError,
+    > {
+        let mut clock = SystemNavigationClock;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, &mut clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let mut params = Map::new();
+        params.insert(
+            "urls".into(),
+            Value::Array(vec![Value::String(url.to_string())]),
+        );
+        let result = self.command(
+            "Network.getCookies",
+            Some(params),
+            Some(attachment.session_id),
+            deadline,
+            None,
+            &mut clock,
+        )?;
+        let cookies = result
+            .get("cookies")
+            .and_then(Value::as_array)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let pairs = cookies
+            .iter()
+            .map(|cookie| {
+                Some((
+                    cookie.get("name").and_then(Value::as_str)?,
+                    cookie.get("value").and_then(Value::as_str)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        Ok(crate::login_capture::CookieHeader::from_pairs(pairs))
+    }
+
     pub fn main_frame_url(
         &mut self,
         context_key: &str,

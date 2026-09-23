@@ -216,7 +216,7 @@ pub struct HumanInControl {
     pub expires_in_ms: u64,
 }
 
-fn render_rfc3339_millis(time: SystemTime) -> String {
+pub(crate) fn render_rfc3339_millis(time: SystemTime) -> String {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = duration.as_secs();
     let days = seconds / 86_400;

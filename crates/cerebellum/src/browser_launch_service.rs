@@ -404,6 +404,283 @@ impl BrowserSessionLauncher for ProductionLaunchService {
     }
 }
 
+/// The launch composition for `browser.capture_login`, and only for it.
+///
+/// It keeps what makes a launch trustworthy -- the executable identity check,
+/// the barred spawn and attestation recorded in the launch journal, and CDP
+/// readiness -- and leaves out the profile registry: the throwaway profile
+/// lives in the capture directory, which is excluded from backups, while the
+/// registry root is not. The one relaxation is the profile directory, admitted
+/// only through `capture_user_data_dir_admitted`.
+impl crate::login_capture::CaptureLauncher for ProductionLaunchService {
+    fn launch_capture(
+        &self,
+        accepted: &AcceptedBindFacts,
+        launch_attempt_id: &str,
+        placement: &crate::login_capture::CapturePlacement,
+    ) -> Result<
+        Box<dyn crate::login_capture::CaptureBrowser>,
+        crate::login_capture::CaptureLaunchRefusal,
+    > {
+        self.launch_capture_browser(accepted, launch_attempt_id, placement)
+            .map_err(|refusal| crate::login_capture::CaptureLaunchRefusal {
+                stage: refusal
+                    .get("stage")
+                    .or_else(|| refusal.get("outcome"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("launch")
+                    .to_string(),
+            })
+    }
+}
+
+impl ProductionLaunchService {
+    fn launch_capture_browser(
+        &self,
+        accepted: &AcceptedBindFacts,
+        launch_attempt_id: &str,
+        placement: &crate::login_capture::CapturePlacement,
+    ) -> Result<Box<dyn crate::login_capture::CaptureBrowser>, Value> {
+        self.require_recovered_startup()?;
+        let Some(executable) = self.config.executable_path.as_ref() else {
+            return Err(json!({"outcome": "executable_missing"}));
+        };
+        if !executable.is_file() {
+            return Err(json!({"outcome": "executable_missing"}));
+        }
+        let expected =
+            self.config.expected_identity.as_deref().ok_or_else(
+                || json!({"outcome": "internal_failure", "stage": "expected_identity"}),
+            )?;
+        let (expected_identity, pre_spawn_identity_verification) =
+            verify_configured_executable(executable, expected)?;
+
+        let profile_directory = placement.profile_directory().to_path_buf();
+        let crash_dumps_directory = profile_directory.join("crash-dumps");
+        let arguments = browser_launch_arguments(&profile_directory, &crash_dumps_directory);
+        let argument_text = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if !crate::custody::capture_user_data_dir_admitted(
+            &argument_text,
+            placement.root(),
+            &profile_directory,
+        ) {
+            return Err(json!({"outcome": "internal_failure", "stage": "capture_profile_path"}));
+        }
+        if !crate::custody::arguments_are_quarantinable(&argument_text) {
+            return Err(json!({"outcome": "internal_failure", "stage": "argument_quarantine"}));
+        }
+
+        let request = AttestedLaunchRequest {
+            launch_attempt_id: launch_attempt_id.to_string(),
+            holder_id: launch_attempt_id.to_string(),
+            route: LaunchRouteIdentity {
+                principal: accepted
+                    .principal
+                    .as_ref()
+                    .map(|principal| format!("{principal:?}"))
+                    .unwrap_or_default(),
+                conversation_key: accepted.identity.conversation_key.clone(),
+                agent_project_id: accepted.identity.agent_project_id.clone(),
+                session_kind: accepted.identity.session_kind,
+            },
+            profile: LaunchProfileIdentity {
+                profile_uuid: launch_attempt_id.to_string(),
+                canonical_profile_path: path_bytes(&profile_directory),
+                disposition: LaunchProfile::Capture,
+            },
+            executable: executable.clone(),
+            arguments,
+            environment: browser_launch_environment(&profile_directory),
+            verified_executable_identity: expected_identity,
+            pre_spawn_identity_verification,
+        };
+        let (command_parent, command_child) = pipe_pair("command")?;
+        let (response_parent, response_child) = pipe_pair("response")?;
+        #[cfg(target_os = "macos")]
+        let mut launcher =
+            MacOsProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        #[cfg(target_os = "linux")]
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        let pipe = UnixCdpPipe::new(command_parent, response_parent)
+            .map_err(|_| json!({"outcome": "internal_failure", "stage": "spawn_preparation"}))?;
+        let handshake_deadline = NonZeroU64::new(self.config.launch_handshake_deadline_ms)
+            .ok_or_else(|| json!({"outcome": "internal_failure", "stage": "handshake_deadline"}))?;
+        let mut journal_guard = map_poisoned_mutex(self.journal.lock(), "launch_journal_lock")?;
+        let journal = journal_guard
+            .as_mut()
+            .ok_or_else(|| json!({"outcome": "internal_failure", "stage": "launch_journal"}))?;
+        let mut clock = SystemLaunchClock;
+        // The capture directory is the capture's to delete, on every path, so
+        // a failed launch has no profile custody to roll back here.
+        let mut rollback = NoCaptureRollback;
+        let ready = launch_attested_to_readiness_with(
+            journal,
+            &mut launcher,
+            &request,
+            pipe,
+            handshake_deadline,
+            &mut clock,
+            &mut rollback,
+        )
+        .map_err(map_readiness_error)?;
+        drop(journal_guard);
+
+        Ok(Box::new(ProductionCaptureBrowser {
+            process: ProductionProcess {
+                process: Some(ready.process),
+                driver: Some(CdpNavigationDriver::new(
+                    ready.pipe,
+                    ready.transport,
+                    ready.decoder,
+                )),
+                reaped: false,
+            },
+            journal: Arc::clone(&self.journal),
+            launch_attempt_id: launch_attempt_id.to_string(),
+            grace_period: Duration::from_millis(self.config.termination_grace_period_ms),
+            closed: false,
+        }))
+    }
+}
+
+struct NoCaptureRollback;
+
+impl crate::browser_launch_readiness::FailedLaunchRollback for NoCaptureRollback {
+    fn rollback(
+        &mut self,
+        _failure: &crate::browser_launch_readiness::ProfileStartupIndeterminate,
+    ) -> Result<(), crate::browser_launch::PlatformLaunchError> {
+        Ok(())
+    }
+}
+
+/// The CDP context key a capture browser's single page is driven under.
+const CAPTURE_CONTEXT_KEY: &str = "browser.capture_login";
+
+struct ProductionCaptureBrowser {
+    process: ProductionProcess,
+    journal: SharedLaunchJournal,
+    launch_attempt_id: String,
+    grace_period: Duration,
+    closed: bool,
+}
+
+fn capture_drive<T>(
+    result: Result<T, NavigationDriveError>,
+) -> Result<T, crate::login_capture::CaptureDriveError> {
+    result.map_err(|_| crate::login_capture::CaptureDriveError)
+}
+
+impl crate::login_capture::CaptureBrowser for ProductionCaptureBrowser {
+    fn navigate(
+        &mut self,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<(), crate::login_capture::CaptureDriveError> {
+        let mut tracker = Tracker::default();
+        capture_drive(self.process.navigate(
+            CAPTURE_CONTEXT_KEY,
+            url,
+            NavigationWait::None,
+            deadline_ms,
+            &mut tracker,
+        ))
+    }
+
+    fn present(&mut self, deadline_ms: u64) -> Result<(), crate::login_capture::CaptureDriveError> {
+        capture_drive(self.process.present(CAPTURE_CONTEXT_KEY, deadline_ms))
+    }
+
+    fn main_frame_url(
+        &mut self,
+        deadline_ms: u64,
+    ) -> Result<String, crate::login_capture::CaptureDriveError> {
+        capture_drive(
+            self.process
+                .main_frame_url(CAPTURE_CONTEXT_KEY, deadline_ms),
+        )
+    }
+
+    fn has_credential_field(
+        &mut self,
+        deadline_ms: u64,
+    ) -> Result<bool, crate::login_capture::CaptureDriveError> {
+        capture_drive(
+            self.process
+                .has_credential_field(CAPTURE_CONTEXT_KEY, deadline_ms),
+        )
+    }
+
+    fn cookie_names_for_origin(
+        &mut self,
+        origin: &str,
+        deadline_ms: u64,
+    ) -> Result<std::collections::BTreeSet<String>, crate::login_capture::CaptureDriveError> {
+        capture_drive(self.process.cookie_names_for_origin(
+            CAPTURE_CONTEXT_KEY,
+            origin,
+            deadline_ms,
+        ))
+    }
+
+    fn cookie_request_header(
+        &mut self,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<
+        Result<crate::login_capture::CookieHeader, crate::login_capture::CookieHeaderError>,
+        crate::login_capture::CaptureDriveError,
+    > {
+        let driver = self
+            .process
+            .driver
+            .as_mut()
+            .ok_or(crate::login_capture::CaptureDriveError)?;
+        capture_drive(driver.cookie_request_header_for_url(CAPTURE_CONTEXT_KEY, url, deadline_ms))
+    }
+
+    fn exited(&mut self) -> bool {
+        self.process.process.as_ref().is_none_or(|process| {
+            platform_generation_exited(BrowserProcessGeneration::from(process.generation()))
+        })
+    }
+
+    fn close(&mut self) -> Result<(), crate::login_capture::CaptureDriveError> {
+        if self.closed {
+            return Ok(());
+        }
+        let _ = self.process.request_graceful_termination();
+        let reaped = match self.process.wait_for_exit(self.grace_period) {
+            Ok(true) => self.process.wait_until_reaped(),
+            _ => self.process.force_terminate(),
+        };
+        // The launch record is closed whatever the reap did, so a failed reap
+        // is not also reported as a launch nobody finished.
+        let recorded = ProductionSessionCleanup::finalize_journal(
+            &self.journal,
+            &self.launch_attempt_id,
+            &mut Some(BrowserSessionTerminalOutcome::Closed),
+        );
+        self.closed = true;
+        match (reaped, recorded) {
+            (Ok(()), Ok(())) => Ok(()),
+            _ => Err(crate::login_capture::CaptureDriveError),
+        }
+    }
+}
+
+impl Drop for ProductionCaptureBrowser {
+    /// A capture that ends without closing its browser (a panicked task) must
+    /// not leave the browser running with a live session in it.
+    fn drop(&mut self) {
+        let _ = crate::login_capture::CaptureBrowser::close(self);
+    }
+}
+
 fn launch_recovery_refusal(failure: BrowserLaunchRecoveryFailure) -> Value {
     json!({
         "outcome": "internal_failure",

@@ -191,6 +191,67 @@ pub fn arguments_are_quarantinable(arguments: &[String]) -> bool {
         .all(|argument| !forbidden_argument(argument))
 }
 
+/// Admit a `browser.capture_login` launch vector only when it names exactly
+/// one profile directory, and that directory is exactly
+/// `<capture root>/<the fresh directory this capture created>`.
+///
+/// Every other launch takes its profile directory from the profile registry
+/// and never reaches this check. A capture profile is deliberately NOT a
+/// registry profile (the registry root is backed up; the capture root is not),
+/// so this is the one place a launch may name a directory the registry did not
+/// mint, and it is kept exact: no other directory under the root, no sibling
+/// of the root, no `..` or `.` segments, and no second `--user-data-dir`.
+/// Callers pass the root only after it was created and proven excluded from
+/// backups.
+pub fn capture_user_data_dir_admitted(
+    arguments: &[String],
+    capture_root: &Path,
+    fresh_directory: &Path,
+) -> bool {
+    use std::path::Component;
+
+    let plain = |path: &Path| {
+        path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    };
+    if !plain(capture_root) || !plain(fresh_directory) {
+        return false;
+    }
+    let Ok(below_root) = fresh_directory.strip_prefix(capture_root) else {
+        return false;
+    };
+    let mut below = below_root.components();
+    if !matches!(
+        (below.next(), below.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return false;
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--user-data-dir")
+    {
+        return false;
+    }
+    let mut named = arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--user-data-dir="));
+    match (named.next(), named.next()) {
+        (Some(value), None) => {
+            // Compared as text as well as by components: `Path` equality
+            // forgives a trailing slash or a doubled separator, and the
+            // browser should be handed exactly the directory that was made.
+            let value_path = Path::new(value);
+            plain(value_path)
+                && value_path == fresh_directory
+                && value == fresh_directory.to_string_lossy()
+        }
+        _ => false,
+    }
+}
+
 pub fn verify_registration(
     artifact: &CustodyArtifact,
     observation: &RegistrationObservation,
@@ -621,5 +682,87 @@ mod proxy_pairing_tests {
              the browser at it, or a browser that reaches the network directly \
              will run beside a gate that believes it is enforcing."
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_user_data_dir_tests {
+    use super::capture_user_data_dir_admitted;
+    use std::path::Path;
+
+    const ROOT: &str = "/private/var/folders/ab/T/ck-cerebellum-capture";
+    const FRESH: &str = "/private/var/folders/ab/T/ck-cerebellum-capture/profile-1";
+
+    fn arguments(user_data_dir: &str) -> Vec<String> {
+        vec![
+            "--remote-debugging-pipe".to_string(),
+            format!("--user-data-dir={user_data_dir}"),
+            format!("--crash-dumps-dir={FRESH}/crash-dumps"),
+            "--no-first-run".to_string(),
+        ]
+    }
+
+    fn admitted(arguments: &[String]) -> bool {
+        capture_user_data_dir_admitted(arguments, Path::new(ROOT), Path::new(FRESH))
+    }
+
+    #[test]
+    fn exactly_the_fresh_directory_is_admitted() {
+        assert!(admitted(&arguments(FRESH)));
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        for user_data_dir in [
+            // A sibling of the fresh directory under the same root.
+            "/private/var/folders/ab/T/ck-cerebellum-capture/profile-2",
+            // The root itself.
+            ROOT,
+            // A sibling of the root that shares its name as a prefix.
+            "/private/var/folders/ab/T/ck-cerebellum-capture-evil/profile-1",
+            // Climbing out and back in.
+            "/private/var/folders/ab/T/ck-cerebellum-capture/profile-1/../profile-1",
+            "/private/var/folders/ab/T/ck-cerebellum-capture/../ck-cerebellum-capture/profile-1",
+            // A current-directory segment and a trailing slash.
+            "/private/var/folders/ab/T/ck-cerebellum-capture/./profile-1",
+            "/private/var/folders/ab/T/ck-cerebellum-capture/profile-1/",
+            // Below the fresh directory, and a relative path.
+            "/private/var/folders/ab/T/ck-cerebellum-capture/profile-1/Default",
+            "ck-cerebellum-capture/profile-1",
+            // The managed registry root.
+            "/Users/someone/.local/share/cortexkit/cerebellum/profiles/p",
+        ] {
+            assert!(!admitted(&arguments(user_data_dir)), "{user_data_dir}");
+        }
+    }
+
+    #[test]
+    fn a_second_or_missing_profile_argument_is_refused() {
+        let mut twice = arguments(FRESH);
+        twice.push(format!("--user-data-dir={FRESH}"));
+        assert!(!admitted(&twice));
+        let mut split = arguments(FRESH);
+        split.push("--user-data-dir".to_string());
+        assert!(!admitted(&split));
+        let none = vec!["--remote-debugging-pipe".to_string()];
+        assert!(!admitted(&none));
+    }
+
+    #[test]
+    fn a_fresh_directory_not_directly_under_the_root_is_refused() {
+        for fresh in [
+            "/private/var/folders/ab/T/ck-cerebellum-capture/a/b",
+            "/private/var/folders/ab/T/elsewhere/profile-1",
+            "/private/var/folders/ab/T/ck-cerebellum-capture/../profile-1",
+        ] {
+            assert!(
+                !capture_user_data_dir_admitted(
+                    &arguments(fresh),
+                    Path::new(ROOT),
+                    Path::new(fresh)
+                ),
+                "{fresh}"
+            );
+        }
     }
 }

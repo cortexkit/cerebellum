@@ -148,6 +148,13 @@ fn management_surface() -> ProviderRole {
                 "Ask the person to re-identify a moved or restored browser profile root. \
                  Refuses rather than adopts any profile directory the registry did not mint.",
             ),
+            (
+                crate::management::CAPTURE_LOGIN,
+                "With the person's approval, have them log in to credential_domain in a fresh \
+                 throwaway browser, write the request Cookie header for fetch_url to one local \
+                 file deleted after 10 minutes, and return the ck auth commands the operator \
+                 runs to store it for insula. No cookie value is returned.",
+            ),
         ]
         .into_iter()
         .map(|(name, description)| ManagementOperation {
@@ -155,6 +162,9 @@ fn management_surface() -> ProviderRole {
             kind: if name == crate::management::IMPORT_LOGIN {
                 // A successful import changes the closed durable profile's
                 // cookie store after the person chooses a source browser.
+                ManagementOperationKind::Mutate
+            } else if name == crate::management::CAPTURE_LOGIN {
+                // A capture writes a file holding a login onto this machine.
                 ManagementOperationKind::Mutate
             } else {
                 // The remaining operations report state or arrange authority;
@@ -910,6 +920,7 @@ mod tests {
                 crate::management::PRESENT,
                 crate::management::RESUME,
                 crate::management::REBIND_PROFILE_ROOT,
+                crate::management::CAPTURE_LOGIN,
             ]
         );
         let dispatchable = crate::management::OPERATIONS

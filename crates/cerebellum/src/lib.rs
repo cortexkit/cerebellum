@@ -29,6 +29,7 @@ pub mod flat_tools;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
+pub mod login_capture;
 pub mod login_import;
 pub mod management;
 pub mod manifest;
@@ -761,6 +762,7 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
             | management::OPEN_GRANT
             | management::IMPORT_LOGIN
             | management::REBIND_PROFILE_ROOT
+            | management::CAPTURE_LOGIN
     ) || (matches!(name, management::PRESENT | management::RESUME)
         && browser::has_wire_dispatch_route(name))
 }
@@ -1157,11 +1159,17 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
             // the transport it can serve launch requests, so publishing the
             // production service any later would let a fresh spawn race an
             // attested orphan from the previous module process.
-            planes.launch_service = Some(Arc::new(
-                browser_launch_service::ProductionLaunchService::open(browser),
+            let service = Arc::new(browser_launch_service::ProductionLaunchService::open(
+                browser,
             ));
+            planes.capture.set_launcher(service.clone());
+            planes.launch_service =
+                Some(service as Arc<dyn browser_session::BrowserSessionLauncher>);
         }
     }
+    // After launch recovery has terminated any capture browser a previous
+    // module process left running, remove the files and profiles it left.
+    planes.capture.sweep_at_startup();
     let idle_enforcer = browser_config.clone().map(|browser| {
         let sessions = planes.sessions.clone();
         let clock = Arc::clone(&planes.lease_clock);
@@ -1698,6 +1706,8 @@ pub struct Planes {
     pub computer_admitted: Arc<std::collections::BTreeSet<String>>,
     /// Questions this module has put to whoever is on the other end of a route.
     pub elicitor: SharedElicitor,
+    /// `browser.capture_login`: one capture at a time, and its residue.
+    pub capture: Arc<login_capture::CaptureModule>,
 }
 
 /// Retention for the browser DRIVE journal: navigate, snapshot, click,
@@ -1779,6 +1789,13 @@ impl Planes {
         // Platforms without a launcher still get None: ProductionLaunchService
         // resolves one at construction, so this cannot advertise a launch it
         // cannot perform.
+        let capture = Arc::new(login_capture::CaptureModule::new(
+            login_capture::CaptureEnv::production(
+                browser_config
+                    .as_ref()
+                    .map_or(30_000, |config| config.navigation_settle_deadline_ms),
+            ),
+        ));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
             browser_config
@@ -1789,9 +1806,15 @@ impl Planes {
                         .as_ref()
                         .is_some_and(|path| path.is_file())
                 })
-                .map(browser_launch_service::ProductionLaunchService::open)
-                .map(|service| {
-                    Arc::new(service) as Arc<dyn browser_session::BrowserSessionLauncher>
+                .map(|config| {
+                    // One service for route sessions and captures, so both
+                    // write the one launch journal whose startup recovery
+                    // reaps an orphan of either kind.
+                    let service = Arc::new(browser_launch_service::ProductionLaunchService::open(
+                        config,
+                    ));
+                    capture.set_launcher(service.clone());
+                    service as Arc<dyn browser_session::BrowserSessionLauncher>
                 });
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let launch_service = None;
@@ -1892,6 +1915,7 @@ impl Planes {
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             cancellations: RequestCancellations::default(),
             elicitor: Arc::new(Elicitor::new()),
+            capture,
         }
     }
 }
@@ -1932,6 +1956,7 @@ impl Clone for Planes {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::clone(&self.computer_admitted),
             elicitor: Arc::clone(&self.elicitor),
+            capture: Arc::clone(&self.capture),
         }
     }
 }
@@ -2285,6 +2310,48 @@ async fn handle_management_request(
             present_browser_handoff(planes, &facts.identity, origin).await
         };
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
+    if method == management::CAPTURE_LOGIN {
+        let request = match login_capture::parse_request(params_object) {
+            Ok(request) => request,
+            Err(error) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &error.field,
+                    error.reason,
+                )
+                .await
+            }
+        };
+        let reply =
+            capture_browser_login(planes, facts, writer, channel, epoch, corr, &request).await;
+        return match planes
+            .browser
+            .finish_reply(management::CAPTURE_LOGIN, reply)
+        {
+            Ok(reply) => send_tool_response(writer, ver, channel, epoch, corr, reply).await,
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!(
+                        "the capture reply violated its declared result schema ({error}); any \
+                         captured file is deleted at its deadline, so capture again rather than \
+                         retrying from this response"
+                    ),
+                )
+                .await
+            }
+        };
     }
 
     if method == management::RESUME {
@@ -2702,6 +2769,56 @@ async fn journal_login_import_result(
         return json!({"outcome":"internal_failure","reason":"journal_unavailable"});
     }
     result.to_value()
+}
+
+/// Run one `browser.capture_login` and journal it. The capture deletes its
+/// throwaway profile before returning, and the record is written before the
+/// reply, so neither a second copy of the session nor an unrecorded capture
+/// exists when the caller hears back.
+async fn capture_browser_login(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    writer: &mpsc::Sender<Frame>,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    request: &login_capture::CaptureRequest,
+) -> Value {
+    // A cancel frame for this request, a Goodbye for its route, or the start
+    // of a drain all end the capture with nothing written.
+    let cancel = planes.cancellations.get((channel, epoch, corr));
+    let draining = Arc::clone(&planes.draining);
+    let outcome = planes
+        .capture
+        .run(
+            request,
+            login_capture::CaptureCall {
+                accepted: facts,
+                declares_elicitation: facts.declares_elicitation(),
+                ask: |question, deadline| {
+                    planes
+                        .elicitor
+                        .ask(writer, channel, epoch, question, deadline)
+                },
+                cancelled: move || {
+                    cancel.as_ref().is_some_and(CancelHandle::is_cancelled)
+                        || draining.load(std::sync::atomic::Ordering::Acquire)
+                },
+            },
+        )
+        .await;
+    if planes
+        .browser
+        .journal_login_capture(&facts.identity, outcome.journal)
+        .await
+        .is_err()
+    {
+        if let Some(path) = outcome.captured_file.as_deref() {
+            planes.capture.discard_captured_file(path);
+        }
+        return json!({"outcome":"internal_failure","reason":"journal_unavailable"});
+    }
+    outcome.reply
 }
 
 async fn present_browser_handoff(planes: &Planes, identity: &RouteIdentity, origin: &str) -> Value {
@@ -4691,6 +4808,7 @@ mod tests {
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
             elicitor: Arc::clone(&elicitor),
+            capture: login_capture::test_support::fixture().module,
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
             .await
@@ -4742,6 +4860,7 @@ mod tests {
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
             elicitor: Arc::clone(&elicitor),
+            capture: login_capture::test_support::fixture().module,
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
             .await
@@ -4944,6 +5063,7 @@ mod tests {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
+            capture: login_capture::test_support::fixture().module,
         };
         planes.routes.insert(
             6,
@@ -5009,6 +5129,7 @@ mod tests {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
+            capture: login_capture::test_support::fixture().module,
         };
         planes.routes.insert(
             channel,

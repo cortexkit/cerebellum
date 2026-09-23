@@ -3087,6 +3087,14 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             request_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
             result_schema: browser_status_result_schema(),
         },
+        // Served on the management surface, never advertised as a tool: it is
+        // listed here only so its reply passes the same closed-schema boundary.
+        BrowserToolDefinition {
+            name: crate::management::CAPTURE_LOGIN,
+            description: "Capture a fresh login in a throwaway browser for the operator to store.",
+            request_schema: crate::login_capture::request_schema(),
+            result_schema: crate::login_capture::reply_schema(),
+        },
         BrowserToolDefinition {
             name: crate::browser_session::BROWSER_CLOSE,
             description: "Close and reap the route-owned browser session.",
