@@ -34,7 +34,7 @@ use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
 };
 use crate::browser_session::{
-    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserKiller,
+    BrowserClickOutcome, BrowserClickPosition, BrowserExitProbe, BrowserInputEvent, BrowserKiller,
     BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, ClickDriveError,
     ClickPointDriveError, KillOutcome, LaunchedBrowser, NavigationDriveError, NavigationWait,
     OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
@@ -1388,6 +1388,24 @@ impl OwnedBrowserProcess for ProductionProcess {
             generation,
             state: Arc::clone(&self.shutdown_kill),
         }))
+    }
+
+    fn exit_probe(&self) -> Option<Arc<dyn BrowserExitProbe>> {
+        let generation = BrowserProcessGeneration::from(self.process.as_ref()?.generation());
+        Some(Arc::new(ProductionExitProbe { generation }))
+    }
+}
+
+/// Answers whether one production browser generation is still running,
+/// through the same generation check `generation_matches` uses, so exit
+/// observation need not wait for a call in progress on its driver.
+struct ProductionExitProbe {
+    generation: BrowserProcessGeneration,
+}
+
+impl BrowserExitProbe for ProductionExitProbe {
+    fn generation_matches(&self) -> bool {
+        platform_generation_matches(self.generation)
     }
 }
 

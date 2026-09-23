@@ -4222,6 +4222,9 @@ fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveErro
                 reason_code: JournalReasonCode::CdpFailure,
             }
         }
+        crate::browser_session::NavigationDriveError::StateUnavailable => {
+            BrowserError::SessionStateUnavailable
+        }
     }
 }
 

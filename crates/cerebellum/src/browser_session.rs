@@ -1,7 +1,7 @@
 //! Route-owned browser session lifecycle, leases, and the common teardown ladder.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotObservation};
@@ -252,6 +252,10 @@ pub enum CleanupStage {
     RecordTerminalization,
     CustodyRelease,
     DisposableDelete,
+    /// Module shutdown could not stop the browser within its budget, so the
+    /// profile's custody was deliberately left held; the next start's launch
+    /// recovery stops the browser and releases it.
+    CustodyHeld,
 }
 
 impl CleanupStage {
@@ -261,6 +265,7 @@ impl CleanupStage {
             Self::RecordTerminalization => "record_terminalization",
             Self::CustodyRelease => "custody_release",
             Self::DisposableDelete => "disposable_delete",
+            Self::CustodyHeld => "custody_held",
         }
     }
 }
@@ -320,10 +325,17 @@ pub struct ProcessControlFailure;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationDriveError {
     Unavailable,
+    /// The session's own state could not be read because a thread panicked
+    /// while holding one of its locks.
+    StateUnavailable,
     ConnectorFailure,
     CdpFailure,
-    CommandFailed { error_text: String },
-    NavigationFailed { error_text: String },
+    CommandFailed {
+        error_text: String,
+    },
+    NavigationFailed {
+        error_text: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,23 +549,31 @@ pub trait OwnedBrowserProcess: Send {
     fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure>;
 
     /// A handle that module shutdown can use to kill this browser without
-    /// taking the session registry's lock. `None`, the default, means shutdown
+    /// taking the session's driver lock. `None`, the default, means shutdown
     /// can only wait for a browser call already in progress to return on its
     /// own.
     fn shutdown_killer(&self) -> Option<Arc<dyn BrowserKiller>> {
         None
     }
+
+    /// A read-only handle that tells whether this browser is still running,
+    /// usable without the session's driver lock. `None`, the default, makes
+    /// exit observation fall back to `generation_matches` when the driver
+    /// lock is free.
+    fn exit_probe(&self) -> Option<Arc<dyn BrowserExitProbe>> {
+        None
+    }
 }
 
-/// Kills one launched browser generation without going through the session
-/// registry's lock.
+/// Kills one launched browser generation without going through the session's
+/// driver lock.
 ///
-/// Every browser driver call holds the registry lock for as long as its CDP
-/// call takes, and that lock is shared by every route. A shutdown that could
-/// reach a browser only through the lock would therefore wait out whatever call
-/// happened to be in progress, however long its deadline. This handle is kept
-/// beside the registry so shutdown can end such a browser; the dying browser
-/// fails the call, which then gives the lock back.
+/// Every browser driver call holds its session's driver lock for as long as
+/// its CDP call takes. A shutdown that could reach a browser only through that
+/// lock would therefore wait out whatever call happened to be in progress,
+/// however long its deadline. This handle is kept beside the lock so shutdown
+/// can end such a browser; the dying browser fails the call, which then gives
+/// the lock back.
 pub trait BrowserKiller: Send + Sync {
     /// Kill exactly the process generation this handle was made for, never a
     /// bare pid: by the time shutdown fires, the pid may name another process.
@@ -561,6 +581,13 @@ pub trait BrowserKiller: Send + Sync {
     /// whose generation-checked kill also reaps an owned child, it may reap;
     /// the session's normal reap path tolerates that.
     fn kill_exact_generation(&self) -> KillOutcome;
+}
+
+/// Tells whether one launched browser generation is still running, without
+/// the session's driver lock. It only observes: it never signals or reaps.
+pub trait BrowserExitProbe: Send + Sync {
+    /// Whether the recorded process generation is still the running process.
+    fn generation_matches(&self) -> bool;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,11 +626,9 @@ pub const SHUTDOWN_IN_FLIGHT_WAIT_MAX: Duration = Duration::from_secs(5);
 /// it never eats into this reserve.
 pub const SHUTDOWN_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
 
-/// How often shutdown looks again at a lock or a count it is waiting on.
-///
-/// Shutdown polls rather than waiting on the registry's condition variable,
-/// because waking from that wait has to take the registry lock again, and a
-/// browser call in progress can hold that lock for its whole deadline.
+/// How often shutdown tries the driver lock again while a call in progress
+/// holds it. `try_lock` is polled rather than parked on, so the wait for that
+/// lock ends by the shutdown plan and not by the call's own deadline.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 
 /// The time limits one module shutdown works within.
@@ -646,12 +671,13 @@ impl ShutdownPlan {
     }
 }
 
-/// What shutdown must be able to reach while a browser call holds the registry
-/// lock: each live session's killer and how many operations it has in flight.
+/// What shutdown keeps per live session beside the session locks: whether its
+/// killer has been fired and whether that kill was confirmed, and how many
+/// operations are in flight on it.
 ///
-/// Lock order: this lock is taken either on its own or while already holding
-/// the registry lock, never the other way round. It is never held across a
-/// kill, a wait, or any other I/O; killers are cloned out before they fire.
+/// Lock order: this lock (L3 below) is always taken last, after the registry
+/// lock or a session's meta lock, never before either. It is never held across
+/// a kill, a wait, or any other I/O; killers fire with no lock held.
 #[derive(Default)]
 struct ShutdownSide {
     plan: Option<ShutdownPlan>,
@@ -660,7 +686,6 @@ struct ShutdownSide {
 
 struct RouteKillSwitch {
     browser_session_id: String,
-    killer: Option<Arc<dyn BrowserKiller>>,
     in_flight: usize,
     kill_attempted: bool,
     killed: bool,
@@ -674,8 +699,232 @@ pub trait SessionCleanup: Send {
     fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage>;
 }
 
-struct ReadySession {
-    browser_session_id: String,
+// Session locking.
+//
+// Four kinds of lock guard the session table:
+//
+// - L1, the registry: which session is active on each route and the records
+//   of the ones that ended. Held only for a lookup, an insert or a removal.
+// - L2, one meta lock per session: its lifecycle, lease, pending-operation
+//   count, terminal outcome, cleanup result, handoff and cleanup handle. Held
+//   only briefly, and it has its own condition variable.
+// - LD, one driver lock per session: the browser process and its CDP pipe. It
+//   is the only lock held across CDP I/O, and it keeps one writer per pipe.
+// - L3, the shutdown side (`ShutdownSide`).
+//
+// Order: L1 -> L2 -> L3, and LD -> L2 -> L3. L1 and LD are never held
+// together, and LD is only ever taken with no other lock held. No kill, sleep
+// or process I/O happens under L1, L2 or L3, and the only I/O under LD is a
+// driver call. A thread drops L2 after a condition-variable wait before it
+// takes LD, and drops LD before any wait on the registry's condition variable.
+// Debug builds check every lock taken against these rules (`lock_scope`).
+//
+// So one route's slow CDP call holds only that session's LD: other routes, and
+// status on the same route, never wait for it.
+//
+// Poison policy, per lock:
+// - L1 and L2: a site that answers a caller refuses; release, teardown and
+//   shutdown recover the guard.
+// - LD: a driver call refuses (`NavigationDriveError::StateUnavailable`),
+//   because a call that panicked mid-command may have left the pipe
+//   half-written; teardown and shutdown recover it to stop the browser.
+
+/// Debug-build bookkeeping of which session locks this thread holds, so the
+/// lock order above is checked on every lock taken rather than only stated.
+mod lock_scope {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Kind {
+        Registry = 0,
+        Meta = 1,
+        Driver = 2,
+    }
+
+    thread_local! {
+        static HELD: Cell<[u32; 3]> = const { Cell::new([0; 3]) };
+    }
+
+    fn held() -> [u32; 3] {
+        HELD.with(Cell::get)
+    }
+
+    fn adjust(kind: Kind, up: bool) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        HELD.with(|held| {
+            let mut counts = held.get();
+            let count = &mut counts[kind as usize];
+            *count = if up {
+                count.saturating_add(1)
+            } else {
+                count.saturating_sub(1)
+            };
+            held.set(counts);
+        });
+    }
+
+    /// Marks one held lock of `kind` for as long as it lives.
+    pub(super) struct Held(Kind);
+
+    impl Held {
+        /// Check the order before the lock is taken, then count it as held.
+        pub(super) fn enter(kind: Kind) -> Self {
+            let [registry, meta, driver] = held();
+            match kind {
+                Kind::Registry => debug_assert!(
+                    registry == 0 && meta == 0 && driver == 0,
+                    "the session registry lock is taken with no other session lock held"
+                ),
+                Kind::Meta => debug_assert!(
+                    meta == 0,
+                    "a session meta lock is never taken while another is held"
+                ),
+                Kind::Driver => debug_assert!(
+                    registry == 0 && meta == 0 && driver == 0,
+                    "a session driver lock is taken with no other session lock held"
+                ),
+            }
+            adjust(kind, true);
+            Self(kind)
+        }
+
+        /// Check that a thread parking on this lock's condition variable holds
+        /// nothing that would stall another thread for the whole wait.
+        pub(super) fn assert_may_park(&self) {
+            let [registry, meta, driver] = held();
+            match self.0 {
+                Kind::Registry => debug_assert!(
+                    meta == 0 && driver == 0,
+                    "waiting on the registry holds no session meta or driver lock"
+                ),
+                Kind::Meta => debug_assert!(
+                    registry == 0 && driver == 0,
+                    "waiting on a session holds no registry or driver lock"
+                ),
+                Kind::Driver => debug_assert!(false, "nothing waits on a driver lock"),
+            }
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            adjust(self.0, false);
+        }
+    }
+}
+
+/// A held session lock, counted by `lock_scope` for as long as it lives.
+struct Locked<'a, T> {
+    guard: MutexGuard<'a, T>,
+    held: lock_scope::Held,
+}
+
+impl<T> std::ops::Deref for Locked<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for Locked<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+/// `Ok` for a clean lock, `Err` carrying the recovered guard for a poisoned
+/// one, so each site picks refusal or recovery by the policy above.
+type LockAttempt<'a, T> = Result<Locked<'a, T>, Locked<'a, T>>;
+
+fn take_lock<T>(mutex: &Mutex<T>, kind: lock_scope::Kind) -> LockAttempt<'_, T> {
+    let held = lock_scope::Held::enter(kind);
+    match mutex.lock() {
+        Ok(guard) => Ok(Locked { guard, held }),
+        Err(poisoned) => Err(Locked {
+            guard: poisoned.into_inner(),
+            held,
+        }),
+    }
+}
+
+/// Take a lock without parking; `None` when another thread holds it. A
+/// poisoned lock is recovered here, because only shutdown uses this.
+fn try_take_lock<T>(mutex: &Mutex<T>, kind: lock_scope::Kind) -> Option<Locked<'_, T>> {
+    let held = lock_scope::Held::enter(kind);
+    match mutex.try_lock() {
+        Ok(guard) => Some(Locked { guard, held }),
+        Err(TryLockError::Poisoned(poisoned)) => Some(Locked {
+            guard: poisoned.into_inner(),
+            held,
+        }),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+fn recovered<G>(attempt: Result<G, G>) -> G {
+    attempt.unwrap_or_else(|guard| guard)
+}
+
+impl<'a, T> Locked<'a, T> {
+    fn wait(self, wake: &Condvar) -> LockAttempt<'a, T> {
+        self.held.assert_may_park();
+        let Locked { guard, held } = self;
+        match wake.wait(guard) {
+            Ok(guard) => Ok(Locked { guard, held }),
+            Err(poisoned) => Err(Locked {
+                guard: poisoned.into_inner(),
+                held,
+            }),
+        }
+    }
+
+    fn wait_timeout(self, wake: &Condvar, timeout: Duration) -> LockAttempt<'a, T> {
+        self.held.assert_may_park();
+        let Locked { guard, held } = self;
+        match wake.wait_timeout(guard, timeout) {
+            Ok((guard, _)) => Ok(Locked { guard, held }),
+            Err(poisoned) => Err(Locked {
+                guard: poisoned.into_inner().0,
+                held,
+            }),
+        }
+    }
+}
+
+/// Where one session is in its life, kept under its meta lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    /// The launch slot is taken and the browser is still starting.
+    Launching,
+    /// The browser process is in the session's driver slot.
+    Ready,
+    /// One terminalizer took the process out of the driver slot. Only it may
+    /// reap the process, run the after-reap cleanup and retire the session.
+    TeardownOwned,
+    /// Teardown finished; its result is in the cleanup fields.
+    Retired,
+    /// The launch failed before readiness and the slot was given back.
+    Abandoned,
+    /// Shutdown could not reach the browser in time. It may still be running
+    /// with its profile open, so profile custody stays held and the route
+    /// stays occupied: a second launch must not open the same profile. The
+    /// next start's launch recovery kills that browser by its exact process
+    /// generation, and only then releases custody.
+    CustodyHeld,
+}
+
+impl Lifecycle {
+    /// Nothing further will happen to the session: every wait on it ends here.
+    fn is_settled(self) -> bool {
+        matches!(self, Self::Retired | Self::Abandoned | Self::CustodyHeld)
+    }
+}
+
+struct SessionMeta {
+    lifecycle: Lifecycle,
     disposition: ProfileDisposition,
     lease: BrowserLease,
     pending_operations: usize,
@@ -683,12 +932,51 @@ struct ReadySession {
     cleanup_failure: Option<CleanupStage>,
     cleanup_outcome: Option<SessionCleanupOutcome>,
     handoff: Option<HandoffState>,
+    /// A `present` has been admitted and has not committed or given up yet.
+    /// A second `present` is refused as `HandoffOpen` meanwhile.
+    handoff_opening: bool,
     next_handoff_generation: u64,
-    process: Option<Box<dyn OwnedBrowserProcess>>,
     cleanup: Option<Box<dyn SessionCleanup>>,
 }
 
-impl ReadySession {
+impl SessionMeta {
+    /// The call-admission fence. It decides whether a NEW driver call may
+    /// start; it does not stop one already running. A call that passed it
+    /// before the session went terminal finishes, including every CDP
+    /// command it issues (a click's mouse press and its release), and only
+    /// later calls are refused. "Terminal" therefore means "no new calls",
+    /// not "no further writes to the browser".
+    fn admits_calls(&self) -> bool {
+        self.lifecycle == Lifecycle::Ready
+            && self.terminal.is_none()
+            && self.cleanup_failure.is_none()
+    }
+
+    fn record(&self, browser_session_id: &str) -> SessionRecord {
+        SessionRecord {
+            browser_session_id: browser_session_id.to_string(),
+            disposition: self.disposition,
+            lease: self.lease.clone(),
+            terminal: self.terminal,
+            cleanup_failure: self.cleanup_failure,
+            cleanup_outcome: self.cleanup_outcome,
+        }
+    }
+}
+
+/// The part of a session that status and close report. An ended session is
+/// kept on its route as one of these plain records.
+#[derive(Clone)]
+struct SessionRecord {
+    browser_session_id: String,
+    disposition: ProfileDisposition,
+    lease: BrowserLease,
+    terminal: Option<BrowserSessionTerminalOutcome>,
+    cleanup_failure: Option<CleanupStage>,
+    cleanup_outcome: Option<SessionCleanupOutcome>,
+}
+
+impl SessionRecord {
     fn status_json<C: MonotonicClock>(&self, clock: &C, wall_now: SystemTime) -> Value {
         if let Some(stage) = self.cleanup_failure {
             return json!({
@@ -723,23 +1011,124 @@ impl ReadySession {
             "lease": self.lease.as_json(clock, wall_now),
         })
     }
+
+    fn close_result(&self) -> Value {
+        if let Some(stage) = self.cleanup_failure {
+            return json!({
+                "outcome": "cleanup_failure",
+                "browser_session_id": self.browser_session_id,
+                "stage": stage.as_str(),
+            });
+        }
+        if let Some(failed_signals) = self
+            .cleanup_outcome
+            .and_then(SessionCleanupOutcome::failed_signals)
+        {
+            return json!({
+                "outcome": "durable_state_at_risk",
+                "browser_session_id": self.browser_session_id,
+                "failed_signals": failed_signals,
+            });
+        }
+        json!({
+            "outcome": self
+                .terminal
+                .unwrap_or(BrowserSessionTerminalOutcome::CleanupFailure)
+                .as_str(),
+            "browser_session_id": self.browser_session_id,
+        })
+    }
+}
+
+/// One browser session and its three per-session locks.
+struct SessionCell {
+    route_key: String,
+    browser_session_id: String,
+    /// L2 and its condition variable.
+    meta: Mutex<SessionMeta>,
+    wake: Condvar,
+    /// LD: the process, and with it the CDP pipe.
+    driver: Mutex<Option<Box<dyn OwnedBrowserProcess>>>,
+    /// Set once when the browser is established and never changed, so
+    /// shutdown can fire it without taking any lock.
+    killer: OnceLock<Arc<dyn BrowserKiller>>,
+    /// Set once when the browser is established, so exit observation can ask
+    /// whether the browser is still running without waiting for a call in
+    /// progress to give LD back.
+    exit_probe: OnceLock<Arc<dyn BrowserExitProbe>>,
+}
+
+impl SessionCell {
+    fn launching(route_key: &str, browser_session_id: String) -> Self {
+        Self {
+            route_key: route_key.to_string(),
+            browser_session_id,
+            meta: Mutex::new(SessionMeta {
+                lifecycle: Lifecycle::Launching,
+                disposition: ProfileDisposition::None,
+                lease: BrowserLease {
+                    idle_timeout_ms: 1,
+                    monotonic_deadline: MonoInstant::from_nanos(0),
+                },
+                pending_operations: 0,
+                terminal: None,
+                cleanup_failure: None,
+                cleanup_outcome: None,
+                handoff: None,
+                handoff_opening: false,
+                next_handoff_generation: 0,
+                cleanup: None,
+            }),
+            wake: Condvar::new(),
+            driver: Mutex::new(None),
+            killer: OnceLock::new(),
+            exit_probe: OnceLock::new(),
+        }
+    }
+
+    fn meta(&self) -> LockAttempt<'_, SessionMeta> {
+        take_lock(&self.meta, lock_scope::Kind::Meta)
+    }
+
+    fn driver(&self) -> LockAttempt<'_, Option<Box<dyn OwnedBrowserProcess>>> {
+        take_lock(&self.driver, lock_scope::Kind::Driver)
+    }
+
+    fn try_driver(&self) -> Option<Locked<'_, Option<Box<dyn OwnedBrowserProcess>>>> {
+        try_take_lock(&self.driver, lock_scope::Kind::Driver)
+    }
+
+    fn notify(&self) {
+        self.wake.notify_all();
+    }
+
+    /// Wait, without bound, until the session is settled. Joins another
+    /// thread's teardown, so a poisoned lock is recovered as teardown does.
+    fn wait_settled(&self) {
+        let mut meta = recovered(self.meta());
+        while !meta.lifecycle.is_settled() {
+            meta = recovered(meta.wait(&self.wake));
+        }
+    }
 }
 
 #[derive(Default)]
-struct RouteSessions {
-    active: Option<ReadySession>,
-    retained: Vec<ReadySession>,
+struct RouteSlot {
+    active: Option<Arc<SessionCell>>,
+    retained: Vec<SessionRecord>,
     next_session: u64,
 }
 
 #[derive(Default)]
-struct SessionState {
-    routes: HashMap<String, RouteSessions>,
+struct Registry {
+    routes: HashMap<String, RouteSlot>,
 }
 
 #[derive(Clone, Default)]
 pub struct BrowserSessions {
-    inner: Arc<(Mutex<SessionState>, Condvar)>,
+    /// L1 and the registry's condition variable.
+    registry: Arc<(Mutex<Registry>, Condvar)>,
+    /// L3.
     shutdown: Arc<Mutex<ShutdownSide>>,
 }
 
@@ -764,19 +1153,71 @@ pub enum DispatchAdmission {
     StateUnavailable,
 }
 
+/// A launched browser that the session table would not take, handed back so
+/// the caller decides how to stop it rather than it being installed into a
+/// session nobody will tear down.
+pub struct UnestablishedBrowser {
+    pub process: Box<dyn OwnedBrowserProcess>,
+    pub cleanup: Box<dyn SessionCleanup>,
+}
+
+impl std::fmt::Debug for UnestablishedBrowser {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UnestablishedBrowser")
+    }
+}
+
+/// Which per-session lock a test poisons.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLockForTest {
+    Meta,
+    Driver,
+}
+
 pub struct OperationGuard {
     sessions: BrowserSessions,
-    route_key: String,
-    /// The session this operation was admitted on. A shutdown that stopped
-    /// waiting for the operation may have replaced the route's session by the
-    /// time it finishes, and its release must not touch a newer session's count.
-    browser_session_id: String,
+    /// The session this operation was admitted on. The route may hold a newer
+    /// session by the time the operation ends, and its release must not touch
+    /// that session's count.
+    cell: Arc<SessionCell>,
+    /// This operation is a `present` holding the handoff reservation.
+    handoff_reservation: bool,
     finished: bool,
 }
 
 impl OperationGuard {
     pub fn finish(mut self) {
         self.release();
+    }
+
+    /// Run one driver call on this operation's own browser.
+    ///
+    /// LD is taken first, with no other lock held; the fence is then checked
+    /// under the meta lock, which is dropped before the call, so the CDP call
+    /// holds this session's LD and nothing else.
+    fn drive<T, E>(
+        &mut self,
+        refused: impl Fn(NavigationDriveError) -> E,
+        call: impl FnOnce(&mut dyn OwnedBrowserProcess) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut driver = self
+            .cell
+            .driver()
+            .map_err(|_| refused(NavigationDriveError::StateUnavailable))?;
+        {
+            let meta = self
+                .cell
+                .meta()
+                .map_err(|_| refused(NavigationDriveError::StateUnavailable))?;
+            if !meta.admits_calls() {
+                return Err(refused(NavigationDriveError::Unavailable));
+            }
+        }
+        let process = driver
+            .as_mut()
+            .ok_or_else(|| refused(NavigationDriveError::Unavailable))?;
+        call(process.as_mut())
     }
 
     pub(crate) fn navigate(
@@ -787,20 +1228,10 @@ impl OperationGuard {
         deadline_ms: u64,
         tracker: &mut Tracker,
     ) -> Result<(), NavigationDriveError> {
-        let mut state = self
-            .sessions
-            .inner
-            .0
-            .lock()
-            .map_err(|_| NavigationDriveError::Unavailable)?;
-        let process = state
-            .routes
-            .get_mut(&self.route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
-            .and_then(|session| session.process.as_mut())
-            .ok_or(NavigationDriveError::Unavailable)?;
-        process.navigate(context_key, url, wait, deadline_ms, tracker)
+        self.drive(
+            |error| error,
+            |process| process.navigate(context_key, url, wait, deadline_ms, tracker),
+        )
     }
 
     pub(crate) fn snapshot_classified(
@@ -811,25 +1242,17 @@ impl OperationGuard {
         current_origin: &str,
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-        let mut state = self
-            .sessions
-            .inner
-            .0
-            .lock()
-            .map_err(|_| NavigationDriveError::Unavailable)?;
-        let process = state
-            .routes
-            .get_mut(&self.route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
-            .and_then(|session| session.process.as_mut())
-            .ok_or(NavigationDriveError::Unavailable)?;
-        process.snapshot_classified(
-            context_key,
-            mode,
-            document_epoch,
-            current_origin,
-            deadline_ms,
+        self.drive(
+            |error| error,
+            |process| {
+                process.snapshot_classified(
+                    context_key,
+                    mode,
+                    document_epoch,
+                    current_origin,
+                    deadline_ms,
+                )
+            },
         )
     }
 
@@ -840,20 +1263,10 @@ impl OperationGuard {
         deadline_ms: u64,
         full: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
-        let mut state = self
-            .sessions
-            .inner
-            .0
-            .lock()
-            .map_err(|_| NavigationDriveError::Unavailable)?;
-        let process = state
-            .routes
-            .get_mut(&self.route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
-            .and_then(|session| session.process.as_mut())
-            .ok_or(NavigationDriveError::Unavailable)?;
-        process.screenshot(context_key, document_epoch, deadline_ms, full)
+        self.drive(
+            |error| error,
+            |process| process.screenshot(context_key, document_epoch, deadline_ms, full),
+        )
     }
 
     pub(crate) fn click_point(
@@ -863,22 +1276,9 @@ impl OperationGuard {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
-        let mut state = self
-            .sessions
-            .inner
-            .0
-            .lock()
-            .map_err(|_| ClickPointDriveError::Navigation(NavigationDriveError::Unavailable))?;
-        let process = state
-            .routes
-            .get_mut(&self.route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
-            .and_then(|session| session.process.as_mut())
-            .ok_or(ClickPointDriveError::Navigation(
-                NavigationDriveError::Unavailable,
-            ))?;
-        process.click_point(context_key, position, deadline_ms, input_dispatched)
+        self.drive(ClickPointDriveError::Navigation, |process| {
+            process.click_point(context_key, position, deadline_ms, input_dispatched)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -892,58 +1292,55 @@ impl OperationGuard {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
-        let mut state = self
+        self.drive(ClickDriveError::Navigation, |process| {
+            process.click_classified(
+                context_key,
+                identity,
+                document_epoch,
+                current_origin,
+                expected,
+                deadline_ms,
+                input_dispatched,
+            )
+        })
+    }
+
+    /// Give the admission back while the caller holds this session's meta
+    /// lock. The caller notifies the session's condition variable after
+    /// dropping that lock.
+    fn release_locked(&mut self, meta: &mut SessionMeta) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        meta.pending_operations = meta.pending_operations.saturating_sub(1);
+        if self.handoff_reservation {
+            meta.handoff_opening = false;
+        }
+        if let Some(switch) = self
             .sessions
-            .inner
-            .0
-            .lock()
-            .map_err(|_| ClickDriveError::Navigation(NavigationDriveError::Unavailable))?;
-        let process = state
+            .side()
             .routes
-            .get_mut(&self.route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| session.terminal.is_none() && session.cleanup_failure.is_none())
-            .and_then(|session| session.process.as_mut())
-            .ok_or(ClickDriveError::Navigation(
-                NavigationDriveError::Unavailable,
-            ))?;
-        process.click_classified(
-            context_key,
-            identity,
-            document_epoch,
-            current_origin,
-            expected,
-            deadline_ms,
-            input_dispatched,
-        )
+            .get_mut(&self.cell.route_key)
+            .filter(|switch| switch.browser_session_id == self.cell.browser_session_id)
+        {
+            switch.in_flight = switch.in_flight.saturating_sub(1);
+        }
     }
 
     fn release(&mut self) {
         if self.finished {
             return;
         }
-        let (lock, wake) = &*self.sessions.inner;
-        // Recovered rather than skipped: teardown waits for this count to reach
-        // zero, so skipping the release on a poisoned lock would stall every
-        // later teardown of this route forever.
-        let mut state = recover_poisoned(lock.lock());
-        if let Some(session) = state
-            .routes
-            .get_mut(&self.route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| session.browser_session_id == self.browser_session_id)
+        let cell = Arc::clone(&self.cell);
         {
-            session.pending_operations = session.pending_operations.saturating_sub(1);
+            // Recovered rather than skipped: teardown waits for this count to
+            // reach zero, so skipping the release on a poisoned lock would
+            // stall every later teardown of this session forever.
+            let mut meta = recovered(cell.meta());
+            self.release_locked(&mut meta);
         }
-        if let Some(switch) = recover_poisoned(self.sessions.shutdown.lock())
-            .routes
-            .get_mut(&self.route_key)
-            .filter(|switch| switch.browser_session_id == self.browser_session_id)
-        {
-            switch.in_flight = switch.in_flight.saturating_sub(1);
-        }
-        wake.notify_all();
-        self.finished = true;
+        cell.notify();
     }
 }
 
@@ -953,13 +1350,89 @@ impl Drop for OperationGuard {
     }
 }
 
+/// Close an open handoff with `outcome`, leaving any other state in place.
+fn close_open_handoff(
+    handoff: &mut Option<HandoffState>,
+    outcome: HandoffOutcome,
+) -> Option<HandoffClose> {
+    match handoff.take() {
+        Some(HandoffState::Open(open)) => {
+            let closed = ClosedHandoff {
+                handoff: open,
+                outcome,
+            };
+            let result = handoff_close(&closed, true);
+            *handoff = Some(HandoffState::Closed(closed));
+            Some(result)
+        }
+        other => {
+            *handoff = other;
+            None
+        }
+    }
+}
+
 impl BrowserSessions {
+    fn registry(&self) -> LockAttempt<'_, Registry> {
+        take_lock(&self.registry.0, lock_scope::Kind::Registry)
+    }
+
+    /// The route's active session, or `Err` when the registry is poisoned.
+    fn active_cell(&self, route_key: &str) -> Result<Option<Arc<SessionCell>>, ()> {
+        let registry = self.registry().map_err(|_| ())?;
+        Ok(registry
+            .routes
+            .get(route_key)
+            .and_then(|route| route.active.clone()))
+    }
+
+    fn active_cell_recovering(&self, route_key: &str) -> Option<Arc<SessionCell>> {
+        recovered(self.registry())
+            .routes
+            .get(route_key)
+            .and_then(|route| route.active.clone())
+    }
+
+    fn active_cells_recovering(&self) -> Vec<Arc<SessionCell>> {
+        recovered(self.registry())
+            .routes
+            .values()
+            .filter_map(|route| route.active.clone())
+            .collect()
+    }
+
+    /// Count one admitted operation. Called with the session's meta lock held.
+    fn admit(
+        &self,
+        cell: &Arc<SessionCell>,
+        meta: &mut SessionMeta,
+        handoff_reservation: bool,
+    ) -> OperationGuard {
+        meta.pending_operations = meta.pending_operations.saturating_add(1);
+        if let Some(switch) = self
+            .side()
+            .routes
+            .get_mut(&cell.route_key)
+            .filter(|switch| switch.browser_session_id == cell.browser_session_id)
+        {
+            switch.in_flight = switch.in_flight.saturating_add(1);
+        }
+        OperationGuard {
+            sessions: self.clone(),
+            cell: Arc::clone(cell),
+            handoff_reservation,
+            finished: false,
+        }
+    }
+
     pub fn acquire_launch_slot(&self, route_key: &str) -> LaunchSlot {
-        let mut state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
-            Ok(state) => state,
-            Err(refusal) => return LaunchSlot::Refused(refusal),
+        let mut registry = match self.registry() {
+            Ok(registry) => registry,
+            Err(_) => {
+                return LaunchSlot::Refused(internal_failure_reply(BROWSER_SESSION_LOCK_STAGE))
+            }
         };
-        let route = state.routes.entry(route_key.to_string()).or_default();
+        let route = registry.routes.entry(route_key.to_string()).or_default();
         if let Some(active) = route.active.as_ref() {
             return LaunchSlot::Occupied {
                 browser_session_id: active.browser_session_id.clone(),
@@ -971,33 +1444,49 @@ impl BrowserSessions {
             stable_route_id(route_key),
             route.next_session
         );
-        route.active = Some(ReadySession {
-            browser_session_id: browser_session_id.clone(),
-            disposition: ProfileDisposition::None,
-            lease: BrowserLease {
-                idle_timeout_ms: 1,
-                monotonic_deadline: MonoInstant::from_nanos(0),
-            },
-            pending_operations: 0,
-            terminal: None,
-            cleanup_failure: None,
-            cleanup_outcome: None,
-            handoff: None,
-            next_handoff_generation: 0,
-            process: None,
-            cleanup: None,
-        });
+        route.active = Some(Arc::new(SessionCell::launching(
+            route_key,
+            browser_session_id.clone(),
+        )));
         LaunchSlot::Acquired { browser_session_id }
     }
 
+    /// Give back a launch slot whose launch failed before readiness.
     pub fn abandon_launch_slot(&self, route_key: &str) {
-        let mut state = recover_poisoned(self.inner.0.lock());
-        if let Some(route) = state.routes.get_mut(route_key) {
-            route.active = None;
+        let removed = {
+            let mut registry = recovered(self.registry());
+            let Some(route) = registry.routes.get_mut(route_key) else {
+                return;
+            };
+            let Some(cell) = route.active.as_ref() else {
+                return;
+            };
+            // Marked while the registry lock is still held, so an
+            // establishment that already found this session sees it abandoned
+            // and hands its browser back instead of installing it.
+            {
+                let mut meta = recovered(cell.meta());
+                if meta.lifecycle != Lifecycle::Launching {
+                    return;
+                }
+                meta.lifecycle = Lifecycle::Abandoned;
+            }
+            route.active.take()
+        };
+        if let Some(cell) = removed {
+            cell.notify();
         }
-        self.inner.1.notify_all();
+        self.registry.1.notify_all();
     }
 
+    /// Install a launched browser in the route's launching session.
+    ///
+    /// Returns the session id, its lease, and whether the session went
+    /// terminal while the browser was starting (a close won the race), in
+    /// which case the terminalizer now tears it down. A browser the table will
+    /// not take (the slot was abandoned or the table is poisoned) is dropped
+    /// here, outside every lock; use [`Self::try_establish_ready`] to get it
+    /// back instead.
     pub fn establish_ready<C: MonotonicClock>(
         &self,
         route_key: &str,
@@ -1007,84 +1496,155 @@ impl BrowserSessions {
         process: Box<dyn OwnedBrowserProcess>,
         cleanup: Box<dyn SessionCleanup>,
     ) -> Option<(String, BrowserLease, bool)> {
-        let mut state = self.inner.0.lock().ok()?;
-        let session = state.routes.get_mut(route_key)?.active.as_mut()?;
-        session.disposition = disposition;
-        session.lease = BrowserLease::established(config.browser_idle_timeout_ms, clock);
+        self.try_establish_ready(route_key, disposition, config, clock, process, cleanup)
+            .ok()
+    }
+
+    /// [`Self::establish_ready`], handing a refused browser back.
+    pub fn try_establish_ready<C: MonotonicClock>(
+        &self,
+        route_key: &str,
+        disposition: ProfileDisposition,
+        config: &BrowserConfig,
+        clock: &C,
+        process: Box<dyn OwnedBrowserProcess>,
+        cleanup: Box<dyn SessionCleanup>,
+    ) -> Result<(String, BrowserLease, bool), UnestablishedBrowser> {
+        let Ok(Some(cell)) = self.active_cell(route_key) else {
+            return Err(UnestablishedBrowser { process, cleanup });
+        };
         let killer = process.shutdown_killer();
-        session.process = Some(process);
-        session.cleanup = Some(cleanup);
+        let exit_probe = process.exit_probe();
+        // LD first, then the meta lock: the permitted order. Nothing has run
+        // on this driver slot yet, so a poisoned one holds nothing to protect.
+        let mut driver = recovered(cell.driver());
+        let Ok(mut meta) = cell.meta() else {
+            return Err(UnestablishedBrowser { process, cleanup });
+        };
+        if meta.lifecycle != Lifecycle::Launching {
+            drop(meta);
+            drop(driver);
+            return Err(UnestablishedBrowser { process, cleanup });
+        }
+        *driver = Some(process);
+        if let Some(killer) = killer {
+            let _ = cell.killer.set(killer);
+        }
+        if let Some(exit_probe) = exit_probe {
+            let _ = cell.exit_probe.set(exit_probe);
+        }
+        meta.disposition = disposition;
+        meta.lease = BrowserLease::established(config.browser_idle_timeout_ms, clock);
+        meta.cleanup = Some(cleanup);
+        meta.lifecycle = Lifecycle::Ready;
         let result = (
-            session.browser_session_id.clone(),
-            session.lease.clone(),
-            session.terminal.is_some(),
+            cell.browser_session_id.clone(),
+            meta.lease.clone(),
+            meta.terminal.is_some(),
         );
-        // Registered while the registry lock is held, which is the permitted
-        // order, so shutdown can never see the session without its switch.
+        // Registered while the meta lock is held, the permitted order, so
+        // shutdown never sees the session ready without its switch.
         self.side().routes.insert(
             route_key.to_string(),
             RouteKillSwitch {
                 browser_session_id: result.0.clone(),
-                killer,
                 in_flight: 0,
                 kill_attempted: false,
                 killed: false,
             },
         );
-        self.inner.1.notify_all();
-        Some(result)
+        cell.notify();
+        drop(meta);
+        drop(driver);
+        Ok(result)
     }
 
     #[doc(hidden)]
     pub fn wait_until_terminal_for_test(&self, route_key: &str) {
-        let mut state = recover_poisoned(self.inner.0.lock());
-        while state
-            .routes
-            .get(route_key)
-            .and_then(|route| route.active.as_ref())
-            .is_some_and(|session| session.terminal.is_none())
-        {
-            state = recover_poisoned(self.inner.1.wait(state));
+        let Some(cell) = self.active_cell_recovering(route_key) else {
+            return;
+        };
+        let mut meta = recovered(cell.meta());
+        while meta.terminal.is_none() && !meta.lifecycle.is_settled() {
+            meta = recovered(meta.wait(&cell.wake));
         }
     }
 
     /// Wait for another thread's teardown of this route to finish. This joins
-    /// a teardown, so it recovers a poisoned lock like the teardown does.
+    /// a teardown, so it recovers a poisoned lock like the teardown does. A
+    /// session whose custody shutdown had to leave held never leaves the
+    /// route, so that ends the wait too.
     pub fn wait_until_inactive(&self, route_key: &str) {
-        let mut state = recover_poisoned(self.inner.0.lock());
-        while state
-            .routes
-            .get(route_key)
-            .and_then(|route| route.active.as_ref())
-            .is_some()
-        {
-            state = recover_poisoned(self.inner.1.wait(state));
+        let mut registry = recovered(self.registry());
+        loop {
+            let Some(cell) = registry
+                .routes
+                .get(route_key)
+                .and_then(|route| route.active.as_ref())
+            else {
+                return;
+            };
+            if recovered(cell.meta()).lifecycle == Lifecycle::CustodyHeld {
+                return;
+            }
+            registry = recovered(registry.wait(&self.registry.1));
         }
     }
 
-    /// Poison the session table's lock by panicking on a thread that holds it,
-    /// so tests can drive every entry point over a poisoned lock.
+    /// Poison the session registry's lock by panicking on a thread that holds
+    /// it, so tests can drive every entry point over a poisoned lock.
     #[doc(hidden)]
     pub fn poison_for_test(&self) {
         let sessions = self.clone();
         let _ = std::thread::spawn(move || {
-            let _guard = sessions.inner.0.lock();
-            panic!("poisoning the browser session lock for a test");
+            let _guard = sessions.registry();
+            panic!("poisoning the browser session registry lock for a test");
+        })
+        .join();
+    }
+
+    /// Poison one of the route's active session's own locks.
+    #[doc(hidden)]
+    pub fn poison_session_lock_for_test(&self, route_key: &str, lock: SessionLockForTest) {
+        let Some(cell) = self.active_cell_recovering(route_key) else {
+            return;
+        };
+        let _ = std::thread::spawn(move || match lock {
+            SessionLockForTest::Meta => {
+                let _guard = cell.meta();
+                panic!("poisoning a browser session meta lock for a test");
+            }
+            SessionLockForTest::Driver => {
+                let _guard = cell.driver();
+                panic!("poisoning a browser session driver lock for a test");
+            }
         })
         .join();
     }
 
     #[doc(hidden)]
     pub fn lease_deadline_for_test(&self, route_key: &str) -> Option<MonoInstant> {
-        let state = self.inner.0.lock().ok()?;
-        let route = state.routes.get(route_key)?;
-        route
-            .active
-            .as_ref()
-            .or_else(|| route.retained.last())
-            .map(|session| session.lease.deadline())
+        let retained = {
+            let registry = self.registry().ok()?;
+            let route = registry.routes.get(route_key)?;
+            match route.active.clone() {
+                Some(cell) => Err(cell),
+                None => Ok(route.retained.last().map(|record| record.lease.deadline())),
+            }
+        };
+        match retained {
+            Ok(deadline) => deadline,
+            Err(cell) => Some(cell.meta().ok()?.lease.deadline()),
+        }
     }
 
+    /// Bring the browser's page to the front for a person to log in.
+    ///
+    /// An admitted operation: it passes the call fence, counts as pending (so
+    /// idle expiry and teardown wait for it), and reserves the handoff so a
+    /// second `present` is refused while this one runs. Its CDP calls hold
+    /// only this session's driver lock. It commits only if the session is
+    /// still ready and admitting calls.
     pub fn present<C: MonotonicClock>(
         &self,
         route_key: &str,
@@ -1092,49 +1652,57 @@ impl BrowserSessions {
         deadline_ms: u64,
         clock: &C,
     ) -> Result<PresentedHandoff, PresentRefusal> {
-        let mut state = self.inner.0.lock().map_err(|_| PresentRefusal::NoSession)?;
-        let session = state
-            .routes
-            .get_mut(route_key)
-            .and_then(|route| route.active.as_mut())
-            .filter(|session| {
-                session.process.is_some()
-                    && session.terminal.is_none()
-                    && session.cleanup_failure.is_none()
-                    && clock.now() < session.lease.deadline()
-            })
+        let cell = self
+            .active_cell(route_key)
+            .ok()
+            .flatten()
             .ok_or(PresentRefusal::NoSession)?;
-        if matches!(session.handoff, Some(HandoffState::Open(_))) {
-            return Err(PresentRefusal::HandoffOpen);
-        }
+        let mut admission = {
+            let mut meta = cell.meta().map_err(|_| PresentRefusal::NoSession)?;
+            if !meta.admits_calls() || clock.now() >= meta.lease.deadline() {
+                return Err(PresentRefusal::NoSession);
+            }
+            if meta.handoff_opening || matches!(meta.handoff, Some(HandoffState::Open(_))) {
+                return Err(PresentRefusal::HandoffOpen);
+            }
+            meta.handoff_opening = true;
+            self.admit(&cell, &mut meta, true)
+        };
 
-        let process = session.process.as_mut().ok_or(PresentRefusal::NoSession)?;
-        let current_url = process
-            .main_frame_url(route_key, deadline_ms)
-            .map_err(|error| PresentRefusal::PresentFailed {
-                error_text: navigation_drive_error_text(error),
+        let opening_cookie_names = {
+            let mut driver = cell.driver().map_err(|_| PresentRefusal::NoSession)?;
+            let process = driver.as_mut().ok_or(PresentRefusal::NoSession)?;
+            let current_url = process
+                .main_frame_url(route_key, deadline_ms)
+                .map_err(|error| PresentRefusal::PresentFailed {
+                    error_text: navigation_drive_error_text(error),
+                })?;
+            let current_origin = main_frame_origin(&current_url);
+            if current_origin != origin {
+                return Err(PresentRefusal::OriginMismatch { current_origin });
+            }
+            process.present(route_key, deadline_ms).map_err(|error| {
+                PresentRefusal::PresentFailed {
+                    error_text: navigation_drive_error_text(error),
+                }
             })?;
-        let current_origin = main_frame_origin(&current_url);
-        if current_origin != origin {
-            return Err(PresentRefusal::OriginMismatch { current_origin });
-        }
-        process
-            .present(route_key, deadline_ms)
-            .map_err(|error| PresentRefusal::PresentFailed {
-                error_text: navigation_drive_error_text(error),
-            })?;
-        let opening_cookie_names = process
-            .cookie_names_for_origin(route_key, origin, deadline_ms)
-            .map_err(|error| PresentRefusal::PresentFailed {
-                error_text: navigation_drive_error_text(error),
-            })?;
+            process
+                .cookie_names_for_origin(route_key, origin, deadline_ms)
+                .map_err(|error| PresentRefusal::PresentFailed {
+                    error_text: navigation_drive_error_text(error),
+                })?
+        };
 
+        let mut meta = cell.meta().map_err(|_| PresentRefusal::NoSession)?;
+        if !meta.admits_calls() {
+            return Err(PresentRefusal::NoSession);
+        }
         let opened_at = clock.now();
         let expires_at = opened_at.saturating_add(Duration::from_millis(HANDOFF_DURATION_MS));
-        session.next_handoff_generation = session.next_handoff_generation.saturating_add(1);
-        let generation = session.next_handoff_generation;
-        session.lease.renew(clock);
-        session.handoff = Some(HandoffState::Open(Handoff {
+        meta.next_handoff_generation = meta.next_handoff_generation.saturating_add(1);
+        let generation = meta.next_handoff_generation;
+        meta.lease.renew(clock);
+        meta.handoff = Some(HandoffState::Open(Handoff {
             generation,
             origin: origin.to_string(),
             opened_at,
@@ -1143,6 +1711,9 @@ impl BrowserSessions {
             saw_credential_field: false,
             cookie_names_added: 0,
         }));
+        admission.release_locked(&mut meta);
+        drop(meta);
+        cell.notify();
         Ok(PresentedHandoff {
             generation,
             expires_in_ms: HANDOFF_DURATION_MS,
@@ -1154,13 +1725,13 @@ impl BrowserSessions {
         route_key: &str,
         clock: &C,
     ) -> Result<HandoffClose, ResumeRefusal> {
-        let mut state = self.inner.0.lock().map_err(|_| ResumeRefusal::NoHandoff)?;
-        let session = state
-            .routes
-            .get_mut(route_key)
-            .and_then(|route| route.active.as_mut())
+        let cell = self
+            .active_cell(route_key)
+            .ok()
+            .flatten()
             .ok_or(ResumeRefusal::NoHandoff)?;
-        let handoff = session.handoff.take().ok_or(ResumeRefusal::NoHandoff)?;
+        let mut meta = cell.meta().map_err(|_| ResumeRefusal::NoHandoff)?;
+        let handoff = meta.handoff.take().ok_or(ResumeRefusal::NoHandoff)?;
         let (closed, should_journal) = match handoff {
             HandoffState::Open(handoff) => (
                 ClosedHandoff {
@@ -1183,15 +1754,9 @@ impl BrowserSessions {
         route_key: &str,
         clock: &C,
     ) -> Option<HumanInControl> {
-        let state = self.inner.0.lock().ok()?;
-        let handoff = state
-            .routes
-            .get(route_key)?
-            .active
-            .as_ref()?
-            .handoff
-            .as_ref()?;
-        match handoff {
+        let cell = self.active_cell(route_key).ok()??;
+        let meta = cell.meta().ok()?;
+        match meta.handoff.as_ref()? {
             HandoffState::Open(handoff) => Some(HumanInControl {
                 origin: handoff.origin.clone(),
                 expires_in_ms: remaining_ms(handoff.expires_at, clock.now()),
@@ -1206,6 +1771,11 @@ impl BrowserSessions {
         }
     }
 
+    /// Check an open handoff for a completed login.
+    ///
+    /// An admitted operation like `present`: its three CDP reads hold only
+    /// this session's driver lock, and its result is committed only if the
+    /// same handoff is still open and the session still admits calls.
     pub fn poll_handoff<C: MonotonicClock>(
         &self,
         route_key: &str,
@@ -1213,57 +1783,75 @@ impl BrowserSessions {
         deadline_ms: u64,
         clock: &C,
     ) -> HandoffPollResult {
-        let mut state = match self.inner.0.lock() {
-            Ok(state) => state,
-            Err(_) => return HandoffPollResult::Gone,
-        };
-        let Some(session) = state
-            .routes
-            .get_mut(route_key)
-            .and_then(|route| route.active.as_mut())
-        else {
+        let Ok(Some(cell)) = self.active_cell(route_key) else {
             return HandoffPollResult::Gone;
         };
-        let Some(HandoffState::Open(handoff)) = session.handoff.as_ref() else {
-            return HandoffPollResult::Gone;
-        };
-        if handoff.generation != generation {
-            return HandoffPollResult::Gone;
-        }
-        if clock.now() >= handoff.expires_at {
-            let HandoffState::Open(handoff) = session.handoff.take().expect("matched open handoff")
-            else {
-                unreachable!("matched open handoff changed under the session lock")
+        let (mut admission, origin, opening_cookie_names, saw_credential_field) = {
+            let Ok(mut meta) = cell.meta() else {
+                return HandoffPollResult::Gone;
             };
-            let closed = ClosedHandoff {
-                handoff,
-                outcome: HandoffOutcome::Expired,
+            let Some(HandoffState::Open(handoff)) = meta.handoff.as_ref() else {
+                return HandoffPollResult::Gone;
             };
-            let result = handoff_close(&closed, true);
-            session.handoff = Some(HandoffState::Closed(closed));
-            return HandoffPollResult::Closed(result);
-        }
+            if handoff.generation != generation {
+                return HandoffPollResult::Gone;
+            }
+            if clock.now() >= handoff.expires_at {
+                return close_open_handoff(&mut meta.handoff, HandoffOutcome::Expired)
+                    .map_or(HandoffPollResult::Gone, HandoffPollResult::Closed);
+            }
+            let origin = handoff.origin.clone();
+            let opening_cookie_names = handoff.opening_cookie_names.clone();
+            let saw_credential_field = handoff.saw_credential_field;
+            if !meta.admits_calls() {
+                return HandoffPollResult::Gone;
+            }
+            meta.lease.renew(clock);
+            let admission = self.admit(&cell, &mut meta, false);
+            (
+                admission,
+                origin,
+                opening_cookie_names,
+                saw_credential_field,
+            )
+        };
 
-        let opening_cookie_names = handoff.opening_cookie_names.clone();
-        let saw_credential_field = handoff.saw_credential_field;
-        let origin = handoff.origin.clone();
-        session.lease.renew(clock);
-        let Some(process) = session.process.as_mut() else {
+        let (current_cookie_names, main_frame_url, has_credential_field_now) = {
+            let Ok(mut driver) = cell.driver() else {
+                return HandoffPollResult::Gone;
+            };
+            let Some(process) = driver.as_mut() else {
+                return HandoffPollResult::Gone;
+            };
+            let Ok(current_cookie_names) =
+                process.cookie_names_for_origin(route_key, &origin, deadline_ms)
+            else {
+                return HandoffPollResult::Open;
+            };
+            let Ok(main_frame_url) = process.main_frame_url(route_key, deadline_ms) else {
+                return HandoffPollResult::Open;
+            };
+            let Ok(has_credential_field_now) = process.has_credential_field(route_key, deadline_ms)
+            else {
+                return HandoffPollResult::Open;
+            };
+            (
+                current_cookie_names,
+                main_frame_url,
+                has_credential_field_now,
+            )
+        };
+
+        let Ok(mut meta) = cell.meta() else {
             return HandoffPollResult::Gone;
         };
-        let current_cookie_names =
-            match process.cookie_names_for_origin(route_key, &origin, deadline_ms) {
-                Ok(names) => names,
-                Err(_) => return HandoffPollResult::Open,
-            };
-        let main_frame_url = match process.main_frame_url(route_key, deadline_ms) {
-            Ok(url) => url,
-            Err(_) => return HandoffPollResult::Open,
-        };
-        let has_credential_field_now = match process.has_credential_field(route_key, deadline_ms) {
-            Ok(value) => value,
-            Err(_) => return HandoffPollResult::Open,
-        };
+        let still_open = matches!(
+            meta.handoff.as_ref(),
+            Some(HandoffState::Open(handoff)) if handoff.generation == generation
+        );
+        if !still_open || !meta.admits_calls() {
+            return HandoffPollResult::Gone;
+        }
         let cookie_names_added = current_cookie_names
             .difference(&opening_cookie_names)
             .count();
@@ -1275,48 +1863,56 @@ impl BrowserSessions {
             &main_frame_url,
             &origin,
         );
-        let Some(HandoffState::Open(handoff)) = session.handoff.as_mut() else {
-            return HandoffPollResult::Gone;
-        };
-        handoff.saw_credential_field |= has_credential_field_now;
-        handoff.cookie_names_added = cookie_names_added;
-        if !observed {
-            return HandoffPollResult::Open;
+        if let Some(HandoffState::Open(handoff)) = meta.handoff.as_mut() {
+            handoff.saw_credential_field |= has_credential_field_now;
+            handoff.cookie_names_added = cookie_names_added;
         }
-        let HandoffState::Open(handoff) = session.handoff.take().expect("matched open handoff")
-        else {
-            unreachable!("matched open handoff changed under the session lock")
+        let result = if observed {
+            close_open_handoff(&mut meta.handoff, HandoffOutcome::LoginObserved)
+                .map_or(HandoffPollResult::Gone, HandoffPollResult::Closed)
+        } else {
+            HandoffPollResult::Open
         };
-        let closed = ClosedHandoff {
-            handoff,
-            outcome: HandoffOutcome::LoginObserved,
-        };
-        let result = handoff_close(&closed, true);
-        session.handoff = Some(HandoffState::Closed(closed));
-        HandoffPollResult::Closed(result)
+        admission.release_locked(&mut meta);
+        drop(meta);
+        cell.notify();
+        result
     }
 
+    /// Report the route's session. Never takes a driver lock, so it answers
+    /// at once even while a call on this route or another is in progress.
     pub fn status<C: MonotonicClock>(
         &self,
         route_key: &str,
         clock: &C,
         wall_now: SystemTime,
     ) -> Value {
-        let state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
-            Ok(state) => state,
-            Err(refusal) => return refusal,
+        let cell = {
+            let registry = match self.registry() {
+                Ok(registry) => registry,
+                Err(_) => return internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
+            };
+            let Some(route) = registry.routes.get(route_key) else {
+                return json!({"outcome": "no_session"});
+            };
+            match route.active.clone() {
+                Some(cell) => cell,
+                None => {
+                    return route
+                        .retained
+                        .last()
+                        .map(|record| record.status_json(clock, wall_now))
+                        .unwrap_or_else(|| json!({"outcome": "no_session"}))
+                }
+            }
         };
-        let Some(route) = state.routes.get(route_key) else {
-            return json!({"outcome": "no_session"});
+        let status = match cell.meta() {
+            Ok(meta) => meta
+                .record(&cell.browser_session_id)
+                .status_json(clock, wall_now),
+            Err(_) => internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
         };
-        if let Some(active) = route.active.as_ref() {
-            return active.status_json(clock, wall_now);
-        }
-        route
-            .retained
-            .last()
-            .map(|session| session.status_json(clock, wall_now))
-            .unwrap_or_else(|| json!({"outcome": "no_session"}))
+        status
     }
 
     pub fn accept_dispatch<C: MonotonicClock>(
@@ -1324,42 +1920,32 @@ impl BrowserSessions {
         route_key: &str,
         clock: &C,
     ) -> DispatchAdmission {
-        let Ok(mut state) = self.inner.0.lock() else {
+        let cell = match self.active_cell(route_key) {
+            Ok(Some(cell)) => cell,
+            Ok(None) => return DispatchAdmission::NoSession,
+            Err(()) => return DispatchAdmission::StateUnavailable,
+        };
+        let Ok(mut meta) = cell.meta() else {
             return DispatchAdmission::StateUnavailable;
         };
-        let Some(session) = state
-            .routes
-            .get_mut(route_key)
-            .and_then(|route| route.active.as_mut())
-        else {
-            return DispatchAdmission::NoSession;
-        };
-        if session.process.is_none() {
+        // A session with no browser in its driver slot answers "launch
+        // pending", as it did when the process lived in the table: that is a
+        // launch still starting, or a teardown that has already taken the
+        // process out.
+        if matches!(
+            meta.lifecycle,
+            Lifecycle::Launching | Lifecycle::TeardownOwned
+        ) {
             return DispatchAdmission::LaunchPending;
         }
-        if session.terminal.is_some() || session.cleanup_failure.is_some() {
+        if !meta.admits_calls() {
             return DispatchAdmission::NoSession;
         }
-        if clock.now() >= session.lease.deadline() {
+        if clock.now() >= meta.lease.deadline() {
             return DispatchAdmission::NoSession;
         }
-        session.lease.renew(clock);
-        session.pending_operations = session.pending_operations.saturating_add(1);
-        let browser_session_id = session.browser_session_id.clone();
-        if let Some(switch) = self
-            .side()
-            .routes
-            .get_mut(route_key)
-            .filter(|switch| switch.browser_session_id == browser_session_id)
-        {
-            switch.in_flight = switch.in_flight.saturating_add(1);
-        }
-        DispatchAdmission::Accepted(OperationGuard {
-            sessions: self.clone(),
-            route_key: route_key.to_string(),
-            browser_session_id,
-            finished: false,
-        })
+        meta.lease.renew(clock);
+        DispatchAdmission::Accepted(self.admit(&cell, &mut meta, false))
     }
 
     pub fn expire_idle<C: MonotonicClock>(
@@ -1368,71 +1954,75 @@ impl BrowserSessions {
         clock: &C,
         config: &BrowserConfig,
     ) -> bool {
-        let (lock, _) = &*self.inner;
-        let mut state = recover_poisoned(lock.lock());
-        let Some(session) = state
-            .routes
-            .get_mut(route_key)
-            .and_then(|route| route.active.as_mut())
-        else {
-            return false;
-        };
-        let now = clock.now();
-        if session.process.is_none()
-            || session.terminal.is_some()
-            || session.pending_operations != 0
-            || session.handoff.as_ref().is_some_and(
-                |handoff| matches!(handoff, HandoffState::Open(open) if now < open.expires_at),
-            )
-            || now < session.lease.deadline()
-        {
-            return false;
+        match self.active_cell_recovering(route_key) {
+            Some(cell) => self.expire_cell(&cell, clock, config),
+            None => false,
         }
-        session.terminal = Some(BrowserSessionTerminalOutcome::IdleExpired);
-        drop(state);
+    }
+
+    fn expire_cell<C: MonotonicClock>(
+        &self,
+        cell: &Arc<SessionCell>,
+        clock: &C,
+        config: &BrowserConfig,
+    ) -> bool {
+        {
+            let mut meta = recovered(cell.meta());
+            let now = clock.now();
+            if meta.lifecycle != Lifecycle::Ready
+                || meta.terminal.is_some()
+                || meta.pending_operations != 0
+                || meta.handoff.as_ref().is_some_and(
+                    |handoff| matches!(handoff, HandoffState::Open(open) if now < open.expires_at),
+                )
+                || now < meta.lease.deadline()
+            {
+                return false;
+            }
+            meta.terminal = Some(BrowserSessionTerminalOutcome::IdleExpired);
+        }
+        cell.notify();
         self.finish_teardown(
-            route_key,
+            cell,
             BrowserSessionTerminalOutcome::IdleExpired,
-            config,
+            configured_grace(config),
         );
         true
     }
 
+    /// Tear down every session whose browser has exited on its own.
+    ///
+    /// Asks each browser's exit probe, which never waits for a call in
+    /// progress. A browser without a probe is checked through its driver slot
+    /// only when that slot is free; a busy one is looked at on the next sweep,
+    /// and its call in progress fails on its own if the browser is gone.
     pub fn observe_exits_all(&self, config: &BrowserConfig) {
-        let route_keys = recover_poisoned(self.inner.0.lock())
-            .routes
-            .iter()
-            .filter_map(|(route_key, route)| {
-                route
-                    .active
-                    .as_ref()
-                    .filter(|session| {
-                        session.terminal.is_none()
-                            && session
-                                .process
-                                .as_ref()
-                                .is_some_and(|process| !process.generation_matches())
-                    })
-                    .map(|_| route_key.clone())
-            })
-            .collect::<Vec<_>>();
-        for route_key in route_keys {
-            self.teardown_route(
-                &route_key,
-                BrowserSessionTerminalOutcome::BrowserCrashed,
-                config,
-            );
+        for cell in self.active_cells_recovering() {
+            {
+                let meta = recovered(cell.meta());
+                if meta.terminal.is_some() || meta.lifecycle != Lifecycle::Ready {
+                    continue;
+                }
+            }
+            let exited = match cell.exit_probe.get() {
+                Some(probe) => !probe.generation_matches(),
+                None => cell.try_driver().is_some_and(|driver| {
+                    driver
+                        .as_ref()
+                        .is_some_and(|process| !process.generation_matches())
+                }),
+            };
+            if exited {
+                // The collected session itself, not whatever the route holds
+                // now, so a session that replaced it is not torn down.
+                self.teardown_cell(&cell, BrowserSessionTerminalOutcome::BrowserCrashed, config);
+            }
         }
     }
 
     pub fn expire_all<C: MonotonicClock>(&self, clock: &C, config: &BrowserConfig) {
-        let route_keys = recover_poisoned(self.inner.0.lock())
-            .routes
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        for route_key in route_keys {
-            self.expire_idle(&route_key, clock, config);
+        for cell in self.active_cells_recovering() {
+            self.expire_cell(&cell, clock, config);
         }
     }
 
@@ -1442,71 +2032,64 @@ impl BrowserSessions {
         browser_session_id: &str,
         config: &BrowserConfig,
     ) -> Value {
-        let terminalizer = {
-            let mut state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
-                Ok(state) => state,
-                Err(refusal) => return refusal,
+        let cell = {
+            let registry = match self.registry() {
+                Ok(registry) => registry,
+                Err(_) => return internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
             };
-            let Some(route) = state.routes.get_mut(route_key) else {
+            let Some(route) = registry.routes.get(route_key) else {
                 return json!({"outcome": "browser_session_not_found"});
             };
             if let Some(retained) = route
                 .retained
                 .iter()
-                .find(|session| session.browser_session_id == browser_session_id)
+                .find(|record| record.browser_session_id == browser_session_id)
             {
-                return close_result(retained);
+                return retained.close_result();
             }
-            let Some(session) = route.active.as_mut() else {
-                return json!({"outcome": "browser_session_not_found"});
+            match route.active.as_ref() {
+                Some(cell) if cell.browser_session_id == browser_session_id => Arc::clone(cell),
+                _ => return json!({"outcome": "browser_session_not_found"}),
+            }
+        };
+        {
+            let mut meta = match cell.meta() {
+                Ok(meta) => meta,
+                Err(_) => return internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
             };
-            if session.browser_session_id != browser_session_id {
-                return json!({"outcome": "browser_session_not_found"});
-            }
-            if let Some(stage) = session.cleanup_failure {
+            if let Some(stage) = meta.cleanup_failure {
                 return json!({
                     "outcome": "cleanup_failure",
                     "browser_session_id": browser_session_id,
                     "stage": stage.as_str(),
                 });
             }
-            let terminalizer = session.terminal.is_none();
-            session
-                .terminal
-                .get_or_insert(BrowserSessionTerminalOutcome::Closed);
-            self.inner.1.notify_all();
-            terminalizer
-        };
-        if terminalizer {
-            self.finish_teardown(route_key, BrowserSessionTerminalOutcome::Closed, config);
-        } else {
-            let mut state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
-                Ok(state) => state,
-                Err(refusal) => return refusal,
-            };
-            while state
-                .routes
-                .get(route_key)
-                .and_then(|route| route.active.as_ref())
-                .is_some()
-            {
-                state = match refuse_poisoned(self.inner.1.wait(state), BROWSER_SESSION_LOCK_STAGE)
-                {
-                    Ok(state) => state,
-                    Err(refusal) => return refusal,
-                };
+            match meta.lifecycle {
+                Lifecycle::Retired => return meta.record(browser_session_id).close_result(),
+                Lifecycle::Abandoned => return json!({"outcome": "browser_session_not_found"}),
+                _ => {}
             }
+            meta.terminal
+                .get_or_insert(BrowserSessionTerminalOutcome::Closed);
         }
-        let state = match refuse_poisoned(self.inner.0.lock(), BROWSER_SESSION_LOCK_STAGE) {
-            Ok(state) => state,
-            Err(refusal) => return refusal,
+        cell.notify();
+        // Whoever takes the process out of the driver slot owns the teardown;
+        // a close that finds it gone joins that teardown instead.
+        self.finish_teardown(
+            &cell,
+            BrowserSessionTerminalOutcome::Closed,
+            configured_grace(config),
+        );
+        // The result is read from this session itself, so a newer session
+        // launched on the route meanwhile cannot answer for it.
+        let meta = match cell.meta() {
+            Ok(meta) => meta,
+            Err(_) => return internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
         };
-        state
-            .routes
-            .get(route_key)
-            .and_then(|route| route.retained.last())
-            .map(close_result)
-            .unwrap_or_else(|| json!({"outcome": "browser_session_not_found"}))
+        if meta.lifecycle == Lifecycle::Abandoned {
+            return json!({"outcome": "browser_session_not_found"});
+        }
+        meta.record(browser_session_id).close_result()
     }
 
     pub fn teardown_route(
@@ -1515,18 +2098,26 @@ impl BrowserSessions {
         reason: BrowserSessionTerminalOutcome,
         config: &BrowserConfig,
     ) {
-        {
-            let mut state = recover_poisoned(self.inner.0.lock());
-            let Some(session) = state
-                .routes
-                .get_mut(route_key)
-                .and_then(|route| route.active.as_mut())
-            else {
-                return;
-            };
-            session.terminal.get_or_insert(reason);
+        if let Some(cell) = self.active_cell_recovering(route_key) {
+            self.teardown_cell(&cell, reason, config);
         }
-        self.finish_teardown(route_key, reason, config);
+    }
+
+    fn teardown_cell(
+        &self,
+        cell: &Arc<SessionCell>,
+        reason: BrowserSessionTerminalOutcome,
+        config: &BrowserConfig,
+    ) {
+        {
+            let mut meta = recovered(cell.meta());
+            if meta.lifecycle.is_settled() {
+                return;
+            }
+            meta.terminal.get_or_insert(reason);
+        }
+        cell.notify();
+        self.finish_teardown(cell, reason, configured_grace(config));
     }
 
     /// Close every session because the module is shutting down, within
@@ -1548,98 +2139,212 @@ impl BrowserSessions {
             .side()
             .plan
             .get_or_insert_with(|| ShutdownPlan::starting_now(budget));
-        // Marking every route terminal in one pass stops any further driver
-        // call from starting on any of them. After this, the only thing that
-        // can hold the registry lock is a call that was already in progress.
-        let keys = {
-            let mut state = self.lock_for_shutdown(&plan, None);
-            for route in state.routes.values_mut() {
-                if let Some(session) = route.active.as_mut() {
-                    session
-                        .terminal
+        // Marking every session terminal in one pass stops any further call
+        // from being admitted on any of them. Only the brief registry and meta
+        // locks are taken, so nothing here waits on a call in progress.
+        let cells = self.active_cells_recovering();
+        for cell in &cells {
+            {
+                let mut meta = recovered(cell.meta());
+                if !meta.lifecycle.is_settled() {
+                    meta.terminal
                         .get_or_insert(BrowserSessionTerminalOutcome::ModuleShutdown);
                 }
             }
-            self.inner.1.notify_all();
-            state.routes.keys().cloned().collect::<Vec<_>>()
-        };
+            cell.notify();
+        }
+        let grace = configured_grace(config);
         // One thread per session, so the time taken is the slowest session's,
         // not the sum over sessions.
         std::thread::scope(|scope| {
-            for key in keys {
-                scope.spawn(move || self.shutdown_route(&key, config, &plan));
+            for cell in cells {
+                scope.spawn(move || self.shutdown_cell(&cell, grace, &plan));
             }
         });
     }
 
-    /// Tear one route's session down inside the shutdown plan.
+    /// Tear one session down inside the shutdown plan.
     ///
     /// Every wait on this path ends by the plan: operations in progress are
-    /// waited for until `in_flight_until`, the graceful close gets whatever is
-    /// left before `graceful_until`, and the kill, reap and after-reap cleanup
-    /// run in the reserve after it.
-    fn shutdown_route(&self, route_key: &str, config: &BrowserConfig, plan: &ShutdownPlan) {
-        let mut state = self.lock_for_shutdown(plan, Some(route_key));
-        let (browser_session_id, terminal_outcome, mut process, mut cleanup) = loop {
-            let Some(session) = state
-                .routes
-                .get_mut(route_key)
-                .and_then(|route| route.active.as_mut())
-            else {
-                return;
-            };
-            let now = Instant::now();
-            if session.pending_operations != 0 && now < plan.in_flight_until {
-                // Operations between driver calls. Waiting lets them finish
-                // cleanly; once the cap passes, the session is closed under
-                // them and their next driver call is refused.
-                drop(state);
-                std::thread::sleep(SHUTDOWN_POLL);
-                state = self.lock_for_shutdown(plan, Some(route_key));
-                continue;
-            }
-            if session.process.is_none() {
-                // Either a launch has not delivered its process yet, or another
-                // teardown (an idle expiry, a close) is holding it. Neither is
-                // ours to finish. A launch that completes sees the session
-                // already terminal and tears itself down. Another teardown is
-                // joined, but once only the reserve is left, its browser is
-                // killed so that its graceful wait ends early.
-                if now >= plan.deadline {
+    /// waited for until `in_flight_until`; the driver lock is sought until
+    /// `graceful_until`; the graceful close gets whatever is left before
+    /// `graceful_until`; and the kill, reap and after-reap cleanup run in the
+    /// reserve that follows, ending at `deadline`. A browser that cannot be
+    /// reached or finished in that time keeps its profile custody held (see
+    /// [`Lifecycle::CustodyHeld`]).
+    fn shutdown_cell(&self, cell: &Arc<SessionCell>, grace: Duration, plan: &ShutdownPlan) {
+        let in_flight_at_cap = {
+            let mut meta = recovered(cell.meta());
+            loop {
+                if meta.lifecycle.is_settled() {
                     return;
                 }
-                if now >= plan.graceful_until {
-                    self.kill_routes(Some(route_key), false);
+                let now = Instant::now();
+                if meta.lifecycle == Lifecycle::Launching {
+                    // The launch is not ours to finish; once it delivers its
+                    // browser, the session (already terminal) is torn down
+                    // here like any other.
+                    if now >= plan.deadline {
+                        return;
+                    }
+                    meta = recovered(meta.wait_timeout(&cell.wake, plan.deadline - now));
+                    continue;
                 }
-                drop(state);
-                std::thread::sleep(SHUTDOWN_POLL);
-                state = self.lock_for_shutdown(plan, Some(route_key));
-                continue;
+                if meta.pending_operations == 0 {
+                    break false;
+                }
+                if now >= plan.in_flight_until {
+                    break true;
+                }
+                meta = recovered(meta.wait_timeout(&cell.wake, plan.in_flight_until - now));
             }
-            let terminal_outcome = *session
+        };
+        if in_flight_at_cap {
+            // Operations were still in progress when the in-flight wait ran
+            // out. Killing the browser fails the call holding the driver lock,
+            // which gives the lock back.
+            self.kill_cell(cell, true);
+        }
+
+        let driver = loop {
+            if let Some(driver) = cell.try_driver() {
+                break Some(driver);
+            }
+            if Instant::now() >= plan.graceful_until {
+                break None;
+            }
+            std::thread::sleep(SHUTDOWN_POLL);
+        };
+        let Some(mut driver) = driver else {
+            // A call is still holding the driver lock: the killer was refused
+            // or there is none. The browser may still be alive with its
+            // profile open, so custody must not be released under it.
+            self.hold_custody(cell, Lifecycle::Ready);
+            return;
+        };
+        let Some(process) = driver.take() else {
+            drop(driver);
+            self.join_other_teardown(cell, plan);
+            return;
+        };
+        let (terminal_outcome, cleanup) = {
+            let mut meta = recovered(cell.meta());
+            meta.lifecycle = Lifecycle::TeardownOwned;
+            let terminal_outcome = *meta
                 .terminal
                 .get_or_insert(BrowserSessionTerminalOutcome::ModuleShutdown);
-            let Some(process) = session.process.take() else {
-                return;
-            };
-            break (
-                session.browser_session_id.clone(),
-                terminal_outcome,
-                process,
-                session.cleanup.take(),
-            );
+            (terminal_outcome, meta.cleanup.take())
         };
-        drop(state);
+        drop(driver);
+        let already_killed = self.cell_killed(cell);
+        let grace = grace.min(
+            plan.graceful_until
+                .saturating_duration_since(Instant::now()),
+        );
+        self.teardown_within(
+            cell,
+            OwnedTeardown {
+                process,
+                cleanup,
+                terminal_outcome,
+                already_killed,
+                grace,
+            },
+            plan,
+        );
+    }
 
-        let outcome = if self.route_killed(route_key, &browser_session_id) {
+    /// Another terminalizer owns this session's process. Join it without
+    /// touching its state, and once only the reserve is left, kill its
+    /// browser so that its graceful wait ends early.
+    fn join_other_teardown(&self, cell: &Arc<SessionCell>, plan: &ShutdownPlan) {
+        let mut killed = false;
+        let mut meta = recovered(cell.meta());
+        loop {
+            if meta.lifecycle.is_settled() {
+                return;
+            }
+            let now = Instant::now();
+            if now >= plan.deadline {
+                return;
+            }
+            if !killed && now >= plan.graceful_until {
+                drop(meta);
+                self.kill_cell(cell, false);
+                killed = true;
+                meta = recovered(cell.meta());
+                continue;
+            }
+            let until = if killed {
+                plan.deadline
+            } else {
+                plan.graceful_until
+            };
+            meta = recovered(meta.wait_timeout(&cell.wake, until - now));
+        }
+    }
+
+    /// Run an owned teardown on its own thread and wait for it until the
+    /// plan's deadline.
+    ///
+    /// None of the process and cleanup steps takes a deadline of its own:
+    /// the reap waits for the process to be collected, and the after-reap
+    /// cleanup does filesystem and journal work. If they overrun, custody is
+    /// left held rather than letting the shutdown wait past its budget; the
+    /// thread carries on, and if it does finish, it retires the session then.
+    fn teardown_within(&self, cell: &Arc<SessionCell>, owned: OwnedTeardown, plan: &ShutdownPlan) {
+        let slot = Arc::new(Mutex::new(Some(owned)));
+        let run = {
+            let sessions = self.clone();
+            let cell = Arc::clone(cell);
+            let slot = Arc::clone(&slot);
+            move || {
+                if let Some(owned) = recover_poisoned(slot.lock()).take() {
+                    sessions.run_owned_teardown(&cell, owned);
+                }
+            }
+        };
+        if std::thread::Builder::new()
+            .name("browser-shutdown-teardown".to_string())
+            .spawn(run)
+            .is_err()
+        {
+            // No thread could be started. The teardown then runs here,
+            // without the deadline, rather than not at all.
+            if let Some(owned) = recover_poisoned(slot.lock()).take() {
+                self.run_owned_teardown(cell, owned);
+            }
+            return;
+        }
+        {
+            let mut meta = recovered(cell.meta());
+            loop {
+                if meta.lifecycle.is_settled() {
+                    return;
+                }
+                let now = Instant::now();
+                if now >= plan.deadline {
+                    break;
+                }
+                meta = recovered(meta.wait_timeout(&cell.wake, plan.deadline - now));
+            }
+        }
+        self.hold_custody(cell, Lifecycle::TeardownOwned);
+    }
+
+    fn run_owned_teardown(&self, cell: &Arc<SessionCell>, owned: OwnedTeardown) {
+        let OwnedTeardown {
+            mut process,
+            mut cleanup,
+            terminal_outcome,
+            already_killed,
+            grace,
+        } = owned;
+        let outcome = if already_killed {
             // Already dead by the shutdown killer: a graceful close would only
             // write to a closed pipe, so all that is left is the reap.
             process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
         } else {
-            let grace = Duration::from_millis(config.termination_grace_period_ms).min(
-                plan.graceful_until
-                    .saturating_duration_since(Instant::now()),
-            );
             teardown_process_with_grace(process.as_mut(), grace)
         }
         .and_then(|()| {
@@ -1647,198 +2352,204 @@ impl BrowserSessions {
             cleanup.set_terminal_outcome(terminal_outcome);
             cleanup.after_reap()
         });
-        self.retain_torn_down(route_key, &browser_session_id, process, cleanup, outcome);
+        self.retire(cell, process, cleanup, outcome);
     }
 
+    /// Leave the session active with its custody held, if it is still in the
+    /// `expected` state. The route stays occupied, so no second browser opens
+    /// the profile, and the call fence refuses every new call.
+    fn hold_custody(&self, cell: &Arc<SessionCell>, expected: Lifecycle) {
+        {
+            let mut meta = recovered(cell.meta());
+            if meta.lifecycle != expected {
+                return;
+            }
+            meta.lifecycle = Lifecycle::CustodyHeld;
+            meta.cleanup_failure = Some(CleanupStage::CustodyHeld);
+            meta.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
+        }
+        cell.notify();
+        self.registry.1.notify_all();
+    }
+
+    /// L3, always taken last.
     fn side(&self) -> MutexGuard<'_, ShutdownSide> {
         recover_poisoned(self.shutdown.lock())
     }
 
-    /// Take the registry lock for shutdown without ever parking on it.
-    ///
-    /// A plain `lock()` would wait out any browser call in progress, whose
-    /// deadline is operator-configured. Past the in-flight cap, the browsers
-    /// with operations in flight (on `route_key`, or on any route when it is
-    /// `None`) are killed, which fails the call holding the lock and so
-    /// releases it.
-    fn lock_for_shutdown(
-        &self,
-        plan: &ShutdownPlan,
-        route_key: Option<&str>,
-    ) -> MutexGuard<'_, SessionState> {
-        loop {
-            match self.inner.0.try_lock() {
-                Ok(state) => return state,
-                Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => {}
-            }
-            if Instant::now() >= plan.in_flight_until {
-                self.kill_routes(route_key, true);
-            }
-            std::thread::sleep(SHUTDOWN_POLL);
-        }
-    }
-
-    /// Fire the shutdown killer of each matching route, at most once per
-    /// session. With `only_in_flight`, routes with no operation in flight are
-    /// left alone: their browsers still get a graceful close.
-    fn kill_routes(&self, route_key: Option<&str>, only_in_flight: bool) {
-        let targets = {
+    /// Fire this session's shutdown killer, at most once per session, with no
+    /// lock held. With `only_in_flight`, a session with no operation in flight
+    /// is left alone: its browser still gets a graceful close.
+    fn kill_cell(&self, cell: &SessionCell, only_in_flight: bool) {
+        let fire = {
             let mut side = self.side();
-            side.routes
-                .iter_mut()
-                .filter(|(key, switch)| {
-                    route_key.is_none_or(|wanted| wanted == key.as_str())
-                        && (!only_in_flight || switch.in_flight != 0)
-                        && !switch.kill_attempted
-                })
-                .filter_map(|(key, switch)| {
-                    switch.kill_attempted = true;
-                    let killer = switch.killer.clone()?;
-                    Some((key.clone(), switch.browser_session_id.clone(), killer))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (key, browser_session_id, killer) in targets {
-            // Fired with no lock held; the side lock is taken again only to
-            // record the result.
-            if killer.kill_exact_generation() == KillOutcome::Dead {
-                if let Some(switch) = self
-                    .side()
-                    .routes
-                    .get_mut(&key)
-                    .filter(|switch| switch.browser_session_id == browser_session_id)
+            match side
+                .routes
+                .get_mut(&cell.route_key)
+                .filter(|switch| switch.browser_session_id == cell.browser_session_id)
+            {
+                Some(switch)
+                    if !switch.kill_attempted && (!only_in_flight || switch.in_flight != 0) =>
                 {
-                    switch.killed = true;
+                    switch.kill_attempted = true;
+                    true
                 }
+                _ => false,
+            }
+        };
+        if !fire {
+            return;
+        }
+        let Some(killer) = cell.killer.get() else {
+            return;
+        };
+        if killer.kill_exact_generation() == KillOutcome::Dead {
+            if let Some(switch) = self
+                .side()
+                .routes
+                .get_mut(&cell.route_key)
+                .filter(|switch| switch.browser_session_id == cell.browser_session_id)
+            {
+                switch.killed = true;
             }
         }
     }
 
-    fn route_killed(&self, route_key: &str, browser_session_id: &str) -> bool {
+    fn cell_killed(&self, cell: &SessionCell) -> bool {
         self.side()
             .routes
-            .get(route_key)
-            .is_some_and(|switch| switch.browser_session_id == browser_session_id && switch.killed)
+            .get(&cell.route_key)
+            .is_some_and(|switch| {
+                switch.browser_session_id == cell.browser_session_id && switch.killed
+            })
     }
 
     /// Record a finished teardown: the session moves from active to retained
-    /// with its outcome, and its shutdown switch is dropped.
-    fn retain_torn_down(
+    /// with its outcome, and its shutdown switch is dropped. Only the thread
+    /// that took the process out of the driver slot calls this.
+    fn retire(
         &self,
-        route_key: &str,
-        browser_session_id: &str,
+        cell: &Arc<SessionCell>,
         process: Box<dyn OwnedBrowserProcess>,
         cleanup: Option<Box<dyn SessionCleanup>>,
         outcome: Result<SessionCleanupOutcome, CleanupStage>,
     ) {
-        let (lock, wake) = &*self.inner;
-        let mut state = recover_poisoned(lock.lock());
-        let Some(route) = state.routes.get_mut(route_key) else {
-            return;
-        };
-        if route
-            .active
-            .as_ref()
-            .is_none_or(|session| session.browser_session_id != browser_session_id)
-        {
-            return;
-        }
-        let Some(mut session) = route.active.take() else {
-            return;
-        };
-        session.process = Some(process);
-        session.cleanup = cleanup;
+        // The retained record is built before the registry lock is taken.
+        let mut record = recovered(cell.meta()).record(&cell.browser_session_id);
         match outcome {
-            Ok(cleanup_outcome) => session.cleanup_outcome = Some(cleanup_outcome),
+            Ok(cleanup_outcome) => record.cleanup_outcome = Some(cleanup_outcome),
             Err(stage) => {
-                session.cleanup_failure = Some(stage);
-                session.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
+                record.cleanup_failure = Some(stage);
+                record.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
             }
         }
-        route.retained.push(session);
-        {
-            // Taken while holding the registry lock, the permitted order.
-            let mut side = self.side();
-            if side
-                .routes
-                .get(route_key)
-                .is_some_and(|switch| switch.browser_session_id == browser_session_id)
+        let removed = {
+            let mut registry = recovered(self.registry());
+            let removed = match registry.routes.get_mut(&cell.route_key) {
+                Some(route)
+                    if route
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, cell)) =>
+                {
+                    route.retained.push(record.clone());
+                    route.active.take()
+                }
+                _ => None,
+            };
             {
-                side.routes.remove(route_key);
+                let mut meta = recovered(cell.meta());
+                meta.lifecycle = Lifecycle::Retired;
+                meta.terminal = record.terminal;
+                meta.cleanup_failure = record.cleanup_failure;
+                meta.cleanup_outcome = record.cleanup_outcome;
+                let mut side = self.side();
+                if side
+                    .routes
+                    .get(&cell.route_key)
+                    .is_some_and(|switch| switch.browser_session_id == cell.browser_session_id)
+                {
+                    side.routes.remove(&cell.route_key);
+                }
             }
-        }
-        wake.notify_all();
+            removed
+        };
+        cell.notify();
+        self.registry.1.notify_all();
+        // Dropped only now, with every lock released: a process handle that
+        // was never reaped kills and waits for its child when dropped.
+        drop(removed);
+        drop(cleanup);
+        drop(process);
     }
 
+    /// Finish a teardown whose terminal outcome is already set.
+    ///
+    /// Waits for operations in progress to end and for the browser to be
+    /// installed, then takes the process out of the driver slot. Whoever gets
+    /// it owns the reap, the after-reap cleanup and the retirement; anyone
+    /// who finds the slot empty joins that owner by waiting for the session
+    /// to settle, and writes nothing.
     fn finish_teardown(
         &self,
-        route_key: &str,
+        cell: &Arc<SessionCell>,
         reason: BrowserSessionTerminalOutcome,
-        config: &BrowserConfig,
+        grace: Duration,
     ) {
-        let (lock, wake) = &*self.inner;
-        let (browser_session_id, terminal_outcome, mut process, mut cleanup) = {
-            let mut state = recover_poisoned(lock.lock());
-            while state
-                .routes
-                .get(route_key)
-                .and_then(|route| route.active.as_ref())
-                .is_some_and(|session| session.pending_operations != 0)
-            {
-                state = recover_poisoned(wake.wait(state));
-            }
-            let Some(session) = state
-                .routes
-                .get_mut(route_key)
-                .and_then(|route| route.active.as_mut())
-            else {
-                return;
-            };
-            let terminal_outcome = *session.terminal.get_or_insert(reason);
-            while state
-                .routes
-                .get(route_key)
-                .and_then(|route| route.active.as_ref())
-                .is_some_and(|session| session.process.is_none())
-            {
-                state = recover_poisoned(wake.wait(state));
-            }
-            let Some(session) = state
-                .routes
-                .get_mut(route_key)
-                .and_then(|route| route.active.as_mut())
-            else {
-                return;
-            };
-            let Some(process) = session.process.take() else {
-                // Another terminalizer owns the process. Join its reap rather
-                // than reporting success from a second close independently.
-                while state
-                    .routes
-                    .get(route_key)
-                    .and_then(|route| route.active.as_ref())
-                    .is_some()
-                {
-                    state = recover_poisoned(wake.wait(state));
+        let terminal_outcome = {
+            let mut meta = recovered(cell.meta());
+            loop {
+                if meta.lifecycle.is_settled() {
+                    return;
                 }
-                return;
-            };
-            (
-                session.browser_session_id.clone(),
-                terminal_outcome,
-                process,
-                session.cleanup.take(),
-            )
+                if meta.lifecycle == Lifecycle::TeardownOwned {
+                    break None;
+                }
+                if meta.lifecycle == Lifecycle::Ready && meta.pending_operations == 0 {
+                    break Some(*meta.terminal.get_or_insert(reason));
+                }
+                meta = recovered(meta.wait(&cell.wake));
+            }
         };
-
-        let outcome = teardown_process(process.as_mut(), config).and_then(|()| {
+        let Some(terminal_outcome) = terminal_outcome else {
+            cell.wait_settled();
+            return;
+        };
+        // The meta lock is released above before the driver lock is taken.
+        // No operation is admitted and the fence refuses new ones, so the
+        // driver lock is free unless another terminalizer is taking it too.
+        let owned = {
+            let mut driver = recovered(cell.driver());
+            driver.take().map(|process| {
+                let mut meta = recovered(cell.meta());
+                meta.lifecycle = Lifecycle::TeardownOwned;
+                (process, meta.cleanup.take())
+            })
+        };
+        let Some((mut process, mut cleanup)) = owned else {
+            cell.wait_settled();
+            return;
+        };
+        let outcome = teardown_process_with_grace(process.as_mut(), grace).and_then(|()| {
             let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
             cleanup.set_terminal_outcome(terminal_outcome);
             cleanup.after_reap()
         });
-        self.retain_torn_down(route_key, &browser_session_id, process, cleanup, outcome);
+        self.retire(cell, process, cleanup, outcome);
     }
+}
+
+/// What the shutdown teardown thread takes over from `shutdown_cell`.
+struct OwnedTeardown {
+    process: Box<dyn OwnedBrowserProcess>,
+    cleanup: Option<Box<dyn SessionCleanup>>,
+    terminal_outcome: BrowserSessionTerminalOutcome,
+    already_killed: bool,
+    grace: Duration,
+}
+
+fn configured_grace(config: &BrowserConfig) -> Duration {
+    Duration::from_millis(config.termination_grace_period_ms)
 }
 
 /// Login is observed only after a credential field has appeared and then gone,
@@ -1891,46 +2602,10 @@ fn navigation_drive_error_text(error: NavigationDriveError) -> String {
         NavigationDriveError::CommandFailed { error_text }
         | NavigationDriveError::NavigationFailed { error_text } => error_text,
         NavigationDriveError::Unavailable => "browser driver unavailable".to_string(),
+        NavigationDriveError::StateUnavailable => "browser session state unavailable".to_string(),
         NavigationDriveError::ConnectorFailure => "browser connector failure".to_string(),
         NavigationDriveError::CdpFailure => "browser CDP failure".to_string(),
     }
-}
-
-fn close_result(session: &ReadySession) -> Value {
-    if let Some(stage) = session.cleanup_failure {
-        return json!({
-            "outcome": "cleanup_failure",
-            "browser_session_id": session.browser_session_id,
-            "stage": stage.as_str(),
-        });
-    }
-    if let Some(failed_signals) = session
-        .cleanup_outcome
-        .and_then(SessionCleanupOutcome::failed_signals)
-    {
-        return json!({
-            "outcome": "durable_state_at_risk",
-            "browser_session_id": session.browser_session_id,
-            "failed_signals": failed_signals,
-        });
-    }
-    json!({
-        "outcome": session
-            .terminal
-            .unwrap_or(BrowserSessionTerminalOutcome::CleanupFailure)
-            .as_str(),
-        "browser_session_id": session.browser_session_id,
-    })
-}
-
-fn teardown_process(
-    process: &mut dyn OwnedBrowserProcess,
-    config: &BrowserConfig,
-) -> Result<(), CleanupStage> {
-    teardown_process_with_grace(
-        process,
-        Duration::from_millis(config.termination_grace_period_ms),
-    )
 }
 
 fn teardown_process_with_grace(
