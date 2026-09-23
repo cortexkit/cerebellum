@@ -675,3 +675,20 @@ fn login_import_records_count_and_no_cookie_names_or_values() {
     assert!(!export.contains("cookie_value"));
     assert!(!export.contains("encrypted_value"));
 }
+
+/// The v5 fixture is a login-import entry written by the v5 serializer before
+/// the next format existed. Re-serializing the decoded entry must reproduce the
+/// stored bytes exactly: a reader that decodes an old entry into a different
+/// shape would pass a looser check while silently rewriting history.
+#[test]
+fn v5_fixture_reads_back_byte_for_byte() {
+    let fixture = include_str!("fixtures/browser-journal-v5.jsonl");
+    let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v5");
+    assert_eq!(entry.capability, Some(Capability::ImportLogin));
+    assert!(matches!(
+        entry.payload,
+        Some(JournalPayload::LoginImport(_))
+    ));
+    assert_eq!(entry.export_line(), fixture);
+}

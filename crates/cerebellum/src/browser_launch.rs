@@ -2246,6 +2246,24 @@ mod tests {
         }
     }
 
+    /// A launch intent written by the v4 serializer, frozen before the format
+    /// moved on. Recovery reads intents written by whichever build ran before
+    /// this one, so an old record must still decode to the same profile and
+    /// re-encode to the same bytes.
+    #[test]
+    fn frozen_v4_launch_intent_still_decodes_to_a_registry_profile() {
+        let fixture = include_str!("../tests/fixtures/launch-intent-v4.json").trim();
+        let intent: AuthorizedLaunchIntent =
+            serde_json::from_str(fixture).expect("decode frozen v4 launch intent");
+        assert_eq!(intent.format_version, "ck-browser-launch-attestation/v4");
+        assert_eq!(intent.launch_attempt_id, "fixture-v4-attempt");
+        assert_eq!(
+            intent.profile.disposition,
+            cerebellum_core::identity::ProfileDisposition::Durable
+        );
+        assert_eq!(serde_json::to_string(&intent).unwrap(), fixture);
+    }
+
     #[test]
     fn v2_launch_records_encode_every_byte_field_as_base64() {
         let intent = request().durable_intent();
