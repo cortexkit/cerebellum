@@ -329,9 +329,20 @@ impl FilesystemProfileCustodyJournal {
 }
 
 impl ProfileCustodyJournal for FilesystemProfileCustodyJournal {
+    /// Append one event as one `write` of the whole line.
+    ///
+    /// Several supervisors can hold this file open at once: custody exists to
+    /// arbitrate between them, and a draining process overlaps its successor.
+    /// `serde_json::to_writer` on an unbuffered `File` issues a write per
+    /// fragment (brace, key, separator), and appenders interleave BETWEEN
+    /// writes, so two events recorded together tear each other mid-line. A
+    /// line-per-event reader then drops both, and a stale break reads as one
+    /// that never happened. `O_APPEND` places a single line-sized write whole,
+    /// so composing the line first confines interleaving to line boundaries.
     fn record(&mut self, event: &ProfileCustodyEvent) -> io::Result<()> {
-        serde_json::to_writer(&mut self.file, event).map_err(io::Error::other)?;
-        self.file.write_all(b"\n")?;
+        let mut line = serde_json::to_vec(event).map_err(io::Error::other)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
         self.file.sync_all()
     }
 }
@@ -746,4 +757,78 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    /// Concurrent supervisors appending to one custody log lose no event.
+    ///
+    /// Each thread opens its OWN handle, the way two supervisor processes do,
+    /// and records events carrying a long evidence string so a fragment-wise
+    /// writer spans many writes per line. Every complete line must parse and
+    /// every event must be present: a torn pair of lines is dropped by any
+    /// per-line reader and reads as events that never happened.
+    #[test]
+    fn concurrent_appenders_lose_no_custody_event() {
+        let root = std::env::temp_dir().join(format!(
+            "ck-custody-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        const WRITERS: u32 = 8;
+        const EVENTS: u32 = 200;
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut journal = FilesystemProfileCustodyJournal::open(&root).unwrap();
+                    for event in 0..EVENTS {
+                        journal
+                            .record(&ProfileCustodyEvent {
+                                format_version: JOURNAL_FORMAT_VERSION.to_string(),
+                                kind: ProfileCustodyEventKind::StaleBreak,
+                                holder_id: HolderId(format!("holder-{writer}-{event}")),
+                                supervisor: SupervisorGeneration {
+                                    pid: writer,
+                                    start_time: u64::from(event),
+                                },
+                                profile_directory: Some(PathBuf::from(format!(
+                                    "profiles/{writer}/{event}"
+                                ))),
+                                evidence: Some("recorded_supervisor_generation_not_live".repeat(8)),
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let text = fs::read_to_string(root.join(JOURNAL_FILE)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let lines: Vec<&str> = text.lines().collect();
+        let parsed = lines
+            .iter()
+            .filter(|line| serde_json::from_str::<ProfileCustodyEvent>(line).is_ok())
+            .count();
+        assert_eq!(
+            lines.len(),
+            (WRITERS * EVENTS) as usize,
+            "one line per event"
+        );
+        assert_eq!(
+            parsed,
+            lines.len(),
+            "{} of {} custody lines were torn by a concurrent appender",
+            lines.len() - parsed,
+            lines.len()
+        );
+    }
 }
