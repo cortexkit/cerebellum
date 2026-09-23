@@ -2621,7 +2621,9 @@ mod launch_refusal_schema_tests {
             RegistryError::UnknownField("/profiles/0000-uuid".to_string()),
             RegistryError::UnsupportedState,
             RegistryError::Conflict,
-            RegistryError::Untrustworthy(UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts),
+            RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
+            ),
             RegistryError::Untrustworthy(UntrustworthyRegistryReason::MalformedRegistry),
             RegistryError::InvalidTransition,
         ];
