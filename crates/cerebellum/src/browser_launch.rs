@@ -19,10 +19,16 @@ use cerebellum_core::journal::{
 use serde::{Deserialize, Serialize};
 
 pub use crate::browser_launch_readiness::*;
+use crate::profile_custody::{
+    classify_process_generation, GenerationObservation, StartTimeStability, SupervisorLiveness,
+};
 
 const GENERATION_SLOT: &str = "browser.launch.generation";
 const ATTESTATION_SLOT: &str = "browser.launch.attestation";
-const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v3";
+/// Version 4 added `boot_id` to the process generation. When present, the
+/// generation's start time is clock ticks since that boot, not epoch microseconds.
+const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v4";
+const V3_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v3";
 const V2_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v2";
 const LEGACY_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v1";
 
@@ -388,11 +394,42 @@ pub struct AuthorizedLaunchIntent {
 }
 
 /// Exact process generation obtained from the kernel after suspended creation.
+///
+/// The field keeps its historical name, but `boot_id` decides its unit: with a
+/// boot ID (Linux, from format version 4) it is clock ticks from that boot to
+/// the process's creation; without one (macOS, and every earlier record) it is
+/// microseconds since the Unix epoch. Readers only compare it for equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserProcessGeneration {
     pub pid: u32,
     pub start_time_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<crate::profile_custody::BootId>,
+}
+
+#[cfg(target_os = "linux")]
+impl From<cerebellum_linux::ProcessGeneration> for BrowserProcessGeneration {
+    fn from(generation: cerebellum_linux::ProcessGeneration) -> Self {
+        Self {
+            pid: generation.pid,
+            start_time_micros: generation.start_ticks,
+            boot_id: Some(crate::profile_custody::BootId::from_bytes(
+                generation.boot_id,
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<cerebellum_macos::ProcessGeneration> for BrowserProcessGeneration {
+    fn from(generation: cerebellum_macos::ProcessGeneration) -> Self {
+        Self {
+            pid: generation.pid,
+            start_time_micros: generation.start_time_micros,
+            boot_id: None,
+        }
+    }
 }
 
 /// Durable generation-stage record written while the process remains barred.
@@ -476,15 +513,37 @@ pub struct OrphanProfileCustodyFailure;
 
 /// Kernel observation and process control used by startup recovery.
 ///
-/// The orchestrator calls `terminate_and_reap` only after this observer returns
-/// the recorded start time. Implementations should repeat that comparison as
-/// close to signaling as the platform allows, so a PID reuse between the two
-/// calls is refused too.
+/// The orchestrator calls `terminate_and_reap` only after
+/// [`crate::profile_custody::classify_process_generation`] finds the observed
+/// generation to be exactly the recorded one. Implementations should repeat
+/// that decision as close to signaling as the platform allows, so a PID reuse
+/// between the two calls is refused too.
 pub trait OrphanBrowserProcessControl {
     fn observed_start_time_micros(
         &mut self,
         pid: u32,
     ) -> Result<Option<u64>, OrphanProcessControlFailure>;
+
+    /// Observe `generation.pid` in the unit `generation` was recorded in.
+    ///
+    /// The default reports [`Self::observed_start_time_micros`] as a start
+    /// time fixed at creation, which is what macOS reports. A platform whose
+    /// start time moves with the wall clock, or that records a boot ID, must
+    /// override this: the default cannot compare a boot-and-ticks record and
+    /// answers it `Unavailable`.
+    fn observe_generation(
+        &mut self,
+        generation: BrowserProcessGeneration,
+    ) -> GenerationObservation {
+        match self.observed_start_time_micros(generation.pid) {
+            Ok(Some(start_time)) => GenerationObservation::StartTime {
+                start_time,
+                stability: StartTimeStability::ClockStable,
+            },
+            Ok(None) => GenerationObservation::Absent,
+            Err(OrphanProcessControlFailure) => GenerationObservation::Unreadable,
+        }
+    }
     fn terminate_and_reap(
         &mut self,
         generation: BrowserProcessGeneration,
@@ -1011,6 +1070,7 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                     matches!(
                         intent.format_version.as_str(),
                         LAUNCH_CODEC_VERSION
+                            | V3_LAUNCH_CODEC_VERSION
                             | V2_LAUNCH_CODEC_VERSION
                             | LEGACY_LAUNCH_CODEC_VERSION
                     )
@@ -1034,6 +1094,15 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                                 && intent
                                     .verified_executable_identity
                                     .admits(&attestation.observed_executable_identity)
+                                // Before version 4 the start time was always
+                                // epoch microseconds; a boot ID there would
+                                // pair a boot with the wrong unit.
+                                && (intent.format_version == LAUNCH_CODEC_VERSION
+                                    || attestation
+                                        .generation
+                                        .process_generation
+                                        .boot_id
+                                        .is_none())
                         })
                         .map(|attestation| attestation.generation.process_generation)
                 })
@@ -1074,9 +1143,14 @@ where
     for attempt in &attempts {
         let outcome = match attempt.attested_generation {
             None => RecoveredBrowserProcess::Unattested,
-            Some(generation) => match process.observed_start_time_micros(generation.pid) {
-                Ok(Some(observed)) if observed == generation.start_time_micros => {
-                    match process.terminate_and_reap(generation) {
+            Some(generation) => {
+                let observed = process.observe_generation(generation);
+                match classify_process_generation(
+                    generation.start_time_micros,
+                    generation.boot_id,
+                    observed,
+                ) {
+                    SupervisorLiveness::Live => match process.terminate_and_reap(generation) {
                         Ok(()) => RecoveredBrowserProcess::TerminatedAndReaped,
                         Err(OrphanProcessControlFailure) => {
                             first_failure.get_or_insert(
@@ -1086,17 +1160,21 @@ where
                             );
                             RecoveredBrowserProcess::Unattested
                         }
+                    },
+                    SupervisorLiveness::NotLive if observed == GenerationObservation::Absent => {
+                        RecoveredBrowserProcess::NotRunning
+                    }
+                    SupervisorLiveness::NotLive => RecoveredBrowserProcess::StartTimeMismatch,
+                    SupervisorLiveness::Unavailable => {
+                        first_failure.get_or_insert(
+                            BrowserLaunchRecoveryFailure::ProcessObservation {
+                                sequence: attempt.sequence,
+                            },
+                        );
+                        RecoveredBrowserProcess::Unattested
                     }
                 }
-                Ok(Some(_)) => RecoveredBrowserProcess::StartTimeMismatch,
-                Ok(None) => RecoveredBrowserProcess::NotRunning,
-                Err(OrphanProcessControlFailure) => {
-                    first_failure.get_or_insert(BrowserLaunchRecoveryFailure::ProcessObservation {
-                        sequence: attempt.sequence,
-                    });
-                    RecoveredBrowserProcess::Unattested
-                }
-            },
+            }
         };
         process_outcomes.insert(attempt.sequence, outcome);
     }
@@ -1355,10 +1433,7 @@ impl LinuxProcessLauncher {
                         identity_chain.push(linux_identity_record(next_exec));
                     }
                     return Ok(LinuxDryRunObservation {
-                        generation: BrowserProcessGeneration {
-                            pid: generation.pid,
-                            start_time_micros: generation.start_time_micros,
-                        },
+                        generation: BrowserProcessGeneration::from(generation),
                         observed,
                         next_exec,
                         identity_chain,
@@ -1374,10 +1449,7 @@ impl LinuxProcessLauncher {
                     })?
                 else {
                     return Ok(LinuxDryRunObservation {
-                        generation: BrowserProcessGeneration {
-                            pid: generation.pid,
-                            start_time_micros: generation.start_time_micros,
-                        },
+                        generation: BrowserProcessGeneration::from(generation),
                         observed,
                         next_exec: None,
                         identity_chain,
@@ -1419,11 +1491,7 @@ impl BarredLaunchProcess for LinuxBarredProcess {
     type Released = cerebellum_linux::ReleasedChild;
 
     fn generation(&self) -> BrowserProcessGeneration {
-        let generation = self.0.borrow().generation();
-        BrowserProcessGeneration {
-            pid: generation.pid,
-            start_time_micros: generation.start_time_micros,
-        }
+        BrowserProcessGeneration::from(self.0.borrow().generation())
     }
 
     fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError> {
@@ -1552,14 +1620,22 @@ fn map_linux_process_control_error(
 #[cfg(target_os = "linux")]
 impl HandshakeProcess for cerebellum_linux::ReleasedChild {
     fn observe_exit(&mut self) -> Option<ChildExitStatus> {
-        let generation = self.generation();
-        match cerebellum_linux::process_start_time(generation.pid) {
-            cerebellum_linux::ProcessStartTime::Started(start_time)
-                if start_time == generation.start_time_micros =>
-            {
-                None
+        // Anything but an exact match reads as exited, as it did before the
+        // generation carried a boot ID: this handle only reports, it never
+        // signals on that answer.
+        let generation = BrowserProcessGeneration::from(self.generation());
+        match classify_process_generation(
+            generation.start_time_micros,
+            generation.boot_id,
+            crate::profile_custody::linux_generation_observation(
+                generation.pid,
+                generation.boot_id,
+            ),
+        ) {
+            SupervisorLiveness::Live => None,
+            SupervisorLiveness::NotLive | SupervisorLiveness::Unavailable => {
+                Some(ChildExitStatus::Unknown)
             }
-            _ => Some(ChildExitStatus::Unknown),
         }
     }
 
@@ -1623,11 +1699,7 @@ impl BarredLaunchProcess for MacOsBarredProcess {
     type Released = cerebellum_macos::ReleasedChild;
 
     fn generation(&self) -> BrowserProcessGeneration {
-        let generation = self.0.generation();
-        BrowserProcessGeneration {
-            pid: generation.pid,
-            start_time_micros: generation.start_time_micros,
-        }
+        BrowserProcessGeneration::from(self.0.generation())
     }
 
     fn executed_image_identity(&self) -> Result<ExecutableIdentityChain, PlatformLaunchError> {
@@ -2098,6 +2170,7 @@ mod tests {
                 generation: BrowserProcessGeneration {
                     pid: 42,
                     start_time_micros: 77,
+                    boot_id: None,
                 },
             })
         }
@@ -2217,7 +2290,19 @@ mod tests {
         journal: &mut DurableLaunchJournal<InMemoryJournalStorage>,
         request: &AttestedLaunchRequest,
     ) -> (u64, LaunchAttestationRecord) {
-        let intent = request.durable_intent();
+        dispatch_attempt_as(journal, request, LAUNCH_CODEC_VERSION, None)
+    }
+
+    /// Dispatch one attempt as a writer of `format_version` would have
+    /// recorded it, so a reader can be driven against older records.
+    fn dispatch_attempt_as(
+        journal: &mut DurableLaunchJournal<InMemoryJournalStorage>,
+        request: &AttestedLaunchRequest,
+        format_version: &str,
+        boot_id: Option<crate::profile_custody::BootId>,
+    ) -> (u64, LaunchAttestationRecord) {
+        let mut intent = request.durable_intent();
+        intent.format_version = format_version.to_string();
         let mut handle = journal.record_intent(&intent).expect("record intent");
         let sequence = handle.sequence();
         let generation = LaunchGenerationRecord {
@@ -2225,6 +2310,7 @@ mod tests {
             process_generation: BrowserProcessGeneration {
                 pid: 42,
                 start_time_micros: sequence,
+                boot_id,
             },
         };
         journal
@@ -2286,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_completion_fixture_reads_through_the_v3_reader() {
+    fn v2_completion_fixture_reads_through_the_v4_reader() {
         let completion: LaunchSessionCompletion =
             serde_json::from_str(include_str!("../tests/fixtures/launch-completion-v2.json"))
                 .unwrap();
@@ -2300,7 +2386,7 @@ mod tests {
             crate::browser_session::BrowserSessionTerminalOutcome::Closed
         );
         assert_eq!(completion.failure, None);
-        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v3");
+        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v4");
     }
 
     fn terminal_completion(
@@ -2344,6 +2430,7 @@ mod tests {
                     BrowserProcessGeneration {
                         pid: 42,
                         start_time_micros: 77,
+                        boot_id: None,
                     }
                 );
                 assert_eq!(
@@ -2642,6 +2729,7 @@ mod tests {
             process_generation: BrowserProcessGeneration {
                 pid: 42,
                 start_time_micros: 77,
+                boot_id: None,
             },
         };
         journal
@@ -2765,6 +2853,167 @@ mod tests {
             audit.reason,
             Some(cerebellum_core::journal::JournalReason::InterruptedAfterDispatch)
         );
+    }
+
+    /// An attestation written by version 3, before the generation carried a
+    /// boot ID, still loads after the upgrade and is compared in the unit it
+    /// was written in: epoch microseconds, never ticks since boot.
+    #[test]
+    fn a_v3_attestation_still_loads_and_takes_the_epoch_micros_arm() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, _) =
+            dispatch_attempt_as(&mut original, &request(), V3_LAUNCH_CODEC_VERSION, None);
+        drop(original);
+        let journal = reopened_dispatched_journal(storage);
+
+        let attempts = journal.active_launch_attempts().expect("read v3 attempt");
+        let generation = attempts[0]
+            .attested_generation
+            .expect("a v3 attestation is still attested");
+        assert_eq!(generation.boot_id, None);
+        assert_eq!(
+            classify_process_generation(
+                generation.start_time_micros,
+                generation.boot_id,
+                GenerationObservation::StartTime {
+                    start_time: sequence,
+                    stability: StartTimeStability::MovesWithWallClock,
+                },
+            ),
+            SupervisorLiveness::Live
+        );
+        assert_eq!(
+            classify_process_generation(
+                generation.start_time_micros,
+                generation.boot_id,
+                GenerationObservation::BootTicks {
+                    boot_id: crate::profile_custody::BootId::from_bytes([7; 16]),
+                    start_ticks: sequence,
+                },
+            ),
+            SupervisorLiveness::Unavailable,
+            "a legacy start time is never compared as ticks"
+        );
+    }
+
+    #[test]
+    fn a_pre_v4_attestation_that_claims_a_boot_id_is_not_trusted() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        dispatch_attempt_as(
+            &mut original,
+            &request(),
+            V3_LAUNCH_CODEC_VERSION,
+            Some(crate::profile_custody::BootId::from_bytes([7; 16])),
+        );
+        drop(original);
+        let journal = reopened_dispatched_journal(storage);
+
+        let attempts = journal.active_launch_attempts().expect("read attempt");
+        assert_eq!(attempts[0].attested_generation, None);
+    }
+
+    /// A platform observer reporting boot and ticks, as Linux does.
+    struct BootTicksOrphan {
+        observed: GenerationObservation,
+        terminations: usize,
+    }
+
+    impl OrphanBrowserProcessControl for BootTicksOrphan {
+        fn observed_start_time_micros(
+            &mut self,
+            _pid: u32,
+        ) -> Result<Option<u64>, OrphanProcessControlFailure> {
+            panic!("a boot-and-ticks record must not be observed as an epoch time")
+        }
+
+        fn observe_generation(
+            &mut self,
+            _generation: BrowserProcessGeneration,
+        ) -> GenerationObservation {
+            self.observed
+        }
+
+        fn terminate_and_reap(
+            &mut self,
+            _generation: BrowserProcessGeneration,
+        ) -> Result<(), OrphanProcessControlFailure> {
+            self.terminations += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn startup_recovery_terminates_a_boot_ticks_orphan_only_on_an_exact_match() {
+        let boot = crate::profile_custody::BootId::from_bytes([7; 16]);
+        for (observed, expected_process, expected_terminations) in [
+            (
+                GenerationObservation::BootTicks {
+                    boot_id: boot,
+                    start_ticks: 1,
+                },
+                RecoveredBrowserProcess::TerminatedAndReaped,
+                1,
+            ),
+            (
+                GenerationObservation::BootTicks {
+                    boot_id: boot,
+                    start_ticks: 2,
+                },
+                RecoveredBrowserProcess::StartTimeMismatch,
+                0,
+            ),
+            (
+                GenerationObservation::Absent,
+                RecoveredBrowserProcess::NotRunning,
+                0,
+            ),
+        ] {
+            let storage = InMemoryJournalStorage::new();
+            let mut original = reopened_dispatched_journal(storage.clone());
+            let (sequence, _) =
+                dispatch_attempt_as(&mut original, &request(), LAUNCH_CODEC_VERSION, Some(boot));
+            assert_eq!(sequence, 1);
+            drop(original);
+            let mut journal = reopened_dispatched_journal(storage);
+            let mut process = BootTicksOrphan {
+                observed,
+                terminations: 0,
+            };
+            let mut custody = RecordingOrphanCustody::new(Events::new());
+
+            let outcomes = recover_browser_launches(&mut journal, &mut process, &mut custody)
+                .expect("recover boot-and-ticks record");
+
+            assert_eq!(outcomes[0].process, expected_process, "{observed:?}");
+            assert_eq!(process.terminations, expected_terminations, "{observed:?}");
+        }
+    }
+
+    #[test]
+    fn startup_recovery_refuses_an_unreadable_boot_ticks_orphan_without_signalling() {
+        let boot = crate::profile_custody::BootId::from_bytes([7; 16]);
+        {
+            let observed = GenerationObservation::Unreadable;
+            let storage = InMemoryJournalStorage::new();
+            let mut original = reopened_dispatched_journal(storage.clone());
+            dispatch_attempt_as(&mut original, &request(), LAUNCH_CODEC_VERSION, Some(boot));
+            drop(original);
+            let mut journal = reopened_dispatched_journal(storage);
+            let mut process = BootTicksOrphan {
+                observed,
+                terminations: 0,
+            };
+            let mut custody = RecordingOrphanCustody::new(Events::new());
+
+            assert_eq!(
+                recover_browser_launches(&mut journal, &mut process, &mut custody),
+                Err(BrowserLaunchRecoveryFailure::ProcessObservation { sequence: 1 }),
+                "{observed:?}"
+            );
+            assert_eq!(process.terminations, 0, "{observed:?}");
+        }
     }
 
     #[test]

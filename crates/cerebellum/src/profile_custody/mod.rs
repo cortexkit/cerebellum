@@ -11,13 +11,17 @@ use std::collections::HashMap;
 
 mod holder_lock;
 
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use holder_lock::linux_current_generation;
+#[cfg(target_os = "linux")]
+pub(crate) use holder_lock::linux_generation_observation;
 pub use holder_lock::{
-    classify_supervisor_start_time, current_supervisor_generation, read_record_if_present,
-    FilesystemProfileCustodyJournal, HolderId, KernelSupervisorLiveness, ProfileCustodyAcquisition,
-    ProfileCustodyClaim, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
-    ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks,
-    ProfileCustodyRelease, StartTimeStability, SupervisorGeneration, SupervisorLiveness,
-    SupervisorLivenessProbe,
+    classify_process_generation, classify_supervisor_start_time, current_supervisor_generation,
+    read_record_if_present, BootId, FilesystemProfileCustodyJournal, GenerationObservation,
+    HolderId, KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyClaim,
+    ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey,
+    ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks, ProfileCustodyRelease,
+    StartTimeStability, SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
 };
 
 /// The caller-visible reason for an unavailable profile-storage operation.

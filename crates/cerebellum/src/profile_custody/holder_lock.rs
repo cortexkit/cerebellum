@@ -10,7 +10,11 @@ use sha2::{Digest, Sha256};
 const LOCK_DIRECTORY: &str = ".ck-browser-profile-custody";
 const COORDINATION_FILE: &str = ".coordination.lock";
 const JOURNAL_FILE: &str = "custody-events.jsonl";
-const LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v1";
+/// Version 2 added `supervisor_boot_id`. When present, `supervisor_start_time`
+/// holds clock ticks since that boot rather than epoch microseconds.
+const LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v2";
+/// Written before the boot ID existed: the start time is always epoch microseconds.
+const V1_LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v1";
 const JOURNAL_FORMAT_VERSION: &str = "ck-browser-profile-custody-event/v1";
 
 static IN_PROCESS_COORDINATION: OnceLock<Mutex<()>> = OnceLock::new();
@@ -34,10 +38,96 @@ impl fmt::Debug for HolderId {
 
 /// A process generation, rather than a pid alone, identifies the supervisor that
 /// remains capable of owning a claim after pid reuse.
+///
+/// `boot_id` says which unit `start_time` carries. With a boot ID (Linux), the
+/// start time is clock ticks from that boot to the process's creation; without
+/// one (macOS, and Linux records written before the boot ID existed), it is
+/// microseconds since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorGeneration {
     pub pid: u32,
     pub start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<BootId>,
+}
+
+/// The kernel's identity for one boot, from `/proc/sys/kernel/random/boot_id`.
+///
+/// Clock ticks since boot repeat from boot to boot, so a tick count names a
+/// process only together with the boot it counts from. Inside a container this
+/// is the host's boot, which is what a process generation needs: a container
+/// restart ends the container's processes without rebooting the kernel, and
+/// their pids then read as absent or reused, not as a new boot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BootId([u8; 16]);
+
+impl BootId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Display for BootId {
+    /// The kernel's own spelling: lowercase hex grouped 8-4-4-4-12.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                formatter.write_str("-")?;
+            }
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for BootId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "BootId({self})")
+    }
+}
+
+impl std::str::FromStr for BootId {
+    type Err = ();
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 36 {
+            return Err(());
+        }
+        let mut digits = Vec::with_capacity(32);
+        for (index, &byte) in bytes.iter().enumerate() {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                if byte != b'-' {
+                    return Err(());
+                }
+                continue;
+            }
+            digits.push((byte as char).to_digit(16).ok_or(())? as u8);
+        }
+        let mut boot_id = [0_u8; 16];
+        for (index, byte) in boot_id.iter_mut().enumerate() {
+            *byte = (digits[2 * index] << 4) | digits[2 * index + 1];
+        }
+        Ok(Self(boot_id))
+    }
+}
+
+impl Serialize for BootId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for BootId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse()
+            .map_err(|()| serde::de::Error::custom("boot_id is not a hyphenated UUID"))
+    }
 }
 
 /// The logical profile selected before preparation. Callers cannot supply the
@@ -75,6 +165,8 @@ pub struct ProfileCustodyLockRecord {
     holder_id: HolderId,
     supervisor_pid: u32,
     supervisor_start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervisor_boot_id: Option<BootId>,
     profile_directory: Option<PathBuf>,
 }
 
@@ -85,6 +177,7 @@ impl ProfileCustodyLockRecord {
             holder_id,
             supervisor_pid: supervisor.pid,
             supervisor_start_time: supervisor.start_time,
+            supervisor_boot_id: supervisor.boot_id,
             profile_directory: None,
         }
     }
@@ -93,6 +186,7 @@ impl ProfileCustodyLockRecord {
         SupervisorGeneration {
             pid: self.supervisor_pid,
             start_time: self.supervisor_start_time,
+            boot_id: self.supervisor_boot_id,
         }
     }
 }
@@ -146,13 +240,161 @@ pub fn classify_supervisor_start_time(
     observed_start_time: Option<u64>,
     stability: StartTimeStability,
 ) -> SupervisorLiveness {
+    classify_start_time(recorded.start_time, observed_start_time, stability)
+}
+
+fn classify_start_time(
+    recorded_start_time: u64,
+    observed_start_time: Option<u64>,
+    stability: StartTimeStability,
+) -> SupervisorLiveness {
     match observed_start_time {
-        Some(start_time) if start_time == recorded.start_time => SupervisorLiveness::Live,
+        Some(start_time) if start_time == recorded_start_time => SupervisorLiveness::Live,
         Some(_) => match stability {
             StartTimeStability::ClockStable => SupervisorLiveness::NotLive,
             StartTimeStability::MovesWithWallClock => SupervisorLiveness::Unavailable,
         },
         None => SupervisorLiveness::NotLive,
+    }
+}
+
+/// What the kernel currently reports for a recorded pid, reduced to the facts
+/// [`classify_process_generation`] compares. Platform code produces this; it
+/// never decides what the reading means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationObservation {
+    /// No process holds the pid.
+    Absent,
+    /// A process holds the pid and started at this epoch time.
+    StartTime {
+        start_time: u64,
+        stability: StartTimeStability,
+    },
+    /// A process holds the pid and started this many ticks into this boot.
+    BootTicks { boot_id: BootId, start_ticks: u64 },
+    /// The current boot's ID could not be read, so no boot-and-ticks record
+    /// can be compared, whatever the pid holds.
+    BootIdUnreadable,
+    /// The kernel would not reveal enough about the process to answer: a
+    /// denied or failed read, or a layout this reader does not understand.
+    Unreadable,
+}
+
+/// Decide whether a recorded process generation is still the process at its pid.
+///
+/// The answer is an authority, so its asymmetry matters: `Live` permits a
+/// signal, `NotLive` permits a restore, a respawn or a lock break to proceed as
+/// if the process had gone, and `Unavailable` permits neither. Hence:
+///
+/// - Only an exact match of every recorded fact is `Live`.
+/// - Every failure to observe is `Unavailable`, never `NotLive`.
+/// - A record with a boot ID compares boot and ticks, which a wall-clock step
+///   cannot move. A different boot means the recorded process ended with the
+///   boot that ran it, so its pid now names something unrelated: `NotLive`.
+///   In the same boot, different ticks are PID reuse: `NotLive`.
+/// - A record without a boot ID holds epoch microseconds and keeps the rule it
+///   was written under (see [`classify_supervisor_start_time`]); on Linux a
+///   moved start time stays `Unavailable` because it may be a clock step. That
+///   refusal lasts only until the pid is gone or the record is rewritten by
+///   the next acquire.
+/// - A reading whose unit differs from the record's cannot be compared, so it
+///   is `Unavailable`.
+pub fn classify_process_generation(
+    recorded_start_time: u64,
+    recorded_boot_id: Option<BootId>,
+    observed: GenerationObservation,
+) -> SupervisorLiveness {
+    match (recorded_boot_id, observed) {
+        (_, GenerationObservation::Unreadable) => SupervisorLiveness::Unavailable,
+        (_, GenerationObservation::BootIdUnreadable) => SupervisorLiveness::Unavailable,
+        (_, GenerationObservation::Absent) => SupervisorLiveness::NotLive,
+        (
+            Some(recorded_boot),
+            GenerationObservation::BootTicks {
+                boot_id,
+                start_ticks,
+            },
+        ) => {
+            if boot_id != recorded_boot {
+                SupervisorLiveness::NotLive
+            } else if start_ticks == recorded_start_time {
+                SupervisorLiveness::Live
+            } else {
+                SupervisorLiveness::NotLive
+            }
+        }
+        (
+            None,
+            GenerationObservation::StartTime {
+                start_time,
+                stability,
+            },
+        ) => classify_start_time(recorded_start_time, Some(start_time), stability),
+        (Some(_), GenerationObservation::StartTime { .. })
+        | (None, GenerationObservation::BootTicks { .. }) => SupervisorLiveness::Unavailable,
+    }
+}
+
+/// Read the Linux facts a recorded generation can be compared against.
+///
+/// The record decides which reading is taken: one with a boot ID is compared
+/// in boot and ticks, one without holds epoch microseconds and can only be
+/// compared with the epoch start time it was written from.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_generation_observation(
+    pid: u32,
+    recorded_boot_id: Option<BootId>,
+) -> GenerationObservation {
+    if recorded_boot_id.is_some() {
+        match cerebellum_linux::process_generation(pid) {
+            cerebellum_linux::ProcessGenerationReading::Started {
+                boot_id,
+                start_ticks,
+            } => GenerationObservation::BootTicks {
+                boot_id: BootId::from_bytes(boot_id),
+                start_ticks,
+            },
+            cerebellum_linux::ProcessGenerationReading::NoSuchProcess => {
+                GenerationObservation::Absent
+            }
+            cerebellum_linux::ProcessGenerationReading::BootIdUnavailable => {
+                GenerationObservation::BootIdUnreadable
+            }
+            cerebellum_linux::ProcessGenerationReading::NotPermitted
+            | cerebellum_linux::ProcessGenerationReading::StatReadFailed
+            | cerebellum_linux::ProcessGenerationReading::LayoutMismatch
+            | cerebellum_linux::ProcessGenerationReading::NoStartTime => {
+                GenerationObservation::Unreadable
+            }
+        }
+    } else {
+        match cerebellum_linux::process_start_time(pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => {
+                GenerationObservation::StartTime {
+                    start_time,
+                    stability: StartTimeStability::MovesWithWallClock,
+                }
+            }
+            cerebellum_linux::ProcessStartTime::NoSuchProcess => GenerationObservation::Absent,
+            cerebellum_linux::ProcessStartTime::NotPermitted
+            | cerebellum_linux::ProcessStartTime::StatReadFailed
+            | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
+            | cerebellum_linux::ProcessStartTime::LayoutMismatch
+            | cerebellum_linux::ProcessStartTime::NoStartTime => GenerationObservation::Unreadable,
+        }
+    }
+}
+
+/// Read `pid`'s current Linux generation in the form new records store:
+/// its boot and its start in ticks since that boot.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_current_generation(pid: u32) -> Option<(BootId, u64)> {
+    match cerebellum_linux::process_generation(pid) {
+        cerebellum_linux::ProcessGenerationReading::Started {
+            boot_id,
+            start_ticks,
+        } => Some((BootId::from_bytes(boot_id), start_ticks)),
+        _ => None,
     }
 }
 
@@ -189,36 +431,18 @@ impl SupervisorLivenessProbe for KernelSupervisorLiveness {
             }
         }
 
-        // Linux records a supervisor's start time (see
-        // `current_supervisor_generation`) and must read it back the same way,
-        // or every lock a crashed supervisor leaves behind answers
-        // `Unavailable` forever and wedges that profile. The reading moves with
-        // the wall clock, so a mismatch stays ambiguous rather than stale.
+        // Linux must read a supervisor back in the unit its lock recorded (see
+        // `current_supervisor_generation`), or every lock a crashed supervisor
+        // leaves behind answers `Unavailable` forever and wedges that profile.
+        // Records with a boot ID compare boot and ticks, which a clock step
+        // cannot move; older records keep the epoch reading and its rule.
         #[cfg(target_os = "linux")]
         {
-            match cerebellum_linux::process_start_time(generation.pid) {
-                cerebellum_linux::ProcessStartTime::Started(start_time) => {
-                    classify_supervisor_start_time(
-                        generation,
-                        Some(start_time),
-                        StartTimeStability::MovesWithWallClock,
-                    )
-                }
-                cerebellum_linux::ProcessStartTime::NoSuchProcess => {
-                    classify_supervisor_start_time(
-                        generation,
-                        None,
-                        StartTimeStability::MovesWithWallClock,
-                    )
-                }
-                cerebellum_linux::ProcessStartTime::NotPermitted
-                | cerebellum_linux::ProcessStartTime::StatReadFailed
-                | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
-                | cerebellum_linux::ProcessStartTime::LayoutMismatch
-                | cerebellum_linux::ProcessStartTime::NoStartTime => {
-                    SupervisorLiveness::Unavailable
-                }
-            }
+            classify_process_generation(
+                generation.start_time,
+                generation.boot_id,
+                linux_generation_observation(generation.pid, generation.boot_id),
+            )
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -234,24 +458,27 @@ pub fn current_supervisor_generation() -> Result<SupervisorGeneration, ProfileCu
     #[cfg(target_os = "macos")]
     {
         match cerebellum_macos::process_start_time(pid) {
-            cerebellum_macos::ProcessStartTime::Started(start_time) => {
-                Ok(SupervisorGeneration { pid, start_time })
-            }
+            cerebellum_macos::ProcessStartTime::Started(start_time) => Ok(SupervisorGeneration {
+                pid,
+                start_time,
+                boot_id: None,
+            }),
             _ => Err(ProfileCustodyLockError::SupervisorGenerationUnavailable),
         }
     }
 
-    // Linux reads the same fact from procfs, in the same shape the macOS arm
-    // consumes. It shipped with the Linux launch barrier and nothing called it,
-    // so custody refused here and the refusal surfaced as unavailable storage
-    // several layers up.
+    // Linux records the boot and the start in ticks since boot rather than an
+    // epoch time, because procfs derives the epoch time from the current wall
+    // clock and a clock step would make this supervisor read as replaced.
     #[cfg(target_os = "linux")]
     {
-        match cerebellum_linux::process_start_time(pid) {
-            cerebellum_linux::ProcessStartTime::Started(start_time) => {
-                Ok(SupervisorGeneration { pid, start_time })
-            }
-            _ => Err(ProfileCustodyLockError::SupervisorGenerationUnavailable),
+        match linux_current_generation(pid) {
+            Some((boot_id, start_ticks)) => Ok(SupervisorGeneration {
+                pid,
+                start_time: start_ticks,
+                boot_id: Some(boot_id),
+            }),
+            None => Err(ProfileCustodyLockError::SupervisorGenerationUnavailable),
         }
     }
 
@@ -700,7 +927,14 @@ fn read_record(path: &Path) -> Result<ProfileCustodyLockRecord, ProfileCustodyLo
 fn decode_record(bytes: &[u8]) -> Result<ProfileCustodyLockRecord, ProfileCustodyLockError> {
     let record: ProfileCustodyLockRecord =
         serde_json::from_slice(bytes).map_err(|_| ProfileCustodyLockError::InvalidRecord)?;
-    if record.format_version != LOCK_FORMAT_VERSION
+    // A version-1 record predates the boot ID, so one claiming a boot ID would
+    // pair a boot with a start time in epoch microseconds.
+    let version_known = match record.format_version.as_str() {
+        LOCK_FORMAT_VERSION => true,
+        V1_LOCK_FORMAT_VERSION => record.supervisor_boot_id.is_none(),
+        _ => false,
+    };
+    if !version_known
         || record.holder_id.as_str().is_empty()
         || record.supervisor_pid == 0
         || record.supervisor_start_time == 0
@@ -796,6 +1030,7 @@ mod journal_tests {
                                 supervisor: SupervisorGeneration {
                                     pid: writer,
                                     start_time: u64::from(event),
+                                    boot_id: None,
                                 },
                                 profile_directory: Some(PathBuf::from(format!(
                                     "profiles/{writer}/{event}"

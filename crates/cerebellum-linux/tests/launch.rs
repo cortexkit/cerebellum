@@ -11,10 +11,25 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cerebellum_linux::{
-    executed_image_identity, process_descriptors, process_start_time, spawn_barred,
-    terminate_exact_generation, BarredChild, ProcessControlError, ProcessStartTime,
-    TerminationOutcome,
+    executed_image_identity, process_descriptors, process_generation, process_start_time,
+    spawn_barred, terminate_exact_generation, BarredChild, GenerationMatch, ProcessControlError,
+    ProcessGenerationReading, ProcessStartTime, TerminationOutcome,
 };
+
+/// The exact-equality verdict a caller supplies for a generation it recorded in
+/// this boot.
+fn exact_match(pid: u32, boot_id: [u8; 16], start_ticks: u64) -> GenerationMatch {
+    match process_generation(pid) {
+        ProcessGenerationReading::Started {
+            boot_id: live_boot,
+            start_ticks: live_ticks,
+        } if live_boot == boot_id && live_ticks == start_ticks => GenerationMatch::Exact,
+        ProcessGenerationReading::Started { .. } | ProcessGenerationReading::NoSuchProcess => {
+            GenerationMatch::GoneOrReplaced
+        }
+        _ => GenerationMatch::Unreadable,
+    }
+}
 
 fn launch_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -287,14 +302,25 @@ fn a_pid_whose_start_time_differs_is_never_signalled() {
         .spawn()
         .expect("spawn victim");
     let pid = victim.id();
-    let ProcessStartTime::Started(start) = process_start_time(pid) else {
-        panic!("start time unavailable")
+    let ProcessGenerationReading::Started {
+        boot_id,
+        start_ticks,
+    } = process_generation(pid)
+    else {
+        panic!("generation unavailable")
     };
-    let outcome =
-        terminate_exact_generation(pid, start - 1, Instant::now() + Duration::from_secs(1))
-            .expect("mismatch is an observation");
+    let outcome = terminate_exact_generation(pid, Instant::now() + Duration::from_secs(1), || {
+        exact_match(pid, boot_id, start_ticks - 1)
+    })
+    .expect("mismatch is an observation");
     assert_eq!(outcome, TerminationOutcome::AlreadyGoneOrReplaced);
-    assert!(matches!(process_start_time(pid), ProcessStartTime::Started(value) if value == start));
+    assert_eq!(
+        process_generation(pid),
+        ProcessGenerationReading::Started {
+            boot_id,
+            start_ticks
+        }
+    );
     let _ = victim.kill();
     let _ = victim.wait();
 }
@@ -307,11 +333,17 @@ fn the_exact_generation_is_signalled() {
         .spawn()
         .expect("spawn target");
     let pid = target.id();
-    let ProcessStartTime::Started(start) = process_start_time(pid) else {
-        panic!("start time unavailable")
+    let ProcessGenerationReading::Started {
+        boot_id,
+        start_ticks,
+    } = process_generation(pid)
+    else {
+        panic!("generation unavailable")
     };
-    let outcome = terminate_exact_generation(pid, start, Instant::now() + Duration::from_secs(1))
-        .expect("terminate exact generation");
+    let outcome = terminate_exact_generation(pid, Instant::now() + Duration::from_secs(1), || {
+        exact_match(pid, boot_id, start_ticks)
+    })
+    .expect("terminate exact generation");
     assert_eq!(outcome, TerminationOutcome::Signalled);
     let _ = target.wait();
 }

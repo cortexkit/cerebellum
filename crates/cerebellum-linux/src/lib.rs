@@ -25,8 +25,10 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use launch::{
     executed_image_identity, process_descriptors, spawn_barred, terminate_exact_generation,
-    BarredChild, ExecutedImageIdentity, ImageIdentityError, ProcessControlError, ProcessGeneration,
-    ReleasedChild, SpawnError, TerminationOutcome,
+    BarredChild, ExecutedImageIdentity, GenerationMatch, ImageIdentityError, ProcessControlError,
+    ProcessGeneration, ReleasedChild, SpawnError, TerminationOutcome,
 };
 #[cfg(any(target_os = "linux", test))]
-pub use linux::{process_start_time, ProcessStartTime};
+pub use linux::{
+    process_generation, process_start_time, ProcessGenerationReading, ProcessStartTime,
+};

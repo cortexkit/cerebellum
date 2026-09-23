@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::exec_stop::{
     continue_to_exec_stop, ExecStopLoopError, ExecStopObservation, ExecStopOutcome,
 };
-use crate::{process_start_time, ProcessStartTime};
+use crate::{process_generation, ProcessGenerationReading};
 
 const CDP_COMMAND_FD: RawFd = 3;
 const CDP_RESPONSE_FD: RawFd = 4;
@@ -25,10 +25,31 @@ const CDP_RESPONSE_FD: RawFd = 4;
 const MAX_INTERVENING_SIGNAL_STOPS: usize = 64;
 
 /// The kernel generation that distinguishes a process from later PID reuse.
+///
+/// The boot ID and the start in ticks since boot are both fixed at creation,
+/// so a wall-clock step cannot make a live process read as a different one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessGeneration {
     pub pid: u32,
-    pub start_time_micros: u64,
+    pub boot_id: [u8; 16],
+    pub start_ticks: u64,
+}
+
+/// A caller's verdict on whether a pid still holds the generation it recorded.
+///
+/// Termination of a recorded generation takes this verdict from the caller
+/// rather than comparing readings itself, because what a mismatch means
+/// depends on how the record was written, and that is policy this crate does
+/// not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationMatch {
+    /// The pid holds exactly the recorded generation: the only case that may signal.
+    Exact,
+    /// The recorded generation no longer exists; the pid is absent or belongs to
+    /// another process.
+    GoneOrReplaced,
+    /// The readings could not establish either answer.
+    Unreadable,
 }
 
 /// Raw identity facts for the executable image currently mapped into a process.
@@ -206,10 +227,11 @@ impl ReleasedChild {
 
     /// Kill this exact generation and reap it if this process owns the child.
     pub fn terminate_and_reap(mut self) -> Result<(), ProcessControlError> {
+        let generation = self.generation;
         let result = terminate_exact_generation(
-            self.generation.pid,
-            self.generation.start_time_micros,
+            generation.pid,
             Instant::now() + Duration::from_secs(2),
+            || own_generation_match(generation),
         );
         if result.is_ok() {
             self.reaped = true;
@@ -223,10 +245,11 @@ impl Drop for ReleasedChild {
         if self.reaped {
             return;
         }
+        let generation = self.generation;
         let _ = terminate_exact_generation(
-            self.generation.pid,
-            self.generation.start_time_micros,
+            generation.pid,
             Instant::now() + Duration::from_millis(100),
+            || own_generation_match(generation),
         );
     }
 }
@@ -409,11 +432,12 @@ pub fn spawn_barred(
     }
     #[cfg(test)]
     test_parent_death_checkpoint(ParentDeathCheckpoint::AfterExecStop, pid);
-    let start_time_micros = start_time_for_spawn(pid as u32)?;
+    let (boot_id, start_ticks) = start_time_for_spawn(pid as u32)?;
     Ok(BarredChild {
         generation: ProcessGeneration {
             pid: pid as u32,
-            start_time_micros,
+            boot_id,
+            start_ticks,
         },
         active: true,
         exec_hops: 0,
@@ -479,58 +503,41 @@ pub fn process_descriptors(pid: u32) -> Result<Vec<RawFd>, io::ErrorKind> {
     Ok(descriptors)
 }
 
-/// Kill a PID only when procfs still identifies the recorded generation.
+/// Kill a PID only while `current_match` answers that it holds the recorded generation.
+///
+/// The verdict is taken once to authorize the signal and again if the signal
+/// fails, so a process that exited between the two reads is reported as gone
+/// rather than as a signalling failure.
 pub fn terminate_exact_generation(
     pid: u32,
-    start_time_micros: u64,
     reap_deadline: Instant,
+    current_match: impl FnMut() -> GenerationMatch,
 ) -> Result<TerminationOutcome, ProcessControlError> {
-    terminate_exact_generation_with(
-        pid,
-        start_time_micros,
-        reap_deadline,
-        process_start_time,
-        |pid| {
-            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
-                Err(io::Error::last_os_error().kind())
-            } else {
-                Ok(())
-            }
-        },
-    )
+    terminate_exact_generation_with(pid, reap_deadline, current_match, |pid| {
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            Err(io::Error::last_os_error().kind())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn terminate_exact_generation_with(
     pid: u32,
-    start_time_micros: u64,
     reap_deadline: Instant,
-    mut read_start_time: impl FnMut(u32) -> ProcessStartTime,
+    mut current_match: impl FnMut() -> GenerationMatch,
     signal_kill: impl FnOnce(c_int) -> Result<(), io::ErrorKind>,
 ) -> Result<TerminationOutcome, ProcessControlError> {
-    match read_start_time(pid) {
-        ProcessStartTime::Started(start) if start == start_time_micros => {}
-        ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
-            return Ok(TerminationOutcome::AlreadyGoneOrReplaced)
-        }
-        ProcessStartTime::NotPermitted
-        | ProcessStartTime::StatReadFailed
-        | ProcessStartTime::SystemTimeBaseUnavailable
-        | ProcessStartTime::LayoutMismatch
-        | ProcessStartTime::NoStartTime => return Err(ProcessControlError::GenerationUnreadable),
+    match current_match() {
+        GenerationMatch::Exact => {}
+        GenerationMatch::GoneOrReplaced => return Ok(TerminationOutcome::AlreadyGoneOrReplaced),
+        GenerationMatch::Unreadable => return Err(ProcessControlError::GenerationUnreadable),
     }
     if let Err(error) = signal_kill(pid as c_int) {
-        return match read_start_time(pid) {
-            ProcessStartTime::Started(start) if start == start_time_micros => {
-                Err(ProcessControlError::Signal(error))
-            }
-            ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
-                Ok(TerminationOutcome::AlreadyGoneOrReplaced)
-            }
-            ProcessStartTime::NotPermitted
-            | ProcessStartTime::StatReadFailed
-            | ProcessStartTime::SystemTimeBaseUnavailable
-            | ProcessStartTime::LayoutMismatch
-            | ProcessStartTime::NoStartTime => Err(ProcessControlError::GenerationUnreadable),
+        return match current_match() {
+            GenerationMatch::Exact => Err(ProcessControlError::Signal(error)),
+            GenerationMatch::GoneOrReplaced => Ok(TerminationOutcome::AlreadyGoneOrReplaced),
+            GenerationMatch::Unreadable => Err(ProcessControlError::GenerationUnreadable),
         };
     }
     reap_if_owned(pid as c_int, reap_deadline)?;
@@ -616,43 +623,69 @@ fn descriptor_limit() -> RawFd {
     limit.clamp(5, 1_048_576) as RawFd
 }
 
-fn start_time_for_spawn(pid: u32) -> Result<u64, SpawnError> {
-    match process_start_time(pid) {
-        ProcessStartTime::Started(value) => Ok(value),
-        ProcessStartTime::NoSuchProcess => Err(SpawnError::ProcessMissing),
-        ProcessStartTime::NotPermitted
-        | ProcessStartTime::StatReadFailed
-        | ProcessStartTime::SystemTimeBaseUnavailable => Err(SpawnError::ProcessInspectionDenied),
-        ProcessStartTime::LayoutMismatch => Err(SpawnError::ProcessLayoutMismatch),
-        ProcessStartTime::NoStartTime => Err(SpawnError::ProcessStartTimeMissing),
+fn start_time_for_spawn(pid: u32) -> Result<([u8; 16], u64), SpawnError> {
+    match process_generation(pid) {
+        ProcessGenerationReading::Started {
+            boot_id,
+            start_ticks,
+        } => Ok((boot_id, start_ticks)),
+        ProcessGenerationReading::NoSuchProcess => Err(SpawnError::ProcessMissing),
+        ProcessGenerationReading::NotPermitted
+        | ProcessGenerationReading::StatReadFailed
+        | ProcessGenerationReading::BootIdUnavailable => Err(SpawnError::ProcessInspectionDenied),
+        ProcessGenerationReading::LayoutMismatch => Err(SpawnError::ProcessLayoutMismatch),
+        ProcessGenerationReading::NoStartTime => Err(SpawnError::ProcessStartTimeMissing),
     }
 }
 
-fn start_time_for_identity(pid: u32) -> Result<u64, ImageIdentityError> {
-    match process_start_time(pid) {
-        ProcessStartTime::Started(value) => Ok(value),
-        ProcessStartTime::NoSuchProcess => Err(ImageIdentityError::ProcessMissing),
-        ProcessStartTime::NotPermitted
-        | ProcessStartTime::StatReadFailed
-        | ProcessStartTime::SystemTimeBaseUnavailable => {
+fn start_time_for_identity(pid: u32) -> Result<([u8; 16], u64), ImageIdentityError> {
+    match process_generation(pid) {
+        ProcessGenerationReading::Started {
+            boot_id,
+            start_ticks,
+        } => Ok((boot_id, start_ticks)),
+        ProcessGenerationReading::NoSuchProcess => Err(ImageIdentityError::ProcessMissing),
+        ProcessGenerationReading::NotPermitted
+        | ProcessGenerationReading::StatReadFailed
+        | ProcessGenerationReading::BootIdUnavailable => {
             Err(ImageIdentityError::ProcessInspectionDenied)
         }
-        ProcessStartTime::LayoutMismatch => Err(ImageIdentityError::ProcessLayoutMismatch),
-        ProcessStartTime::NoStartTime => Err(ImageIdentityError::ProcessStartTimeMissing),
+        ProcessGenerationReading::LayoutMismatch => Err(ImageIdentityError::ProcessLayoutMismatch),
+        ProcessGenerationReading::NoStartTime => Err(ImageIdentityError::ProcessStartTimeMissing),
+    }
+}
+
+/// Compare a generation this process spawned, and still holds a handle to,
+/// against procfs.
+///
+/// Such a child cannot outlive this boot while its handle exists, so exact
+/// equality of the reading is the whole question. Durable records that may
+/// predate this boot or this record format are classified by the caller and
+/// reach termination through [`terminate_exact_generation`]'s verdict instead.
+fn own_generation_match(generation: ProcessGeneration) -> GenerationMatch {
+    match process_generation(generation.pid) {
+        ProcessGenerationReading::Started {
+            boot_id,
+            start_ticks,
+        } if boot_id == generation.boot_id && start_ticks == generation.start_ticks => {
+            GenerationMatch::Exact
+        }
+        ProcessGenerationReading::Started { .. } | ProcessGenerationReading::NoSuchProcess => {
+            GenerationMatch::GoneOrReplaced
+        }
+        ProcessGenerationReading::NotPermitted
+        | ProcessGenerationReading::StatReadFailed
+        | ProcessGenerationReading::BootIdUnavailable
+        | ProcessGenerationReading::LayoutMismatch
+        | ProcessGenerationReading::NoStartTime => GenerationMatch::Unreadable,
     }
 }
 
 fn ensure_generation(generation: ProcessGeneration) -> Result<(), ProcessControlError> {
-    match process_start_time(generation.pid) {
-        ProcessStartTime::Started(start) if start == generation.start_time_micros => Ok(()),
-        ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
-            Err(ProcessControlError::GenerationChanged)
-        }
-        ProcessStartTime::NotPermitted
-        | ProcessStartTime::StatReadFailed
-        | ProcessStartTime::SystemTimeBaseUnavailable
-        | ProcessStartTime::LayoutMismatch
-        | ProcessStartTime::NoStartTime => Err(ProcessControlError::GenerationUnreadable),
+    match own_generation_match(generation) {
+        GenerationMatch::Exact => Ok(()),
+        GenerationMatch::GoneOrReplaced => Err(ProcessControlError::GenerationChanged),
+        GenerationMatch::Unreadable => Err(ProcessControlError::GenerationUnreadable),
     }
 }
 
@@ -973,6 +1006,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{process_start_time, ProcessStartTime};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
@@ -1109,12 +1143,23 @@ mod tests {
         loop {
             match process_start_time(pid) {
                 ProcessStartTime::NoSuchProcess => return,
-                ProcessStartTime::Started(start) if Instant::now() >= deadline => {
-                    let _ = terminate_exact_generation(
-                        pid,
-                        start,
-                        Instant::now() + Duration::from_secs(1),
-                    );
+                ProcessStartTime::Started(_) if Instant::now() >= deadline => {
+                    if let ProcessGenerationReading::Started {
+                        boot_id,
+                        start_ticks,
+                    } = process_generation(pid)
+                    {
+                        let generation = ProcessGeneration {
+                            pid,
+                            boot_id,
+                            start_ticks,
+                        };
+                        let _ = terminate_exact_generation(
+                            pid,
+                            Instant::now() + Duration::from_secs(1),
+                            || own_generation_match(generation),
+                        );
+                    }
                     panic!("target {pid} survived launcher death");
                 }
                 ProcessStartTime::Started(_) => std::thread::sleep(Duration::from_millis(10)),
@@ -1229,7 +1274,7 @@ mod tests {
     #[test]
     fn release_refuses_a_process_generation_that_no_longer_matches() {
         let mut child = spawn_sleep();
-        child.generation.start_time_micros += 1;
+        child.generation.start_ticks += 1;
         assert_eq!(
             child.release().map(|_| ()),
             Err(ProcessControlError::GenerationChanged)
@@ -1237,28 +1282,57 @@ mod tests {
     }
 
     #[test]
-    fn termination_refuses_unreadable_start_times_without_signalling() {
-        for observed in [
-            ProcessStartTime::NotPermitted,
-            ProcessStartTime::StatReadFailed,
-            ProcessStartTime::SystemTimeBaseUnavailable,
-        ] {
-            let mut signalled = false;
-            assert_eq!(
-                terminate_exact_generation_with(
-                    42,
-                    123,
-                    Instant::now() + Duration::from_secs(1),
-                    |_| observed,
-                    |_| {
-                        signalled = true;
-                        Ok(())
-                    },
-                ),
-                Err(ProcessControlError::GenerationUnreadable)
-            );
-            assert!(!signalled, "{observed:?} must refuse before signalling");
-        }
+    fn termination_refuses_unreadable_generations_without_signalling() {
+        let mut signalled = false;
+        assert_eq!(
+            terminate_exact_generation_with(
+                42,
+                Instant::now() + Duration::from_secs(1),
+                || GenerationMatch::Unreadable,
+                |_| {
+                    signalled = true;
+                    Ok(())
+                },
+            ),
+            Err(ProcessControlError::GenerationUnreadable)
+        );
+        assert!(
+            !signalled,
+            "an unreadable generation must refuse before signalling"
+        );
+    }
+
+    #[test]
+    fn termination_of_a_gone_or_replaced_generation_does_not_signal() {
+        let mut signalled = false;
+        assert_eq!(
+            terminate_exact_generation_with(
+                42,
+                Instant::now() + Duration::from_secs(1),
+                || GenerationMatch::GoneOrReplaced,
+                |_| {
+                    signalled = true;
+                    Ok(())
+                },
+            ),
+            Ok(TerminationOutcome::AlreadyGoneOrReplaced)
+        );
+        assert!(!signalled, "a replaced pid belongs to another process");
+    }
+
+    #[test]
+    fn a_spawned_generation_reads_back_as_its_own_exact_match() {
+        let child = spawn_sleep();
+        assert_eq!(
+            own_generation_match(child.generation()),
+            GenerationMatch::Exact
+        );
+        let mut other_boot = child.generation();
+        other_boot.boot_id[0] ^= 0xff;
+        assert_eq!(
+            own_generation_match(other_boot),
+            GenerationMatch::GoneOrReplaced
+        );
     }
 
     #[test]

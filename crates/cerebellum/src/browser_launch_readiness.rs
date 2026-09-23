@@ -964,6 +964,7 @@ pub(crate) mod tests {
                 process_generation: BrowserProcessGeneration {
                     pid: 42,
                     start_time_micros: 77,
+                    boot_id: None,
                 },
             },
             observed_executable_identity: executable_identity(),
@@ -1319,6 +1320,7 @@ pub(crate) mod tests {
             BrowserProcessGeneration {
                 pid: 42,
                 start_time_micros: 77,
+                boot_id: None,
             }
         }
 

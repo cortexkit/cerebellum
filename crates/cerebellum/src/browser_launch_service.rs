@@ -44,6 +44,8 @@ use crate::profile::{
     BindFacts, DispatchCommitmentToken, InvocationToken, JournalReservationHandle,
     ProfileLifecycle, RegistryConfig, RegistryError, StampedBindContext,
 };
+#[cfg(target_os = "linux")]
+use crate::profile_custody::SupervisorLiveness;
 use crate::profile_custody::{
     current_supervisor_generation, FilesystemProfileCustodyJournal, KernelSupervisorLiveness,
     ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
@@ -627,10 +629,17 @@ fn platform_generation_matches(generation: BrowserProcessGeneration) -> bool {
 
 #[cfg(target_os = "linux")]
 fn platform_generation_matches(generation: BrowserProcessGeneration) -> bool {
-    matches!(
-        cerebellum_linux::process_start_time(generation.pid),
-        cerebellum_linux::ProcessStartTime::Started(start_time)
-            if start_time == generation.start_time_micros
+    linux_generation_liveness(generation) == SupervisorLiveness::Live
+}
+
+/// Classify a recorded browser generation against what procfs reports now,
+/// reading it in the unit the record was written in.
+#[cfg(target_os = "linux")]
+fn linux_generation_liveness(generation: BrowserProcessGeneration) -> SupervisorLiveness {
+    crate::profile_custody::classify_process_generation(
+        generation.start_time_micros,
+        generation.boot_id,
+        crate::profile_custody::linux_generation_observation(generation.pid, generation.boot_id),
     )
 }
 
@@ -641,11 +650,10 @@ fn platform_generation_exited(generation: BrowserProcessGeneration) -> bool {
 
 #[cfg(target_os = "linux")]
 fn platform_generation_exited(generation: BrowserProcessGeneration) -> bool {
-    !matches!(
-        cerebellum_linux::process_start_time(generation.pid),
-        cerebellum_linux::ProcessStartTime::Started(start_time)
-            if start_time == generation.start_time_micros
-    )
+    // Unchanged from before the boot ID: anything but an exact match counts as
+    // exited here, and the caller's next step is a generation-checked
+    // termination that refuses an unreadable generation on its own.
+    !platform_generation_matches(generation)
 }
 
 #[cfg(target_os = "linux")]
@@ -655,6 +663,9 @@ struct LinuxOrphanProcessControl {
 
 #[cfg(target_os = "linux")]
 impl OrphanBrowserProcessControl for LinuxOrphanProcessControl {
+    /// The epoch start time, which only a record written before the boot ID
+    /// existed can be compared with. Recovery reads through
+    /// [`Self::observe_generation`], which picks the reading the record needs.
     fn observed_start_time_micros(
         &mut self,
         pid: u32,
@@ -670,14 +681,29 @@ impl OrphanBrowserProcessControl for LinuxOrphanProcessControl {
         }
     }
 
+    fn observe_generation(
+        &mut self,
+        generation: BrowserProcessGeneration,
+    ) -> crate::profile_custody::GenerationObservation {
+        crate::profile_custody::linux_generation_observation(generation.pid, generation.boot_id)
+    }
+
     fn terminate_and_reap(
         &mut self,
         generation: BrowserProcessGeneration,
     ) -> Result<(), OrphanProcessControlFailure> {
+        // The seam signals only on `Exact`, and asks again if the signal
+        // fails. A record with a boot ID matches after a wall-clock step, so a
+        // live orphan is terminated; an older record whose epoch start time
+        // moved answers `Unreadable` and is refused rather than read as gone.
         match cerebellum_linux::terminate_exact_generation(
             generation.pid,
-            generation.start_time_micros,
             Instant::now() + self.reap_deadline,
+            || match linux_generation_liveness(generation) {
+                SupervisorLiveness::Live => cerebellum_linux::GenerationMatch::Exact,
+                SupervisorLiveness::NotLive => cerebellum_linux::GenerationMatch::GoneOrReplaced,
+                SupervisorLiveness::Unavailable => cerebellum_linux::GenerationMatch::Unreadable,
+            },
         ) {
             Ok(cerebellum_linux::TerminationOutcome::AlreadyGoneOrReplaced) => return Ok(()),
             Ok(cerebellum_linux::TerminationOutcome::Signalled) => {}
@@ -685,21 +711,10 @@ impl OrphanBrowserProcessControl for LinuxOrphanProcessControl {
         }
         let deadline = Instant::now() + self.reap_deadline;
         loop {
-            match cerebellum_linux::process_start_time(generation.pid) {
-                cerebellum_linux::ProcessStartTime::NoSuchProcess => return Ok(()),
-                cerebellum_linux::ProcessStartTime::Started(start_time)
-                    if start_time != generation.start_time_micros =>
-                {
-                    return Ok(())
-                }
-                cerebellum_linux::ProcessStartTime::Started(_) => {}
-                cerebellum_linux::ProcessStartTime::NotPermitted
-                | cerebellum_linux::ProcessStartTime::StatReadFailed
-                | cerebellum_linux::ProcessStartTime::SystemTimeBaseUnavailable
-                | cerebellum_linux::ProcessStartTime::LayoutMismatch
-                | cerebellum_linux::ProcessStartTime::NoStartTime => {
-                    return Err(OrphanProcessControlFailure)
-                }
+            match linux_generation_liveness(generation) {
+                SupervisorLiveness::NotLive => return Ok(()),
+                SupervisorLiveness::Live => {}
+                SupervisorLiveness::Unavailable => return Err(OrphanProcessControlFailure),
             }
             if Instant::now() >= deadline {
                 return Err(OrphanProcessControlFailure);
@@ -960,10 +975,7 @@ impl OwnedBrowserProcess for ProductionProcess {
     fn generation_matches(&self) -> bool {
         self.process.as_ref().is_some_and(|process| {
             let generation = process.generation();
-            platform_generation_matches(BrowserProcessGeneration {
-                pid: generation.pid,
-                start_time_micros: generation.start_time_micros,
-            })
+            platform_generation_matches(BrowserProcessGeneration::from(generation))
         })
     }
 
@@ -982,10 +994,7 @@ impl OwnedBrowserProcess for ProductionProcess {
         let generation = process.generation();
         let deadline = Instant::now() + grace_period;
         while Instant::now() < deadline {
-            if platform_generation_exited(BrowserProcessGeneration {
-                pid: generation.pid,
-                start_time_micros: generation.start_time_micros,
-            }) {
+            if platform_generation_exited(BrowserProcessGeneration::from(generation)) {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1974,6 +1983,7 @@ mod orphan_recovery_tests {
         let old_supervisor = SupervisorGeneration {
             pid: u32::MAX,
             start_time: 17,
+            boot_id: None,
         };
         let journal = FilesystemProfileCustodyJournal::open(root.join(PROFILE_CUSTODY_DIRECTORY))
             .expect("open custody journal");
@@ -2123,65 +2133,116 @@ mod orphan_recovery_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_orphan_recovery_tests {
     use super::*;
+    use crate::profile_custody::{BootId, GenerationObservation};
 
-    #[test]
-    fn linux_orphan_control_observes_and_reaps_the_exact_generation() {
-        let mut child = std::process::Command::new("/bin/sleep")
+    fn sleeping_fixture() -> (std::process::Child, BrowserProcessGeneration) {
+        let child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn orphan-control fixture");
         let pid = child.id();
-        let start_time = match cerebellum_linux::process_start_time(pid) {
-            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
-            other => panic!("unexpected fixture generation reading: {other:?}"),
-        };
+        let (boot_id, start_ticks) = crate::profile_custody::linux_current_generation(pid)
+            .expect("fixture generation is readable");
+        (
+            child,
+            BrowserProcessGeneration {
+                pid,
+                start_time_micros: start_ticks,
+                boot_id: Some(boot_id),
+            },
+        )
+    }
+
+    fn still_running(generation: BrowserProcessGeneration) -> bool {
+        linux_generation_liveness(generation) == SupervisorLiveness::Live
+    }
+
+    #[test]
+    fn linux_orphan_control_observes_and_reaps_the_exact_generation() {
+        let (mut child, generation) = sleeping_fixture();
         let mut control = LinuxOrphanProcessControl {
             reap_deadline: Duration::from_secs(1),
         };
 
         assert_eq!(
-            control.observed_start_time_micros(pid),
-            Ok(Some(start_time))
+            control.observe_generation(generation),
+            GenerationObservation::BootTicks {
+                boot_id: generation.boot_id.unwrap(),
+                start_ticks: generation.start_time_micros,
+            }
         );
         control
-            .terminate_and_reap(BrowserProcessGeneration {
-                pid,
-                start_time_micros: start_time,
-            })
+            .terminate_and_reap(generation)
             .expect("terminate exact orphan generation");
         assert_eq!(
-            cerebellum_linux::process_start_time(pid),
-            cerebellum_linux::ProcessStartTime::NoSuchProcess
+            cerebellum_linux::process_generation(generation.pid),
+            cerebellum_linux::ProcessGenerationReading::NoSuchProcess
         );
         let _ = child.wait();
     }
 
     #[test]
     fn linux_orphan_control_does_not_signal_a_different_generation() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn generation-mismatch fixture");
-        let pid = child.id();
-        let start_time = match cerebellum_linux::process_start_time(pid) {
-            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
-            other => panic!("unexpected fixture generation reading: {other:?}"),
-        };
+        let (mut child, generation) = sleeping_fixture();
         let mut control = LinuxOrphanProcessControl {
             reap_deadline: Duration::from_secs(1),
         };
 
         control
             .terminate_and_reap(BrowserProcessGeneration {
-                pid,
-                start_time_micros: start_time.saturating_sub(1),
+                start_time_micros: generation.start_time_micros.saturating_sub(1),
+                ..generation
             })
             .expect("mismatched generation is already gone-or-replaced");
-        assert_eq!(
-            cerebellum_linux::process_start_time(pid),
-            cerebellum_linux::ProcessStartTime::Started(start_time)
-        );
+        assert!(still_running(generation));
         child.kill().expect("clean up mismatch fixture");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn linux_orphan_control_does_not_signal_a_generation_from_another_boot() {
+        let (mut child, generation) = sleeping_fixture();
+        let mut other_boot = *generation.boot_id.unwrap().as_bytes();
+        other_boot[0] ^= 0xff;
+        let mut control = LinuxOrphanProcessControl {
+            reap_deadline: Duration::from_secs(1),
+        };
+
+        control
+            .terminate_and_reap(BrowserProcessGeneration {
+                boot_id: Some(BootId::from_bytes(other_boot)),
+                ..generation
+            })
+            .expect("a previous boot's process is gone");
+        assert!(still_running(generation));
+        child.kill().expect("clean up cross-boot fixture");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn linux_orphan_control_refuses_a_legacy_record_whose_start_time_moved() {
+        let (mut child, generation) = sleeping_fixture();
+        let micros = match cerebellum_linux::process_start_time(generation.pid) {
+            cerebellum_linux::ProcessStartTime::Started(start_time) => start_time,
+            other => panic!("unexpected fixture start-time reading: {other:?}"),
+        };
+        let mut control = LinuxOrphanProcessControl {
+            reap_deadline: Duration::from_secs(1),
+        };
+
+        // A pre-boot-ID record that differs from the live epoch reading may be
+        // a clock step over this very process, so it is neither signalled nor
+        // reported as gone.
+        assert_eq!(
+            control.terminate_and_reap(BrowserProcessGeneration {
+                pid: generation.pid,
+                start_time_micros: micros - 7_201_000_000,
+                boot_id: None,
+            }),
+            Err(OrphanProcessControlFailure)
+        );
+        assert!(still_running(generation));
+        child.kill().expect("clean up legacy fixture");
         let _ = child.wait();
     }
 }

@@ -967,9 +967,15 @@ fn is_holder_lock_path(path: &Path) -> bool {
 fn observed_supervisor_start_time(pid: u32) -> Result<Option<u64>, String> {
     #[cfg(target_os = "linux")]
     {
-        match cerebellum_linux::process_start_time(pid) {
-            cerebellum_linux::ProcessStartTime::Started(start_time) => Ok(Some(start_time)),
-            cerebellum_linux::ProcessStartTime::NoSuchProcess => Ok(None),
+        // Current locks record the start in clock ticks since boot, which a
+        // wall-clock step cannot move (see `SupervisorGeneration`). A lock
+        // written before that holds epoch microseconds and reads here as a
+        // moved start time, which this probe refuses the same way.
+        match cerebellum_linux::process_generation(pid) {
+            cerebellum_linux::ProcessGenerationReading::Started { start_ticks, .. } => {
+                Ok(Some(start_ticks))
+            }
+            cerebellum_linux::ProcessGenerationReading::NoSuchProcess => Ok(None),
             outcome => Err(format!("live reading unavailable: {outcome:?}")),
         }
     }

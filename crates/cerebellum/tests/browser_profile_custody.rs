@@ -16,11 +16,12 @@ use cerebellum::profile::{
     ProfileOutcome, ProfileState, RegistryConfig, UntrustworthyRegistryReason,
 };
 use cerebellum::profile_custody::{
-    classify_supervisor_start_time, current_supervisor_generation, read_record_if_present,
-    KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyEvent,
-    ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLockError,
-    ProfileCustodyLockRecord, ProfileCustodyLocks, ProfileCustodyRelease, StartTimeStability,
-    SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
+    classify_process_generation, classify_supervisor_start_time, current_supervisor_generation,
+    read_record_if_present, BootId, GenerationObservation, KernelSupervisorLiveness,
+    ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
+    ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks,
+    ProfileCustodyRelease, StartTimeStability, SupervisorGeneration, SupervisorLiveness,
+    SupervisorLivenessProbe,
 };
 use serde_json::{json, Value};
 
@@ -139,7 +140,11 @@ impl ProfileCustodyJournal for FailEventJournal {
 }
 
 fn generation(pid: u32, start_time: u64) -> SupervisorGeneration {
-    SupervisorGeneration { pid, start_time }
+    SupervisorGeneration {
+        pid,
+        start_time,
+        boot_id: None,
+    }
 }
 
 fn context(
@@ -1254,4 +1259,243 @@ fn the_production_probe_reads_back_the_generation_this_supervisor_records() {
         KernelSupervisorLiveness.observe(own),
         SupervisorLiveness::Live
     );
+}
+
+const BOOT: BootId = BootId::from_bytes([0x3f; 16]);
+const OTHER_BOOT: BootId = BootId::from_bytes([0xa1; 16]);
+
+fn boot_ticks(boot_id: BootId, start_ticks: u64) -> GenerationObservation {
+    GenerationObservation::BootTicks {
+        boot_id,
+        start_ticks,
+    }
+}
+
+/// Only an exact match of boot and ticks is the recorded process. Neither half
+/// moves with the wall clock, so this holds after a clock step as well.
+#[test]
+fn a_boot_ticks_record_is_live_on_an_exact_boot_and_tick_match() {
+    assert_eq!(
+        classify_process_generation(6100, Some(BOOT), boot_ticks(BOOT, 6100)),
+        SupervisorLiveness::Live
+    );
+}
+
+/// Every process of an earlier boot ended with it, so a record from another
+/// boot names nobody now, however its ticks compare: its pid belongs to an
+/// unrelated process and must not be treated as the holder.
+#[test]
+fn a_boot_ticks_record_from_another_boot_is_gone_even_when_ticks_agree() {
+    assert_eq!(
+        classify_process_generation(6100, Some(OTHER_BOOT), boot_ticks(BOOT, 6100)),
+        SupervisorLiveness::NotLive
+    );
+}
+
+/// In the same boot, a pid that started at other ticks has been reused. This
+/// is no longer ambiguous: ticks since boot do not move with the clock.
+#[test]
+fn same_boot_different_ticks_is_pid_reuse_and_gone() {
+    assert_eq!(
+        classify_process_generation(6100, Some(BOOT), boot_ticks(BOOT, 6101)),
+        SupervisorLiveness::NotLive
+    );
+}
+
+#[test]
+fn an_absent_pid_is_gone_for_either_record_kind() {
+    for recorded_boot in [Some(BOOT), None] {
+        assert_eq!(
+            classify_process_generation(6100, recorded_boot, GenerationObservation::Absent),
+            SupervisorLiveness::NotLive
+        );
+    }
+}
+
+/// `NotLive` lets a restore or respawn proceed over the pid, so failing to
+/// read the boot must never produce it.
+#[test]
+fn an_unreadable_boot_id_is_unavailable_never_gone() {
+    for recorded_boot in [Some(BOOT), None] {
+        assert_eq!(
+            classify_process_generation(
+                6100,
+                recorded_boot,
+                GenerationObservation::BootIdUnreadable
+            ),
+            SupervisorLiveness::Unavailable
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_process_is_unavailable_never_gone() {
+    for recorded_boot in [Some(BOOT), None] {
+        assert_eq!(
+            classify_process_generation(6100, recorded_boot, GenerationObservation::Unreadable),
+            SupervisorLiveness::Unavailable
+        );
+    }
+}
+
+/// A record written before the boot ID holds epoch microseconds, which on
+/// Linux move with the wall clock. A 7201 s step over a live holder must
+/// refuse, not break the lock.
+#[test]
+fn a_legacy_record_whose_micros_moved_by_a_clock_step_is_unavailable_not_gone() {
+    assert_eq!(
+        classify_process_generation(
+            6100,
+            None,
+            GenerationObservation::StartTime {
+                start_time: 6100 + 7_201_000_000,
+                stability: StartTimeStability::MovesWithWallClock,
+            },
+        ),
+        SupervisorLiveness::Unavailable
+    );
+}
+
+/// macOS records keep their rule: a stored start time that differs is reuse.
+#[test]
+fn a_clock_stable_record_keeps_its_existing_rule() {
+    let observed = |start_time| GenerationObservation::StartTime {
+        start_time,
+        stability: StartTimeStability::ClockStable,
+    };
+    assert_eq!(
+        classify_process_generation(6100, None, observed(6100)),
+        SupervisorLiveness::Live
+    );
+    assert_eq!(
+        classify_process_generation(6100, None, observed(6200)),
+        SupervisorLiveness::NotLive
+    );
+}
+
+#[test]
+fn a_reading_in_the_other_unit_cannot_be_compared() {
+    assert_eq!(
+        classify_process_generation(
+            6100,
+            Some(BOOT),
+            GenerationObservation::StartTime {
+                start_time: 6100,
+                stability: StartTimeStability::ClockStable,
+            },
+        ),
+        SupervisorLiveness::Unavailable
+    );
+    assert_eq!(
+        classify_process_generation(6100, None, boot_ticks(BOOT, 6100)),
+        SupervisorLiveness::Unavailable
+    );
+}
+
+/// A probe that answers through the neutral classifier from a scripted reading.
+struct ScriptedObservation(GenerationObservation);
+
+impl SupervisorLivenessProbe for ScriptedObservation {
+    fn observe(&self, generation: SupervisorGeneration) -> SupervisorLiveness {
+        classify_process_generation(generation.start_time, generation.boot_id, self.0)
+    }
+}
+
+/// A lock written before this format carried a boot ID still loads, is read
+/// in epoch microseconds, and does not wedge its profile: once its holder is
+/// gone the next acquire breaks it and writes the current format.
+#[test]
+fn a_v1_custody_lock_still_loads_and_takes_the_legacy_arm() {
+    let root = TestRoot::new("v1-lock-migration");
+    let key = ProfileCustodyKey::durable("project-1");
+    let legacy = generation(61, 6100);
+    let mut seed =
+        ProfileCustodyLocks::open(root.path(), legacy, RecordingJournal::default(), AlwaysLive)
+            .unwrap();
+    let old_holder = seed.mint_holder().unwrap();
+    assert!(matches!(
+        seed.acquire(key.clone(), old_holder.clone()),
+        Ok(ProfileCustodyAcquisition::Acquired(_))
+    ));
+    let lock = profile_lock_path(root.path());
+    fs::write(
+        &lock,
+        format!(
+            r#"{{"format_version":"ck-browser-profile-custody-lock/v1","holder_id":"{}","supervisor_pid":61,"supervisor_start_time":6100,"profile_directory":null}}"#,
+            old_holder.as_str()
+        ),
+    )
+    .unwrap();
+
+    let record = read_record_if_present(&lock)
+        .unwrap()
+        .expect("v1 lock loads");
+    assert_eq!(record.supervisor(), legacy);
+    assert_eq!(
+        classify_process_generation(
+            legacy.start_time,
+            legacy.boot_id,
+            GenerationObservation::StartTime {
+                start_time: 6100,
+                stability: StartTimeStability::MovesWithWallClock,
+            },
+        ),
+        SupervisorLiveness::Live,
+        "an unmoved legacy start time is still its holder"
+    );
+
+    let current = SupervisorGeneration {
+        pid: 62,
+        start_time: 99,
+        boot_id: Some(BOOT),
+    };
+    let mut contender = ProfileCustodyLocks::open(
+        root.path(),
+        current,
+        RecordingJournal::default(),
+        ScriptedObservation(GenerationObservation::Absent),
+    )
+    .unwrap();
+    let new_holder = contender.mint_holder().unwrap();
+    assert!(matches!(
+        contender.acquire(key, new_holder),
+        Ok(ProfileCustodyAcquisition::Acquired(_))
+    ));
+    let installed: Value = serde_json::from_slice(&fs::read(&lock).unwrap()).unwrap();
+    assert_eq!(
+        installed["format_version"],
+        "ck-browser-profile-custody-lock/v2"
+    );
+    assert_eq!(
+        installed["supervisor_boot_id"],
+        "3f3f3f3f-3f3f-3f3f-3f3f-3f3f3f3f3f3f"
+    );
+    assert_eq!(
+        read_record_if_present(&lock).unwrap().unwrap().supervisor(),
+        current
+    );
+}
+
+#[test]
+fn a_v1_custody_lock_that_claims_a_boot_id_is_invalid() {
+    let root = TestRoot::new("v1-lock-with-boot");
+    let lock = root.path().join("claims-boot.lock");
+    fs::write(
+        &lock,
+        r#"{"format_version":"ck-browser-profile-custody-lock/v1","holder_id":"h","supervisor_pid":17,"supervisor_start_time":1700,"supervisor_boot_id":"3f3f3f3f-3f3f-3f3f-3f3f-3f3f3f3f3f3f","profile_directory":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        read_record_if_present(&lock),
+        Err(ProfileCustodyLockError::InvalidRecord)
+    ));
+}
+
+/// Linux records the supervisor in boot and ticks, and the production probe
+/// must compare it that way; macOS keeps its epoch reading with no boot ID.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_supervisor_generation_carries_a_boot_id_exactly_on_linux() {
+    let own = current_supervisor_generation().expect("this platform records a supervisor");
+    assert_eq!(own.boot_id.is_some(), cfg!(target_os = "linux"));
 }
