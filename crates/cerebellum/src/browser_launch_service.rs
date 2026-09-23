@@ -26,7 +26,7 @@ use crate::browser_launch::MacOsProcessLauncher;
 use crate::browser_launch::{
     recover_browser_launches, AttestedLaunchError, AttestedLaunchRequest, BrowserLaunchOutcome,
     BrowserLaunchRecoveryFailure, BrowserProcessGeneration, DurableLaunchJournal,
-    LaunchAttestationRecord, LaunchProfileIdentity, LaunchRouteIdentity,
+    LaunchAttestationRecord, LaunchProfile, LaunchProfileIdentity, LaunchRouteIdentity,
     OrphanBrowserProcessControl, OrphanProcessControlFailure, OrphanProfileCustody,
     OrphanProfileCustodyFailure, ProfileBoundLaunch,
 };
@@ -304,7 +304,7 @@ impl ProductionLaunchService {
             profile: LaunchProfileIdentity {
                 profile_uuid,
                 canonical_profile_path: path_bytes(&profile_directory),
-                disposition: accepted.identity.profile_disposition,
+                disposition: LaunchProfile::Registry(accepted.identity.profile_disposition),
             },
             executable: executable.clone(),
             arguments,
@@ -767,13 +767,22 @@ fn release_orphan_profile_custody_at(
     let mut locks = ProfileCustodyLocks::open(root, supervisor, journal, KernelSupervisorLiveness)
         .map_err(|_| ())?;
     let key = match intent.profile.disposition {
-        ProfileDisposition::Durable => ProfileCustodyKey::durable(&intent.route.agent_project_id),
-        ProfileDisposition::Disposable => ProfileCustodyKey::disposable_route(
-            &intent.route.agent_project_id,
-            &intent.route.conversation_key,
-            &intent.launch_attempt_id,
-        ),
-        ProfileDisposition::None => return Err(()),
+        LaunchProfile::Registry(ProfileDisposition::Durable) => {
+            ProfileCustodyKey::durable(&intent.route.agent_project_id)
+        }
+        LaunchProfile::Registry(ProfileDisposition::Disposable) => {
+            ProfileCustodyKey::disposable_route(
+                &intent.route.agent_project_id,
+                &intent.route.conversation_key,
+                &intent.launch_attempt_id,
+            )
+        }
+        // Recovery skips capture records before reaching custody, so arriving
+        // here with one is a caller error; refusing is the honest answer, as it
+        // is for a record with no profile at all.
+        LaunchProfile::Registry(ProfileDisposition::None) | LaunchProfile::Capture => {
+            return Err(())
+        }
     };
     let temporary_holder = locks.mint_holder().map_err(|_| ())?;
     let claim = match locks.acquire(key, temporary_holder).map_err(|_| ())? {
@@ -2030,7 +2039,9 @@ mod orphan_recovery_tests {
             profile: LaunchProfileIdentity {
                 profile_uuid: "profile-1".to_string(),
                 canonical_profile_path: path_bytes(&root.join("profiles/profile-1")),
-                disposition: ProfileDisposition::Durable,
+                disposition: crate::browser_launch::LaunchProfile::Registry(
+                    ProfileDisposition::Durable,
+                ),
             },
             verified_executable_identity:
                 crate::browser_launch::VerifiedExecutableIdentity::CodeSignedFile {

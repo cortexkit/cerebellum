@@ -934,7 +934,9 @@ pub(crate) mod tests {
             profile: LaunchProfileIdentity {
                 profile_uuid: "profile-1".to_string(),
                 canonical_profile_path: b"/tmp/profile-1".to_vec(),
-                disposition: cerebellum_core::identity::ProfileDisposition::Durable,
+                disposition: crate::browser_launch::LaunchProfile::Registry(
+                    cerebellum_core::identity::ProfileDisposition::Durable,
+                ),
             },
             executable: PathBuf::from("/Applications/Browser.app/Contents/MacOS/Browser"),
             arguments: vec![OsString::from("--remote-debugging-pipe")],
@@ -1461,7 +1463,9 @@ mod live_chrome_test {
             profile: LaunchProfileIdentity {
                 profile_uuid: "real-chrome-test".to_string(),
                 canonical_profile_path: profile.as_os_str().as_bytes().to_vec(),
-                disposition: cerebellum_core::identity::ProfileDisposition::Durable,
+                disposition: crate::browser_launch::LaunchProfile::Registry(
+                    cerebellum_core::identity::ProfileDisposition::Durable,
+                ),
             },
             executable,
             arguments,

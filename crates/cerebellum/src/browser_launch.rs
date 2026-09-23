@@ -25,9 +25,11 @@ use crate::profile_custody::{
 
 const GENERATION_SLOT: &str = "browser.launch.generation";
 const ATTESTATION_SLOT: &str = "browser.launch.attestation";
+/// Version 5 admits `capture` as a launch profile (see [`LaunchProfile`]).
+const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v5";
 /// Version 4 added `boot_id` to the process generation. When present, the
 /// generation's start time is clock ticks since that boot, not epoch microseconds.
-const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v4";
+const V4_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v4";
 const V3_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v3";
 const V2_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v2";
 const LEGACY_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v1";
@@ -49,7 +51,54 @@ pub struct LaunchProfileIdentity {
     pub profile_uuid: String,
     #[serde(with = "cerebellum_core::serde_base64::bytes_compat")]
     pub canonical_profile_path: Vec<u8>,
-    pub disposition: cerebellum_core::identity::ProfileDisposition,
+    pub disposition: LaunchProfile,
+}
+
+/// Which kind of profile a launch record describes.
+///
+/// Local to the launch journal on purpose. `ProfileDisposition` is bind-fact
+/// vocabulary that crosses the wire in admission facts, so a value meaning
+/// "capture" there would be one a carrier could stamp on a route. Here it only
+/// tells crash recovery what it owes the record.
+///
+/// Serialized under the historical `disposition` key as one string: a registry
+/// profile writes exactly the string its disposition always wrote, so a record
+/// from before version 5 decodes as `Registry(..)` and re-encodes to the same
+/// bytes, and only a capture adds the new word `capture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchProfile {
+    /// A profile the profile registry minted and holds custody of. Recovery
+    /// releases that custody after terminating an orphaned browser.
+    Registry(cerebellum_core::identity::ProfileDisposition),
+    /// A throwaway profile `browser.capture_login` created in its own capture
+    /// directory. It was never registered and never held registry custody, so
+    /// recovery terminates an orphaned browser and releases nothing; the
+    /// capture directory's own residue sweep deletes the files.
+    Capture,
+}
+
+const CAPTURE_PROFILE_WORD: &str = "capture";
+
+impl Serialize for LaunchProfile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Registry(disposition) => disposition.serialize(serializer),
+            Self::Capture => serializer.serialize_str(CAPTURE_PROFILE_WORD),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LaunchProfile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        if word == CAPTURE_PROFILE_WORD {
+            return Ok(Self::Capture);
+        }
+        cerebellum_core::identity::ProfileDisposition::deserialize(
+            serde::de::value::StrDeserializer::<D::Error>::new(&word),
+        )
+        .map(Self::Registry)
+    }
 }
 
 /// Guarantee established for the executable selected by launch policy.
@@ -1066,14 +1115,18 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                 .map_err(|_| BrowserLaunchRecoveryFailure::JournalRead { sequence })?;
             let intent = serde_json::from_slice::<AuthorizedLaunchIntent>(&audit.descriptor_bytes)
                 .ok()
-                .filter(|intent| {
-                    matches!(
-                        intent.format_version.as_str(),
-                        LAUNCH_CODEC_VERSION
-                            | V3_LAUNCH_CODEC_VERSION
-                            | V2_LAUNCH_CODEC_VERSION
-                            | LEGACY_LAUNCH_CODEC_VERSION
-                    )
+                .filter(|intent| match intent.format_version.as_str() {
+                    LAUNCH_CODEC_VERSION => true,
+                    // No writer before version 5 could record a capture, so
+                    // an older record claiming one is not a record this
+                    // module wrote, and recovery must not act on it.
+                    V4_LAUNCH_CODEC_VERSION
+                    | V3_LAUNCH_CODEC_VERSION
+                    | V2_LAUNCH_CODEC_VERSION
+                    | LEGACY_LAUNCH_CODEC_VERSION => {
+                        intent.profile.disposition != LaunchProfile::Capture
+                    }
+                    _ => false,
                 });
             let attested_generation = if classification
                 == cerebellum_core::journal::RecoveryClassification::ProvisionalDispatched
@@ -1097,8 +1150,10 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                                 // Before version 4 the start time was always
                                 // epoch microseconds; a boot ID there would
                                 // pair a boot with the wrong unit.
-                                && (intent.format_version == LAUNCH_CODEC_VERSION
-                                    || attestation
+                                && (matches!(
+                                    intent.format_version.as_str(),
+                                    LAUNCH_CODEC_VERSION | V4_LAUNCH_CODEC_VERSION
+                                ) || attestation
                                         .generation
                                         .process_generation
                                         .boot_id
@@ -1198,6 +1253,11 @@ where
 
     for attempt in &attempts {
         match attempt.intent.as_ref() {
+            // A capture profile never held registry custody, so there is
+            // nothing to release. Acquiring and releasing a lock it never held
+            // would write a claim into the registry's custody journal that no
+            // launch ever made.
+            Some(intent) if intent.profile.disposition == LaunchProfile::Capture => {}
             Some(intent) => {
                 if custody.release(intent).is_err() {
                     first_failure.get_or_insert(
@@ -2236,7 +2296,9 @@ mod tests {
             profile: LaunchProfileIdentity {
                 profile_uuid: "profile-1".to_string(),
                 canonical_profile_path: b"/tmp/profile-1".to_vec(),
-                disposition: cerebellum_core::identity::ProfileDisposition::Durable,
+                disposition: LaunchProfile::Registry(
+                    cerebellum_core::identity::ProfileDisposition::Durable,
+                ),
             },
             executable: PathBuf::from("/Applications/Browser.app/Contents/MacOS/Browser"),
             arguments: vec![OsString::from("--remote-debugging-pipe")],
@@ -2259,9 +2321,58 @@ mod tests {
         assert_eq!(intent.launch_attempt_id, "fixture-v4-attempt");
         assert_eq!(
             intent.profile.disposition,
-            cerebellum_core::identity::ProfileDisposition::Durable
+            LaunchProfile::Registry(cerebellum_core::identity::ProfileDisposition::Durable)
         );
         assert_eq!(serde_json::to_string(&intent).unwrap(), fixture);
+    }
+
+    #[test]
+    fn a_capture_profile_round_trips_and_is_refused_in_an_older_record() {
+        let mut intent = request().durable_intent();
+        intent.profile.disposition = LaunchProfile::Capture;
+        let encoded = serde_json::to_value(&intent).unwrap();
+        assert_eq!(encoded["profile"]["disposition"], "capture");
+        assert_eq!(
+            serde_json::from_value::<AuthorizedLaunchIntent>(encoded).unwrap(),
+            intent
+        );
+
+        // A pre-v5 record naming a capture was not written by any build of
+        // this module, so recovery refuses it rather than skipping custody.
+        let mut journal = reopened_dispatched_journal(InMemoryJournalStorage::new());
+        let mut request = request();
+        request.profile.disposition = LaunchProfile::Capture;
+        dispatch_attempt_as(&mut journal, &request, V4_LAUNCH_CODEC_VERSION, None);
+        let attempts = journal.active_launch_attempts().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].intent.is_none());
+    }
+
+    /// A capture browser left running by a crashed module is terminated by
+    /// exact generation like any orphan, but the profile registry's custody is
+    /// never touched: the capture profile never held any.
+    #[test]
+    fn a_recovered_capture_orphan_never_touches_profile_custody() {
+        let mut journal = reopened_dispatched_journal(InMemoryJournalStorage::new());
+        let mut request = request();
+        request.profile.disposition = LaunchProfile::Capture;
+        let (_, attestation) = dispatch_attempt(&mut journal, &request);
+        let generation = attestation.generation.process_generation;
+        let events = Events::new();
+        let mut process =
+            RecordingOrphanProcess::new(Ok(Some(generation.start_time_micros)), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events.clone());
+        let outcomes = recover_browser_launches(&mut journal, &mut process, &mut custody).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].process,
+            RecoveredBrowserProcess::TerminatedAndReaped
+        );
+        assert!(custody.releases.is_empty());
+        assert_eq!(
+            events.snapshot(),
+            vec!["generation_observed", "orphan_terminated_and_reaped"]
+        );
     }
 
     #[test]
@@ -2390,7 +2501,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_completion_fixture_reads_through_the_v4_reader() {
+    fn v2_completion_fixture_reads_through_the_current_reader() {
         let completion: LaunchSessionCompletion =
             serde_json::from_str(include_str!("../tests/fixtures/launch-completion-v2.json"))
                 .unwrap();
@@ -2404,7 +2515,7 @@ mod tests {
             crate::browser_session::BrowserSessionTerminalOutcome::Closed
         );
         assert_eq!(completion.failure, None);
-        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v4");
+        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v5");
     }
 
     fn terminal_completion(
