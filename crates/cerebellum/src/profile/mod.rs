@@ -302,8 +302,16 @@ impl FailureOrigin {
     }
 }
 
-pub(crate) const PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED: &str =
-    "profile_registry_managed_root_identity_changed";
+pub(crate) const PROFILE_REGISTRY_ROOT_INODE_CHANGED: &str =
+    "profile_registry_managed_root_inode_changed";
+pub(crate) const PROFILE_REGISTRY_ROOT_BIRTH_TIME_CHANGED: &str =
+    "profile_registry_managed_root_birth_time_changed";
+pub(crate) const PROFILE_REGISTRY_ROOT_PATH_CHANGED: &str =
+    "profile_registry_managed_root_path_changed";
+pub(crate) const PROFILE_REGISTRY_ROOT_IDENTITY_PREDATES_FACTS: &str =
+    "profile_registry_managed_root_identity_predates_facts";
+pub(crate) const PROFILE_REGISTRY_ROOT_BIRTH_TIME_UNAVAILABLE: &str =
+    "profile_registry_managed_root_birth_time_unavailable";
 pub(crate) const PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH: &str =
     "profile_registry_possibly_managed_path";
 
@@ -358,8 +366,10 @@ impl fmt::Display for ProfileOutcome {
     }
 }
 
-/// Stable identity for a directory and the held descriptor.  Device and inode
-/// are the identity proof on Unix; metadata size is only a conservative fallback
+/// Stable identity for a directory and the held descriptor within one process
+/// run.  Device and inode are the identity proof on Unix (the device cannot
+/// move while this process holds the directory open; the identity persisted
+/// across restarts is [`RootIdentityFacts`], which leaves the device out); metadata size is only a conservative fallback
 /// on other platforms and never authorizes a target outside the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StableIdentity {
@@ -389,6 +399,207 @@ fn stable_identity(metadata: &fs::Metadata) -> StableIdentity {
             readonly: metadata.permissions().readonly(),
         }
     }
+}
+
+/// The version of the persisted managed-root identity written by this build.
+///
+/// Version 1 was a bare SHA-256 over the canonical path, the device number and
+/// the inode. The device number is assigned at mount time on macOS and moves
+/// across reboots, so every reboot made the same directory look like a
+/// different one; and because only the hash was kept, nobody could tell a
+/// reboot from a restore. Version 2 records the facts themselves in plaintext
+/// and leaves the device out.
+pub const ROOT_IDENTITY_FORMULA: u32 = 2;
+
+/// A directory's creation time, split so it serializes as two exact integers.
+/// `nanoseconds` is always in `0..1_000_000_000`; times before 1970 carry a
+/// negative `unix_seconds` with a non-negative nanosecond part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BirthTime {
+    pub unix_seconds: i64,
+    pub nanoseconds: u32,
+}
+
+impl BirthTime {
+    /// Convert a timestamp, or `None` when it does not fit the stored range.
+    pub fn from_system_time(time: SystemTime) -> Option<Self> {
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(after) => Some(Self {
+                unix_seconds: i64::try_from(after.as_secs()).ok()?,
+                nanoseconds: after.subsec_nanos(),
+            }),
+            Err(error) => {
+                let before = error.duration();
+                let seconds = i64::try_from(before.as_secs()).ok()?;
+                if before.subsec_nanos() == 0 {
+                    Some(Self {
+                        unix_seconds: -seconds,
+                        nanoseconds: 0,
+                    })
+                } else {
+                    Some(Self {
+                        unix_seconds: -seconds - 1,
+                        nanoseconds: 1_000_000_000 - before.subsec_nanos(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for BirthTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:09}", self.unix_seconds, self.nanoseconds)
+    }
+}
+
+/// What the filesystem reports about the managed root directory right now.
+///
+/// The device number is read but deliberately never part of the identity: on
+/// macOS it is assigned when a volume mounts and changes across reboots for
+/// the very same directory. It is carried here so a test can present a
+/// different device and prove the identity does not depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootMetadataFacts {
+    pub device: u64,
+    pub inode: u64,
+    /// `None` when the filesystem cannot report a creation time (for example
+    /// overlayfs or NFS on Linux).
+    pub birth_time: Option<BirthTime>,
+}
+
+/// Reads [`RootMetadataFacts`] from the root directory's metadata. Production
+/// uses [`read_root_metadata_facts`]; tests substitute a reader to present a
+/// different device, inode or birth time than the disk holds.
+pub type RootFactsReader = fn(&fs::Metadata) -> RootMetadataFacts;
+
+/// The production reader: `st_dev`/`st_ino` on Unix and
+/// [`fs::Metadata::created`] (`st_birthtime` on macOS, statx `btime` on Linux).
+pub fn read_root_metadata_facts(metadata: &fs::Metadata) -> RootMetadataFacts {
+    let birth_time = metadata
+        .created()
+        .ok()
+        .and_then(BirthTime::from_system_time);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        RootMetadataFacts {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            birth_time,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No stable inode is available through std off Unix; the length is
+        // the same conservative stand-in the in-process stability check uses.
+        RootMetadataFacts {
+            device: 0,
+            inode: metadata.len(),
+            birth_time,
+        }
+    }
+}
+
+/// The persisted identity of the managed root in the current formula.
+///
+/// A replaced or restored directory always gets a new inode; a clone or backup
+/// restore can keep the creation date but not the inode; a reboot keeps both.
+/// Inode plus birth time therefore catches every replacement the pin exists
+/// for without tripping on a reboot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootIdentityFacts {
+    pub formula: u32,
+    pub path: String,
+    pub inode: u64,
+    pub birth_time: BirthTime,
+}
+
+impl RootIdentityFacts {
+    /// Build the current identity from a canonical path and the metadata read
+    /// for it. A filesystem that cannot report birth time is refused rather
+    /// than identified by inode alone: an inode can be reused once the old
+    /// directory is gone, and birth time is what tells those two apart.
+    pub fn observe(
+        canonical_path: &Path,
+        facts: &RootMetadataFacts,
+    ) -> Result<Self, UntrustworthyRegistryReason> {
+        let birth_time = facts
+            .birth_time
+            .ok_or(UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable)?;
+        Ok(Self {
+            formula: ROOT_IDENTITY_FORMULA,
+            path: canonical_path.to_string_lossy().into_owned(),
+            inode: facts.inode,
+            birth_time,
+        })
+    }
+}
+
+impl fmt::Display for RootIdentityFacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "path {} inode {} birth time {}",
+            self.path, self.inode, self.birth_time
+        )
+    }
+}
+
+/// The managed-root identity as stored in a registry document.
+///
+/// Both forms live in the same `managed_root_identity` field so a registry
+/// written before the fact-based formula still parses, and is refused by name
+/// instead of as malformed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ManagedRootIdentity {
+    /// Formula 1: an opaque hash that included the device number. It cannot be
+    /// checked against current facts, because the device it hashed has usually
+    /// moved since, so it is only ever replaced by a recorded rebind.
+    HashOnly(String),
+    Facts(RootIdentityFacts),
+}
+
+impl fmt::Display for ManagedRootIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HashOnly(hash) => write!(f, "hash-only formula 1 digest {hash}"),
+            Self::Facts(facts) => write!(f, "{facts}"),
+        }
+    }
+}
+
+/// Decide whether a stored identity still describes the observed root, naming
+/// the fact that differs. Platform-neutral: every filesystem read happens in
+/// the caller, so this can be exercised with any facts on any host.
+pub fn verify_root_identity(
+    stored: &ManagedRootIdentity,
+    current: &RootIdentityFacts,
+) -> Result<(), UntrustworthyRegistryReason> {
+    let stored = match stored {
+        ManagedRootIdentity::HashOnly(_) => {
+            return Err(UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts)
+        }
+        ManagedRootIdentity::Facts(stored) => stored,
+    };
+    if stored.formula != ROOT_IDENTITY_FORMULA {
+        return Err(UntrustworthyRegistryReason::UnsupportedRegistrySchema);
+    }
+    // Inode first: a new inode means a different directory, the case this pin
+    // exists for, and it should be the reason reported when several differ.
+    if stored.inode != current.inode {
+        return Err(UntrustworthyRegistryReason::ManagedRootInodeChanged);
+    }
+    if stored.birth_time != current.birth_time {
+        return Err(UntrustworthyRegistryReason::ManagedRootBirthTimeChanged);
+    }
+    if stored.path != current.path {
+        return Err(UntrustworthyRegistryReason::ManagedRootPathChanged);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -454,18 +665,6 @@ impl HeldManagedRoot {
 
     pub fn canonical_path(&self) -> &Path {
         &self.path
-    }
-
-    fn binding(&self) -> String {
-        let mut bytes = self.path.to_string_lossy().as_bytes().to_vec();
-        #[cfg(unix)]
-        {
-            bytes.extend_from_slice(&self.identity.device.to_be_bytes());
-            bytes.extend_from_slice(&self.identity.inode.to_be_bytes());
-        }
-        #[cfg(not(unix))]
-        bytes.extend_from_slice(&self.identity.len.to_be_bytes());
-        hex(&Sha256::digest(bytes))
     }
 
     fn revalidate(&self) -> Result<(), RootError> {
@@ -971,6 +1170,8 @@ pub struct RegistryConfig {
     pub release_failure: bool,
     pub abort_failure: bool,
     pub deletion_failure_after_start: bool,
+    /// How the managed root's identity facts are read from its metadata.
+    pub root_facts: RootFactsReader,
 }
 impl Default for RegistryConfig {
     fn default() -> Self {
@@ -985,6 +1186,7 @@ impl Default for RegistryConfig {
             release_failure: false,
             abort_failure: false,
             deletion_failure_after_start: false,
+            root_facts: read_root_metadata_facts,
         }
     }
 }
@@ -998,7 +1200,21 @@ pub enum UntrustworthyRegistryReason {
     LockContentionWithoutOwnerProof,
     MalformedRegistry,
     UnsupportedRegistrySchema,
-    ManagedRootIdentityChanged,
+    /// The root's inode differs from the recorded one: the directory was
+    /// replaced or restored.
+    ManagedRootInodeChanged,
+    /// Same inode, different creation time: the directory was recreated and
+    /// happened to receive the old inode number.
+    ManagedRootBirthTimeChanged,
+    /// Same directory reached through a different canonical path: it or a
+    /// parent was moved or renamed.
+    ManagedRootPathChanged,
+    /// The registry records the root with the hash-only formula, which cannot
+    /// be checked against current facts. Only a recorded rebind replaces it.
+    ManagedRootIdentityPredatesFacts,
+    /// The filesystem holding the root cannot report a creation time, so the
+    /// root cannot be identified. Never treated as an identity change.
+    ManagedRootBirthTimeUnavailable,
     IntegrityMismatch,
     InvalidRegistryIdentity,
     NonCanonicalTarget,
@@ -1017,7 +1233,15 @@ impl fmt::Display for UntrustworthyRegistryReason {
             Self::LockContentionWithoutOwnerProof => "lock contention without positive owner proof",
             Self::MalformedRegistry => "malformed registry",
             Self::UnsupportedRegistrySchema => "unsupported registry schema",
-            Self::ManagedRootIdentityChanged => "managed root identity changed",
+            Self::ManagedRootInodeChanged => "managed root inode changed",
+            Self::ManagedRootBirthTimeChanged => "managed root birth time changed",
+            Self::ManagedRootPathChanged => "managed root canonical path changed",
+            Self::ManagedRootIdentityPredatesFacts => {
+                "managed root identity predates the fact-based formula"
+            }
+            Self::ManagedRootBirthTimeUnavailable => {
+                "the filesystem holding the managed root cannot report birth time"
+            }
             Self::IntegrityMismatch => "integrity mismatch",
             Self::InvalidRegistryIdentity => "invalid registry identity",
             Self::NonCanonicalTarget => "non-canonical target",
@@ -1045,8 +1269,16 @@ pub const fn untrustworthy_registry_reason_code(
         UntrustworthyRegistryReason::UnsupportedRegistrySchema => {
             "profile_registry_schema_unsupported"
         }
-        UntrustworthyRegistryReason::ManagedRootIdentityChanged => {
-            PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED
+        UntrustworthyRegistryReason::ManagedRootInodeChanged => PROFILE_REGISTRY_ROOT_INODE_CHANGED,
+        UntrustworthyRegistryReason::ManagedRootBirthTimeChanged => {
+            PROFILE_REGISTRY_ROOT_BIRTH_TIME_CHANGED
+        }
+        UntrustworthyRegistryReason::ManagedRootPathChanged => PROFILE_REGISTRY_ROOT_PATH_CHANGED,
+        UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts => {
+            PROFILE_REGISTRY_ROOT_IDENTITY_PREDATES_FACTS
+        }
+        UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable => {
+            PROFILE_REGISTRY_ROOT_BIRTH_TIME_UNAVAILABLE
         }
         UntrustworthyRegistryReason::IntegrityMismatch => "profile_registry_integrity_mismatch",
         UntrustworthyRegistryReason::InvalidRegistryIdentity => "profile_registry_identity_invalid",
@@ -1068,9 +1300,33 @@ pub const fn untrustworthy_registry_remedy(
     reason: UntrustworthyRegistryReason,
 ) -> Option<&'static str> {
     match reason {
-        UntrustworthyRegistryReason::ManagedRootIdentityChanged => Some(
-            "run browser.rebind_profile_root to re-identify the restored or moved browser root; \
+        UntrustworthyRegistryReason::ManagedRootInodeChanged => Some(
+            "the browser root directory was replaced or restored (its inode differs from the \
+             recorded one); run browser.rebind_profile_root to re-identify it; that operation \
+             will itself refuse and name any directory the registry did not mint",
+        ),
+        UntrustworthyRegistryReason::ManagedRootBirthTimeChanged => Some(
+            "the browser root directory was recreated (its creation time differs from the \
+             recorded one); run browser.rebind_profile_root to re-identify it; that operation \
+             will itself refuse and name any directory the registry did not mint",
+        ),
+        UntrustworthyRegistryReason::ManagedRootPathChanged => Some(
+            "the browser root is reached through a different canonical path than the recorded \
+             one (it or a parent was moved); run browser.rebind_profile_root to re-identify it; \
              that operation will itself refuse and name any directory the registry did not mint",
+        ),
+        UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts => Some(
+            "the registry predates the fact-based root identity: it holds only a hash that \
+             included a device number which changes across reboots, so it cannot be checked; \
+             run browser.rebind_profile_root once to record the root's path, inode, and birth \
+             time; that operation will itself refuse and name any directory the registry did \
+             not mint",
+        ),
+        UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable => Some(
+            "the filesystem holding the browser root cannot report a directory birth time, so \
+             the root cannot be identified; move the browser root to a filesystem that reports \
+             birth time (APFS, ext4, btrfs, xfs); browser.rebind_profile_root names the root \
+             path and refuses for the same reason",
         ),
         UntrustworthyRegistryReason::PossiblyManagedPath => Some(
             "move or account for the unaccounted profile directories before running \
@@ -1200,7 +1456,7 @@ impl QuarantineReason {
 #[serde(deny_unknown_fields)]
 struct RegistryDocument {
     schema: String,
-    managed_root_identity: String,
+    managed_root_identity: ManagedRootIdentity,
     generation: u64,
     records: BTreeMap<String, RegistryRecord>,
     integrity: String,
@@ -1217,8 +1473,10 @@ pub struct RebindProvenance {
 /// The exact registry transition a root rebind performed or would perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebindReport {
-    pub old_identity: String,
-    pub new_identity: String,
+    /// What the registry recorded, in whichever formula it was written.
+    pub old_identity: ManagedRootIdentity,
+    /// What the rebind records: always the current fact-based formula.
+    pub new_identity: RootIdentityFacts,
     pub generation_before: u64,
     pub generation_after: u64,
     pub record_count: usize,
@@ -1248,14 +1506,27 @@ pub enum RebindRefusal {
     /// person was shown. An elicited answer arrives minutes after its
     /// question; a root that changed in between is not the one consented to.
     RootUnstable,
+    /// The filesystem holding the root cannot report a creation time, so no
+    /// identity can be recorded for it. Names the root so the operator can
+    /// see which filesystem is involved.
+    BirthTimeUnavailable {
+        root_path: PathBuf,
+    },
     Io(io::Error),
 }
+
+/// Schema of each line in the rebind provenance file. Version 2 lines carry
+/// the identities as written in the registry: `new_identity` is the
+/// fact-based object, and `old_identity` is either that object or, for a
+/// migration from the hash-only formula, the old digest string. Version 1
+/// lines (both identities as digest strings) remain in older files untouched.
+const PROFILE_ROOT_REBIND_RECORD_SCHEMA: &str = "ck-browser-profile-root-rebind/v2";
 
 #[derive(Serialize)]
 struct DurableRebindRecord<'a> {
     schema: &'static str,
-    old_identity: &'a str,
-    new_identity: &'a str,
+    old_identity: &'a ManagedRootIdentity,
+    new_identity: &'a RootIdentityFacts,
     generation_before: u64,
     generation_after: u64,
     record_count: usize,
@@ -1446,6 +1717,14 @@ impl ProfileRegistry {
             profile_uuid: profile_uuid.to_string(),
         }
     }
+    /// The managed root's identity as the filesystem reports it now.
+    fn current_root_identity(&self) -> Result<RootIdentityFacts, RegistryError> {
+        let metadata = self.root.handle.metadata()?;
+        let facts = (self.config.root_facts)(&metadata);
+        RootIdentityFacts::observe(self.root.canonical_path(), &facts)
+            .map_err(RegistryError::Untrustworthy)
+    }
+
     fn lock_path(&self) -> Result<PathBuf, RegistryError> {
         Ok(self.root.target_path(Path::new(DURABLE_LOCK_FILE), true)?)
     }
@@ -1540,8 +1819,26 @@ impl ProfileRegistry {
 
     fn inspect_rebind_locked(&self) -> Result<(RegistryDocument, RebindReport), RebindRefusal> {
         let document = self.read_rebind_document()?;
-        let new_identity = self.root.binding();
-        if document.managed_root_identity == new_identity {
+        // A stored identity in a formula newer than this build must not be
+        // overwritten by an older formula.
+        if matches!(
+            &document.managed_root_identity,
+            ManagedRootIdentity::Facts(stored) if stored.formula != ROOT_IDENTITY_FORMULA
+        ) {
+            return Err(RebindRefusal::UnsupportedRegistrySchema);
+        }
+        let new_identity = match self.current_root_identity() {
+            Ok(identity) => identity,
+            Err(RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable,
+            )) => {
+                return Err(RebindRefusal::BirthTimeUnavailable {
+                    root_path: self.root.canonical_path().to_path_buf(),
+                })
+            }
+            Err(error) => return Err(rebind_registry_error(error)),
+        };
+        if document.managed_root_identity == ManagedRootIdentity::Facts(new_identity.clone()) {
             return Err(RebindRefusal::AlreadyBound);
         }
         let unaccounted = self.unaccounted_profile_paths(&document)?;
@@ -1570,7 +1867,7 @@ impl ProfileRegistry {
         provenance: &RebindProvenance,
     ) -> Result<(), RebindRefusal> {
         let record = DurableRebindRecord {
-            schema: "ck-browser-profile-root-rebind/v1",
+            schema: PROFILE_ROOT_REBIND_RECORD_SCHEMA,
             old_identity: &report.old_identity,
             new_identity: &report.new_identity,
             generation_before: report.generation_before,
@@ -1610,7 +1907,7 @@ impl ProfileRegistry {
             return Err(RebindRefusal::RootUnstable);
         }
         self.write_rebind_record(&report, provenance)?;
-        document.managed_root_identity = report.new_identity.clone();
+        document.managed_root_identity = ManagedRootIdentity::Facts(report.new_identity.clone());
         document.generation = report.generation_after;
         self.write_document(document)
             .map_err(rebind_registry_error)?;
@@ -1665,11 +1962,9 @@ impl ProfileRegistry {
                 UntrustworthyRegistryReason::UnsupportedRegistrySchema,
             ));
         }
-        if document.managed_root_identity != self.root.binding() {
-            return Err(RegistryError::Untrustworthy(
-                UntrustworthyRegistryReason::ManagedRootIdentityChanged,
-            ));
-        }
+        let current = self.current_root_identity()?;
+        verify_root_identity(&document.managed_root_identity, &current)
+            .map_err(RegistryError::Untrustworthy)?;
         if hex(&Sha256::digest(canonical_json(&document_payload(
             &document,
         )))) != document.integrity
@@ -1714,14 +2009,16 @@ impl ProfileRegistry {
         Ok(Some(document))
     }
 
-    fn empty_document(&self) -> RegistryDocument {
-        RegistryDocument {
+    /// A registry for a root that has none yet. Fails when the root cannot be
+    /// identified, so no registry is ever minted without a checkable identity.
+    fn empty_document(&self) -> Result<RegistryDocument, RegistryError> {
+        Ok(RegistryDocument {
             schema: REGISTRY_SCHEMA.to_string(),
-            managed_root_identity: self.root.binding(),
+            managed_root_identity: ManagedRootIdentity::Facts(self.current_root_identity()?),
             generation: 0,
             records: BTreeMap::new(),
             integrity: String::new(),
-        }
+        })
     }
 
     fn write_document(&self, mut document: RegistryDocument) -> Result<(), RegistryError> {
@@ -1906,9 +2203,10 @@ impl ProfileRegistry {
             integrity: String::new(),
         };
         record.integrity = record_integrity(&record);
-        let mut document = self
-            .read_document()?
-            .unwrap_or_else(|| self.empty_document());
+        let mut document = match self.read_document()? {
+            Some(document) => document,
+            None => self.empty_document()?,
+        };
         document
             .records
             .insert(context.agent_project_id().to_string(), record.clone());
@@ -2434,7 +2732,11 @@ impl ProfileLifecycle {
 
     fn closed_untrusted_root(&self, reason: UntrustworthyRegistryReason) -> PrepareResult {
         let outcome = match reason {
-            UntrustworthyRegistryReason::ManagedRootIdentityChanged
+            UntrustworthyRegistryReason::ManagedRootInodeChanged
+            | UntrustworthyRegistryReason::ManagedRootBirthTimeChanged
+            | UntrustworthyRegistryReason::ManagedRootPathChanged
+            | UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts
+            | UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable
             | UntrustworthyRegistryReason::PossiblyManagedPath => {
                 ProfileOutcome::UntrustworthyRegistry { reason }
             }
@@ -2744,10 +3046,10 @@ impl ProfileLifecycle {
             integrity: String::new(),
         };
         record.integrity = record_integrity(&record);
-        let mut document = self
-            .registry
-            .read_document()?
-            .unwrap_or_else(|| self.registry.empty_document());
+        let mut document = match self.registry.read_document()? {
+            Some(document) => document,
+            None => self.registry.empty_document()?,
+        };
         // Disposable records use a transaction-specific synthetic key, so they
         // are stored separately and cannot replace or claim the one durable
         // record associated with a project.
@@ -3611,10 +3913,10 @@ impl ProfileLifecycle {
         if !self.registry.artifact_enabled() {
             return Ok(0);
         }
-        let document = self
-            .registry
-            .read_document()?
-            .unwrap_or_else(|| self.registry.empty_document());
+        // A root with no registry has nothing to recover.
+        let Some(document) = self.registry.read_document()? else {
+            return Ok(0);
+        };
         let mut recovered = 0;
         for record in document.records.values() {
             if record.state == ProfileState::DeletionFailed || record.deletion_pending {
@@ -3894,13 +4196,76 @@ mod tests {
     }
 
     #[test]
+    fn root_identity_decision_is_platform_neutral_and_ignores_the_device() {
+        let birth_time = BirthTime {
+            unix_seconds: 1_723_600_000,
+            nanoseconds: 5,
+        };
+        let facts = |device, inode, birth_time| RootMetadataFacts {
+            device,
+            inode,
+            birth_time,
+        };
+        let path = Path::new("/profiles/root");
+        let stored = ManagedRootIdentity::Facts(
+            RootIdentityFacts::observe(path, &facts(16_777_230, 839_348_454, Some(birth_time)))
+                .unwrap(),
+        );
+        let after_reboot =
+            RootIdentityFacts::observe(path, &facts(16_777_233, 839_348_454, Some(birth_time)))
+                .unwrap();
+        assert_eq!(verify_root_identity(&stored, &after_reboot), Ok(()));
+
+        let replaced =
+            RootIdentityFacts::observe(path, &facts(16_777_233, 1, Some(birth_time))).unwrap();
+        assert_eq!(
+            verify_root_identity(&stored, &replaced),
+            Err(UntrustworthyRegistryReason::ManagedRootInodeChanged)
+        );
+        assert_eq!(
+            RootIdentityFacts::observe(path, &facts(16_777_233, 839_348_454, None)),
+            Err(UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable)
+        );
+        assert_eq!(
+            verify_root_identity(&ManagedRootIdentity::HashOnly("00".into()), &after_reboot),
+            Err(UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts)
+        );
+
+        // Times before 1970 keep a non-negative nanosecond part.
+        let before_epoch = UNIX_EPOCH - std::time::Duration::new(1, 250_000_000);
+        assert_eq!(
+            BirthTime::from_system_time(before_epoch),
+            Some(BirthTime {
+                unix_seconds: -2,
+                nanoseconds: 750_000_000,
+            })
+        );
+    }
+
+    #[test]
     fn untrustworthy_registry_reasons_map_to_refusals_by_value() {
         let path = root();
         let lifecycle = ProfileLifecycle::open(&path).unwrap();
         for (reason, reason_code) in [
             (
-                UntrustworthyRegistryReason::ManagedRootIdentityChanged,
-                PROFILE_REGISTRY_ROOT_IDENTITY_CHANGED,
+                UntrustworthyRegistryReason::ManagedRootInodeChanged,
+                PROFILE_REGISTRY_ROOT_INODE_CHANGED,
+            ),
+            (
+                UntrustworthyRegistryReason::ManagedRootBirthTimeChanged,
+                PROFILE_REGISTRY_ROOT_BIRTH_TIME_CHANGED,
+            ),
+            (
+                UntrustworthyRegistryReason::ManagedRootPathChanged,
+                PROFILE_REGISTRY_ROOT_PATH_CHANGED,
+            ),
+            (
+                UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
+                PROFILE_REGISTRY_ROOT_IDENTITY_PREDATES_FACTS,
+            ),
+            (
+                UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable,
+                PROFILE_REGISTRY_ROOT_BIRTH_TIME_UNAVAILABLE,
             ),
             (
                 UntrustworthyRegistryReason::PossiblyManagedPath,
@@ -3956,7 +4321,11 @@ mod tests {
             ),
         ] {
             let expected = match reason {
-                UntrustworthyRegistryReason::ManagedRootIdentityChanged
+                UntrustworthyRegistryReason::ManagedRootInodeChanged
+                | UntrustworthyRegistryReason::ManagedRootBirthTimeChanged
+                | UntrustworthyRegistryReason::ManagedRootPathChanged
+                | UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts
+                | UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable
                 | UntrustworthyRegistryReason::PossiblyManagedPath => {
                     ProfileOutcome::UntrustworthyRegistry { reason }
                 }

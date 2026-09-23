@@ -100,9 +100,13 @@ fn main() {
                      discards."
                 );
                 println!(
-                    "  Known reasons: `managed root identity changed` means the root's \
-                     device+inode differ from the recorded binding, which is what a directory \
-                     recreated in place looks like. `possibly_managed_path` means profile \
+                    "  Known reasons: `managed root inode changed` means the root directory \
+                     was replaced or restored; `managed root birth time changed` means it was \
+                     recreated with a reused inode; `managed root canonical path changed` \
+                     means it was moved; `managed root identity predates the fact-based \
+                     formula` means the registry still holds the old hash-only identity and \
+                     needs one rebind; `cannot report birth time` means the filesystem cannot \
+                     identify the root at all. `possibly_managed_path` means profile \
                      directories exist that no record accounts for, which is refused rather \
                      than deleted on purpose."
                 );

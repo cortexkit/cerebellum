@@ -940,6 +940,12 @@ fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
             "reason": "root_unstable",
             "remedy": "stop modifying or replacing the browser root, then retry the rebind preflight",
         }),
+        RebindRefusal::BirthTimeUnavailable { root_path } => json!({
+            "outcome": "refused",
+            "reason": "birth_time_unavailable",
+            "root_path": root_path.display().to_string(),
+            "remedy": "the filesystem holding this browser root cannot report a directory birth time, so the root cannot be identified; move the browser root to a filesystem that reports birth time (APFS, ext4, btrfs, xfs)",
+        }),
         RebindRefusal::Io(error) => json!({
             "outcome": "refused",
             "reason": "io",

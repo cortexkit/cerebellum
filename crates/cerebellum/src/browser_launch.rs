@@ -4031,15 +4031,46 @@ mod profile_registry_outcome_tests {
 
     #[test]
     fn untrusted_root_remedies_are_typed_and_selective() {
-        let identity_changed = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
-            reason: UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+        let replaced = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason: UntrustworthyRegistryReason::ManagedRootInodeChanged,
         }
         .as_json();
         assert_eq!(
-            identity_changed["remedy"],
-            "run browser.rebind_profile_root to re-identify the restored or moved browser root; \
-             that operation will itself refuse and name any directory the registry did not mint"
+            replaced["reason_code"],
+            "profile_registry_managed_root_inode_changed"
         );
+        assert_eq!(
+            replaced["remedy"],
+            "the browser root directory was replaced or restored (its inode differs from the \
+             recorded one); run browser.rebind_profile_root to re-identify it; that operation \
+             will itself refuse and name any directory the registry did not mint"
+        );
+
+        let hash_only = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason: UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
+        }
+        .as_json();
+        assert_eq!(
+            hash_only["reason_code"],
+            "profile_registry_managed_root_identity_predates_facts"
+        );
+        assert!(hash_only["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("browser.rebind_profile_root")));
+
+        // A filesystem without birth time is not an identity change, so its
+        // refusal must not tell the operator to rebind as the fix.
+        let no_birth_time = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+            reason: UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable,
+        }
+        .as_json();
+        assert_eq!(
+            no_birth_time["reason_code"],
+            "profile_registry_managed_root_birth_time_unavailable"
+        );
+        assert!(no_birth_time["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("cannot report a directory birth time")));
 
         let possibly_managed = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
             reason: UntrustworthyRegistryReason::PossiblyManagedPath,

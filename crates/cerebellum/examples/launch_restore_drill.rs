@@ -3,9 +3,11 @@
 //! it without touching a record, and launch-journal recovery over the restored
 //! attestations signals nothing it should not.
 //!
-//! The registry pins its managed root by path+device+inode, so ANY restore
-//! recreates the root and every launch refuses
-//! `profile_registry_managed_root_identity_changed`. Until the rebind
+//! The registry pins its managed root by canonical path, inode and birth time,
+//! so ANY restore recreates the root and every launch refuses with
+//! `profile_registry_managed_root_inode_changed` (or, for a capture whose
+//! registry was written before those facts were recorded,
+//! `profile_registry_managed_root_identity_predates_facts`). Until the rebind
 //! operation existed that refusal had no recovery; this drill is the proof
 //! that it now does, on a real captured tree rather than a constructed one.
 //!
@@ -152,9 +154,6 @@ fn main() -> ExitCode {
         before["generation"],
         projects.len(),
         before["managed_root_identity"]
-            .as_str()
-            .map(|s| &s[..12])
-            .unwrap_or("?")
     );
     if projects.is_empty() {
         return fail(
@@ -164,16 +163,19 @@ fn main() -> ExitCode {
     }
     for project in &projects {
         match lifecycle.registry().resolve_durable(project) {
-            Err(RegistryError::Untrustworthy(UntrustworthyRegistryReason::ManagedRootIdentityChanged)) => {
+            // The reasons a restore can produce that the rebind heals. The
+            // path reason is included because a capture restored under a
+            // different data home has moved as well as been recreated.
+            Err(RegistryError::Untrustworthy(
+                reason @ (UntrustworthyRegistryReason::ManagedRootInodeChanged
+                | UntrustworthyRegistryReason::ManagedRootBirthTimeChanged
+                | UntrustworthyRegistryReason::ManagedRootPathChanged
+                | UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts),
+            )) => {
                 println!(
                     "  {project}: refused {} · remedy: {}",
-                    untrustworthy_registry_reason_code(
-                        UntrustworthyRegistryReason::ManagedRootIdentityChanged
-                    ),
-                    untrustworthy_registry_remedy(
-                        UntrustworthyRegistryReason::ManagedRootIdentityChanged
-                    )
-                    .unwrap_or("<none>")
+                    untrustworthy_registry_reason_code(reason),
+                    untrustworthy_registry_remedy(reason).unwrap_or("<none>")
                 );
             }
             other => {
@@ -200,8 +202,8 @@ fn main() -> ExitCode {
     };
     println!(
         "rebound: {} -> {} · generation {} -> {} · {} record(s)",
-        &report.old_identity[..12],
-        &report.new_identity[..12],
+        report.old_identity,
+        report.new_identity,
         report.generation_before,
         report.generation_after,
         report.record_count
@@ -238,8 +240,10 @@ fn main() -> ExitCode {
         .and_then(|line| serde_json::from_str::<Value>(&line).ok());
     match provenance_line {
         Some(line)
-            if line["old_identity"] == report.old_identity
-                && line["new_identity"] == report.new_identity =>
+            if serde_json::to_value(&report.old_identity).ok().as_ref()
+                == Some(&line["old_identity"])
+                && serde_json::to_value(&report.new_identity).ok().as_ref()
+                    == Some(&line["new_identity"]) =>
         {
             println!(
                 "  provenance recorded: {} (elicited under {})",

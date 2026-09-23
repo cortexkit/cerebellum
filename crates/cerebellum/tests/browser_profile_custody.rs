@@ -1005,15 +1005,15 @@ fn registry_root_identity_refusal_is_not_reported_as_profile_storage_unavailable
     assert_eq!(
         outcome,
         ProfileOutcome::UntrustworthyRegistry {
-            reason: UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+            reason: UntrustworthyRegistryReason::ManagedRootInodeChanged,
         }
     );
     assert_eq!(
         map_profile_outcome(outcome).as_json(),
         json!({
             "outcome": "profile_registry_untrusted_root",
-            "reason_code": "profile_registry_managed_root_identity_changed",
-            "remedy": "run browser.rebind_profile_root to re-identify the restored or moved browser root; that operation will itself refuse and name any directory the registry did not mint",
+            "reason_code": "profile_registry_managed_root_inode_changed",
+            "remedy": "the browser root directory was replaced or restored (its inode differs from the recorded one); run browser.rebind_profile_root to re-identify it; that operation will itself refuse and name any directory the registry did not mint",
         })
     );
 
@@ -1183,7 +1183,7 @@ fn every_wire_outcome_is_structurally_profile_uuid_free() {
         BrowserLaunchOutcome::ProfileBusy { holder_id: holder },
         BrowserLaunchOutcome::ProfileGrantRequired,
         BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
-            reason: UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+            reason: UntrustworthyRegistryReason::ManagedRootInodeChanged,
         },
         BrowserLaunchOutcome::ProfileStorageUnavailable {
             reason_code: "fixture_storage_unavailable",

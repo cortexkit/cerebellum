@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cerebellum::browser_launch::map_profile_outcome;
 use cerebellum::management::{ManagementPlane, TargetResolver, REBIND_PROFILE_ROOT};
 use cerebellum::profile::{
-    stamped_bind_context, BindFacts, DurableResolution, InvocationToken, JournalReservationHandle,
-    PrepareResult, ProfileLifecycle, RebindProvenance, RebindRefusal, RegistryConfig,
-    RegistryError, UntrustworthyRegistryReason, PROFILE_ROOT_REBINDS_FILE,
+    read_root_metadata_facts, stamped_bind_context, BindFacts, DurableResolution, InvocationToken,
+    JournalReservationHandle, ManagedRootIdentity, PrepareResult, ProfileLifecycle, ProfileOutcome,
+    RebindProvenance, RebindRefusal, RegistryConfig, RegistryError, RootMetadataFacts,
+    UntrustworthyRegistryReason, PROFILE_ROOT_REBINDS_FILE,
 };
 use cerebellum::{HealthState, JournalPersistence, Planes};
 use cerebellum_computer::platform::TargetResolution;
@@ -125,13 +127,129 @@ fn provenance(label: &str) -> RebindProvenance {
     }
 }
 
+/// `recreate_root` creates the new directory while the old one still exists,
+/// so the new one always has a different inode.
 fn assert_identity_mismatch(lifecycle: &ProfileLifecycle, project_id: &str) {
-    assert!(matches!(
-        lifecycle.registry().resolve_durable(project_id),
-        Err(RegistryError::Untrustworthy(
-            UntrustworthyRegistryReason::ManagedRootIdentityChanged
-        ))
-    ));
+    assert_resolution_refuses(
+        lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootInodeChanged,
+    );
+}
+
+fn assert_resolution_refuses(
+    lifecycle: &ProfileLifecycle,
+    project_id: &str,
+    expected: UntrustworthyRegistryReason,
+) {
+    match lifecycle.registry().resolve_durable(project_id) {
+        Err(RegistryError::Untrustworthy(reason)) => assert_eq!(reason, expected),
+        other => panic!("expected refusal {expected:?}, got {other:?}"),
+    }
+}
+
+/// The identity facts the real filesystem reports for `root`, as a registry
+/// document would record them.
+fn recorded_facts(root: &Path) -> Value {
+    let canonical = fs::canonicalize(root).expect("canonical root");
+    let facts = read_root_metadata_facts(&fs::metadata(&canonical).expect("root metadata"));
+    let birth_time = facts
+        .birth_time
+        .expect("test filesystem reports birth time");
+    json!({
+        "formula": 2,
+        "path": canonical.to_string_lossy(),
+        "inode": facts.inode,
+        "birth_time": {
+            "unix_seconds": birth_time.unix_seconds,
+            "nanoseconds": birth_time.nanoseconds,
+        },
+    })
+}
+
+// Readers that present the root as the disk holds it except for one fact.
+
+fn reboot_shaped_facts(metadata: &fs::Metadata) -> RootMetadataFacts {
+    let mut facts = read_root_metadata_facts(metadata);
+    facts.device = facts.device.wrapping_add(1);
+    facts
+}
+
+fn replaced_inode_facts(metadata: &fs::Metadata) -> RootMetadataFacts {
+    let mut facts = read_root_metadata_facts(metadata);
+    facts.inode = facts.inode.wrapping_add(1);
+    facts
+}
+
+fn recreated_birth_time_facts(metadata: &fs::Metadata) -> RootMetadataFacts {
+    let mut facts = read_root_metadata_facts(metadata);
+    if let Some(birth_time) = facts.birth_time.as_mut() {
+        birth_time.unix_seconds += 1;
+    }
+    facts
+}
+
+fn birth_time_unavailable_facts(metadata: &fs::Metadata) -> RootMetadataFacts {
+    let mut facts = read_root_metadata_facts(metadata);
+    facts.birth_time = None;
+    facts
+}
+
+fn config_reading(reader: fn(&fs::Metadata) -> RootMetadataFacts) -> RegistryConfig {
+    RegistryConfig {
+        root_facts: reader,
+        ..registry_config()
+    }
+}
+
+fn prepare_durable(
+    lifecycle: &mut ProfileLifecycle,
+    project_id: &str,
+    label: &str,
+) -> PrepareResult {
+    let invocation = InvocationToken::for_test(format!("invocation-{label}"));
+    let reservation =
+        JournalReservationHandle::for_test(&invocation, format!("reservation-{label}"));
+    lifecycle.prepare_context_open(&invocation, &reservation, &profile_context(project_id))
+}
+
+fn assert_launch_refuses(
+    lifecycle: &mut ProfileLifecycle,
+    project_id: &str,
+    expected: UntrustworthyRegistryReason,
+) -> Value {
+    match prepare_durable(lifecycle, project_id, "refused") {
+        PrepareResult::Closed(outcome) => {
+            assert_eq!(
+                outcome,
+                ProfileOutcome::UntrustworthyRegistry { reason: expected }
+            );
+            map_profile_outcome(outcome).as_json()
+        }
+        PrepareResult::Prepared(_) => panic!("launch preparation must refuse with {expected:?}"),
+    }
+}
+
+const HASH_ONLY_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/profile-registry-v1-formula1.json"
+);
+const HASH_ONLY_PROJECT: &str = "project-fixture";
+
+/// Place the frozen hash-only registry in `root`, with the profile directory
+/// its one record names, and return the stored digest.
+fn install_hash_only_registry(root: &Path) -> String {
+    let bytes = fs::read(HASH_ONLY_FIXTURE).expect("hash-only fixture");
+    let document: Value = serde_json::from_slice(&bytes).expect("fixture JSON");
+    let target = document["records"][HASH_ONLY_PROJECT]["target"]
+        .as_str()
+        .expect("fixture target");
+    fs::create_dir_all(root.join(target)).expect("fixture profile directory");
+    fs::write(root.join(REGISTRY_FILE), bytes).expect("install fixture registry");
+    document["managed_root_identity"]
+        .as_str()
+        .expect("fixture identity is a hash-only string")
+        .to_string()
 }
 
 #[test]
@@ -145,10 +263,8 @@ fn recreated_root_is_refused_then_rebound_without_changing_the_record() {
         .expect("recreated root opens");
     assert_identity_mismatch(&lifecycle, project_id);
     let before = registry_document(root.path());
-    let old_identity = before["managed_root_identity"]
-        .as_str()
-        .expect("old identity")
-        .to_string();
+    let old_identity = before["managed_root_identity"].clone();
+    assert_eq!(old_identity["formula"], 2, "fresh registries record facts");
     let generation_before = before["generation"].as_u64().expect("generation");
 
     let report = lifecycle
@@ -167,10 +283,9 @@ fn recreated_root_is_refused_then_rebound_without_changing_the_record() {
     assert_eq!(resolved, original_record);
 
     let after = registry_document(root.path());
-    let new_identity = after["managed_root_identity"]
-        .as_str()
-        .expect("new identity");
+    let new_identity = after["managed_root_identity"].clone();
     assert_ne!(old_identity, new_identity);
+    assert_eq!(new_identity, recorded_facts(root.path()));
     assert_eq!(after["generation"], generation_before + 1);
     assert_eq!(report.generation_before, generation_before);
     assert_eq!(report.generation_after, generation_before + 1);
@@ -181,7 +296,7 @@ fn recreated_root_is_refused_then_rebound_without_changing_the_record() {
     let lines: Vec<&str> = record_bytes.lines().collect();
     assert_eq!(lines.len(), 1, "one rebind writes one provenance line");
     let durable: Value = serde_json::from_str(lines[0]).expect("rebind record JSON");
-    assert_eq!(durable["schema"], "ck-browser-profile-root-rebind/v1");
+    assert_eq!(durable["schema"], "ck-browser-profile-root-rebind/v2");
     assert_eq!(durable["old_identity"], old_identity);
     assert_eq!(durable["new_identity"], new_identity);
     assert_eq!(durable["generation_before"], generation_before);
@@ -301,10 +416,7 @@ fn durable_rebind_record_is_synced_before_registry_rewrite_is_attempted() {
     let project_id = "project-record-first";
     mint_durable_record(root.path(), project_id);
     recreate_root(root.path());
-    let old_identity = registry_document(root.path())["managed_root_identity"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let old_identity = registry_document(root.path())["managed_root_identity"].clone();
     fs::create_dir(root.path().join(REGISTRY_TEMPORARY_FILE))
         .expect("block the registry temporary file");
     let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
@@ -322,6 +434,261 @@ fn durable_rebind_record_is_synced_before_registry_rewrite_is_attempted() {
         old_identity
     );
     assert_identity_mismatch(&lifecycle, project_id);
+}
+
+/// A reboot moves the device number on macOS but keeps the directory, so it
+/// must not be mistaken for a replaced root.
+#[test]
+fn reboot_shaped_device_change_keeps_the_root_trusted_and_launch_preparation_proceeds() {
+    let root = TestRoot::new("reboot");
+    let project_id = "project-reboot";
+    let original = mint_durable_record(root.path(), project_id);
+    let before = registry_bytes(root.path());
+
+    let mut lifecycle =
+        ProfileLifecycle::open_with_config(root.path(), config_reading(reboot_shaped_facts))
+            .expect("root opens after a reboot");
+    match lifecycle.registry().resolve_durable(project_id) {
+        Ok(DurableResolution::TrustworthyExisting(record)) => assert_eq!(record, original),
+        other => panic!("a device change alone must not refuse: {other:?}"),
+    }
+    assert!(matches!(
+        prepare_durable(&mut lifecycle, project_id, "after-reboot"),
+        PrepareResult::Prepared(_)
+    ));
+    assert_eq!(
+        registry_document(root.path())["managed_root_identity"],
+        serde_json::from_slice::<Value>(&before).unwrap()["managed_root_identity"],
+        "no rebind is needed or performed"
+    );
+    assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
+}
+
+#[test]
+fn replaced_root_with_a_new_inode_refuses_with_the_inode_reason() {
+    let root = TestRoot::new("new-inode");
+    let project_id = "project-new-inode";
+    mint_durable_record(root.path(), project_id);
+    let mut lifecycle =
+        ProfileLifecycle::open_with_config(root.path(), config_reading(replaced_inode_facts))
+            .unwrap();
+    assert_resolution_refuses(
+        &lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootInodeChanged,
+    );
+    let wire = assert_launch_refuses(
+        &mut lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootInodeChanged,
+    );
+    assert_eq!(
+        wire["reason_code"],
+        "profile_registry_managed_root_inode_changed"
+    );
+}
+
+#[test]
+fn recreated_root_with_a_reused_inode_refuses_with_the_birth_time_reason() {
+    let root = TestRoot::new("new-birth-time");
+    let project_id = "project-new-birth-time";
+    mint_durable_record(root.path(), project_id);
+    let mut lifecycle =
+        ProfileLifecycle::open_with_config(root.path(), config_reading(recreated_birth_time_facts))
+            .unwrap();
+    assert_resolution_refuses(
+        &lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootBirthTimeChanged,
+    );
+    let wire = assert_launch_refuses(
+        &mut lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootBirthTimeChanged,
+    );
+    assert_eq!(
+        wire["reason_code"],
+        "profile_registry_managed_root_birth_time_changed"
+    );
+}
+
+/// A real rename: the directory, and so its inode and birth time, stay the
+/// same while the canonical path changes.
+#[test]
+fn moved_root_refuses_with_the_path_reason() {
+    let parent = TestRoot::new("moved");
+    let original_path = parent.path().join("root");
+    fs::create_dir(&original_path).unwrap();
+    let project_id = "project-moved";
+    mint_durable_record(&original_path, project_id);
+    let moved_path = parent.path().join("moved-root");
+    fs::rename(&original_path, &moved_path).unwrap();
+
+    let mut lifecycle = ProfileLifecycle::open_with_config(&moved_path, registry_config()).unwrap();
+    assert_resolution_refuses(
+        &lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootPathChanged,
+    );
+    let wire = assert_launch_refuses(
+        &mut lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootPathChanged,
+    );
+    assert_eq!(
+        wire["reason_code"],
+        "profile_registry_managed_root_path_changed"
+    );
+}
+
+#[test]
+fn birth_time_unavailable_refuses_by_name_and_never_as_an_identity_change() {
+    let root = TestRoot::new("no-birth-time");
+    let project_id = "project-no-birth-time";
+    mint_durable_record(root.path(), project_id);
+    let before = registry_bytes(root.path());
+
+    let mut lifecycle = ProfileLifecycle::open_with_config(
+        root.path(),
+        config_reading(birth_time_unavailable_facts),
+    )
+    .unwrap();
+    assert_resolution_refuses(
+        &lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable,
+    );
+    let wire = assert_launch_refuses(
+        &mut lifecycle,
+        project_id,
+        UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable,
+    );
+    assert_eq!(
+        wire["reason_code"],
+        "profile_registry_managed_root_birth_time_unavailable"
+    );
+
+    // The rebind cannot record an identity for this root either, and says
+    // which root it is.
+    match lifecycle
+        .registry()
+        .rebind_managed_root(&provenance("no-birth-time"))
+    {
+        Err(RebindRefusal::BirthTimeUnavailable { root_path }) => {
+            assert_eq!(root_path, fs::canonicalize(root.path()).unwrap())
+        }
+        other => panic!("rebind must refuse on missing birth time: {other:?}"),
+    }
+    assert_eq!(registry_bytes(root.path()), before);
+    assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
+
+    // A root with no registry yet is not minted one without an identity.
+    let fresh = TestRoot::new("no-birth-time-fresh");
+    let mut fresh_lifecycle = ProfileLifecycle::open_with_config(
+        fresh.path(),
+        config_reading(birth_time_unavailable_facts),
+    )
+    .unwrap();
+    assert!(matches!(
+        prepare_durable(&mut fresh_lifecycle, "project-fresh", "fresh"),
+        PrepareResult::Closed(_)
+    ));
+    assert!(!fresh.path().join(REGISTRY_FILE).exists());
+}
+
+#[test]
+fn hash_only_registry_refuses_with_the_migration_reason_until_rebound_to_facts() {
+    let root = TestRoot::new("hash-only");
+    let old_digest = install_hash_only_registry(root.path());
+
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
+    assert_resolution_refuses(
+        &lifecycle,
+        HASH_ONLY_PROJECT,
+        UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
+    );
+    let wire = assert_launch_refuses(
+        &mut lifecycle,
+        HASH_ONLY_PROJECT,
+        UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
+    );
+    assert_eq!(
+        wire["reason_code"],
+        "profile_registry_managed_root_identity_predates_facts"
+    );
+    assert!(
+        wire["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("browser.rebind_profile_root")),
+        "{wire}"
+    );
+
+    let generation_before = registry_document(root.path())["generation"]
+        .as_u64()
+        .unwrap();
+    let report = lifecycle
+        .registry()
+        .rebind_managed_root(&provenance("hash-only"))
+        .expect("rebind migrates the hash-only identity");
+    assert_eq!(
+        report.old_identity,
+        ManagedRootIdentity::HashOnly(old_digest.clone())
+    );
+    assert_eq!(
+        serde_json::to_value(&report.new_identity).unwrap(),
+        recorded_facts(root.path())
+    );
+    assert_eq!(report.generation_after, generation_before + 1);
+
+    let after = registry_document(root.path());
+    assert_eq!(after["managed_root_identity"], recorded_facts(root.path()));
+    let lines =
+        fs::read_to_string(root.path().join(PROFILE_ROOT_REBINDS_FILE)).expect("rebind record");
+    let durable: Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
+    assert_eq!(durable["schema"], "ck-browser-profile-root-rebind/v2");
+    assert_eq!(durable["old_identity"], old_digest);
+    assert_eq!(durable["new_identity"], recorded_facts(root.path()));
+
+    match lifecycle
+        .registry()
+        .resolve_durable(HASH_ONLY_PROJECT)
+        .expect("migrated registry resolves")
+    {
+        DurableResolution::TrustworthyExisting(record) => {
+            assert_eq!(record.project_id, HASH_ONLY_PROJECT)
+        }
+        other => panic!("migrated record did not resolve: {other:?}"),
+    }
+}
+
+#[test]
+fn hash_only_migration_writes_the_rebind_record_before_a_failed_registry_rewrite() {
+    let root = TestRoot::new("hash-only-record-first");
+    let old_digest = install_hash_only_registry(root.path());
+    fs::create_dir(root.path().join(REGISTRY_TEMPORARY_FILE))
+        .expect("block the registry temporary file");
+    let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
+
+    assert!(matches!(
+        lifecycle
+            .registry()
+            .rebind_managed_root(&provenance("hash-only-record-first")),
+        Err(RebindRefusal::Io(_))
+    ));
+    let lines = fs::read_to_string(root.path().join(PROFILE_ROOT_REBINDS_FILE))
+        .expect("the rebind record survives the failed rewrite");
+    let durable: Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
+    assert_eq!(durable["old_identity"], old_digest);
+    assert_eq!(durable["new_identity"], recorded_facts(root.path()));
+    assert_eq!(
+        registry_document(root.path())["managed_root_identity"],
+        old_digest
+    );
+    assert_resolution_refuses(
+        &lifecycle,
+        HASH_ONLY_PROJECT,
+        UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
+    );
 }
 
 #[derive(Debug)]
