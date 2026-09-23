@@ -180,6 +180,11 @@ check_lock_matches_head() {
   [ -n "$drift" ] || return 0
   echo "    Cargo.lock differs from HEAD before this gate ran anything:" >&2
   local unpublished=0 name version published
+  # A package's name is read from context lines AND added lines. A moved
+  # version sits under an unchanged `name` line, but a package new to the lock
+  # arrives as `+name` followed by `+version`, and reading names from context
+  # alone attributed the new package's version to whichever package the diff
+  # showed last -- then told the operator to `cargo update` the wrong crate.
   while read -r name version; do
     [ -n "$name" ] || continue
     published="$(sibling_version "$name" published)"
@@ -203,7 +208,7 @@ check_lock_matches_head() {
       echo "        and commit the absorb." >&2
     fi
   done <<EOF
-$(git diff HEAD -- Cargo.lock | awk '/^ name = /{gsub(/"/,"",$3); n=$3} /^\+version/{gsub(/"/,"",$3); if (n != "") print n, $3}')
+$(git diff HEAD -- Cargo.lock | awk '/^[ +]name = /{gsub(/"/,"",$3); n=$3} /^\+version/{gsub(/"/,"",$3); if (n != "") print n, $3}')
 EOF
   if [ "$unpublished" -eq 1 ]; then
     echo "    Refusing: at least one moved version is not published." >&2
