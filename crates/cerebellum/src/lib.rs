@@ -5217,7 +5217,7 @@ mod tests {
     /// A cancel frame for the request, arriving while the question is open,
     /// ends the capture with nothing written.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancel_frame_ends_a_capture_waiting_on_consent() {
+    async fn a_cancel_during_consent_ends_the_capture_and_deregisters_its_question() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
@@ -5246,6 +5246,18 @@ mod tests {
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "cancelled", "{body}");
+        // The abandoned question is deregistered, so a late answer finds no
+        // entry and is discarded rather than settling a capture that ended.
+        assert_eq!(
+            planes.elicitor.outstanding(),
+            0,
+            "the cancelled capture left its question registered"
+        );
+        assert!(!planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow"}),
+        ));
         assert!(fixture.fs.contents().is_empty());
         assert_eq!(
             fixture

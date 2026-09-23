@@ -146,9 +146,19 @@ impl Elicitor {
         // it, and an answer with no waiter is indistinguishable from one nobody
         // asked for, so it would be discarded as noise.
         self.lane.register(channel, correlation, tx);
+        // Every way this question stops being waited on removes its entry,
+        // including the caller dropping this future mid-wait (a cancelled
+        // capture, a closed route, a drain). Explicit forgets on each return
+        // could not cover that ending, and an entry nobody will settle stays
+        // in the lane for the life of the module. A late answer then finds no
+        // entry and is discarded as unsolicited.
+        let _registration = Registration {
+            lane: &self.lane,
+            channel,
+            correlation,
+        };
 
         let Ok(payload) = serde_json::to_vec(&body) else {
-            self.lane.forget(channel, correlation);
             return AskOutcome::Undeliverable;
         };
         // Interactive priority: a person is waiting at the other end, so this
@@ -162,11 +172,9 @@ impl Elicitor {
             correlation,
             payload,
         ) else {
-            self.lane.forget(channel, correlation);
             return AskOutcome::Undeliverable;
         };
         if writer.send(frame).await.is_err() {
-            self.lane.forget(channel, correlation);
             return AskOutcome::Undeliverable;
         }
 
@@ -178,14 +186,7 @@ impl Elicitor {
             },
             // The sender was dropped, which happens when the question is
             // forgotten without an answer. Nobody replied.
-            Ok(Err(_)) => {
-                self.lane.forget(channel, correlation);
-                AskOutcome::NoAnswer
-            }
-            Err(_) => {
-                self.lane.forget(channel, correlation);
-                AskOutcome::NoAnswer
-            }
+            Ok(Err(_)) | Err(_) => AskOutcome::NoAnswer,
         }
     }
 
@@ -207,6 +208,20 @@ impl Elicitor {
     /// How many questions are outstanding.
     pub fn outstanding(&self) -> usize {
         self.lane.outstanding()
+    }
+}
+
+/// One registered question, removed from the lane when dropped. Correlations
+/// are never reused, so removing an entry an answer already claimed is a no-op.
+struct Registration<'a> {
+    lane: &'a AskLane<oneshot::Sender<Value>>,
+    channel: u16,
+    correlation: u64,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        self.lane.forget(self.channel, self.correlation);
     }
 }
 
@@ -343,6 +358,26 @@ mod tests {
             0,
             "an abandoned question left an entry behind"
         );
+    }
+
+    /// A caller that stops waiting mid-question (its future is dropped, as a
+    /// cancelled capture does) leaves no entry behind, and a late answer is
+    /// then unsolicited rather than delivered to nobody.
+    #[tokio::test]
+    async fn a_dropped_question_leaves_no_entry_behind() {
+        let elicitor = Elicitor::new();
+        let (tx, mut rx) = writer();
+        let asked = elicitor.ask(&tx, 7, 1, json!({}), Duration::from_secs(300));
+        let sent = tokio::select! {
+            _ = asked => panic!("nobody answered, so the question cannot end"),
+            frame = rx.recv() => frame.expect("the question was sent"),
+        };
+        assert_eq!(
+            elicitor.outstanding(),
+            0,
+            "a dropped question left an entry"
+        );
+        assert!(!elicitor.deliver(7, sent.header.corr, json!({"decision": "allow"})));
     }
 
     /// A question that cannot be sent is reported as undeliverable, not as
