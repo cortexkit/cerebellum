@@ -1088,9 +1088,149 @@ impl RouteBindings {
 /// The binary entry point: read config from env, load the health config
 /// file, and run the module loop. Exposed publicly so the thin `main.rs`
 /// binary can delegate here.
+///
+/// It also decides how the process ends: a SIGTERM ending does not return at
+/// all, because the process re-raises the signal once teardown has finished.
 pub async fn run_entry() -> Result<(), ModuleError> {
     let config = ModuleConfig::from_env()?;
-    run(config).await
+    conclude(run(config, |_| {}).await)
+}
+
+/// [`run_entry`] with the configuration supplied here instead of read from the
+/// environment, and `prepare` applied to the planes before the module wires its
+/// launch service. The ending is decided by the same code as in production.
+///
+/// For child-process tests, which need a running module that owns sessions to
+/// tear down without launching real browsers.
+#[doc(hidden)]
+pub async fn run_entry_prepared_for_test(
+    connection_file_path: PathBuf,
+    browser: BrowserConfig,
+    prepare: impl FnOnce(&mut Planes),
+) -> Result<(), ModuleError> {
+    let config = ModuleConfig {
+        connection_file_path,
+        module_id: DEFAULT_MODULE_ID.into(),
+        health: HealthConfig::default(),
+        browser: BrowserSurface::Available(browser),
+    };
+    conclude(run(config, prepare).await)
+}
+
+/// How a module run ended, which decides how the process exits.
+enum ModuleEnding {
+    /// The daemon connection ended (or could not be made). The process exits
+    /// 0 for a clean end and 1 for an error, as it always has.
+    Disconnected(Result<(), ModuleError>),
+    /// SIGTERM arrived, and the shutdown teardown has finished.
+    #[cfg(unix)]
+    Terminated,
+}
+
+fn conclude(ending: ModuleEnding) -> Result<(), ModuleError> {
+    match ending {
+        ModuleEnding::Disconnected(result) => result,
+        #[cfg(unix)]
+        ModuleEnding::Terminated => die_by_sigterm(),
+    }
+}
+
+/// End the process by SIGTERM with the default disposition, after the handler
+/// has done the teardown.
+///
+/// Exiting 0 instead would tell the supervisor that the module stopped on
+/// purpose, and a supervisor does not respawn a module that stopped on purpose.
+/// Dying by the signal it was sent is what an unhandled SIGTERM looks like to
+/// the parent, so the supervisor makes the same decision it would have made
+/// without a handler. Only the SIGTERM ending comes here; the end of the daemon
+/// connection still exits 0.
+#[cfg(unix)]
+fn die_by_sigterm() -> Result<(), ModuleError> {
+    match signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTERM) {
+        // Not expected to return: the default action of SIGTERM ends the
+        // process. Reported as an error so the exit is at least non-zero.
+        Ok(()) => Err(ModuleError::Message(
+            "SIGTERM was re-raised with its default action but the process survived".into(),
+        )),
+        Err(error) => Err(ModuleError::Message(format!(
+            "re-raising SIGTERM failed: {error}"
+        ))),
+    }
+}
+
+/// The module's one shutdown teardown, reachable from every way it can end.
+///
+/// The first caller starts it on a blocking thread, and every caller, the first
+/// included, then waits for that same run to finish. It is never started twice,
+/// and a caller that stops waiting (its future dropped) does not stop it.
+#[derive(Clone)]
+struct ShutdownTeardown(Arc<ShutdownTeardownState>);
+
+struct ShutdownTeardownState {
+    sessions: browser_session::BrowserSessions,
+    browser: Option<BrowserConfig>,
+    idle_enforcer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    started: std::sync::atomic::AtomicBool,
+    finished: tokio::sync::watch::Sender<bool>,
+}
+
+/// Marks the teardown finished when dropped, so a teardown that panicked still
+/// releases everyone waiting for it rather than leaving them parked forever.
+struct MarkTeardownFinished(Arc<ShutdownTeardownState>);
+
+impl Drop for MarkTeardownFinished {
+    fn drop(&mut self) {
+        self.0.finished.send_replace(true);
+    }
+}
+
+impl ShutdownTeardown {
+    fn new(
+        sessions: browser_session::BrowserSessions,
+        browser: Option<BrowserConfig>,
+        idle_enforcer: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        let (finished, _) = tokio::sync::watch::channel(false);
+        Self(Arc::new(ShutdownTeardownState {
+            sessions,
+            browser,
+            idle_enforcer: std::sync::Mutex::new(idle_enforcer),
+            started: std::sync::atomic::AtomicBool::new(false),
+            finished,
+        }))
+    }
+
+    async fn run_or_join(&self) {
+        let mut finished = self.0.finished.subscribe();
+        if !self
+            .0
+            .started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let enforcer = self
+                .0
+                .idle_enforcer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(enforcer) = enforcer {
+                enforcer.abort();
+            }
+            let state = Arc::clone(&self.0);
+            // On a blocking thread because the teardown waits on browser
+            // processes, and the runtime must stay free to notice SIGTERM
+            // while it does.
+            tokio::task::spawn_blocking(move || {
+                let finished = MarkTeardownFinished(state);
+                if let Some(browser) = &finished.0.browser {
+                    finished.0.sessions.teardown_all(browser);
+                }
+            });
+        }
+        // The sender lives as long as `self`, so this only returns once the
+        // teardown has finished.
+        let _ = finished.wait_for(|done| *done).await;
+    }
 }
 
 struct ModuleConfig {
@@ -1130,8 +1270,16 @@ impl ModuleConfig {
     }
 }
 
-async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
-    let stream = connect_to_subc(&config.connection_file_path).await?;
+async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleEnding {
+    // Listening starts before the connection is made, so a SIGTERM that
+    // arrives while connecting is held until the module can act on it rather
+    // than ending the process with no teardown.
+    #[cfg(unix)]
+    let mut sigterm = listen_for_sigterm();
+    let stream = match connect_to_subc(&config.connection_file_path).await {
+        Ok(stream) => stream,
+        Err(error) => return ModuleEnding::Disconnected(Err(error)),
+    };
     let (mut read_half, write_half) = tokio::io::split(stream);
 
     let mut health_config = config.health;
@@ -1144,10 +1292,8 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
         BrowserSurface::Available(browser) => Some(browser.clone()),
         BrowserSurface::NotConfigured | BrowserSurface::Refused(_) => None,
     };
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
+    prepare(&mut planes);
     // Recovery publishes the service before module_loop takes the transport, so
     // an attested orphan from a previous process cannot race a fresh spawn. That
     // ordering matters on every platform that can launch, not only the first one
@@ -1193,17 +1339,69 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
             }
         })
     });
-    let connection_result = serve_until_disconnect(
-        &mut read_half,
-        write_half,
-        &config,
-        planes,
-        browser_config.as_ref(),
+    let teardown = ShutdownTeardown::new(
+        planes.sessions.clone(),
+        browser_config.clone(),
         idle_enforcer,
-    )
-    .await;
+    );
+    let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
+    #[cfg(unix)]
+    let ending = end_on_disconnect_or_sigterm(serving, sigterm.as_mut(), &teardown).await;
+    #[cfg(not(unix))]
+    let ending = ModuleEnding::Disconnected(serving.await);
+    ending
+}
 
-    connection_result
+#[cfg(unix)]
+fn listen_for_sigterm() -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            // Without a listener SIGTERM keeps its default action: the module
+            // still dies by the signal, just without its teardown, which is
+            // how it behaved before it listened at all.
+            eprintln!("ck-cerebellum: SIGTERM listener not installed: {error}");
+            None
+        }
+    }
+}
+
+/// Serve until the daemon connection ends or SIGTERM arrives, whichever is
+/// first, and run the shutdown teardown either way.
+///
+/// On SIGTERM the connection future is dropped, which stops serving. A teardown
+/// that the connection ending had already started keeps running on its own
+/// thread and is joined here, never started a second time.
+#[cfg(unix)]
+async fn end_on_disconnect_or_sigterm(
+    serving: impl std::future::Future<Output = Result<(), ModuleError>>,
+    sigterm: Option<&mut tokio::signal::unix::Signal>,
+    teardown: &ShutdownTeardown,
+) -> ModuleEnding {
+    let Some(sigterm) = sigterm else {
+        return ModuleEnding::Disconnected(serving.await);
+    };
+    tokio::select! {
+        biased;
+        Some(()) = sigterm.recv() => {
+            teardown.run_or_join().await;
+            ModuleEnding::Terminated
+        }
+        result = serving => {
+            // A SIGTERM that landed as the connection finished still decides
+            // the ending: the sender asked for a death by signal.
+            let terminated = tokio::select! {
+                biased;
+                Some(()) = sigterm.recv() => true,
+                () = std::future::ready(()) => false,
+            };
+            if terminated {
+                ModuleEnding::Terminated
+            } else {
+                ModuleEnding::Disconnected(result)
+            }
+        }
+    }
 }
 
 /// Serve the daemon connection and, once it ends for any reason, close every
@@ -1213,6 +1411,11 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 /// `launchctl bootout` kills it with no handler); a module learns by EOF. The
 /// graceful stop therefore also runs on connection ending, even without a
 /// drain notice. Sessions are torn down before the result is reported.
+///
+/// `run` builds its teardown itself, because SIGTERM must be able to join it,
+/// and calls [`serve_then_tear_down`] directly; this wrapper is what the
+/// in-process connection tests drive, and it runs that same function.
+#[cfg(test)]
 async fn serve_until_disconnect<R, W>(
     read_half: &mut R,
     write_half: W,
@@ -1225,14 +1428,29 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let connection_result = run_connection(read_half, write_half, config, planes.clone()).await;
-    if let Some(enforcer) = idle_enforcer {
-        enforcer.abort();
-    }
-    if let Some(browser) = browser_config {
-        planes.sessions.teardown_all(browser);
-    }
+    let teardown = ShutdownTeardown::new(
+        planes.sessions.clone(),
+        browser_config.cloned(),
+        idle_enforcer,
+    );
+    serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
+}
 
+/// The connection-ending half of [`serve_until_disconnect`], sharing its
+/// teardown with whatever else can end the module.
+async fn serve_then_tear_down<R, W>(
+    read_half: &mut R,
+    write_half: W,
+    config: &ModuleConfig,
+    planes: Planes,
+    teardown: &ShutdownTeardown,
+) -> Result<(), ModuleError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let connection_result = run_connection(read_half, write_half, config, planes).await;
+    teardown.run_or_join().await;
     connection_result
 }
 

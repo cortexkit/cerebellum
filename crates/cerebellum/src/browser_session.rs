@@ -1,8 +1,8 @@
 //! Route-owned browser session lifecycle, leases, and the common teardown ladder.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Condvar, LockResult, Mutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotObservation};
 use crate::browser::Tracker;
@@ -535,6 +535,135 @@ pub trait OwnedBrowserProcess: Send {
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure>;
     fn force_terminate(&mut self) -> Result<(), ProcessControlFailure>;
     fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure>;
+
+    /// A handle that module shutdown can use to kill this browser without
+    /// taking the session registry's lock. `None`, the default, means shutdown
+    /// can only wait for a browser call already in progress to return on its
+    /// own.
+    fn shutdown_killer(&self) -> Option<Arc<dyn BrowserKiller>> {
+        None
+    }
+}
+
+/// Kills one launched browser generation without going through the session
+/// registry's lock.
+///
+/// Every browser driver call holds the registry lock for as long as its CDP
+/// call takes, and that lock is shared by every route. A shutdown that could
+/// reach a browser only through the lock would therefore wait out whatever call
+/// happened to be in progress, however long its deadline. This handle is kept
+/// beside the registry so shutdown can end such a browser; the dying browser
+/// fails the call, which then gives the lock back.
+pub trait BrowserKiller: Send + Sync {
+    /// Kill exactly the process generation this handle was made for, never a
+    /// bare pid: by the time shutdown fires, the pid may name another process.
+    /// Calling it again after it reported `Dead` changes nothing. On platforms
+    /// whose generation-checked kill also reaps an owned child, it may reap;
+    /// the session's normal reap path tolerates that.
+    fn kill_exact_generation(&self) -> KillOutcome;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// The browser is dead: this call killed it, or it had already gone.
+    Dead,
+    /// Whether the pid still names this browser could not be confirmed, so
+    /// nothing was signalled and the browser may still be running.
+    Refused,
+}
+
+/// How long a module shutdown may spend closing browsers, measured from the
+/// moment the shutdown starts.
+///
+/// The daemon's side of the contract: after a module's connection ends it
+/// waits up to 25 s (the module drain deadline, 30 s by default but capped at
+/// 25 s for modules), then sends SIGTERM, then SIGKILL half a second later.
+/// Whatever teardown is still running at SIGKILL never releases profile
+/// custody, which leaves the profile locked for the next launch. 20 s leaves
+/// 5 s of that window for the process to exit and for anything unforeseen.
+pub const SHUTDOWN_TEARDOWN_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long shutdown waits for browser operations already in progress before
+/// it closes their browsers anyway. Closing a browser under an operation fails
+/// that operation, which is the right result when the module is going away.
+pub const SHUTDOWN_IN_FLIGHT_WAIT_MAX: Duration = Duration::from_secs(5);
+
+/// Time kept free at the end of the shutdown budget for the steps that must
+/// never be cut short: the forced kill and reap, then the session's after-reap
+/// cleanup. That cleanup checks profile persistence (a stat and a small probe
+/// write), finalizes the launch journal (an fsynced append), releases profile
+/// custody (journal writes), and deletes the profile directory when it was
+/// disposable. The deletion dominates: a used Chromium profile holds tens of
+/// thousands of files and deleting one takes around a second on a local SSD, so
+/// 5 s leaves several times that. The graceful-close wait is shortened so that
+/// it never eats into this reserve.
+pub const SHUTDOWN_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
+
+/// How often shutdown looks again at a lock or a count it is waiting on.
+///
+/// Shutdown polls rather than waiting on the registry's condition variable,
+/// because waking from that wait has to take the registry lock again, and a
+/// browser call in progress can hold that lock for its whole deadline.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(5);
+
+/// The time limits one module shutdown works within.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownBudget {
+    pub total: Duration,
+    pub in_flight_wait_max: Duration,
+    pub cleanup_reserve: Duration,
+}
+
+impl ShutdownBudget {
+    pub const PRODUCTION: Self = Self {
+        total: SHUTDOWN_TEARDOWN_BUDGET,
+        in_flight_wait_max: SHUTDOWN_IN_FLIGHT_WAIT_MAX,
+        cleanup_reserve: SHUTDOWN_CLEANUP_RESERVE,
+    };
+}
+
+/// A shutdown budget turned into instants, fixed once when shutdown starts so
+/// that a drain, the end of the connection and SIGTERM all share one deadline.
+#[derive(Debug, Clone, Copy)]
+struct ShutdownPlan {
+    /// Until here, operations in progress are waited for.
+    in_flight_until: Instant,
+    /// A graceful close must be over by here, leaving the cleanup reserve.
+    graceful_until: Instant,
+    /// The end of the whole budget.
+    deadline: Instant,
+}
+
+impl ShutdownPlan {
+    fn starting_now(budget: ShutdownBudget) -> Self {
+        let start = Instant::now();
+        let before_reserve = budget.total.saturating_sub(budget.cleanup_reserve);
+        Self {
+            in_flight_until: start + budget.in_flight_wait_max.min(before_reserve),
+            graceful_until: start + before_reserve,
+            deadline: start + budget.total,
+        }
+    }
+}
+
+/// What shutdown must be able to reach while a browser call holds the registry
+/// lock: each live session's killer and how many operations it has in flight.
+///
+/// Lock order: this lock is taken either on its own or while already holding
+/// the registry lock, never the other way round. It is never held across a
+/// kill, a wait, or any other I/O; killers are cloned out before they fire.
+#[derive(Default)]
+struct ShutdownSide {
+    plan: Option<ShutdownPlan>,
+    routes: HashMap<String, RouteKillSwitch>,
+}
+
+struct RouteKillSwitch {
+    browser_session_id: String,
+    killer: Option<Arc<dyn BrowserKiller>>,
+    in_flight: usize,
+    kill_attempted: bool,
+    killed: bool,
 }
 
 pub trait SessionCleanup: Send {
@@ -611,6 +740,7 @@ struct SessionState {
 #[derive(Clone, Default)]
 pub struct BrowserSessions {
     inner: Arc<(Mutex<SessionState>, Condvar)>,
+    shutdown: Arc<Mutex<ShutdownSide>>,
 }
 
 pub enum LaunchSlot {
@@ -637,6 +767,10 @@ pub enum DispatchAdmission {
 pub struct OperationGuard {
     sessions: BrowserSessions,
     route_key: String,
+    /// The session this operation was admitted on. A shutdown that stopped
+    /// waiting for the operation may have replaced the route's session by the
+    /// time it finishes, and its release must not touch a newer session's count.
+    browser_session_id: String,
     finished: bool,
 }
 
@@ -797,8 +931,16 @@ impl OperationGuard {
             .routes
             .get_mut(&self.route_key)
             .and_then(|route| route.active.as_mut())
+            .filter(|session| session.browser_session_id == self.browser_session_id)
         {
             session.pending_operations = session.pending_operations.saturating_sub(1);
+        }
+        if let Some(switch) = recover_poisoned(self.sessions.shutdown.lock())
+            .routes
+            .get_mut(&self.route_key)
+            .filter(|switch| switch.browser_session_id == self.browser_session_id)
+        {
+            switch.in_flight = switch.in_flight.saturating_sub(1);
         }
         wake.notify_all();
         self.finished = true;
@@ -869,12 +1011,25 @@ impl BrowserSessions {
         let session = state.routes.get_mut(route_key)?.active.as_mut()?;
         session.disposition = disposition;
         session.lease = BrowserLease::established(config.browser_idle_timeout_ms, clock);
+        let killer = process.shutdown_killer();
         session.process = Some(process);
         session.cleanup = Some(cleanup);
         let result = (
             session.browser_session_id.clone(),
             session.lease.clone(),
             session.terminal.is_some(),
+        );
+        // Registered while the registry lock is held, which is the permitted
+        // order, so shutdown can never see the session without its switch.
+        self.side().routes.insert(
+            route_key.to_string(),
+            RouteKillSwitch {
+                browser_session_id: result.0.clone(),
+                killer,
+                in_flight: 0,
+                kill_attempted: false,
+                killed: false,
+            },
         );
         self.inner.1.notify_all();
         Some(result)
@@ -1190,9 +1345,19 @@ impl BrowserSessions {
         }
         session.lease.renew(clock);
         session.pending_operations = session.pending_operations.saturating_add(1);
+        let browser_session_id = session.browser_session_id.clone();
+        if let Some(switch) = self
+            .side()
+            .routes
+            .get_mut(route_key)
+            .filter(|switch| switch.browser_session_id == browser_session_id)
+        {
+            switch.in_flight = switch.in_flight.saturating_add(1);
+        }
         DispatchAdmission::Accepted(OperationGuard {
             sessions: self.clone(),
             route_key: route_key.to_string(),
+            browser_session_id,
             finished: false,
         })
     }
@@ -1364,23 +1529,246 @@ impl BrowserSessions {
         self.finish_teardown(route_key, reason, config);
     }
 
+    /// Close every session because the module is shutting down, within
+    /// [`ShutdownBudget::PRODUCTION`].
+    ///
+    /// Every way the module can end (a drain notice, the daemon connection
+    /// ending, SIGTERM) comes here, and they share one deadline fixed by the
+    /// first of them, so a later caller joins the teardown already running
+    /// rather than granting itself a fresh budget.
     pub fn teardown_all(&self, config: &BrowserConfig) {
-        let keys = recover_poisoned(self.inner.0.lock())
-            .routes
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        self.teardown_all_within(config, ShutdownBudget::PRODUCTION);
+    }
+
+    /// [`Self::teardown_all`] under an explicit budget, so tests can observe
+    /// the bound without sleeping for the production one.
+    #[doc(hidden)]
+    pub fn teardown_all_within(&self, config: &BrowserConfig, budget: ShutdownBudget) {
+        let plan = *self
+            .side()
+            .plan
+            .get_or_insert_with(|| ShutdownPlan::starting_now(budget));
+        // Marking every route terminal in one pass stops any further driver
+        // call from starting on any of them. After this, the only thing that
+        // can hold the registry lock is a call that was already in progress.
+        let keys = {
+            let mut state = self.lock_for_shutdown(&plan, None);
+            for route in state.routes.values_mut() {
+                if let Some(session) = route.active.as_mut() {
+                    session
+                        .terminal
+                        .get_or_insert(BrowserSessionTerminalOutcome::ModuleShutdown);
+                }
+            }
+            self.inner.1.notify_all();
+            state.routes.keys().cloned().collect::<Vec<_>>()
+        };
+        // One thread per session, so the time taken is the slowest session's,
+        // not the sum over sessions.
         std::thread::scope(|scope| {
             for key in keys {
-                scope.spawn(move || {
-                    self.teardown_route(
-                        &key,
-                        BrowserSessionTerminalOutcome::ModuleShutdown,
-                        config,
-                    );
-                });
+                scope.spawn(move || self.shutdown_route(&key, config, &plan));
             }
         });
+    }
+
+    /// Tear one route's session down inside the shutdown plan.
+    ///
+    /// Every wait on this path ends by the plan: operations in progress are
+    /// waited for until `in_flight_until`, the graceful close gets whatever is
+    /// left before `graceful_until`, and the kill, reap and after-reap cleanup
+    /// run in the reserve after it.
+    fn shutdown_route(&self, route_key: &str, config: &BrowserConfig, plan: &ShutdownPlan) {
+        let mut state = self.lock_for_shutdown(plan, Some(route_key));
+        let (browser_session_id, terminal_outcome, mut process, mut cleanup) = loop {
+            let Some(session) = state
+                .routes
+                .get_mut(route_key)
+                .and_then(|route| route.active.as_mut())
+            else {
+                return;
+            };
+            let now = Instant::now();
+            if session.pending_operations != 0 && now < plan.in_flight_until {
+                // Operations between driver calls. Waiting lets them finish
+                // cleanly; once the cap passes, the session is closed under
+                // them and their next driver call is refused.
+                drop(state);
+                std::thread::sleep(SHUTDOWN_POLL);
+                state = self.lock_for_shutdown(plan, Some(route_key));
+                continue;
+            }
+            if session.process.is_none() {
+                // Either a launch has not delivered its process yet, or another
+                // teardown (an idle expiry, a close) is holding it. Neither is
+                // ours to finish. A launch that completes sees the session
+                // already terminal and tears itself down. Another teardown is
+                // joined, but once only the reserve is left, its browser is
+                // killed so that its graceful wait ends early.
+                if now >= plan.deadline {
+                    return;
+                }
+                if now >= plan.graceful_until {
+                    self.kill_routes(Some(route_key), false);
+                }
+                drop(state);
+                std::thread::sleep(SHUTDOWN_POLL);
+                state = self.lock_for_shutdown(plan, Some(route_key));
+                continue;
+            }
+            let terminal_outcome = *session
+                .terminal
+                .get_or_insert(BrowserSessionTerminalOutcome::ModuleShutdown);
+            let Some(process) = session.process.take() else {
+                return;
+            };
+            break (
+                session.browser_session_id.clone(),
+                terminal_outcome,
+                process,
+                session.cleanup.take(),
+            );
+        };
+        drop(state);
+
+        let outcome = if self.route_killed(route_key, &browser_session_id) {
+            // Already dead by the shutdown killer: a graceful close would only
+            // write to a closed pipe, so all that is left is the reap.
+            process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
+        } else {
+            let grace = Duration::from_millis(config.termination_grace_period_ms).min(
+                plan.graceful_until
+                    .saturating_duration_since(Instant::now()),
+            );
+            teardown_process_with_grace(process.as_mut(), grace)
+        }
+        .and_then(|()| {
+            let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
+            cleanup.set_terminal_outcome(terminal_outcome);
+            cleanup.after_reap()
+        });
+        self.retain_torn_down(route_key, &browser_session_id, process, cleanup, outcome);
+    }
+
+    fn side(&self) -> MutexGuard<'_, ShutdownSide> {
+        recover_poisoned(self.shutdown.lock())
+    }
+
+    /// Take the registry lock for shutdown without ever parking on it.
+    ///
+    /// A plain `lock()` would wait out any browser call in progress, whose
+    /// deadline is operator-configured. Past the in-flight cap, the browsers
+    /// with operations in flight (on `route_key`, or on any route when it is
+    /// `None`) are killed, which fails the call holding the lock and so
+    /// releases it.
+    fn lock_for_shutdown(
+        &self,
+        plan: &ShutdownPlan,
+        route_key: Option<&str>,
+    ) -> MutexGuard<'_, SessionState> {
+        loop {
+            match self.inner.0.try_lock() {
+                Ok(state) => return state,
+                Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= plan.in_flight_until {
+                self.kill_routes(route_key, true);
+            }
+            std::thread::sleep(SHUTDOWN_POLL);
+        }
+    }
+
+    /// Fire the shutdown killer of each matching route, at most once per
+    /// session. With `only_in_flight`, routes with no operation in flight are
+    /// left alone: their browsers still get a graceful close.
+    fn kill_routes(&self, route_key: Option<&str>, only_in_flight: bool) {
+        let targets = {
+            let mut side = self.side();
+            side.routes
+                .iter_mut()
+                .filter(|(key, switch)| {
+                    route_key.is_none_or(|wanted| wanted == key.as_str())
+                        && (!only_in_flight || switch.in_flight != 0)
+                        && !switch.kill_attempted
+                })
+                .filter_map(|(key, switch)| {
+                    switch.kill_attempted = true;
+                    let killer = switch.killer.clone()?;
+                    Some((key.clone(), switch.browser_session_id.clone(), killer))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (key, browser_session_id, killer) in targets {
+            // Fired with no lock held; the side lock is taken again only to
+            // record the result.
+            if killer.kill_exact_generation() == KillOutcome::Dead {
+                if let Some(switch) = self
+                    .side()
+                    .routes
+                    .get_mut(&key)
+                    .filter(|switch| switch.browser_session_id == browser_session_id)
+                {
+                    switch.killed = true;
+                }
+            }
+        }
+    }
+
+    fn route_killed(&self, route_key: &str, browser_session_id: &str) -> bool {
+        self.side()
+            .routes
+            .get(route_key)
+            .is_some_and(|switch| switch.browser_session_id == browser_session_id && switch.killed)
+    }
+
+    /// Record a finished teardown: the session moves from active to retained
+    /// with its outcome, and its shutdown switch is dropped.
+    fn retain_torn_down(
+        &self,
+        route_key: &str,
+        browser_session_id: &str,
+        process: Box<dyn OwnedBrowserProcess>,
+        cleanup: Option<Box<dyn SessionCleanup>>,
+        outcome: Result<SessionCleanupOutcome, CleanupStage>,
+    ) {
+        let (lock, wake) = &*self.inner;
+        let mut state = recover_poisoned(lock.lock());
+        let Some(route) = state.routes.get_mut(route_key) else {
+            return;
+        };
+        if route
+            .active
+            .as_ref()
+            .is_none_or(|session| session.browser_session_id != browser_session_id)
+        {
+            return;
+        }
+        let Some(mut session) = route.active.take() else {
+            return;
+        };
+        session.process = Some(process);
+        session.cleanup = cleanup;
+        match outcome {
+            Ok(cleanup_outcome) => session.cleanup_outcome = Some(cleanup_outcome),
+            Err(stage) => {
+                session.cleanup_failure = Some(stage);
+                session.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
+            }
+        }
+        route.retained.push(session);
+        {
+            // Taken while holding the registry lock, the permitted order.
+            let mut side = self.side();
+            if side
+                .routes
+                .get(route_key)
+                .is_some_and(|switch| switch.browser_session_id == browser_session_id)
+            {
+                side.routes.remove(route_key);
+            }
+        }
+        wake.notify_all();
     }
 
     fn finish_teardown(
@@ -1449,32 +1837,7 @@ impl BrowserSessions {
             cleanup.set_terminal_outcome(terminal_outcome);
             cleanup.after_reap()
         });
-
-        let mut state = recover_poisoned(lock.lock());
-        let Some(route) = state.routes.get_mut(route_key) else {
-            return;
-        };
-        if route
-            .active
-            .as_ref()
-            .is_none_or(|session| session.browser_session_id != browser_session_id)
-        {
-            return;
-        }
-        let Some(mut session) = route.active.take() else {
-            return;
-        };
-        session.process = Some(process);
-        session.cleanup = cleanup;
-        match outcome {
-            Ok(cleanup_outcome) => session.cleanup_outcome = Some(cleanup_outcome),
-            Err(stage) => {
-                session.cleanup_failure = Some(stage);
-                session.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
-            }
-        }
-        route.retained.push(session);
-        wake.notify_all();
+        self.retain_torn_down(route_key, &browser_session_id, process, cleanup, outcome);
     }
 }
 
@@ -1564,6 +1927,16 @@ fn teardown_process(
     process: &mut dyn OwnedBrowserProcess,
     config: &BrowserConfig,
 ) -> Result<(), CleanupStage> {
+    teardown_process_with_grace(
+        process,
+        Duration::from_millis(config.termination_grace_period_ms),
+    )
+}
+
+fn teardown_process_with_grace(
+    process: &mut dyn OwnedBrowserProcess,
+    grace_period: Duration,
+) -> Result<(), CleanupStage> {
     if !process.generation_matches() {
         return process.wait_until_reaped().map_err(|_| CleanupStage::Reap);
     }
@@ -1571,7 +1944,7 @@ fn teardown_process(
         .request_graceful_termination()
         .map_err(|_| CleanupStage::Reap)?;
     let exited = process
-        .wait_for_exit(Duration::from_millis(config.termination_grace_period_ms))
+        .wait_for_exit(grace_period)
         .map_err(|_| CleanupStage::Reap)?;
     if !exited {
         // The second generation check is the fence against signaling a recycled
@@ -2762,6 +3135,332 @@ mod tests {
         assert_eq!(
             process.lock().unwrap().as_slice(),
             ["graceful", "grace_wait", "force", "reap"]
+        );
+    }
+
+    /// The daemon's side of the shutdown contract. After a module's connection
+    /// ends, the daemon waits up to 25 s (the module drain deadline: 30 s by
+    /// default, capped at 25 s for modules), then sends SIGTERM, and SIGKILL
+    /// half a second later. Teardown still running at SIGKILL never releases
+    /// profile custody. If either side changes, this figure and the test below
+    /// are where the two have to be reconciled.
+    const DAEMON_SIGTERM_AFTER_EOF: Duration = Duration::from_secs(25);
+
+    /// The worst-case shutdown teardown, from the module's own constants.
+    ///
+    /// Every wait on the shutdown path is cut off by one plan: operations in
+    /// progress are waited for until `in_flight_until`, the graceful close
+    /// ends by `graceful_until`, and the kill, reap and after-reap cleanup run
+    /// in the reserve that follows, which ends at `deadline`. Sessions are torn
+    /// down on one thread each (`teardown_all_within` spawns one per route), so
+    /// the session count does not multiply this; that is measured by
+    /// `teardown_all_finishes_n_sessions_in_about_one_grace_period`.
+    #[test]
+    fn the_shutdown_teardown_budget_fits_before_the_daemons_sigterm() {
+        let budget = ShutdownBudget::PRODUCTION;
+        assert_eq!(budget.total, SHUTDOWN_TEARDOWN_BUDGET);
+        assert_eq!(budget.in_flight_wait_max, SHUTDOWN_IN_FLIGHT_WAIT_MAX);
+        assert_eq!(budget.cleanup_reserve, SHUTDOWN_CLEANUP_RESERVE);
+
+        let plan = ShutdownPlan::starting_now(budget);
+        let start = plan.deadline - SHUTDOWN_TEARDOWN_BUDGET;
+        let in_flight_wait = plan.in_flight_until - start;
+        let graceful_close = plan.graceful_until - plan.in_flight_until;
+        let reserve = plan.deadline - plan.graceful_until;
+        assert_eq!(in_flight_wait, SHUTDOWN_IN_FLIGHT_WAIT_MAX);
+        assert_eq!(reserve, SHUTDOWN_CLEANUP_RESERVE);
+        assert!(
+            graceful_close > Duration::ZERO,
+            "the in-flight wait and the cleanup reserve leave no time for a graceful close"
+        );
+
+        let worst_case = in_flight_wait + graceful_close + reserve;
+        assert_eq!(worst_case, SHUTDOWN_TEARDOWN_BUDGET);
+        assert!(
+            worst_case < DAEMON_SIGTERM_AFTER_EOF,
+            "worst-case shutdown teardown {worst_case:?} does not finish before the daemon's \
+             SIGTERM at {DAEMON_SIGTERM_AFTER_EOF:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct KillSwitch {
+        killed: Mutex<bool>,
+        wake: Condvar,
+        fired: std::sync::atomic::AtomicUsize,
+    }
+
+    struct SwitchKiller(Arc<KillSwitch>);
+
+    impl BrowserKiller for SwitchKiller {
+        fn kill_exact_generation(&self) -> KillOutcome {
+            self.0
+                .fired
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.0.killed.lock().unwrap() = true;
+            self.0.wake.notify_all();
+            KillOutcome::Dead
+        }
+    }
+
+    /// A browser whose screenshot call never returns until its shutdown
+    /// killer fires, standing in for a CDP call with a very long deadline.
+    struct StuckCallProcess {
+        switch: Arc<KillSwitch>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        entered: std::sync::mpsc::Sender<()>,
+    }
+
+    impl OwnedBrowserProcess for StuckCallProcess {
+        fn screenshot(
+            &mut self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: bool,
+        ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+            let _ = self.entered.send(());
+            let mut killed = self.switch.killed.lock().unwrap();
+            while !*killed {
+                killed = self.switch.wake.wait(killed).unwrap();
+            }
+            Err(NavigationDriveError::CdpFailure)
+        }
+
+        fn generation_matches(&self) -> bool {
+            true
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.events.lock().unwrap().push("graceful");
+            Ok(())
+        }
+
+        fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+            self.events.lock().unwrap().push("grace_wait");
+            Ok(false)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            self.events.lock().unwrap().push("force");
+            Ok(())
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            self.events.lock().unwrap().push("reap");
+            Ok(())
+        }
+
+        fn shutdown_killer(&self) -> Option<Arc<dyn BrowserKiller>> {
+            Some(Arc::new(SwitchKiller(Arc::clone(&self.switch))))
+        }
+    }
+
+    /// A browser that never exits on its own. It records the graceful wait it
+    /// was given and sleeps for it, up to `sleep_cap`.
+    struct NeverExitingProcess {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        graces: Arc<Mutex<Vec<Duration>>>,
+        sleep_cap: Duration,
+    }
+
+    impl OwnedBrowserProcess for NeverExitingProcess {
+        fn generation_matches(&self) -> bool {
+            true
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.events.lock().unwrap().push("graceful");
+            Ok(())
+        }
+
+        fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure> {
+            self.events.lock().unwrap().push("grace_wait");
+            self.graces.lock().unwrap().push(grace_period);
+            std::thread::sleep(grace_period.min(self.sleep_cap));
+            Ok(false)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            self.events.lock().unwrap().push("force");
+            Ok(())
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            self.events.lock().unwrap().push("reap");
+            Ok(())
+        }
+    }
+
+    /// Records when after-reap cleanup (custody release) ran.
+    struct TimedCleanup(Arc<Mutex<Vec<Instant>>>);
+
+    impl SessionCleanup for TimedCleanup {
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            self.0.lock().unwrap().push(Instant::now());
+            Ok(SessionCleanupOutcome::Complete)
+        }
+    }
+
+    /// One session is stuck inside a browser call, holding the registry-wide
+    /// lock; another is idle but its browser never exits, under a configured
+    /// grace of an hour. Shutdown must still release custody for both inside
+    /// the budget: the stuck browser is killed out of band once the in-flight
+    /// wait is over, and the idle one's graceful wait is cut to what the budget
+    /// has left before the cleanup reserve.
+    #[test]
+    fn a_stuck_call_and_a_huge_grace_still_release_custody_within_the_budget() {
+        let budget = ShutdownBudget {
+            total: Duration::from_millis(900),
+            in_flight_wait_max: Duration::from_millis(150),
+            cleanup_reserve: Duration::from_millis(300),
+        };
+        let mut shutdown_config = config();
+        shutdown_config.termination_grace_period_ms = 3_600_000;
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+
+        let switch = Arc::new(KillSwitch::default());
+        let stuck_events = Arc::new(Mutex::new(Vec::new()));
+        let stuck_released = Arc::new(Mutex::new(Vec::new()));
+        let (entered, call_entered) = std::sync::mpsc::channel();
+        let _ = sessions.acquire_launch_slot("stuck");
+        sessions
+            .establish_ready(
+                "stuck",
+                ProfileDisposition::Durable,
+                &shutdown_config,
+                &clock,
+                Box::new(StuckCallProcess {
+                    switch: Arc::clone(&switch),
+                    events: Arc::clone(&stuck_events),
+                    entered,
+                }),
+                Box::new(TimedCleanup(Arc::clone(&stuck_released))),
+            )
+            .unwrap();
+
+        let idle_events = Arc::new(Mutex::new(Vec::new()));
+        let idle_graces = Arc::new(Mutex::new(Vec::new()));
+        let idle_released = Arc::new(Mutex::new(Vec::new()));
+        let _ = sessions.acquire_launch_slot("idle");
+        sessions
+            .establish_ready(
+                "idle",
+                ProfileDisposition::Durable,
+                &shutdown_config,
+                &clock,
+                Box::new(NeverExitingProcess {
+                    events: Arc::clone(&idle_events),
+                    graces: Arc::clone(&idle_graces),
+                    sleep_cap: Duration::from_secs(2),
+                }),
+                Box::new(TimedCleanup(Arc::clone(&idle_released))),
+            )
+            .unwrap();
+
+        let DispatchAdmission::Accepted(mut operation) = sessions.accept_dispatch("stuck", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let caller = std::thread::spawn(move || {
+            let result = operation.screenshot("context", 0, 3_600_000, false);
+            operation.finish();
+            result.is_err()
+        });
+        call_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the stuck call is in progress and holds the registry lock");
+
+        let started = Instant::now();
+        let (done, finished) = std::sync::mpsc::channel();
+        let tearing_down = sessions.clone();
+        std::thread::spawn(move || {
+            tearing_down.teardown_all_within(&shutdown_config, budget);
+            let _ = done.send(Instant::now());
+        });
+        let ended = finished
+            .recv_timeout(budget.total + Duration::from_secs(2))
+            .expect("shutdown teardown must end");
+
+        // Scheduling and the 5 ms polls are the only time not on the plan.
+        let slack = Duration::from_millis(100);
+        assert!(
+            ended - started <= budget.total + slack,
+            "shutdown teardown took {:?} against a budget of {:?}",
+            ended - started,
+            budget.total
+        );
+        assert!(
+            caller.join().unwrap(),
+            "the killed browser fails the stuck call"
+        );
+        assert_eq!(
+            switch.fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stuck browser's killer fires once"
+        );
+        assert_eq!(
+            stuck_events.lock().unwrap().as_slice(),
+            ["reap"],
+            "a killed browser is reaped, not asked to close"
+        );
+        assert_eq!(
+            idle_events.lock().unwrap().as_slice(),
+            ["graceful", "grace_wait", "force", "reap"]
+        );
+        let graces = idle_graces.lock().unwrap();
+        assert_eq!(graces.len(), 1);
+        assert!(
+            graces[0] <= budget.total - budget.cleanup_reserve,
+            "the graceful wait {:?} was not cut to the budget",
+            graces[0]
+        );
+        for (route, released) in [("stuck", &stuck_released), ("idle", &idle_released)] {
+            let released = released.lock().unwrap();
+            assert_eq!(released.len(), 1, "{route} custody released once");
+            assert!(
+                released[0] - started <= budget.total + slack,
+                "{route} custody released after {:?}",
+                released[0] - started
+            );
+            assert_eq!(
+                sessions.status(route, &clock, UNIX_EPOCH)["terminal_outcome"],
+                "module_shutdown"
+            );
+        }
+    }
+
+    /// The shutdown cap is for shutdown only: an idle expiry still gives the
+    /// browser the whole configured grace, however long.
+    #[test]
+    fn idle_expiry_still_honours_the_configured_grace() {
+        let mut idle_config = config();
+        idle_config.termination_grace_period_ms = 3_600_000;
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let graces = Arc::new(Mutex::new(Vec::new()));
+        let _ = sessions.acquire_launch_slot("route");
+        sessions
+            .establish_ready(
+                "route",
+                ProfileDisposition::Durable,
+                &idle_config,
+                &clock,
+                Box::new(NeverExitingProcess {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    graces: Arc::clone(&graces),
+                    sleep_cap: Duration::from_millis(1),
+                }),
+                Box::new(RecordingCleanup::default()),
+            )
+            .unwrap();
+        clock.advance(Duration::from_millis(idle_config.browser_idle_timeout_ms));
+
+        assert!(sessions.expire_idle("route", &clock, &idle_config));
+        assert_eq!(
+            graces.lock().unwrap().as_slice(),
+            [Duration::from_millis(3_600_000)]
         );
     }
 }

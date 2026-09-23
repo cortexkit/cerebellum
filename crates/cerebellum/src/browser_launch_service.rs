@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -34,10 +34,10 @@ use crate::browser_launch_readiness::{
     launch_attested_to_readiness_with, AttestedReadinessError, HandshakeClock, UnixCdpPipe,
 };
 use crate::browser_session::{
-    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher,
-    BrowserSessionTerminalOutcome, CleanupStage, ClickDriveError, ClickPointDriveError,
-    LaunchedBrowser, NavigationDriveError, NavigationWait, OwnedBrowserProcess,
-    ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
+    BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserKiller,
+    BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, ClickDriveError,
+    ClickPointDriveError, KillOutcome, LaunchedBrowser, NavigationDriveError, NavigationWait,
+    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
 };
 use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
@@ -543,6 +543,7 @@ impl ProductionLaunchService {
                     ready.decoder,
                 )),
                 reaped: false,
+                shutdown_kill: Arc::default(),
             },
             journal: Arc::clone(&self.journal),
             launch_attempt_id: launch_attempt_id.to_string(),
@@ -1105,6 +1106,7 @@ impl ReadyProductionBrowser {
                     self.decoder.expect("ready browser owns its CDP decoder"),
                 )),
                 reaped: false,
+                shutdown_kill: Arc::default(),
             }),
             cleanup: Box::new(self.cleanup.expect("ready browser owns profile cleanup")),
         }
@@ -1115,6 +1117,65 @@ struct ProductionProcess {
     process: Option<PlatformReleasedChild>,
     driver: Option<CdpNavigationDriver<UnixCdpPipe>>,
     reaped: bool,
+    /// Shared with this browser's shutdown killer, so the reap path knows the
+    /// browser was already killed (and, on Linux, possibly reaped) out of band.
+    shutdown_kill: Arc<ShutdownKillState>,
+}
+
+#[derive(Default)]
+struct ShutdownKillState {
+    dead: AtomicBool,
+}
+
+/// Kills one production browser by its exact process generation, for module
+/// shutdown when a browser call is holding the session registry lock.
+struct ProductionShutdownKiller {
+    generation: BrowserProcessGeneration,
+    state: Arc<ShutdownKillState>,
+}
+
+impl BrowserKiller for ProductionShutdownKiller {
+    fn kill_exact_generation(&self) -> KillOutcome {
+        if self.state.dead.load(Ordering::Acquire) {
+            return KillOutcome::Dead;
+        }
+        if !platform_kill_exact_generation(self.generation) {
+            return KillOutcome::Refused;
+        }
+        self.state.dead.store(true, Ordering::Release);
+        KillOutcome::Dead
+    }
+}
+
+/// SIGKILL the recorded generation only if the pid still names it; `true` when
+/// the browser is now dead or had already gone. Reuses the same generation
+/// check that orphan recovery signals through, and never reaps on macOS.
+#[cfg(target_os = "macos")]
+fn platform_kill_exact_generation(generation: BrowserProcessGeneration) -> bool {
+    cerebellum_macos::terminate_exact_generation(cerebellum_macos::ProcessGeneration {
+        pid: generation.pid,
+        start_time_micros: generation.start_time_micros,
+    })
+    .is_ok()
+}
+
+/// As on macOS, except that Linux's generation-checked kill also reaps the
+/// child when this process owns it, waiting at most this long for that.
+#[cfg(target_os = "linux")]
+const SHUTDOWN_KILL_REAP_WAIT: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+fn platform_kill_exact_generation(generation: BrowserProcessGeneration) -> bool {
+    cerebellum_linux::terminate_exact_generation(
+        generation.pid,
+        Instant::now() + SHUTDOWN_KILL_REAP_WAIT,
+        || match linux_generation_liveness(generation) {
+            SupervisorLiveness::Live => cerebellum_linux::GenerationMatch::Exact,
+            SupervisorLiveness::NotLive => cerebellum_linux::GenerationMatch::GoneOrReplaced,
+            SupervisorLiveness::Unavailable => cerebellum_linux::GenerationMatch::Unreadable,
+        },
+    )
+    .is_ok()
 }
 
 impl OwnedBrowserProcess for ProductionProcess {
@@ -1303,9 +1364,22 @@ impl OwnedBrowserProcess for ProductionProcess {
             return Ok(());
         }
         let process = self.process.take().ok_or(ProcessControlFailure)?;
-        process.wait().map_err(|_| ProcessControlFailure)?;
+        if process.wait().is_err() && !self.shutdown_kill.dead.load(Ordering::Acquire) {
+            return Err(ProcessControlFailure);
+        }
+        // A failed wait after the shutdown killer confirmed this generation
+        // dead means the child was already reaped (Linux reaps inside the
+        // kill), so there is nothing left to wait for.
         self.reaped = true;
         Ok(())
+    }
+
+    fn shutdown_killer(&self) -> Option<Arc<dyn BrowserKiller>> {
+        let generation = BrowserProcessGeneration::from(self.process.as_ref()?.generation());
+        Some(Arc::new(ProductionShutdownKiller {
+            generation,
+            state: Arc::clone(&self.shutdown_kill),
+        }))
     }
 }
 

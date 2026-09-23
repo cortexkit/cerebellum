@@ -49,6 +49,10 @@ sha2 = "0.10"
 socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false }
+# Only `low_level::emulate_default_handler`, which re-raises SIGTERM with the
+# default disposition restored so a supervisor sees a death by signal. The
+# default features add a signal-iterator thread this module does not use.
+signal-hook = { version = "0.4", default-features = false }
 
 # The test harness takes subc-daemon and subc-control from crates.io, so the
 # lock moves on the daemon only when this repo chooses. Those published crates
