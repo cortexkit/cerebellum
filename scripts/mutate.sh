@@ -173,7 +173,13 @@ fi
 red="$(printf '%s\n' "$verify_output" | grep -cE '^test .* \.\.\. FAILED' || true)"
 summary_failed="$(printf '%s\n' "$verify_output" | grep -cE '^test result: FAILED' || true)"
 panics="$(printf '%s\n' "$verify_output" | grep -c 'panicked at' || true)"
-compile_errors="$(printf '%s\n' "$verify_output" | grep -cE '^error(\[E[0-9]+\])?: |could not compile' || true)"
+# Cargo reports a failing test binary with its own `error:` lines ("error: test
+# failed, to rerun pass ...", "error: N targets failed:"). Those are the SIGN of a
+# caught mutation, and counting them as compiler errors turned every caught
+# mutation into INCONCLUSIVE, so they are excluded before counting.
+compile_errors="$(printf '%s\n' "$verify_output" \
+  | grep -vE '^error: (test failed, to rerun pass|[0-9]+ targets? failed)' \
+  | grep -cE '^error(\[E[0-9]+\])?: |could not compile' || true)"
 
 if [ "$compile_errors" -ne 0 ]; then
   echo "INCONCLUSIVE: the mutant did not build ($compile_errors compiler errors)."
