@@ -83,15 +83,24 @@ impl ProductionProfileLifecycleError {
         }
     }
 
+    /// No free-text detail: a registry error's Debug text can carry filesystem
+    /// paths, and a profile directory is named by its profile UUID, which must
+    /// never reach the wire. The one cause a caller acts on differently -- a
+    /// root the registry no longer trusts, which has its own remedy -- keeps
+    /// the typed outcome the acquire path already renders for it; every other
+    /// registry failure is a storage problem the stage already names.
     fn into_launch_refusal(self) -> Value {
         match self {
             Self::DataRoot => {
                 json!({"outcome": "profile_storage_unavailable", "stage": "data_root"})
             }
-            Self::Registry(error) => json!({
+            Self::Registry(RegistryError::Untrustworthy(reason)) => {
+                crate::browser_launch::BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason }
+                    .as_json()
+            }
+            Self::Registry(_) => json!({
                 "outcome": "profile_storage_unavailable",
                 "stage": "profile_registry",
-                "detail": format!("{error:?}"),
             }),
         }
     }
@@ -199,10 +208,11 @@ impl ProductionLaunchService {
         let root = lifecycle.registry().root().canonical_path().to_path_buf();
         let lifecycle = Arc::new(Mutex::new(lifecycle));
         let locks = Arc::new(Mutex::new(
-            ProfileCustodyLocks::open_filesystem(&root).map_err(|error| {
-                json!({"outcome": "custody_locks_unavailable", "stage": "custody_locks",
-                       "detail": format!("{error:?}")})
-            })?,
+            // The lock error's Debug text is dropped: it names paths under the
+            // profile root and says nothing the stage does not.
+            ProfileCustodyLocks::open_filesystem(&root).map_err(
+                |_| json!({"outcome": "custody_locks_unavailable", "stage": "custody_locks"}),
+            )?,
         ));
         let invocation =
             InvocationToken::from_trusted_invocation(format!("invocation-{browser_session_id}"));
@@ -328,26 +338,21 @@ impl ProductionLaunchService {
             LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
         let pipe = match UnixCdpPipe::new(command_parent, response_parent) {
             Ok(pipe) => pipe,
-            Err(error) => {
+            Err(_) => {
                 return Err(cleanup_before_spawn(
                     rollback.clone(),
                     json!({
                         "outcome": "internal_failure",
                         "stage": "spawn_preparation",
                         "pipe": "cdp",
-                        "detail": format!("{error:?}"),
                     }),
                 ))
             }
         };
-        let mut journal_guard = self.journal.lock().map_err(|error| {
+        let mut journal_guard = self.journal.lock().map_err(|_| {
             cleanup_before_spawn(
                 rollback.clone(),
-                json!({
-                    "outcome": "internal_failure",
-                    "stage": "launch_journal_lock",
-                    "detail": format!("{error:?}"),
-                }),
+                crate::browser_session::internal_failure_reply("launch_journal_lock"),
             )
         })?;
         let journal = journal_guard.as_mut().ok_or_else(|| {
@@ -681,12 +686,14 @@ impl Drop for ProductionCaptureBrowser {
     }
 }
 
-fn launch_recovery_refusal(failure: BrowserLaunchRecoveryFailure) -> Value {
+/// The recovery failure's variant and journal sequence stay out of the reply:
+/// they are internal state, and every variant asks the same of a caller -- the
+/// module must be restarted once an operator has looked at the launch journal.
+fn launch_recovery_refusal(_failure: BrowserLaunchRecoveryFailure) -> Value {
     json!({
         "outcome": "internal_failure",
         "stage": "startup_recovery",
         "reason_code": BROWSER_LAUNCH_RECOVERY_FAILED,
-        "detail": format!("{failure:?}"),
     })
 }
 
@@ -1564,7 +1571,14 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
                 stage: crate::browser_launch_readiness::ReadinessCleanupStage::JournalFinalization,
             },
         ) => {
-            json!({"outcome": "internal_failure", "stage": "journal_finalization", "primary": primary})
+            // Omitted rather than null when there is no startup failure to
+            // carry: the launch schema declares `primary` as an object only.
+            let mut refusal =
+                json!({"outcome": "internal_failure", "stage": "journal_finalization"});
+            if let Some(primary) = primary.and_then(|primary| serde_json::to_value(primary).ok()) {
+                refusal["primary"] = primary;
+            }
+            refusal
         }
         AttestedReadinessError::AttestedLaunch(
             AttestedLaunchError::ExecutableIdentityMismatch {
@@ -1585,11 +1599,10 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
             crate::browser_launch_readiness::LaunchReadinessError::ProfileStartupIndeterminate(
                 failure,
             ),
-        ) => serde_json::to_value(failure).unwrap_or_else(|error| {
+        ) => serde_json::to_value(failure).unwrap_or_else(|_| {
             json!({
                 "outcome": "internal_failure",
                 "stage": "readiness_error_serialization",
-                "detail": format!("{error:?}"),
             })
         }),
         AttestedReadinessError::Readiness(
@@ -1599,10 +1612,11 @@ fn map_readiness_error(error: AttestedReadinessError) -> Value {
         | AttestedReadinessError::AttestedLaunch(AttestedLaunchError::TerminationOrReapFailed) => {
             json!({"outcome":"cleanup_failure","stage":"reap"})
         }
-        error => json!({
+        // The error's Debug text is internal state and may name launch paths;
+        // the stage is what a caller can act on.
+        _ => json!({
             "outcome": "internal_failure",
             "stage": "readiness_error_mapping",
-            "detail": format!("{error:?}"),
         }),
     }
 }
@@ -1679,12 +1693,11 @@ fn pipe_pair(
     ),
     Value,
 > {
-    std::os::unix::net::UnixStream::pair().map_err(|error| {
+    std::os::unix::net::UnixStream::pair().map_err(|_| {
         json!({
             "outcome": "internal_failure",
             "stage": "spawn_preparation",
             "pipe": pipe,
-            "detail": format!("{error:?}"),
         })
     })
 }
@@ -2432,7 +2445,6 @@ mod orphan_recovery_tests {
                 "outcome": "internal_failure",
                 "stage": "startup_recovery",
                 "reason_code": "browser_launch_recovery_failed",
-                "detail": "JournalTerminalization",
             }))
         );
     }
@@ -2581,4 +2593,185 @@ fn journal_finalization_refusal_preserves_primary_startup_payload() {
                 ] }
         })
     );
+}
+
+#[cfg(test)]
+mod launch_refusal_schema_tests {
+    use super::*;
+    use crate::browser_launch::{BrowserLaunchRecoveryFailure, LaunchRecordStage};
+    use crate::browser_launch_readiness::{
+        LaunchReadinessError, ProfileStartupCause, ProfileStartupIndeterminate,
+        ReadinessCleanupStage,
+    };
+    use crate::profile::{ArtifactError, RootError, UntrustworthyRegistryReason};
+
+    fn assert_declared(reply: &Value) {
+        assert_eq!(
+            crate::browser::validate_browser_result(crate::browser_session::BROWSER_LAUNCH, reply),
+            Ok(()),
+            "{reply} is a browser.launch reply the launch schema does not declare"
+        );
+    }
+
+    fn registry_errors() -> Vec<RegistryError> {
+        let all = vec![
+            RegistryError::Root(RootError::NotDirectory),
+            RegistryError::Artifact(ArtifactError::InvalidJson),
+            RegistryError::Io(io::Error::other("fixture")),
+            RegistryError::UnknownField("/profiles/0000-uuid".to_string()),
+            RegistryError::UnsupportedState,
+            RegistryError::Conflict,
+            RegistryError::Untrustworthy(UntrustworthyRegistryReason::ManagedRootIdentityChanged),
+            RegistryError::Untrustworthy(UntrustworthyRegistryReason::MalformedRegistry),
+            RegistryError::InvalidTransition,
+        ];
+        // Exhaustive without a wildcard: a new registry error does not compile
+        // until it is rendered above.
+        for error in &all {
+            match error {
+                RegistryError::Root(_)
+                | RegistryError::Artifact(_)
+                | RegistryError::Io(_)
+                | RegistryError::UnknownField(_)
+                | RegistryError::UnsupportedState
+                | RegistryError::Conflict
+                | RegistryError::Untrustworthy(_)
+                | RegistryError::InvalidTransition => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_profile_lifecycle_refusal_passes_the_launch_reply_schema() {
+        let mut replies = vec![ProductionProfileLifecycleError::DataRoot.into_launch_refusal()];
+        for error in registry_errors() {
+            replies.push(ProductionProfileLifecycleError::Registry(error).into_launch_refusal());
+        }
+        for reply in &replies {
+            assert_declared(reply);
+            // Registry errors can carry paths, and profile directories are
+            // named by profile UUID; neither may reach the wire as text.
+            assert!(reply.get("detail").is_none(), "{reply}");
+            assert!(!reply.to_string().contains("uuid"), "{reply}");
+        }
+    }
+
+    /// A registry that no longer trusts its root has its own remedy, so it is
+    /// rendered as that typed refusal rather than as a storage failure.
+    #[test]
+    fn an_untrusted_registry_at_open_keeps_its_typed_outcome_and_remedy() {
+        let reply = ProductionProfileLifecycleError::Registry(RegistryError::Untrustworthy(
+            UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+        ))
+        .into_launch_refusal();
+        assert_eq!(
+            reply["outcome"], "profile_registry_untrusted_root",
+            "{reply}"
+        );
+        assert!(reply["remedy"].is_string(), "{reply}");
+    }
+
+    #[test]
+    fn every_startup_recovery_refusal_passes_the_launch_reply_schema() {
+        let failures = [
+            BrowserLaunchRecoveryFailure::JournalOpen,
+            BrowserLaunchRecoveryFailure::JournalRead { sequence: 7 },
+            BrowserLaunchRecoveryFailure::ProcessObservation { sequence: 7 },
+            BrowserLaunchRecoveryFailure::ProcessTermination { sequence: 7 },
+            BrowserLaunchRecoveryFailure::JournalTerminalization,
+            BrowserLaunchRecoveryFailure::ProfileCustodyRelease { sequence: 7 },
+            BrowserLaunchRecoveryFailure::InvalidIntent { sequence: 7 },
+        ];
+        for failure in failures {
+            match failure {
+                BrowserLaunchRecoveryFailure::JournalOpen
+                | BrowserLaunchRecoveryFailure::JournalRead { .. }
+                | BrowserLaunchRecoveryFailure::ProcessObservation { .. }
+                | BrowserLaunchRecoveryFailure::ProcessTermination { .. }
+                | BrowserLaunchRecoveryFailure::JournalTerminalization
+                | BrowserLaunchRecoveryFailure::ProfileCustodyRelease { .. }
+                | BrowserLaunchRecoveryFailure::InvalidIntent { .. } => {}
+            }
+            assert_declared(&launch_recovery_refusal(failure));
+        }
+    }
+
+    #[test]
+    fn every_readiness_refusal_passes_the_launch_reply_schema() {
+        let causes = [
+            ProfileStartupCause::ChildExit,
+            ProfileStartupCause::PipeClosed,
+            ProfileStartupCause::DeadlineExpired,
+        ];
+        let mut errors = Vec::new();
+        for cause in causes {
+            errors.push(AttestedReadinessError::Readiness(
+                LaunchReadinessError::ProfileStartupIndeterminate(
+                    ProfileStartupIndeterminate::new(cause),
+                ),
+            ));
+            errors.push(AttestedReadinessError::Readiness(
+                LaunchReadinessError::CleanupFailed {
+                    primary: Some(ProfileStartupIndeterminate::new(cause)),
+                    stage: ReadinessCleanupStage::JournalFinalization,
+                },
+            ));
+        }
+        for stage in [
+            ReadinessCleanupStage::Reap,
+            ReadinessCleanupStage::Rollback,
+            ReadinessCleanupStage::JournalFinalization,
+        ] {
+            errors.push(AttestedReadinessError::Readiness(
+                LaunchReadinessError::CleanupFailed {
+                    primary: None,
+                    stage,
+                },
+            ));
+        }
+        errors.push(AttestedReadinessError::Readiness(
+            LaunchReadinessError::HandshakeSetupFailed,
+        ));
+        errors.push(AttestedReadinessError::CleanupFailed {
+            primary: AttestedLaunchError::SpawnFailed,
+            stage: ReadinessCleanupStage::Reap,
+        });
+        for claim_kind in ["code_signed", "image_digest"] {
+            errors.push(AttestedReadinessError::AttestedLaunch(
+                AttestedLaunchError::ExecutableIdentityMismatch {
+                    claim_kind: claim_kind.to_string(),
+                    expected_identity: "expected".to_string(),
+                    observed_identity: "observed".to_string(),
+                },
+            ));
+        }
+        errors.push(AttestedReadinessError::AttestedLaunch(
+            AttestedLaunchError::PlatformRefused {
+                error: crate::browser_launch::PlatformLaunchError::Spawn,
+            },
+        ));
+        for error in [
+            AttestedLaunchError::JournalRecordFailed {
+                stage: LaunchRecordStage::Intent,
+            },
+            AttestedLaunchError::SpawnFailed,
+            AttestedLaunchError::ImageAttestationFailed {
+                expected_identity: "/Applications/Browser.app".to_string(),
+            },
+            AttestedLaunchError::TerminationOrReapFailed,
+            AttestedLaunchError::ReleaseFailed,
+        ] {
+            errors.push(AttestedReadinessError::AttestedLaunch(error));
+        }
+        for error in errors {
+            let rendered = format!("{error:?}");
+            let reply = map_readiness_error(error);
+            assert_declared(&reply);
+            assert!(
+                !reply.to_string().contains("/Applications"),
+                "{rendered} leaked its Debug text into {reply}"
+            );
+        }
+    }
 }

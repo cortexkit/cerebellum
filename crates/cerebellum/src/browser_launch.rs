@@ -4458,3 +4458,175 @@ const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     | BrowserLaunchOutcome::InternalFailure { reason_code: _ }
     | BrowserLaunchOutcome::CleanupFailure { stage: _ } => {}
 };
+
+#[cfg(test)]
+mod launch_outcome_schema_tests {
+    use super::*;
+
+    /// Every rendering one variant can produce. The match has no wildcard arm,
+    /// so a new variant does not compile until it is listed here -- and so
+    /// until its wire shape is checked against the declared launch schema.
+    /// Nested closed enums are expanded in full because each of their values
+    /// changes the rendered words (a remedy appears for some reasons only).
+    fn renderings_of(variant: &BrowserLaunchOutcome) -> Vec<BrowserLaunchOutcome> {
+        match variant {
+            BrowserLaunchOutcome::ProfileBusy { .. } => vec![BrowserLaunchOutcome::ProfileBusy {
+                holder_id: serde_json::from_value(json!("holder-under-test"))
+                    .expect("a holder id deserializes from its string"),
+            }],
+            BrowserLaunchOutcome::ProfileGrantRequired => {
+                vec![BrowserLaunchOutcome::ProfileGrantRequired]
+            }
+            BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { .. } => every_untrusted_reason()
+                .into_iter()
+                .map(|reason| BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason })
+                .collect(),
+            BrowserLaunchOutcome::ProfileStorageUnavailable { .. } => {
+                vec![BrowserLaunchOutcome::ProfileStorageUnavailable {
+                    reason_code: "profile_storage_unavailable",
+                }]
+            }
+            BrowserLaunchOutcome::InternalFailure { .. } => {
+                vec![BrowserLaunchOutcome::InternalFailure {
+                    reason_code: "custody_acquisition",
+                }]
+            }
+            BrowserLaunchOutcome::CleanupFailure { .. } => [
+                LaunchCleanupStage::RecordTerminalization,
+                LaunchCleanupStage::CustodyRelease,
+                LaunchCleanupStage::DisposableDelete,
+            ]
+            .into_iter()
+            .map(|stage| BrowserLaunchOutcome::CleanupFailure { stage })
+            .collect(),
+        }
+    }
+
+    fn every_untrusted_reason() -> Vec<UntrustworthyRegistryReason> {
+        use UntrustworthyRegistryReason as R;
+        let all = vec![
+            R::LockContentionWithoutOwnerProof,
+            R::MalformedRegistry,
+            R::UnsupportedRegistrySchema,
+            R::ManagedRootIdentityChanged,
+            R::IntegrityMismatch,
+            R::InvalidRegistryIdentity,
+            R::NonCanonicalTarget,
+            R::MissingRegistry,
+            R::MissingRecord,
+            R::MissingProfileUuid,
+            R::PossiblyManagedPath,
+            R::DurableKindConflict,
+            R::DurableDeletionState,
+            R::RecordTargetMissing,
+        ];
+        // Exhaustive without a wildcard, so a new reason fails to compile
+        // until it is added to the list above.
+        for reason in &all {
+            match reason {
+                R::LockContentionWithoutOwnerProof
+                | R::MalformedRegistry
+                | R::UnsupportedRegistrySchema
+                | R::ManagedRootIdentityChanged
+                | R::IntegrityMismatch
+                | R::InvalidRegistryIdentity
+                | R::NonCanonicalTarget
+                | R::MissingRegistry
+                | R::MissingRecord
+                | R::MissingProfileUuid
+                | R::PossiblyManagedPath
+                | R::DurableKindConflict
+                | R::DurableDeletionState
+                | R::RecordTargetMissing => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_browser_launch_outcome_rendering_passes_the_launch_reply_schema() {
+        // One seed per variant; `renderings_of` refuses to compile if a
+        // variant is missing from its match.
+        let seeds = [
+            BrowserLaunchOutcome::ProfileBusy {
+                holder_id: serde_json::from_value(json!("seed")).expect("holder id"),
+            },
+            BrowserLaunchOutcome::ProfileGrantRequired,
+            BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+                reason: UntrustworthyRegistryReason::MalformedRegistry,
+            },
+            BrowserLaunchOutcome::ProfileStorageUnavailable {
+                reason_code: "seed",
+            },
+            BrowserLaunchOutcome::InternalFailure {
+                reason_code: "seed",
+            },
+            BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            },
+        ];
+        let mut checked = 0;
+        for seed in &seeds {
+            for outcome in renderings_of(seed) {
+                let reply = outcome.as_json();
+                assert_eq!(
+                    crate::browser::validate_browser_result(
+                        crate::browser_session::BROWSER_LAUNCH,
+                        &reply
+                    ),
+                    Ok(()),
+                    "{outcome:?} renders {reply}, which browser.launch does not declare"
+                );
+                checked += 1;
+            }
+        }
+        // One rendering each for busy, grant, storage and internal failure,
+        // fourteen untrusted-root reasons, and three cleanup stages: 21. A
+        // lower count means a rendering was dropped from the check.
+        assert_eq!(checked, 21);
+    }
+
+    /// Platform launch refusals reach the caller through the launch service's
+    /// readiness mapping unchanged, so each one is a browser.launch reply.
+    #[test]
+    fn every_platform_launch_refusal_passes_the_launch_reply_schema() {
+        let errors = [
+            PlatformLaunchError::Spawn,
+            PlatformLaunchError::ImageIdentity,
+            PlatformLaunchError::ProcessControl,
+            PlatformLaunchError::PtraceUnavailable,
+            PlatformLaunchError::ExecChainUnresolved {
+                chain: ExecutableIdentityChain::StoppedAtHopLimit { hops: Vec::new() },
+            },
+            PlatformLaunchError::GenerationUnreadable,
+            PlatformLaunchError::UnexpectedStop { signal: 19 },
+            PlatformLaunchError::SignalStopLimitExceeded {
+                last_signal: 19,
+                limit: 8,
+            },
+        ];
+        for error in errors {
+            // Exhaustive without a wildcard: a new platform error does not
+            // compile until this test decides how to build it.
+            match &error {
+                PlatformLaunchError::Spawn
+                | PlatformLaunchError::ImageIdentity
+                | PlatformLaunchError::ProcessControl
+                | PlatformLaunchError::PtraceUnavailable
+                | PlatformLaunchError::ExecChainUnresolved { .. }
+                | PlatformLaunchError::GenerationUnreadable
+                | PlatformLaunchError::UnexpectedStop { .. }
+                | PlatformLaunchError::SignalStopLimitExceeded { .. } => {}
+            }
+            let reply = error.refusal();
+            assert_eq!(
+                crate::browser::validate_browser_result(
+                    crate::browser_session::BROWSER_LAUNCH,
+                    &reply
+                ),
+                Ok(()),
+                "{reply}"
+            );
+        }
+    }
+}

@@ -1511,3 +1511,58 @@ async fn poisoned_profile_registry_lock_launch_refusal_reaches_the_caller_not_a_
         json!({"outcome": "internal_failure", "stage": "profile_registry_lock"})
     );
 }
+
+/// A launcher refusing the way production does when the profile registry no
+/// longer trusts its managed root -- the refusal a real launch received.
+struct UntrustedRootLauncher;
+
+impl BrowserSessionLauncher for UntrustedRootLauncher {
+    fn launch(
+        &self,
+        _: &cerebellum_core::identity::AcceptedBindFacts,
+        _: &str,
+    ) -> Result<LaunchedBrowser, Value> {
+        Err(
+            cerebellum::browser_launch::BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+                reason:
+                    cerebellum::profile::UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+            }
+            .as_json(),
+        )
+    }
+}
+
+/// The reply boundary withholds undeclared replies. This refusal was once
+/// undeclared, so the caller received `computer_result_schema_violation` and
+/// lost the remedy that would have told it to rebind the profile root.
+#[tokio::test]
+async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_violation() {
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(UntrustedRootLauncher));
+
+    let refusal = response_body(&planes, 1, "browser.launch", json!({})).await;
+    assert_eq!(
+        refusal["outcome"], "profile_registry_untrusted_root",
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal["reason_code"], "profile_registry_managed_root_identity_changed",
+        "{refusal}"
+    );
+    assert!(
+        refusal["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("browser.rebind_profile_root")),
+        "{refusal}"
+    );
+    // The launch slot is released, so the next attempt meets the same refusal
+    // rather than a session left half-open by the first.
+    assert_eq!(
+        response_body(&planes, 2, "browser.launch", json!({})).await,
+        refusal
+    );
+}

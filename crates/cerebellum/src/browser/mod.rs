@@ -3388,6 +3388,24 @@ fn browser_launch_result_schema() -> Value {
             "launch_cancelled",
             "cleanup_failure",
             "invalid_request",
+            // Refusals from profile custody and preparation, rendered by
+            // `BrowserLaunchOutcome::as_json` or by the launch service while it
+            // opens profile storage. Each carries a reason or remedy the caller
+            // needs; left undeclared, the reply boundary replaced them with a
+            // schema violation that told the caller nothing.
+            "profile_busy",
+            "profile_grant_required",
+            "profile_registry_untrusted_root",
+            "profile_storage_unavailable",
+            "custody_locks_unavailable",
+            // Refusals from the executable identity check and the platform
+            // launcher, before and after the browser process is spawned.
+            "identity_unverifiable",
+            "executable_identity_mismatch",
+            "launch_refused",
+            // The browser exited or went silent before its handshake, and this
+            // layer cannot tell why.
+            "profile_startup_indeterminate",
         ],
         json!({
             "browser_session_id":string_schema(),
@@ -3399,8 +3417,52 @@ fn browser_launch_result_schema() -> Value {
             "lease":browser_lease_result_schema(),
             "stage":string_schema(),
             "reason_code":string_schema(),
+            // The custody holder currently owning the profile. Minted by the
+            // custody lock, never a profile UUID or path.
+            "holder_id":string_schema(),
+            "rollback":enum_schema(&["rollback_opened"]),
+            "pipe":enum_schema(&["command", "response", "cdp"]),
+            "claim_kind":enum_schema(&["code_signed", "image_digest"]),
+            "expected_identity":string_schema(),
+            "observed_identity":string_schema(),
+            "cause":startup_cause_schema(),
+            "ambiguity":startup_ambiguity_schema(),
+            "possible_reasons":startup_possible_reasons_schema(),
+            // When the browser failed to start AND finalizing its launch
+            // journal entry then failed too, the reply's stage names the
+            // journal step and `primary` preserves the startup failure.
+            "primary":closed_object(
+                json!({
+                    "outcome":enum_schema(&["profile_startup_indeterminate"]),
+                    "cause":startup_cause_schema(),
+                    "ambiguity":startup_ambiguity_schema(),
+                    "possible_reasons":startup_possible_reasons_schema(),
+                }),
+                &["outcome", "cause", "ambiguity", "possible_reasons"],
+            ),
         }),
     )
+}
+
+fn startup_cause_schema() -> Value {
+    enum_schema(&["child_exit", "pipe_closed", "deadline_expired"])
+}
+
+fn startup_ambiguity_schema() -> Value {
+    enum_schema(&["indeterminate_startup_failure"])
+}
+
+fn startup_possible_reasons_schema() -> Value {
+    json!({
+        "type":"array",
+        "items":enum_schema(&[
+            "external_profile_holder",
+            "profile_unopenable_or_corrupt",
+            "browser_startup_failure",
+            "invalid_browser_invocation",
+            "platform_or_sandbox_denial",
+        ]),
+    })
 }
 
 fn browser_status_result_schema() -> Value {
