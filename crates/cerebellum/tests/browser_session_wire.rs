@@ -1513,7 +1513,10 @@ async fn poisoned_profile_registry_lock_launch_refusal_reaches_the_caller_not_a_
 }
 
 /// A launcher refusing the way production does when the profile registry no
-/// longer trusts its managed root -- the refusal a real launch received.
+/// longer trusts its managed root. The live refusal that motivated this test
+/// was a root pinned by a device number a reboot had moved; under the
+/// fact-based identity that registry now refuses as predating the stored
+/// facts, which is the refusal the next real launch on it receives.
 struct UntrustedRootLauncher;
 
 impl BrowserSessionLauncher for UntrustedRootLauncher {
@@ -1525,7 +1528,7 @@ impl BrowserSessionLauncher for UntrustedRootLauncher {
         Err(
             cerebellum::browser_launch::BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
                 reason:
-                    cerebellum::profile::UntrustworthyRegistryReason::ManagedRootIdentityChanged,
+                    cerebellum::profile::UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
             }
             .as_json(),
         )
@@ -1550,7 +1553,7 @@ async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_v
         "{refusal}"
     );
     assert_eq!(
-        refusal["reason_code"], "profile_registry_managed_root_identity_changed",
+        refusal["reason_code"], "profile_registry_managed_root_identity_predates_facts",
         "{refusal}"
     );
     assert!(
