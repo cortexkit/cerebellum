@@ -3159,7 +3159,9 @@ mod tests {
         // Each fixture breaks exactly one step, and the expected facts are
         // written out rather than derived, so a neighbouring variant, a
         // generic reason, or no reason at all each fail a different case.
-        let cases: Vec<(Vec<Value>, Option<(u64, &str)>, Unavailable, Value)> = vec![
+        // (DOM answers, classification context, expected reason, its facts)
+        type Case<'a> = (Vec<Value>, Option<(u64, &'a str)>, Unavailable, Value);
+        let cases: Vec<Case> = vec![
             (vec![], None, Unavailable::NotCaptured, json!({})),
             (
                 vec![],
