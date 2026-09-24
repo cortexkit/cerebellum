@@ -34,6 +34,13 @@ impl HolderId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A holder named by a durable record rather than freshly minted. Startup
+    /// recovery re-takes a claim under the holder its launch journal recorded,
+    /// so a later recovery can still prove that the claim is the one it owns.
+    pub(crate) fn from_recorded(holder_id: impl Into<String>) -> Self {
+        Self(holder_id.into())
+    }
 }
 
 impl fmt::Debug for HolderId {

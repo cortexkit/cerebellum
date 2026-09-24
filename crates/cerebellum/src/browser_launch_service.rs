@@ -47,9 +47,10 @@ use crate::profile::{
 #[cfg(target_os = "linux")]
 use crate::profile_custody::SupervisorLiveness;
 use crate::profile_custody::{
-    current_supervisor_generation, FilesystemProfileCustodyJournal, KernelSupervisorLiveness,
-    ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
-    ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
+    current_supervisor_generation, FilesystemProfileCustodyJournal, HolderId,
+    KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyEvent,
+    ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLocks,
+    ProfileCustodyRelease, SupervisorGeneration, SupervisorLivenessProbe,
 };
 use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 
@@ -1042,23 +1043,93 @@ impl OrphanProfileCustody for ProductionOrphanProfileCustody {
         intent: &crate::browser_launch::AuthorizedLaunchIntent,
     ) -> Result<(), OrphanProfileCustodyFailure> {
         let root = browser_data_root().map_err(|_| OrphanProfileCustodyFailure)?;
-        release_orphan_profile_custody_at(&root, intent).map_err(|_| OrphanProfileCustodyFailure)
+        let supervisor =
+            current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
+        release_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
+            .map_err(|_| OrphanProfileCustodyFailure)
+    }
+
+    fn retain(
+        &mut self,
+        intent: &crate::browser_launch::AuthorizedLaunchIntent,
+    ) -> Result<(), OrphanProfileCustodyFailure> {
+        let root = browser_data_root().map_err(|_| OrphanProfileCustodyFailure)?;
+        let supervisor =
+            current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
+        retain_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
+            .map_err(|_| OrphanProfileCustodyFailure)
     }
 }
 
-fn release_orphan_profile_custody_at(
+fn release_orphan_profile_custody_at<P: SupervisorLivenessProbe>(
     root: &Path,
     intent: &crate::browser_launch::AuthorizedLaunchIntent,
+    supervisor: SupervisorGeneration,
+    liveness: P,
 ) -> Result<(), ()> {
-    let supervisor = current_supervisor_generation().map_err(|_| ())?;
+    let (mut locks, key) = orphan_profile_custody_locks(root, intent, supervisor, liveness)?;
+    let temporary_holder = locks.mint_holder().map_err(|_| ())?;
+    let claim = match locks.acquire(key, temporary_holder).map_err(|_| ())? {
+        ProfileCustodyAcquisition::Acquired(claim) => claim,
+        ProfileCustodyAcquisition::ProfileBusy { .. } => return Err(()),
+    };
+    match locks.release_exact(&claim).map_err(|_| ())? {
+        ProfileCustodyRelease::Released => Ok(()),
+        ProfileCustodyRelease::HolderMismatch { .. } | ProfileCustodyRelease::Missing => Err(()),
+    }
+}
+
+/// Re-take an orphaned launch's profile claim under this process, keeping the
+/// holder its launch journal recorded.
+///
+/// The claim a crashed module left behind names a supervisor that is no longer
+/// running, and a fresh launch breaks such a claim as stale. Re-taking it under
+/// the running supervisor makes launches see the profile as busy instead. The
+/// holder is kept, not minted, because the next start's recovery may break a
+/// stale claim only when it names the holder the launch journal recorded.
+fn retain_orphan_profile_custody_at<P: SupervisorLivenessProbe>(
+    root: &Path,
+    intent: &crate::browser_launch::AuthorizedLaunchIntent,
+    supervisor: SupervisorGeneration,
+    liveness: P,
+) -> Result<(), ()> {
+    let (mut locks, key) = orphan_profile_custody_locks(root, intent, supervisor, liveness)?;
+    let recorded_holder = HolderId::from_recorded(intent.holder_id.clone());
+    match locks.acquire(key, recorded_holder).map_err(|_| ())? {
+        // The claim is deliberately not released: its lock file is the refusal.
+        ProfileCustodyAcquisition::Acquired(_claim) => Ok(()),
+        // Already held by a running supervisor under the recorded holder, so
+        // the profile is refused already.
+        ProfileCustodyAcquisition::ProfileBusy { holder_id }
+            if holder_id.as_str() == intent.holder_id =>
+        {
+            Ok(())
+        }
+        ProfileCustodyAcquisition::ProfileBusy { .. } => Err(()),
+    }
+}
+
+/// Open the custody locks as `supervisor`, with a journal that lets a stale
+/// claim be broken only when it names the holder `intent` recorded.
+fn orphan_profile_custody_locks<P: SupervisorLivenessProbe>(
+    root: &Path,
+    intent: &crate::browser_launch::AuthorizedLaunchIntent,
+    supervisor: SupervisorGeneration,
+    liveness: P,
+) -> Result<
+    (
+        ProfileCustodyLocks<ExactRecoveryCustodyJournal, P>,
+        ProfileCustodyKey,
+    ),
+    (),
+> {
     let durable = FilesystemProfileCustodyJournal::open(root.join(PROFILE_CUSTODY_DIRECTORY))
         .map_err(|_| ())?;
     let journal = ExactRecoveryCustodyJournal {
         durable,
         expected_holder_id: intent.holder_id.clone(),
     };
-    let mut locks = ProfileCustodyLocks::open(root, supervisor, journal, KernelSupervisorLiveness)
-        .map_err(|_| ())?;
+    let locks = ProfileCustodyLocks::open(root, supervisor, journal, liveness).map_err(|_| ())?;
     let key = match intent.profile.disposition {
         LaunchProfile::Registry(ProfileDisposition::Durable) => {
             ProfileCustodyKey::durable(&intent.route.agent_project_id)
@@ -1077,15 +1148,7 @@ fn release_orphan_profile_custody_at(
             return Err(())
         }
     };
-    let temporary_holder = locks.mint_holder().map_err(|_| ())?;
-    let claim = match locks.acquire(key, temporary_holder).map_err(|_| ())? {
-        ProfileCustodyAcquisition::Acquired(claim) => claim,
-        ProfileCustodyAcquisition::ProfileBusy { .. } => return Err(()),
-    };
-    match locks.release_exact(&claim).map_err(|_| ())? {
-        ProfileCustodyRelease::Released => Ok(()),
-        ProfileCustodyRelease::HolderMismatch { .. } | ProfileCustodyRelease::Missing => Err(()),
-    }
+    Ok((locks, key))
 }
 
 pub struct ReadyProductionBrowser {
@@ -2478,9 +2541,118 @@ mod orphan_recovery_tests {
         let intent = installed_durable_claim(&root.0);
         assert_eq!(lock_count(&root.0), 1);
 
-        let result = release_orphan_profile_custody_at(&root.0, &intent);
+        let result = release_orphan_profile_custody_at(
+            &root.0,
+            &intent,
+            current_supervisor_generation().expect("current supervisor"),
+            KernelSupervisorLiveness,
+        );
 
         assert_eq!(result, Ok(()));
+        assert_eq!(lock_count(&root.0), 0);
+    }
+
+    /// Drive the custody acquisition a real launch performs: the same
+    /// filesystem locks `ProductionLaunchService::launch` opens, through
+    /// `ProfileBoundLaunch::acquire_and_prepare`, on the profile `intent` names.
+    fn launch_on_intent_profile(
+        root: &Path,
+        attempt: &str,
+    ) -> Result<crate::browser_launch::HeldPreparedProfile, BrowserLaunchOutcome> {
+        let mut lifecycle = crate::profile::ProfileLifecycle::open_with_config(
+            root,
+            crate::profile::RegistryConfig {
+                uuid_protocol_compatible: true,
+                grant_verifier_available: true,
+                sealing_available: true,
+                ..crate::profile::RegistryConfig::default()
+            },
+        )
+        .expect("open profile registry");
+        let mut locks = ProfileCustodyLocks::open_filesystem(root).expect("open custody locks");
+        let context = crate::profile::stamped_bind_context(crate::profile::BindFacts {
+            principal: "direct:agent".into(),
+            conversation_key: "conversation-2".into(),
+            agent_project_id: "project-1".into(),
+            session_kind: Some("primary".into()),
+            session_kind_attested: true,
+            profile_disposition: Some("durable".into()),
+            effective_capability_scope: Some(vec!["browser.launch".into()]),
+            provenance: "daemon_attested_spec_a".into(),
+        })
+        .expect("stamp bind context");
+        let invocation = InvocationToken::for_test(attempt);
+        let reservation =
+            JournalReservationHandle::for_test(&invocation, format!("reservation-{attempt}"));
+        ProfileBoundLaunch::new(&mut lifecycle, &mut locks).acquire_and_prepare(
+            ProfileCustodyKey::durable("project-1"),
+            &invocation,
+            &reservation,
+            &context,
+        )
+    }
+
+    /// A claim left by a module that has exited is stale, and a launch breaks
+    /// it. This is why recovery must re-take, not merely keep, the claim of a
+    /// browser it could not stop.
+    #[test]
+    fn a_launch_breaks_an_orphaned_claim_that_recovery_did_not_retain() {
+        let root = TestRoot::new("unretained");
+        installed_durable_claim(&root.0);
+
+        assert!(launch_on_intent_profile(&root.0, "fresh").is_ok());
+    }
+
+    /// Recovery that could not prove a browser gone retains its profile, and
+    /// the launch path then refuses that profile as busy under the recorded
+    /// holder. The next start, once this process has exited, can still break
+    /// and release that claim because it names the recorded holder.
+    #[test]
+    fn a_retained_orphan_claim_refuses_launches_until_a_later_start_releases_it() {
+        let root = TestRoot::new("retained");
+        let intent = installed_durable_claim(&root.0);
+        let this_process = current_supervisor_generation().expect("current supervisor");
+
+        assert_eq!(
+            retain_orphan_profile_custody_at(
+                &root.0,
+                &intent,
+                this_process,
+                KernelSupervisorLiveness
+            ),
+            Ok(())
+        );
+        assert_eq!(lock_count(&root.0), 1);
+        // Retaining twice in one process is idempotent.
+        assert_eq!(
+            retain_orphan_profile_custody_at(
+                &root.0,
+                &intent,
+                this_process,
+                KernelSupervisorLiveness
+            ),
+            Ok(())
+        );
+
+        match launch_on_intent_profile(&root.0, "contender") {
+            Err(BrowserLaunchOutcome::ProfileBusy { holder_id }) => {
+                assert_eq!(holder_id.as_str(), intent.holder_id);
+            }
+            Err(other) => panic!("expected profile_busy, got {other:?}"),
+            Ok(_) => panic!("a launch opened a profile whose browser may still be running"),
+        }
+        assert_eq!(lock_count(&root.0), 1);
+
+        // The next start runs in a new process, so this one reads as gone.
+        let next_process = SupervisorGeneration {
+            pid: u32::MAX - 1,
+            start_time: 19,
+            boot_id: None,
+        };
+        assert_eq!(
+            release_orphan_profile_custody_at(&root.0, &intent, next_process, NoLiveSupervisor),
+            Ok(())
+        );
         assert_eq!(lock_count(&root.0), 0);
     }
 
@@ -2491,7 +2663,199 @@ mod orphan_recovery_tests {
         intent.holder_id = "holder-from-another-attempt".to_string();
         assert_eq!(lock_count(&root.0), 1);
 
-        let result = release_orphan_profile_custody_at(&root.0, &intent);
+        let result = release_orphan_profile_custody_at(
+            &root.0,
+            &intent,
+            current_supervisor_generation().expect("current supervisor"),
+            KernelSupervisorLiveness,
+        );
+
+        assert_eq!(result, Err(()));
+        assert_eq!(lock_count(&root.0), 1);
+    }
+
+    /// Production custody over a test root, as a chosen supervisor.
+    struct RootCustody<P> {
+        root: PathBuf,
+        supervisor: SupervisorGeneration,
+        liveness: P,
+    }
+
+    impl<P: SupervisorLivenessProbe + Copy> OrphanProfileCustody for RootCustody<P> {
+        fn release(
+            &mut self,
+            intent: &AuthorizedLaunchIntent,
+        ) -> Result<(), OrphanProfileCustodyFailure> {
+            release_orphan_profile_custody_at(&self.root, intent, self.supervisor, self.liveness)
+                .map_err(|_| OrphanProfileCustodyFailure)
+        }
+
+        fn retain(
+            &mut self,
+            intent: &AuthorizedLaunchIntent,
+        ) -> Result<(), OrphanProfileCustodyFailure> {
+            retain_orphan_profile_custody_at(&self.root, intent, self.supervisor, self.liveness)
+                .map_err(|_| OrphanProfileCustodyFailure)
+        }
+    }
+
+    /// An orphan that is running under its recorded generation, and whose
+    /// kill works only when told to.
+    struct LiveOrphan {
+        kill_succeeds: bool,
+    }
+
+    impl OrphanBrowserProcessControl for LiveOrphan {
+        fn observed_start_time_micros(
+            &mut self,
+            _pid: u32,
+        ) -> Result<Option<u64>, OrphanProcessControlFailure> {
+            Ok(Some(ORPHAN_START_TIME))
+        }
+
+        fn terminate_and_reap(
+            &mut self,
+            _generation: BrowserProcessGeneration,
+        ) -> Result<(), OrphanProcessControlFailure> {
+            if self.kill_succeeds {
+                Ok(())
+            } else {
+                Err(OrphanProcessControlFailure)
+            }
+        }
+    }
+
+    const ORPHAN_START_TIME: u64 = 7;
+
+    /// Journal `intent` as a launch that reached release, with an attestation
+    /// recovery trusts.
+    fn dispatched_launch_journal(
+        intent: &AuthorizedLaunchIntent,
+    ) -> cerebellum_core::journal::InMemoryJournalStorage {
+        use crate::browser_launch::{
+            ExecutableIdentityChain, ExecutableIdentityCheckpoints, ExecutableIdentityClaim,
+            ExecutableIdentityRecord, LaunchGenerationRecord, LaunchJournalPort,
+        };
+        let storage = cerebellum_core::journal::InMemoryJournalStorage::new();
+        let mut journal = DurableLaunchJournal::open(launch_journal_config(), storage.clone())
+            .expect("open launch journal");
+        let mut handle = journal.record_intent(intent).expect("record intent");
+        let generation = LaunchGenerationRecord {
+            intent: intent.clone(),
+            process_generation: BrowserProcessGeneration {
+                pid: 4242,
+                start_time_micros: ORPHAN_START_TIME,
+                boot_id: None,
+            },
+        };
+        journal
+            .record_generation(&mut handle, &generation)
+            .expect("record generation");
+        let claim = ExecutableIdentityClaim::CodeSigned {
+            signing_identifier: "com.example.browser".to_string(),
+            unique_code_hash: "abc123".to_string(),
+        };
+        journal
+            .commit_attestation(
+                &mut handle,
+                &LaunchAttestationRecord {
+                    generation,
+                    observed_executable_identity: claim.clone(),
+                    executable_identity_chain: ExecutableIdentityChain::NoWalkPerformed {
+                        attestation: ExecutableIdentityRecord { claim, path: None },
+                    },
+                    executable_identity_checkpoints:
+                        ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
+                },
+            )
+            .expect("commit attestation");
+        storage
+    }
+
+    /// The whole cycle through `recover_browser_launches` and production
+    /// custody: a browser whose kill fails keeps its profile refused to the
+    /// real launch path's acquisition, and the next start, whose kill works,
+    /// releases it so a launch succeeds again.
+    #[test]
+    fn a_browser_recovery_could_not_stop_keeps_its_profile_refused_until_a_later_start() {
+        let root = TestRoot::new("recovery-cycle");
+        let intent = installed_durable_claim(&root.0);
+        let storage = dispatched_launch_journal(&intent);
+
+        let mut journal = DurableLaunchJournal::open(launch_journal_config(), storage.clone())
+            .expect("reopen launch journal");
+        let mut custody = RootCustody {
+            root: root.0.clone(),
+            supervisor: current_supervisor_generation().expect("current supervisor"),
+            liveness: KernelSupervisorLiveness,
+        };
+        let outcomes = recover_browser_launches(
+            &mut journal,
+            &mut LiveOrphan {
+                kill_succeeds: false,
+            },
+            &mut custody,
+        )
+        .expect("a browser that survived its kill refuses only its own profile");
+        assert_eq!(
+            outcomes[0].process,
+            crate::browser_launch::RecoveredBrowserProcess::TerminationFailed
+        );
+        assert_eq!(outcomes[0].journal_action, None);
+        drop(journal);
+
+        match launch_on_intent_profile(&root.0, "contender") {
+            Err(BrowserLaunchOutcome::ProfileBusy { holder_id }) => {
+                assert_eq!(holder_id.as_str(), intent.holder_id);
+            }
+            Err(other) => panic!("expected profile_busy, got {other:?}"),
+            Ok(_) => panic!("a launch opened a profile whose browser may still be running"),
+        }
+
+        // The next start runs in a new process, so this one reads as gone.
+        let mut journal = DurableLaunchJournal::open(launch_journal_config(), storage)
+            .expect("reopen launch journal at the next start");
+        let mut custody = RootCustody {
+            root: root.0.clone(),
+            supervisor: SupervisorGeneration {
+                pid: u32::MAX - 1,
+                start_time: 19,
+                boot_id: None,
+            },
+            liveness: NoLiveSupervisor,
+        };
+        let outcomes = recover_browser_launches(
+            &mut journal,
+            &mut LiveOrphan {
+                kill_succeeds: true,
+            },
+            &mut custody,
+        )
+        .expect("the retried recovery succeeds");
+        assert_eq!(
+            outcomes[0].process,
+            crate::browser_launch::RecoveredBrowserProcess::TerminatedAndReaped
+        );
+        assert!(outcomes[0].journal_action.is_some());
+        assert_eq!(lock_count(&root.0), 0);
+        assert!(launch_on_intent_profile(&root.0, "after-recovery").is_ok());
+    }
+
+    /// Retention re-takes only the claim the launch journal recorded; a claim
+    /// installed by another attempt is not adopted, and the failure is
+    /// reported so recovery can refuse every launch instead.
+    #[test]
+    fn startup_recovery_never_retains_a_different_profile_holder() {
+        let root = TestRoot::new("retain-different-holder");
+        let mut intent = installed_durable_claim(&root.0);
+        intent.holder_id = "holder-from-another-attempt".to_string();
+
+        let result = retain_orphan_profile_custody_at(
+            &root.0,
+            &intent,
+            current_supervisor_generation().expect("current supervisor"),
+            KernelSupervisorLiveness,
+        );
 
         assert_eq!(result, Err(()));
         assert_eq!(lock_count(&root.0), 1);
@@ -2780,20 +3144,18 @@ mod launch_refusal_schema_tests {
         let failures = [
             BrowserLaunchRecoveryFailure::JournalOpen,
             BrowserLaunchRecoveryFailure::JournalRead { sequence: 7 },
-            BrowserLaunchRecoveryFailure::ProcessObservation { sequence: 7 },
-            BrowserLaunchRecoveryFailure::ProcessTermination { sequence: 7 },
             BrowserLaunchRecoveryFailure::JournalTerminalization,
             BrowserLaunchRecoveryFailure::ProfileCustodyRelease { sequence: 7 },
+            BrowserLaunchRecoveryFailure::ProfileCustodyRetain { sequence: 7 },
             BrowserLaunchRecoveryFailure::InvalidIntent { sequence: 7 },
         ];
         for failure in failures {
             match failure {
                 BrowserLaunchRecoveryFailure::JournalOpen
                 | BrowserLaunchRecoveryFailure::JournalRead { .. }
-                | BrowserLaunchRecoveryFailure::ProcessObservation { .. }
-                | BrowserLaunchRecoveryFailure::ProcessTermination { .. }
                 | BrowserLaunchRecoveryFailure::JournalTerminalization
                 | BrowserLaunchRecoveryFailure::ProfileCustodyRelease { .. }
+                | BrowserLaunchRecoveryFailure::ProfileCustodyRetain { .. }
                 | BrowserLaunchRecoveryFailure::InvalidIntent { .. } => {}
             }
             assert_declared(&launch_recovery_refusal(failure));

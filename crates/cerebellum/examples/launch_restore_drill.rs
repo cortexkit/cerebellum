@@ -92,17 +92,19 @@ impl OrphanBrowserProcessControl for ObserveOnly {
         generation: BrowserProcessGeneration,
     ) -> Result<(), OrphanProcessControlFailure> {
         self.would_terminate.push(generation);
-        // Refusing here makes production's own bookkeeping report the
-        // sequence as a termination failure, which is the drill's signal that
-        // a live match existed -- without a signal ever being sent.
+        // Refusing termination makes production recovery report a
+        // termination failure, which this drill uses to show that a matching
+        // live process exists, without sending it a signal. Recovery then
+        // leaves the record active and retains its custody.
         Err(OrphanProcessControlFailure)
     }
 }
 
-/// Custody release is a filesystem edit under the restored root; the drill
-/// reports it rather than performing it, for the same reason as above.
+/// Releasing or retaining custody edits files under the restored root, so the
+/// drill records those actions without modifying the restored tree.
 struct ReportOnlyCustody {
     releases: Vec<String>,
+    retains: Vec<String>,
 }
 
 impl OrphanProfileCustody for ReportOnlyCustody {
@@ -111,6 +113,14 @@ impl OrphanProfileCustody for ReportOnlyCustody {
         intent: &AuthorizedLaunchIntent,
     ) -> Result<(), OrphanProfileCustodyFailure> {
         self.releases.push(intent.launch_attempt_id.clone());
+        Ok(())
+    }
+
+    fn retain(
+        &mut self,
+        intent: &AuthorizedLaunchIntent,
+    ) -> Result<(), OrphanProfileCustodyFailure> {
+        self.retains.push(intent.launch_attempt_id.clone());
         Ok(())
     }
 }
@@ -268,6 +278,7 @@ fn main() -> ExitCode {
     };
     let mut custody = ReportOnlyCustody {
         releases: Vec::new(),
+        retains: Vec::new(),
     };
     let recovery = recover_browser_launches(&mut journal, &mut process, &mut custody);
     for generation in &process.would_terminate {
@@ -291,22 +302,24 @@ fn main() -> ExitCode {
                 );
             }
             println!(
-                "recovery: {} active attempt(s) settled; {} custody release(s) reported",
+                "recovery: {} active attempt(s) examined; {} custody release(s) and {} retention(s) reported",
                 outcomes.len(),
-                custody.releases.len()
+                custody.releases.len(),
+                custody.retains.len()
             );
+            if !process.would_terminate.is_empty() {
+                // The observe-only control refuses termination on purpose, so
+                // those attempts are left active with custody retained; that
+                // IS the report that a live match existed.
+                println!(
+                    "recovery: {} attestation(s) matched a live process and were NOT signalled by this drill \
+                     (production would terminate them)",
+                    process.would_terminate.len()
+                );
+            }
         }
         Err(failure) => {
-            if process.would_terminate.is_empty() {
-                return fail("3", format!("recovery failed: {failure:?}"));
-            }
-            // The observe-only control refuses termination on purpose; the
-            // failure IS the report that a live match existed.
-            println!(
-                "recovery: {} attestation(s) matched a live process and were NOT signalled by this drill \
-                 (production would terminate them): {failure:?}",
-                process.would_terminate.len()
-            );
+            return fail("3", format!("recovery failed: {failure:?}"));
         }
     }
     println!("all three arms held");
