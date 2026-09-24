@@ -1078,6 +1078,17 @@ async fn start_live_daemon_with_browser(
                 .join("cortexkit")
                 .join("run")
                 .join("logs"),
+        )
+        // Same reason, one file over: the terminal journal also defaults into
+        // the daemon's own run dir, where the live daemon appends every
+        // module exit and `ck module terminals` reads them. A fixture module
+        // that exits abnormally here must not land beside the real ones.
+        .with_terminal_journal_path(
+            home.join(".local")
+                .join("share")
+                .join("cortexkit")
+                .join("run")
+                .join("terminals.jsonl"),
         );
     let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
 
