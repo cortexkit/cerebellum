@@ -90,10 +90,11 @@ mod pattern {
     /// Measured on macOS 26 at 2x: the honoured capture decodes to exactly the
     /// requested rows (maximum error 0), because each point of the pattern is
     /// a uniform block and the framework's downscale averages identical
-    /// pixels. One is allowed for resampling that straddles a point boundary
-    /// on a display at another scale. The defects are nowhere near it: an
-    /// ignored rect is off by up to 127 rows, and the wrong space by the
-    /// window's vertical screen position.
+    /// pixels. One is allowed because the bottom edge row of a capture can
+    /// repeat the row above it (see `pattern_reference`), and for resampling
+    /// that straddles a point boundary on a display at another scale. The
+    /// defects are nowhere near it: an ignored rect is off by up to 127 rows,
+    /// and the wrong space by the window's vertical screen position.
     const TOLERANCE: usize = 1;
 
     const TIMEOUT: Duration = Duration::from_secs(10);
@@ -331,9 +332,9 @@ mod pattern {
     /// How the full capture renders each row's grey level, top to bottom.
     ///
     /// Decoding against the window's own full capture rather than against the
-    /// levels drawn, because the display's colour conversion maps drawn level
-    /// y to something other than y (measured: level 0 renders as 32). It maps
-    /// greys monotonically, and both captures pass through the same
+    /// levels drawn, because the display's colour conversion maps a drawn
+    /// level to a slightly different rendered one, and not by a fixed amount.
+    /// It maps greys monotonically, and both captures pass through the same
     /// conversion, so the full capture is the dictionary for the half.
     ///
     /// Grey rather than a colour per axis: a pattern with the column in red and
@@ -358,9 +359,18 @@ mod pattern {
 
     /// Read the reference out of a full capture, or say why it is not one.
     ///
-    /// Every row must render to a distinct level, strictly increasing, or the
-    /// pattern cannot name a row and nothing decoded from it would mean
-    /// anything.
+    /// Every row but the last must render to a distinct level, strictly
+    /// increasing, or the pattern cannot name a row and nothing decoded from it
+    /// would mean anything.
+    ///
+    /// The last row is exempt because the capture's bottom edge is not
+    /// reliable. Measured on macOS 26, in four runs of about fifteen: the
+    /// final output row repeated the one above it, or came out a level darker
+    /// than it, with levels 0..=255 and again with levels 32..=223, while every
+    /// other row decoded exactly. It is an edge effect of the resampling, not of the pattern.
+    /// Left in the dictionary, it only ever duplicates a level held by an
+    /// earlier row, and decoding takes the first row with the nearest level,
+    /// so it cannot capture a reading that belongs elsewhere.
     fn pattern_reference(full: &RawCapture) -> Result<Reference, String> {
         if full.width != SIDE || full.height != SIDE {
             return Err(format!(
@@ -369,7 +379,10 @@ mod pattern {
             ));
         }
         let rows: Vec<u8> = (0..SIDE).map(|y| row_value(full, y)).collect();
-        if let Some(at) = rows.windows(2).position(|pair| pair[0] >= pair[1]) {
+        if let Some(at) = rows[..SIDE - 1]
+            .windows(2)
+            .position(|pair| pair[0] >= pair[1])
+        {
             return Err(format!(
                 "row {at} renders as {} and row {} as {}, so they cannot be told apart",
                 rows[at],
