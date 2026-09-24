@@ -265,12 +265,6 @@ check_sibling_declaration() {
     echo "build against. Nothing has been produced." >&2
     exit 2
   fi
-  if [ -n "$(git -C "$sibling_dir" status --porcelain -- crates)" ]; then
-    echo "The $sibling_name crates have uncommitted changes." >&2
-    echo "A recorded hash does not describe what would be compiled, so the" >&2
-    echo "declaration cannot be honoured. Nothing has been produced." >&2
-    exit 2
-  fi
   while read -r declared_hash crate; do
     # Skip blanks and comments, so the declaration can explain what it holds.
     # A bare list of hashes reads as commit shas to everyone, which is exactly
@@ -278,6 +272,16 @@ check_sibling_declaration() {
     # refuse every release build it was asked to approve.
     case "$declared_hash" in ""|\#*) continue ;; esac
     [ -z "$crate" ] && continue
+    # Uncommitted edits are checked per declared crate, for the same reason
+    # the hashes are: an edit in a sibling crate this binary does not link
+    # cannot change what is compiled, and refusing over it (someone's work in
+    # progress elsewhere in the sibling) blocks every release until they commit.
+    if [ -n "$(git -C "$sibling_dir" status --porcelain -- "crates/$crate")" ]; then
+      echo "The $sibling_name crate $crate has uncommitted changes." >&2
+      echo "A recorded hash does not describe what would be compiled, so the" >&2
+      echo "declaration cannot be honoured. Nothing has been produced." >&2
+      exit 2
+    fi
     local actual_hash
     actual_hash="$(git -C "$sibling_dir" rev-parse "HEAD:crates/$crate")"
     if [ "$actual_hash" != "$declared_hash" ]; then
