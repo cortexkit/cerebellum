@@ -4799,6 +4799,9 @@ mod tests {
         let message = question["params"]["message"].as_str().unwrap();
         for disclosed in [
             "https://requested.example",
+            // A disclosed hazard mints the durable tier, so the question must
+            // state that tier's whole reach, not only the form kinds.
+            "It can also follow links that lead to other sites",
             "It can also submit sign-in forms and forms whose purpose it couldn't check.",
             "It can't submit payment forms.",
         ] {

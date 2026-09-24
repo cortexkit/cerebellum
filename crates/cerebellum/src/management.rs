@@ -359,9 +359,6 @@ impl ManagementPlane {
                 .max(severity_tier.unwrap_or(hazard_severity.tier)),
             ..hazard_severity
         };
-        // Only a tier the request actually raised needs its own sentence; a
-        // ceiling the hazards already imply is described by the hazard text.
-        let raised_tier = (severity.tier > hazard_severity.tier).then_some(severity.tier);
         let severity_value = browser_grant_severity_value(severity);
 
         if !can_relay_to_a_person {
@@ -395,7 +392,6 @@ impl ManagementPlane {
                 &authorized_origins,
                 &disclosed_hazards_wire,
                 severity,
-                raised_tier,
             ),
             deadline: PHONE_CONSENT_DEADLINE,
         };
@@ -872,11 +868,7 @@ fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
 /// phone. It states what the grant allows and, just as plainly, what it still
 /// refuses, because that is what the person is deciding. The structured
 /// `origins`, `hazards` and `severity_ceiling` beside it stay the exact scope.
-fn browser_grant_message(
-    origins: &[String],
-    hazards: &[String],
-    raised_tier: Option<u8>,
-) -> String {
+fn browser_grant_message(origins: &[String], hazards: &[String], ceiling_tier: u8) -> String {
     // Each hazard class unlocks submitting one kind of form. Listed in a fixed
     // order so the sentence does not change with the order a caller sent them.
     const FORM_KINDS: [(&str, &str); 3] = [
@@ -905,14 +897,17 @@ fn browser_grant_message(
             "and"
         )
     );
-    // A raised tier widens what counts as an ordinary click, so the person is
-    // told in words what they are approving beyond reading and browsing.
-    match raised_tier {
-        Some(MUTATE_DURABLE) => message.push_str(
+    // The sentence follows the ceiling the grant is minted at, whatever raised
+    // it. A disclosed hazard also lifts the ceiling to the durable tier, and
+    // that tier admits every lasting-change click, not only the one form kind
+    // the hazard names; describing only the form kind would ask the person to
+    // approve less than the grant allows.
+    match ceiling_tier {
+        MUTATE_DURABLE => message.push_str(
             " It can also follow links that lead to other sites and submit other forms, \
              which can make lasting changes such as posting, saving or sending something.",
         ),
-        Some(MUTATE_REVERSIBLE) => message
+        MUTATE_REVERSIBLE => message
             .push_str(" It can also make changes on those sites that can be undone afterwards."),
         _ => {}
     }
@@ -957,7 +952,6 @@ fn browser_grant_question(
     origins: &[String],
     hazards: &[String],
     severity: Severity,
-    raised_tier: Option<u8>,
 ) -> Value {
     let severity_value = browser_grant_severity_value(severity);
     json!({
@@ -965,7 +959,7 @@ fn browser_grant_question(
         "id": ask_id,
         "method": "elicitation/create",
         "params": {
-            "message": browser_grant_message(origins, hazards, raised_tier),
+            "message": browser_grant_message(origins, hazards, severity.tier),
             // These values are the exact scope that an affirmative answer mints.
             // Keeping them beside the prose lets a relay render structured scope
             // without translating or reconstructing the grant.
@@ -1326,7 +1320,9 @@ mod tests {
             question.body["params"]["message"],
             "Let this agent use its own browser on https://login.example and \
              https://pay.example? It can open and read pages there and click ordinary \
-             buttons and links. It can also submit sign-in forms and payment forms. \
+             buttons and links. It can also follow links that lead to other sites and \
+             submit other forms, which can make lasting changes such as posting, saving \
+             or sending something. It can also submit sign-in forms and payment forms. \
              It can't submit forms whose purpose it couldn't check."
         );
         // Answered from a phone, so its deadline is the phone one, not the
