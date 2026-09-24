@@ -988,39 +988,45 @@ where
 
     pub fn recover_active(&mut self) -> Vec<CoreRecoveryOutcome> {
         let sequences: Vec<u64> = self.state.reservations.keys().copied().collect();
-        let mut outcomes = Vec::new();
-        for sequence in sequences {
-            let Some(record) = self.state.reservations.get(&sequence).cloned() else {
-                continue;
-            };
-            let classification = if record.state == LifecycleState::Dispatched {
-                RecoveryClassification::ProvisionalDispatched
-            } else {
-                match record.marker {
-                    None => RecoveryClassification::UnmarkedOrphan,
-                    Some(ReservationMarker::Rejection(_)) | Some(ReservationMarker::Reduced(_)) => {
-                        RecoveryClassification::FailedRejection
-                    }
-                    Some(ReservationMarker::DispatchCommitment) => {
-                        RecoveryClassification::FailedCommitment
-                    }
+        sequences
+            .into_iter()
+            .filter_map(|sequence| self.recover_record(sequence))
+            .collect()
+    }
+
+    /// Terminalize exactly one active reservation, leaving every other active
+    /// reservation untouched.
+    ///
+    /// A plane whose recovery can fail for one record and succeed for another
+    /// needs this: a record whose external effect could not be settled must
+    /// stay active so the next start retries it, while its neighbours are
+    /// consumed. `None` means the sequence is not active or could not be
+    /// terminalized durably. Unlike `recover_one`, which recovers every active
+    /// record and reports one, this consumes only the named record.
+    pub fn recover_record(&mut self, sequence: u64) -> Option<CoreRecoveryOutcome> {
+        let record = self.state.reservations.get(&sequence).cloned()?;
+        let classification = if record.state == LifecycleState::Dispatched {
+            RecoveryClassification::ProvisionalDispatched
+        } else {
+            match record.marker {
+                None => RecoveryClassification::UnmarkedOrphan,
+                Some(ReservationMarker::Rejection(_)) | Some(ReservationMarker::Reduced(_)) => {
+                    RecoveryClassification::FailedRejection
                 }
-            };
-            let outcome = match classification {
-                RecoveryClassification::ProvisionalDispatched => {
-                    self.recover_dispatched(sequence, record)
+                Some(ReservationMarker::DispatchCommitment) => {
+                    RecoveryClassification::FailedCommitment
                 }
-                RecoveryClassification::FailedRejection => self.recover_rejection(sequence, record),
-                RecoveryClassification::UnmarkedOrphan
-                | RecoveryClassification::FailedCommitment => {
-                    self.cancel_recovery(sequence, record, classification)
-                }
-            };
-            if let Some(outcome) = outcome {
-                outcomes.push(outcome);
+            }
+        };
+        match classification {
+            RecoveryClassification::ProvisionalDispatched => {
+                self.recover_dispatched(sequence, record)
+            }
+            RecoveryClassification::FailedRejection => self.recover_rejection(sequence, record),
+            RecoveryClassification::UnmarkedOrphan | RecoveryClassification::FailedCommitment => {
+                self.cancel_recovery(sequence, record, classification)
             }
         }
-        outcomes
     }
 
     pub fn read_obligation_audit(
@@ -1709,5 +1715,47 @@ mod tests {
         let reopened =
             JournalBinding::new_without_policies(FixtureCodec, journal.config(), storage).unwrap();
         assert_eq!(reopened.terminal_transitions(0).unwrap().len(), 1);
+    }
+
+    /// Recovering one record must leave its active neighbours active, durably,
+    /// so a caller that could not settle a neighbour can retry it after a
+    /// restart.
+    #[test]
+    fn recover_record_consumes_only_the_named_record() {
+        let storage = InMemoryJournalStorage::new();
+        let mut journal = JournalBinding::new_without_policies(
+            FixtureCodec,
+            JournalConfig {
+                journal_retention_bytes: 1000,
+                journal_max_entry_bytes: 100,
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        let first = journal.reserve(identity(), vec![1]).unwrap();
+        let second = journal.reserve(identity(), vec![2]).unwrap();
+        let first = first.action_obligation_id;
+        let second = second.action_obligation_id;
+
+        let outcome = journal.recover_record(second).expect("recover second");
+        assert_eq!(outcome.action_obligation_id, second);
+        assert_eq!(outcome.recovery_action, RecoveryAction::Cancelled);
+        assert_eq!(journal.classify(second), None);
+        assert_eq!(
+            journal.classify(first),
+            Some(RecoveryClassification::UnmarkedOrphan)
+        );
+        assert_eq!(journal.recover_record(second), None, "already consumed");
+
+        let mut reopened =
+            JournalBinding::new_without_policies(FixtureCodec, journal.config(), storage).unwrap();
+        assert_eq!(
+            reopened.classify(first),
+            Some(RecoveryClassification::UnmarkedOrphan)
+        );
+        assert_eq!(reopened.classify(second), None);
+        let remaining = reopened.recover_active();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].action_obligation_id, first);
     }
 }
