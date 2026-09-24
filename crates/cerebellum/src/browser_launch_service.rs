@@ -110,6 +110,93 @@ pub struct ProductionLaunchService {
     config: BrowserConfig,
     journal: SharedLaunchJournal,
     startup_failure: Option<BrowserLaunchRecoveryFailure>,
+    profile_root: ProfileStateRoot,
+}
+
+/// Where a launch service keeps profile state: the profile registry, the
+/// custody locks a launch takes, and the custody startup recovery releases or
+/// re-takes for an orphaned browser.
+///
+/// That state follows the same `JournalPersistence` as the launch journal. The
+/// data home holds the operator's real, backed-up browser profiles and their
+/// custody locks, so a service built for a test must never resolve it: a launch
+/// through it would take real custody and write into the real registry.
+enum ProfileStateRoot {
+    /// The operator's data home, which production uses.
+    DataHome,
+    /// A private directory created for this service and removed with it.
+    Scratch(ScratchProfileRoot),
+    /// Isolation was asked for but the private directory could not be
+    /// created. Launches refuse at the data-root stage; falling back to the
+    /// data home would break the promise isolation makes.
+    ScratchUnavailable,
+}
+
+impl ProfileStateRoot {
+    fn for_persistence(persistence: crate::JournalPersistence) -> Self {
+        match persistence {
+            crate::JournalPersistence::Durable => Self::DataHome,
+            crate::JournalPersistence::Isolated => match ScratchProfileRoot::create() {
+                Ok(scratch) => Self::Scratch(scratch),
+                Err(_) => Self::ScratchUnavailable,
+            },
+        }
+    }
+
+    /// The directory to open the registry and custody locks in. Reports only
+    /// failure, like `browser_data_root`, so a path never reaches a refusal.
+    fn resolve(&self) -> Result<PathBuf, ()> {
+        match self {
+            Self::DataHome => browser_data_root(),
+            Self::Scratch(scratch) => Ok(scratch.path.clone()),
+            Self::ScratchUnavailable => Err(()),
+        }
+    }
+}
+
+/// A fresh directory under the per-user temporary directory, removed on drop.
+///
+/// Created with `create`, not `create_dir_all`, so a name that already exists
+/// is an error rather than a directory shared with someone else, and under the
+/// canonicalized temporary directory because the registry compares its root by
+/// real path (on macOS the temporary directory sits behind the `/var` symlink).
+struct ScratchProfileRoot {
+    path: PathBuf,
+}
+
+impl ScratchProfileRoot {
+    fn create() -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().canonicalize()?.join(format!(
+            "ck-cerebellum-isolated-profiles-{}-{nanos}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Owner-only, as profiles and their locks are wherever they live.
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ScratchProfileRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A launch's profile, opened in the registry and held in custody, with the
+/// rollback that gives both back.
+struct HeldLaunchProfile {
+    profile_directory: PathBuf,
+    holder_id: String,
+    profile_uuid: String,
+    arguments: Vec<OsString>,
+    rollback: SharedRollback,
 }
 
 impl ProductionLaunchService {
@@ -123,15 +210,18 @@ impl ProductionLaunchService {
     /// profile custody -- so an isolated service must not read the operator's
     /// journal: it gets one in memory, which starts empty and gives recovery
     /// nothing to act on.
+    ///
+    /// Profile state follows `persistence` too; see [`ProfileStateRoot`].
     pub fn open(config: BrowserConfig, persistence: crate::JournalPersistence) -> Self {
-        Self::open_with_recovery(config, |config| {
+        let profile_root = ProfileStateRoot::for_persistence(persistence);
+        Self::open_with_recovery(config, profile_root, |config, profile_root| {
             let mut startup_failure = None;
             let journal = match open_launch_journal(persistence) {
                 Ok(mut journal) => {
                     let mut process = ProductionOrphanProcessControl {
                         reap_deadline: Duration::from_millis(config.termination_grace_period_ms),
                     };
-                    let mut custody = ProductionOrphanProfileCustody;
+                    let mut custody = ProductionOrphanProfileCustody { root: profile_root };
                     if let Err(failure) =
                         recover_browser_launches(&mut journal, &mut process, &mut custody)
                     {
@@ -155,21 +245,43 @@ impl ProductionLaunchService {
         }
     }
 
-    fn open_with_recovery<F>(config: BrowserConfig, recover: F) -> Self
+    fn open_with_recovery<F>(config: BrowserConfig, profile_root: ProfileStateRoot, recover: F) -> Self
     where
         F: FnOnce(
             &BrowserConfig,
+            &ProfileStateRoot,
         ) -> (
             Option<ProductionLaunchJournal>,
             Option<BrowserLaunchRecoveryFailure>,
         ),
     {
-        let (journal, startup_failure) = recover(&config);
+        let (journal, startup_failure) = recover(&config, &profile_root);
         Self {
             config,
             journal: Arc::new(Mutex::new(journal)),
             startup_failure,
+            profile_root,
         }
+    }
+
+    /// Open the registry and take profile custody exactly as a launch does,
+    /// then give both back, without spawning a browser.
+    ///
+    /// Public so a test can prove where a service keeps profile state: a real
+    /// launch first needs a verified browser executable, which a test machine
+    /// may not have. Returns the profile directory the launch would have used.
+    #[doc(hidden)]
+    pub fn take_and_return_profile_custody(
+        &self,
+        accepted: &AcceptedBindFacts,
+        browser_session_id: &str,
+    ) -> Result<PathBuf, Value> {
+        let held = self.take_launch_profile(accepted, browser_session_id)?;
+        let mut rollback = held.rollback;
+        rollback
+            .after_reap()
+            .map_err(|_| json!({"outcome": "internal_failure", "stage": "custody_release"}))?;
+        Ok(held.profile_directory)
     }
 
     pub fn launch(
@@ -195,114 +307,13 @@ impl ProductionLaunchService {
         })?;
         let (expected_identity, pre_spawn_identity_verification) =
             verify_configured_executable(executable, expected)?;
-        let context =
-            stamped_context(accepted).map_err(|_| json!({"outcome": "authorization_denied"}))?;
-        if context.profile_disposition() == crate::profile::ProfileDisposition::None {
-            return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}));
-        }
-
-        // Three distinct failures follow, and a caller's next move differs for
-        // each: a data root that cannot be resolved is an environment problem,
-        // a registry that will not open is profile state, and custody locks
-        // that refuse are a supervisor-identity problem that has nothing to do
-        // with storage at all. They shared one reason code, so an operator was
-        // told to check a disk whichever one fired.
-        // browser_data_root reports only failure, so this stage cannot say more
-        // than which stage it was -- which is still the fact that was missing.
-        let lifecycle = production_profile_lifecycle()
-            .map_err(ProductionProfileLifecycleError::into_launch_refusal)?;
-        let root = lifecycle.registry().root().canonical_path().to_path_buf();
-        let lifecycle = Arc::new(Mutex::new(lifecycle));
-        let locks = Arc::new(Mutex::new(
-            // The lock error's Debug text is dropped: it names paths under the
-            // profile root and says nothing the stage does not.
-            ProfileCustodyLocks::open_filesystem(&root).map_err(
-                |_| json!({"outcome": "custody_locks_unavailable", "stage": "custody_locks"}),
-            )?,
-        ));
-        let invocation =
-            InvocationToken::from_trusted_invocation(format!("invocation-{browser_session_id}"));
-        let reservation = JournalReservationHandle::from_recorded_reservation(
-            &invocation,
-            format!("reservation-{browser_session_id}"),
-        );
-        let commitment = DispatchCommitmentToken::from_durable_commitment(
-            &invocation,
-            &reservation,
-            format!("commitment-{browser_session_id}"),
-        );
-        let key = match accepted.identity.profile_disposition {
-            ProfileDisposition::Durable => {
-                ProfileCustodyKey::durable(&accepted.identity.agent_project_id)
-            }
-            ProfileDisposition::Disposable => ProfileCustodyKey::disposable_route(
-                &accepted.identity.agent_project_id,
-                &accepted.identity.conversation_key,
-                browser_session_id,
-            ),
-            // Refused rather than asserted impossible. It is unreachable only
-            // because the check above reads a disposition that this same field
-            // produced, so the two agree by construction — an invariant held in
-            // another module's validator rather than here. A panic on a wire
-            // path takes the module loop down and every unrelated capability
-            // with it, which is a heavy price for a condition whose honest
-            // answer already exists one branch up.
-            ProfileDisposition::None => {
-                return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}))
-            }
-        };
-
-        let mut lifecycle_guard = map_poisoned_mutex(lifecycle.lock(), "profile_registry_lock")?;
-        let mut locks_guard = map_poisoned_mutex(locks.lock(), "custody_locks_lock")?;
-        let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard);
-        let prepared = bound
-            .acquire_and_prepare(key, &invocation, &reservation, &context)
-            .map_err(|outcome| outcome.as_json())?;
-        let opened = bound
-            .launch_prepared(prepared, &commitment)
-            .map_err(|outcome| outcome.as_json())?;
-        let profile_directory = opened.profile_directory().to_path_buf();
-        let holder_id = opened.holder_id().as_str().to_string();
-        let Some(profile_uuid) = lifecycle_guard
-            .current_open(&accepted.identity.conversation_key)
-            .profile_uuid
-        else {
-            let _ = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
-                .rollback_opened(opened);
-            return Err(json!({
-                "outcome": "internal_failure",
-                "stage": "profile_uuid_lookup",
-                "rollback": "rollback_opened",
-            }));
-        };
-
-        let crash_dumps_directory = profile_directory.join("crash-dumps");
-        let arguments = browser_launch_arguments(&profile_directory, &crash_dumps_directory);
-        if !crate::custody::arguments_are_quarantinable(
-            &arguments
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-        ) {
-            let _ = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
-                .rollback_opened(opened);
-            return Err(json!({
-                "outcome": "internal_failure",
-                "stage": "argument_quarantine",
-                "rollback": "rollback_opened",
-            }));
-        }
-
-        let rollback = SharedRollback::new(
-            Arc::clone(&lifecycle),
-            Arc::clone(&locks),
-            Box::new(move |lifecycle, locks| {
-                ProfileBoundLaunch::new(lifecycle, locks).rollback_opened(opened)
-            }),
-        );
-        drop(locks_guard);
-        drop(lifecycle_guard);
-
+        let HeldLaunchProfile {
+            profile_directory,
+            holder_id,
+            profile_uuid,
+            arguments,
+            rollback,
+        } = self.take_launch_profile(accepted, browser_session_id)?;
         let route = LaunchRouteIdentity {
             principal: accepted
                 .principal
@@ -400,6 +411,136 @@ impl ProductionLaunchService {
                 },
                 profile: rollback,
             }),
+        })
+    }
+
+    /// Open the registry and take custody of the profile a launch for
+    /// `accepted` uses, returning it with the rollback that gives both back.
+    ///
+    /// The launch path and [`Self::take_and_return_profile_custody`] share
+    /// this, so a test of where profile state lives tests the launch's own path.
+    fn take_launch_profile(
+        &self,
+        accepted: &AcceptedBindFacts,
+        browser_session_id: &str,
+    ) -> Result<HeldLaunchProfile, Value> {
+        let context =
+            stamped_context(accepted).map_err(|_| json!({"outcome": "authorization_denied"}))?;
+        if context.profile_disposition() == crate::profile::ProfileDisposition::None {
+            return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}));
+        }
+
+        // Three distinct failures follow, and a caller's next move differs for
+        // each: a data root that cannot be resolved is an environment problem,
+        // a registry that will not open is profile state, and custody locks
+        // that refuse are a supervisor-identity problem that has nothing to do
+        // with storage at all. They shared one reason code, so an operator was
+        // told to check a disk whichever one fired.
+        // The root reports only failure, so this stage cannot say more than
+        // which stage it was -- which is still the fact that was missing.
+        let lifecycle = self
+            .profile_root
+            .resolve()
+            .map_err(|()| ProductionProfileLifecycleError::DataRoot)
+            .and_then(profile_lifecycle_at)
+            .map_err(ProductionProfileLifecycleError::into_launch_refusal)?;
+        let root = lifecycle.registry().root().canonical_path().to_path_buf();
+        let lifecycle = Arc::new(Mutex::new(lifecycle));
+        let locks = Arc::new(Mutex::new(
+            // The lock error's Debug text is dropped: it names paths under the
+            // profile root and says nothing the stage does not.
+            ProfileCustodyLocks::open_filesystem(&root).map_err(
+                |_| json!({"outcome": "custody_locks_unavailable", "stage": "custody_locks"}),
+            )?,
+        ));
+        let invocation =
+            InvocationToken::from_trusted_invocation(format!("invocation-{browser_session_id}"));
+        let reservation = JournalReservationHandle::from_recorded_reservation(
+            &invocation,
+            format!("reservation-{browser_session_id}"),
+        );
+        let commitment = DispatchCommitmentToken::from_durable_commitment(
+            &invocation,
+            &reservation,
+            format!("commitment-{browser_session_id}"),
+        );
+        let key = match accepted.identity.profile_disposition {
+            ProfileDisposition::Durable => {
+                ProfileCustodyKey::durable(&accepted.identity.agent_project_id)
+            }
+            ProfileDisposition::Disposable => ProfileCustodyKey::disposable_route(
+                &accepted.identity.agent_project_id,
+                &accepted.identity.conversation_key,
+                browser_session_id,
+            ),
+            // Refused rather than asserted impossible. It is unreachable only
+            // because the check above reads a disposition that this same field
+            // produced, so the two agree by construction — an invariant held in
+            // another module's validator rather than here. A panic on a wire
+            // path takes the module loop down and every unrelated capability
+            // with it, which is a heavy price for a condition whose honest
+            // answer already exists one branch up.
+            ProfileDisposition::None => {
+                return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}))
+            }
+        };
+
+        let mut lifecycle_guard = map_poisoned_mutex(lifecycle.lock(), "profile_registry_lock")?;
+        let mut locks_guard = map_poisoned_mutex(locks.lock(), "custody_locks_lock")?;
+        let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard);
+        let prepared = bound
+            .acquire_and_prepare(key, &invocation, &reservation, &context)
+            .map_err(|outcome| outcome.as_json())?;
+        let opened = bound
+            .launch_prepared(prepared, &commitment)
+            .map_err(|outcome| outcome.as_json())?;
+        let profile_directory = opened.profile_directory().to_path_buf();
+        let holder_id = opened.holder_id().as_str().to_string();
+        let Some(profile_uuid) = lifecycle_guard
+            .current_open(&accepted.identity.conversation_key)
+            .profile_uuid
+        else {
+            let _ = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
+                .rollback_opened(opened);
+            return Err(json!({
+                "outcome": "internal_failure",
+                "stage": "profile_uuid_lookup",
+                "rollback": "rollback_opened",
+            }));
+        };
+
+        let crash_dumps_directory = profile_directory.join("crash-dumps");
+        let arguments = browser_launch_arguments(&profile_directory, &crash_dumps_directory);
+        if !crate::custody::arguments_are_quarantinable(
+            &arguments
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        ) {
+            let _ = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
+                .rollback_opened(opened);
+            return Err(json!({
+                "outcome": "internal_failure",
+                "stage": "argument_quarantine",
+                "rollback": "rollback_opened",
+            }));
+        }
+
+        let rollback = SharedRollback::new(
+            Arc::clone(&lifecycle),
+            Arc::clone(&locks),
+            Box::new(move |lifecycle, locks| {
+                ProfileBoundLaunch::new(lifecycle, locks).rollback_opened(opened)
+            }),
+        );
+        drop(locks_guard);
+        drop(lifecycle_guard);
+        Ok(HeldLaunchProfile {
+            profile_directory,
+            holder_id,
+            profile_uuid,
+            arguments,
+            rollback,
         })
     }
 }
@@ -1065,14 +1206,16 @@ impl ProfileCustodyJournal for ExactRecoveryCustodyJournal {
     }
 }
 
-struct ProductionOrphanProfileCustody;
+struct ProductionOrphanProfileCustody<'a> {
+    root: &'a ProfileStateRoot,
+}
 
-impl OrphanProfileCustody for ProductionOrphanProfileCustody {
+impl OrphanProfileCustody for ProductionOrphanProfileCustody<'_> {
     fn release(
         &mut self,
         intent: &crate::browser_launch::AuthorizedLaunchIntent,
     ) -> Result<(), OrphanProfileCustodyFailure> {
-        let root = browser_data_root().map_err(|_| OrphanProfileCustodyFailure)?;
+        let root = self.root.resolve().map_err(|_| OrphanProfileCustodyFailure)?;
         let supervisor =
             current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
         release_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
@@ -1083,7 +1226,7 @@ impl OrphanProfileCustody for ProductionOrphanProfileCustody {
         &mut self,
         intent: &crate::browser_launch::AuthorizedLaunchIntent,
     ) -> Result<(), OrphanProfileCustodyFailure> {
-        let root = browser_data_root().map_err(|_| OrphanProfileCustodyFailure)?;
+        let root = self.root.resolve().map_err(|_| OrphanProfileCustodyFailure)?;
         let supervisor =
             current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
         retain_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
@@ -1832,6 +1975,12 @@ fn production_registry_config() -> RegistryConfig {
 #[doc(hidden)]
 pub fn production_profile_lifecycle() -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
     let root = browser_data_root().map_err(|()| ProductionProfileLifecycleError::DataRoot)?;
+    profile_lifecycle_at(root)
+}
+
+/// The production registry configuration opened at `root`, which is the data
+/// home for production and a private directory for an isolated service.
+fn profile_lifecycle_at(root: PathBuf) -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
     ProfileLifecycle::open_with_config(root, production_registry_config())
         .map_err(ProductionProfileLifecycleError::Registry)
 }
@@ -2043,7 +2192,11 @@ mod executable_identity_launch_tests {
             browser_exit_observation_deadline_ms: 100,
             navigation_settle_deadline_ms: 1_000,
         };
-        let service = ProductionLaunchService::open_with_recovery(config, |_| (None, None));
+        let service = ProductionLaunchService::open_with_recovery(
+            config,
+            ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
+            |_, _| (None, None),
+        );
         let refusal = match service.launch(&accepted_facts(Path::new("/tmp")), "session-1") {
             Err(refusal) => refusal,
             Ok(_) => panic!("launch proceeded without a configured expected identity"),
@@ -2066,7 +2219,11 @@ mod executable_identity_launch_tests {
             browser_exit_observation_deadline_ms: 100,
             navigation_settle_deadline_ms: 1_000,
         };
-        let service = ProductionLaunchService::open_with_recovery(config, |_| (None, None));
+        let service = ProductionLaunchService::open_with_recovery(
+            config,
+            ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
+            |_, _| (None, None),
+        );
         let refusal = match service.launch(&accepted_facts(Path::new("/tmp")), "session-1") {
             Err(refusal) => refusal,
             Ok(_) => panic!("launch proceeded without an executable identity"),
@@ -2898,14 +3055,18 @@ mod orphan_recovery_tests {
         let (service_tx, service_rx) = std::sync::mpsc::channel();
 
         let worker = std::thread::spawn(move || {
-            let service = ProductionLaunchService::open_with_recovery(test_config(), |_| {
-                entered_tx.send(()).expect("announce recovery start");
-                release_rx.recv().expect("finish recovery");
-                (
-                    None,
-                    Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
-                )
-            });
+            let service = ProductionLaunchService::open_with_recovery(
+                test_config(),
+                ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
+                |_, _| {
+                    entered_tx.send(()).expect("announce recovery start");
+                    release_rx.recv().expect("finish recovery");
+                    (
+                        None,
+                        Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
+                    )
+                },
+            );
             service_tx.send(service).expect("publish recovered service");
         });
 
@@ -2927,12 +3088,16 @@ mod orphan_recovery_tests {
 
     #[test]
     fn failed_startup_recovery_has_an_exact_named_launch_refusal() {
-        let service = ProductionLaunchService::open_with_recovery(test_config(), |_| {
-            (
-                None,
-                Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
-            )
-        });
+        let service = ProductionLaunchService::open_with_recovery(
+            test_config(),
+            ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
+            |_, _| {
+                (
+                    None,
+                    Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
+                )
+            },
+        );
 
         assert_eq!(
             service.require_recovered_startup(),

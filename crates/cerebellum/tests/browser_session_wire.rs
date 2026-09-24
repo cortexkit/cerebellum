@@ -1574,7 +1574,9 @@ const ISOLATED_DATA_HOME_CHILD: &str = "CEREBELLUM_TEST_ISOLATED_DATA_HOME_CHILD
 /// `Isolated` is what a test passes to stay off the operator's audit data, so a
 /// journal it still opens on disk is a journal every test run touches: the
 /// launch journal also runs startup recovery, which may kill a browser and move
-/// profile custody recorded there. The check has to look at the disk, because
+/// profile custody recorded there. A launch also opens the profile registry and
+/// takes custody locks, which under the data home are the operator's real,
+/// backed-up profiles. The check has to look at the disk, because
 /// nothing inside the plane can tell that a file was opened where it should not
 /// have been.
 ///
@@ -1701,6 +1703,76 @@ fn build_an_isolated_plane_with_a_launcher() {
             planes.computer.as_ref().err()
         );
     });
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    take_profile_custody_through_an_isolated_launch_service(&data_home);
+}
+
+/// Open the profile registry and take custody through an isolated launch
+/// service, the way a launch does before it spawns a browser.
+///
+/// The plane's own launcher is never asked to launch here -- that needs a
+/// verified browser -- so without this the registry and custody locks would
+/// never be opened and an empty data home would prove nothing about them.
+/// The service is built directly because the plane holds it behind the
+/// launcher trait; `Planes` passes its persistence to this same constructor.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path::Path) {
+    use cerebellum_core::identity::{
+        AcceptedBindFacts, ProfileDisposition, RouteIdentity, RouteSurface, SessionKind,
+    };
+
+    let service = cerebellum::browser_launch_service::ProductionLaunchService::open(
+        cerebellum::browser_config::BrowserConfig {
+            executable_path: Some(std::env::current_exe().expect("the test binary is a file")),
+            expected_identity: Some("test.identity".into()),
+            launch_handshake_deadline_ms: 10_000,
+            termination_grace_period_ms: 1_000,
+            browser_idle_timeout_ms: 60_000,
+            browser_exit_observation_deadline_ms: 5_000,
+            navigation_settle_deadline_ms: 10_000,
+        },
+        cerebellum::JournalPersistence::Isolated,
+    );
+    let accepted = AcceptedBindFacts {
+        identity: RouteIdentity {
+            conversation_key: "isolated-conversation".to_string(),
+            agent_project_id: "isolated-project".to_string(),
+            session_kind: SessionKind::Primary,
+            // Durable, because a durable profile is the one the operator's
+            // real registry keeps, so it is the one that must not land there.
+            profile_disposition: ProfileDisposition::Durable,
+            project_root: std::path::PathBuf::from("/tmp"),
+        },
+        // The bind validator refuses an empty principal before the registry
+        // is opened.
+        principal: Some(subc_protocol::Principal::Direct),
+        agent_project_id_attested: true,
+        session_kind_attested: true,
+        control_operations: Vec::new(),
+        effective_capability_scope: None,
+        consumer_capabilities: Vec::new(),
+        surface: RouteSurface::Tools,
+    };
+    // It must succeed: a refusal before the registry opened would also leave
+    // the data home empty, and would pass the parent's check for nothing.
+    let profile_directory = service
+        .take_and_return_profile_custody(&accepted, "isolated-session")
+        .expect("an isolated service takes and returns profile custody");
+    assert!(
+        !profile_directory.starts_with(data_home),
+        "the isolated profile {} is under the data home {}",
+        profile_directory.display(),
+        data_home.display()
+    );
+    // The private root goes with the service, so a test run leaves no
+    // profiles behind in the temporary directory either.
+    drop(service);
+    assert!(
+        !profile_directory.exists(),
+        "the isolated profile {} outlived its service",
+        profile_directory.display()
+    );
 }
 
 fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
