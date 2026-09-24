@@ -737,9 +737,15 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
         wrong_origin["detail"]["reason"], "origin_scope",
         "{wrong_origin}"
     );
+    // Compared as a set: the list follows grant-id order, and minted grant ids
+    // come from a process-wide counter shared with every other test in this
+    // binary, so `...-9` and `...-10` can sort either way round.
+    let mut granted_origins: Vec<String> =
+        serde_json::from_value(wrong_origin["detail"]["granted_origins"].clone()).unwrap();
+    granted_origins.sort();
     assert_eq!(
-        wrong_origin["detail"]["granted_origins"],
-        json!(["https://other.example", "https://second-other.example"]),
+        granted_origins,
+        ["https://other.example", "https://second-other.example"],
         "the origin-scope refusal must name every severity-covering grant: {wrong_origin}"
     );
     assert!(
