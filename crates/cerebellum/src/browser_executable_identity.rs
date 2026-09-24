@@ -541,29 +541,15 @@ mod tests {
     /// depending on which slices this machine's system binaries happen to have.
     #[cfg(target_os = "macos")]
     fn fake_verifier(name: &str, script: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Under /tmp, not `std::env::temp_dir()`. On macOS 27 a newly written
-        // executable in the per-user temporary directory goes through system
-        // policy evaluation, and that can block the exec itself, before the
-        // verifier's deadline starts counting. Measured: a test using this
-        // fixture ran past 60 s against a 5 s deadline and failed as
-        // `verifier_timed_out`, and a codesign read of a file there never
-        // returned. `UnsignedExecutable` in browser_launch_service.rs uses
-        // /tmp for the same reason.
-        let directory = std::path::Path::new("/tmp").join(format!(
-            "cerebellum-fake-verifier-{name}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).expect("create fake verifier directory");
-        let verifier = directory.join("codesign");
-        std::fs::write(&verifier, script).expect("write fake verifier");
-        let mut permissions = std::fs::metadata(&verifier)
-            .expect("fake verifier metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&verifier, permissions).expect("make fake verifier executable");
-        verifier
+        // Keep this under /tmp: on macOS 27, system-policy evaluation of a
+        // newly written executable under the per-user $TMPDIR can block its
+        // exec before the verifier deadline starts counting.
+        crate::content_named_fixture::content_named_fixture(
+            name,
+            "codesign",
+            script.as_bytes(),
+            0o700,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -607,8 +593,6 @@ fi
                 ),
             }
         );
-        std::fs::remove_dir_all(verifier.parent().expect("fake verifier directory"))
-            .expect("remove fake verifier directory");
     }
 
     #[cfg(target_os = "macos")]
@@ -643,8 +627,6 @@ fi
 
         assert_eq!(refusal["outcome"], "identity_unverifiable");
         assert_eq!(refusal["reason"], "verifier_failed");
-        std::fs::remove_dir_all(verifier.parent().expect("fake verifier directory"))
-            .expect("remove fake verifier directory");
     }
 
     #[cfg(target_os = "macos")]
@@ -664,8 +646,6 @@ fi
 
         assert_eq!(refusal["outcome"], "identity_unverifiable");
         assert_eq!(refusal["reason"], "verifier_failed");
-        std::fs::remove_dir_all(verifier.parent().expect("fake verifier directory"))
-            .expect("remove fake verifier directory");
     }
 
     #[cfg(target_os = "macos")]

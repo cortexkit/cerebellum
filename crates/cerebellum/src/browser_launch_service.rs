@@ -2147,29 +2147,17 @@ mod executable_identity_launch_tests {
 
     impl UnsignedExecutable {
         fn new() -> Self {
-            // NOT under `std::env::temp_dir()`. Measured on macOS 27.0: these
-            // exact bytes under `$TMPDIR` make `codesign -d` never return,
-            // while the same bytes under `/tmp` answer instantly -- the
-            // system-policy evaluation that applies to the per-user temp
-            // directory does not apply here. Left in `$TMPDIR`, this fixture
-            // measured the host's `syspolicyd` instead of our refusal path, and
-            // it hung the whole suite indefinitely rather than failing.
-            let path = Path::new("/tmp").join(format!(
-                "ck-unsigned-browser-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos()
-            ));
-            std::fs::write(&path, b"not a signed executable").expect("write unsigned executable");
+            // Keep this under /tmp: on macOS 27, codesign can hang inspecting
+            // these bytes under the per-user $TMPDIR while /tmp returns promptly.
+            // Reusing the content-named file also avoids a new policy assessment
+            // on each test run.
+            let path = crate::content_named_fixture::content_named_fixture(
+                "unsigned-browser",
+                "browser",
+                b"not a signed executable",
+                0o600,
+            );
             Self(path)
-        }
-    }
-
-    impl Drop for UnsignedExecutable {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
         }
     }
 

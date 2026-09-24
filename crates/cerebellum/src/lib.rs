@@ -22,6 +22,8 @@ pub mod cdp;
 pub mod classification;
 pub mod computer_capability;
 pub mod connector_evidence;
+#[cfg(test)]
+mod content_named_fixture;
 pub mod coordinate;
 pub mod custody;
 pub mod elicit;
