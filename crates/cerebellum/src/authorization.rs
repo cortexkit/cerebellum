@@ -23,6 +23,9 @@ pub const MUTATE_REVERSIBLE: u8 = 3;
 pub const MUTATE_DURABLE: u8 = 4;
 pub const ACTUATE: u8 = 5;
 pub const MAX_ORIGINS: usize = 256;
+/// The highest ceiling `browser.open_grant` mints. Actuation is never granted
+/// to the browser, so a declared tier above this cannot be covered by asking.
+pub const MAX_GRANTABLE_TIER: u8 = MUTATE_DURABLE;
 
 /// Target facts a person must be told before a grant can cover the action.
 ///
@@ -573,24 +576,51 @@ impl GrantStore {
     ) -> Result<ActionGrant, AuthorizationError> {
         self.ensure_valid()?;
         required.validate()?;
-        let mut candidates = self
+        let mut conversation_grants = self
             .current
             .values()
-            .filter(|grant| {
-                grant.validate().is_ok()
-                    && grant.conversation_key == conversation_key
-                    && grant.severity.covers(required)
-            })
+            .filter(|grant| grant.validate().is_ok() && grant.conversation_key == conversation_key)
             .collect::<Vec<_>>();
-        candidates.sort_by(compare_grants);
+        conversation_grants.sort_by(compare_grants);
+        let candidates = conversation_grants
+            .iter()
+            .copied()
+            .filter(|grant| grant.severity.covers(required))
+            .collect::<Vec<_>>();
         if candidates.is_empty() {
             // An empty severity scope still names a target hazard when one is
             // known. This is the actionable fact the caller needs in order to
-            // re-ask a person.
+            // re-ask a person, and disclosing it mints a grant whose ceiling
+            // is high enough for any classified target.
             if let Some(missing) = required_hazards.iter().next().copied() {
                 return Err(AuthorizationError::HazardNotDisclosed(missing));
             }
-            return Err(AuthorizationError::NoGrant);
+            // Both refusals name the attempted origin and the required
+            // severity, so the one grant a caller opens from them covers this
+            // action. When the existing grants are wrong on origin as well as
+            // on severity, the severity refusal is the one reported: a grant
+            // opened for the attempted origin at the required severity fixes
+            // both at once, whereas reporting the origin first would send the
+            // caller to open a grant that is still too low.
+            let attempted_origin =
+                canonical_origin(attempted_origin).unwrap_or_else(|| attempted_origin.to_string());
+            if conversation_grants.is_empty() {
+                return Err(AuthorizationError::NoGrantForAction {
+                    attempted_origin,
+                    required,
+                });
+            }
+            let mut granted_ceilings = Vec::new();
+            for grant in &conversation_grants {
+                if !granted_ceilings.contains(&grant.severity) {
+                    granted_ceilings.push(grant.severity);
+                }
+            }
+            return Err(AuthorizationError::GrantSeverityInsufficient {
+                attempted_origin,
+                required,
+                granted_ceilings,
+            });
         }
 
         let Some(canonical_attempted) = canonical_origin(attempted_origin) else {
@@ -630,6 +660,11 @@ impl GrantStore {
         }) {
             return Err(AuthorizationError::HazardNotDisclosed(missing));
         }
+        // Not reachable: `scoped` is non-empty and no grant in it discloses
+        // every required hazard, so the required set is non-empty and the
+        // first scoped grant lacks at least one of them, which the fallback
+        // above returns. Kept as a refusal rather than a panic so a future
+        // change to the selection above fails closed.
         Err(AuthorizationError::NoGrant)
     }
 
@@ -991,7 +1026,26 @@ pub enum AuthorizationError {
     SeverityBelowFloor {
         required: Severity,
     },
+    /// No grant is available, without facts about what one must cover. Used
+    /// where the refusal is about a grant that vanished or changed between
+    /// selection and commit rather than about the action's requirements.
     NoGrant,
+    /// This conversation holds no valid grant at all. Names the attempted
+    /// origin and the severity a grant must cover, so the caller can open the
+    /// one grant that makes the retry succeed.
+    NoGrantForAction {
+        attempted_origin: String,
+        required: Severity,
+    },
+    /// This conversation holds grants, but none has a severity ceiling that
+    /// covers `required`. Kept apart from `NoGrantForAction` because opening
+    /// another grant at the default ceiling would be refused the same way;
+    /// the caller has to ask for this severity specifically.
+    GrantSeverityInsufficient {
+        attempted_origin: String,
+        required: Severity,
+        granted_ceilings: Vec<Severity>,
+    },
     OriginScope {
         attempted_origin: String,
         granted_origins: Vec<String>,

@@ -2646,7 +2646,7 @@ async fn handle_management_request(
     } else if method == management::OPEN_GRANT {
         if let Some(field) = params_object
             .keys()
-            .filter(|field| !matches!(field.as_str(), "origins" | "hazards"))
+            .filter(|field| !matches!(field.as_str(), "origins" | "hazards" | "severity_tier"))
             .min()
         {
             return send_invalid_request_response(
@@ -2724,12 +2724,33 @@ async fn handle_management_request(
             )
             .await;
         };
+        // Optional: omitted keeps the ceiling the hazards imply. Out-of-range
+        // integers are refused by the management plane below.
+        let severity_tier = match params_object.get("severity_tier") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(tier) => Some(u8::try_from(tier).unwrap_or(u8::MAX)),
+                None => {
+                    return send_invalid_request_response(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "severity_tier",
+                        "wrong_type",
+                    )
+                    .await
+                }
+            },
+        };
         let opened = planes
             .management
-            .open_browser_grant(
+            .open_browser_grant_at_tier(
                 &facts.identity.conversation_key,
                 origins,
                 hazards,
+                severity_tier,
                 facts.declares_elicitation(),
             )
             .await;
@@ -2756,6 +2777,18 @@ async fn handle_management_request(
                     corr,
                     "hazards",
                     "unsupported_value",
+                )
+                .await
+            }
+            Err(management::BrowserGrantRequestError::InvalidSeverityTier) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "severity_tier",
+                    "out_of_range",
                 )
                 .await
             }

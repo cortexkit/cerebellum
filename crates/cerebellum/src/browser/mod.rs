@@ -168,6 +168,19 @@ pub enum BrowserError {
         attempted_origin: String,
         granted_origins: Vec<String>,
     },
+    /// The conversation holds no grant. Reported as `no_grant`, with the
+    /// origin and severity a grant must cover to admit this action.
+    AuthorizationNoGrantForAction {
+        attempted_origin: String,
+        required: crate::authorization::Severity,
+    },
+    /// The conversation holds grants, but no ceiling reaches the severity this
+    /// action needs.
+    AuthorizationSeverityInsufficient {
+        attempted_origin: String,
+        required: crate::authorization::Severity,
+        granted_ceilings: Vec<crate::authorization::Severity>,
+    },
     HazardNotDisclosed {
         missing: HazardClass,
         /// Why the target had no classification, when that is what made the
@@ -216,9 +229,10 @@ impl BrowserError {
             Self::PointOutsideViewport { .. } => "point_outside_viewport",
             Self::InvalidCoordinates { .. } => "invalid_coordinates",
             Self::ImageTooLarge { .. } => "image_too_large",
-            Self::AuthorizationDenied { .. } | Self::AuthorizationOriginScope { .. } => {
-                "authorization_denied"
-            }
+            Self::AuthorizationDenied { .. }
+            | Self::AuthorizationOriginScope { .. }
+            | Self::AuthorizationNoGrantForAction { .. }
+            | Self::AuthorizationSeverityInsufficient { .. } => "authorization_denied",
             Self::HazardNotDisclosed { .. } => "hazard_not_disclosed",
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
             Self::NavigationFailed { .. } => "navigation_failed",
@@ -269,6 +283,16 @@ impl BrowserError {
             }
             Self::AuthorizationDenied { .. } | Self::AuthorizationOriginScope { .. } => {
                 "call browser.open_grant to mint a grant covering this action, then retry"
+            }
+            Self::AuthorizationNoGrantForAction { required, .. }
+            | Self::AuthorizationSeverityInsufficient { required, .. }
+                if !grant_can_reach(*required) =>
+            {
+                "no grant can be opened above tier 4; resubmit with a severity whose tier is at most 4"
+            }
+            Self::AuthorizationNoGrantForAction { .. }
+            | Self::AuthorizationSeverityInsufficient { .. } => {
+                "call browser.open_grant with the arguments in detail.grant_request, then retry"
             }
             Self::HazardNotDisclosed { .. } => {
                 "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry"
@@ -326,6 +350,20 @@ impl BrowserError {
                 "attempted_origin":attempted_origin,
                 "granted_origins":granted_origins,
             }),
+            Self::AuthorizationNoGrantForAction {
+                attempted_origin,
+                required,
+            } => grant_requirement_detail("no_grant", attempted_origin, *required, None),
+            Self::AuthorizationSeverityInsufficient {
+                attempted_origin,
+                required,
+                granted_ceilings,
+            } => grant_requirement_detail(
+                "grant_severity_insufficient",
+                attempted_origin,
+                *required,
+                Some(granted_ceilings),
+            ),
             Self::HazardNotDisclosed {
                 missing,
                 classification_unavailable,
@@ -374,6 +412,64 @@ impl BrowserError {
             Self::BrowserCrashed => json!({"reason_code":"browser_crashed"}),
         })
     }
+}
+
+fn severity_value(severity: crate::authorization::Severity) -> Value {
+    json!({
+        "tier":severity.tier,
+        "credential":severity.credential,
+        "financial":severity.financial,
+    })
+}
+
+/// Whether `browser.open_grant` can mint a ceiling that covers `required`.
+/// Its tier input stops at `MAX_GRANTABLE_TIER`, so a caller who declared a
+/// higher severity has to lower the declaration instead of asking a person.
+fn grant_can_reach(required: crate::authorization::Severity) -> bool {
+    required.tier <= crate::authorization::MAX_GRANTABLE_TIER
+}
+
+/// Detail for a refusal that a new grant can cure. `grant_request` is the
+/// exact `browser.open_grant` argument set whose grant covers this action:
+/// the attempted origin, the required tier, and the hazard classes that
+/// supply the credential and financial flags (a grant gets those flags only
+/// from disclosed hazards). It is omitted when no grant can reach the tier.
+fn grant_requirement_detail(
+    reason: &str,
+    attempted_origin: &str,
+    required: crate::authorization::Severity,
+    granted_ceilings: Option<&Vec<crate::authorization::Severity>>,
+) -> Value {
+    let mut detail = json!({
+        "reason":reason,
+        "attempted_origin":attempted_origin,
+        "required":severity_value(required),
+    });
+    let object = detail.as_object_mut().expect("detail is an object");
+    if let Some(ceilings) = granted_ceilings {
+        object.insert(
+            "granted_ceilings".into(),
+            Value::Array(ceilings.iter().copied().map(severity_value).collect()),
+        );
+    }
+    if grant_can_reach(required) {
+        let mut hazards = Vec::new();
+        if required.credential {
+            hazards.push(HazardClass::CredentialFormSubmit.as_str());
+        }
+        if required.financial {
+            hazards.push(HazardClass::FinancialFormSubmit.as_str());
+        }
+        object.insert(
+            "grant_request".into(),
+            json!({
+                "origins":[attempted_origin],
+                "severity_tier":required.tier,
+                "hazards":hazards,
+            }),
+        );
+    }
+    detail
 }
 
 /// Name the reason a click target was unclassified beside the refusal it
@@ -2081,7 +2177,10 @@ impl BrowserPlane {
                 &origin,
             ) {
                 Ok(decision) => decision,
-                Err(crate::authorization::AuthorizationError::NoGrant) => {
+                Err(
+                    error @ (crate::authorization::AuthorizationError::NoGrant
+                    | crate::authorization::AuthorizationError::NoGrantForAction { .. }),
+                ) => {
                     drop(grants);
                     self.record_snapshot_refusal(
                         identity,
@@ -2089,7 +2188,7 @@ impl BrowserPlane {
                         SnapshotRefusalReason::NoGrant,
                     )
                     .await?;
-                    return Err(BrowserError::AuthorizationDenied { reason: "no_grant" });
+                    return Err(map_authorization_error(error));
                 }
                 Err(error @ crate::authorization::AuthorizationError::OriginScope { .. }) => {
                     drop(grants);
@@ -3258,6 +3357,15 @@ fn context_result_schema() -> Value {
     )
 }
 
+/// Severity as it appears in a reply. Distinct from the request-side schema
+/// because the result-schema vocabulary has no numeric bounds keywords.
+fn severity_result_schema() -> Value {
+    closed_object(
+        json!({"tier":integer_schema(),"credential":boolean_schema(),"financial":boolean_schema()}),
+        &["tier", "credential", "financial"],
+    )
+}
+
 fn refusal_detail_schema() -> Value {
     closed_object(
         json!({
@@ -3272,7 +3380,13 @@ fn refusal_detail_schema() -> Value {
             "bytes":integer_schema(),
             "bound_bytes":integer_schema(),
             "missing_hazard":string_schema(),
-            "required":closed_object(json!({"tier":integer_schema(),"credential":boolean_schema(),"financial":boolean_schema()}), &["tier", "credential", "financial"]),
+            "required":severity_result_schema(),
+            "granted_ceilings":json!({"type":"array","items":severity_result_schema()}),
+            "grant_request":closed_object(json!({
+                "origins":string_array_schema(),
+                "severity_tier":integer_schema(),
+                "hazards":string_array_schema(),
+            }), &["origins", "severity_tier", "hazards"]),
             "classification_unavailable":string_schema(),
             "classification_unavailable_facts":closed_object(json!({
                 "index":integer_schema(),
@@ -4140,6 +4254,22 @@ fn map_authorization_error(error: crate::authorization::AuthorizationError) -> B
         crate::authorization::AuthorizationError::NoGrant => {
             BrowserError::AuthorizationDenied { reason: "no_grant" }
         }
+        crate::authorization::AuthorizationError::NoGrantForAction {
+            attempted_origin,
+            required,
+        } => BrowserError::AuthorizationNoGrantForAction {
+            attempted_origin,
+            required,
+        },
+        crate::authorization::AuthorizationError::GrantSeverityInsufficient {
+            attempted_origin,
+            required,
+            granted_ceilings,
+        } => BrowserError::AuthorizationSeverityInsufficient {
+            attempted_origin,
+            required,
+            granted_ceilings,
+        },
         crate::authorization::AuthorizationError::OriginScope {
             attempted_origin,
             granted_origins,
@@ -4191,6 +4321,8 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         }
         BrowserError::AuthorizationDenied { .. }
         | BrowserError::AuthorizationOriginScope { .. }
+        | BrowserError::AuthorizationNoGrantForAction { .. }
+        | BrowserError::AuthorizationSeverityInsufficient { .. }
         | BrowserError::HazardNotDisclosed { .. } => Outcome::Denied,
         BrowserError::StaleSnapshot { .. }
         | BrowserError::RefNotFound { .. }
@@ -4444,6 +4576,48 @@ mod tests {
         );
     }
 
+    /// A grant gets its credential and financial flags only from disclosed
+    /// hazards, so a grant request for a flagged severity must name those
+    /// hazards or the grant it mints would still fall short. A tier no grant
+    /// can reach gets no grant request at all.
+    #[tokio::test]
+    async fn a_grant_request_names_the_hazards_that_supply_the_required_flags() {
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        let flagged = plane
+            .result(
+                &identity,
+                Err(BrowserError::AuthorizationNoGrantForAction {
+                    attempted_origin: "https://example.test".into(),
+                    required: crate::authorization::Severity::new(4, true, true),
+                }),
+            )
+            .await;
+        assert_eq!(
+            flagged["detail"]["grant_request"],
+            json!({
+                "origins": ["https://example.test"],
+                "severity_tier": 4,
+                "hazards": ["credential_form_submit", "financial_form_submit"],
+            }),
+            "{flagged}"
+        );
+        let unreachable = plane
+            .result(
+                &identity,
+                Err(BrowserError::AuthorizationNoGrantForAction {
+                    attempted_origin: "https://example.test".into(),
+                    required: crate::authorization::Severity::new(5, false, false),
+                }),
+            )
+            .await;
+        assert!(
+            unreachable["detail"].get("grant_request").is_none(),
+            "{unreachable}"
+        );
+        assert_eq!(unreachable["detail"]["required"]["tier"], 5);
+    }
+
     #[tokio::test]
     async fn every_browser_error_serializes_its_exact_caller_remedy() {
         let cases = vec![
@@ -4550,6 +4724,35 @@ mod tests {
                 BrowserError::AuthorizationDenied { reason: "no_grant" },
                 "authorization_denied",
                 "call browser.open_grant to mint a grant covering this action, then retry",
+            ),
+            (
+                "no_grant_for_action",
+                BrowserError::AuthorizationNoGrantForAction {
+                    attempted_origin: "https://example.test".into(),
+                    required: crate::authorization::Severity::new(4, true, false),
+                },
+                "authorization_denied",
+                "call browser.open_grant with the arguments in detail.grant_request, then retry",
+            ),
+            (
+                "grant_severity_insufficient",
+                BrowserError::AuthorizationSeverityInsufficient {
+                    attempted_origin: "https://example.test".into(),
+                    required: crate::authorization::Severity::new(4, false, true),
+                    granted_ceilings: vec![crate::authorization::Severity::new(2, false, false)],
+                },
+                "authorization_denied",
+                "call browser.open_grant with the arguments in detail.grant_request, then retry",
+            ),
+            (
+                "grant_severity_insufficient_beyond_any_grant",
+                BrowserError::AuthorizationSeverityInsufficient {
+                    attempted_origin: "https://example.test".into(),
+                    required: crate::authorization::Severity::new(5, false, false),
+                    granted_ceilings: vec![crate::authorization::Severity::new(4, false, false)],
+                },
+                "authorization_denied",
+                "no grant can be opened above tier 4; resubmit with a severity whose tier is at most 4",
             ),
             (
                 "hazard_not_disclosed",

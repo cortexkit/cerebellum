@@ -30,7 +30,8 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::authorization::{
-    ActionGrant, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE,
+    ActionGrant, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE, MUTATE_REVERSIBLE,
+    OBSERVE,
 };
 use crate::classification::canonical_origin;
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
@@ -298,6 +299,35 @@ impl ManagementPlane {
         hazards: Vec<HazardClass>,
         can_relay_to_a_person: bool,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
+        self.open_browser_grant_at_tier(
+            conversation_key,
+            origins,
+            hazards,
+            None,
+            can_relay_to_a_person,
+        )
+        .await
+    }
+
+    /// Prepare a browser grant question whose ceiling tier is at least
+    /// `severity_tier`. The tier can only raise the ceiling the hazards already
+    /// imply; the credential and financial flags still come only from disclosed
+    /// hazards, so a number alone never lets the agent submit a sign-in or
+    /// payment form.
+    pub async fn open_browser_grant_at_tier(
+        &self,
+        conversation_key: &str,
+        origins: Vec<String>,
+        hazards: Vec<HazardClass>,
+        severity_tier: Option<u8>,
+        can_relay_to_a_person: bool,
+    ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
+        if severity_tier.is_some_and(|tier| {
+            !(crate::authorization::OBSERVE..=crate::authorization::MAX_GRANTABLE_TIER)
+                .contains(&tier)
+        }) {
+            return Err(BrowserGrantRequestError::InvalidSeverityTier);
+        }
         if conversation_key.is_empty()
             || origins.is_empty()
             || origins.len() > crate::authorization::MAX_ORIGINS
@@ -322,7 +352,16 @@ impl ManagementPlane {
             }
             disclosed_hazards_wire.push(hazard.as_str().to_string());
         }
-        let severity = browser_grant_severity(&disclosed_hazards);
+        let hazard_severity = browser_grant_severity(&disclosed_hazards);
+        let severity = Severity {
+            tier: hazard_severity
+                .tier
+                .max(severity_tier.unwrap_or(hazard_severity.tier)),
+            ..hazard_severity
+        };
+        // Only a tier the request actually raised needs its own sentence; a
+        // ceiling the hazards already imply is described by the hazard text.
+        let raised_tier = (severity.tier > hazard_severity.tier).then_some(severity.tier);
         let severity_value = browser_grant_severity_value(severity);
 
         if !can_relay_to_a_person {
@@ -356,6 +395,7 @@ impl ManagementPlane {
                 &authorized_origins,
                 &disclosed_hazards_wire,
                 severity,
+                raised_tier,
             ),
             deadline: PHONE_CONSENT_DEADLINE,
         };
@@ -810,6 +850,8 @@ impl ManagementPlane {
 pub enum BrowserGrantRequestError {
     InvalidOrigins,
     InvalidHazards,
+    /// A `severity_tier` outside the tiers a browser grant may carry.
+    InvalidSeverityTier,
 }
 
 fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
@@ -830,7 +872,11 @@ fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
 /// phone. It states what the grant allows and, just as plainly, what it still
 /// refuses, because that is what the person is deciding. The structured
 /// `origins`, `hazards` and `severity_ceiling` beside it stay the exact scope.
-fn browser_grant_message(origins: &[String], hazards: &[String]) -> String {
+fn browser_grant_message(
+    origins: &[String],
+    hazards: &[String],
+    raised_tier: Option<u8>,
+) -> String {
     // Each hazard class unlocks submitting one kind of form. Listed in a fixed
     // order so the sentence does not change with the order a caller sent them.
     const FORM_KINDS: [(&str, &str); 3] = [
@@ -859,6 +905,17 @@ fn browser_grant_message(origins: &[String], hazards: &[String]) -> String {
             "and"
         )
     );
+    // A raised tier widens what counts as an ordinary click, so the person is
+    // told in words what they are approving beyond reading and browsing.
+    match raised_tier {
+        Some(MUTATE_DURABLE) => message.push_str(
+            " It can also follow links that lead to other sites and submit other forms, \
+             which can make lasting changes such as posting, saving or sending something.",
+        ),
+        Some(MUTATE_REVERSIBLE) => message
+            .push_str(" It can also make changes on those sites that can be undone afterwards."),
+        _ => {}
+    }
     if !allowed.is_empty() {
         message.push_str(&format!(
             " It can also submit {}.",
@@ -883,7 +940,13 @@ fn join_words(items: &[&str], conjunction: &str) -> String {
 fn browser_grant_severity_value(severity: Severity) -> Value {
     json!({
         "tier": severity.tier,
-        "name": if severity.tier == COMPOSE { "compose" } else { "mutate_durable" },
+        "name": match severity.tier {
+            OBSERVE => "observe",
+            COMPOSE => "compose",
+            MUTATE_REVERSIBLE => "mutate_reversible",
+            MUTATE_DURABLE => "mutate_durable",
+            _ => "actuate",
+        },
         "credential": severity.credential,
         "financial": severity.financial,
     })
@@ -894,6 +957,7 @@ fn browser_grant_question(
     origins: &[String],
     hazards: &[String],
     severity: Severity,
+    raised_tier: Option<u8>,
 ) -> Value {
     let severity_value = browser_grant_severity_value(severity);
     json!({
@@ -901,7 +965,7 @@ fn browser_grant_question(
         "id": ask_id,
         "method": "elicitation/create",
         "params": {
-            "message": browser_grant_message(origins, hazards),
+            "message": browser_grant_message(origins, hazards, raised_tier),
             // These values are the exact scope that an affirmative answer mints.
             // Keeping them beside the prose lets a relay render structured scope
             // without translating or reconstructing the grant.
@@ -1308,6 +1372,111 @@ mod tests {
              read pages there and click ordinary buttons and links. It can't submit \
              sign-in forms, payment forms or forms whose purpose it couldn't check."
         );
+    }
+
+    /// A requested tier above the default must be spelled out for the person,
+    /// must raise only the tier, and must never turn on the credential or
+    /// financial flags, which only a disclosed hazard can grant.
+    #[tokio::test]
+    async fn a_requested_tier_is_told_to_the_person_and_raises_only_the_tier() {
+        let plane = plane(TargetResolution::NotRunning);
+        let (reply, question) = plane
+            .open_browser_grant_at_tier(
+                "conversation",
+                vec!["https://example.com".to_string()],
+                vec![],
+                Some(MUTATE_DURABLE),
+                true,
+            )
+            .await
+            .unwrap();
+        let question = question.unwrap();
+        assert_eq!(
+            reply["severity_ceiling"],
+            json!({"tier": 4, "name": "mutate_durable", "credential": false, "financial": false})
+        );
+        assert_eq!(
+            question.body["params"]["severity_ceiling"],
+            reply["severity_ceiling"]
+        );
+        assert_eq!(
+            question.body["params"]["message"],
+            "Let this agent use its own browser on https://example.com? It can open and \
+             read pages there and click ordinary buttons and links. It can also follow \
+             links that lead to other sites and submit other forms, which can make \
+             lasting changes such as posting, saving or sending something. It can't \
+             submit sign-in forms, payment forms or forms whose purpose it couldn't check."
+        );
+        assert!(
+            plane
+                .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+                .await
+        );
+        let grants = plane.browser_grants.lock().await;
+        let grant = grants.current_grants().next().unwrap();
+        assert_eq!(grant.severity, Severity::new(MUTATE_DURABLE, false, false));
+        drop(grants);
+
+        let (reply, question) = plane
+            .open_browser_grant_at_tier(
+                "conversation",
+                vec!["https://example.com".to_string()],
+                vec![],
+                Some(MUTATE_REVERSIBLE),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["severity_ceiling"]["name"], "mutate_reversible");
+        assert_eq!(
+            question.unwrap().body["params"]["message"],
+            "Let this agent use its own browser on https://example.com? It can open and \
+             read pages there and click ordinary buttons and links. It can also make \
+             changes on those sites that can be undone afterwards. It can't submit \
+             sign-in forms, payment forms or forms whose purpose it couldn't check."
+        );
+
+        // A tier at or below what the hazards imply changes neither the
+        // ceiling nor the words.
+        let (reply, question) = plane
+            .open_browser_grant_at_tier(
+                "conversation",
+                vec!["https://example.com".to_string()],
+                vec![],
+                Some(OBSERVE),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["severity_ceiling"]["tier"], 2);
+        assert_eq!(
+            question.unwrap().body["params"]["message"],
+            "Let this agent use its own browser on https://example.com? It can open and \
+             read pages there and click ordinary buttons and links. It can't submit \
+             sign-in forms, payment forms or forms whose purpose it couldn't check."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_tier_outside_the_grantable_range_is_refused() {
+        let plane = plane(TargetResolution::NotRunning);
+        for tier in [0, crate::authorization::ACTUATE, u8::MAX] {
+            assert_eq!(
+                plane
+                    .open_browser_grant_at_tier(
+                        "conversation",
+                        vec!["https://example.com".to_string()],
+                        vec![],
+                        Some(tier),
+                        true,
+                    )
+                    .await
+                    .unwrap_err(),
+                BrowserGrantRequestError::InvalidSeverityTier,
+                "tier {tier}"
+            );
+        }
+        assert_eq!(plane.browser_grant_count().await, 0);
     }
 
     #[tokio::test]

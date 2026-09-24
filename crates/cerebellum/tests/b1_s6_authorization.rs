@@ -282,9 +282,15 @@ fn missing_grant_is_opaque_and_observations_have_an_empty_hazard_floor() {
             "https://missing.test",
         )
         .unwrap_err();
+    // Still opaque about other grants: the refusal names only the caller's own
+    // attempted origin and the severity its own action requires, which is
+    // what a caller needs to open the grant that covers it.
     assert_eq!(
         error,
-        cerebellum::authorization::AuthorizationError::NoGrant
+        cerebellum::authorization::AuthorizationError::NoGrantForAction {
+            attempted_origin: "https://missing.test".to_string(),
+            required: Severity::new(OBSERVE, false, false),
+        }
     );
     for action in [Action::Navigate, Action::Snapshot] {
         assert_eq!(action.floor(), Severity::new(OBSERVE, false, false));

@@ -25,8 +25,14 @@ use cerebellum_computer::platform::vocabulary::{
 use cerebellum_core::health::HealthState;
 use cerebellum_core::identity::RouteIdentity;
 use serde_json::{json, Value};
-use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Principal, Priority, PROTOCOL_VERSION};
+use subc_protocol::session::ModuleControlRequest;
+use subc_protocol::{
+    BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
+};
 use tokio::sync::mpsc;
+
+#[path = "../examples/support/consent_relay.rs"]
+mod consent_relay;
 
 fn config() -> BrowserConfig {
     BrowserConfig {
@@ -97,9 +103,93 @@ async fn grant_browser(planes: &Planes, origin: &str, hazards: Vec<HazardClass>)
     );
 }
 
+const MANAGEMENT_CHANNEL: u16 = 4;
+const MANAGEMENT_EPOCH: u32 = 1;
+
+/// Bind a management route for the same session the tool route uses, able to
+/// relay a question to a person, so `browser.open_grant` runs through the
+/// production management dispatcher and mints into the grants the browser
+/// reads.
+async fn bind_management_route(planes: &Planes) {
+    let request = ModuleControlRequest::RouteBind {
+        route_channel: MANAGEMENT_CHANNEL,
+        epoch: MANAGEMENT_EPOCH,
+        target: RouteTarget::ManagementSurface {
+            module_id: "cerebellum".to_string(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session".to_string()),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: Some(vec!["elicitation".to_string()]),
+        admission_facts: Some(json!({
+            "agentProjectId": "pj-browser-session-wire",
+            "sessionKind": "primary",
+            "effectiveCapabilityScope": ["*"],
+            "browserControlOperations": ["browser.open_grant"]
+        })),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        u64::from(MANAGEMENT_CHANNEL),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(2);
+    cerebellum::handle_control_request_for_test_with_bindings(
+        frame,
+        &writer,
+        &planes.health,
+        &planes.routes,
+    )
+    .await
+    .expect("the management route binds");
+    let reply = replies.recv().await.expect("route.bind receives a reply");
+    assert_eq!(reply.header.ty, FrameType::Response);
+}
+
+/// Send `browser.open_grant` with exactly `params`, allow the question, and
+/// wait until the grant is minted.
+async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) {
+    let before = planes.management.browser_grant_count().await;
+    let opening = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        MANAGEMENT_CHANNEL,
+        MANAGEMENT_EPOCH,
+        corr,
+        serde_json::to_vec(&json!({
+            "method": cerebellum::management::OPEN_GRANT,
+            "params": params,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reply = consent_relay::elicit_and_answer(
+        planes,
+        opening,
+        json!({"decision": "allow"}),
+        "browser.open_grant",
+    )
+    .await
+    .expect("the grant request and its question complete");
+    assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while planes.management.browser_grant_count().await <= before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the affirmative answer mints a grant");
+}
+
 fn snapshot_observation(
     clicked: bool,
     hazardous: bool,
+    cross_site_link: bool,
     document_epoch: u64,
     current_url: &str,
 ) -> BrowserSnapshotObservation {
@@ -108,10 +198,20 @@ fn snapshot_observation(
         .expect("the wire test page URL has a scheme");
     let authority = rest.split(['/', '?', '#']).next().unwrap();
     let origin = format!("{scheme}://{authority}");
-    let mut target = ElementClassificationInput::new(
-        NodeIdentityInput::new("target", "frame-main", 42),
-        TargetKind::Button,
-    );
+    let mut target = if cross_site_link {
+        // A link whose destination is another site: classification requires
+        // a higher tier for it than for an ordinary same-site click.
+        ElementClassificationInput::new(
+            NodeIdentityInput::new("target", "frame-main", 42),
+            TargetKind::Anchor,
+        )
+        .destination("https://www.iana.org/domains/example")
+    } else {
+        ElementClassificationInput::new(
+            NodeIdentityInput::new("target", "frame-main", 42),
+            TargetKind::Button,
+        )
+    };
     if hazardous {
         target = target
             .form_owner(NodeIdentityInput::new("target", "frame-main", 7))
@@ -167,6 +267,7 @@ struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
     hazardous_target: bool,
+    cross_site_link_target: bool,
     present_error: Option<&'static str>,
     cookie_value: Option<&'static str>,
     cookie_grows_on_poll: bool,
@@ -188,6 +289,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 effects: Arc::clone(&self.effects),
                 clicked: false,
                 hazardous_target: self.hazardous_target,
+                cross_site_link_target: self.cross_site_link_target,
                 present_error: self.present_error,
                 cookie_value: self.cookie_value,
                 cookie_grows_on_poll: self.cookie_grows_on_poll,
@@ -237,6 +339,7 @@ struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
     clicked: bool,
     hazardous_target: bool,
+    cross_site_link_target: bool,
     present_error: Option<&'static str>,
     cookie_value: Option<&'static str>,
     cookie_grows_on_poll: bool,
@@ -308,6 +411,7 @@ impl OwnedBrowserProcess for RecordingProcess {
         Ok(snapshot_observation(
             self.clicked,
             self.hazardous_target,
+            self.cross_site_link_target,
             document_epoch,
             current_origin,
         ))
@@ -745,11 +849,251 @@ async fn wire_click_without_a_covering_grant_dispatches_no_input() {
     .await;
     let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
     assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
-    assert_eq!(clicked["detail"]["reason"], "no_grant", "{clicked}");
+    // The conversation holds a grant, just one whose ceiling is below a click,
+    // so the refusal says the severity is short rather than that no grant
+    // exists.
+    assert_eq!(
+        clicked["detail"]["reason"], "grant_severity_insufficient",
+        "{clicked}"
+    );
     assert_eq!(
         launcher.effects.lock().unwrap().as_slice(),
         ["snapshot"],
         "a refused click dispatched input"
+    );
+}
+
+/// A grant for the page at the default ceiling cannot admit a click that
+/// classifies higher. The refusal must name the severity it needs, and
+/// opening a grant with exactly the arguments the refusal names must make the
+/// same click succeed; a remedy that leaves the outcome unchanged sends the
+/// caller round the same loop forever.
+#[tokio::test]
+async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_grant_admits_it() {
+    let launcher = Arc::new(RecordingLauncher {
+        cross_site_link_target: true,
+        ..RecordingLauncher::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    bind_management_route(&planes).await;
+    // No hazards and no tier: the ordinary browsing grant, ceiling tier 2.
+    open_grant_and_allow(
+        &planes,
+        60,
+        json!({"origins": ["https://page.example"], "hazards": []}),
+    )
+    .await;
+    launch_at(&planes, "https://page.example").await;
+
+    let snapshot = invoke(&planes, 61, "browser.snapshot", json!({})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let click = json!({
+        "ref": snapshot["refs"][0]["ref"],
+        "snapshot_id": snapshot["snapshot_id"],
+        "intent": "follow the cross-site link",
+        "severity": {"tier": 2, "credential": false, "financial": false}
+    });
+
+    // Asserted on the wire reply: an undeclared field or reason would have
+    // been withheld by result-schema enforcement instead of reaching here.
+    let refused = invoke_existing(&planes, 62, "browser.click", click.clone()).await;
+    let refused: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(
+        refused["detail"]["reason"], "grant_severity_insufficient",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["required"],
+        json!({"tier": 4, "credential": false, "financial": false}),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["granted_ceilings"],
+        json!([{"tier": 2, "credential": false, "financial": false}]),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["attempted_origin"], "https://page.example",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["grant_request"],
+        json!({"origins": ["https://page.example"], "severity_tier": 4, "hazards": []}),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["remedy"],
+        "call browser.open_grant with the arguments in detail.grant_request, then retry",
+        "{refused}"
+    );
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["snapshot"],
+        "a refused click dispatched input"
+    );
+
+    // Follow the remedy literally, then retry the identical click.
+    open_grant_and_allow(&planes, 63, refused["detail"]["grant_request"].clone()).await;
+    let clicked = invoke_existing(&planes, 64, "browser.click", click).await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["snapshot", "input_press", "input_release"]
+    );
+}
+
+/// With no grant at all, `no_grant` names the origin and severity a grant
+/// must cover, and opening exactly that grant admits the retry.
+#[tokio::test]
+async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_it() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    bind_management_route(&planes).await;
+    launch_at(&planes, "https://page.example").await;
+
+    let refused = invoke_existing(&planes, 70, "browser.snapshot", json!({})).await;
+    let refused: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "no_grant", "{refused}");
+    assert_eq!(
+        refused["detail"]["attempted_origin"], "https://page.example",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["required"],
+        json!({"tier": 1, "credential": false, "financial": false}),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["grant_request"],
+        json!({"origins": ["https://page.example"], "severity_tier": 1, "hazards": []}),
+        "{refused}"
+    );
+    assert!(launcher.effects.lock().unwrap().is_empty());
+
+    open_grant_and_allow(&planes, 71, refused["detail"]["grant_request"].clone()).await;
+    let snapshot = invoke_existing(&planes, 72, "browser.snapshot", json!({})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+}
+
+fn planes_with_installed_grants(
+    launcher: &Arc<RecordingLauncher>,
+    grants: Vec<ActionGrant>,
+) -> Planes {
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(
+            planes.sessions.clone(),
+            Arc::clone(&planes.lease_clock),
+            config().navigation_settle_deadline_ms,
+        )
+        .with_grants_installed(GrantStore::new(grants)),
+    );
+    planes
+}
+
+async fn click_cross_site_link(planes: &Planes, corr: u64) -> Value {
+    let snapshot = invoke(planes, corr, "browser.snapshot", json!({})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let clicked = invoke(
+        planes,
+        corr + 1,
+        "browser.click",
+        json!({
+            "ref": snapshot["refs"][0]["ref"],
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "follow the cross-site link",
+            "severity": {"tier": 2, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    serde_json::from_slice(&clicked.body).unwrap()
+}
+
+/// Severity is checked before origin. A grant that reaches the severity but
+/// names another origin is still an origin-scope refusal; when no grant
+/// reaches the severity, the severity refusal names the attempted origin in
+/// its grant request, so the one grant it describes fixes both.
+#[tokio::test]
+async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() {
+    let launcher = Arc::new(RecordingLauncher {
+        cross_site_link_target: true,
+        ..RecordingLauncher::default()
+    });
+    let snapshot_grant = ActionGrant::new(
+        "snapshot-only",
+        1,
+        "test-session",
+        Severity::new(OBSERVE, false, false),
+        ["https://page.example"],
+    );
+
+    let planes = planes_with_installed_grants(
+        &launcher,
+        vec![
+            snapshot_grant.clone(),
+            ActionGrant::new(
+                "durable-elsewhere",
+                1,
+                "test-session",
+                Severity::new(4, false, false),
+                ["https://other.example"],
+            ),
+        ],
+    );
+    launch_at(&planes, "https://page.example").await;
+    let clicked = click_cross_site_link(&planes, 80).await;
+    assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
+    assert_eq!(clicked["detail"]["reason"], "origin_scope", "{clicked}");
+    assert_eq!(
+        clicked["detail"]["granted_origins"],
+        json!(["https://other.example"]),
+        "{clicked}"
+    );
+
+    let planes = planes_with_installed_grants(
+        &launcher,
+        vec![
+            snapshot_grant,
+            ActionGrant::new(
+                "compose-elsewhere",
+                1,
+                "test-session",
+                Severity::new(2, false, false),
+                ["https://other.example"],
+            ),
+        ],
+    );
+    launch_at(&planes, "https://page.example").await;
+    let clicked = click_cross_site_link(&planes, 90).await;
+    assert_eq!(
+        clicked["detail"]["reason"], "grant_severity_insufficient",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["detail"]["grant_request"],
+        json!({"origins": ["https://page.example"], "severity_tier": 4, "hazards": []}),
+        "{clicked}"
     );
 }
 
