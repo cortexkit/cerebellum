@@ -1598,44 +1598,50 @@ mod tests {
             })
             .sum();
 
-        // Within a quarter of each other, the two hypotheses are not being
-        // separated by this window's content.
-        if at_top.max(elsewhere) * 4 <= at_top.min(elsewhere) * 5 {
+        // THREE HYPOTHESES, ONE VERDICT. The output sits at the top (the rect
+        // was honoured), somewhere lower (an offset applied in the wrong space,
+        // which the framework clamps rather than refuses), or it is the whole
+        // window squeezed (the rect was ignored). The smallest distance is the
+        // answer. They are compared together rather than one after another,
+        // because a sequence let an earlier "cannot separate" skip fire on the
+        // ignored-rect output itself: a squeezed window matches the top about as
+        // well as a few rows down, so the check that exists to catch that
+        // defect was never reached. A tie with the runner-up means this window's
+        // content cannot answer, which is stated as a skip.
+        let (runner_up, runner_up_is_scale) = if at_scale < elsewhere {
+            (at_scale, true)
+        } else {
+            (elsewhere, false)
+        };
+        if at_top.max(runner_up) * 4 <= at_top.min(runner_up) * 5 {
             eprintln!(
                 "SKIPPED: this window cannot separate the hypotheses -- the output matches the \
-                 top ({at_top}) about as well as it matches {elsewhere_at} rows down \
-                 ({elsewhere}), so its content places nothing."
+                 top ({at_top}) about as well as it matches {} ({runner_up}).",
+                if runner_up_is_scale {
+                    "the whole window squeezed".to_string()
+                } else {
+                    format!("{elsewhere_at} rows down")
+                }
             );
             return;
         }
-
-        assert!(
-            at_top < elsewhere,
-            "the source rect returned the wrong region: the output of a capture requesting the \
-             window's top half matches the window {elsewhere_at} rows down ({elsewhere}) better \
-             than it matches the top ({at_top}). A rect outside the window's own coordinate \
-             space is clamped into some other region rather than refused, so an offset applied \
-             in the wrong space looks exactly like this"
-        );
-        // The scale hypothesis is judged the way the offset one is: which of the
-        // two numbers is smaller, with a tie reported as a window that cannot
-        // answer. A fixed factor here (it was 2x) is a margin nothing measured,
-        // and it refused an honoured crop at 1.94x on a window whose content
-        // squeezed well; an ignored rect is not near the margin at all, because
-        // the output then IS the squeezed window and scores close to zero.
-        if at_top.max(at_scale) * 4 <= at_top.min(at_scale) * 5 {
-            eprintln!(
-                "SKIPPED: this window cannot separate crop from scale -- the output matches the \
-                 top crop ({at_top}) about as well as the whole window squeezed ({at_scale})."
+        if runner_up_is_scale {
+            assert!(
+                at_top < at_scale,
+                "the source rect was ignored: the output matches the whole window squeezed into \
+                 the requested size (distance {at_scale}) better than it matches the top crop \
+                 ({at_top})"
             );
-            return;
+        } else {
+            assert!(
+                at_top < elsewhere,
+                "the source rect returned the wrong region: the output of a capture requesting \
+                 the window's top half matches the window {elsewhere_at} rows down \
+                 ({elsewhere}) better than it matches the top ({at_top}). A rect outside the \
+                 window's own coordinate space is clamped into some other region rather than \
+                 refused, so an offset applied in the wrong space looks exactly like this"
+            );
         }
-        assert!(
-            at_top < at_scale,
-            "the source rect was ignored: the output matches the whole window squeezed into the \
-             requested size (distance {at_scale}) better than it matches the top crop \
-             ({at_top})"
-        );
     }
 
     /// An errno this code does not classify is reported as unclassified,
