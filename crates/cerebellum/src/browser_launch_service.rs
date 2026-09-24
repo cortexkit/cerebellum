@@ -813,9 +813,6 @@ pub fn browser_launch_arguments(
 /// 44% in the direction that runs out sooner than the comment promises.
 const LAUNCH_JOURNAL_RETENTION_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Public for the restore drill, for the same reason as
-/// `production_profile_lifecycle`: the drill opens the launch journal with the
-/// bounds production uses, not a copy of them.
 /// Open the launch journal where `persistence` says.
 ///
 /// The durable arm is `DurableLaunchJournal::open_filesystem` with the storage
@@ -841,6 +838,9 @@ fn open_launch_journal(
     DurableLaunchJournal::open(launch_journal_config(), storage)
 }
 
+/// Public for the restore drill, for the same reason as
+/// `production_profile_lifecycle`: the drill opens the launch journal with the
+/// bounds production uses, not a copy of them.
 #[doc(hidden)]
 pub fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
     cerebellum_core::journal::JournalConfig {
