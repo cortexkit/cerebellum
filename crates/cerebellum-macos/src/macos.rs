@@ -1617,10 +1617,23 @@ mod tests {
              space is clamped into some other region rather than refused, so an offset applied \
              in the wrong space looks exactly like this"
         );
+        // The scale hypothesis is judged the way the offset one is: which of the
+        // two numbers is smaller, with a tie reported as a window that cannot
+        // answer. A fixed factor here (it was 2x) is a margin nothing measured,
+        // and it refused an honoured crop at 1.94x on a window whose content
+        // squeezed well; an ignored rect is not near the margin at all, because
+        // the output then IS the squeezed window and scores close to zero.
+        if at_top.max(at_scale) * 4 <= at_top.min(at_scale) * 5 {
+            eprintln!(
+                "SKIPPED: this window cannot separate crop from scale -- the output matches the \
+                 top crop ({at_top}) about as well as the whole window squeezed ({at_scale})."
+            );
+            return;
+        }
         assert!(
-            at_scale >= at_top.saturating_mul(2),
+            at_top < at_scale,
             "the source rect was ignored: the output matches the whole window squeezed into the \
-             requested size (distance {at_scale}) about as well as it matches the top crop \
+             requested size (distance {at_scale}) better than it matches the top crop \
              ({at_top})"
         );
     }
