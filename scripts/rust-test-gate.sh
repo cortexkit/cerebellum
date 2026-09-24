@@ -326,31 +326,39 @@ run_phase "sibling matches the declared revisions" \
 # directory enrolled for fleet backup, and every test passed. Nothing in the
 # suite could notice, because the suite does not look outside the repository.
 #
-# The allowlist carries its reason per entry rather than a bare filename, so an
-# entry that stops being justified reads as wrong rather than as precedent.
+# Test code is found structurally by scripts/lib/durable-journal-scan.py:
+# every file under crates/*/tests/, and under crates/*/src/ every item behind
+# a test-enabling attribute (`#[cfg(test)]` modules, including out-of-line
+# ones, `#[test]` and `#[tokio::test]` functions) plus functions named for
+# tests. Source is tokenized, so comments and strings never match and line
+# breaks cannot hide a call. What it looks for: the durable plane
+# constructors, naming `JournalPersistence::Durable` outright, and the openers
+# that always take the operator's own files -- the computer audit, the launch
+# journal (whose startup recovery can kill a live browser and move profile
+# custody) and the profile registry of real browser profiles.
+#
+# Its planted-offender proofs run first: a scan that reports nothing looks the
+# same whether the tree is clean or the scan is blind. The scan prints how many
+# files it read and refuses when that is none, for the same reason.
+#
+# An allowlist, if one is ever needed, lives in the scanner and carries its
+# reason per entry, so an entry that stops being justified reads as wrong
+# rather than as precedent.
 check_tests_do_not_journal_durably() {
-  local offenders
-  # Deliberate: b1_s3_browser.rs asserts that the PRODUCTION constructor
-  # installs a journal, which is the defect that started this -- production had
-  # none from the day the plane shipped. It builds the plane and never
-  # dispatches, and the store opens lazily on first reservation, so it observes
-  # the setting without opening anything.
-  #
-  # Past the plane constructors: naming `JournalPersistence::Durable` outright,
-  # and the two openers that always take the operator's journal -- the computer
-  # audit and the launch journal. The launch journal is the costly one, since
-  # opening it runs startup recovery over whatever it records, which can kill a
-  # live browser and move profile custody.
-  offenders="$(grep -rln "Planes::new(\|Planes::with_browser_config(\|JournalPersistence::Durable\|production_audit(\|DurableLaunchJournal::open_filesystem(" \
-    crates/*/tests/ 2>/dev/null | grep -v "tests/b1_s3_browser.rs" || true)"
-  if [ -n "$offenders" ]; then
-    echo "    these tests build a durably-journaling plane:" >&2
-    echo "$offenders" | sed 's/^/      /' >&2
+  scripts/lib/durable-journal-scan.test.sh >/dev/null || {
+    echo "    the scanner's planted-offender proofs failed, so its verdict means nothing:" >&2
+    scripts/lib/durable-journal-scan.test.sh 2>&1 | grep -v '^ok ' | sed 's/^/      /' >&2
+    return 1
+  }
+  local status=0
+  python3 scripts/lib/durable-journal-scan.py . || status=$?
+  if [ "$status" -eq 1 ]; then
+    echo "    the test code above builds something that journals to the operator's disk." >&2
     echo "    use Planes::with_browser_config_journaling(.., JournalPersistence::Isolated)" >&2
     echo "    (or an in-memory journal where a test opens one directly)" >&2
-    echo "    or add the file here with the reason it must be durable." >&2
-    return 1
+    echo "    or allow the file in durable-journal-scan.py with the reason it must be durable." >&2
   fi
+  return "$status"
 }
 
 run_phase "no test journals to the operator's disk" \

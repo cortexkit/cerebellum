@@ -2005,18 +2005,19 @@ impl Planes {
     /// tests. A running module builds through `with_browser_config` with the
     /// config it loaded, `None` when the file names no browser.
     pub fn new(health: Arc<HealthState>) -> Self {
-        Self::with_browser_config(
-            health,
-            Some(BrowserConfig {
-                executable_path: None,
-                expected_identity: None,
-                launch_handshake_deadline_ms: 100,
-                termination_grace_period_ms: 100,
-                browser_idle_timeout_ms: 30_000,
-                browser_exit_observation_deadline_ms: 100,
-                navigation_settle_deadline_ms: 100,
-            }),
-        )
+        Self::with_browser_config(health, Some(Self::short_test_browser_config()))
+    }
+
+    fn short_test_browser_config() -> BrowserConfig {
+        BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 100,
+        }
     }
 
     /// Build with a durable journal. What a running module uses.
@@ -4277,6 +4278,18 @@ pub async fn handle_tool_request_for_test_with_existing_planes(
     handle_tool_request(frame, writer, planes).await
 }
 
+/// The planes the tool-request test helpers drive: `Planes::new`'s short test
+/// browser config, journaling in memory. A durable plane would write the
+/// computer audit and launch journal into the operator's data home, which is
+/// backed up and holds real browser profiles.
+fn isolated_test_planes(health_state: &Arc<HealthState>) -> Planes {
+    Planes::with_browser_config_journaling(
+        Arc::clone(health_state),
+        Some(Planes::short_test_browser_config()),
+        JournalPersistence::Isolated,
+    )
+}
+
 pub async fn handle_tool_request_for_test(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -4284,7 +4297,7 @@ pub async fn handle_tool_request_for_test(
 ) -> Result<(), ModuleError> {
     let route_bindings = Arc::new(RouteBindings::new());
     install_test_bind(&route_bindings, &frame);
-    let mut planes = Planes::new(Arc::clone(health_state));
+    let mut planes = isolated_test_planes(health_state);
     planes.routes = route_bindings;
     #[cfg(target_os = "macos")]
     {
@@ -4305,7 +4318,7 @@ pub async fn handle_tool_request_for_test_admitting(
 ) -> Result<(), ModuleError> {
     let route_bindings = Arc::new(RouteBindings::new());
     install_test_bind(&route_bindings, &frame);
-    let mut planes = Planes::new(Arc::clone(health_state));
+    let mut planes = isolated_test_planes(health_state);
     planes.routes = route_bindings;
     #[cfg(target_os = "macos")]
     {
@@ -4329,7 +4342,11 @@ pub async fn handle_tool_request_for_test_unconfigured_browser(
 ) -> Result<(), ModuleError> {
     let route_bindings = Arc::new(RouteBindings::new());
     install_test_bind(&route_bindings, &frame);
-    let mut planes = Planes::with_browser_config(Arc::clone(health_state), None);
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::clone(health_state),
+        None,
+        JournalPersistence::Isolated,
+    );
     planes.routes = route_bindings;
     #[cfg(target_os = "macos")]
     {
@@ -4346,7 +4363,7 @@ pub async fn handle_tool_request_for_test_with_bindings(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    let mut planes = Planes::new(Arc::clone(health_state));
+    let mut planes = isolated_test_planes(health_state);
     planes.routes = Arc::clone(route_bindings);
     #[cfg(target_os = "macos")]
     {
@@ -4737,7 +4754,7 @@ mod tests {
     /// the navigation may use is the answer delivered to the elicitation request.
     #[tokio::test]
     async fn an_elicited_browser_grant_admits_wire_navigation() {
-        let planes = Planes::with_browser_config(
+        let planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             Some(BrowserConfig {
                 executable_path: None,
@@ -4748,6 +4765,7 @@ mod tests {
                 browser_exit_observation_deadline_ms: 100,
                 navigation_settle_deadline_ms: 100,
             }),
+            JournalPersistence::Isolated,
         );
         let identity = bind_identity_for_test();
         let admission = json!({
@@ -5986,7 +6004,7 @@ mod connection_liveness_tests {
         // remains open and silent, so only hearing the writer can end the loop.
         let (_silent_peer, mut parked_reader) = tokio::io::duplex(1024);
         let config = connection_test_config();
-        let planes = Planes::new(Arc::new(HealthState::with_config(config.health)));
+        let planes = isolated_test_planes(&Arc::new(HealthState::with_config(config.health)));
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -6065,9 +6083,10 @@ mod connection_liveness_tests {
             navigation_settle_deadline_ms: 10,
         };
         let config = connection_test_config();
-        let planes = Planes::with_browser_config(
+        let planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::with_config(config.health)),
             Some(browser.clone()),
+            JournalPersistence::Isolated,
         );
         let outcomes = Arc::new(Mutex::new(Vec::new()));
         let clock = FakeClock::new();
