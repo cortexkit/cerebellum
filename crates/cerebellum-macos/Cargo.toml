@@ -10,6 +10,14 @@ description = "Raw macOS framework readings for ck-cerebellum. One of two seam c
 name = "cerebellum_macos"
 path = "src/lib.rs"
 
+# No standard harness: this test opens an AppKit window, which must happen on a
+# process's main thread, and the harness runs every test on a thread of its own.
+# Its own `main` stands in for the harness and prints ok, SKIPPED, or FAILED.
+[[test]]
+name = "source_rect_pattern"
+path = "tests/source_rect_pattern.rs"
+harness = false
+
 # Framework bindings are needed only where the frameworks exist. On every other
 # host this crate compiles to nothing, so the workspace still builds and tests
 # there without them.
