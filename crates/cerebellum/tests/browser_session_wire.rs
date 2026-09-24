@@ -171,6 +171,9 @@ struct RecordingLauncher {
     cookie_value: Option<&'static str>,
     cookie_grows_on_poll: bool,
     credential_field_then_clears: bool,
+    /// Shared with every process this launcher starts; setting it makes them
+    /// all report that the browser has exited, as a crashed browser would.
+    exited: Arc<Mutex<bool>>,
 }
 
 impl BrowserSessionLauncher for RecordingLauncher {
@@ -190,6 +193,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 cookie_grows_on_poll: self.cookie_grows_on_poll,
                 credential_field_then_clears: self.credential_field_then_clears,
                 cookie_reads: 0,
+                exited: Arc::clone(&self.exited),
             }),
             cleanup: Box::new(RecordingCleanup {
                 effects: Arc::clone(&self.effects),
@@ -238,6 +242,7 @@ struct RecordingProcess {
     cookie_grows_on_poll: bool,
     credential_field_then_clears: bool,
     cookie_reads: usize,
+    exited: Arc<Mutex<bool>>,
 }
 
 impl OwnedBrowserProcess for RecordingProcess {
@@ -331,7 +336,7 @@ impl OwnedBrowserProcess for RecordingProcess {
     }
 
     fn generation_matches(&self) -> bool {
-        true
+        !*self.exited.lock().unwrap()
     }
 
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
@@ -1568,4 +1573,177 @@ async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_v
         response_body(&planes, 2, "browser.launch", json!({})).await,
         refusal
     );
+}
+
+/// Launch through the wire, place the page at `origin`, and return the new
+/// browser session id so the caller can close it.
+async fn launch_session_at(planes: &Planes, corr: u64, origin: &str) -> String {
+    let launched = response_body(planes, corr, "browser.launch", json!({})).await;
+    assert_eq!(launched["outcome"], "launched", "{launched}");
+    planes
+        .browser
+        .same_document_url(
+            &route_identity(),
+            &format!("{origin}/page"),
+            cerebellum::snapshot_store::SameDocumentChange::ReplaceState,
+        )
+        .await
+        .unwrap();
+    launched["browser_session_id"].as_str().unwrap().to_string()
+}
+
+async fn close_session(planes: &Planes, corr: u64, browser_session_id: &str) {
+    let closed = response_body(
+        planes,
+        corr,
+        "browser.close",
+        json!({"browser_session_id": browser_session_id}),
+    )
+    .await;
+    assert_eq!(closed["outcome"], "closed", "{closed}");
+}
+
+fn recording_planes(launcher: &Arc<RecordingLauncher>) -> Planes {
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    planes
+}
+
+// Closing a browser marks the conversation's page context ended. A later
+// launch on the same conversation is a new browser, and its pages must be
+// readable: before, the ended context survived the relaunch and every read on
+// the new browser was refused as no_session.
+#[tokio::test]
+async fn a_browser_relaunched_after_close_serves_snapshots() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let planes = recording_planes(&launcher);
+    grant_browser(&planes, "https://page.example", Vec::new()).await;
+
+    let first = launch_session_at(&planes, 1, "https://page.example").await;
+    let before_close = response_body(&planes, 2, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(before_close["outcome"], "ok", "{before_close}");
+    close_session(&planes, 3, &first).await;
+
+    let second = launch_session_at(&planes, 4, "https://page.example").await;
+    assert_ne!(first, second);
+    let relaunched = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(relaunched["outcome"], "ok", "{relaunched}");
+    assert!(
+        relaunched["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Click probe before")),
+        "{relaunched}"
+    );
+    // The new browser must not re-mint an id the caller holds from the old one.
+    assert_ne!(relaunched["snapshot_id"], before_close["snapshot_id"]);
+}
+
+// The same relaunch, read through navigate's read_page rather than a separate
+// snapshot call: the read runs in the same page context and was refused the
+// same way.
+#[tokio::test]
+async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let planes = recording_planes(&launcher);
+    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    grant_browser(&planes, "https://landed.example", Vec::new()).await;
+
+    let first = launch_session_at(&planes, 1, "https://requested.example").await;
+    close_session(&planes, 2, &first).await;
+    launch_session_at(&planes, 3, "https://requested.example").await;
+
+    let navigated = response_body(
+        &planes,
+        4,
+        "browser.navigate",
+        json!({
+            "url": "https://requested.example/",
+            "intent": "read the page after a relaunch",
+            "wait": "settle",
+            "severity": {"tier": 1, "credential": false, "financial": false},
+            "read_page": true
+        }),
+    )
+    .await;
+    assert_eq!(navigated["outcome"], "ok", "{navigated}");
+    assert_eq!(navigated["read_page"]["outcome"], "ok", "{navigated}");
+    assert!(
+        navigated["read_page"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Click probe before")),
+        "{navigated}"
+    );
+}
+
+// A browser that exits on its own is torn down by the exit sweep, which never
+// tells the page context. The relaunched browser must read its own pages, and
+// a snapshot id from the crashed browser must not address anything on the new
+// one: its refs name elements of a page that is gone.
+#[tokio::test]
+async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let planes = recording_planes(&launcher);
+    grant_browser(
+        &planes,
+        "https://page.example",
+        vec![HazardClass::CredentialFormSubmit],
+    )
+    .await;
+
+    launch_session_at(&planes, 1, "https://page.example").await;
+    let old = response_body(&planes, 2, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(old["outcome"], "ok", "{old}");
+
+    *launcher.exited.lock().unwrap() = true;
+    planes.sessions.observe_exits_all(&config());
+    let status = response_body(&planes, 3, "browser.status", json!({})).await;
+    assert_ne!(status["outcome"], "ready", "{status}");
+    *launcher.exited.lock().unwrap() = false;
+
+    launch_session_at(&planes, 4, "https://page.example").await;
+    let fresh = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(fresh["outcome"], "ok", "{fresh}");
+    assert_ne!(fresh["snapshot_id"], old["snapshot_id"]);
+
+    launcher.effects.lock().unwrap().clear();
+    let stale_click = response_body(
+        &planes,
+        6,
+        "browser.click",
+        json!({
+            "ref": old["refs"][0]["ref"],
+            "snapshot_id": old["snapshot_id"],
+            "intent": "click through a snapshot of the crashed browser",
+            "severity": {"tier": 2, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    assert_ne!(stale_click["outcome"], "ok", "{stale_click}");
+    assert!(
+        !launcher
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|effect| effect.starts_with("input_")),
+        "a stale snapshot dispatched input on the relaunched browser: {:?}",
+        launcher.effects.lock().unwrap()
+    );
+}
+
+// A closed browser that nobody relaunched stays closed: reads keep refusing.
+#[tokio::test]
+async fn a_closed_browser_without_relaunch_still_refuses_snapshots() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let planes = recording_planes(&launcher);
+    grant_browser(&planes, "https://page.example", Vec::new()).await;
+
+    let first = launch_session_at(&planes, 1, "https://page.example").await;
+    close_session(&planes, 2, &first).await;
+    let refused = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(refused["outcome"], "no_session", "{refused}");
 }

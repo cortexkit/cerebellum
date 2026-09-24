@@ -1248,10 +1248,32 @@ impl BrowserPlane {
     pub async fn open_context(&self, identity: RouteIdentity) -> Result<(), BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
         let mut state = self.state.lock().await;
-        state
+        // Only a successful launch opens a context, and a launch only succeeds
+        // when the conversation holds no live browser, so whatever context is
+        // still here belongs to a browser that is gone: one that was closed
+        // (marked ended), or one the idle or exit sweep tore down without the
+        // browser plane hearing about it (never marked ended). Keeping it would
+        // either refuse every read as no_session, or hand the new browser the
+        // old browser's snapshots, document epoch, page tracker and crash flag.
+        // The new browser gets a fresh context instead.
+        //
+        // The one value carried over is the snapshot-id counter. Snapshot ids
+        // are derived from the conversation key, the snapshot kind and this
+        // counter, so restarting it at zero would mint ids the caller may still
+        // hold from the previous browser, and a stale id would then address a
+        // snapshot of a different page.
+        let key = identity.conversation_key.clone();
+        let next_snapshot_seed = state
             .contexts
-            .entry(identity.conversation_key.clone())
-            .or_insert_with(|| ContextState::new(identity));
+            .get(&key)
+            .map_or(0, |previous| previous.next_snapshot_seed);
+        let mut context = ContextState::new(identity);
+        context.next_snapshot_seed = next_snapshot_seed;
+        state.contexts.insert(key.clone(), context);
+        // Dialogs, downloads and policy rejections queued for the previous
+        // browser describe pages that no longer exist; surfacing them from
+        // browser.wait_for on the new browser would report events it never had.
+        state.late_events.remove(&key);
         Ok(())
     }
     pub async fn end_context(&self, identity: &RouteIdentity, crashed: bool) {
