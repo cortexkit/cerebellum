@@ -245,7 +245,11 @@ impl ProductionLaunchService {
         }
     }
 
-    fn open_with_recovery<F>(config: BrowserConfig, profile_root: ProfileStateRoot, recover: F) -> Self
+    fn open_with_recovery<F>(
+        config: BrowserConfig,
+        profile_root: ProfileStateRoot,
+        recover: F,
+    ) -> Self
     where
         F: FnOnce(
             &BrowserConfig,
@@ -1215,7 +1219,10 @@ impl OrphanProfileCustody for ProductionOrphanProfileCustody<'_> {
         &mut self,
         intent: &crate::browser_launch::AuthorizedLaunchIntent,
     ) -> Result<(), OrphanProfileCustodyFailure> {
-        let root = self.root.resolve().map_err(|_| OrphanProfileCustodyFailure)?;
+        let root = self
+            .root
+            .resolve()
+            .map_err(|_| OrphanProfileCustodyFailure)?;
         let supervisor =
             current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
         release_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
@@ -1226,7 +1233,10 @@ impl OrphanProfileCustody for ProductionOrphanProfileCustody<'_> {
         &mut self,
         intent: &crate::browser_launch::AuthorizedLaunchIntent,
     ) -> Result<(), OrphanProfileCustodyFailure> {
-        let root = self.root.resolve().map_err(|_| OrphanProfileCustodyFailure)?;
+        let root = self
+            .root
+            .resolve()
+            .map_err(|_| OrphanProfileCustodyFailure)?;
         let supervisor =
             current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
         retain_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
@@ -1980,7 +1990,9 @@ pub fn production_profile_lifecycle() -> Result<ProfileLifecycle, ProductionProf
 
 /// The production registry configuration opened at `root`, which is the data
 /// home for production and a private directory for an isolated service.
-fn profile_lifecycle_at(root: PathBuf) -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
+fn profile_lifecycle_at(
+    root: PathBuf,
+) -> Result<ProfileLifecycle, ProductionProfileLifecycleError> {
     ProfileLifecycle::open_with_config(root, production_registry_config())
         .map_err(ProductionProfileLifecycleError::Registry)
 }
