@@ -72,12 +72,17 @@ mod pattern {
     /// every row exactly, one level per point.
     const SIDE: usize = 256;
 
-    /// Where the window sits, in AppKit's bottom-left screen coordinates, so
-    /// that its screen position is far from zero on both axes: a rect offset by
-    /// that position (the wrong space) then cannot land near the top. The test
-    /// still reads the position the window list reports and skips if it is
-    /// too small to tell the defect apart.
-    const ORIGIN: f64 = 200.0;
+    /// Where the window's top-left corner sits, in screen points from the top
+    /// left of the primary display.
+    ///
+    /// Chosen so that the window's screen position is well clear of zero, yet
+    /// smaller than the window: a rect wrongly offset by that position then
+    /// still overlaps the window, and the framework returns some OTHER band of
+    /// rows rather than refusing -- the quiet form of the defect, which is the
+    /// one a caller would not notice. Below the menu bar, so the system leaves
+    /// the window where it was put. The test reads the position the window list
+    /// reports and skips if it is too small to tell the defect apart.
+    const TOP_LEFT: (f64, f64) = (48.0, 64.0);
 
     /// How many rows a decoded row may differ from the one requested before
     /// the capture is judged to hold the wrong region.
@@ -238,6 +243,10 @@ mod pattern {
         // A window near the top of the screen would make an offset applied in
         // the wrong space too small to see, and a pass then would prove nothing
         // about that defect.
+        println!(
+            "window {window_id} of process {helper_pid} at ({}, {}), {}x{}",
+            window.x, window.y, window.width, window.height
+        );
         if window.y <= (TOLERANCE + 1) as f64 {
             return Outcome::Skipped(format!(
                 "the window sits {} points from the top of the screen, too close to tell a rect \
@@ -512,8 +521,17 @@ mod pattern {
             let _: bool = msg_send![&application, setActivationPolicy: 1isize];
             let _: () = msg_send![&application, finishLaunching];
 
+            // AppKit places windows by their BOTTOM-left corner, measured up
+            // from the bottom of the primary display, so the top-left position
+            // is converted through that display's height.
+            let screens: Retained<AnyObject> = msg_send![class!(NSScreen), screens];
+            let primary: Retained<AnyObject> = msg_send![&screens, firstObject];
+            let primary_frame: NSRect = msg_send![&primary, frame];
             let frame = NSRect::new(
-                NSPoint::new(ORIGIN, ORIGIN),
+                NSPoint::new(
+                    TOP_LEFT.0,
+                    primary_frame.size.height - TOP_LEFT.1 - SIDE as f64,
+                ),
                 NSSize::new(SIDE as f64, SIDE as f64),
             );
             let window_class: &AnyClass = class!(NSWindow);
