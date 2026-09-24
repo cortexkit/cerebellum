@@ -1564,6 +1564,163 @@ async fn the_production_constructor_wires_a_launcher_on_every_platform_that_has_
     );
 }
 
+/// Set in the child process that builds the isolated plane; the parent only
+/// spawns it and inspects the directory afterwards.
+const ISOLATED_DATA_HOME_CHILD: &str = "CEREBELLUM_TEST_ISOLATED_DATA_HOME_CHILD";
+
+/// An isolated plane with a launchable browser writes nothing under the data
+/// home.
+///
+/// `Isolated` is what a test passes to stay off the operator's audit data, so a
+/// journal it still opens on disk is a journal every test run touches: the
+/// launch journal also runs startup recovery, which may kill a browser and move
+/// profile custody recorded there. The check has to look at the disk, because
+/// nothing inside the plane can tell that a file was opened where it should not
+/// have been.
+///
+/// The data home is found through `XDG_DATA_HOME` and `HOME`, which are
+/// process-wide. Pointing them at a scratch directory inside this test binary
+/// would redirect every test running beside it, so the plane is built in a
+/// child process -- this same binary, filtered to this one test -- that
+/// receives the scratch directory through its own environment.
+#[test]
+fn an_isolated_plane_leaves_nothing_under_the_data_home() {
+    if std::env::var_os(ISOLATED_DATA_HOME_CHILD).is_some() {
+        build_an_isolated_plane_with_a_launcher();
+        return;
+    }
+
+    let scratch = std::env::temp_dir().join(format!(
+        "cerebellum-isolated-data-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos()
+    ));
+    let data_home = scratch.join("data");
+    let home = scratch.join("home");
+    std::fs::create_dir_all(&data_home).expect("create the scratch data home");
+    std::fs::create_dir_all(&home).expect("create the scratch home");
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "an_isolated_plane_leaves_nothing_under_the_data_home",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ISOLATED_DATA_HOME_CHILD, "1")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("HOME", &home)
+        .output()
+        .expect("spawn the child test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the child that builds the isolated plane failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // A filter that matched nothing also exits successfully, having built no
+    // plane and so written nothing -- which would pass the checks below.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test, so it built no plane:\n{stdout}"
+    );
+
+    let written: Vec<_> = [
+        data_home.join("cortexkit").join("cerebellum"),
+        home.join(".local")
+            .join("share")
+            .join("cortexkit")
+            .join("cerebellum"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .map(|path| {
+        let entries = walk(&path);
+        format!("{}: {entries:?}", path.display())
+    })
+    .collect();
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert!(
+        written.is_empty(),
+        "an isolated plane wrote under the data home: {written:?}"
+    );
+}
+
+fn build_an_isolated_plane_with_a_launcher() {
+    // The scratch directory reaches the plane only if the journal path is
+    // resolved from it. Were it resolved elsewhere, nothing would be written
+    // under the scratch directory whatever the plane did.
+    let data_home = std::path::PathBuf::from(
+        std::env::var_os("XDG_DATA_HOME").expect("the parent set XDG_DATA_HOME"),
+    );
+    let launch_journal = cerebellum_core::journal::journal_data_path("browser-launch.json")
+        .expect("the journal path resolves");
+    assert!(
+        launch_journal.starts_with(&data_home),
+        "{} is not under the scratch data home {}",
+        launch_journal.display(),
+        data_home.display()
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime");
+    runtime.block_on(async {
+        let planes = cerebellum::Planes::with_browser_config_journaling(
+            std::sync::Arc::new(cerebellum_core::health::HealthState::new()),
+            Some(cerebellum::browser_config::BrowserConfig {
+                // A path that is a file, since the launcher wiring filters on
+                // exactly that. It is never executed: nothing here launches.
+                executable_path: Some(std::env::current_exe().expect("the test binary is a file")),
+                expected_identity: Some("test.identity".into()),
+                launch_handshake_deadline_ms: 10_000,
+                termination_grace_period_ms: 1_000,
+                browser_idle_timeout_ms: 60_000,
+                browser_exit_observation_deadline_ms: 5_000,
+                navigation_settle_deadline_ms: 10_000,
+            }),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        // Without a launcher the launch journal is never opened, and an empty
+        // data home would say nothing about it.
+        assert_eq!(
+            planes.launch_service.is_some(),
+            cfg!(target_os = "macos") || cfg!(target_os = "linux"),
+            "the launcher wiring changed, so this no longer reaches the launch journal"
+        );
+        // The computer plane journals too; an isolated plane still serves it,
+        // from memory.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(
+            planes.computer.is_ok(),
+            "the isolated computer plane is unavailable: {:?}",
+            planes.computer.as_ref().err()
+        );
+    });
+}
+
+fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found
+}
+
 #[tokio::test]
 async fn present_fronts_then_marks_human_in_control() {
     let launcher = Arc::new(RecordingLauncher::default());

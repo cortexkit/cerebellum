@@ -1307,6 +1307,7 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
             // attested orphan from the previous module process.
             let service = Arc::new(browser_launch_service::ProductionLaunchService::open(
                 browser,
+                JournalPersistence::Durable,
             ));
             planes.capture.set_launcher(service.clone());
             planes.launch_service =
@@ -1962,6 +1963,43 @@ pub enum JournalPersistence {
     Isolated,
 }
 
+/// Where a journal that honours [`JournalPersistence`] keeps its state.
+///
+/// One storage type for both choices, so a plane's journal has the same type
+/// whichever the caller picked. The alternative, a type per choice, would have
+/// to be threaded through every plane that holds a journal, and a plane whose
+/// type only admits the filesystem is how an isolated plane kept writing to the
+/// operator's data home.
+#[derive(Clone, Debug)]
+pub enum PlaneJournalStorage {
+    /// The operator's journal file under the data home.
+    Filesystem(cerebellum_core::journal::FilesystemJournalStorage),
+    /// A journal that starts empty and is discarded with the plane.
+    InMemory(cerebellum_core::journal::InMemoryJournalStorage),
+}
+
+impl cerebellum_core::journal::JournalStorage for PlaneJournalStorage {
+    fn load(
+        &self,
+    ) -> Result<cerebellum_core::journal::store::DurableState, cerebellum_core::journal::StorageError>
+    {
+        match self {
+            Self::Filesystem(storage) => storage.load(),
+            Self::InMemory(storage) => storage.load(),
+        }
+    }
+
+    fn save(
+        &self,
+        state: &cerebellum_core::journal::store::DurableState,
+    ) -> Result<(), cerebellum_core::journal::StorageError> {
+        match self {
+            Self::Filesystem(storage) => storage.save(state),
+            Self::InMemory(storage) => storage.save(state),
+        }
+    }
+}
+
 impl Planes {
     /// A browser config with every deadline short and no executable, for
     /// tests. A running module builds through `with_browser_config` with the
@@ -2029,7 +2067,7 @@ impl Planes {
                     // write the one launch journal whose startup recovery
                     // reaps an orphan of either kind.
                     let service = Arc::new(browser_launch_service::ProductionLaunchService::open(
-                        config,
+                        config, journal,
                     ));
                     capture.set_launcher(service.clone());
                     service as Arc<dyn browser_session::BrowserSessionLauncher>
@@ -2093,7 +2131,7 @@ impl Planes {
             launch_service,
             management,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            computer: computer_capability::production_audit().map(|audit| {
+            computer: computer_capability::computer_audit(journal).map(|audit| {
                 // One idle estimator for the plane's lifetime: it exists to
                 // remember the previous sequence's posts, which a per-dispatch
                 // driver cannot do.

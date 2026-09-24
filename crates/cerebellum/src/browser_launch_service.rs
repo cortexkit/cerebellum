@@ -54,8 +54,7 @@ use crate::profile_custody::{
 };
 use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 
-type ProductionLaunchJournal =
-    DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage>;
+type ProductionLaunchJournal = DurableLaunchJournal<crate::PlaneJournalStorage>;
 
 type SharedLaunchJournal = Arc<Mutex<Option<ProductionLaunchJournal>>>;
 
@@ -118,10 +117,16 @@ impl ProductionLaunchService {
     /// published to request handlers. Keeping recovery synchronous here means no
     /// caller can obtain the service while an orphan still contends with a fresh
     /// spawn for the same profile.
-    pub fn open(config: BrowserConfig) -> Self {
+    ///
+    /// `persistence` decides where the launch journal lives. Recovery acts on
+    /// whatever that journal records -- it terminates browsers and moves
+    /// profile custody -- so an isolated service must not read the operator's
+    /// journal: it gets one in memory, which starts empty and gives recovery
+    /// nothing to act on.
+    pub fn open(config: BrowserConfig, persistence: crate::JournalPersistence) -> Self {
         Self::open_with_recovery(config, |config| {
             let mut startup_failure = None;
-            let journal = match DurableLaunchJournal::open_filesystem(launch_journal_config()) {
+            let journal = match open_launch_journal(persistence) {
                 Ok(mut journal) => {
                     let mut process = ProductionOrphanProcessControl {
                         reap_deadline: Duration::from_millis(config.termination_grace_period_ms),
@@ -811,6 +816,31 @@ const LAUNCH_JOURNAL_RETENTION_BYTES: u64 = 64 * 1024 * 1024;
 /// Public for the restore drill, for the same reason as
 /// `production_profile_lifecycle`: the drill opens the launch journal with the
 /// bounds production uses, not a copy of them.
+/// Open the launch journal where `persistence` says.
+///
+/// The durable arm is `DurableLaunchJournal::open_filesystem` with the storage
+/// wrapped, so production opens the same file with the same writability check.
+fn open_launch_journal(
+    persistence: crate::JournalPersistence,
+) -> Result<ProductionLaunchJournal, cerebellum_core::journal::BindingError> {
+    let storage = match persistence {
+        crate::JournalPersistence::Durable => {
+            let path = cerebellum_core::journal::journal_data_path(
+                crate::browser_launch::LAUNCH_JOURNAL_FILE_NAME,
+            )
+            .map_err(cerebellum_core::journal::BindingError::Storage)?;
+            crate::PlaneJournalStorage::Filesystem(
+                cerebellum_core::journal::FilesystemJournalStorage::prepare(path)
+                    .map_err(cerebellum_core::journal::BindingError::Storage)?,
+            )
+        }
+        crate::JournalPersistence::Isolated => crate::PlaneJournalStorage::InMemory(
+            cerebellum_core::journal::InMemoryJournalStorage::new(),
+        ),
+    };
+    DurableLaunchJournal::open(launch_journal_config(), storage)
+}
+
 #[doc(hidden)]
 pub fn launch_journal_config() -> cerebellum_core::journal::JournalConfig {
     cerebellum_core::journal::JournalConfig {

@@ -263,7 +263,7 @@ pub type RunningComputerPlane = ComputerPlane<
     NativeComputerCaptureBackend,
     cerebellum_computer::audit::redaction::ExcludeApplicationText,
     cerebellum_core::journal::ValidatedSeverityTaxonomy,
-    cerebellum_core::journal::FilesystemJournalStorage,
+    crate::PlaneJournalStorage,
     NativeComputerPlatformDriver,
 >;
 
@@ -337,19 +337,37 @@ where
 /// reason instead of silently substituting process-local storage.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[allow(clippy::result_large_err)]
-pub fn production_audit() -> Result<
-    ComputerAudit<
-        cerebellum_computer::audit::redaction::ExcludeApplicationText,
-        cerebellum_core::journal::ValidatedSeverityTaxonomy,
-        cerebellum_core::journal::FilesystemJournalStorage,
-    >,
-    ComputerPlaneUnavailable,
-> {
+pub fn production_audit() -> Result<RunningComputerAudit, ComputerPlaneUnavailable> {
+    computer_audit(crate::JournalPersistence::Durable)
+}
+
+/// The audit type a module's computer plane journals through: application text
+/// withheld, the pinned severity table, and a journal that is on disk or in
+/// memory as the plane's [`crate::JournalPersistence`] chose.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub type RunningComputerAudit = ComputerAudit<
+    cerebellum_computer::audit::redaction::ExcludeApplicationText,
+    cerebellum_core::journal::ValidatedSeverityTaxonomy,
+    crate::PlaneJournalStorage,
+>;
+
+/// The computer-plane audit with its journal where `persistence` says.
+///
+/// `Durable` is [`production_audit`]. `Isolated` keeps every other part --
+/// severity table, redaction, custody bounds, startup reconciliation -- and
+/// holds the journal in memory, so a test plane serves the same capabilities
+/// without creating, probing or reconciling the operator's `computer.json`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[allow(clippy::result_large_err)]
+pub fn computer_audit(
+    persistence: crate::JournalPersistence,
+) -> Result<RunningComputerAudit, ComputerPlaneUnavailable> {
     use cerebellum_computer::capture_custody::{
         CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
     };
     use cerebellum_core::journal::{
-        journal_data_path, BindingError, FilesystemJournalStorage, JournalConfig,
+        journal_data_path, BindingError, FilesystemJournalStorage, InMemoryJournalStorage,
+        JournalConfig,
     };
 
     // When the severity table cannot load, the computer plane has no severity
@@ -364,20 +382,31 @@ pub fn production_audit() -> Result<
     // reported when resolution is what failed. It must still name the real
     // location: an operator reading this error goes looking for the directory it
     // names, and a stale one sends them to a path nothing writes to.
-    let unresolved_path =
-        PathBuf::from("~/.local/share/cortexkit/cerebellum/journal/computer.json");
-    let path = journal_data_path("computer.json").map_err(|error| {
-        ComputerPlaneUnavailable::JournalStorage {
-            path: unresolved_path,
-            error,
+    let (path, storage) = match persistence {
+        crate::JournalPersistence::Durable => {
+            let unresolved_path =
+                PathBuf::from("~/.local/share/cortexkit/cerebellum/journal/computer.json");
+            let path = journal_data_path("computer.json").map_err(|error| {
+                ComputerPlaneUnavailable::JournalStorage {
+                    path: unresolved_path,
+                    error,
+                }
+            })?;
+            let storage = FilesystemJournalStorage::prepare(&path).map_err(|error| {
+                ComputerPlaneUnavailable::JournalStorage {
+                    path: path.clone(),
+                    error,
+                }
+            })?;
+            (path, crate::PlaneJournalStorage::Filesystem(storage))
         }
-    })?;
-    let storage = FilesystemJournalStorage::prepare(&path).map_err(|error| {
-        ComputerPlaneUnavailable::JournalStorage {
-            path: path.clone(),
-            error,
-        }
-    })?;
+        // No file exists to name, but a storage failure below still reports
+        // a path; this one says where the journal was held instead.
+        crate::JournalPersistence::Isolated => (
+            PathBuf::from("<in-memory computer journal>"),
+            crate::PlaneJournalStorage::InMemory(InMemoryJournalStorage::new()),
+        ),
+    };
 
     let custody = CaptureCustody::new(
         CustodyBounds {

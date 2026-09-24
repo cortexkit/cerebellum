@@ -335,12 +335,19 @@ check_tests_do_not_journal_durably() {
   # none from the day the plane shipped. It builds the plane and never
   # dispatches, and the store opens lazily on first reservation, so it observes
   # the setting without opening anything.
-  offenders="$(grep -rln "Planes::new(\|Planes::with_browser_config(" \
+  #
+  # Past the plane constructors: naming `JournalPersistence::Durable` outright,
+  # and the two openers that always take the operator's journal -- the computer
+  # audit and the launch journal. The launch journal is the costly one, since
+  # opening it runs startup recovery over whatever it records, which can kill a
+  # live browser and move profile custody.
+  offenders="$(grep -rln "Planes::new(\|Planes::with_browser_config(\|JournalPersistence::Durable\|production_audit(\|DurableLaunchJournal::open_filesystem(" \
     crates/*/tests/ 2>/dev/null | grep -v "tests/b1_s3_browser.rs" || true)"
   if [ -n "$offenders" ]; then
     echo "    these tests build a durably-journaling plane:" >&2
     echo "$offenders" | sed 's/^/      /' >&2
     echo "    use Planes::with_browser_config_journaling(.., JournalPersistence::Isolated)" >&2
+    echo "    (or an in-memory journal where a test opens one directly)" >&2
     echo "    or add the file here with the reason it must be durable." >&2
     return 1
   fi

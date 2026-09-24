@@ -1364,6 +1364,11 @@ where
     }
 }
 
+/// The launch journal's file name under the data home's journal directory.
+/// Shared by every opener, so the production service and the restore drill
+/// cannot drift apart onto two files.
+pub const LAUNCH_JOURNAL_FILE_NAME: &str = "browser-launch.json";
+
 impl DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage> {
     /// Open the production launch journal after creating its application-data
     /// directory and verifying that it can hold durable journal storage. A
@@ -1371,7 +1376,7 @@ impl DurableLaunchJournal<cerebellum_core::journal::FilesystemJournalStorage> {
     pub fn open_filesystem(
         config: CoreJournalConfig,
     ) -> Result<Self, cerebellum_core::journal::BindingError> {
-        let path = cerebellum_core::journal::journal_data_path("browser-launch.json")
+        let path = cerebellum_core::journal::journal_data_path(LAUNCH_JOURNAL_FILE_NAME)
             .map_err(cerebellum_core::journal::BindingError::Storage)?;
         let storage = cerebellum_core::journal::FilesystemJournalStorage::prepare(path)
             .map_err(cerebellum_core::journal::BindingError::Storage)?;
