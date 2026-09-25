@@ -492,31 +492,35 @@ fn with_classification_unavailable(
     detail
 }
 
-fn browser_click_result(outcome: crate::browser_session::BrowserClickOutcome) -> Value {
-    match outcome {
-        crate::browser_session::BrowserClickOutcome::Clicked(_) => {
-            json!({"outcome":"ok","url_final":Value::Null,"lifecycle":[]})
-        }
-        crate::browser_session::BrowserClickOutcome::JavaScriptDialogDismissed {
-            dialogs, ..
-        } => {
-            let dialogs = dialogs
-                .into_iter()
-                .map(|dialog| {
-                    json!({
-                        "dialog_type": dialog.dialog_type,
-                        "response": dialog.response.as_str(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "outcome":"javascript_dialog_dismissed",
-                "url_final":Value::Null,
-                "lifecycle":["javascript_dialog_opened","javascript_dialog_dismissed"],
-                "dialogs":dialogs,
-            })
-        }
+/// The reply fields a navigation reports from its tracker.
+///
+/// `browser.navigate` and a click that navigated both reply through here, so
+/// `url_final`, `lifecycle`, `http_status`, `challenge` and the `not_settled`
+/// outcome mean the same thing from either capability.
+fn navigation_reply(tracker: &Tracker, should_settle: bool) -> Value {
+    let mut response = if should_settle && !tracker.settled {
+        json!({
+            "outcome":"not_settled",
+            "remedy":"call browser.snapshot to re-observe the page before depending on its current state",
+            "url_final":tracker.url_final,
+            "lifecycle":tracker.lifecycle,
+        })
+    } else {
+        json!({"outcome":"ok","url_final":tracker.url_final,"lifecycle":tracker.lifecycle})
+    };
+    let response_object = response
+        .as_object_mut()
+        .expect("navigation response is an object");
+    if let Some(status) = tracker.http_status() {
+        response_object.insert("http_status".into(), json!(status));
     }
+    if tracker.cloudflare_challenge() {
+        response_object.insert(
+            "challenge".into(),
+            json!({"vendor":"cloudflare","evidence":"cf-mitigated: challenge"}),
+        );
+    }
+    response
 }
 
 fn viewport_refusal_detail(
@@ -591,6 +595,28 @@ pub struct Tracker {
     main_frame_id: Option<String>,
     pending_document_responses: HashMap<String, MainFrameResponse>,
     quiet_since: Option<Instant>,
+    /// The main frame asked to leave its current document. Set from events a
+    /// renderer-initiated navigation (a link click, a form submission, script)
+    /// emits before any network activity, so a click can tell that it caused a
+    /// navigation before the new document commits.
+    main_frame_navigation_requested: bool,
+    /// The main frame changed URL without replacing its document (a fragment
+    /// link, `history.pushState`). Kept apart from `url_final`, which only a
+    /// committed cross-document navigation sets.
+    main_frame_same_document_url: Option<String>,
+    /// The main frame stopped loading. Together with no committed navigation
+    /// this means the navigation ended without replacing the page, as a 204
+    /// response or a download does.
+    main_frame_stopped_loading: bool,
+    /// Document requests by request id, so a later `Network.loadingFailed`,
+    /// which carries no frame id, can be attributed to the frame it was for.
+    document_request_frames: HashMap<String, String>,
+    /// Failed document loads by frame id, held until main-frame identity
+    /// resolves, for the same reason document responses are.
+    pending_document_failures: HashMap<String, String>,
+    /// Why the committed main-frame navigation failed, when the browser
+    /// committed its own error page in place of the requested document.
+    main_frame_failure: Option<String>,
 }
 impl Tracker {
     pub fn token(&mut self, token: impl Into<String>) {
@@ -635,8 +661,72 @@ impl Tracker {
             .as_ref()
             .and_then(|frame_id| self.pending_document_responses.remove(frame_id));
         self.pending_document_responses.clear();
+        self.pending_document_failures.clear();
         self.main_frame_id = frame_id;
         self.url_final = Some(url);
+    }
+    /// A committed main-frame navigation that landed on the browser's own
+    /// error page. `unreachable_url` is what the browser failed to load; the
+    /// reason comes from the failed document request buffered for this frame.
+    pub fn main_frame_navigation_unreachable(
+        &mut self,
+        frame_id: Option<String>,
+        url: String,
+        unreachable_url: &str,
+    ) {
+        let failure = frame_id
+            .as_ref()
+            .and_then(|frame_id| self.pending_document_failures.remove(frame_id));
+        self.pending_document_failures.clear();
+        self.main_frame_navigated(frame_id, url);
+        self.main_frame_failure =
+            Some(failure.unwrap_or_else(|| format!("could not load {unreachable_url}")));
+    }
+    pub fn document_request_started(&mut self, request_id: &str, frame_id: &str) {
+        self.document_request_frames
+            .insert(request_id.to_string(), frame_id.to_string());
+    }
+    pub fn document_request_failed(&mut self, request_id: &str, error_text: String) {
+        let Some(frame_id) = self.document_request_frames.remove(request_id) else {
+            return;
+        };
+        match self.main_frame_id.as_deref() {
+            Some(main_frame_id) if main_frame_id == frame_id => {
+                self.main_frame_failure = Some(error_text);
+            }
+            Some(_) => {}
+            None => {
+                self.pending_document_failures.insert(frame_id, error_text);
+            }
+        }
+    }
+    pub fn main_frame_navigation_requested(&mut self) {
+        self.main_frame_navigation_requested = true;
+    }
+    pub fn main_frame_navigated_within_document(&mut self, url: String) {
+        self.main_frame_same_document_url = Some(url);
+    }
+    pub fn main_frame_stopped_loading(&mut self) {
+        self.main_frame_stopped_loading = true;
+    }
+    /// Whether the main frame has begun, or already committed, a navigation
+    /// to another document.
+    pub fn main_frame_navigation_observed(&self) -> bool {
+        self.main_frame_navigation_requested || self.url_final.is_some()
+    }
+    pub fn same_document_url(&self) -> Option<&str> {
+        self.main_frame_same_document_url.as_deref()
+    }
+    /// The main frame began a navigation and then stopped loading without
+    /// committing a new document, so the page the caller was on is still the
+    /// page shown.
+    pub fn navigation_ended_without_commit(&self) -> bool {
+        self.main_frame_navigation_requested
+            && self.main_frame_stopped_loading
+            && self.url_final.is_none()
+    }
+    pub fn main_frame_failure(&self) -> Option<&str> {
+        self.main_frame_failure.as_deref()
     }
     pub fn http_status(&self) -> Option<u16> {
         self.main_frame_response
@@ -2015,28 +2105,7 @@ impl BrowserPlane {
         } else {
             Outcome::Success
         };
-        let mut response = if should_settle && !tracker.settled {
-            json!({
-                "outcome":"not_settled",
-                "remedy":"call browser.snapshot to re-observe the page before depending on its current state",
-                "url_final":tracker.url_final,
-                "lifecycle":tracker.lifecycle,
-            })
-        } else {
-            json!({"outcome":"ok","url_final":tracker.url_final,"lifecycle":tracker.lifecycle})
-        };
-        let response_object = response
-            .as_object_mut()
-            .expect("navigation response is an object");
-        if let Some(status) = tracker.http_status() {
-            response_object.insert("http_status".into(), json!(status));
-        }
-        if tracker.cloudflare_challenge() {
-            response_object.insert(
-                "challenge".into(),
-                json!({"vendor":"cloudflare","evidence":"cf-mitigated: challenge"}),
-            );
-        }
+        let mut response = navigation_reply(&tracker, should_settle);
         self.finalize(
             identity,
             BrowserCapability::Navigate,
@@ -2410,6 +2479,136 @@ impl BrowserPlane {
             .await
     }
 
+    /// Build a click's reply from what the driver measured, and record a
+    /// navigation the click caused as the conversation's current page.
+    ///
+    /// Recording it is what keeps later reads honest: a snapshot or
+    /// screenshot authorizes against the tracked page, so leaving the page
+    /// the click started from in place would let the next read of the
+    /// landing page run under that page's grant.
+    async fn click_reply(
+        &self,
+        identity: &RouteIdentity,
+        outcome: crate::browser_session::BrowserClickOutcome,
+    ) -> Value {
+        use crate::browser_session::{BrowserClickOutcome, ClickNavigation};
+        let (dialogs, navigation) = match outcome {
+            BrowserClickOutcome::Clicked { navigation, .. } => (Vec::new(), navigation),
+            BrowserClickOutcome::JavaScriptDialogDismissed {
+                dialogs,
+                navigation,
+                ..
+            } => (dialogs, navigation),
+        };
+        let mut response = match navigation {
+            ClickNavigation::NoneObserved { window_ms } => json!({
+                "outcome":"ok",
+                "navigation":"none_observed",
+                "navigation_window_ms":window_ms,
+            }),
+            ClickNavigation::SameDocument { url } => {
+                // A same-document change cannot leave the origin, so the
+                // document epoch and its snapshots stay valid.
+                if let Some(context) = self
+                    .state
+                    .lock()
+                    .await
+                    .contexts
+                    .get_mut(&identity.conversation_key)
+                {
+                    context.tracker.url_final = Some(url.clone());
+                }
+                json!({"outcome":"ok","navigation":"same_document","url_final":url})
+            }
+            ClickNavigation::MainFrame(tracker) if tracker.navigation_ended_without_commit() => {
+                // The page the click started from is still the one shown.
+                json!({
+                    "outcome":"ok",
+                    "navigation":"not_committed",
+                    "lifecycle":tracker.lifecycle,
+                })
+            }
+            ClickNavigation::MainFrame(tracker) => {
+                if let Some(context) = self
+                    .state
+                    .lock()
+                    .await
+                    .contexts
+                    .get_mut(&identity.conversation_key)
+                {
+                    let _ = context
+                        .epoch
+                        .replace(DocumentTransition::TopLevelDocumentReplaced);
+                    context.tracker = (*tracker).clone();
+                }
+                let mut response = navigation_reply(&tracker, true);
+                let object = response
+                    .as_object_mut()
+                    .expect("navigation response is an object");
+                object.insert("navigation".into(), json!("main_frame"));
+                if let Some(error_text) = tracker.main_frame_failure() {
+                    let failed = BrowserError::NavigationFailed {
+                        error_text: error_text.to_string(),
+                    };
+                    object.insert("outcome".into(), json!(failed.outcome()));
+                    object.insert("remedy".into(), json!(failed.remedy()));
+                    object.insert("detail".into(), failed.detail().unwrap_or(Value::Null));
+                }
+                if let Some(url_final) = tracker.url_final.as_deref() {
+                    // The same check the next snapshot runs, made without
+                    // committing, so the caller learns before reading whether
+                    // that read will be refused and which origin to request.
+                    let landing_origin = origin_from_url(url_final);
+                    let granted = self
+                        .grants
+                        .lock()
+                        .await
+                        .authorize(
+                            AuthorizationRequest::snapshot(
+                                &identity.conversation_key,
+                                url_final,
+                                &identity.agent_project_id,
+                            ),
+                            &landing_origin,
+                        )
+                        .is_ok();
+                    object.insert("landing_origin".into(), json!(landing_origin));
+                    object.insert("landing_origin_granted".into(), json!(granted));
+                }
+                response
+            }
+        };
+        if !dialogs.is_empty() {
+            let object = response
+                .as_object_mut()
+                .expect("click response is an object");
+            if object.get("outcome") == Some(&json!("ok")) {
+                object.insert("outcome".into(), json!("javascript_dialog_dismissed"));
+            }
+            let mut lifecycle = vec![
+                json!("javascript_dialog_opened"),
+                json!("javascript_dialog_dismissed"),
+            ];
+            if let Some(Value::Array(navigation_lifecycle)) = object.remove("lifecycle") {
+                lifecycle.extend(navigation_lifecycle);
+            }
+            object.insert("lifecycle".into(), Value::Array(lifecycle));
+            object.insert(
+                "dialogs".into(),
+                dialogs
+                    .into_iter()
+                    .map(|dialog| {
+                        json!({
+                            "dialog_type": dialog.dialog_type,
+                            "response": dialog.response.as_str(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        response
+    }
+
     async fn click(&self, identity: &RouteIdentity, args: &Value) -> Result<Value, BrowserError> {
         let object = self
             .validate_request(args, &["ref", "snapshot_id", "intent", "severity"])
@@ -2599,7 +2798,7 @@ impl BrowserPlane {
         self.unpin_snapshot(identity, snapshot_id).await;
 
         let response = match drive_result {
-            Ok(outcome) => browser_click_result(outcome),
+            Ok(outcome) => self.click_reply(identity, outcome).await,
             Err(crate::browser_session::ClickDriveError::NoPosition) => {
                 self.finalize(
                     identity,
@@ -2960,7 +3159,7 @@ impl BrowserPlane {
         session_operation.finish();
         self.unpin_snapshot(identity, snapshot_id).await;
         let response = match drive_result {
-            Ok(outcome) => browser_click_result(outcome),
+            Ok(outcome) => self.click_reply(identity, outcome).await,
             Err(crate::browser_session::ClickPointDriveError::OutsideViewport(refusal)) => {
                 let detail = viewport_refusal_detail("point_outside_viewport", refusal);
                 self.finalize(
@@ -3242,7 +3441,7 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         },
         BrowserToolDefinition {
             name: CLICK,
-            description: "Click a retained structured reference.",
+            description: "Click a retained structured reference. The reply's navigation reports what the click did to the page: none_observed (within navigation_window_ms), same_document, not_committed, or main_frame with url_final, lifecycle, and landing_origin_granted, which is false when a read of the landing page would be refused.",
             request_schema: json!({"type":"object","properties":{"ref":{"type":"string"},"snapshot_id":{"type":"string"},"intent":{"type":"string"},"severity":severity_schema()},"required":["ref","snapshot_id","intent","severity"],"additionalProperties":false}),
             result_schema: click_result_schema(),
         },
@@ -3254,7 +3453,7 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         },
         BrowserToolDefinition {
             name: CLICK_POINT,
-            description: "Click a retained screenshot pixel. Coordinates address the image this module declared; pass its image_width_px and image_height_px so a coordinate taken from a resized copy is refused rather than mis-clicked.",
+            description: "Click a retained screenshot pixel. Coordinates address the image this module declared; pass its image_width_px and image_height_px so a coordinate taken from a resized copy is refused rather than mis-clicked. The reply reports navigation as browser.click does.",
             request_schema: json!({"type":"object","properties":{"snapshot_id":{"type":"string"},"x_px":{"type":"integer"},"y_px":{"type":"integer"},"image_width_px":{"type":"integer"},"image_height_px":{"type":"integer"},"intent":{"type":"string"},"severity":severity_schema()},"required":["snapshot_id","x_px","y_px","image_width_px","image_height_px","intent","severity"],"additionalProperties":false}),
             result_schema: click_point_result_schema(),
         },
@@ -3516,8 +3715,14 @@ fn snapshot_result_schema() -> Value {
 fn click_result_schema() -> Value {
     reply_schema(
         json!({
+            "navigation":enum_schema(&["none_observed", "same_document", "not_committed", "main_frame"]),
+            "navigation_window_ms":integer_schema(),
             "url_final":nullable_string_schema(),
             "lifecycle":string_array_schema(),
+            "http_status":integer_schema(),
+            "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
+            "landing_origin":string_schema(),
+            "landing_origin_granted":boolean_schema(),
             "dialogs":json!({"type":"array","items":closed_object(json!({"dialog_type":string_schema(),"response":string_schema()}), &["dialog_type", "response"])}),
         }),
         &[],

@@ -375,12 +375,34 @@ pub struct BrowserJavaScriptDialog {
     pub response: JavaScriptDialogResponse,
 }
 
+/// What a click did to the page's main frame, as observed after its input.
+///
+/// Only the main frame is reported. A subframe navigating is not the page
+/// moving, so it is left out rather than reported as if it were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickNavigation {
+    /// No main-frame navigation began within `window_ms` of the input
+    /// release being acknowledged.
+    NoneObserved { window_ms: u64 },
+    /// The main frame changed URL without replacing its document, as a
+    /// fragment link or `history.pushState` does.
+    SameDocument { url: String },
+    /// The main frame began navigating to another document. The tracker was
+    /// driven by the same settle loop `browser.navigate` uses, and may or may
+    /// not have committed or settled before the deadline.
+    MainFrame(Box<Tracker>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowserClickOutcome {
-    Clicked(BrowserClickPosition),
+    Clicked {
+        position: BrowserClickPosition,
+        navigation: ClickNavigation,
+    },
     JavaScriptDialogDismissed {
         position: BrowserClickPosition,
         dialogs: Vec<BrowserJavaScriptDialog>,
+        navigation: ClickNavigation,
     },
 }
 

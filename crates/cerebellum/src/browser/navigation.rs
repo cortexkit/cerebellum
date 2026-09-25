@@ -9,8 +9,8 @@ use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use crate::browser_session::{
     BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserJavaScriptDialog,
-    ClickDriveError, ClickPointDriveError, JavaScriptDialogResponse, NavigationDriveError,
-    NavigationWait, ViewportRefusal,
+    ClickDriveError, ClickNavigation, ClickPointDriveError, JavaScriptDialogResponse,
+    NavigationDriveError, NavigationWait, ViewportRefusal,
 };
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
 use crate::classification::{
@@ -24,6 +24,18 @@ use crate::snapshot_store::{
 };
 
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How long after a click's release is acknowledged to watch for the main
+/// frame starting a navigation before reporting that none was observed.
+///
+/// Measured against Chrome 153 headless on macOS (2026-09-25), clicking
+/// cross-origin-redirect, fragment, iframe, unresolvable-host and 204 links
+/// on a local server: the main frame's `Page.frameRequestedNavigation` arrived
+/// before the release acknowledgement in every run (18 to 114 ms before it),
+/// and a fragment's `Page.navigatedWithinDocument` at most 28 ms after. The window
+/// catches a start the renderer reports late on a loaded machine without
+/// making every non-navigating click wait long.
+const CLICK_NAVIGATION_WINDOW: Duration = Duration::from_millis(100);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_AX_NODES: usize = MAX_REFS;
 const MAX_AX_DEPTH: usize = 64;
@@ -815,9 +827,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
 
         self.actuate_click(
+            context_key,
             &attachment.session_id,
             position,
             deadline,
+            deadline_ms,
             input_dispatched,
             clock,
         )
@@ -866,9 +880,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
         self.actuate_click(
+            context_key,
             &attachment.session_id,
             position,
             deadline,
+            deadline_ms,
             input_dispatched,
             clock,
         )
@@ -963,16 +979,25 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         })
     }
 
+    /// Dispatch press then release at `position`, then report what the click
+    /// did to the main frame. `settle_deadline_ms` bounds the wait for a
+    /// navigation the click started, measured from when it was seen to start,
+    /// as `browser.navigate` bounds its own.
+    #[allow(clippy::too_many_arguments)]
     fn actuate_click<C: NavigationClock>(
         &mut self,
+        context_key: &str,
         session_id: &str,
         position: BrowserClickPosition,
         deadline: Instant,
+        settle_deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
     ) -> Result<BrowserClickOutcome, NavigationDriveError> {
         // Page events must be enabled before either input dispatch. Arming after a
-        // blocked release would leave the first dialog waiting for an answer.
+        // blocked release would leave the first dialog waiting for an answer,
+        // and the events that show the click starting a navigation arrive
+        // while the input commands are still in flight.
         self.command(
             "Page.enable",
             None,
@@ -981,7 +1006,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
+        // Network events are what a navigation settles on (in-flight requests
+        // reaching quiet) and where the landing document's status comes from.
+        self.command(
+            "Network.enable",
+            None,
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
 
+        // Tracked from the press onward: Chrome reports a link click's
+        // navigation request before it acknowledges the release.
+        let mut tracker = Tracker::default();
         let mut dialogs = Vec::new();
         let mut press_params = mouse_event_params("mousePressed", position);
         press_params.insert("button".into(), Value::String("left".into()));
@@ -994,6 +1032,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline,
             Some(&mut press_dispatched),
             &mut dialogs,
+            (context_key, &mut tracker),
             clock,
         )?;
         if press.error.is_some() {
@@ -1011,17 +1050,81 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline,
             Some(&mut release_dispatched),
             &mut dialogs,
+            (context_key, &mut tracker),
             clock,
         )?;
         if release.error.is_some() {
             return Err(NavigationDriveError::CdpFailure);
         }
 
+        let navigation =
+            self.observe_click_navigation(context_key, tracker, settle_deadline_ms, clock)?;
         if dialogs.is_empty() {
-            Ok(BrowserClickOutcome::Clicked(position))
+            Ok(BrowserClickOutcome::Clicked {
+                position,
+                navigation,
+            })
         } else {
-            Ok(BrowserClickOutcome::JavaScriptDialogDismissed { position, dialogs })
+            Ok(BrowserClickOutcome::JavaScriptDialogDismissed {
+                position,
+                dialogs,
+                navigation,
+            })
         }
+    }
+
+    /// Wait up to [`CLICK_NAVIGATION_WINDOW`] for the main frame to start
+    /// navigating, and if it does, settle that navigation exactly as
+    /// `browser.navigate` settles its own.
+    fn observe_click_navigation<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        mut tracker: Tracker,
+        settle_deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<ClickNavigation, NavigationDriveError> {
+        let window_end = clock
+            .now()
+            .checked_add(CLICK_NAVIGATION_WINDOW)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        while !tracker.main_frame_navigation_observed()
+            && tracker.same_document_url().is_none()
+            && clock.now() < window_end
+        {
+            self.read_turn(None, Some((context_key, &mut tracker)), clock.now())?;
+            if tracker.main_frame_navigation_observed() || tracker.same_document_url().is_some() {
+                break;
+            }
+            let remaining = window_end.saturating_duration_since(clock.now());
+            clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+        }
+
+        if tracker.main_frame_navigation_observed() {
+            // The same first token `browser.navigate` records. Placed first
+            // because the landing page may already have fired `load` while
+            // the input commands were in flight.
+            tracker.lifecycle.insert(0, "navigation_started".into());
+            let settle_deadline = clock
+                .now()
+                .checked_add(Duration::from_millis(settle_deadline_ms))
+                .ok_or(NavigationDriveError::CdpFailure)?;
+            self.settle_navigation(
+                context_key,
+                &mut tracker,
+                settle_deadline,
+                Tracker::navigation_ended_without_commit,
+                clock,
+            )?;
+            return Ok(ClickNavigation::MainFrame(Box::new(tracker)));
+        }
+        if let Some(url) = tracker.same_document_url() {
+            return Ok(ClickNavigation::SameDocument {
+                url: url.to_string(),
+            });
+        }
+        Ok(ClickNavigation::NoneObserved {
+            window_ms: CLICK_NAVIGATION_WINDOW.as_millis() as u64,
+        })
     }
 
     fn screenshot_with_clock<C: NavigationClock>(
@@ -1366,9 +1469,24 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             return Ok(());
         }
 
+        self.settle_navigation(context_key, tracker, deadline, |_| false, clock)
+    }
+
+    /// Feed page events into `tracker` until it settles, `ended` reports the
+    /// navigation over without settling, or `deadline` passes. Both
+    /// `browser.navigate` and a click that navigated wait through here, so the
+    /// two report `lifecycle`, `url_final` and settlement the same way.
+    fn settle_navigation<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        tracker: &mut Tracker,
+        deadline: Instant,
+        ended: impl Fn(&Tracker) -> bool,
+        clock: &mut C,
+    ) -> Result<(), NavigationDriveError> {
         while clock.now() < deadline {
             self.read_turn(None, Some((context_key, tracker)), clock.now())?;
-            if tracker.poll_settlement(clock.now()) {
+            if tracker.poll_settlement(clock.now()) || ended(tracker) {
                 return Ok(());
             }
             let remaining = deadline.saturating_duration_since(clock.now());
@@ -1508,6 +1626,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline: Instant,
         dispatched: Option<&mut dyn FnMut()>,
         dialogs: &mut Vec<BrowserJavaScriptDialog>,
+        tracking: (&str, &mut Tracker),
         clock: &mut C,
     ) -> Result<CdpResponse, NavigationDriveError> {
         self.command_response_inner(
@@ -1515,7 +1634,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             params,
             session_id,
             deadline,
-            None,
+            Some(tracking),
             dispatched,
             Some(dialogs),
             clock,
@@ -1535,7 +1654,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         clock: &mut C,
     ) -> Result<CdpResponse, NavigationDriveError> {
         if let Some(dialogs) = handled_dialogs.as_deref_mut() {
-            self.dismiss_pending_javascript_dialogs(deadline, dialogs, clock)?;
+            self.dismiss_pending_javascript_dialogs(deadline, dialogs, &mut tracking, clock)?;
         }
 
         let command = self
@@ -1570,7 +1689,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 None => self.read_turn(Some(command_id), None, clock.now())?,
             };
             if let Some(dialogs) = handled_dialogs.as_deref_mut() {
-                self.dismiss_pending_javascript_dialogs(deadline, dialogs, clock)?;
+                self.dismiss_pending_javascript_dialogs(deadline, dialogs, &mut tracking, clock)?;
             }
             if let Some(response) = response {
                 return Ok(response);
@@ -1584,17 +1703,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         &mut self,
         deadline: Instant,
         handled: &mut Vec<BrowserJavaScriptDialog>,
+        tracking: &mut Option<(&str, &mut Tracker)>,
         clock: &mut C,
     ) -> Result<(), NavigationDriveError> {
         while let Some(dialog) = self.pending_javascript_dialogs.pop_front() {
             let mut params = Map::new();
             params.insert("accept".into(), Value::Bool(false));
+            // Page events that arrive while the dialog is answered still
+            // belong to the click, so they keep feeding its tracker.
             let response = self.command_response(
                 "Page.handleJavaScriptDialog",
                 Some(params),
                 Some(dialog.session_id),
                 deadline,
-                None,
+                tracking
+                    .as_mut()
+                    .map(|(context_key, tracker)| (*context_key, &mut **tracker)),
                 None,
                 clock,
             )?;
@@ -1731,9 +1855,90 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 if !is_redirect_continuation {
                     tracker.request_started();
                 }
+                if let Some(params) = event
+                    .params
+                    .as_ref()
+                    .filter(|params| params.get("type").and_then(Value::as_str) == Some("Document"))
+                {
+                    if let (Some(request_id), Some(frame_id)) = (
+                        params.get("requestId").and_then(Value::as_str),
+                        params.get("frameId").and_then(Value::as_str),
+                    ) {
+                        tracker.document_request_started(request_id, frame_id);
+                    }
+                }
             }
-            "Network.loadingFinished" | "Network.loadingFailed" => {
-                tracker.request_finished(observed_at)
+            "Network.loadingFinished" => tracker.request_finished(observed_at),
+            "Network.loadingFailed" => {
+                tracker.request_finished(observed_at);
+                if let Some(params) = event.params.as_ref() {
+                    if let (Some(request_id), Some(error_text)) = (
+                        params.get("requestId").and_then(Value::as_str),
+                        params.get("errorText").and_then(Value::as_str),
+                    ) {
+                        tracker.document_request_failed(request_id, error_text.to_string());
+                    }
+                }
+            }
+            // These three carry only a frame id. A page target's main frame
+            // id is its target id: measured against Chrome 153 (2026-09-25),
+            // `Page.getFrameTree` returned the target id as the root frame id,
+            // and every event for the main frame carried it while an iframe's
+            // carried its own. So an event naming any other frame is a
+            // subframe's and never counts as the page navigating.
+            "Page.frameRequestedNavigation" | "Page.frameStartedNavigating" => {
+                let Some(params) = event.params.as_ref() else {
+                    return;
+                };
+                if params.get("frameId").and_then(Value::as_str)
+                    != Some(attachment.target_id.as_str())
+                {
+                    return;
+                }
+                // A link that opens a new tab or starts a download still
+                // requests a navigation from this frame, but this page stays
+                // where it is.
+                if params
+                    .get("disposition")
+                    .and_then(Value::as_str)
+                    .is_some_and(|disposition| disposition != "currentTab")
+                {
+                    return;
+                }
+                // Same-document navigations are reported through
+                // `Page.navigatedWithinDocument` instead.
+                if params
+                    .get("navigationType")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.contains("SameDocument") || kind == "sameDocument")
+                {
+                    return;
+                }
+                tracker.main_frame_navigation_requested();
+            }
+            "Page.navigatedWithinDocument" => {
+                let Some(params) = event.params.as_ref() else {
+                    return;
+                };
+                if params.get("frameId").and_then(Value::as_str)
+                    != Some(attachment.target_id.as_str())
+                {
+                    return;
+                }
+                if let Some(url) = params.get("url").and_then(Value::as_str) {
+                    tracker.main_frame_navigated_within_document(url.to_string());
+                }
+            }
+            "Page.frameStoppedLoading" => {
+                if event
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("frameId"))
+                    .and_then(Value::as_str)
+                    == Some(attachment.target_id.as_str())
+                {
+                    tracker.main_frame_stopped_loading();
+                }
             }
             "Page.frameNavigated" => {
                 let frame = event
@@ -1743,10 +1948,21 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .and_then(Value::as_object);
                 if let Some(frame) = frame.filter(|frame| !frame.contains_key("parentId")) {
                     if let Some(url) = frame.get("url").and_then(Value::as_str) {
-                        tracker.main_frame_navigated(
-                            frame.get("id").and_then(Value::as_str).map(str::to_string),
-                            url.to_string(),
-                        );
+                        let frame_id = frame.get("id").and_then(Value::as_str).map(str::to_string);
+                        // Chrome commits its own error page for a failed
+                        // navigation and names what it could not load here.
+                        match frame
+                            .get("unreachableUrl")
+                            .and_then(Value::as_str)
+                            .filter(|unreachable| !unreachable.is_empty())
+                        {
+                            Some(unreachable) => tracker.main_frame_navigation_unreachable(
+                                frame_id,
+                                url.to_string(),
+                                unreachable,
+                            ),
+                            None => tracker.main_frame_navigated(frame_id, url.to_string()),
+                        }
                     }
                 }
             }
@@ -3786,6 +4002,7 @@ mod tests {
             json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"id":7,"sessionId":"session-own","result":{}}),
             json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
@@ -3806,7 +4023,13 @@ mod tests {
             x_css: 22.0,
             y_css: 36.0,
         };
-        assert_eq!(outcome, BrowserClickOutcome::Clicked(position));
+        assert_eq!(
+            outcome,
+            BrowserClickOutcome::Clicked {
+                position,
+                navigation: ClickNavigation::NoneObserved { window_ms: 100 },
+            }
+        );
         assert_eq!(
             input_events,
             vec![
@@ -3815,7 +4038,7 @@ mod tests {
             ]
         );
         let writes = &driver.pipe.writes;
-        assert_eq!(writes.len(), 8);
+        assert_eq!(writes.len(), 9);
         assert_eq!(writes[0]["method"], "DOM.getContentQuads");
         assert_eq!(writes[1]["method"], "DOM.scrollIntoViewIfNeeded");
         assert_eq!(writes[1]["params"]["backendNodeId"], 42);
@@ -3825,10 +4048,11 @@ mod tests {
         assert_eq!(writes[4]["params"]["x"], 22);
         assert_eq!(writes[4]["params"]["y"], 36);
         assert_eq!(writes[5]["method"], "Page.enable");
-        assert_eq!(writes[6]["method"], "Input.dispatchMouseEvent");
-        assert_eq!(writes[6]["params"]["type"], "mousePressed");
+        assert_eq!(writes[6]["method"], "Network.enable");
         assert_eq!(writes[7]["method"], "Input.dispatchMouseEvent");
-        assert_eq!(writes[7]["params"]["type"], "mouseReleased");
+        assert_eq!(writes[7]["params"]["type"], "mousePressed");
+        assert_eq!(writes[8]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(writes[8]["params"]["type"], "mouseReleased");
     }
 
     #[test]
@@ -3842,6 +4066,7 @@ mod tests {
             json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"id":7,"sessionId":"session-own","result":{}}),
             json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
@@ -3859,10 +4084,13 @@ mod tests {
 
         assert_eq!(
             outcome,
-            BrowserClickOutcome::Clicked(BrowserClickPosition {
-                x_css: 150.0,
-                y_css: 70.0,
-            })
+            BrowserClickOutcome::Clicked {
+                position: BrowserClickPosition {
+                    x_css: 150.0,
+                    y_css: 70.0,
+                },
+                navigation: ClickNavigation::NoneObserved { window_ms: 100 },
+            }
         );
         assert_eq!(input_events.len(), 2);
         assert_eq!(
@@ -3871,7 +4099,7 @@ mod tests {
         );
         assert_eq!(driver.pipe.writes[2]["method"], "DOM.getContentQuads");
         assert_eq!(driver.pipe.writes[5]["method"], "Page.enable");
-        assert_eq!(driver.pipe.writes[6]["params"]["y"], 70.0);
+        assert_eq!(driver.pipe.writes[7]["params"]["y"], 70.0);
     }
 
     #[test]

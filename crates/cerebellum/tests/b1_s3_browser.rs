@@ -13,8 +13,8 @@ use cerebellum::browser::{self, BrowserCapability, BrowserPlane, SnapshotRefusal
 use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
     BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessions, CleanupStage,
-    ClickDriveError, ClickPointDriveError, LaunchSlot, NavigationDriveError, NavigationWait,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, ViewportRefusal,
+    ClickDriveError, ClickNavigation, ClickPointDriveError, LaunchSlot, NavigationDriveError,
+    NavigationWait, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, ViewportRefusal,
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
 use cerebellum::classification::ClassificationUnavailable;
@@ -322,7 +322,10 @@ impl OwnedBrowserProcess for SnapshotProcess {
         };
         input_dispatched(BrowserInputEvent::Press(position));
         input_dispatched(BrowserInputEvent::Release(position));
-        Ok(BrowserClickOutcome::Clicked(position))
+        Ok(BrowserClickOutcome::Clicked {
+            position,
+            navigation: ClickNavigation::NoneObserved { window_ms: 100 },
+        })
     }
 
     fn click_classified(
@@ -468,7 +471,10 @@ impl OwnedBrowserProcess for ClickProcess {
             self.input_events.lock().unwrap().push(event);
             input_dispatched(event);
         }
-        Ok(BrowserClickOutcome::Clicked(position))
+        Ok(BrowserClickOutcome::Clicked {
+            position,
+            navigation: ClickNavigation::NoneObserved { window_ms: 100 },
+        })
     }
 
     fn click_classified(
@@ -538,6 +544,7 @@ impl RecordingClickPointPipe {
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
             json!({"id":6,"sessionId":"session-own","result":{}}),
+            json!({"id":7,"sessionId":"session-own","result":{}}),
         ]
         .into_iter()
         .map(|frame| {
@@ -940,6 +947,7 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         json!({"id":9,"sessionId":"session-own","result":{}}),
         json!({"id":10,"sessionId":"session-own","result":{}}),
         json!({"id":11,"sessionId":"session-own","result":{}}),
+        json!({"id":12,"sessionId":"session-own","result":{}}),
     ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
@@ -1025,6 +1033,7 @@ fn screenshot_process_with_capture(
         json!({"id":9,"sessionId":"session-own","result":{}}),
         json!({"id":10,"sessionId":"session-own","result":{}}),
         json!({"id":11,"sessionId":"session-own","result":{}}),
+        json!({"id":12,"sessionId":"session-own","result":{}}),
     ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
@@ -1124,13 +1133,19 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
     position_on_authorized_page(&plane, &route).await;
     let snapshot_id = retain_click_point_snapshot(&plane, &route).await;
 
-    let _response = plane
+    let response = plane
         .dispatch(
             &route,
             BrowserCapability::ClickPoint,
             &click_point_arguments(&snapshot_id),
         )
         .await;
+    // A coordinate click shares the element click's input path, so it too
+    // reports the navigation it measured rather than a constant.
+    assert_eq!(response["outcome"], "ok", "{response}");
+    assert_eq!(response["navigation"], "none_observed", "{response}");
+    assert_eq!(response["navigation_window_ms"], 100, "{response}");
+    assert!(response.get("lifecycle").is_none(), "{response}");
 
     let commands = commands.lock().unwrap().clone();
     let methods: Vec<&str> = commands
@@ -1144,16 +1159,17 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
             "Target.attachToTarget",
             "Page.getLayoutMetrics",
             "Page.enable",
+            "Network.enable",
             "Input.dispatchMouseEvent",
             "Input.dispatchMouseEvent",
         ]
     );
-    assert_eq!(commands[4]["params"]["type"], "mousePressed");
-    assert_eq!(commands[4]["params"]["x"], 60.0);
-    assert_eq!(commands[4]["params"]["y"], 45.0);
-    assert_eq!(commands[5]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[5]["params"]["type"], "mousePressed");
     assert_eq!(commands[5]["params"]["x"], 60.0);
     assert_eq!(commands[5]["params"]["y"], 45.0);
+    assert_eq!(commands[6]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[6]["params"]["x"], 60.0);
+    assert_eq!(commands[6]["params"]["y"], 45.0);
     assert_eq!(
         plane
             .snapshot_pin_count_for_test(&route, &snapshot_id)

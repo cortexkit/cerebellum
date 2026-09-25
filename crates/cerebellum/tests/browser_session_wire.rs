@@ -1,16 +1,20 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity, OBSERVE};
-use cerebellum::browser::navigation::BrowserSnapshotObservation;
+use cerebellum::browser::navigation::{
+    classify_flattened_document, BrowserSnapshotObservation, CdpNavigationDriver,
+};
 use cerebellum::browser::{BrowserPlane, Tracker};
 use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
+use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
     BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher,
-    CleanupStage, ClickDriveError, LaunchedBrowser, NavigationDriveError, NavigationWait,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+    CleanupStage, ClickDriveError, ClickNavigation, LaunchedBrowser, NavigationDriveError,
+    NavigationWait, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
 };
+use cerebellum::cdp::{CdpFrameDecoder, CdpTransport};
 use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
     NonTypeClassificationInput, TargetKind,
@@ -436,7 +440,10 @@ impl OwnedBrowserProcess for RecordingProcess {
         self.effects.lock().unwrap().push("input_release");
         input_dispatched(BrowserInputEvent::Release(position));
         self.clicked = true;
-        Ok(BrowserClickOutcome::Clicked(position))
+        Ok(BrowserClickOutcome::Clicked {
+            position,
+            navigation: ClickNavigation::NoneObserved { window_ms: 100 },
+        })
     }
 
     fn generation_matches(&self) -> bool {
@@ -2325,4 +2332,570 @@ async fn a_closed_browser_without_relaunch_still_refuses_snapshots() {
     close_session(&planes, 2, &first).await;
     let refused = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(refused["outcome"], "no_session", "{refused}");
+}
+
+// ---------------------------------------------------------------------------
+// A click's reply reports the navigation it caused.
+//
+// These drive `browser.click` through the wire into the production CDP
+// driver, over a pipe that answers commands and emits page events in the
+// order Chrome 153 was measured to emit them for the same kind of click.
+// ---------------------------------------------------------------------------
+
+/// The page every scenario starts on, as a canonical origin plus the path
+/// `launch_at` records.
+const CLICK_PAGE_ORIGIN: &str = "https://example.com";
+/// A page target's main frame id is its target id in Chrome.
+const MAIN_FRAME: &str = "target-own";
+const LINK_BACKEND_NODE: u64 = 42;
+const LINK_DESTINATION: &str = "https://iana.org/domains/example";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClickScenario {
+    /// The main frame follows the link through a redirect chain to another
+    /// origin, commits, loads and goes quiet.
+    CrossOriginRedirect,
+    /// The click changes nothing.
+    NoNavigation,
+    /// Only an iframe navigates; the main frame stays where it is.
+    SubframeOnly,
+    /// The click opens a confirm dialog, which is dismissed; nothing navigates.
+    DialogDismissed,
+}
+
+/// The `DOM.getFlattenedDocument` result for the page: one link. The snapshot
+/// classifies the same document, so the driver's pre-input reclassification
+/// agrees with it.
+fn click_page_document() -> serde_json::Map<String, Value> {
+    json!({"nodes":[{
+        "nodeId":1,
+        "backendNodeId":LINK_BACKEND_NODE,
+        "nodeType":1,
+        "localName":"a",
+        "nodeName":"A",
+        "attributes":["href", LINK_DESTINATION],
+    }]})
+    .as_object()
+    .unwrap()
+    .clone()
+}
+
+fn session_event(method: &str, params: Value) -> Value {
+    json!({"method":method,"sessionId":"session-own","params":params})
+}
+
+fn document_response(request_id: &str, frame_id: &str, url: &str, status: u16) -> Value {
+    session_event(
+        "Network.responseReceived",
+        json!({
+            "requestId":request_id,
+            "frameId":frame_id,
+            "type":"Document",
+            "response":{"url":url,"status":status,"statusText":"OK","headers":{}}
+        }),
+    )
+}
+
+fn document_request(
+    request_id: &str,
+    frame_id: &str,
+    url: &str,
+    redirect_from: Option<u16>,
+) -> Value {
+    let mut params = json!({
+        "requestId":request_id,
+        "frameId":frame_id,
+        "type":"Document",
+        "request":{"url":url}
+    });
+    if let Some(status) = redirect_from {
+        params["redirectResponse"] = json!({"status":status,"statusText":"Moved","headers":{}});
+    }
+    session_event("Network.requestWillBeSent", params)
+}
+
+/// Events Chrome sends after acknowledging the release, per scenario.
+fn events_after_release(scenario: ClickScenario) -> Vec<Value> {
+    match scenario {
+        ClickScenario::CrossOriginRedirect => vec![
+            session_event("Page.frameStartedLoading", json!({"frameId":MAIN_FRAME})),
+            document_request("doc-1", MAIN_FRAME, LINK_DESTINATION, None),
+            document_request(
+                "doc-1",
+                MAIN_FRAME,
+                "https://www.iana.org/domains/example",
+                Some(301),
+            ),
+            document_request(
+                "doc-1",
+                MAIN_FRAME,
+                "http://www.iana.org/help/example-domains",
+                Some(301),
+            ),
+            document_request(
+                "doc-1",
+                MAIN_FRAME,
+                "https://www.iana.org/help/example-domains",
+                Some(307),
+            ),
+            document_response(
+                "doc-1",
+                MAIN_FRAME,
+                "https://www.iana.org/help/example-domains",
+                200,
+            ),
+            session_event(
+                "Page.frameNavigated",
+                json!({"frame":{
+                    "id":MAIN_FRAME,
+                    "loaderId":"loader-2",
+                    "url":"https://www.iana.org/help/example-domains",
+                    "securityOrigin":"https://www.iana.org",
+                    "mimeType":"text/html"
+                },"type":"Navigation"}),
+            ),
+            session_event("Network.loadingFinished", json!({"requestId":"doc-1"})),
+            session_event("Page.domContentEventFired", json!({"timestamp":1.0})),
+            session_event("Page.loadEventFired", json!({"timestamp":1.1})),
+            session_event("Page.frameStoppedLoading", json!({"frameId":MAIN_FRAME})),
+        ],
+        ClickScenario::SubframeOnly => vec![
+            session_event("Page.frameStartedLoading", json!({"frameId":"frame-child"})),
+            document_request("doc-2", "frame-child", "https://example.com/frame2", None),
+            document_response("doc-2", "frame-child", "https://example.com/frame2", 200),
+            session_event(
+                "Page.frameNavigated",
+                json!({"frame":{
+                    "id":"frame-child",
+                    "parentId":MAIN_FRAME,
+                    "loaderId":"loader-3",
+                    "url":"https://example.com/frame2",
+                    "securityOrigin":"https://example.com",
+                    "mimeType":"text/html"
+                },"type":"Navigation"}),
+            ),
+            session_event("Network.loadingFinished", json!({"requestId":"doc-2"})),
+            session_event("Page.frameStoppedLoading", json!({"frameId":"frame-child"})),
+        ],
+        ClickScenario::NoNavigation | ClickScenario::DialogDismissed => Vec::new(),
+    }
+}
+
+/// A CDP pipe that answers the driver's commands the way Chrome does and,
+/// on the mouse release, emits the scenario's page events.
+struct ChromeLikePipe {
+    scenario: ClickScenario,
+    reads: VecDeque<Vec<u8>>,
+    blocked_release_id: Option<u64>,
+}
+
+impl ChromeLikePipe {
+    fn queue(&mut self, frame: Value) {
+        let mut bytes = serde_json::to_vec(&frame).unwrap();
+        bytes.push(0);
+        self.reads.push_back(bytes);
+    }
+
+    fn reply(&mut self, id: u64, result: Value) {
+        self.queue(json!({"id":id,"sessionId":"session-own","result":result}));
+    }
+}
+
+impl CdpPipeIo for ChromeLikePipe {
+    fn write_frame(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        let id = command["id"].as_u64().unwrap();
+        match command["method"].as_str().unwrap() {
+            "Target.createTarget" => {
+                self.queue(json!({"id":id,"result":{"targetId":"target-own"}}));
+            }
+            "Target.attachToTarget" => {
+                self.queue(json!({"id":id,"result":{"sessionId":"session-own"}}));
+            }
+            "DOM.getContentQuads" => self.reply(
+                id,
+                json!({"quads":[[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]}),
+            ),
+            "Page.getLayoutMetrics" => self.reply(
+                id,
+                json!({"cssVisualViewport":{
+                    "offsetX":0.0,"offsetY":0.0,"pageX":0.0,"pageY":0.0,
+                    "clientWidth":1280.0,"clientHeight":713.0,"scale":1.0
+                }}),
+            ),
+            "DOM.getNodeForLocation" => self.reply(
+                id,
+                json!({"backendNodeId":LINK_BACKEND_NODE,"frameId":MAIN_FRAME}),
+            ),
+            "DOM.getFlattenedDocument" => self.reply(id, Value::Object(click_page_document())),
+            "DOM.scrollIntoViewIfNeeded" | "DOM.enable" | "Page.enable" | "Network.enable" => {
+                self.reply(id, json!({}))
+            }
+            "Input.dispatchMouseEvent" if command["params"]["type"] == "mousePressed" => {
+                self.reply(id, json!({}))
+            }
+            "Input.dispatchMouseEvent" => match self.scenario {
+                ClickScenario::DialogDismissed => {
+                    // The release blocks until the dialog is answered.
+                    self.blocked_release_id = Some(id);
+                    self.queue(session_event(
+                        "Page.javascriptDialogOpening",
+                        json!({
+                            "type":"confirm",
+                            "message":"leave?",
+                            "url":"https://example.com/page",
+                            "hasBrowserHandler":false
+                        }),
+                    ));
+                }
+                scenario => {
+                    // Measured: the navigation request for a link click
+                    // arrives before the release acknowledgement.
+                    match scenario {
+                        ClickScenario::CrossOriginRedirect => self.queue(session_event(
+                            "Page.frameRequestedNavigation",
+                            json!({
+                                "frameId":MAIN_FRAME,
+                                "reason":"anchorClick",
+                                "url":LINK_DESTINATION,
+                                "disposition":"currentTab"
+                            }),
+                        )),
+                        ClickScenario::SubframeOnly => self.queue(session_event(
+                            "Page.frameRequestedNavigation",
+                            json!({
+                                "frameId":"frame-child",
+                                "reason":"anchorClick",
+                                "url":"https://example.com/frame2",
+                                "disposition":"currentTab"
+                            }),
+                        )),
+                        _ => {}
+                    }
+                    self.reply(id, json!({}));
+                    for event in events_after_release(scenario) {
+                        self.queue(event);
+                    }
+                }
+            },
+            "Page.handleJavaScriptDialog" => {
+                assert_eq!(command["params"]["accept"], false);
+                let release_id = self
+                    .blocked_release_id
+                    .take()
+                    .expect("the dialog handler follows a blocked release");
+                self.reply(release_id, json!({}));
+                self.reply(id, json!({}));
+            }
+            other => panic!("unexpected CDP command {other}: {command}"),
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<PipeRead> {
+        let Some(bytes) = self.reads.pop_front() else {
+            return Ok(PipeRead::WouldBlock);
+        };
+        destination[..bytes.len()].copy_from_slice(&bytes);
+        Ok(PipeRead::Bytes(bytes.len()))
+    }
+}
+
+/// A browser whose snapshot is canned (the snapshot path is not what these
+/// tests exercise) and whose click runs through the production CDP driver.
+struct CdpClickProcess {
+    driver: CdpNavigationDriver<ChromeLikePipe>,
+    snapshots: Arc<Mutex<usize>>,
+}
+
+impl OwnedBrowserProcess for CdpClickProcess {
+    fn snapshot_classified(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        document_epoch: u64,
+        current_origin: &str,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        *self.snapshots.lock().unwrap() += 1;
+        let identity =
+            BackendNodeIdentity::new("target-own", MAIN_FRAME, LINK_BACKEND_NODE).unwrap();
+        let classification = classify_flattened_document(
+            &click_page_document(),
+            &identity,
+            document_epoch,
+            current_origin,
+        )
+        .expect("the link on the page classifies");
+        Ok(BrowserSnapshotObservation {
+            records: vec![AxRecord {
+                depth: 0,
+                role: "link".into(),
+                name: "Learn more".into(),
+                value: None,
+                reference: Some("e1".into()),
+            }],
+            dom_text: None,
+            refs: vec![RefRecord {
+                captured: SnapshotRef::new("e1", "link", "Learn more", 0).unwrap(),
+                frame_path: vec![MAIN_FRAME.into()],
+                backend_identity: Some(identity),
+                raw_role: Some("link".into()),
+                raw_name: Some("Learn more".into()),
+                classification: Ok(Box::new(classification)),
+            }],
+            ax_truncated: false,
+            refs_truncated: false,
+        })
+    }
+
+    fn click_classified(
+        &mut self,
+        context_key: &str,
+        identity: &BackendNodeIdentity,
+        document_epoch: u64,
+        current_origin: &str,
+        expected: Option<&cerebellum::classification::NonTypeClassificationRecord>,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.driver.click_classified(
+            context_key,
+            identity,
+            document_epoch,
+            current_origin,
+            expected,
+            deadline_ms,
+            input_dispatched,
+        )
+    }
+
+    fn generation_matches(&self) -> bool {
+        true
+    }
+
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+struct CdpClickLauncher {
+    scenario: ClickScenario,
+    snapshots: Arc<Mutex<usize>>,
+}
+
+impl BrowserSessionLauncher for CdpClickLauncher {
+    fn launch(
+        &self,
+        _: &cerebellum_core::identity::AcceptedBindFacts,
+        _: &str,
+    ) -> Result<LaunchedBrowser, Value> {
+        Ok(LaunchedBrowser {
+            process: Box::new(CdpClickProcess {
+                driver: CdpNavigationDriver::new(
+                    ChromeLikePipe {
+                        scenario: self.scenario,
+                        reads: VecDeque::new(),
+                        blocked_release_id: None,
+                    },
+                    CdpTransport::new(),
+                    CdpFrameDecoder::default(),
+                ),
+                snapshots: Arc::clone(&self.snapshots),
+            }),
+            cleanup: Box::new(RecordingCleanup {
+                effects: Arc::new(Mutex::new(Vec::new())),
+            }),
+            executable_identity_checkpoints: ExecutableIdentityCheckpoints::AfterExecOnly,
+        })
+    }
+}
+
+/// Long enough for a navigation to reach network quiet, which needs
+/// `QUIET_MS` of real time after the last request finishes.
+const CLICK_SETTLE_DEADLINE_MS: u64 = 3_000;
+
+/// Launch on the example page with a tier-4 grant for `granted_origins`,
+/// snapshot it, and click its link.
+async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Planes, Value, usize) {
+    let snapshots = Arc::new(Mutex::new(0));
+    let config = BrowserConfig {
+        navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
+        ..config()
+    };
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config.clone()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        scenario,
+        snapshots: Arc::clone(&snapshots),
+    }));
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(
+            planes.sessions.clone(),
+            Arc::clone(&planes.lease_clock),
+            config.navigation_settle_deadline_ms,
+        )
+        .with_grants_installed(GrantStore::new([ActionGrant::new(
+            "browse",
+            1,
+            "test-session",
+            Severity::new(4, false, false),
+            granted_origins.iter().copied(),
+        )])),
+    );
+    launch_at(&planes, CLICK_PAGE_ORIGIN).await;
+
+    let snapshot = invoke(&planes, 100, "browser.snapshot", json!({"mode": "ax"})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let clicked = invoke(
+        &planes,
+        101,
+        "browser.click",
+        json!({
+            "ref": snapshot["refs"][0]["ref"],
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "follow the Learn more link",
+            "severity": {"tier": 4, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    // Parsed from the wire frame, after result-schema enforcement: a field
+    // the click schema did not declare would have withheld this reply.
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    let snapshot_count = *snapshots.lock().unwrap();
+    (planes, clicked, snapshot_count)
+}
+
+#[tokio::test]
+async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_reading_there_is_ungranted(
+) {
+    let (planes, clicked, _) =
+        click_link(ClickScenario::CrossOriginRedirect, &[CLICK_PAGE_ORIGIN]).await;
+
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(clicked["navigation"], "main_frame", "{clicked}");
+    assert_eq!(
+        clicked["url_final"], "https://www.iana.org/help/example-domains",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["lifecycle"],
+        json!(["navigation_started", "load", "network_quiet"]),
+        "{clicked}"
+    );
+    assert_eq!(clicked["http_status"], 200, "{clicked}");
+    assert_eq!(
+        clicked["landing_origin"], "https://www.iana.org",
+        "{clicked}"
+    );
+    assert_eq!(clicked["landing_origin_granted"], false, "{clicked}");
+    assert!(clicked.get("navigation_window_ms").is_none(), "{clicked}");
+
+    // The reply's claim holds: the conversation's page is now the landing
+    // page, and reading it is refused under the grant for the old origin.
+    let refused = invoke(&planes, 102, "browser.snapshot", json!({"mode": "ax"})).await;
+    let refused: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(
+        refused["detail"]["attempted_origin"], "https://www.iana.org",
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_click_landing_on_a_granted_origin_says_it_can_be_read() {
+    let (_, clicked, _) = click_link(
+        ClickScenario::CrossOriginRedirect,
+        &[CLICK_PAGE_ORIGIN, "https://www.iana.org"],
+    )
+    .await;
+
+    assert_eq!(clicked["navigation"], "main_frame", "{clicked}");
+    assert_eq!(
+        clicked["landing_origin"], "https://www.iana.org",
+        "{clicked}"
+    );
+    assert_eq!(clicked["landing_origin_granted"], true, "{clicked}");
+}
+
+#[tokio::test]
+async fn a_click_that_navigates_nowhere_says_none_was_observed() {
+    let (_, clicked, _) = click_link(ClickScenario::NoNavigation, &[CLICK_PAGE_ORIGIN]).await;
+
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(clicked["navigation"], "none_observed", "{clicked}");
+    assert_eq!(clicked["navigation_window_ms"], 100, "{clicked}");
+    // Nothing was measured, so nothing that reads like a measurement is
+    // claimed: no empty lifecycle, no null landing URL.
+    for absent in [
+        "lifecycle",
+        "url_final",
+        "landing_origin",
+        "landing_origin_granted",
+    ] {
+        assert!(clicked.get(absent).is_none(), "{absent} in {clicked}");
+    }
+}
+
+#[tokio::test]
+async fn a_subframe_navigation_is_not_reported_as_the_page_navigating() {
+    let (planes, clicked, _) = click_link(ClickScenario::SubframeOnly, &[CLICK_PAGE_ORIGIN]).await;
+
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(clicked["navigation"], "none_observed", "{clicked}");
+    for absent in ["lifecycle", "url_final", "http_status", "landing_origin"] {
+        assert!(clicked.get(absent).is_none(), "{absent} in {clicked}");
+    }
+
+    // The page is still the one the click started on, so it is still readable.
+    let snapshot = invoke(&planes, 102, "browser.snapshot", json!({"mode": "ax"})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(
+        snapshot["source_origin"], "https://example.com/page",
+        "{snapshot}"
+    );
+}
+
+#[tokio::test]
+async fn a_click_whose_dialog_is_dismissed_reports_the_dialog_and_no_navigation() {
+    let (planes, clicked, _) =
+        click_link(ClickScenario::DialogDismissed, &[CLICK_PAGE_ORIGIN]).await;
+
+    assert_eq!(
+        clicked["outcome"], "javascript_dialog_dismissed",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["dialogs"],
+        json!([{"dialog_type":"confirm","response":"dismissed"}]),
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["lifecycle"],
+        json!(["javascript_dialog_opened", "javascript_dialog_dismissed"]),
+        "{clicked}"
+    );
+    assert_eq!(clicked["navigation"], "none_observed", "{clicked}");
+    assert!(clicked.get("url_final").is_none(), "{clicked}");
+
+    let snapshot = invoke(&planes, 102, "browser.snapshot", json!({"mode": "ax"})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
 }
