@@ -83,3 +83,7 @@ test = true
 [[example]]
 name = "live_interrupt"
 test = true
+
+[[example]]
+name = "crashpad_census"
+test = true

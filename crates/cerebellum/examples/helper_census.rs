@@ -50,10 +50,15 @@ fn main() {
     std::process::exit(census::run());
 }
 
+// The CDP pipe client, shared with the `crashpad_census` example, which
+// launches Chrome the same way this probe does.
+#[cfg(target_os = "macos")]
+#[path = "support/cdp_pipe.rs"]
+mod cdp_pipe;
+
 #[cfg(target_os = "macos")]
 mod census {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
@@ -65,7 +70,9 @@ mod census {
         browser_launch_arguments, browser_launch_environment,
     };
     use cerebellum_macos::{process_start_time, ProcessGeneration, ProcessStartTime};
-    use serde_json::{json, Value};
+    use serde_json::json;
+
+    use crate::cdp_pipe::Cdp;
 
     /// How long a page is left open before the census, so the helpers Chrome
     /// starts lazily (GPU, network, storage, audio) have appeared.
@@ -383,12 +390,7 @@ mod census {
             .release()
             .map_err(|error| format!("release: {error:?}"))?;
         let main = released.generation();
-        let mut cdp = Cdp {
-            writer: command_parent,
-            reader: response_parent,
-            buffer: Vec::new(),
-            next_id: 1,
-        };
+        let mut cdp = Cdp::new(command_parent, response_parent);
 
         let deadline = Instant::now() + setup.handshake;
         let version = cdp
@@ -919,70 +921,6 @@ mod census {
             0
         } else {
             1
-        }
-    }
-
-    /// The CDP pipe: NUL-terminated JSON messages in each direction.
-    struct Cdp {
-        writer: UnixStream,
-        reader: UnixStream,
-        buffer: Vec<u8>,
-        next_id: u64,
-    }
-
-    impl Cdp {
-        fn send(&mut self, method: &str, params: Value) -> Result<u64, String> {
-            let id = self.next_id;
-            self.next_id += 1;
-            let mut bytes =
-                serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
-                    .map_err(|error| error.to_string())?;
-            bytes.push(0);
-            self.writer
-                .write_all(&bytes)
-                .map_err(|error| format!("write: {error}"))?;
-            Ok(id)
-        }
-
-        fn call(
-            &mut self,
-            method: &str,
-            params: Value,
-            deadline: Instant,
-        ) -> Result<Value, String> {
-            let id = self.send(method, params)?;
-            loop {
-                while let Some(end) = self.buffer.iter().position(|byte| *byte == 0) {
-                    let frame: Vec<u8> = self.buffer.drain(..=end).collect();
-                    let Ok(message) = serde_json::from_slice::<Value>(&frame[..end]) else {
-                        continue;
-                    };
-                    if message["id"].as_u64() == Some(id) {
-                        if let Some(error) = message.get("error") {
-                            return Err(format!("{method} failed: {error}"));
-                        }
-                        return Ok(message["result"].clone());
-                    }
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(format!("{method}: no answer before the deadline"));
-                }
-                self.reader
-                    .set_read_timeout(Some(remaining))
-                    .map_err(|error| error.to_string())?;
-                let mut chunk = [0_u8; 64 * 1024];
-                match self.reader.read(&mut chunk) {
-                    Ok(0) => return Err(format!("{method}: the browser closed the pipe")),
-                    Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(error) => return Err(format!("{method}: read: {error}")),
-                }
-            }
         }
     }
 }
