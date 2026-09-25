@@ -235,6 +235,8 @@ fn origin_scope_refusal_lists_every_severity_covering_grant_origin() {
         AuthorizationError::OriginScope {
             attempted_origin: "https://c.test".to_string(),
             granted_origins: vec!["https://a.test".to_string(), "https://b.test".to_string()],
+            required: Severity::new(OBSERVE, false, false),
+            required_hazards: Default::default(),
         }
     );
 }
@@ -368,7 +370,12 @@ fn disclosure_coverage_is_subset_semantics_and_unknown_is_distinct() {
         .unwrap_err();
     assert_eq!(
         unknown,
-        AuthorizationError::HazardNotDisclosed(HazardClass::UnverifiedFormContents)
+        AuthorizationError::HazardNotDisclosed {
+            missing: HazardClass::UnverifiedFormContents,
+            attempted_origin: "https://login.test".to_string(),
+            required: Severity::new(MUTATE_DURABLE, true, true),
+            required_hazards: [HazardClass::UnverifiedFormContents].into(),
+        }
     );
 
     let unknown_grant = grant("unknown", &["https://login.test"])

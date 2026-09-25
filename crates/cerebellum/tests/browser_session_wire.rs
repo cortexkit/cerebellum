@@ -161,8 +161,9 @@ async fn bind_management_route(planes: &Planes) {
 }
 
 /// Send `browser.open_grant` with exactly `params`, allow the question, and
-/// wait until the grant is minted.
-async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) {
+/// wait until the grant is minted. Returns the `open_grant` reply, whose
+/// `severity_ceiling` is the ceiling the minted grant carries.
+async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Value {
     let before = planes.management.browser_grant_count().await;
     let opening = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -194,6 +195,7 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) {
     })
     .await
     .expect("the affirmative answer mints a grant");
+    reply
 }
 
 fn snapshot_observation(
@@ -1140,7 +1142,9 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
 }
 
 /// With no grant at all, `no_grant` names the origin and severity a grant
-/// must cover, and opening exactly that grant admits the retry.
+/// must cover, and opening exactly that grant admits the retry. A read needs
+/// only tier 1, but a grant without hazards is never minted below compose, so
+/// the request names tier 2: the ceiling the grant it opens really carries.
 #[tokio::test]
 async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_it() {
     let launcher = Arc::new(RecordingLauncher::default());
@@ -1168,12 +1172,17 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
     );
     assert_eq!(
         refused["detail"]["grant_request"],
-        json!({"origins": ["https://page.example"], "severity_tier": 1, "hazards": []}),
+        json!({"origins": ["https://page.example"], "severity_tier": 2, "hazards": []}),
         "{refused}"
     );
     assert!(launcher.effects.lock().unwrap().is_empty());
 
-    open_grant_and_allow(&planes, 71, refused["detail"]["grant_request"].clone()).await;
+    let opened =
+        open_grant_and_allow(&planes, 71, refused["detail"]["grant_request"].clone()).await;
+    assert_eq!(
+        opened["severity_ceiling"]["tier"], refused["detail"]["grant_request"]["severity_tier"],
+        "the refusal named a tier the grant is not minted at: {opened}"
+    );
     let snapshot = invoke_existing(&planes, 72, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
@@ -1336,9 +1345,16 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
         clicked["detail"]["missing_hazard"], "credential_form_submit",
         "{clicked}"
     );
+    // The existing grant discloses only the financial hazard, so the grant
+    // that admits this click names the credential hazard it lacks.
+    assert_eq!(
+        clicked["detail"]["grant_request"],
+        json!({"origins": ["https://page.example"], "severity_tier": 4, "hazards": ["credential_form_submit"]}),
+        "{clicked}"
+    );
     assert_eq!(
         clicked["remedy"],
-        "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
+        "call browser.open_grant with the arguments in detail.grant_request, then retry",
         "{clicked}"
     );
     assert_eq!(
@@ -3078,6 +3094,112 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
     assert_eq!(
         refused["detail"]["attempted_origin"], "https://www.iana.org",
         "{refused}"
+    );
+}
+
+/// The way an ungranted page is reached live: a click follows a link to
+/// another origin, and the next read there is refused `origin_scope`. That
+/// refusal must name the grant for the page's origin as it is now, and
+/// following it literally -- open exactly those arguments, answer allow,
+/// read again -- must succeed. A refusal whose remedy leaves the caller to
+/// guess the tier or hazards sends it round the same loop.
+#[tokio::test]
+async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_following_it_succeeds() {
+    let page = CommittedPage::default();
+    let config = BrowserConfig {
+        navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
+        ..config()
+    };
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        scenario: ClickScenario::CrossOriginRedirect,
+        snapshots: Arc::default(),
+        page: page.clone(),
+        commands: Arc::default(),
+    }));
+    bind_management_route(&planes).await;
+    // A durable-tier grant for the starting page only, so the click that
+    // leaves it is admitted and the landing origin stays ungranted.
+    open_grant_and_allow(
+        &planes,
+        110,
+        json!({"origins": [CLICK_PAGE_ORIGIN], "hazards": [], "severity_tier": 4}),
+    )
+    .await;
+    launch_at(&planes, &page, CLICK_PAGE_ORIGIN).await;
+
+    let snapshot = invoke_existing(&planes, 111, "browser.snapshot", json!({"mode": "ax"})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let clicked = invoke_existing(
+        &planes,
+        112,
+        "browser.click",
+        json!({
+            "ref": snapshot["refs"][0]["ref"],
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "follow the Learn more link",
+            "severity": {"tier": 4, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(
+        clicked["landing_origin"], "https://www.iana.org",
+        "{clicked}"
+    );
+    assert_eq!(clicked["landing_origin_granted"], false, "{clicked}");
+
+    // Parsed from the wire frame, after result-schema enforcement: an
+    // undeclared detail field would have withheld this reply.
+    let read = json!({"mode": "ax"});
+    let refused = invoke_existing(&planes, 113, "browser.snapshot", read.clone()).await;
+    let refused: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "origin_scope", "{refused}");
+    assert_eq!(
+        refused["detail"]["attempted_origin"], "https://www.iana.org",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["granted_origins"],
+        json!(["https://example.com"]),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["required"],
+        json!({"tier": 1, "credential": false, "financial": false}),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["detail"]["grant_request"],
+        json!({"origins": ["https://www.iana.org"], "severity_tier": 2, "hazards": []}),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["remedy"],
+        "call browser.open_grant with the arguments in detail.grant_request, then retry",
+        "{refused}"
+    );
+
+    // Follow the remedy literally, then retry the identical read.
+    let opened =
+        open_grant_and_allow(&planes, 114, refused["detail"]["grant_request"].clone()).await;
+    assert_eq!(
+        opened["severity_ceiling"]["tier"], refused["detail"]["grant_request"]["severity_tier"],
+        "{opened}"
+    );
+    let read_again = invoke_existing(&planes, 115, "browser.snapshot", read).await;
+    let read_again: Value = serde_json::from_slice(&read_again.body).unwrap();
+    assert_eq!(read_again["outcome"], "ok", "{read_again}");
+    assert_eq!(
+        read_again["source_origin"], "https://www.iana.org/help/example-domains",
+        "{read_again}"
     );
 }
 

@@ -5034,7 +5034,12 @@ mod tests {
         );
         assert_eq!(
             result["remedy"],
-            "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
+            "call browser.open_grant with the arguments in detail.grant_request, then retry",
+            "{result}"
+        );
+        assert_eq!(
+            result["detail"]["grant_request"]["hazards"],
+            json!(["credential_form_submit"]),
             "{result}"
         );
 
@@ -5057,7 +5062,12 @@ mod tests {
         );
         assert_eq!(
             unknown["remedy"],
-            "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
+            "call browser.open_grant with the arguments in detail.grant_request, then retry",
+            "{unknown}"
+        );
+        assert_eq!(
+            unknown["detail"]["grant_request"]["hazards"],
+            json!(["unverified_form_contents"]),
             "{unknown}"
         );
     }

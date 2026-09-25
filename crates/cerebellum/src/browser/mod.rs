@@ -173,9 +173,14 @@ pub enum BrowserError {
     AuthorizationDenied {
         reason: &'static str,
     },
+    /// Grants reach the severity but none names the attempted origin.
+    /// `required` and `required_hazards` are what a grant for that origin
+    /// must cover, so the reply can name the grant that admits the retry.
     AuthorizationOriginScope {
         attempted_origin: String,
         granted_origins: Vec<String>,
+        required: crate::authorization::Severity,
+        required_hazards: std::collections::BTreeSet<HazardClass>,
     },
     /// The conversation holds no grant. Reported as `no_grant`, with the
     /// origin and severity a grant must cover to admit this action.
@@ -195,6 +200,11 @@ pub enum BrowserError {
         /// Why the target had no classification, when that is what made the
         /// hazard unverified. `None` for a classified target.
         classification_unavailable: Option<ClassificationUnavailable>,
+        /// The origin, severity and every hazard a grant must cover to admit
+        /// this action; `missing` alone can leave another one uncovered.
+        attempted_origin: String,
+        required: crate::authorization::Severity,
+        required_hazards: std::collections::BTreeSet<HazardClass>,
     },
     /// The requested severity is under the action's floor. `required` is the
     /// value the authorization check computed for this target.
@@ -301,22 +311,32 @@ impl BrowserError {
             Self::ImageTooLarge { .. } => {
                 "use browser.snapshot for a text observation, or reduce the viewport before capturing another image"
             }
-            Self::AuthorizationDenied { .. } | Self::AuthorizationOriginScope { .. } => {
-                "call browser.open_grant to mint a grant covering this action, then retry"
+            // The bare form is only produced when the grant selected for this
+            // action changed before it was committed. Nothing about what a new
+            // grant must cover is known here, and a retry re-runs selection,
+            // whose refusal (if any) names the exact grant to open.
+            Self::AuthorizationDenied { .. } => {
+                "retry the browser action; if it is refused again, follow that refusal's remedy"
             }
-            Self::AuthorizationNoGrantForAction { required, .. }
-            | Self::AuthorizationSeverityInsufficient { required, .. }
-                if !grant_can_reach(*required) =>
-            {
-                "no grant can be opened above tier 4; resubmit with a severity whose tier is at most 4"
+            Self::AuthorizationNoGrantForAction {
+                attempted_origin,
+                required,
             }
-            Self::AuthorizationNoGrantForAction { .. }
-            | Self::AuthorizationSeverityInsufficient { .. } => {
-                "call browser.open_grant with the arguments in detail.grant_request, then retry"
+            | Self::AuthorizationSeverityInsufficient {
+                attempted_origin,
+                required,
+                ..
             }
-            Self::HazardNotDisclosed { .. } => {
-                "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry"
+            | Self::AuthorizationOriginScope {
+                attempted_origin,
+                required,
+                ..
             }
+            | Self::HazardNotDisclosed {
+                attempted_origin,
+                required,
+                ..
+            } => grant_remedy(attempted_origin, *required),
             Self::NavigationPolicyRejected { .. } => {
                 "navigate to an http or https URL allowed by browser policy"
             }
@@ -376,32 +396,63 @@ impl BrowserError {
             Self::AuthorizationOriginScope {
                 attempted_origin,
                 granted_origins,
-            } => json!({
-                "reason":"origin_scope",
-                "attempted_origin":attempted_origin,
-                "granted_origins":granted_origins,
-            }),
+                required,
+                required_hazards,
+            } => {
+                let mut detail = grant_requirement_detail(
+                    "origin_scope",
+                    attempted_origin,
+                    *required,
+                    required_hazards,
+                );
+                detail["granted_origins"] = json!(granted_origins);
+                detail
+            }
             Self::AuthorizationNoGrantForAction {
                 attempted_origin,
                 required,
-            } => grant_requirement_detail("no_grant", attempted_origin, *required, None),
+            } => grant_requirement_detail(
+                "no_grant",
+                attempted_origin,
+                *required,
+                &Default::default(),
+            ),
             Self::AuthorizationSeverityInsufficient {
                 attempted_origin,
                 required,
                 granted_ceilings,
-            } => grant_requirement_detail(
-                "grant_severity_insufficient",
-                attempted_origin,
-                *required,
-                Some(granted_ceilings),
-            ),
+            } => {
+                let mut detail = grant_requirement_detail(
+                    "grant_severity_insufficient",
+                    attempted_origin,
+                    *required,
+                    &Default::default(),
+                );
+                detail["granted_ceilings"] = Value::Array(
+                    granted_ceilings
+                        .iter()
+                        .copied()
+                        .map(severity_value)
+                        .collect(),
+                );
+                detail
+            }
             Self::HazardNotDisclosed {
                 missing,
                 classification_unavailable,
-            } => with_classification_unavailable(
-                json!({"reason":"hazard_not_disclosed","missing_hazard":missing.as_str()}),
-                classification_unavailable.as_ref(),
-            ),
+                attempted_origin,
+                required,
+                required_hazards,
+            } => {
+                let mut detail = grant_requirement_detail(
+                    "hazard_not_disclosed",
+                    attempted_origin,
+                    *required,
+                    required_hazards,
+                );
+                detail["missing_hazard"] = json!(missing.as_str());
+                with_classification_unavailable(detail, classification_unavailable.as_ref())
+            }
             Self::SeverityBelowFloor {
                 required,
                 classification_unavailable,
@@ -468,45 +519,79 @@ fn grant_can_reach(required: crate::authorization::Severity) -> bool {
     required.tier <= crate::authorization::MAX_GRANTABLE_TIER
 }
 
-/// Detail for a refusal that a new grant can cure. `grant_request` is the
-/// exact `browser.open_grant` argument set whose grant covers this action:
-/// the attempted origin, the required tier, and the hazard classes that
-/// supply the credential and financial flags (a grant gets those flags only
-/// from disclosed hazards). It is omitted when no grant can reach the tier.
+/// Whether a grant can name `origin` at all. Refusals carry the origin as the
+/// authorization check saw it, which is the raw page origin when it has no
+/// canonical form (a `file://` page, for one), and `browser.open_grant`
+/// refuses any origin that is not already canonical by this same function.
+fn grant_can_name_origin(origin: &str) -> bool {
+    crate::classification::canonical_origin(origin).as_deref() == Some(origin)
+}
+
+/// The remedy for a refusal a new grant could cure. It must agree with
+/// whether `grant_request` below produced arguments, because the remedy
+/// points at them.
+fn grant_remedy(attempted_origin: &str, required: crate::authorization::Severity) -> &'static str {
+    if !grant_can_reach(required) {
+        "no grant can be opened above tier 4; resubmit with a severity whose tier is at most 4"
+    } else if !grant_can_name_origin(attempted_origin) {
+        "no grant can name detail.attempted_origin; navigate to an http or https page, then retry"
+    } else {
+        "call browser.open_grant with the arguments in detail.grant_request, then retry"
+    }
+}
+
+/// The exact `browser.open_grant` arguments whose grant admits an action at
+/// `attempted_origin` that needs `required` and whose target carries
+/// `target_hazards`, or `None` when no grant can (see `grant_remedy`).
+///
+/// Hazards: every target hazard must be disclosed, and a grant gets its
+/// credential and financial flags only from disclosed hazards, so a flag the
+/// target hazards do not already supply adds the hazard class that does.
+/// Tier: `browser.open_grant` never mints below the tier its hazards imply
+/// (at least compose even with none), so the tier named here is the one the
+/// grant will actually carry, computed by the function that mints it. Naming
+/// the raw required tier instead would send a caller a number the grant and
+/// the person's consent question then contradict.
+fn grant_request(
+    attempted_origin: &str,
+    required: crate::authorization::Severity,
+    target_hazards: &std::collections::BTreeSet<HazardClass>,
+) -> Option<Value> {
+    if !grant_can_reach(required) || !grant_can_name_origin(attempted_origin) {
+        return None;
+    }
+    let mut hazards = target_hazards.clone();
+    let from_hazards = crate::management::browser_grant_minted_severity(&hazards, None);
+    if required.credential && !from_hazards.credential {
+        hazards.insert(HazardClass::CredentialFormSubmit);
+    }
+    if required.financial && !from_hazards.financial {
+        hazards.insert(HazardClass::FinancialFormSubmit);
+    }
+    let minted = crate::management::browser_grant_minted_severity(&hazards, Some(required.tier));
+    Some(json!({
+        "origins":[attempted_origin],
+        "severity_tier":minted.tier,
+        "hazards":hazards.iter().map(|hazard| hazard.as_str()).collect::<Vec<_>>(),
+    }))
+}
+
+/// Detail shared by every refusal a new grant can cure: the attempted origin,
+/// the severity a grant must cover, and `grant_request` when one can be
+/// opened. Each refusal adds its own facts beside these.
 fn grant_requirement_detail(
     reason: &str,
     attempted_origin: &str,
     required: crate::authorization::Severity,
-    granted_ceilings: Option<&Vec<crate::authorization::Severity>>,
+    target_hazards: &std::collections::BTreeSet<HazardClass>,
 ) -> Value {
     let mut detail = json!({
         "reason":reason,
         "attempted_origin":attempted_origin,
         "required":severity_value(required),
     });
-    let object = detail.as_object_mut().expect("detail is an object");
-    if let Some(ceilings) = granted_ceilings {
-        object.insert(
-            "granted_ceilings".into(),
-            Value::Array(ceilings.iter().copied().map(severity_value).collect()),
-        );
-    }
-    if grant_can_reach(required) {
-        let mut hazards = Vec::new();
-        if required.credential {
-            hazards.push(HazardClass::CredentialFormSubmit.as_str());
-        }
-        if required.financial {
-            hazards.push(HazardClass::FinancialFormSubmit.as_str());
-        }
-        object.insert(
-            "grant_request".into(),
-            json!({
-                "origins":[attempted_origin],
-                "severity_tier":required.tier,
-                "hazards":hazards,
-            }),
-        );
+    if let Some(request) = grant_request(attempted_origin, required, target_hazards) {
+        detail["grant_request"] = request;
     }
     detail
 }
@@ -4715,16 +4800,26 @@ fn map_authorization_error(error: crate::authorization::AuthorizationError) -> B
         crate::authorization::AuthorizationError::OriginScope {
             attempted_origin,
             granted_origins,
+            required,
+            required_hazards,
         } => BrowserError::AuthorizationOriginScope {
             attempted_origin,
             granted_origins,
+            required,
+            required_hazards,
         },
-        crate::authorization::AuthorizationError::HazardNotDisclosed(missing) => {
-            BrowserError::HazardNotDisclosed {
-                missing,
-                classification_unavailable: None,
-            }
-        }
+        crate::authorization::AuthorizationError::HazardNotDisclosed {
+            missing,
+            attempted_origin,
+            required,
+            required_hazards,
+        } => BrowserError::HazardNotDisclosed {
+            missing,
+            classification_unavailable: None,
+            attempted_origin,
+            required,
+            required_hazards,
+        },
         crate::authorization::AuthorizationError::SeverityBelowFloor { required } => {
             BrowserError::SeverityBelowFloor {
                 required,
@@ -5033,6 +5128,9 @@ mod tests {
                 Err(BrowserError::HazardNotDisclosed {
                     missing: HazardClass::CredentialFormSubmit,
                     classification_unavailable: None,
+                    attempted_origin: "https://example.test".into(),
+                    required: Severity::new(4, true, false),
+                    required_hazards: [HazardClass::CredentialFormSubmit].into(),
                 }),
             )
             .await;
@@ -5089,6 +5187,70 @@ mod tests {
             "{unreachable}"
         );
         assert_eq!(unreachable["detail"]["required"]["tier"], 5);
+
+        // The unverified-form hazard already supplies both flags, so the
+        // request discloses it alone rather than two more hazard classes.
+        let unverified = plane
+            .result(
+                &identity,
+                Err(BrowserError::AuthorizationOriginScope {
+                    attempted_origin: "https://example.test".into(),
+                    granted_origins: vec!["https://other.test".into()],
+                    required: Severity::new(4, true, true),
+                    required_hazards: [HazardClass::UnverifiedFormContents].into(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            unverified["detail"]["grant_request"],
+            json!({
+                "origins": ["https://example.test"],
+                "severity_tier": 4,
+                "hazards": ["unverified_form_contents"],
+            }),
+            "{unverified}"
+        );
+
+        // A non-http(s) origin cannot be named by any grant, so no arguments
+        // are offered and the remedy says to leave the page instead.
+        let opaque = plane
+            .result(
+                &identity,
+                Err(BrowserError::AuthorizationNoGrantForAction {
+                    attempted_origin: "file://".into(),
+                    required: Severity::new(1, false, false),
+                }),
+            )
+            .await;
+        assert!(opaque["detail"].get("grant_request").is_none(), "{opaque}");
+        assert_eq!(
+            opaque["remedy"],
+            "no grant can name detail.attempted_origin; navigate to an http or https page, then retry",
+            "{opaque}"
+        );
+    }
+
+    /// A grant with no hazards is minted at compose however low a tier it is
+    /// asked for, so a refusal for a tier-1 read names tier 2: the tier the
+    /// grant will really carry, not one it can never be minted at.
+    #[tokio::test]
+    async fn a_grant_request_names_the_tier_the_grant_is_minted_at() {
+        let plane = BrowserPlane::new();
+        let refused = plane
+            .result(
+                &identity(),
+                Err(BrowserError::AuthorizationNoGrantForAction {
+                    attempted_origin: "https://example.test".into(),
+                    required: Severity::new(crate::authorization::OBSERVE, false, false),
+                }),
+            )
+            .await;
+        assert_eq!(
+            refused["detail"]["grant_request"]["severity_tier"],
+            crate::management::NO_HAZARD_GRANT_TIER,
+            "{refused}"
+        );
+        assert_eq!(refused["detail"]["required"]["tier"], 1, "{refused}");
     }
 
     #[tokio::test]
@@ -5196,7 +5358,18 @@ mod tests {
                 "authorization_denied",
                 BrowserError::AuthorizationDenied { reason: "no_grant" },
                 "authorization_denied",
-                "call browser.open_grant to mint a grant covering this action, then retry",
+                "retry the browser action; if it is refused again, follow that refusal's remedy",
+            ),
+            (
+                "origin_scope",
+                BrowserError::AuthorizationOriginScope {
+                    attempted_origin: "https://example.test".into(),
+                    granted_origins: vec!["https://other.test".into()],
+                    required: crate::authorization::Severity::new(1, false, false),
+                    required_hazards: Default::default(),
+                },
+                "authorization_denied",
+                "call browser.open_grant with the arguments in detail.grant_request, then retry",
             ),
             (
                 "no_grant_for_action",
@@ -5232,9 +5405,12 @@ mod tests {
                 BrowserError::HazardNotDisclosed {
                     missing: HazardClass::CredentialFormSubmit,
                     classification_unavailable: None,
+                    attempted_origin: "https://example.test".into(),
+                    required: crate::authorization::Severity::new(4, true, false),
+                    required_hazards: [HazardClass::CredentialFormSubmit].into(),
                 },
                 "hazard_not_disclosed",
-                "call browser.open_grant to mint a grant that discloses detail.missing_hazard, then retry",
+                "call browser.open_grant with the arguments in detail.grant_request, then retry",
             ),
             (
                 "severity_below_floor",

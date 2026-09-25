@@ -382,7 +382,7 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
     );
     properties.insert(
         "severity_tier".into(),
-        json!({"type":"integer","minimum":1,"maximum":4,"description":"Optional grant ceiling tier; raises the ceiling the hazards imply. Use the tier a grant_severity_insufficient or no_grant refusal names in detail.grant_request."}),
+        json!({"type":"integer","minimum":1,"maximum":4,"description":"Optional grant ceiling tier; raises the ceiling the hazards imply. Use the tier a refusal names in detail.grant_request (no_grant, grant_severity_insufficient, origin_scope and hazard_not_disclosed carry one)."}),
     );
     properties.insert(
         "origin".into(),

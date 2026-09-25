@@ -352,13 +352,7 @@ impl ManagementPlane {
             }
             disclosed_hazards_wire.push(hazard.as_str().to_string());
         }
-        let hazard_severity = browser_grant_severity(&disclosed_hazards);
-        let severity = Severity {
-            tier: hazard_severity
-                .tier
-                .max(severity_tier.unwrap_or(hazard_severity.tier)),
-            ..hazard_severity
-        };
+        let severity = browser_grant_minted_severity(&disclosed_hazards, severity_tier);
         let severity_value = browser_grant_severity_value(severity);
 
         if !can_relay_to_a_person {
@@ -850,9 +844,33 @@ pub enum BrowserGrantRequestError {
     InvalidSeverityTier,
 }
 
+/// The ceiling tier of a browser grant that discloses no hazard and names no
+/// tier: ordinary browsing, reading pages and clicking plain links and buttons.
+/// A caller asking for a lower tier still gets this one, so anything that
+/// predicts the tier a grant will be minted at must start from here.
+pub(crate) const NO_HAZARD_GRANT_TIER: u8 = COMPOSE;
+
+/// The ceiling `browser.open_grant` mints for these disclosed hazards and this
+/// optional requested tier. The requested tier can only raise the ceiling the
+/// hazards imply; the credential and financial flags come only from hazards.
+/// Refusals that suggest `open_grant` arguments call this too, so the tier they
+/// name is the tier the grant will really carry.
+pub(crate) fn browser_grant_minted_severity(
+    hazards: &BTreeSet<HazardClass>,
+    severity_tier: Option<u8>,
+) -> Severity {
+    let hazard_severity = browser_grant_severity(hazards);
+    Severity {
+        tier: hazard_severity
+            .tier
+            .max(severity_tier.unwrap_or(hazard_severity.tier)),
+        ..hazard_severity
+    }
+}
+
 fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
     if hazards.is_empty() {
-        Severity::new(COMPOSE, false, false)
+        Severity::new(NO_HAZARD_GRANT_TIER, false, false)
     } else {
         Severity::new(
             MUTATE_DURABLE,

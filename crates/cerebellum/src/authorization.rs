@@ -593,7 +593,13 @@ impl GrantStore {
             // re-ask a person, and disclosing it mints a grant whose ceiling
             // is high enough for any classified target.
             if let Some(missing) = required_hazards.iter().next().copied() {
-                return Err(AuthorizationError::HazardNotDisclosed(missing));
+                return Err(AuthorizationError::HazardNotDisclosed {
+                    missing,
+                    attempted_origin: canonical_origin(attempted_origin)
+                        .unwrap_or_else(|| attempted_origin.to_string()),
+                    required,
+                    required_hazards: required_hazards.clone(),
+                });
             }
             // Both refusals name the attempted origin and the required
             // severity, so the one grant a caller opens from them covers this
@@ -627,6 +633,8 @@ impl GrantStore {
             return Err(AuthorizationError::OriginScope {
                 attempted_origin: attempted_origin.to_string(),
                 granted_origins: granted_origins(&candidates),
+                required,
+                required_hazards: required_hazards.clone(),
             });
         };
         let scoped = candidates
@@ -638,6 +646,8 @@ impl GrantStore {
             return Err(AuthorizationError::OriginScope {
                 attempted_origin: canonical_attempted,
                 granted_origins: granted_origins(&candidates),
+                required,
+                required_hazards: required_hazards.clone(),
             });
         }
         if let Some(grant) = scoped
@@ -658,7 +668,12 @@ impl GrantStore {
                 .next()
                 .copied()
         }) {
-            return Err(AuthorizationError::HazardNotDisclosed(missing));
+            return Err(AuthorizationError::HazardNotDisclosed {
+                missing,
+                attempted_origin: canonical_attempted,
+                required,
+                required_hazards: required_hazards.clone(),
+            });
         }
         // Not reachable: `scoped` is non-empty and no grant in it discloses
         // every required hazard, so the required set is non-empty and the
@@ -1046,11 +1061,25 @@ pub enum AuthorizationError {
         required: Severity,
         granted_ceilings: Vec<Severity>,
     },
+    /// Grants reach the severity, but none names the attempted origin.
+    /// `required` and `required_hazards` are what a grant for that origin must
+    /// cover, so the refusal can name the one grant that admits the retry.
     OriginScope {
         attempted_origin: String,
         granted_origins: Vec<String>,
+        required: Severity,
+        required_hazards: BTreeSet<HazardClass>,
     },
-    HazardNotDisclosed(HazardClass),
+    /// The target carries a hazard no usable grant disclosed. `missing` is the
+    /// first such hazard; the other fields describe the whole grant that would
+    /// admit this action, because disclosing only `missing` can leave another
+    /// required hazard or the origin still uncovered.
+    HazardNotDisclosed {
+        missing: HazardClass,
+        attempted_origin: String,
+        required: Severity,
+        required_hazards: BTreeSet<HazardClass>,
+    },
     SeverityUnclassifiable,
     InvalidGrant,
     DuplicateGrantIdentity,
