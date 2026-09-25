@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity, OBSERVE};
 use cerebellum::browser::navigation::{
-    classify_flattened_document, BrowserSnapshotObservation, CdpNavigationDriver,
+    classify_flattened_document, BrowserScreenshotObservation, BrowserSnapshotObservation,
+    CdpNavigationDriver,
 };
 use cerebellum::browser::{BrowserPlane, Tracker};
 use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
@@ -19,6 +20,7 @@ use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
     NonTypeClassificationInput, TargetKind,
 };
+use cerebellum::coordinate::{TransformInputs, ViewportObservation};
 use cerebellum::snapshot_store::{
     AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
 };
@@ -37,6 +39,9 @@ use tokio::sync::mpsc;
 
 #[path = "../examples/support/consent_relay.rs"]
 mod consent_relay;
+
+/// A valid one-pixel PNG, the smallest image a screenshot reply admits.
+const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 fn config() -> BrowserConfig {
     BrowserConfig {
@@ -266,9 +271,40 @@ fn snapshot_observation(
     }
 }
 
+/// The URL a double's main frame has committed to, shared between a test and
+/// the process it launches.
+///
+/// Page reads authorize against what the browser reports here, not against the
+/// navigation the module tracked. A double that echoed the tracker would make
+/// every read look authorized for the reason under test, so the test moves the
+/// page itself, the way a page's own script or a late redirect would.
+#[derive(Clone)]
+struct CommittedPage(Arc<Mutex<String>>);
+
+impl Default for CommittedPage {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new("about:blank".into())))
+    }
+}
+
+impl CommittedPage {
+    fn commit(&self, url: &str) {
+        *self.0.lock().unwrap() = url.to_string();
+    }
+
+    fn url(&self) -> String {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 #[derive(Default)]
 struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
+    page: CommittedPage,
+    /// A URL the page commits to while a snapshot or screenshot is being
+    /// captured, standing for a navigation that lands between the read's
+    /// authorization and its return.
+    commit_during_capture: Arc<Mutex<Option<String>>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
     hazardous_target: bool,
     cross_site_link_target: bool,
@@ -291,6 +327,8 @@ impl BrowserSessionLauncher for RecordingLauncher {
         Ok(LaunchedBrowser {
             process: Box::new(RecordingProcess {
                 effects: Arc::clone(&self.effects),
+                page: self.page.clone(),
+                commit_during_capture: Arc::clone(&self.commit_during_capture),
                 clicked: false,
                 hazardous_target: self.hazardous_target,
                 cross_site_link_target: self.cross_site_link_target,
@@ -341,6 +379,8 @@ impl BrowserSessionLauncher for UndeclaredReplyLauncher {
 
 struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
+    page: CommittedPage,
+    commit_during_capture: Arc<Mutex<Option<String>>>,
     clicked: bool,
     hazardous_target: bool,
     cross_site_link_target: bool,
@@ -380,7 +420,7 @@ impl OwnedBrowserProcess for RecordingProcess {
     }
 
     fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
-        Ok("https://landed.example/final".to_string())
+        Ok(self.page.url())
     }
 
     fn has_credential_field(&mut self, _: &str, _: u64) -> Result<bool, NavigationDriveError> {
@@ -397,6 +437,7 @@ impl OwnedBrowserProcess for RecordingProcess {
     ) -> Result<(), NavigationDriveError> {
         self.effects.lock().unwrap().push("navigate");
         let now = std::time::Instant::now();
+        self.page.commit("https://landed.example/final");
         tracker.url_final = Some("https://landed.example/final".into());
         tracker.load(now);
         tracker.poll_settlement(now + Duration::from_millis(cerebellum::browser::QUIET_MS));
@@ -412,13 +453,41 @@ impl OwnedBrowserProcess for RecordingProcess {
         _: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.effects.lock().unwrap().push("snapshot");
-        Ok(snapshot_observation(
+        let observation = snapshot_observation(
             self.clicked,
             self.hazardous_target,
             self.cross_site_link_target,
             document_epoch,
             current_origin,
-        ))
+        );
+        if let Some(url) = self.commit_during_capture.lock().unwrap().take() {
+            self.page.commit(&url);
+        }
+        Ok(observation)
+    }
+
+    fn screenshot(
+        &mut self,
+        _: &str,
+        _: u64,
+        _: u64,
+        _: bool,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        self.effects.lock().unwrap().push("screenshot");
+        let viewport = ViewportObservation::new(
+            0,
+            TransformInputs::from_values(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+        );
+        let observation = BrowserScreenshotObservation {
+            image_png_b64: ONE_BY_ONE_PNG_B64.into(),
+            before: viewport,
+            after: viewport,
+            invalidation_observed: false,
+        };
+        if let Some(url) = self.commit_during_capture.lock().unwrap().take() {
+            self.page.commit(&url);
+        }
+        Ok(observation)
     }
 
     fn click_classified(
@@ -484,10 +553,14 @@ impl SessionCleanup for RecordingCleanup {
     }
 }
 
-async fn launch_at(planes: &Planes, origin: &str) {
+/// Launch and put the page at `{origin}/page`: committed in the browser double
+/// and recorded in the module's tracker, so the two agree as they do after a
+/// navigation the module watched.
+async fn launch_at(planes: &Planes, page: &CommittedPage, origin: &str) {
     let launched = invoke(planes, 1, "browser.launch", json!({})).await;
     let launched: Value = serde_json::from_slice(&launched.body).unwrap();
     assert_eq!(launched["outcome"], "launched", "{launched}");
+    page.commit(&format!("{origin}/page"));
     planes
         .browser
         .same_document_url(
@@ -724,7 +797,7 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
 
     let no_grant = invoke(&planes, 20, "browser.snapshot", json!({"mode": "ax"})).await;
     let no_grant: Value = serde_json::from_slice(&no_grant.body).unwrap();
@@ -777,7 +850,7 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
         vec![HazardClass::CredentialFormSubmit],
     )
     .await;
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
 
     let before = invoke(&planes, 30, "browser.snapshot", json!({"mode": "ax"})).await;
     let before: Value = serde_json::from_slice(&before.body).unwrap();
@@ -843,7 +916,7 @@ async fn wire_click_without_a_covering_grant_dispatches_no_input() {
             ["https://page.example"],
         )])),
     );
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
 
     let snapshot = invoke(&planes, 40, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -901,7 +974,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
         json!({"origins": ["https://page.example"], "hazards": []}),
     )
     .await;
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
 
     let snapshot = invoke(&planes, 61, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -975,7 +1048,7 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
     );
     planes.launch_service = Some(launcher.clone());
     bind_management_route(&planes).await;
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
 
     let refused = invoke_existing(&planes, 70, "browser.snapshot", json!({})).await;
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
@@ -1074,7 +1147,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
             ),
         ],
     );
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
     let clicked = click_cross_site_link(&planes, 80).await;
     assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
     assert_eq!(clicked["detail"]["reason"], "origin_scope", "{clicked}");
@@ -1097,7 +1170,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
             ),
         ],
     );
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
     let clicked = click_cross_site_link(&planes, 90).await;
     assert_eq!(
         clicked["detail"]["reason"], "grant_severity_insufficient",
@@ -1137,7 +1210,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
         )
         .with_disclosed_hazards([HazardClass::FinancialFormSubmit])])),
     );
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
 
     let snapshot = invoke(&planes, 50, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -1809,7 +1882,7 @@ async fn present_fronts_then_marks_human_in_control() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example").await;
 
     let presented = cerebellum::present_browser_handoff_for_test(
         &planes,
@@ -1853,7 +1926,7 @@ async fn present_that_cannot_front_is_refused_not_presented() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example").await;
 
     let reply = cerebellum::present_browser_handoff_for_test(
         &planes,
@@ -1887,8 +1960,8 @@ async fn resume_closes_by_caller_and_reports_it() {
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
     );
-    planes.launch_service = Some(launcher);
-    launch_at(&planes, "https://landed.example").await;
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, &launcher.page, "https://landed.example").await;
     let route = route_identity();
 
     let presented =
@@ -1922,8 +1995,8 @@ async fn cookie_values_never_leave_the_driver() {
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
     );
-    planes.launch_service = Some(launcher);
-    launch_at(&planes, "https://landed.example").await;
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, &launcher.page, "https://landed.example").await;
     let route = route_identity();
 
     let presented =
@@ -2049,7 +2122,7 @@ async fn poisoned_session_lock_refuses_a_browser_action_through_the_wire() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
     grant_browser(&planes, "https://page.example", Vec::new()).await;
     planes.sessions.poison_for_test();
 
@@ -2163,9 +2236,15 @@ async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_v
 
 /// Launch through the wire, place the page at `origin`, and return the new
 /// browser session id so the caller can close it.
-async fn launch_session_at(planes: &Planes, corr: u64, origin: &str) -> String {
+async fn launch_session_at(
+    planes: &Planes,
+    page: &CommittedPage,
+    corr: u64,
+    origin: &str,
+) -> String {
     let launched = response_body(planes, corr, "browser.launch", json!({})).await;
     assert_eq!(launched["outcome"], "launched", "{launched}");
+    page.commit(&format!("{origin}/page"));
     planes
         .browser
         .same_document_url(
@@ -2209,12 +2288,12 @@ async fn a_browser_relaunched_after_close_serves_snapshots() {
     let planes = recording_planes(&launcher);
     grant_browser(&planes, "https://page.example", Vec::new()).await;
 
-    let first = launch_session_at(&planes, 1, "https://page.example").await;
+    let first = launch_session_at(&planes, &launcher.page, 1, "https://page.example").await;
     let before_close = response_body(&planes, 2, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(before_close["outcome"], "ok", "{before_close}");
     close_session(&planes, 3, &first).await;
 
-    let second = launch_session_at(&planes, 4, "https://page.example").await;
+    let second = launch_session_at(&planes, &launcher.page, 4, "https://page.example").await;
     assert_ne!(first, second);
     let relaunched = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(relaunched["outcome"], "ok", "{relaunched}");
@@ -2238,9 +2317,9 @@ async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
     grant_browser(&planes, "https://requested.example", Vec::new()).await;
     grant_browser(&planes, "https://landed.example", Vec::new()).await;
 
-    let first = launch_session_at(&planes, 1, "https://requested.example").await;
+    let first = launch_session_at(&planes, &launcher.page, 1, "https://requested.example").await;
     close_session(&planes, 2, &first).await;
-    launch_session_at(&planes, 3, "https://requested.example").await;
+    launch_session_at(&planes, &launcher.page, 3, "https://requested.example").await;
 
     let navigated = response_body(
         &planes,
@@ -2280,7 +2359,7 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
     )
     .await;
 
-    launch_session_at(&planes, 1, "https://page.example").await;
+    launch_session_at(&planes, &launcher.page, 1, "https://page.example").await;
     let old = response_body(&planes, 2, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(old["outcome"], "ok", "{old}");
 
@@ -2290,7 +2369,7 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
     assert_ne!(status["outcome"], "ready", "{status}");
     *launcher.exited.lock().unwrap() = false;
 
-    launch_session_at(&planes, 4, "https://page.example").await;
+    launch_session_at(&planes, &launcher.page, 4, "https://page.example").await;
     let fresh = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(fresh["outcome"], "ok", "{fresh}");
     assert_ne!(fresh["snapshot_id"], old["snapshot_id"]);
@@ -2328,7 +2407,7 @@ async fn a_closed_browser_without_relaunch_still_refuses_snapshots() {
     let planes = recording_planes(&launcher);
     grant_browser(&planes, "https://page.example", Vec::new()).await;
 
-    let first = launch_session_at(&planes, 1, "https://page.example").await;
+    let first = launch_session_at(&planes, &launcher.page, 1, "https://page.example").await;
     close_session(&planes, 2, &first).await;
     let refused = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(refused["outcome"], "no_session", "{refused}");
@@ -2485,6 +2564,9 @@ fn events_after_release(scenario: ClickScenario) -> Vec<Value> {
 /// on the mouse release, emits the scenario's page events.
 struct ChromeLikePipe {
     scenario: ClickScenario,
+    /// The main frame's committed URL, which `Page.getNavigationHistory`
+    /// reports and a main-frame `Page.frameNavigated` moves.
+    page: CommittedPage,
     reads: VecDeque<Vec<u8>>,
     blocked_release_id: Option<u64>,
 }
@@ -2528,6 +2610,15 @@ impl CdpPipeIo for ChromeLikePipe {
                 json!({"backendNodeId":LINK_BACKEND_NODE,"frameId":MAIN_FRAME}),
             ),
             "DOM.getFlattenedDocument" => self.reply(id, Value::Object(click_page_document())),
+            "Page.getNavigationHistory" => {
+                let url = self.page.url();
+                self.reply(
+                    id,
+                    json!({"currentIndex":0,"entries":[{
+                        "id":1,"url":url,"userTypedURL":url,"title":"","transitionType":"link"
+                    }]}),
+                )
+            }
             "DOM.scrollIntoViewIfNeeded" | "DOM.enable" | "Page.enable" | "Network.enable" => {
                 self.reply(id, json!({}))
             }
@@ -2574,6 +2665,14 @@ impl CdpPipeIo for ChromeLikePipe {
                     }
                     self.reply(id, json!({}));
                     for event in events_after_release(scenario) {
+                        // Chrome's history entry moves when the main frame
+                        // commits, which is the event that says so.
+                        if event["method"] == "Page.frameNavigated"
+                            && event["params"]["frame"].get("parentId").is_none()
+                        {
+                            let url = event["params"]["frame"]["url"].as_str().unwrap();
+                            self.page.commit(url);
+                        }
                         self.queue(event);
                     }
                 }
@@ -2609,6 +2708,14 @@ struct CdpClickProcess {
 }
 
 impl OwnedBrowserProcess for CdpClickProcess {
+    fn main_frame_url(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<String, NavigationDriveError> {
+        self.driver.main_frame_url(context_key, deadline_ms)
+    }
+
     fn snapshot_classified(
         &mut self,
         _: &str,
@@ -2694,6 +2801,7 @@ impl OwnedBrowserProcess for CdpClickProcess {
 struct CdpClickLauncher {
     scenario: ClickScenario,
     snapshots: Arc<Mutex<usize>>,
+    page: CommittedPage,
 }
 
 impl BrowserSessionLauncher for CdpClickLauncher {
@@ -2707,6 +2815,7 @@ impl BrowserSessionLauncher for CdpClickLauncher {
                 driver: CdpNavigationDriver::new(
                     ChromeLikePipe {
                         scenario: self.scenario,
+                        page: self.page.clone(),
                         reads: VecDeque::new(),
                         blocked_release_id: None,
                     },
@@ -2731,6 +2840,7 @@ const CLICK_SETTLE_DEADLINE_MS: u64 = 3_000;
 /// snapshot it, and click its link.
 async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Planes, Value, usize) {
     let snapshots = Arc::new(Mutex::new(0));
+    let page = CommittedPage::default();
     let config = BrowserConfig {
         navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
         ..config()
@@ -2743,6 +2853,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
     planes.launch_service = Some(Arc::new(CdpClickLauncher {
         scenario,
         snapshots: Arc::clone(&snapshots),
+        page: page.clone(),
     }));
     planes.browser = Arc::new(
         BrowserPlane::with_session_gate(
@@ -2758,7 +2869,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
             granted_origins.iter().copied(),
         )])),
     );
-    launch_at(&planes, CLICK_PAGE_ORIGIN).await;
+    launch_at(&planes, &page, CLICK_PAGE_ORIGIN).await;
 
     let snapshot = invoke(&planes, 100, "browser.snapshot", json!({"mode": "ax"})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -2898,4 +3009,283 @@ async fn a_click_whose_dialog_is_dismissed_reports_the_dialog_and_no_navigation(
     let snapshot = invoke(&planes, 102, "browser.snapshot", json!({"mode": "ax"})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+}
+
+// ---------------------------------------------------------------------------
+// Page reads authorize against where the page IS, not where the module last
+// saw it navigate.
+//
+// A page can leave the document the module navigated to without the module
+// starting or watching the move: a timer, a meta refresh, a script assigning
+// `location`, a redirect that lands after a click's observation window. The
+// double stands in for that by committing a new main-frame URL directly, which
+// is all Chrome's navigation history shows afterwards. The module's tracker
+// still names the old page in every one of these tests.
+// ---------------------------------------------------------------------------
+
+/// Text that appears only in the double's page content: a reply carrying any
+/// of it returned bytes from a document.
+const PAGE_CONTENT_MARKERS: [&str; 3] = ["Click probe", "Sign in", ONE_BY_ONE_PNG_B64];
+
+fn assert_no_page_content(reply: &Value) {
+    let serialized = reply.to_string();
+    for marker in PAGE_CONTENT_MARKERS {
+        assert!(
+            !serialized.contains(marker),
+            "a refused read returned page content ({marker}): {reply}"
+        );
+    }
+}
+
+/// Launch, grant navigation to `https://requested.example` plus a read grant
+/// for each of `readable`, and navigate there. The double lands on
+/// `https://landed.example/final`, which is also what the tracker records.
+async fn navigated_to_landed(readable: &[&str]) -> (Arc<RecordingLauncher>, Planes) {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let planes = recording_planes(&launcher);
+    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    for origin in readable {
+        grant_browser(&planes, origin, Vec::new()).await;
+    }
+    launch_session_at(&planes, &launcher.page, 1, "https://requested.example").await;
+    let navigated = response_body(
+        &planes,
+        2,
+        "browser.navigate",
+        json!({
+            "url": "https://requested.example/",
+            "intent": "open the page the reads are about",
+            "wait": "settle",
+            "severity": {"tier": 1, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    assert_eq!(navigated["outcome"], "ok", "{navigated}");
+    assert_eq!(
+        navigated["url_final"], "https://landed.example/final",
+        "{navigated}"
+    );
+    (launcher, planes)
+}
+
+/// Every refusal the plane's refusal ring holds, as `(page URL the refused read
+/// addressed, reason)`, across all callers: the wire route's project id is
+/// assigned by the harness, and which caller a record lands under is not what
+/// these tests are about.
+async fn refusal_records(planes: &Planes) -> Vec<(String, String)> {
+    let export = planes.browser.refusal_ring_export_for_test().await;
+    if export.is_empty() {
+        return Vec::new();
+    }
+    let ring: Value = serde_json::from_str(&export).unwrap();
+    ring["callers"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|caller| caller["records"].as_array().unwrap().clone())
+        .map(|record| {
+            (
+                record["claimed_addressing"].as_str().unwrap().to_string(),
+                record["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapshot_in_both_modes() {
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    // The same read succeeds while the page stays where it was navigated, so
+    // the refusals below come from the move and not from a plane refusing
+    // everything.
+    let before = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(before["outcome"], "ok", "{before}");
+
+    launcher.page.commit("https://attacker.example/moved");
+
+    for (corr, mode) in [(4, "ax"), (5, "dom_full")] {
+        let refused = response_body(&planes, corr, "browser.snapshot", json!({"mode": mode})).await;
+        assert_eq!(
+            refused["outcome"], "authorization_denied",
+            "{mode}: {refused}"
+        );
+        assert_eq!(
+            refused["detail"]["attempted_origin"], "https://attacker.example",
+            "{mode}: {refused}"
+        );
+        assert_no_page_content(&refused);
+    }
+    assert_eq!(
+        launcher
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|effect| **effect == "snapshot")
+            .count(),
+        1,
+        "a refused snapshot still reached the capture: {:?}",
+        launcher.effects.lock().unwrap()
+    );
+    let moved = (
+        "https://attacker.example/moved".to_string(),
+        "origin_scope".to_string(),
+    );
+    assert_eq!(refusal_records(&planes).await, [moved.clone(), moved]);
+}
+
+#[tokio::test]
+async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screenshot() {
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let before = response_body(&planes, 3, "browser.screenshot", json!({})).await;
+    assert_eq!(before["outcome"], "ok", "{before}");
+
+    launcher.page.commit("https://attacker.example/moved");
+
+    let refused = response_body(&planes, 4, "browser.screenshot", json!({})).await;
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(
+        refused["detail"]["attempted_origin"], "https://attacker.example",
+        "{refused}"
+    );
+    assert_no_page_content(&refused);
+    assert_eq!(
+        launcher
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|effect| **effect == "screenshot")
+            .count(),
+        1,
+        "a refused screenshot still reached the capture: {:?}",
+        launcher.effects.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+
+    for (corr, tool, arguments) in [
+        (3, "browser.snapshot", json!({"mode": "ax"})),
+        (5, "browser.snapshot", json!({"mode": "dom_full"})),
+        (7, "browser.screenshot", json!({})),
+    ] {
+        launcher.page.commit("https://landed.example/final");
+        *launcher.commit_during_capture.lock().unwrap() =
+            Some("https://attacker.example/mid-read".into());
+
+        let refused = response_body(&planes, corr, tool, arguments.clone()).await;
+        assert_eq!(
+            refused["outcome"], "page_navigated_during_read",
+            "{tool} {arguments}: {refused}"
+        );
+        assert_eq!(
+            refused["detail"]["authorized_origin"], "https://landed.example",
+            "{refused}"
+        );
+        assert_eq!(
+            refused["detail"]["live_origin"], "https://attacker.example",
+            "{refused}"
+        );
+        assert_no_page_content(&refused);
+
+        // The page is now on the ungranted origin, so reading again is
+        // refused before any capture rather than repeating the race.
+        let again = response_body(&planes, corr + 1, tool, arguments).await;
+        assert_eq!(again["outcome"], "authorization_denied", "{again}");
+        assert_no_page_content(&again);
+    }
+
+    // The same race inside navigate's read_page: the navigation itself is
+    // reported, and the embedded read is withheld.
+    launcher.page.commit("https://landed.example/final");
+    *launcher.commit_during_capture.lock().unwrap() =
+        Some("https://attacker.example/mid-read".into());
+    let navigated = response_body(
+        &planes,
+        9,
+        "browser.navigate",
+        json!({
+            "url": "https://requested.example/",
+            "intent": "read the page as it lands",
+            "wait": "settle",
+            "severity": {"tier": 1, "credential": false, "financial": false},
+            "read_page": true
+        }),
+    )
+    .await;
+    assert_eq!(navigated["outcome"], "ok", "{navigated}");
+    assert_eq!(
+        navigated["read_page"]["outcome"], "page_navigated_during_read",
+        "{navigated}"
+    );
+    assert_no_page_content(&navigated);
+
+    let records = refusal_records(&planes).await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(
+                |(addressing, reason)| addressing == "https://attacker.example/mid-read"
+                    && reason == "page_navigated_during_read"
+            )
+            .count(),
+        4,
+        "{records:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_page_that_stays_put_reads_as_before() {
+    let (_launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+
+    for (corr, mode) in [(3, "ax"), (4, "dom_full")] {
+        let read = response_body(&planes, corr, "browser.snapshot", json!({"mode": mode})).await;
+        assert_eq!(read["outcome"], "ok", "{mode}: {read}");
+        assert_eq!(
+            read["source_origin"], "https://landed.example/final",
+            "{read}"
+        );
+    }
+    let ax = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert!(
+        ax["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Click probe before")),
+        "{ax}"
+    );
+    let screenshot = response_body(&planes, 6, "browser.screenshot", json!({})).await;
+    assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+    assert_eq!(
+        screenshot["image_png_b64"], ONE_BY_ONE_PNG_B64,
+        "{screenshot}"
+    );
+    assert_eq!(
+        screenshot["source_origin"], "https://landed.example/final",
+        "{screenshot}"
+    );
+    assert!(refusal_records(&planes).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_read_authorizes_against_the_live_origin_when_the_tracker_is_stale() {
+    // Only the page's CURRENT origin is readable; the one the module tracked
+    // is not. Authorizing against the tracker would refuse both reads.
+    let (launcher, planes) = navigated_to_landed(&["https://moved.example"]).await;
+    launcher.page.commit("https://moved.example/next");
+
+    let snapshot = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(
+        snapshot["source_origin"], "https://moved.example/next",
+        "{snapshot}"
+    );
+    let screenshot = response_body(&planes, 4, "browser.screenshot", json!({})).await;
+    assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+    assert_eq!(
+        screenshot["source_origin"], "https://moved.example/next",
+        "{screenshot}"
+    );
 }

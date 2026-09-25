@@ -300,6 +300,12 @@ impl OwnedBrowserProcess for SnapshotProcess {
         Ok(())
     }
 
+    /// Reads authorize against where the browser says its page is, so this
+    /// double stays on the granted origin whatever the tracker records.
+    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
+        Ok("https://requested.example/page".into())
+    }
+
     fn snapshot(
         &mut self,
         _: &str,
@@ -402,9 +408,16 @@ impl CdpPipeIo for ScreenshotPipe {
 struct ScreenshotProcess {
     driver: CdpNavigationDriver<ScreenshotPipe>,
     captures: Arc<AtomicUsize>,
+    /// Where the browser reports its main frame to be; a screenshot
+    /// authorizes against this rather than the tracked navigation.
+    page_url: &'static str,
 }
 
 impl OwnedBrowserProcess for ScreenshotProcess {
+    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
+        Ok(self.page_url.into())
+    }
+
     fn screenshot(
         &mut self,
         context_key: &str,
@@ -956,6 +969,7 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
             CdpFrameDecoder::default(),
         ),
         captures,
+        page_url: "https://requested.example/page",
     }
 }
 
@@ -1042,6 +1056,7 @@ fn screenshot_process_with_capture(
             CdpFrameDecoder::default(),
         ),
         captures,
+        page_url: "https://requested.example/page",
     }
 }
 
@@ -1405,7 +1420,10 @@ async fn screenshot_origin_scope_refuses_redirect_before_capture() {
     let captures = Arc::new(AtomicUsize::new(0));
     let plane = plane_with_process(
         &route,
-        Box::new(screenshot_process(Arc::clone(&captures))),
+        Box::new(ScreenshotProcess {
+            page_url: "https://attacker.example/after-redirect",
+            ..screenshot_process(Arc::clone(&captures))
+        }),
         100,
     );
     plane.open_context(route.clone()).await.unwrap();
@@ -2783,6 +2801,10 @@ impl OwnedBrowserProcess for OffOriginRedirectProcess {
         tracker.load(now);
         tracker.poll_settlement(now + Duration::from_millis(browser::QUIET_MS));
         Ok(())
+    }
+
+    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
+        Ok("https://attacker.example/landed".into())
     }
 
     fn snapshot(

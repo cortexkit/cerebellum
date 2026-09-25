@@ -124,6 +124,9 @@ impl BrowserCapability {
 pub enum SnapshotRefusalReason {
     NoGrant,
     OriginScope,
+    /// The page committed a navigation to another origin while it was being
+    /// read, so the captured content was discarded unreturned.
+    PageNavigatedDuringRead,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +202,13 @@ pub enum BrowserError {
     NavigationFailed {
         error_text: String,
     },
+    /// A page read was authorized for `authorized_origin`, and by the time the
+    /// capture returned the page showed a document from `live_origin`. The
+    /// captured content is withheld because no grant was consulted for it.
+    PageNavigatedDuringRead {
+        authorized_origin: String,
+        live_origin: String,
+    },
     NotSettled {
         url_final: Option<String>,
         lifecycle: Vec<String>,
@@ -236,6 +246,7 @@ impl BrowserError {
             Self::HazardNotDisclosed { .. } => "hazard_not_disclosed",
             Self::NavigationPolicyRejected { .. } => "navigation_policy_rejected",
             Self::NavigationFailed { .. } => "navigation_failed",
+            Self::PageNavigatedDuringRead { .. } => "page_navigated_during_read",
             Self::NotSettled { .. } => "not_settled",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
@@ -302,6 +313,9 @@ impl BrowserError {
             }
             Self::NavigationFailed { .. } => {
                 "inspect detail.error_text and choose a reachable destination or retry when that browser error is transient"
+            }
+            Self::PageNavigatedDuringRead { .. } => {
+                "read the page again with browser.snapshot or browser.screenshot; if it stays on detail.live_origin, that read needs browser.open_grant for detail.live_origin first"
             }
             Self::NotSettled { .. } => {
                 "call browser.snapshot to re-observe the page before depending on its current state"
@@ -396,6 +410,14 @@ impl BrowserError {
             }
             Self::NavigationPolicyRejected { reason_code } => json!({"reason_code":reason_code}),
             Self::NavigationFailed { error_text } => json!({"error_text":error_text}),
+            Self::PageNavigatedDuringRead {
+                authorized_origin,
+                live_origin,
+            } => json!({
+                "reason_code":"page_navigated_during_read",
+                "authorized_origin":authorized_origin,
+                "live_origin":live_origin,
+            }),
             Self::Internal { reason_code } => json!({"reason_code":reason_code.as_str()}),
             Self::NoSession => {
                 json!({"reason_code":"no_session","reason":"no browser session is open"})
@@ -1771,21 +1793,28 @@ impl BrowserPlane {
         self.reserve_inner(identity, capability, true).await
     }
 
-    async fn reserve_without_journal(
-        &self,
-        identity: &RouteIdentity,
-        capability: BrowserCapability,
-    ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
-        self.reserve_inner(identity, capability, false).await
-    }
-
     async fn reserve_inner(
         &self,
         identity: &RouteIdentity,
         capability: BrowserCapability,
         persist_journal: bool,
     ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
-        let operation = if let Some((sessions, clock, _)) = &self.session_gate {
+        let operation = self.admit_operation(identity, capability)?;
+        self.reserve_journal(identity, capability, persist_journal)
+            .await?;
+        Ok(operation)
+    }
+
+    /// Admit one operation on the route's browser session without opening a
+    /// journal entry. Page reads use this to ask the browser where its page is
+    /// before deciding whether the read is authorized, so a refused read still
+    /// leaves nothing in the actuation journal.
+    fn admit_operation(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+    ) -> Result<Option<crate::browser_session::OperationGuard>, BrowserError> {
+        Ok(if let Some((sessions, clock, _)) = &self.session_gate {
             match sessions.accept_dispatch(&identity.conversation_key, clock.as_ref()) {
                 crate::browser_session::DispatchAdmission::Accepted(guard) => Some(guard),
                 crate::browser_session::DispatchAdmission::LaunchPending => {
@@ -1809,7 +1838,15 @@ impl BrowserPlane {
             return Err(BrowserError::NoSession);
         } else {
             None
-        };
+        })
+    }
+
+    async fn reserve_journal(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+        persist_journal: bool,
+    ) -> Result<(), BrowserError> {
         if persist_journal && self.journal_mode.is_enabled() {
             let mut journal = self.journal.lock().await;
             if journal.store.is_none() {
@@ -1841,7 +1878,7 @@ impl BrowserPlane {
                 outcome: None,
             });
         Self::op(&mut state, &identity.conversation_key, Operation::Reserve);
-        Ok(operation)
+        Ok(())
     }
     async fn commit(
         &self,
@@ -2125,8 +2162,8 @@ impl BrowserPlane {
         // origin is the confidentiality boundary the web itself enforces, so
         // an action axis would multiply consent prompts without narrowing
         // anything the origin does not already narrow. The read still
-        // authorizes against the LANDING url, because a redirect can leave the
-        // granted origin.
+        // authorizes against the URL the page is on when it is read, not the
+        // one requested, because a redirect can leave the granted origin.
         //
         // The read journals under its own capability. It did not when this landed
         // -- the vocabulary had no Snapshot member, so recording the read would
@@ -2211,6 +2248,130 @@ impl BrowserPlane {
             })
     }
 
+    /// Ask the browser which document its main frame has committed to.
+    ///
+    /// The tracker records the last navigation this module started or saw a
+    /// click start. A page can leave that document on its own -- a timer, a
+    /// meta refresh, a script assigning `location`, a redirect that lands after
+    /// a click's observation window -- and the tracker would still name the old
+    /// origin. Reads authorize against this value instead, because a grant is
+    /// the person's consent to one origin being read and the content a read
+    /// returns is whatever the page currently shows.
+    async fn read_live_url(
+        &self,
+        identity: &RouteIdentity,
+        mut session_operation: crate::browser_session::OperationGuard,
+        deadline_ms: u64,
+    ) -> Result<(crate::browser_session::OperationGuard, String), BrowserError> {
+        let route_key = identity.conversation_key.clone();
+        let (session_operation, live_url) = tokio::task::spawn_blocking(move || {
+            let live_url = session_operation.main_frame_url(&route_key, deadline_ms);
+            (session_operation, live_url)
+        })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        Ok((
+            session_operation,
+            live_url.map_err(map_navigation_drive_error)?,
+        ))
+    }
+
+    /// Authorize one page read against the page's live URL, recording a
+    /// consent refusal in the refusal ring rather than the actuation journal.
+    async fn authorize_read(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+        live_url: &str,
+    ) -> Result<(), BrowserError> {
+        let origin = origin_from_url(live_url);
+        let grants = self.grants.lock().await;
+        let request = if capability == BrowserCapability::Screenshot {
+            AuthorizationRequest::screenshot(
+                &identity.conversation_key,
+                live_url,
+                &identity.agent_project_id,
+            )
+        } else {
+            AuthorizationRequest::snapshot(
+                &identity.conversation_key,
+                live_url,
+                &identity.agent_project_id,
+            )
+        };
+        let (error, reason) = match grants.authorize(request, &origin) {
+            Ok(decision) => {
+                if grants.commit(&decision).is_ok() {
+                    return Ok(());
+                }
+                (
+                    BrowserError::AuthorizationDenied { reason: "no_grant" },
+                    SnapshotRefusalReason::NoGrant,
+                )
+            }
+            Err(
+                error @ (crate::authorization::AuthorizationError::NoGrant
+                | crate::authorization::AuthorizationError::NoGrantForAction { .. }),
+            ) => (
+                map_authorization_error(error),
+                SnapshotRefusalReason::NoGrant,
+            ),
+            Err(error @ crate::authorization::AuthorizationError::OriginScope { .. }) => (
+                map_authorization_error(error),
+                SnapshotRefusalReason::OriginScope,
+            ),
+            Err(error) => return Err(map_authorization_error(error)),
+        };
+        drop(grants);
+        self.record_snapshot_refusal(identity, live_url, reason)
+            .await?;
+        Err(error)
+    }
+
+    /// Refuse a completed capture whose page left the authorized origin while
+    /// it was being taken.
+    ///
+    /// Authorization and capture are separate CDP calls, and a page can commit
+    /// a navigation between them or during a multi-call capture. The only
+    /// grant consulted was for `authorized_url`'s origin, so content captured
+    /// after the page moved elsewhere was read without consent. The captured
+    /// content is dropped by the caller; this records the refusal and closes
+    /// the already-dispatched journal entry as denied.
+    async fn confirm_read_origin(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+        authorized_url: &str,
+        live_url_after: Result<String, crate::browser_session::NavigationDriveError>,
+    ) -> Result<(), BrowserError> {
+        let live_url_after = live_url_after.map_err(map_navigation_drive_error)?;
+        let authorized_origin = origin_from_url(authorized_url);
+        let live_origin = origin_from_url(&live_url_after);
+        if authorized_origin == live_origin {
+            return Ok(());
+        }
+        let error = BrowserError::PageNavigatedDuringRead {
+            authorized_origin,
+            live_origin,
+        };
+        self.record_snapshot_refusal(
+            identity,
+            &live_url_after,
+            SnapshotRefusalReason::PageNavigatedDuringRead,
+        )
+        .await?;
+        self.finalize(
+            identity,
+            capability,
+            Outcome::Denied,
+            error.detail().unwrap_or(Value::Null),
+        )
+        .await?;
+        Err(error)
+    }
+
     async fn capture_snapshot(
         &self,
         identity: &RouteIdentity,
@@ -2218,79 +2379,33 @@ impl BrowserPlane {
         max_bytes: usize,
         persist_journal: bool,
     ) -> Result<Value, BrowserError> {
-        let (document_epoch, source_origin) = {
+        let document_epoch = {
             let state = self.state.lock().await;
-            let context = state
+            state
                 .contexts
                 .get(&identity.conversation_key)
                 .filter(|context| !context.ended)
-                .ok_or(BrowserError::NoSession)?;
-            (
-                context.epoch.value(),
-                context
-                    .tracker
-                    .url_final
-                    .clone()
-                    .unwrap_or_else(|| "null".into()),
-            )
+                .ok_or(BrowserError::NoSession)?
+                .epoch
+                .value()
         };
-        {
-            let origin = origin_from_url(&source_origin);
-            let grants = self.grants.lock().await;
-            let decision = match grants.authorize(
-                AuthorizationRequest::snapshot(
-                    &identity.conversation_key,
-                    &source_origin,
-                    &identity.agent_project_id,
-                ),
-                &origin,
-            ) {
-                Ok(decision) => decision,
-                Err(
-                    error @ (crate::authorization::AuthorizationError::NoGrant
-                    | crate::authorization::AuthorizationError::NoGrantForAction { .. }),
-                ) => {
-                    drop(grants);
-                    self.record_snapshot_refusal(
-                        identity,
-                        &source_origin,
-                        SnapshotRefusalReason::NoGrant,
-                    )
-                    .await?;
-                    return Err(map_authorization_error(error));
-                }
-                Err(error @ crate::authorization::AuthorizationError::OriginScope { .. }) => {
-                    drop(grants);
-                    self.record_snapshot_refusal(
-                        identity,
-                        &source_origin,
-                        SnapshotRefusalReason::OriginScope,
-                    )
-                    .await?;
-                    return Err(map_authorization_error(error));
-                }
-                Err(error) => return Err(map_authorization_error(error)),
-            };
-            if grants.commit(&decision).is_err() {
-                drop(grants);
-                self.record_snapshot_refusal(
-                    identity,
-                    &source_origin,
-                    SnapshotRefusalReason::NoGrant,
-                )
-                .await?;
-                return Err(BrowserError::AuthorizationDenied { reason: "no_grant" });
-            }
-        }
-        let reservation = if persist_journal {
-            self.reserve(identity, BrowserCapability::Snapshot).await?
-        } else {
-            self.reserve_without_journal(identity, BrowserCapability::Snapshot)
-                .await?
-        };
-        let Some(mut session_operation) = reservation else {
+        let deadline_ms = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+            .ok_or(BrowserError::NoSession)?;
+        let Some(session_operation) =
+            self.admit_operation(identity, BrowserCapability::Snapshot)?
+        else {
             return Err(BrowserError::NoSession);
         };
+        let (mut session_operation, source_url) = self
+            .read_live_url(identity, session_operation, deadline_ms)
+            .await?;
+        self.authorize_read(identity, BrowserCapability::Snapshot, &source_url)
+            .await?;
+        self.reserve_journal(identity, BrowserCapability::Snapshot, persist_journal)
+            .await?;
         self.commit(identity, BrowserCapability::Snapshot).await?;
         {
             let mut state = self.state.lock().await;
@@ -2301,29 +2416,36 @@ impl BrowserPlane {
             );
         }
 
-        let deadline_ms = self
-            .session_gate
-            .as_ref()
-            .map(|(_, _, deadline_ms)| *deadline_ms)
-            .ok_or(BrowserError::NoSession)?;
         let route_key = identity.conversation_key.clone();
+        let authorized_url = source_url.clone();
         let driven = tokio::task::spawn_blocking(move || {
             let result = session_operation.snapshot_classified(
                 &route_key,
                 kind,
                 document_epoch,
-                &source_origin,
+                &authorized_url,
                 deadline_ms,
             );
-            (session_operation, result)
+            // Read where the page is once the capture has returned, on the
+            // same admitted operation, so nothing this module issues can sit
+            // between the capture and this check.
+            let live_url_after = session_operation.main_frame_url(&route_key, deadline_ms);
+            (session_operation, result, live_url_after)
         })
         .await
         .map_err(|_| BrowserError::Internal {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
-        let (session_operation, drive_result) = driven;
+        let (session_operation, drive_result, live_url_after) = driven;
         session_operation.finish();
         let observation = drive_result.map_err(map_navigation_drive_error)?;
+        self.confirm_read_origin(
+            identity,
+            BrowserCapability::Snapshot,
+            &source_url,
+            live_url_after,
+        )
+        .await?;
         let result = self
             .retain_text_snapshot_inner(
                 identity,
@@ -2334,6 +2456,7 @@ impl BrowserPlane {
                 max_bytes,
                 kind == SnapshotKind::Ax && observation.ax_truncated,
                 observation.refs_truncated,
+                Some(source_url),
             )
             .await?;
         let content_bytes = result
@@ -2377,7 +2500,7 @@ impl BrowserPlane {
     ) -> Result<Value, BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
         self.retain_text_snapshot_inner(
-            identity, mode, records, dom_text, refs, max_bytes, false, false,
+            identity, mode, records, dom_text, refs, max_bytes, false, false, None,
         )
         .await
     }
@@ -2393,6 +2516,10 @@ impl BrowserPlane {
         max_bytes: usize,
         content_incomplete: bool,
         refs_incomplete: bool,
+        // The URL the read was authorized against. `None` only for an
+        // observation handed in directly rather than captured here, which
+        // falls back to the tracked page.
+        source_url: Option<String>,
     ) -> Result<Value, BrowserError> {
         let mut state = self.state.lock().await;
         let context = state
@@ -2428,11 +2555,13 @@ impl BrowserPlane {
             snapshot_id: id.clone(),
             kind: mode,
             document_epoch: context.epoch.value(),
-            source_origin: context
-                .tracker
-                .url_final
-                .clone()
-                .unwrap_or_else(|| "null".into()),
+            source_origin: source_url.unwrap_or_else(|| {
+                context
+                    .tracker
+                    .url_final
+                    .clone()
+                    .unwrap_or_else(|| "null".into())
+            }),
             content_schema: schema,
             content,
             truncated,
@@ -2482,10 +2611,10 @@ impl BrowserPlane {
     /// Build a click's reply from what the driver measured, and record a
     /// navigation the click caused as the conversation's current page.
     ///
-    /// Recording it is what keeps later reads honest: a snapshot or
-    /// screenshot authorizes against the tracked page, so leaving the page
-    /// the click started from in place would let the next read of the
-    /// landing page run under that page's grant.
+    /// Recording it keeps the tracked page, and the `url_final` later replies
+    /// report, in step with the browser. Reads do not rely on it: a snapshot
+    /// or screenshot asks the browser for its committed URL and authorizes
+    /// against that.
     async fn click_reply(
         &self,
         identity: &RouteIdentity,
@@ -2863,45 +2992,35 @@ impl BrowserPlane {
         let max_bytes = optional_integer(object, "max_bytes", 1, MAX_ENCODED_PNG_BYTES as u64)?
             .unwrap_or(MAX_ENCODED_PNG_BYTES as u64) as usize;
         let full = optional_bool(object, "full")?.unwrap_or(false);
-        let (document_epoch, source_origin) = {
+        let document_epoch = {
             let state = self.state.lock().await;
-            let context = state
+            state
                 .contexts
                 .get(&identity.conversation_key)
                 .filter(|context| !context.ended)
-                .ok_or(BrowserError::NoSession)?;
-            (
-                context.epoch.value(),
-                context
-                    .tracker
-                    .url_final
-                    .clone()
-                    .unwrap_or_else(|| "null".into()),
-            )
+                .ok_or(BrowserError::NoSession)?
+                .epoch
+                .value()
         };
-        {
-            let origin = origin_from_url(&source_origin);
-            let grants = self.grants.lock().await;
-            let decision = grants
-                .authorize(
-                    AuthorizationRequest::screenshot(
-                        &identity.conversation_key,
-                        &source_origin,
-                        &identity.agent_project_id,
-                    ),
-                    &origin,
-                )
-                .map_err(map_authorization_error)?;
-            grants
-                .commit(&decision)
-                .map_err(|_| BrowserError::AuthorizationDenied { reason: "no_grant" })?;
-        }
-        let Some(mut session_operation) = self
-            .reserve(identity, BrowserCapability::Screenshot)
-            .await?
+        let deadline_ms = self
+            .session_gate
+            .as_ref()
+            .map(|(_, _, deadline_ms)| *deadline_ms)
+            .ok_or(BrowserError::NoSession)?;
+        let Some(session_operation) =
+            self.admit_operation(identity, BrowserCapability::Screenshot)?
         else {
             return Err(BrowserError::NoSession);
         };
+        // As for a snapshot: pixels of an authenticated page are a read of it,
+        // so the grant consulted is the one for where the page is now.
+        let (mut session_operation, source_url) = self
+            .read_live_url(identity, session_operation, deadline_ms)
+            .await?;
+        self.authorize_read(identity, BrowserCapability::Screenshot, &source_url)
+            .await?;
+        self.reserve_journal(identity, BrowserCapability::Screenshot, true)
+            .await?;
         self.commit(identity, BrowserCapability::Screenshot).await?;
         {
             let mut state = self.state.lock().await;
@@ -2912,24 +3031,30 @@ impl BrowserPlane {
             );
         }
 
-        let deadline_ms = self
-            .session_gate
-            .as_ref()
-            .map(|(_, _, deadline_ms)| *deadline_ms)
-            .ok_or(BrowserError::NoSession)?;
         let route_key = identity.conversation_key.clone();
         let driven = tokio::task::spawn_blocking(move || {
             let result =
                 session_operation.screenshot(&route_key, document_epoch, deadline_ms, full);
-            (session_operation, result)
+            // Read where the page is on the same admitted operation right
+            // after the capture, so nothing this module issues can sit between
+            // the capture and the check that it read the authorized origin.
+            let live_url_after = session_operation.main_frame_url(&route_key, deadline_ms);
+            (session_operation, result, live_url_after)
         })
         .await
         .map_err(|_| BrowserError::Internal {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
-        let (session_operation, drive_result) = driven;
+        let (session_operation, drive_result, live_url_after) = driven;
         session_operation.finish();
         let observation = drive_result.map_err(map_navigation_drive_error)?;
+        self.confirm_read_origin(
+            identity,
+            BrowserCapability::Screenshot,
+            &source_url,
+            live_url_after,
+        )
+        .await?;
         let bytes = observation.image_png_b64.len();
         if bytes > max_bytes {
             return Err(BrowserError::ImageTooLarge {
@@ -2948,6 +3073,7 @@ impl BrowserPlane {
                 observation.before,
                 observation.after,
                 observation.invalidation_observed,
+                Some(source_url),
             )
             .await?;
         self.finalize(
@@ -3244,8 +3370,15 @@ impl BrowserPlane {
         invalidation_observed: bool,
     ) -> Result<Value, BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
-        self.retain_screenshot_inner(identity, payload, before, after, invalidation_observed)
-            .await
+        self.retain_screenshot_inner(
+            identity,
+            payload,
+            before,
+            after,
+            invalidation_observed,
+            None,
+        )
+        .await
     }
 
     async fn retain_screenshot_inner(
@@ -3255,6 +3388,9 @@ impl BrowserPlane {
         before: ViewportObservation,
         after: ViewportObservation,
         invalidation_observed: bool,
+        // The URL the capture was authorized against; `None` falls back to the
+        // tracked page, as for text snapshots.
+        source_url: Option<String>,
     ) -> Result<Value, BrowserError> {
         let coherent = capture_screenshot(before, payload, after, invalidation_observed)
             .map_err(map_coordinate_error)?;
@@ -3264,11 +3400,13 @@ impl BrowserPlane {
             .get_mut(&identity.conversation_key)
             .ok_or(BrowserError::NoSession)?;
         let id = context.snapshot_id(SnapshotKind::Screenshot);
-        let source_origin = context
-            .tracker
-            .url_final
-            .clone()
-            .unwrap_or_else(|| "null".into());
+        let source_origin = source_url.unwrap_or_else(|| {
+            context
+                .tracker
+                .url_final
+                .clone()
+                .unwrap_or_else(|| "null".into())
+        });
         let snapshot = coherent.into_snapshot(id.clone(), source_origin);
         let result = json!({"outcome":"ok","snapshot_id":snapshot.snapshot_id,"document_epoch":snapshot.document_epoch,"source_origin":snapshot.source_origin,"image_png_b64":snapshot.image_png_b64,"image_width_px":snapshot.image_width_px,"image_height_px":snapshot.image_height_px,"input_rect":{"x_input_css":snapshot.input_rect.x_input_css,"y_input_css":snapshot.input_rect.y_input_css,"width_input_css":snapshot.input_rect.width_input_css,"height_input_css":snapshot.input_rect.height_input_css},"device_scale_factor":snapshot.device_scale_factor,"visual_viewport_scale":snapshot.visual_viewport_scale});
         context
@@ -3573,6 +3711,8 @@ fn refusal_detail_schema() -> Value {
             "reason":string_schema(),
             "attempted_origin":string_schema(),
             "granted_origins":string_array_schema(),
+            "authorized_origin":string_schema(),
+            "live_origin":string_schema(),
             "error_text":string_schema(),
             "ref":string_schema(),
             "candidates":integer_schema(),
@@ -3656,6 +3796,7 @@ fn browser_result_outcome_schema() -> Value {
         "hazard_not_disclosed",
         "navigation_policy_rejected",
         "navigation_failed",
+        "page_navigated_during_read",
         "not_settled",
         "browser_crashed",
         "internal_error",
@@ -4528,7 +4669,8 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::AuthorizationOriginScope { .. }
         | BrowserError::AuthorizationNoGrantForAction { .. }
         | BrowserError::AuthorizationSeverityInsufficient { .. }
-        | BrowserError::HazardNotDisclosed { .. } => Outcome::Denied,
+        | BrowserError::HazardNotDisclosed { .. }
+        | BrowserError::PageNavigatedDuringRead { .. } => Outcome::Denied,
         BrowserError::StaleSnapshot { .. }
         | BrowserError::RefNotFound { .. }
         | BrowserError::RefAmbiguous { .. }
@@ -4992,6 +5134,15 @@ mod tests {
                 },
                 "navigation_failed",
                 "inspect detail.error_text and choose a reachable destination or retry when that browser error is transient",
+            ),
+            (
+                "page_navigated_during_read",
+                BrowserError::PageNavigatedDuringRead {
+                    authorized_origin: "https://granted.test".to_string(),
+                    live_origin: "https://elsewhere.test".to_string(),
+                },
+                "page_navigated_during_read",
+                "read the page again with browser.snapshot or browser.screenshot; if it stays on detail.live_origin, that read needs browser.open_grant for detail.live_origin first",
             ),
             (
                 "not_settled",

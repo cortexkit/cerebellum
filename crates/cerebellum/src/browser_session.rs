@@ -453,7 +453,14 @@ pub trait OwnedBrowserProcess: Send {
         Err(NavigationDriveError::Unavailable)
     }
 
-    /// Read only the current main-frame URL.
+    /// Read only the URL of the document the main frame has COMMITTED to.
+    ///
+    /// Page reads authorize against this value, so it must not report a
+    /// navigation that is still pending: a pending destination names a page
+    /// whose content is not yet what a read would return. The CDP driver
+    /// answers from `Page.getNavigationHistory`'s current entry, which moves
+    /// only when a navigation commits. The default refuses, so a process that
+    /// cannot say where its page is cannot serve a read.
     fn main_frame_url(
         &mut self,
         _context_key: &str,
@@ -1253,6 +1260,20 @@ impl OperationGuard {
         self.drive(
             |error| error,
             |process| process.navigate(context_key, url, wait, deadline_ms, tracker),
+        )
+    }
+
+    /// Read the URL of the document the main frame has committed to, so a
+    /// page read can authorize against where the page actually is rather than
+    /// against the last navigation this module started and watched.
+    pub(crate) fn main_frame_url(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<String, NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.main_frame_url(context_key, deadline_ms),
         )
     }
 
