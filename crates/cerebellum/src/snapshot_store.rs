@@ -198,12 +198,57 @@ impl AxRecord {
     }
 }
 
+/// Which committed document the browser's main frame showed, as the browser
+/// itself reports it.
+///
+/// The module's own document epoch only moves on navigations it starts or
+/// watches. A page can also replace itself (a timer, a script assigning
+/// `location`, a late redirect), and only the browser knows that happened.
+/// Reads compare two of these taken around a capture, and an action compares
+/// the one recorded with its snapshot to the one current at dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedDocument {
+    /// The committed main-frame URL.
+    pub url: String,
+    /// The browser's unique id for the current history entry
+    /// (`Page.getNavigationHistory`). Every committed navigation that adds
+    /// or replaces an entry changes it, including a same-document one such as
+    /// a fragment change or `history.pushState`.
+    pub entry_id: i64,
+    /// The id of every history entry, in order, with `current_index` naming
+    /// the current one. A navigation away and a history traversal back can
+    /// land on the original entry id again, but the entry it created remains
+    /// in this list, so the round trip still shows.
+    pub history: Vec<i64>,
+    pub current_index: usize,
+    /// The main frame's document loader (`Page.getFrameTree`). It changes when
+    /// a new document commits, including a reload, and stays the same across
+    /// same-document navigations, which keep the elements a ref names.
+    pub loader_id: String,
+}
+
+impl CommittedDocument {
+    /// A document whose history holds only its own entry.
+    pub fn new(url: impl Into<String>, entry_id: i64, loader_id: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            entry_id,
+            history: vec![entry_id],
+            current_index: 0,
+            loader_id: loader_id.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSnapshot {
     pub snapshot_id: String,
     pub kind: SnapshotKind,
     pub document_epoch: u64,
     pub source_origin: String,
+    /// The browser-reported document this snapshot was read from. `None` for
+    /// an observation handed in without one, which no action will trust.
+    pub source_document: Option<CommittedDocument>,
     pub content_schema: &'static str,
     pub content: String,
     pub truncated: bool,
@@ -771,6 +816,7 @@ mod tests {
                 kind: SnapshotKind::Ax,
                 document_epoch: 0,
                 source_origin: "https://example.test".into(),
+                source_document: None,
                 content_schema: AX_SCHEMA,
                 content: String::new(),
                 truncated: false,

@@ -12,8 +12,9 @@ use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
 use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use cerebellum::browser_session::{
     BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserSessionLauncher,
-    CleanupStage, ClickDriveError, ClickNavigation, LaunchedBrowser, NavigationDriveError,
-    NavigationWait, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
+    CleanupStage, ClickDriveError, ClickNavigation, ClickPointDriveError, LaunchedBrowser,
+    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
+    SessionCleanup,
 };
 use cerebellum::cdp::{CdpFrameDecoder, CdpTransport};
 use cerebellum::classification::{
@@ -22,7 +23,7 @@ use cerebellum::classification::{
 };
 use cerebellum::coordinate::{TransformInputs, ViewportObservation};
 use cerebellum::snapshot_store::{
-    AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
+    AxRecord, BackendNodeIdentity, CommittedDocument, RefRecord, SnapshotKind, SnapshotRef,
 };
 use cerebellum::{BrowserConfig, BrowserSurface, Planes};
 use cerebellum_computer::platform::vocabulary::{
@@ -271,40 +272,127 @@ fn snapshot_observation(
     }
 }
 
-/// The URL a double's main frame has committed to, shared between a test and
-/// the process it launches.
+/// The main frame's committed history, shared between a test and the process
+/// it launches, modelled on what Chrome reports through
+/// `Page.getNavigationHistory` and `Page.getFrameTree`.
 ///
-/// Page reads authorize against what the browser reports here, not against the
+/// Page reads and actions check what the browser reports here, not the
 /// navigation the module tracked. A double that echoed the tracker would make
-/// every read look authorized for the reason under test, so the test moves the
-/// page itself, the way a page's own script or a late redirect would.
+/// every check pass for the reason under test, so the test moves the page
+/// itself, the way a page's own script or a late redirect would.
+///
+/// As in Chrome: a cross-document navigation prunes forward history, adds an
+/// entry with a new unique id, and loads a new document (a new loader id); a
+/// same-document navigation such as a fragment change also adds an entry with
+/// a new id but keeps the document and its loader; a traversal back moves the
+/// current index to an existing entry and restores that entry's document.
 #[derive(Clone)]
-struct CommittedPage(Arc<Mutex<String>>);
+struct CommittedPage(Arc<Mutex<PageHistory>>);
+
+struct PageHistory {
+    /// `(entry id, url, loader id)` per entry.
+    entries: Vec<(i64, String, String)>,
+    current: usize,
+    next_id: i64,
+}
 
 impl Default for CommittedPage {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new("about:blank".into())))
+        Self(Arc::new(Mutex::new(PageHistory {
+            entries: vec![(1, "about:blank".into(), "loader-1".into())],
+            current: 0,
+            next_id: 2,
+        })))
     }
 }
 
 impl CommittedPage {
+    fn push(&self, url: &str, new_document: bool) {
+        let mut history = self.0.lock().unwrap();
+        let id = history.next_id;
+        history.next_id += 1;
+        let loader = if new_document {
+            format!("loader-{id}")
+        } else {
+            history.entries[history.current].2.clone()
+        };
+        let keep = history.current + 1;
+        history.entries.truncate(keep);
+        history.entries.push((id, url.to_string(), loader));
+        history.current = keep;
+    }
+
+    /// A cross-document navigation commits.
     fn commit(&self, url: &str) {
-        *self.0.lock().unwrap() = url.to_string();
+        self.push(url, true);
+    }
+
+    /// A same-document navigation (fragment change) commits.
+    fn fragment(&self, url: &str) {
+        self.push(url, false);
+    }
+
+    /// `history.back()` commits, restoring the previous entry's document as
+    /// the back/forward cache does.
+    fn back(&self) {
+        let mut history = self.0.lock().unwrap();
+        history.current -= 1;
     }
 
     fn url(&self) -> String {
-        self.0.lock().unwrap().clone()
+        let history = self.0.lock().unwrap();
+        history.entries[history.current].1.clone()
     }
+
+    fn document(&self) -> CommittedDocument {
+        let history = self.0.lock().unwrap();
+        let (entry_id, url, loader_id) = history.entries[history.current].clone();
+        CommittedDocument {
+            url,
+            entry_id,
+            history: history.entries.iter().map(|entry| entry.0).collect(),
+            current_index: history.current,
+            loader_id,
+        }
+    }
+
+    fn navigation_history(&self) -> Value {
+        let history = self.0.lock().unwrap();
+        json!({
+            "currentIndex": history.current,
+            "entries": history.entries.iter().map(|(id, url, _)| json!({
+                "id": id, "url": url, "userTypedURL": url, "title": "", "transitionType": "link"
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn frame_tree(&self) -> Value {
+        let document = self.document();
+        json!({"frameTree":{"frame":{
+            "id": MAIN_FRAME,
+            "loaderId": document.loader_id,
+            "url": document.url,
+            "securityOrigin": "",
+            "mimeType": "text/html"
+        }}})
+    }
+}
+
+/// One way a page moves while a read is being captured.
+#[derive(Clone)]
+enum PageMove {
+    Commit(&'static str),
+    Back,
 }
 
 #[derive(Default)]
 struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
     page: CommittedPage,
-    /// A URL the page commits to while a snapshot or screenshot is being
-    /// captured, standing for a navigation that lands between the read's
-    /// authorization and its return.
-    commit_during_capture: Arc<Mutex<Option<String>>>,
+    /// Navigations the page commits while a snapshot or screenshot is being
+    /// captured, standing for ones that land between the read's
+    /// authorization and its return. Consumed by the next capture.
+    moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
     hazardous_target: bool,
     cross_site_link_target: bool,
@@ -328,7 +416,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
             process: Box::new(RecordingProcess {
                 effects: Arc::clone(&self.effects),
                 page: self.page.clone(),
-                commit_during_capture: Arc::clone(&self.commit_during_capture),
+                moves_during_capture: Arc::clone(&self.moves_during_capture),
                 clicked: false,
                 hazardous_target: self.hazardous_target,
                 cross_site_link_target: self.cross_site_link_target,
@@ -380,7 +468,7 @@ impl BrowserSessionLauncher for UndeclaredReplyLauncher {
 struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
     page: CommittedPage,
-    commit_during_capture: Arc<Mutex<Option<String>>>,
+    moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
     clicked: bool,
     hazardous_target: bool,
     cross_site_link_target: bool,
@@ -392,7 +480,26 @@ struct RecordingProcess {
     exited: Arc<Mutex<bool>>,
 }
 
+impl RecordingProcess {
+    fn apply_moves_during_capture(&mut self) {
+        for page_move in std::mem::take(&mut *self.moves_during_capture.lock().unwrap()) {
+            match page_move {
+                PageMove::Commit(url) => self.page.commit(url),
+                PageMove::Back => self.page.back(),
+            }
+        }
+    }
+}
+
 impl OwnedBrowserProcess for RecordingProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(self.page.document())
+    }
+
     fn present(&mut self, _: &str, _: u64) -> Result<(), NavigationDriveError> {
         self.effects.lock().unwrap().push("Page.bringToFront");
         if let Some(error_text) = self.present_error {
@@ -460,9 +567,7 @@ impl OwnedBrowserProcess for RecordingProcess {
             document_epoch,
             current_origin,
         );
-        if let Some(url) = self.commit_during_capture.lock().unwrap().take() {
-            self.page.commit(&url);
-        }
+        self.apply_moves_during_capture();
         Ok(observation)
     }
 
@@ -484,9 +589,7 @@ impl OwnedBrowserProcess for RecordingProcess {
             after: viewport,
             invalidation_observed: false,
         };
-        if let Some(url) = self.commit_during_capture.lock().unwrap().take() {
-            self.page.commit(&url);
-        }
+        self.apply_moves_during_capture();
         Ok(observation)
     }
 
@@ -2567,6 +2670,8 @@ struct ChromeLikePipe {
     /// The main frame's committed URL, which `Page.getNavigationHistory`
     /// reports and a main-frame `Page.frameNavigated` moves.
     page: CommittedPage,
+    /// Every CDP method the driver sent, in order.
+    commands: Arc<Mutex<Vec<String>>>,
     reads: VecDeque<Vec<u8>>,
     blocked_release_id: Option<u64>,
 }
@@ -2587,6 +2692,10 @@ impl CdpPipeIo for ChromeLikePipe {
     fn write_frame(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
         let id = command["id"].as_u64().unwrap();
+        self.commands
+            .lock()
+            .unwrap()
+            .push(command["method"].as_str().unwrap().to_string());
         match command["method"].as_str().unwrap() {
             "Target.createTarget" => {
                 self.queue(json!({"id":id,"result":{"targetId":"target-own"}}));
@@ -2611,13 +2720,12 @@ impl CdpPipeIo for ChromeLikePipe {
             ),
             "DOM.getFlattenedDocument" => self.reply(id, Value::Object(click_page_document())),
             "Page.getNavigationHistory" => {
-                let url = self.page.url();
-                self.reply(
-                    id,
-                    json!({"currentIndex":0,"entries":[{
-                        "id":1,"url":url,"userTypedURL":url,"title":"","transitionType":"link"
-                    }]}),
-                )
+                let history = self.page.navigation_history();
+                self.reply(id, history)
+            }
+            "Page.getFrameTree" => {
+                let tree = self.page.frame_tree();
+                self.reply(id, tree)
             }
             "DOM.scrollIntoViewIfNeeded" | "DOM.enable" | "Page.enable" | "Network.enable" => {
                 self.reply(id, json!({}))
@@ -2716,6 +2824,47 @@ impl OwnedBrowserProcess for CdpClickProcess {
         self.driver.main_frame_url(context_key, deadline_ms)
     }
 
+    fn committed_document(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        self.driver.committed_document(context_key, deadline_ms)
+    }
+
+    /// Canned like the snapshot: what matters here is the document the
+    /// capture records and the click_point that follows, which runs through
+    /// the production driver. The viewport matches the pipe's layout metrics.
+    fn screenshot(
+        &mut self,
+        _: &str,
+        _: u64,
+        _: u64,
+        _: bool,
+    ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
+        let viewport = ViewportObservation::new(
+            0,
+            TransformInputs::from_values(0.0, 0.0, 1280.0, 713.0, 1.0, 1.0),
+        );
+        Ok(BrowserScreenshotObservation {
+            image_png_b64: ONE_BY_ONE_PNG_B64.into(),
+            before: viewport,
+            after: viewport,
+            invalidation_observed: false,
+        })
+    }
+
+    fn click_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
+        self.driver
+            .click_point(context_key, position, deadline_ms, input_dispatched)
+    }
+
     fn snapshot_classified(
         &mut self,
         _: &str,
@@ -2802,6 +2951,7 @@ struct CdpClickLauncher {
     scenario: ClickScenario,
     snapshots: Arc<Mutex<usize>>,
     page: CommittedPage,
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 impl BrowserSessionLauncher for CdpClickLauncher {
@@ -2816,6 +2966,7 @@ impl BrowserSessionLauncher for CdpClickLauncher {
                     ChromeLikePipe {
                         scenario: self.scenario,
                         page: self.page.clone(),
+                        commands: Arc::clone(&self.commands),
                         reads: VecDeque::new(),
                         blocked_release_id: None,
                     },
@@ -2854,6 +3005,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
         scenario,
         snapshots: Arc::clone(&snapshots),
         page: page.clone(),
+        commands: Arc::default(),
     }));
     planes.browser = Arc::new(
         BrowserPlane::with_session_gate(
@@ -3173,8 +3325,8 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
         (7, "browser.screenshot", json!({})),
     ] {
         launcher.page.commit("https://landed.example/final");
-        *launcher.commit_during_capture.lock().unwrap() =
-            Some("https://attacker.example/mid-read".into());
+        *launcher.moves_during_capture.lock().unwrap() =
+            vec![PageMove::Commit("https://attacker.example/mid-read")];
 
         let refused = response_body(&planes, corr, tool, arguments.clone()).await;
         assert_eq!(
@@ -3201,8 +3353,8 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
     // The same race inside navigate's read_page: the navigation itself is
     // reported, and the embedded read is withheld.
     launcher.page.commit("https://landed.example/final");
-    *launcher.commit_during_capture.lock().unwrap() =
-        Some("https://attacker.example/mid-read".into());
+    *launcher.moves_during_capture.lock().unwrap() =
+        vec![PageMove::Commit("https://attacker.example/mid-read")];
     let navigated = response_body(
         &planes,
         9,
@@ -3287,5 +3439,198 @@ async fn a_read_authorizes_against_the_live_origin_when_the_tracker_is_stale() {
     assert_eq!(
         screenshot["source_origin"], "https://moved.example/next",
         "{screenshot}"
+    );
+}
+
+#[tokio::test]
+async fn a_round_trip_through_another_origin_during_a_read_discards_the_capture() {
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+
+    // Out and straight back by a new navigation, and out and back by history
+    // traversal. Either way the page is on the authorized origin at both ends
+    // of the capture, and either way the capture may hold the other page's
+    // content. Checking only the origin would return it.
+    let mut corr = 3;
+    for moves in [
+        vec![
+            PageMove::Commit("https://attacker.example/mid-read"),
+            PageMove::Commit("https://landed.example/final"),
+        ],
+        vec![
+            PageMove::Commit("https://attacker.example/mid-read"),
+            PageMove::Back,
+        ],
+    ] {
+        for (tool, arguments) in [
+            ("browser.snapshot", json!({"mode": "ax"})),
+            ("browser.snapshot", json!({"mode": "dom_full"})),
+            ("browser.screenshot", json!({})),
+        ] {
+            *launcher.moves_during_capture.lock().unwrap() = moves.clone();
+            let refused = response_body(&planes, corr, tool, arguments.clone()).await;
+            corr += 1;
+            assert_eq!(
+                refused["outcome"], "page_navigated_during_read",
+                "{tool} {arguments}: {refused}"
+            );
+            assert_eq!(
+                refused["detail"]["authorized_origin"], "https://landed.example",
+                "{refused}"
+            );
+            assert_eq!(
+                refused["detail"]["live_origin"], "https://landed.example",
+                "{refused}"
+            );
+            assert_no_page_content(&refused);
+        }
+    }
+
+    // Back where it started and holding still: reads work.
+    let read = response_body(&planes, corr, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(read["outcome"], "ok", "{read}");
+}
+
+/// Launch the Chrome-like double on the example page with a grant that
+/// covers clicking there, including a screenshot point whose target is not
+/// classified. Returns the planes, the page, and the double's CDP command log.
+async fn actuation_planes() -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) {
+    let page = CommittedPage::default();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let config = BrowserConfig {
+        navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
+        ..config()
+    };
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config.clone()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        scenario: ClickScenario::NoNavigation,
+        snapshots: Arc::new(Mutex::new(0)),
+        page: page.clone(),
+        commands: Arc::clone(&commands),
+    }));
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(
+            planes.sessions.clone(),
+            Arc::clone(&planes.lease_clock),
+            config.navigation_settle_deadline_ms,
+        )
+        .with_grants_installed(GrantStore::new([ActionGrant::new(
+            "act",
+            1,
+            "test-session",
+            Severity::new(4, true, true),
+            [CLICK_PAGE_ORIGIN],
+        )
+        .with_disclosed_hazards([HazardClass::UnverifiedFormContents])])),
+    );
+    launch_at(&planes, &page, CLICK_PAGE_ORIGIN).await;
+    (planes, page, commands)
+}
+
+fn mouse_events(commands: &Arc<Mutex<Vec<String>>>) -> usize {
+    commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|method| *method == "Input.dispatchMouseEvent")
+        .count()
+}
+
+async fn click_ref(planes: &Planes, corr: u64, snapshot: &Value) -> Value {
+    response_body(
+        planes,
+        corr,
+        "browser.click",
+        json!({
+            "ref": snapshot["refs"][0]["ref"],
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "follow the Learn more link",
+            "severity": {"tier": 4, "credential": true, "financial": true}
+        }),
+    )
+    .await
+}
+
+async fn click_screenshot_point(planes: &Planes, corr: u64, screenshot: &Value) -> Value {
+    response_body(
+        planes,
+        corr,
+        "browser.click_point",
+        json!({
+            "snapshot_id": screenshot["snapshot_id"],
+            "x_px": 0,
+            "y_px": 0,
+            "image_width_px": screenshot["image_width_px"],
+            "image_height_px": screenshot["image_height_px"],
+            "intent": "click the top-left point",
+            "severity": {"tier": 4, "credential": true, "financial": true}
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_action_on_a_snapshot_of_a_page_that_has_since_moved_dispatches_no_input() {
+    let (planes, page, commands) = actuation_planes().await;
+    let snapshot = response_body(&planes, 100, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let screenshot = response_body(&planes, 101, "browser.screenshot", json!({})).await;
+    assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+
+    // The page replaces itself with another site's document. The tracker
+    // never hears of it, so both retained captures still look current.
+    page.commit("https://attacker.example/moved");
+
+    let clicked = click_ref(&planes, 102, &snapshot).await;
+    let pointed = click_screenshot_point(&planes, 103, &screenshot).await;
+    for refused in [&clicked, &pointed] {
+        assert_eq!(refused["outcome"], "stale_snapshot", "{refused}");
+        assert_eq!(
+            refused["detail"]["reason_code"], "page_changed_since_snapshot",
+            "{refused}"
+        );
+        assert_eq!(
+            refused["detail"]["snapshot_origin"], CLICK_PAGE_ORIGIN,
+            "{refused}"
+        );
+        assert_eq!(
+            refused["detail"]["live_origin"], "https://attacker.example",
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        mouse_events(&commands),
+        0,
+        "input reached a page nobody snapshotted: {:?}",
+        commands.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_action_after_a_same_document_fragment_change_still_dispatches() {
+    let (planes, page, commands) = actuation_planes().await;
+    let snapshot = response_body(&planes, 100, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let screenshot = response_body(&planes, 101, "browser.screenshot", json!({})).await;
+    assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+
+    // Chrome adds a history entry, with a new id, for a fragment change, but
+    // the document and every element in it stay. The refs and pixels still
+    // name what they named.
+    page.fragment(&format!("{CLICK_PAGE_ORIGIN}/page#details"));
+
+    let clicked = click_ref(&planes, 102, &snapshot).await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    let after_click = mouse_events(&commands);
+    assert!(after_click > 0, "{:?}", commands.lock().unwrap());
+    let pointed = click_screenshot_point(&planes, 103, &screenshot).await;
+    assert_eq!(pointed["outcome"], "ok", "{pointed}");
+    assert!(
+        mouse_events(&commands) > after_click,
+        "{:?}",
+        commands.lock().unwrap()
     );
 }

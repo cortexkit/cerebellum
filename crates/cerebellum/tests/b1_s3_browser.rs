@@ -23,7 +23,8 @@ use cerebellum::coordinate::{
 };
 use cerebellum::journal::Outcome;
 use cerebellum::snapshot_store::{
-    AxRecord, BackendNodeIdentity, RefRecord, SameDocumentChange, SnapshotKind, SnapshotRef,
+    AxRecord, BackendNodeIdentity, CommittedDocument, RefRecord, SameDocumentChange, SnapshotKind,
+    SnapshotRef,
 };
 use cerebellum::{BrowserConfig, RouteIdentity};
 use cerebellum_core::clock::SystemClock;
@@ -68,6 +69,7 @@ async fn a_click_addressing_a_differently_sized_image_is_refused_before_dispatch
             view,
             view,
             false,
+            Some(page_document()),
         )
         .await
         .expect("a coherent screenshot is retained");
@@ -159,6 +161,7 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
                 classification: Err(ClassificationUnavailable::NotCaptured),
             }],
             4096,
+            Some(page_document()),
         )
         .await
         .unwrap();
@@ -170,6 +173,7 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
             Some("body"),
             vec![],
             4096,
+            Some(page_document()),
         )
         .await
         .unwrap()["snapshot_id"]
@@ -302,8 +306,12 @@ impl OwnedBrowserProcess for SnapshotProcess {
 
     /// Reads authorize against where the browser says its page is, so this
     /// double stays on the granted origin whatever the tracker records.
-    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
-        Ok("https://requested.example/page".into())
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
     }
 
     fn snapshot(
@@ -414,8 +422,12 @@ struct ScreenshotProcess {
 }
 
 impl OwnedBrowserProcess for ScreenshotProcess {
-    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
-        Ok(self.page_url.into())
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(CommittedDocument::new(self.page_url, 1, "loader-page"))
     }
 
     fn screenshot(
@@ -469,6 +481,14 @@ struct ClickProcess {
 }
 
 impl OwnedBrowserProcess for ClickProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
+    }
+
     fn click(
         &mut self,
         _: &str,
@@ -591,6 +611,14 @@ struct ClickPointProcess {
 }
 
 impl OwnedBrowserProcess for ClickPointProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
+    }
+
     fn click_point(
         &mut self,
         context_key: &str,
@@ -673,6 +701,14 @@ impl CdpNavigationProcess {
 }
 
 impl OwnedBrowserProcess for CdpNavigationProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
+    }
+
     fn navigate(
         &mut self,
         context_key: &str,
@@ -822,6 +858,14 @@ struct DialogClickPointProcess {
 }
 
 impl OwnedBrowserProcess for DialogClickPointProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
+    }
+
     fn navigate(
         &mut self,
         context_key: &str,
@@ -871,6 +915,14 @@ struct RefusingClickPointProcess {
 }
 
 impl OwnedBrowserProcess for RefusingClickPointProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
+    }
+
     fn click_point(
         &mut self,
         _: &str,
@@ -1092,6 +1144,14 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
     }
 }
 
+/// The document every page-positioned double here reports, matching
+/// `position_on_authorized_page`. Snapshots retained by hand record it too, so
+/// an action on them passes the check that the page still shows the document
+/// they were taken from.
+fn page_document() -> CommittedDocument {
+    CommittedDocument::new("https://requested.example/page", 1, "loader-page")
+}
+
 async fn position_on_authorized_page(plane: &BrowserPlane, route: &RouteIdentity) {
     plane
         .same_document_url(
@@ -1115,6 +1175,7 @@ async fn retain_click_point_snapshot(plane: &BrowserPlane, route: &RouteIdentity
             viewport,
             viewport,
             false,
+            Some(page_document()),
         )
         .await
         .unwrap()["snapshot_id"]
@@ -2500,6 +2561,7 @@ async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> S
                 classification: Err(ClassificationUnavailable::NotCaptured),
             }],
             4096,
+            Some(page_document()),
         )
         .await
         .unwrap()["snapshot_id"]
@@ -2803,8 +2865,16 @@ impl OwnedBrowserProcess for OffOriginRedirectProcess {
         Ok(())
     }
 
-    fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
-        Ok("https://attacker.example/landed".into())
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(CommittedDocument::new(
+            "https://attacker.example/landed",
+            2,
+            "loader-attacker",
+        ))
     }
 
     fn snapshot(
@@ -3447,6 +3517,7 @@ async fn served_browser_reply_divergence_inventory_is_empty() {
             observation.dom_text.as_deref(),
             observation.refs.clone(),
             4_096,
+            Some(page_document()),
         )
         .await
         .unwrap();

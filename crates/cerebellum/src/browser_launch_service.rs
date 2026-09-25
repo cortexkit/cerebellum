@@ -1463,6 +1463,17 @@ impl OwnedBrowserProcess for ProductionProcess {
             .main_frame_url(context_key, deadline_ms)
     }
 
+    fn committed_document(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<crate::snapshot_store::CommittedDocument, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .committed_document(context_key, deadline_ms)
+    }
+
     fn has_credential_field(
         &mut self,
         context_key: &str,

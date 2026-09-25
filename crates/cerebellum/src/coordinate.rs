@@ -420,6 +420,7 @@ impl CoherentScreenshot {
             snapshot_id: snapshot_id.into(),
             document_epoch: self.document_epoch,
             source_origin: source_origin.into(),
+            source_document: None,
             image_png_b64: self.image_png_b64,
             image_width_px: self.image_width_px,
             image_height_px: self.image_height_px,
@@ -438,6 +439,10 @@ pub struct ScreenshotSnapshot {
     pub snapshot_id: String,
     pub document_epoch: u64,
     pub source_origin: String,
+    /// The browser-reported document the image was captured from; see
+    /// `CommittedDocument`. `None` when the capture did not record one, which
+    /// no action will trust.
+    pub source_document: Option<crate::snapshot_store::CommittedDocument>,
     pub image_png_b64: String,
     pub image_width_px: u32,
     pub image_height_px: u32,
@@ -499,6 +504,7 @@ impl ScreenshotSnapshot {
             snapshot_id: snapshot_id.into(),
             document_epoch,
             source_origin: source_origin.into(),
+            source_document: None,
             image_png_b64,
             image_width_px,
             image_height_px,

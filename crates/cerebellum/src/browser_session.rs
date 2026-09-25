@@ -455,17 +455,30 @@ pub trait OwnedBrowserProcess: Send {
 
     /// Read only the URL of the document the main frame has COMMITTED to.
     ///
-    /// Page reads authorize against this value, so it must not report a
-    /// navigation that is still pending: a pending destination names a page
-    /// whose content is not yet what a read would return. The CDP driver
-    /// answers from `Page.getNavigationHistory`'s current entry, which moves
-    /// only when a navigation commits. The default refuses, so a process that
-    /// cannot say where its page is cannot serve a read.
+    /// It must not report a navigation that is still pending: a pending
+    /// destination names a page whose content is not yet what the browser
+    /// shows. The CDP driver answers from `Page.getNavigationHistory`'s
+    /// current entry, which moves only when a navigation commits.
     fn main_frame_url(
         &mut self,
         _context_key: &str,
         _deadline_ms: u64,
     ) -> Result<String, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Read the committed main-frame document: its URL, its history entry and
+    /// its document loader. See `CommittedDocument` for what each identifies.
+    ///
+    /// Page reads authorize against this document's URL and refuse when it
+    /// changes during the capture; actions refuse when it is no longer the
+    /// document their snapshot was taken from. The default refuses, so a
+    /// process that cannot say which document it shows can serve neither.
+    fn committed_document(
+        &mut self,
+        _context_key: &str,
+        _deadline_ms: u64,
+    ) -> Result<crate::snapshot_store::CommittedDocument, NavigationDriveError> {
         Err(NavigationDriveError::Unavailable)
     }
 
@@ -1263,17 +1276,17 @@ impl OperationGuard {
         )
     }
 
-    /// Read the URL of the document the main frame has committed to, so a
-    /// page read can authorize against where the page actually is rather than
-    /// against the last navigation this module started and watched.
-    pub(crate) fn main_frame_url(
+    /// Read which document the main frame has committed to, so a page read
+    /// or an action can check it against where the page actually is rather
+    /// than against the last navigation this module started and watched.
+    pub(crate) fn committed_document(
         &mut self,
         context_key: &str,
         deadline_ms: u64,
-    ) -> Result<String, NavigationDriveError> {
+    ) -> Result<crate::snapshot_store::CommittedDocument, NavigationDriveError> {
         self.drive(
             |error| error,
-            |process| process.main_frame_url(context_key, deadline_ms),
+            |process| process.committed_document(context_key, deadline_ms),
         )
     }
 

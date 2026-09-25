@@ -90,6 +90,41 @@ struct CssVisualViewport {
     page_y: Option<f64>,
 }
 
+/// Build the committed document from `Page.getNavigationHistory` and
+/// `Page.getFrameTree` results, or `None` when either lacks a field it needs.
+///
+/// The URL comes from the history's current entry rather than the frame
+/// tree's frame, because a history entry exists only once its navigation has
+/// committed. An error page keeps the URL that failed, which authorizes
+/// against the site that was attempted.
+pub fn committed_document_from(
+    history: &Map<String, Value>,
+    frame_tree: &Map<String, Value>,
+) -> Option<crate::snapshot_store::CommittedDocument> {
+    let current_index = usize::try_from(history.get("currentIndex")?.as_u64()?).ok()?;
+    let entries = history.get("entries")?.as_array()?;
+    let ids = entries
+        .iter()
+        .map(|entry| entry.get("id").and_then(Value::as_i64))
+        .collect::<Option<Vec<_>>>()?;
+    let current = entries.get(current_index)?;
+    let url = current.get("url")?.as_str()?.to_string();
+    let loader_id = frame_tree
+        .get("frameTree")?
+        .get("frame")?
+        .get("loaderId")?
+        .as_str()
+        .filter(|loader| !loader.is_empty())?
+        .to_string();
+    Some(crate::snapshot_store::CommittedDocument {
+        url,
+        entry_id: ids[current_index],
+        history: ids,
+        current_index,
+        loader_id,
+    })
+}
+
 /// Scale Chrome should apply to a visual-viewport clip so the returned bitmap
 /// is the largest aspect-preserving size that fits both standard-tier vision
 /// limits: the long-edge cap and the token cap.
@@ -391,6 +426,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     ) -> Result<String, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
         self.main_frame_url_with_clock(context_key, deadline_ms, &mut clock)
+    }
+
+    pub fn committed_document(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+    ) -> Result<crate::snapshot_store::CommittedDocument, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.committed_document_with_clock(context_key, deadline_ms, &mut clock)
     }
 
     pub fn has_credential_field(
@@ -1407,6 +1451,43 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or(NavigationDriveError::CdpFailure)
+    }
+
+    /// Every part is required: a document whose history entry or loader
+    /// cannot be named cannot be shown to be the one a grant or a snapshot
+    /// covered, so a missing field is a CDP failure rather than a default.
+    fn committed_document_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<crate::snapshot_store::CommittedDocument, NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let history = self.command(
+            "Page.getNavigationHistory",
+            None,
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let tree = self.command(
+            "Page.getFrameTree",
+            None,
+            Some(attachment.session_id),
+            deadline,
+            None,
+            clock,
+        )?;
+        committed_document_from(&history, &tree).ok_or(NavigationDriveError::CdpFailure)
     }
 
     fn navigate_with_clock<C: NavigationClock>(
@@ -3346,7 +3427,7 @@ mod tests {
             .await
             .unwrap();
         let retained = plane
-            .retain_text_snapshot(&route, SnapshotKind::Ax, &[], None, refs, 4096)
+            .retain_text_snapshot(&route, SnapshotKind::Ax, &[], None, refs, 4096, None)
             .await
             .unwrap();
         plane
@@ -3794,6 +3875,7 @@ mod tests {
                 view,
                 view,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -4301,6 +4383,7 @@ mod tests {
                 kind: SnapshotKind::Ax,
                 document_epoch: 7,
                 source_origin: "https://snapshot.example".into(),
+                source_document: None,
                 content_schema: AX_SCHEMA,
                 content: String::new(),
                 truncated: false,
