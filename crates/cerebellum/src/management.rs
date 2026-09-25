@@ -33,7 +33,7 @@ use crate::authorization::{
     ActionGrant, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE, MUTATE_REVERSIBLE,
     OBSERVE,
 };
-use crate::classification::canonical_origin;
+use crate::classification::canonical_grant_origin;
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
 
 /// The computer-target operation this surface serves.
@@ -337,12 +337,16 @@ impl ManagementPlane {
         let mut seen_origins = HashSet::new();
         let mut authorized_origins = Vec::with_capacity(origins.len());
         for origin in origins {
-            let canonical =
-                canonical_origin(&origin).ok_or(BrowserGrantRequestError::InvalidOrigins)?;
-            if canonical != origin || !seen_origins.insert(canonical.clone()) {
+            // Only an http(s) origin already in canonical form can be granted,
+            // so the person is shown exactly the site the grant will match.
+            // The opaque origin `null` is refused here too: it names no site.
+            if canonical_grant_origin(&origin).as_deref() != Some(origin.as_str()) {
+                return Err(BrowserGrantRequestError::UngrantableOrigin { value: origin });
+            }
+            if !seen_origins.insert(origin.clone()) {
                 return Err(BrowserGrantRequestError::InvalidOrigins);
             }
-            authorized_origins.push(canonical);
+            authorized_origins.push(origin);
         }
         let mut disclosed_hazards = BTreeSet::new();
         let mut disclosed_hazards_wire = Vec::with_capacity(hazards.len());
@@ -836,9 +840,15 @@ impl ManagementPlane {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserGrantRequestError {
+    /// The origin list is empty, too long, or names an origin twice.
     InvalidOrigins,
+    /// One origin is not a canonical http(s) origin a grant can name. Carries
+    /// the value as sent so the refusal can show the caller which one.
+    UngrantableOrigin {
+        value: String,
+    },
     InvalidHazards,
     /// A `severity_tier` outside the tiers a browser grant may carry.
     InvalidSeverityTier,

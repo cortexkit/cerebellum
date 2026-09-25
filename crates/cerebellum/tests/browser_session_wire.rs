@@ -1188,6 +1188,95 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
 }
 
+/// The opaque origin `null` names no site, so `browser.open_grant` refuses it
+/// as an invalid request before any question reaches a person: approving it
+/// would be consent to nothing identifiable, and the grant would match every
+/// about:blank, data: and sandboxed page at once.
+#[tokio::test]
+async fn wire_open_grant_refuses_the_opaque_null_origin_without_asking_a_person() {
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    bind_management_route(&planes).await;
+    let opening = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        MANAGEMENT_CHANNEL,
+        MANAGEMENT_EPOCH,
+        80,
+        serde_json::to_vec(&json!({
+            "method": cerebellum::management::OPEN_GRANT,
+            "params": {"origins": ["null"], "hazards": []},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (writer, mut frames) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(opening, &writer, &planes)
+        .await
+        .expect("the grant request is served");
+    drop(writer);
+
+    let mut replies = Vec::new();
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(Duration::from_millis(300), frames.recv()).await
+    {
+        // A question to a person travels as a reverse request on the route.
+        assert_ne!(
+            frame.header.ty,
+            FrameType::Request,
+            "a question was put to a person for a null-origin grant"
+        );
+        replies.push(serde_json::from_slice::<Value>(&frame.body).unwrap());
+    }
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    let reply = &replies[0];
+    assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"field": "origins", "reason_code": "unsupported_value", "value": "null"}),
+        "{reply}"
+    );
+    assert_eq!(planes.management.browser_grant_count().await, 0);
+}
+
+/// A page with an opaque origin (the fresh about:blank a launch starts on)
+/// cannot be granted, so the refusal offers no grant arguments and tells the
+/// caller to go to an http(s) page instead. Offering `origins: ["null"]` would
+/// send the caller to a grant `browser.open_grant` refuses.
+#[tokio::test]
+async fn wire_snapshot_on_an_opaque_origin_page_says_to_navigate_and_offers_no_grant() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    let launched = invoke(&planes, 1, "browser.launch", json!({})).await;
+    let launched: Value = serde_json::from_slice(&launched.body).unwrap();
+    assert_eq!(launched["outcome"], "launched", "{launched}");
+    assert_eq!(launcher.page.url(), "about:blank");
+
+    let refused = invoke_existing(&planes, 81, "browser.snapshot", json!({})).await;
+    let refused: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["detail"]["attempted_origin"], "null", "{refused}");
+    assert!(
+        refused["detail"].get("grant_request").is_none(),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["remedy"],
+        "no grant can name detail.attempted_origin; navigate to an http or https page, then retry",
+        "{refused}"
+    );
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
 fn planes_with_installed_grants(
     launcher: &Arc<RecordingLauncher>,
     grants: Vec<ActionGrant>,

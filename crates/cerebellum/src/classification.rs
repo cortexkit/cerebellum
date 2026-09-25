@@ -1063,6 +1063,19 @@ pub fn canonical_origin(value: &str) -> Option<String> {
     })
 }
 
+/// The canonical form of an origin a grant may name: an http or https scheme,
+/// host and port, and nothing else.
+///
+/// `canonical_origin` also accepts the opaque origin `null`, because a live
+/// page on about:blank, a data: URL or a sandboxed document really has that
+/// origin and classification has to describe it. A grant must never name it:
+/// `null` identifies no site, so the person asked to approve it cannot tell
+/// what they are allowing, and every opaque document shares that one value, so
+/// a grant for it would authorize reading all of them at once.
+pub fn canonical_grant_origin(value: &str) -> Option<String> {
+    canonical_origin(value).filter(|origin| origin != "null")
+}
+
 /// The canonical origin of an absolute http(s) URL, dropping its path, query
 /// and fragment. Returns `None` for anything `canonical_origin` would refuse.
 pub fn canonical_origin_from_url(value: &str) -> Option<String> {

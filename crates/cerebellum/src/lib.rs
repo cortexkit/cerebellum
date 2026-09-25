@@ -2809,6 +2809,28 @@ async fn handle_management_request(
                 )
                 .await
             }
+            Err(management::BrowserGrantRequestError::UngrantableOrigin { value }) => {
+                // The value is echoed so a caller holding several origins can
+                // see which one was refused, `null` included.
+                return send_tool_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    json!({
+                        "outcome": "invalid_request",
+                        "context": null,
+                        "session": null,
+                        "detail": {
+                            "field": "origins",
+                            "reason_code": "unsupported_value",
+                            "value": value,
+                        },
+                    }),
+                )
+                .await;
+            }
             Err(management::BrowserGrantRequestError::InvalidHazards) => {
                 return send_invalid_request_response(
                     writer,

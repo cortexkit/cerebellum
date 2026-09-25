@@ -521,10 +521,12 @@ fn grant_can_reach(required: crate::authorization::Severity) -> bool {
 
 /// Whether a grant can name `origin` at all. Refusals carry the origin as the
 /// authorization check saw it, which is the raw page origin when it has no
-/// canonical form (a `file://` page, for one), and `browser.open_grant`
-/// refuses any origin that is not already canonical by this same function.
+/// canonical form (a `file://` page, for one) and the opaque `null` on an
+/// about:blank, data: or sandboxed page. `browser.open_grant` refuses any
+/// origin that is not already canonical by this same function, so offering
+/// either as grant arguments would send the caller to a certain refusal.
 fn grant_can_name_origin(origin: &str) -> bool {
-    crate::classification::canonical_origin(origin).as_deref() == Some(origin)
+    crate::classification::canonical_grant_origin(origin).as_deref() == Some(origin)
 }
 
 /// The remedy for a refusal a new grant could cure. It must agree with

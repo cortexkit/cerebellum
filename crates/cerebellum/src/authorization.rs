@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::classification::{
-    canonical_origin, NonTypeClassificationFingerprint, NonTypeClassificationRecord,
+    canonical_grant_origin, canonical_origin, NonTypeClassificationFingerprint,
+    NonTypeClassificationRecord,
 };
 
 pub const OBSERVE: u8 = 1;
@@ -234,7 +235,11 @@ impl ActionGrant {
         }
         let mut seen = HashSet::new();
         for origin in &self.authorized_origins {
-            if canonical_origin(origin).as_deref() != Some(origin) {
+            // The grant-specific form, not `canonical_origin`: that one also
+            // accepts the opaque `null`, and a grant naming it would match
+            // every about:blank, data: and sandboxed page alike. An invalid
+            // grant is refused on install and skipped during selection.
+            if canonical_grant_origin(origin).as_deref() != Some(origin) {
                 return Err(AuthorizationError::InvalidOrigin);
             }
             if !seen.insert(origin) {
