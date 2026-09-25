@@ -2504,6 +2504,7 @@ impl BrowserPlane {
     /// Retain a completed extraction observation supplied by the CDP adapter.
     /// The adapter performs DOM/AX traversal; this method performs bounded wire
     /// encoding and retention only.
+    #[allow(clippy::too_many_arguments)]
     pub async fn retain_text_snapshot(
         &self,
         identity: &RouteIdentity,
