@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "getrandom",
  "hmac",
