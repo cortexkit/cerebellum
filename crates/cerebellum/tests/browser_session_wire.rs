@@ -1656,6 +1656,161 @@ async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
 }
 
+/// Open the data-plane route `invoke_existing` uses through a real
+/// `route.bind` control frame carrying exactly `admission_facts`.
+async fn bind_tool_route_with_facts(planes: &Planes, admission_facts: Value) {
+    let request = ModuleControlRequest::RouteBind {
+        route_channel: 9,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".to_string(),
+        },
+        identity: BindIdentity::new("/caller/chosen/project", "test", "test-session".to_string()),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: None,
+        admission_facts: Some(admission_facts),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        9,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(2);
+    cerebellum::handle_control_request_for_test_with_bindings(
+        frame,
+        &writer,
+        &planes.health,
+        &planes.routes,
+    )
+    .await
+    .expect("the tool route binds");
+    let reply = replies.recv().await.expect("route.bind receives a reply");
+    assert_eq!(reply.header.ty, FrameType::Response);
+}
+
+/// Bind a route with `admission_facts` and call `browser.launch` on it,
+/// returning the reply body and how many browsers were launched.
+async fn launch_on_route_with_facts(admission_facts: Value) -> (Value, usize) {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    bind_tool_route_with_facts(&planes, admission_facts).await;
+    let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    let launches = *launcher.launches.lock().unwrap();
+    (body, launches)
+}
+
+/// Admission facts are read only at the root of the stamped object, under one
+/// exact camelCase name each.
+///
+/// These facts pick the durable profile a launch opens and the controls a
+/// route may call, so a fact stamped anywhere else, whether nested under
+/// another object or spelled another way, must refuse the launch exactly as the
+/// same bind with that fact absent does. Driven through a real `route.bind`
+/// and `browser.launch`, because the bind path is where the facts are read.
+#[tokio::test]
+async fn a_fact_outside_its_root_camel_case_key_refuses_a_launch_as_if_absent() {
+    let operations = json!(["browser.launch"]);
+
+    let (absent_project, launches) = launch_on_route_with_facts(json!({
+        "sessionKind": "primary",
+        "browserControlOperations": operations,
+    }))
+    .await;
+    assert_eq!(absent_project["reason"], "agent_project_id_unattested");
+    assert_eq!(launches, 0);
+    for (shape, facts) in [
+        (
+            "nested under accepted",
+            json!({"sessionKind": "primary", "browserControlOperations": operations,
+                   "accepted": {"agentProjectId": "pj-misplaced"}}),
+        ),
+        (
+            "nested under bind",
+            json!({"sessionKind": "primary", "browserControlOperations": operations,
+                   "bind": {"agentProjectId": "pj-misplaced"}}),
+        ),
+        (
+            "nested under identity",
+            json!({"sessionKind": "primary", "browserControlOperations": operations,
+                   "identity": {"agentProjectId": "pj-misplaced"}}),
+        ),
+        (
+            "spelled agent_project_id",
+            json!({"sessionKind": "primary", "browserControlOperations": operations,
+                   "agent_project_id": "pj-misplaced"}),
+        ),
+        (
+            "spelled projectId",
+            json!({"sessionKind": "primary", "browserControlOperations": operations,
+                   "projectId": "pj-misplaced"}),
+        ),
+    ] {
+        let (body, launches) = launch_on_route_with_facts(facts).await;
+        assert_eq!(body, absent_project, "{shape}");
+        assert_eq!(launches, 0, "{shape}");
+    }
+
+    let (absent_kind, launches) = launch_on_route_with_facts(json!({
+        "agentProjectId": "pj-accepted",
+        "browserControlOperations": operations,
+    }))
+    .await;
+    assert_eq!(absent_kind["reason"], "session_kind_unattested");
+    assert_eq!(launches, 0);
+    let (body, launches) = launch_on_route_with_facts(json!({
+        "agentProjectId": "pj-accepted",
+        "session_kind": "primary",
+        "browserControlOperations": operations,
+    }))
+    .await;
+    assert_eq!(body, absent_kind, "spelled session_kind");
+    assert_eq!(launches, 0);
+
+    let (absent_operations, launches) = launch_on_route_with_facts(json!({
+        "agentProjectId": "pj-accepted",
+        "sessionKind": "primary",
+    }))
+    .await;
+    assert_eq!(absent_operations["reason"], "operation_not_granted");
+    assert_eq!(launches, 0);
+    let (body, launches) = launch_on_route_with_facts(json!({
+        "agentProjectId": "pj-accepted",
+        "sessionKind": "primary",
+        "accepted": {"browserControlOperations": operations},
+    }))
+    .await;
+    assert_eq!(body, absent_operations, "nested browserControlOperations");
+    assert_eq!(launches, 0);
+}
+
+/// The three root facts beside a key this module does not know launch
+/// normally: an unknown fact is ignored, never refused, so a carrier can stamp
+/// facts for other consumers on the same route.
+#[tokio::test]
+async fn an_unknown_top_level_fact_beside_the_root_facts_still_launches() {
+    let (body, launches) = launch_on_route_with_facts(json!({
+        "agentProjectId": "pj-accepted",
+        "sessionKind": "primary",
+        "browserControlOperations": ["browser.launch"],
+        "ck.project-trust/v1": {"projectId": "pj-other-schema", "trusted": true},
+    }))
+    .await;
+    assert_eq!(body["outcome"], "launched", "{body}");
+    assert_eq!(body["profile_disposition"], "durable", "{body}");
+    assert_eq!(launches, 1);
+}
+
 /// A route opened without the admission carrier is refused with the reason
 /// and remedy that say so, through the declared reply contract.
 ///

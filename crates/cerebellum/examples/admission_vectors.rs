@@ -35,15 +35,23 @@ fn accepted_facts() -> BindFacts {
     }
 }
 
+/// Render one vector's facts.
+///
+/// The facts a carrier stamps are keyed by the exact root camelCase names the
+/// bind reads (`agentProjectId`, `sessionKind`, `effectiveCapabilityScope`);
+/// any other spelling is ignored as an unknown fact, so printing them in the
+/// validator's snake_case field names would teach a consumer a shape that
+/// silently admits nothing. The remaining keys are not stamped facts: they are
+/// derived from the bind itself and keep the validator's field names.
 fn facts_json(facts: &BindFacts) -> Value {
     json!({
         "principal": facts.principal,
         "conversation_key": facts.conversation_key,
-        "agent_project_id": facts.agent_project_id,
-        "session_kind": facts.session_kind,
+        "agentProjectId": facts.agent_project_id,
+        "sessionKind": facts.session_kind,
         "session_kind_attested": facts.session_kind_attested,
         "profile_disposition": facts.profile_disposition,
-        "effective_capability_scope": facts.effective_capability_scope,
+        "effectiveCapabilityScope": facts.effective_capability_scope,
         "provenance": facts.provenance,
     })
 }
@@ -185,6 +193,12 @@ fn main() {
                         absence cannot be expressed at this entry point -- only emptiness. That \
                         refusal is raised upstream where wire JSON becomes BindFacts. A consumer \
                         omitting a fact entirely will receive it, and this file cannot show it.",
+        "fact_names": "agentProjectId, sessionKind and effectiveCapabilityScope are the exact \
+                        keys read at the root of the stamped admission facts; any other \
+                        spelling or a nested copy is ignored as an unknown fact. principal, \
+                        conversation_key, session_kind_attested, profile_disposition and \
+                        provenance are derived from the bind rather than stamped. Refusal \
+                        names keep the validator's field names.",
         "note": "Produced by driving the production validator. Re-mint with \
                  `cargo run -p cerebellum --example admission_vectors` rather than \
                  editing: a hand-edited vector describes a belief about this module \

@@ -392,43 +392,25 @@ impl AcceptedBindFacts {
 /// the wire.
 pub const ELICITATION_CAPABILITY: &str = "elicitation";
 
-fn admission_object(facts: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
-    let root = facts?.as_object()?;
-    Some(root)
-}
-
-/// Look up a fact using the fleet's camelCase spelling and the Rust-facing
-/// snake_case spelling. The small set of nested containers keeps the parser
-/// tolerant of the carrier envelope while avoiding any request-body fallback.
-fn fact<'a>(facts: Option<&'a Value>, names: &[&str]) -> Option<&'a Value> {
-    let root = admission_object(facts)?;
-    let containers = std::iter::once(root).chain(
-        ["accepted", "bind", "bind_identity", "identity"]
-            .into_iter()
-            .filter_map(|name| root.get(name).and_then(Value::as_object)),
-    );
-    for object in containers {
-        for name in names {
-            if let Some(value) = object.get(*name) {
-                return Some(value);
-            }
-        }
-    }
-    None
+/// Read one admission fact by its single exact name, at the root of the facts
+/// object and nowhere else.
+///
+/// The admission carrier stamps each fact at the root in camelCase, and these
+/// facts decide which durable browser profile a route opens and which browser
+/// controls it may call. Every additional place a fact could be read from (a
+/// nested object, another spelling, a similarly named key from a different
+/// schema) is another way to pick up a value the carrier never stamped for this
+/// purpose, so there is exactly one. Every other key is an unknown fact and is
+/// ignored rather than refused: providers ignore facts they do not recognise,
+/// so a carrier can add facts for other consumers without breaking this one.
+fn fact<'a>(facts: Option<&'a Value>, name: &str) -> Option<&'a Value> {
+    facts?.as_object()?.get(name)
 }
 
 fn admitted_agent_project_id(facts: Option<&Value>) -> Option<&str> {
-    fact(
-        facts,
-        &[
-            "agentProjectId",
-            "agent_project_id",
-            "projectId",
-            "project_id",
-        ],
-    )
-    .and_then(Value::as_str)
-    .filter(|value| !value.is_empty())
+    fact(facts, "agentProjectId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -> String {
@@ -452,7 +434,7 @@ fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -
 }
 
 fn admitted_session_kind(facts: Option<&Value>) -> Option<SessionKind> {
-    fact(facts, &["sessionKind", "session_kind"])
+    fact(facts, "sessionKind")
         .and_then(Value::as_str)
         .and_then(SessionKind::from_str)
 }
@@ -466,7 +448,7 @@ fn session_kind_from_facts(facts: Option<&Value>) -> SessionKind {
 }
 
 fn control_operations_from_facts(facts: Option<&Value>) -> Vec<String> {
-    fact(facts, &["browserControlOperations"])
+    fact(facts, "browserControlOperations")
         .and_then(Value::as_array)
         .map(|operations| {
             operations
@@ -485,15 +467,7 @@ fn control_operations_from_facts(facts: Option<&Value>) -> Vec<String> {
 }
 
 fn effective_capability_scope_from_facts(facts: Option<&Value>) -> Option<Vec<String>> {
-    let value = fact(
-        facts,
-        &[
-            "effectiveCapabilityScope",
-            "effective_capability_scope",
-            "capabilityScope",
-            "capability_scope",
-        ],
-    )?;
+    let value = fact(facts, "effectiveCapabilityScope")?;
     if let Some(scope) = value.as_str() {
         return Some(vec![scope.to_string()]);
     }
@@ -812,6 +786,163 @@ mod tests {
         );
     }
 
+    /// Admit a bind carrying `facts` and report the control refusal for
+    /// `browser.launch`, alongside the accepted facts themselves.
+    fn launch_refusal(facts: serde_json::Value) -> (AcceptedBindFacts, Option<&'static str>) {
+        let accepted = AcceptedBindFacts::from_bind(
+            &bind_identity("/caller/project", "conversation-1"),
+            Some(Principal::Direct),
+            Some(&facts),
+            None,
+            &tool_route(),
+        );
+        let refusal = accepted
+            .control_operation_refusal("browser.launch")
+            .map(ControlOperationRefusal::reason_code);
+        (accepted, refusal)
+    }
+
+    /// A project id anywhere but the root `agentProjectId` key is not admitted.
+    ///
+    /// The durable profile a route opens is keyed on this fact, so a value read
+    /// from a nested object or under another spelling, possibly a different
+    /// schema's `projectId`, would select a profile the carrier never named.
+    /// Each misplaced id must leave the bind exactly as if the fact were absent:
+    /// unattested, refused by name, and falling back to the unattested project
+    /// root that durable storage refuses.
+    #[test]
+    fn a_project_id_outside_the_root_camel_case_key_is_not_admitted() {
+        let (absent, absent_refusal) = launch_refusal(serde_json::json!({
+            "sessionKind": "primary",
+            "browserControlOperations": ["browser.launch"],
+        }));
+        assert!(!absent.agent_project_id_attested);
+        assert_eq!(absent_refusal, Some("agent_project_id_unattested"));
+
+        for (shape, facts) in [
+            (
+                "nested under accepted",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "accepted": {"agentProjectId": "pj-misplaced"},
+                }),
+            ),
+            (
+                "nested under bind",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "bind": {"agentProjectId": "pj-misplaced"},
+                }),
+            ),
+            (
+                "nested under bind_identity",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "bind_identity": {"agentProjectId": "pj-misplaced"},
+                }),
+            ),
+            (
+                "nested under identity",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "identity": {"agentProjectId": "pj-misplaced"},
+                }),
+            ),
+            (
+                "spelled agent_project_id",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "agent_project_id": "pj-misplaced",
+                }),
+            ),
+            (
+                "spelled projectId",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "projectId": "pj-misplaced",
+                }),
+            ),
+            (
+                "spelled project_id",
+                serde_json::json!({
+                    "sessionKind": "primary",
+                    "browserControlOperations": ["browser.launch"],
+                    "project_id": "pj-misplaced",
+                }),
+            ),
+        ] {
+            let (accepted, refusal) = launch_refusal(facts);
+            assert!(!accepted.agent_project_id_attested, "{shape}");
+            assert_eq!(refusal, absent_refusal, "{shape}");
+            assert_eq!(
+                accepted.identity, absent.identity,
+                "{shape}: the misplaced id must not reach the route identity"
+            );
+        }
+    }
+
+    /// A session kind spelled `session_kind` is not admitted, and neither is
+    /// a control-operation list nested under another object: each refuses as
+    /// if its fact were absent.
+    #[test]
+    fn a_session_kind_or_operation_list_outside_its_root_key_is_not_admitted() {
+        let (absent_kind, absent_kind_refusal) = launch_refusal(serde_json::json!({
+            "agentProjectId": "pj-accepted",
+            "browserControlOperations": ["browser.launch"],
+        }));
+        assert_eq!(absent_kind_refusal, Some("session_kind_unattested"));
+        let (snake_kind, snake_kind_refusal) = launch_refusal(serde_json::json!({
+            "agentProjectId": "pj-accepted",
+            "session_kind": "subagent",
+            "browserControlOperations": ["browser.launch"],
+        }));
+        assert!(!snake_kind.session_kind_attested);
+        assert_eq!(snake_kind_refusal, absent_kind_refusal);
+        assert_eq!(snake_kind.identity, absent_kind.identity);
+
+        let (absent_operations, absent_operations_refusal) = launch_refusal(serde_json::json!({
+            "agentProjectId": "pj-accepted",
+            "sessionKind": "primary",
+        }));
+        assert_eq!(absent_operations_refusal, Some("operation_not_granted"));
+        for container in ["accepted", "bind", "bind_identity", "identity"] {
+            let (nested, nested_refusal) = launch_refusal(serde_json::json!({
+                "agentProjectId": "pj-accepted",
+                "sessionKind": "primary",
+                container: {"browserControlOperations": ["browser.launch"]},
+            }));
+            assert!(nested.control_operations.is_empty(), "{container}");
+            assert_eq!(nested_refusal, absent_operations_refusal, "{container}");
+            assert_eq!(
+                nested.control_operations,
+                absent_operations.control_operations
+            );
+        }
+    }
+
+    /// A fact this module does not know is ignored, never refused, so a
+    /// carrier can stamp facts for other consumers beside the ones read here.
+    #[test]
+    fn an_unknown_top_level_fact_beside_the_three_root_keys_admits_normally() {
+        let (accepted, refusal) = launch_refusal(serde_json::json!({
+            "agentProjectId": "pj-accepted",
+            "sessionKind": "primary",
+            "browserControlOperations": ["browser.launch"],
+            "ck.project-trust/v1": {"projectId": "pj-other-schema", "trusted": true},
+        }));
+        assert_eq!(refusal, None);
+        assert!(accepted.agent_project_id_attested);
+        assert!(accepted.session_kind_attested);
+        assert_eq!(accepted.identity.agent_project_id, "pj-accepted");
+        assert_eq!(accepted.identity.session_kind, SessionKind::Primary);
+    }
+
     #[test]
     fn explicit_scope_is_enforced_without_request_body_input() {
         let bind = bind_identity("/tmp/project", "conversation-1");
@@ -819,7 +950,7 @@ mod tests {
             &bind,
             Some(Principal::Direct),
             Some(&serde_json::json!({
-                "effective_capability_scope": ["other.capability"]
+                "effectiveCapabilityScope": ["other.capability"]
             })),
             None,
             &tool_route(),
