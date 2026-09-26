@@ -3312,6 +3312,31 @@ async fn handle_control_request(
                 .await;
             }
 
+            // A capability scope stamped where it is no longer read would, if
+            // ignored, leave the route with the permissive default scope. Refuse
+            // the bind and bind nothing, so the route serves no request at all.
+            if let Some(refusal) =
+                AcceptedBindFacts::admission_facts_refusal(admission_facts.as_ref())
+            {
+                let body = serde_json::to_vec(&subc_protocol::ErrorBody {
+                    code: refusal.reason_code().to_string(),
+                    message: refusal.message(),
+                    detail: Some(refusal.detail()),
+                })
+                .map_err(ModuleError::Json)?;
+                let frame = Frame::build_with_version(
+                    frame.header.ver,
+                    FrameType::Error,
+                    control_flags(),
+                    0,
+                    0,
+                    frame.header.corr,
+                    body,
+                )
+                .map_err(|e| ModuleError::Message(e.to_string()))?;
+                return send(writer, frame).await;
+            }
+
             // Retain only facts from the accepted bind. Data-plane frames inherit
             // these facts by (channel, epoch); request bodies cannot replace them.
             let accepted_facts = AcceptedBindFacts::from_bind(

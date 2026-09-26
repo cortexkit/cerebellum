@@ -328,10 +328,32 @@ impl AcceptedBindFacts {
             agent_project_id_attested: admitted_agent_project_id(admission_facts).is_some(),
             session_kind_attested: admitted_session_kind(admission_facts).is_some(),
             control_operations: control_operations_from_facts(admission_facts),
-            effective_capability_scope: effective_capability_scope_from_facts(admission_facts),
+            // A bind carrying a scope under a retired name is refused before it
+            // is retained (see `admission_facts_refusal`). Should any caller
+            // build facts from such a bind without that check, the scope is
+            // taken as explicitly empty rather than absent: absent means the
+            // permissive default, and a scope the carrier meant to restrict
+            // must never widen into it.
+            effective_capability_scope: if misplaced_capability_scope_key(admission_facts).is_some()
+            {
+                Some(Vec::new())
+            } else {
+                effective_capability_scope_from_facts(admission_facts)
+            },
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
             surface: RouteSurface::from_target(target),
         }
+    }
+
+    /// Why these admission facts must refuse the bind outright, if they must.
+    ///
+    /// The route is not bound at all when this returns a refusal, so nothing on
+    /// it is served.
+    pub fn admission_facts_refusal(
+        admission_facts: Option<&Value>,
+    ) -> Option<AdmissionFactsRefusal> {
+        misplaced_capability_scope_key(admission_facts)
+            .map(|key| AdmissionFactsRefusal::CapabilityScopeMisspelled { key })
     }
 
     /// Whether the consumer declared it can relay a question to a human.
@@ -388,6 +410,46 @@ impl AcceptedBindFacts {
     }
 }
 
+/// Why a bind's admission facts are refused before the route is bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionFactsRefusal {
+    /// A capability scope was stamped under a name or location this module no
+    /// longer reads. `key` is where it was found, as a dotted path from the
+    /// root of the facts (for example `accepted.effectiveCapabilityScope`).
+    CapabilityScopeMisspelled { key: String },
+}
+
+impl AdmissionFactsRefusal {
+    /// The wire reason code.
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::CapabilityScopeMisspelled { .. } => "admission_fact_misspelled",
+        }
+    }
+
+    /// A human-readable account of the refusal and what to do about it.
+    pub fn message(&self) -> String {
+        match self {
+            Self::CapabilityScopeMisspelled { key } => format!(
+                "the admission facts carry a capability scope at '{key}', which is not read; \
+                 the scope is read only from the root key 'effectiveCapabilityScope'. The bind \
+                 is refused rather than admitted without the restriction the scope was meant \
+                 to impose; restamp the scope under that key"
+            ),
+        }
+    }
+
+    /// Structured facts about the refusal, for the error body's `detail`.
+    pub fn detail(&self) -> Value {
+        match self {
+            Self::CapabilityScopeMisspelled { key } => serde_json::json!({
+                "key": key,
+                "expected_key": "effectiveCapabilityScope",
+            }),
+        }
+    }
+}
+
 /// The reverse-request family that carries a question to a human, as spelled on
 /// the wire.
 pub const ELICITATION_CAPABILITY: &str = "elicitation";
@@ -403,8 +465,47 @@ pub const ELICITATION_CAPABILITY: &str = "elicitation";
 /// purpose, so there is exactly one. Every other key is an unknown fact and is
 /// ignored rather than refused: providers ignore facts they do not recognise,
 /// so a carrier can add facts for other consumers without breaking this one.
+/// The one exception is a capability scope in a place it used to be read from,
+/// which refuses the bind instead; `misplaced_capability_scope_key` says why.
 fn fact<'a>(facts: Option<&'a Value>, name: &str) -> Option<&'a Value> {
     facts?.as_object()?.get(name)
+}
+
+/// Root names under which a capability scope used to be read and no longer is.
+const RETIRED_CAPABILITY_SCOPE_NAMES: [&str; 3] = [
+    "effective_capability_scope",
+    "capabilityScope",
+    "capability_scope",
+];
+
+/// Nested objects under which any spelling of the capability scope used to be
+/// read and no longer is.
+const RETIRED_FACT_CONTAINERS: [&str; 4] = ["accepted", "bind", "bind_identity", "identity"];
+
+/// Where a capability scope sits that this module used to read and no longer
+/// does, as a dotted path from the root of the facts.
+///
+/// Unlike every other fact, the scope RESTRICTS: when it is absent the route
+/// receives the permissive first-party default. Ignoring a scope written in a
+/// retired place would therefore silently widen the route to everything,
+/// whereas ignoring a retired spelling of a granting fact only refuses. So a
+/// retired scope location is refused rather than treated as an unknown fact.
+/// Any other unknown key stays ignored.
+fn misplaced_capability_scope_key(facts: Option<&Value>) -> Option<String> {
+    let root = facts?.as_object()?;
+    if let Some(name) = RETIRED_CAPABILITY_SCOPE_NAMES
+        .iter()
+        .find(|name| root.contains_key(**name))
+    {
+        return Some((*name).to_string());
+    }
+    RETIRED_FACT_CONTAINERS.iter().find_map(|container| {
+        let nested = root.get(*container)?.as_object()?;
+        std::iter::once("effectiveCapabilityScope")
+            .chain(RETIRED_CAPABILITY_SCOPE_NAMES)
+            .find(|name| nested.contains_key(*name))
+            .map(|name| format!("{container}.{name}"))
+    })
 }
 
 fn admitted_agent_project_id(facts: Option<&Value>) -> Option<&str> {
@@ -941,6 +1042,87 @@ mod tests {
         assert!(accepted.session_kind_attested);
         assert_eq!(accepted.identity.agent_project_id, "pj-accepted");
         assert_eq!(accepted.identity.session_kind, SessionKind::Primary);
+    }
+
+    /// A capability scope under a retired name or inside a retired container
+    /// refuses the bind by name, and the facts built from such a bind never
+    /// carry the permissive absent scope.
+    ///
+    /// The scope restricts, so ignoring it as an unknown fact would admit the
+    /// route with every capability. Keys that are not retired scope locations,
+    /// including another schema's object and a misplaced granting fact, are
+    /// still ignored.
+    #[test]
+    fn a_capability_scope_in_a_retired_place_refuses_rather_than_widening() {
+        let bind = bind_identity("/tmp/project", "conversation-1");
+        let base = serde_json::json!({
+            "agentProjectId": "pj-accepted",
+            "sessionKind": "primary",
+            "browserControlOperations": ["browser.launch"],
+        });
+        let mut cases = Vec::new();
+        for name in RETIRED_CAPABILITY_SCOPE_NAMES {
+            let mut facts = base.clone();
+            facts[name] = serde_json::json!(["other.capability"]);
+            cases.push((name.to_string(), facts));
+        }
+        for container in RETIRED_FACT_CONTAINERS {
+            for name in [
+                "effectiveCapabilityScope",
+                "effective_capability_scope",
+                "capabilityScope",
+                "capability_scope",
+            ] {
+                let mut facts = base.clone();
+                facts[container] = serde_json::json!({ name: ["other.capability"] });
+                cases.push((format!("{container}.{name}"), facts));
+            }
+        }
+        assert_eq!(cases.len(), 19);
+
+        for (key, facts) in cases {
+            assert_eq!(
+                AcceptedBindFacts::admission_facts_refusal(Some(&facts)),
+                Some(AdmissionFactsRefusal::CapabilityScopeMisspelled { key: key.clone() }),
+                "{key}"
+            );
+            let accepted = AcceptedBindFacts::from_bind(
+                &bind,
+                Some(Principal::Direct),
+                Some(&facts),
+                None,
+                &tool_route(),
+            );
+            assert_eq!(
+                accepted.effective_capability_scope,
+                Some(Vec::new()),
+                "{key}: a retired scope must not read as the absent, permissive one"
+            );
+            assert!(!accepted.allows_capability("browser.status"), "{key}");
+        }
+
+        for (shape, facts) in [
+            ("no scope", base.clone()),
+            (
+                "scope under its read name",
+                serde_json::json!({"effectiveCapabilityScope": ["browser.status"]}),
+            ),
+            (
+                "another schema's object",
+                serde_json::json!({"ck.project-trust/v1": {"capabilityScope": ["x"]}}),
+            ),
+            (
+                "a misplaced granting fact",
+                serde_json::json!({"accepted": {"agentProjectId": "pj-misplaced"}}),
+            ),
+        ] {
+            assert_eq!(
+                AcceptedBindFacts::admission_facts_refusal(Some(&facts)),
+                None,
+                "{shape}"
+            );
+        }
+        assert_eq!(AcceptedBindFacts::admission_facts_refusal(None), None);
     }
 
     #[test]

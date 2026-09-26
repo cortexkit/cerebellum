@@ -1657,8 +1657,21 @@ async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
 }
 
 /// Open the data-plane route `invoke_existing` uses through a real
-/// `route.bind` control frame carrying exactly `admission_facts`.
+/// `route.bind` control frame carrying exactly `admission_facts`, and expect
+/// the bind to be accepted.
 async fn bind_tool_route_with_facts(planes: &Planes, admission_facts: Value) {
+    let reply = send_tool_route_bind(planes, admission_facts).await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+}
+
+/// Send a real `route.bind` for the data-plane route `invoke_existing` uses,
+/// carrying exactly `admission_facts`, and return the control reply.
+async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame {
     let request = ModuleControlRequest::RouteBind {
         route_channel: 9,
         epoch: 3,
@@ -1688,9 +1701,8 @@ async fn bind_tool_route_with_facts(planes: &Planes, admission_facts: Value) {
         &planes.routes,
     )
     .await
-    .expect("the tool route binds");
-    let reply = replies.recv().await.expect("route.bind receives a reply");
-    assert_eq!(reply.header.ty, FrameType::Response);
+    .expect("the control request is handled");
+    replies.recv().await.expect("route.bind receives a reply")
 }
 
 /// Bind a route with `admission_facts` and call `browser.launch` on it,
@@ -1808,6 +1820,78 @@ async fn an_unknown_top_level_fact_beside_the_root_facts_still_launches() {
     .await;
     assert_eq!(body["outcome"], "launched", "{body}");
     assert_eq!(body["profile_disposition"], "durable", "{body}");
+    assert_eq!(launches, 1);
+}
+
+/// A capability scope stamped where it is no longer read refuses the bind.
+///
+/// The scope is the one fact that restricts: absent, a route gets the
+/// permissive default. So a scope under a retired spelling, or nested under an
+/// object it used to be read from, must not be ignored the way an unknown fact
+/// is, because ignoring it would admit the route unrestricted. The bind is
+/// refused by name with the offending key, and the route it named serves
+/// nothing afterwards.
+#[tokio::test]
+async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
+    let base = json!({
+        "agentProjectId": "pj-accepted",
+        "sessionKind": "primary",
+        "browserControlOperations": ["browser.launch"],
+    });
+    let mut cases = Vec::new();
+    for name in [
+        "effective_capability_scope",
+        "capabilityScope",
+        "capability_scope",
+    ] {
+        let mut facts = base.clone();
+        facts[name] = json!(["browser.status"]);
+        cases.push((name.to_string(), facts));
+    }
+    for container in ["accepted", "bind", "bind_identity", "identity"] {
+        for name in [
+            "effectiveCapabilityScope",
+            "effective_capability_scope",
+            "capabilityScope",
+            "capability_scope",
+        ] {
+            let mut facts = base.clone();
+            facts[container] = json!({ name: ["browser.status"] });
+            cases.push((format!("{container}.{name}"), facts));
+        }
+    }
+
+    for (key, facts) in cases {
+        let launcher = Arc::new(RecordingLauncher::default());
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            Some(config()),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        planes.launch_service = Some(launcher.clone());
+
+        let reply = send_tool_route_bind(&planes, facts).await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{key}");
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "admission_fact_misspelled", "{key}");
+        assert_eq!(
+            error.detail.as_ref().map(|detail| &detail["key"]),
+            Some(&json!(key)),
+            "{key}"
+        );
+
+        let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "route_not_bound", "{key}: {body}");
+        assert_eq!(*launcher.launches.lock().unwrap(), 0, "{key}");
+    }
+
+    // The same facts with the scope under its one read name bind normally, so
+    // the refusal above is about where the scope was written.
+    let mut facts = base.clone();
+    facts["effectiveCapabilityScope"] = json!(["browser.launch"]);
+    let (body, launches) = launch_on_route_with_facts(facts).await;
+    assert_eq!(body["outcome"], "launched", "{body}");
     assert_eq!(launches, 1);
 }
 
