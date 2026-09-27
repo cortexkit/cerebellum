@@ -840,8 +840,9 @@ impl crate::login_capture::CaptureBrowser for ProductionCaptureBrowser {
             &self.launch_attempt_id,
             &mut Some(BrowserSessionTerminalOutcome::Closed),
         );
-        // Deleted whatever the reap did too, for the same reason; a failure is
-        // reported with the others rather than dropped.
+        // The crash-report directory is deleted whether or not the reap
+        // succeeded, and a failure to delete it is reported with the others
+        // rather than dropped.
         let crash_reports_deleted = self
             .crash_reports
             .take()
