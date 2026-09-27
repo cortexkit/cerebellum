@@ -2551,7 +2551,7 @@ async fn handle_management_request(
             )
             .await;
         };
-        if crate::classification::canonical_origin(origin).as_deref() != Some(origin) {
+        if crate::classification::canonical_grant_origin(origin).as_deref() != Some(origin) {
             return send_invalid_request_response(
                 writer,
                 ver,
@@ -5326,6 +5326,45 @@ mod tests {
                 .is_err(),
             "a consumer that did not declare elicitation received a question"
         );
+    }
+
+    #[tokio::test]
+    async fn browser_present_and_import_login_reject_opaque_origin_before_side_effects() {
+        for method in [management::PRESENT, management::IMPORT_LOGIN] {
+            let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+            let planes = management_bound_planes(4, 1);
+            let frame = Frame::build_with_version(
+                subc_protocol::PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                4,
+                1,
+                105,
+                serde_json::to_vec(&json!({"method": method, "params": {"origin": "null"}}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+            handle_route_request(frame, &writer_tx, &planes)
+                .await
+                .expect("an opaque origin receives a response");
+            let response = writer_rx.recv().await.expect("an invalid-request response");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["outcome"], "invalid_request", "{method}: {body}");
+            assert_eq!(body["detail"]["field"], "origin", "{method}: {body}");
+            assert_eq!(
+                body["detail"]["reason_code"], "invalid_origin",
+                "{method}: {body}"
+            );
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "{method} sent an elicitation frame"
+            );
+            assert!(
+                planes.browser.operation_log().await.is_empty(),
+                "{method} operated the browser"
+            );
+        }
     }
 
     #[tokio::test]

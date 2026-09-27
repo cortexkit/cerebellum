@@ -2321,6 +2321,41 @@ fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[tokio::test]
+async fn present_with_opaque_origin_does_not_front_browser() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, &launcher.page, "https://landed.example").await;
+
+    let (tx, mut rx) = mpsc::channel(4);
+    cerebellum::handle_tool_request_for_test_with_existing_planes(
+        request(
+            50,
+            "browser_use",
+            json!({"action": "present", "origin": "null"}),
+        ),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    let reply = rx.recv().await.expect("an invalid-request response");
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "invalid_request", "{body}");
+    assert_eq!(body["detail"]["field"], "origin", "{body}");
+    assert_eq!(body["detail"]["reason_code"], "invalid_origin", "{body}");
+    assert!(rx.try_recv().is_err(), "an elicitation frame was sent");
+    assert!(
+        launcher.effects.lock().unwrap().is_empty(),
+        "browser was fronted"
+    );
+}
+
+#[tokio::test]
 async fn present_fronts_then_marks_human_in_control() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = Planes::with_browser_config_journaling(

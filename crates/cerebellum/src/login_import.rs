@@ -763,8 +763,12 @@ fn same_executable(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn valid_import_origin(origin: &str) -> bool {
+    crate::classification::canonical_grant_origin(origin).as_deref() == Some(origin)
+}
+
 fn origin_host(origin: &str) -> Option<String> {
-    if crate::classification::canonical_origin(origin).as_deref() != Some(origin) {
+    if !valid_import_origin(origin) {
         return None;
     }
     let authority = origin.split_once("://")?.1;
@@ -999,6 +1003,54 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn import_origin_must_name_a_site() {
+        assert!(!valid_import_origin("null"));
+        assert!(!valid_import_origin("https://example.test/path"));
+        assert!(valid_import_origin("https://example.test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opaque_import_origin_never_invokes_cookie_store_reader() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestRoot::new("opaque-origin-no-store-read");
+        let browser = source("chrome", "Chrome", root.path());
+        let application_support = root.path().join("Application Support");
+        let store = cookie_store(&application_support, &browser);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&store, b"fixture store").unwrap();
+        let read_marker = root.path().join("store-was-read");
+        let reader = root.path().join("sqlite-reader");
+        fs::write(
+            &reader,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", read_marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&reader, fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = ImportSettings::for_test(
+            reader,
+            application_support,
+            root.path().join("Safari.binarycookies"),
+            vec![browser.clone()],
+        );
+        let result = prepare_import(
+            "null",
+            "project-1",
+            &browser.executable,
+            DurableProfileLocation {
+                managed_root: root.path().join("managed"),
+                profile_directory: root.path().join("managed/profile"),
+            },
+            settings,
+        );
+        assert!(
+            matches!(result, PreparedImport::Refused(ref refusal) if refusal.outcome == "invalid_origin")
+        );
+        assert!(!read_marker.exists(), "cookie store reader was invoked");
     }
 
     #[derive(Clone, Copy)]
