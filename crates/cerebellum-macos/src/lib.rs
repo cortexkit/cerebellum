@@ -34,6 +34,8 @@ mod input;
 mod launch;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod process_table;
 
 // The export gate MATCHES the module gate above. `accessibility` compiles off
 // macOS under `test` on purpose, so its platform-neutral logic -- cycle
@@ -81,7 +83,12 @@ pub use launch::{
 pub use macos::{
     capture_window, encode_png, enumerate_windows, establish_window_server_connection,
     frontmost_process_id, is_off_main_thread, post_event_at_hid_tap_for_measurement,
-    post_event_globally, post_event_to_pid, process_start_time, process_start_time_micros,
-    responsible_process, screen_capture_is_permitted, screen_is_locked, CaptureError,
-    CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessStartTime, RawCapture, RawWindow,
+    post_event_globally, post_event_to_pid, process_owner, process_start_time,
+    process_start_time_micros, responsible_process, screen_capture_is_permitted, screen_is_locked,
+    CaptureError, CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessOwner, ProcessStartTime,
+    RawCapture, RawWindow,
+};
+#[cfg(target_os = "macos")]
+pub use process_table::{
+    all_process_ids, host_name, process_arguments, process_executable_path, ProcessArguments,
 };

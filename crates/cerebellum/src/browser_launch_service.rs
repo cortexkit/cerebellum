@@ -48,7 +48,7 @@ use crate::profile::{
 use crate::profile_custody::SupervisorLiveness;
 use crate::profile_custody::{
     current_supervisor_generation, FilesystemProfileCustodyJournal, HolderId,
-    KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyEvent,
+    KernelSupervisorLiveness, ProfileCustodyAcquisition, ProfileCustodyClaim, ProfileCustodyEvent,
     ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLocks,
     ProfileCustodyRelease, SupervisorGeneration, SupervisorLivenessProbe,
 };
@@ -111,6 +111,10 @@ pub struct ProductionLaunchService {
     journal: SharedLaunchJournal,
     startup_failure: Option<BrowserLaunchRecoveryFailure>,
     profile_root: ProfileStateRoot,
+    /// The profiles startup recovery kept, and the operator's way to clear
+    /// them. Built before this service exists, so a launch never sees a
+    /// partial set.
+    recovery: Arc<RecoveryClearState>,
 }
 
 /// Where a launch service keeps profile state: the profile registry, the
@@ -213,29 +217,42 @@ impl ProductionLaunchService {
     ///
     /// Profile state follows `persistence` too; see [`ProfileStateRoot`].
     pub fn open(config: BrowserConfig, persistence: crate::JournalPersistence) -> Self {
+        Self::open_publishing(
+            config,
+            persistence,
+            &crate::launch_recovery::LaunchRecoveryRegistry::new(),
+        )
+    }
+
+    /// Open as [`Self::open`] does, then publish the operator's clear of what
+    /// startup recovery kept into `registry`, which the management plane
+    /// consults. Until this returns the registry stays empty, and a clear
+    /// refuses `not_ready`.
+    pub fn open_publishing(
+        config: BrowserConfig,
+        persistence: crate::JournalPersistence,
+        registry: &crate::launch_recovery::LaunchRecoveryRegistry,
+    ) -> Self {
         let profile_root = ProfileStateRoot::for_persistence(persistence);
-        Self::open_with_recovery(config, profile_root, |config, profile_root| {
-            let mut startup_failure = None;
-            let journal = match open_launch_journal(persistence) {
+        let service = Self::open_with_recovery(config, profile_root, |config, profile_root| {
+            match open_launch_journal(persistence) {
                 Ok(mut journal) => {
                     let mut process = ProductionOrphanProcessControl {
                         reap_deadline: Duration::from_millis(config.termination_grace_period_ms),
                     };
-                    let mut custody = ProductionOrphanProfileCustody { root: profile_root };
-                    if let Err(failure) =
-                        recover_browser_launches(&mut journal, &mut process, &mut custody)
-                    {
-                        startup_failure = Some(failure);
-                    }
-                    Some(journal)
+                    let (startup_failure, retained) =
+                        recover_and_retain(&mut journal, &mut process, profile_root);
+                    (Some(journal), startup_failure, retained)
                 }
-                Err(_) => {
-                    startup_failure = Some(BrowserLaunchRecoveryFailure::JournalOpen);
-                    None
-                }
-            };
-            (journal, startup_failure)
-        })
+                Err(_) => (
+                    None,
+                    Some(BrowserLaunchRecoveryFailure::JournalOpen),
+                    Vec::new(),
+                ),
+            }
+        });
+        registry.publish(service.recovery.clone());
+        service
     }
 
     fn require_recovered_startup(&self) -> Result<(), Value> {
@@ -257,14 +274,32 @@ impl ProductionLaunchService {
         ) -> (
             Option<ProductionLaunchJournal>,
             Option<BrowserLaunchRecoveryFailure>,
+            Vec<RetainedRecoveryClaim>,
         ),
     {
-        let (journal, startup_failure) = recover(&config, &profile_root);
+        let (journal, startup_failure, retained) = recover(&config, &profile_root);
+        let journal = Arc::new(Mutex::new(journal));
+        let recovery = Arc::new(RecoveryClearState {
+            journal: Arc::clone(&journal),
+            root: profile_root.resolve().ok(),
+            configured_executable: config.executable_path.clone(),
+            retained: Mutex::new(
+                retained
+                    .into_iter()
+                    .map(|claim| (claim.claim.holder_id().as_str().to_string(), claim))
+                    .collect(),
+            ),
+            clearing: Mutex::new(()),
+            process_table: Arc::new(crate::launch_recovery::SystemProcessTable),
+            #[cfg(test)]
+            stage_hook: Mutex::new(None),
+        });
         Self {
             config,
-            journal: Arc::new(Mutex::new(journal)),
+            journal,
             startup_failure,
             profile_root,
+            recovery,
         }
     }
 
@@ -494,7 +529,7 @@ impl ProductionLaunchService {
         let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard);
         let prepared = bound
             .acquire_and_prepare(key, &invocation, &reservation, &context)
-            .map_err(|outcome| outcome.as_json())?;
+            .map_err(|outcome| self.recovery.name_recovery_hold(outcome).as_json())?;
         let opened = bound
             .launch_prepared(prepared, &commitment)
             .map_err(|outcome| outcome.as_json())?;
@@ -1212,6 +1247,12 @@ impl ProfileCustodyJournal for ExactRecoveryCustodyJournal {
 
 struct ProductionOrphanProfileCustody<'a> {
     root: &'a ProfileStateRoot,
+    /// The claims `retain` took, with the launch intent each was taken for,
+    /// so the operator's clear can later release exactly these.
+    retained: Vec<(
+        crate::browser_launch::AuthorizedLaunchIntent,
+        ProfileCustodyClaim,
+    )>,
 }
 
 impl OrphanProfileCustody for ProductionOrphanProfileCustody<'_> {
@@ -1239,9 +1280,67 @@ impl OrphanProfileCustody for ProductionOrphanProfileCustody<'_> {
             .map_err(|_| OrphanProfileCustodyFailure)?;
         let supervisor =
             current_supervisor_generation().map_err(|_| OrphanProfileCustodyFailure)?;
-        retain_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
-            .map_err(|_| OrphanProfileCustodyFailure)
+        let claim =
+            retake_orphan_profile_custody_at(&root, intent, supervisor, KernelSupervisorLiveness)
+                .map_err(|_| OrphanProfileCustodyFailure)?;
+        if let Some(claim) = claim {
+            self.retained.push((intent.clone(), claim));
+        }
+        Ok(())
     }
+}
+
+/// Run startup recovery over production custody at `profile_root`. Returns its
+/// failure, or, when it succeeded, every profile it kept that this process can
+/// later release.
+///
+/// A kept profile is listed only when three facts agree: recovery's own
+/// outcome says the record stayed active and why, the journal still holds that
+/// record with its intent, and this process holds the custody claim it took
+/// for exactly that intent.
+fn recover_and_retain<P: OrphanBrowserProcessControl>(
+    journal: &mut ProductionLaunchJournal,
+    process: &mut P,
+    profile_root: &ProfileStateRoot,
+) -> (
+    Option<BrowserLaunchRecoveryFailure>,
+    Vec<RetainedRecoveryClaim>,
+) {
+    let mut custody = ProductionOrphanProfileCustody {
+        root: profile_root,
+        retained: Vec::new(),
+    };
+    let outcomes = match recover_browser_launches(journal, process, &mut custody) {
+        Ok(outcomes) => outcomes,
+        // A failed pass refuses every launch before any profile is looked at,
+        // so a clear would unblock nothing: none is offered, and the profiles
+        // it did retain stay held by their claims.
+        Err(failure) => return (Some(failure), Vec::new()),
+    };
+    let mut retained = Vec::new();
+    for (sequence, reason) in outcomes
+        .iter()
+        .filter(|outcome| outcome.journal_action.is_none())
+        .filter_map(|outcome| Some((outcome.sequence, outcome.process.pending_reason()?)))
+    {
+        let Ok(Some(record)) = journal.active_launch_record(sequence) else {
+            continue;
+        };
+        let Some((_, claim)) = custody
+            .retained
+            .iter()
+            .find(|(intent, _)| *intent == record.intent)
+        else {
+            continue;
+        };
+        retained.push(RetainedRecoveryClaim {
+            sequence,
+            intent: record.intent.clone(),
+            reason,
+            claim: claim.clone(),
+        });
+    }
+    (None, retained)
 }
 
 fn release_orphan_profile_custody_at<P: SupervisorLivenessProbe>(
@@ -1262,31 +1361,48 @@ fn release_orphan_profile_custody_at<P: SupervisorLivenessProbe>(
     }
 }
 
-/// Re-take an orphaned launch's profile claim under this process, keeping the
-/// holder its launch journal recorded.
-///
-/// The claim a crashed module left behind names a supervisor that is no longer
-/// running, and a fresh launch breaks such a claim as stale. Re-taking it under
-/// the running supervisor makes launches see the profile as busy instead. The
-/// holder is kept, not minted, because the next start's recovery may break a
-/// stale claim only when it names the holder the launch journal recorded.
+/// [`retake_orphan_profile_custody_at`] for tests that only need to know it
+/// succeeded.
+#[cfg(all(test, target_os = "macos"))]
 fn retain_orphan_profile_custody_at<P: SupervisorLivenessProbe>(
     root: &Path,
     intent: &crate::browser_launch::AuthorizedLaunchIntent,
     supervisor: SupervisorGeneration,
     liveness: P,
 ) -> Result<(), ()> {
+    retake_orphan_profile_custody_at(root, intent, supervisor, liveness).map(|_| ())
+}
+
+/// Re-take an orphaned launch's profile claim under this process, keeping the
+/// holder its launch journal recorded.
+///
+/// The claim a crashed module left behind names a supervisor that is no longer
+/// running, and a fresh launch breaks such a claim as stale. Re-taking it under
+/// the running supervisor makes launches see the profile as held instead. The
+/// holder is kept, not minted, because the next start's recovery may break a
+/// stale claim only when it names the holder the launch journal recorded.
+///
+/// Returns the claim when this call took it, so the operator's clear can later
+/// release exactly it. `Ok(None)` when a running supervisor already holds it
+/// under the recorded holder, so the profile is refused without this call
+/// owning the claim.
+fn retake_orphan_profile_custody_at<P: SupervisorLivenessProbe>(
+    root: &Path,
+    intent: &crate::browser_launch::AuthorizedLaunchIntent,
+    supervisor: SupervisorGeneration,
+    liveness: P,
+) -> Result<Option<ProfileCustodyClaim>, ()> {
     let (mut locks, key) = orphan_profile_custody_locks(root, intent, supervisor, liveness)?;
     let recorded_holder = HolderId::from_recorded(intent.holder_id.clone());
     match locks.acquire(key, recorded_holder).map_err(|_| ())? {
         // The claim is deliberately not released: its lock file is the refusal.
-        ProfileCustodyAcquisition::Acquired(_claim) => Ok(()),
+        ProfileCustodyAcquisition::Acquired(claim) => Ok(Some(claim)),
         // Already held by a running supervisor under the recorded holder, so
         // the profile is refused already.
         ProfileCustodyAcquisition::ProfileBusy { holder_id }
             if holder_id.as_str() == intent.holder_id =>
         {
-            Ok(())
+            Ok(None)
         }
         ProfileCustodyAcquisition::ProfileBusy { .. } => Err(()),
     }
@@ -1332,6 +1448,277 @@ fn orphan_profile_custody_locks<P: SupervisorLivenessProbe>(
         }
     };
     Ok((locks, key))
+}
+
+/// One profile startup recovery kept for a browser it could not prove gone,
+/// with the custody claim it took so an operator's clear can release exactly
+/// that claim.
+#[derive(Debug, Clone)]
+struct RetainedRecoveryClaim {
+    sequence: u64,
+    intent: crate::browser_launch::AuthorizedLaunchIntent,
+    reason: crate::browser_launch::RecoveryPendingReason,
+    claim: ProfileCustodyClaim,
+}
+
+/// Points in an operator's clear, for tests that must look at the profile
+/// between two steps or stop there as a crash would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearStage {
+    Rechecked,
+    Recorded,
+    Terminalized,
+}
+
+/// What startup recovery kept, and the operator's clear of it.
+///
+/// `retained` is a cache built only by startup recovery: it tells a launch
+/// refused by a recovery claim apart from one refused by a live session, and
+/// holds the claim a clear releases. It is never the authority for a clear;
+/// the journal is read again for that.
+struct RecoveryClearState {
+    journal: SharedLaunchJournal,
+    root: Option<PathBuf>,
+    configured_executable: Option<PathBuf>,
+    /// Keyed by custody holder id, the one fact a refused launch can see.
+    retained: Mutex<std::collections::BTreeMap<String, RetainedRecoveryClaim>>,
+    /// One clear at a time, so two answers cannot both act on one record.
+    clearing: Mutex<()>,
+    process_table: Arc<dyn crate::launch_recovery::ProcessTable + Send + Sync>,
+    #[cfg(test)]
+    stage_hook: Mutex<Option<ClearStageHook>>,
+}
+
+/// Called at each [`ClearStage`]; returning `false` stops the clear there.
+#[cfg(test)]
+type ClearStageHook = Box<dyn FnMut(ClearStage) -> bool + Send>;
+
+impl RecoveryClearState {
+    /// A launch refused because a holder has the profile is refused by name
+    /// when that holder is startup recovery: no session holds it, so telling
+    /// the caller to close one or retry would send it round a loop.
+    fn name_recovery_hold(&self, outcome: BrowserLaunchOutcome) -> BrowserLaunchOutcome {
+        let BrowserLaunchOutcome::ProfileBusy { holder_id } = &outcome else {
+            return outcome;
+        };
+        let reason = self.retained.lock().ok().and_then(|retained| {
+            retained
+                .get(holder_id.as_str())
+                .map(|retained| retained.reason)
+        });
+        match reason {
+            Some(reason) => BrowserLaunchOutcome::ProfileRecoveryPending { reason },
+            None => outcome,
+        }
+    }
+
+    /// Whether the journal still describes `retained` as recovery kept it:
+    /// the record active, with the same intent, not cleared already, and
+    /// in the state that gives recovery's reason.
+    fn journal_agrees(
+        journal: &ProductionLaunchJournal,
+        retained: &RetainedRecoveryClaim,
+    ) -> Result<crate::browser_launch::ActiveLaunchRecord, crate::launch_recovery::ClearRefusal>
+    {
+        use crate::browser_launch::RecoveryPendingReason;
+        use crate::launch_recovery::ClearRefusal;
+        let record = journal
+            .active_launch_record(retained.sequence)
+            .map_err(|_| ClearRefusal::JournalUnavailable)?
+            .ok_or(ClearRefusal::JournalDisagrees)?;
+        let reason_agrees = match retained.reason {
+            RecoveryPendingReason::AttestationUntrusted => {
+                record.dispatched && !record.attestation_trusted
+            }
+            RecoveryPendingReason::TerminationFailed
+            | RecoveryPendingReason::GenerationUnobservable => record.attestation_trusted,
+        };
+        if record.intent != retained.intent || record.cleared || !reason_agrees {
+            return Err(ClearRefusal::JournalDisagrees);
+        }
+        Ok(record)
+    }
+
+    fn evidence(
+        &self,
+        retained: &RetainedRecoveryClaim,
+    ) -> crate::launch_recovery::ProfileEvidence {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = PathBuf::from(OsString::from_vec(
+            retained.intent.profile.canonical_profile_path.clone(),
+        ));
+        crate::launch_recovery::read_profile_evidence(
+            &directory,
+            self.configured_executable.as_deref(),
+            self.process_table.as_ref(),
+        )
+    }
+
+    /// Test seam: whether to go on past `stage`. Production always goes on.
+    fn continue_after(&self, stage: ClearStage) -> bool {
+        #[cfg(test)]
+        if let Ok(mut hook) = self.stage_hook.lock() {
+            if let Some(hook) = hook.as_mut() {
+                return hook(stage);
+            }
+        }
+        let _ = stage;
+        true
+    }
+}
+
+impl crate::launch_recovery::LaunchRecoveryClearer for RecoveryClearState {
+    fn preview(
+        &self,
+        agent_project_id: &str,
+        sequence: Option<u64>,
+    ) -> Result<crate::launch_recovery::ClearPreview, crate::launch_recovery::ClearRefusal> {
+        use crate::launch_recovery::ClearRefusal;
+        let retained = {
+            let retained = self
+                .retained
+                .lock()
+                .map_err(|_| ClearRefusal::JournalUnavailable)?;
+            let mut candidates: Vec<RetainedRecoveryClaim> = retained
+                .values()
+                .filter(|retained| retained.intent.route.agent_project_id == agent_project_id)
+                .filter(|retained| sequence.is_none_or(|sequence| sequence == retained.sequence))
+                .cloned()
+                .collect();
+            match candidates.len() {
+                0 => return Err(ClearRefusal::NotRetained),
+                1 => candidates.remove(0),
+                _ => {
+                    let mut sequences: Vec<u64> = candidates
+                        .iter()
+                        .map(|retained| retained.sequence)
+                        .collect();
+                    sequences.sort_unstable();
+                    return Err(ClearRefusal::Ambiguous { sequences });
+                }
+            }
+        };
+        let record = {
+            let journal = self
+                .journal
+                .lock()
+                .map_err(|_| ClearRefusal::JournalUnavailable)?;
+            let journal = journal.as_ref().ok_or(ClearRefusal::JournalUnavailable)?;
+            Self::journal_agrees(journal, &retained)?
+        };
+        let evidence = self.evidence(&retained);
+        evidence.permits_clear()?;
+        Ok(crate::launch_recovery::ClearPreview {
+            agent_project_id: agent_project_id.to_string(),
+            sequence: retained.sequence,
+            reason: retained.reason,
+            launched_at: crate::launch_recovery::launched_at(record.browser_started_at_micros),
+            evidence,
+        })
+    }
+
+    /// INVARIANT: from the re-check until `release_exact`, the profile's
+    /// custody stays held under the holder recovery took it for, and the
+    /// claim stays in `retained`. A launch in that window therefore still
+    /// refuses `profile_recovery_pending`. The order is record, then consume,
+    /// then release: a crash after the durable record leaves a record the next
+    /// start finishes, and a crash after consuming it leaves a claim whose
+    /// supervisor is gone, which the next launch breaks as stale. Releasing
+    /// first would open the profile with a record still saying a browser may
+    /// be using it.
+    fn clear(
+        &self,
+        preview: &crate::launch_recovery::ClearPreview,
+        ask_id: &str,
+    ) -> Result<(), crate::launch_recovery::ClearFailure> {
+        use crate::launch_recovery::{ClearFailure, ClearRefusal};
+        let refused = ClearFailure::Refused;
+        let _one_at_a_time = self
+            .clearing
+            .lock()
+            .map_err(|_| refused(ClearRefusal::JournalUnavailable))?;
+        let retained = self
+            .retained
+            .lock()
+            .map_err(|_| refused(ClearRefusal::JournalUnavailable))?
+            .values()
+            .find(|retained| retained.sequence == preview.sequence)
+            .cloned()
+            .ok_or(refused(ClearRefusal::NotRetained))?;
+        if retained.reason != preview.reason
+            || retained.intent.route.agent_project_id != preview.agent_project_id
+        {
+            return Err(refused(ClearRefusal::JournalDisagrees));
+        }
+        let root = self
+            .root
+            .clone()
+            .ok_or(refused(ClearRefusal::JournalUnavailable))?;
+
+        {
+            let mut journal = self
+                .journal
+                .lock()
+                .map_err(|_| refused(ClearRefusal::JournalUnavailable))?;
+            let journal = journal
+                .as_mut()
+                .ok_or(refused(ClearRefusal::JournalUnavailable))?;
+            Self::journal_agrees(journal, &retained).map_err(refused)?;
+            // Both readings again: the person answered minutes after the
+            // question showed them, and a browser may have opened since.
+            self.evidence(&retained).permits_clear().map_err(refused)?;
+            if !self.continue_after(ClearStage::Rechecked) {
+                return Err(refused(ClearRefusal::JournalUnavailable));
+            }
+            journal
+                .record_recovery_clear(&crate::browser_launch::LaunchRecoveryClearRecord::new(
+                    retained.sequence,
+                    &retained.intent,
+                    retained.reason,
+                    ask_id,
+                ))
+                .map_err(|_| refused(ClearRefusal::JournalUnavailable))?;
+            if !self.continue_after(ClearStage::Recorded) {
+                return Err(ClearFailure::Terminalization {
+                    sequence: retained.sequence,
+                });
+            }
+            if journal.terminalize_recovered(retained.sequence).is_none() {
+                return Err(ClearFailure::Terminalization {
+                    sequence: retained.sequence,
+                });
+            }
+        }
+        if !self.continue_after(ClearStage::Terminalized) {
+            return Err(ClearFailure::CustodyRelease {
+                sequence: retained.sequence,
+            });
+        }
+
+        let released = current_supervisor_generation()
+            .map_err(|_| ())
+            .and_then(|supervisor| {
+                orphan_profile_custody_locks(
+                    &root,
+                    &retained.intent,
+                    supervisor,
+                    KernelSupervisorLiveness,
+                )
+            })
+            .and_then(|(mut locks, _)| locks.release_exact(&retained.claim).map_err(|_| ()));
+        match released {
+            Ok(ProfileCustodyRelease::Released) => {
+                if let Ok(mut map) = self.retained.lock() {
+                    map.remove(retained.claim.holder_id().as_str());
+                }
+                Ok(())
+            }
+            Ok(ProfileCustodyRelease::HolderMismatch { .. } | ProfileCustodyRelease::Missing)
+            | Err(()) => Err(ClearFailure::CustodyRelease {
+                sequence: retained.sequence,
+            }),
+        }
+    }
 }
 
 pub struct ReadyProductionBrowser {
@@ -2206,7 +2593,7 @@ mod executable_identity_launch_tests {
         let service = ProductionLaunchService::open_with_recovery(
             config,
             ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
-            |_, _| (None, None),
+            |_, _| (None, None, Vec::new()),
         );
         let refusal = match service.launch(&accepted_facts(Path::new("/tmp")), "session-1") {
             Err(refusal) => refusal,
@@ -2233,7 +2620,7 @@ mod executable_identity_launch_tests {
         let service = ProductionLaunchService::open_with_recovery(
             config,
             ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
-            |_, _| (None, None),
+            |_, _| (None, None, Vec::new()),
         );
         let refusal = match service.launch(&accepted_facts(Path::new("/tmp")), "session-1") {
             Err(refusal) => refusal,
@@ -2632,13 +3019,18 @@ mod orphan_recovery_tests {
 
     impl TestRoot {
         fn new(label: &str) -> Self {
+            // The counter keeps two roots made in the same clock tick apart:
+            // tests run in parallel, and one removing the other's shared
+            // directory on drop fails it with a missing path.
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "cerebellum-orphan-recovery-{label}-{}-{}",
+                "cerebellum-orphan-recovery-{label}-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("clock")
-                    .as_nanos()
+                    .as_nanos(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).expect("create test root");
             Self(path)
@@ -3075,6 +3467,7 @@ mod orphan_recovery_tests {
                     (
                         None,
                         Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
+                        Vec::new(),
                     )
                 },
             );
@@ -3106,6 +3499,7 @@ mod orphan_recovery_tests {
                 (
                     None,
                     Some(BrowserLaunchRecoveryFailure::JournalTerminalization),
+                    Vec::new(),
                 )
             },
         );
@@ -3118,6 +3512,643 @@ mod orphan_recovery_tests {
                 "reason_code": "browser_launch_recovery_failed",
             }))
         );
+    }
+
+    /// An operator's clear of a launch record startup recovery kept, driven
+    /// through the launch service's own recovery, launch path and custody, and
+    /// the management plane's question and answer.
+    mod launch_recovery_clear {
+        use super::*;
+        use crate::browser_launch::{
+            ExecutableIdentityChain, ExecutableIdentityCheckpoints, ExecutableIdentityClaim,
+            ExecutableIdentityRecord, LaunchGenerationRecord, LaunchJournalPort,
+            RecoveredBrowserProcess, RecoveryPendingReason,
+        };
+        use crate::launch_recovery::{ClearFailure, ClearRefusal, ProcessTable, Unreadable};
+        use crate::management::{ClearSettlement, ManagementPlane, TargetResolver};
+        use cerebellum_core::identity::{
+            AcceptedBindFacts, RouteIdentity, RouteSurface, SessionKind,
+        };
+        use cerebellum_core::journal::InMemoryJournalStorage;
+
+        struct NoTargets;
+
+        impl TargetResolver for NoTargets {
+            fn resolve(
+                &self,
+                _bundle_identity: &str,
+            ) -> cerebellum_computer::platform::TargetResolution {
+                cerebellum_computer::platform::TargetResolution::NotRunning
+            }
+        }
+
+        /// A recorded browser whose generation cannot be read.
+        struct UnobservableOrphan;
+
+        impl OrphanBrowserProcessControl for UnobservableOrphan {
+            fn observed_start_time_micros(
+                &mut self,
+                _pid: u32,
+            ) -> Result<Option<u64>, OrphanProcessControlFailure> {
+                Err(OrphanProcessControlFailure)
+            }
+
+            fn terminate_and_reap(
+                &mut self,
+                _generation: BrowserProcessGeneration,
+            ) -> Result<(), OrphanProcessControlFailure> {
+                panic!("an unobservable generation is never signalled")
+            }
+        }
+
+        /// A process table that cannot be read.
+        struct UnreadableTable;
+
+        impl ProcessTable for UnreadableTable {
+            fn arguments_of_user_processes(&self) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable> {
+                Err(Unreadable)
+            }
+
+            fn executable(&self, _pid: u32) -> Result<Option<PathBuf>, Unreadable> {
+                Err(Unreadable)
+            }
+
+            fn host_name(&self) -> Option<String> {
+                None
+            }
+        }
+
+        const PROJECT: &str = "project-1";
+        const SEQUENCE: u64 = 1;
+
+        struct Fixture {
+            service: Arc<ProductionLaunchService>,
+            plane: ManagementPlane,
+            storage: InMemoryJournalStorage,
+            root: PathBuf,
+            profile_directory: TestRoot,
+        }
+
+        impl Fixture {
+            fn launch(&self, attempt: &str) -> Result<PathBuf, Value> {
+                self.service
+                    .take_and_return_profile_custody(&accepted(), attempt)
+            }
+
+            fn record_is_active(&self) -> bool {
+                DurableLaunchJournal::open(launch_journal_config(), self.storage.clone())
+                    .expect("reopen launch journal")
+                    .active_launch_record(SEQUENCE)
+                    .expect("read launch journal")
+                    .is_some()
+            }
+
+            /// Still refused by name, with the record and custody untouched.
+            fn assert_still_held(&self, reason: RecoveryPendingReason, attempt: &str) {
+                assert_eq!(
+                    self.launch(attempt)
+                        .map_err(|reply| reply["reason"].clone()),
+                    Err(json!(reason.as_str()))
+                );
+                assert!(self.record_is_active());
+                assert_eq!(lock_count(&self.root), 1);
+            }
+
+            async fn ask(&self) -> (Value, String) {
+                let (reply, question) = self
+                    .plane
+                    .open_launch_recovery_clear(PROJECT, None, true)
+                    .await;
+                let question = question.unwrap_or_else(|| panic!("no question: {reply}"));
+                assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+                (question.body, question.ask_id)
+            }
+
+            async fn refusal(&self) -> Value {
+                let (reply, question) = self
+                    .plane
+                    .open_launch_recovery_clear(PROJECT, None, true)
+                    .await;
+                assert!(question.is_none(), "a refused clear asked anyway: {reply}");
+                assert_eq!(reply["outcome"], "refused", "{reply}");
+                reply
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // A hook may hold the service; break that cycle so the
+                // scratch root is removed.
+                if let Ok(mut hook) = self.service.recovery.stage_hook.lock() {
+                    hook.take();
+                }
+            }
+        }
+
+        fn accepted() -> AcceptedBindFacts {
+            AcceptedBindFacts {
+                identity: RouteIdentity {
+                    conversation_key: "conversation-2".to_string(),
+                    agent_project_id: PROJECT.to_string(),
+                    session_kind: SessionKind::Primary,
+                    profile_disposition: ProfileDisposition::Durable,
+                    project_root: PathBuf::from("/tmp"),
+                },
+                principal: Some(subc_protocol::Principal::Direct),
+                agent_project_id_attested: true,
+                session_kind_attested: true,
+                control_operations: Vec::new(),
+                effective_capability_scope: None,
+                consumer_capabilities: Vec::new(),
+                surface: RouteSurface::Tools,
+            }
+        }
+
+        /// Journal `intent` as a launch that reached release. Its attestation
+        /// is one recovery trusts unless `reason` is an untrusted attestation.
+        fn record_released_launch(
+            storage: &InMemoryJournalStorage,
+            intent: &AuthorizedLaunchIntent,
+            reason: RecoveryPendingReason,
+        ) {
+            let mut journal = DurableLaunchJournal::open(launch_journal_config(), storage.clone())
+                .expect("open launch journal");
+            let mut handle = journal.record_intent(intent).expect("record intent");
+            assert_eq!(handle.sequence(), SEQUENCE);
+            let generation = LaunchGenerationRecord {
+                intent: intent.clone(),
+                process_generation: BrowserProcessGeneration {
+                    pid: 4242,
+                    start_time_micros: ORPHAN_START_TIME,
+                    boot_id: None,
+                },
+            };
+            journal
+                .record_generation(&mut handle, &generation)
+                .expect("record generation");
+            let code_hash = match reason {
+                RecoveryPendingReason::AttestationUntrusted => "not-the-verified-hash",
+                _ => "abc123",
+            };
+            let claim = ExecutableIdentityClaim::CodeSigned {
+                signing_identifier: "com.example.browser".to_string(),
+                unique_code_hash: code_hash.to_string(),
+            };
+            journal
+                .commit_attestation(
+                    &mut handle,
+                    &LaunchAttestationRecord {
+                        generation,
+                        observed_executable_identity: claim.clone(),
+                        executable_identity_chain: ExecutableIdentityChain::NoWalkPerformed {
+                            attestation: ExecutableIdentityRecord { claim, path: None },
+                        },
+                        executable_identity_checkpoints:
+                            ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
+                    },
+                )
+                .expect("commit attestation");
+        }
+
+        /// A module start whose recovery kept `project-1`'s profile for
+        /// `reason`, published to a management plane.
+        fn retained(reason: RecoveryPendingReason) -> Fixture {
+            let profile_directory = TestRoot::new("clear-profile");
+            let storage = InMemoryJournalStorage::new();
+            let service = ProductionLaunchService::open_with_recovery(
+                test_config(),
+                ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
+                |_, profile_root| {
+                    let root = profile_root.resolve().expect("scratch profile root");
+                    let mut intent = installed_durable_claim(&root);
+                    intent.profile.canonical_profile_path = path_bytes(&profile_directory.0);
+                    record_released_launch(&storage, &intent, reason);
+                    let mut journal = DurableLaunchJournal::open(
+                        launch_journal_config(),
+                        crate::PlaneJournalStorage::InMemory(storage.clone()),
+                    )
+                    .expect("reopen launch journal");
+                    let (failure, retained) = match reason {
+                        RecoveryPendingReason::TerminationFailed => recover_and_retain(
+                            &mut journal,
+                            &mut LiveOrphan {
+                                kill_succeeds: false,
+                            },
+                            profile_root,
+                        ),
+                        RecoveryPendingReason::GenerationUnobservable => {
+                            recover_and_retain(&mut journal, &mut UnobservableOrphan, profile_root)
+                        }
+                        RecoveryPendingReason::AttestationUntrusted => recover_and_retain(
+                            &mut journal,
+                            &mut LiveOrphan {
+                                kill_succeeds: true,
+                            },
+                            profile_root,
+                        ),
+                    };
+                    assert_eq!(failure, None);
+                    assert_eq!(retained.len(), 1, "recovery kept the profile");
+                    (Some(journal), failure, retained)
+                },
+            );
+            let root = service
+                .profile_root
+                .resolve()
+                .expect("scratch profile root");
+            let plane = ManagementPlane::new(Arc::new(NoTargets));
+            assert!(plane
+                .launch_recovery_registry()
+                .publish(service.recovery.clone()));
+            let fixture = Fixture {
+                service: Arc::new(service),
+                plane,
+                storage,
+                root,
+                profile_directory,
+            };
+            assert_eq!(lock_count(&fixture.root), 1);
+            fixture
+        }
+
+        fn clear() -> Value {
+            json!({"decision": "clear"})
+        }
+
+        /// A running process whose arguments carry `--user-data-dir=<dir>`,
+        /// the way every Chrome process does.
+        fn process_naming(directory: &Path) -> std::process::Child {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30; true")
+                .arg(format!("--user-data-dir={}", directory.display()))
+                .spawn()
+                .expect("spawn a process naming the profile")
+        }
+
+        /// A running process whose executable is named like Chromium.
+        fn chromium_named_process(directory: &TestRoot) -> std::process::Child {
+            let executable = directory.0.join("Chromium");
+            std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+            std::process::Command::new(&executable)
+                .arg("30")
+                .spawn()
+                .expect("spawn a Chromium-named process")
+        }
+
+        fn stop(mut child: std::process::Child) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        fn singleton_lock_to(directory: &Path, target: &str) {
+            std::os::unix::fs::symlink(target, directory.join("SingletonLock"))
+                .expect("plant SingletonLock");
+        }
+
+        fn this_host() -> String {
+            crate::launch_recovery::SystemProcessTable
+                .host_name()
+                .expect("host name")
+        }
+
+        #[test]
+        fn a_profile_recovery_kept_refuses_launches_by_name_for_each_reason() {
+            for reason in RecoveryPendingReason::ALL {
+                let fixture = retained(reason);
+                let reply = fixture
+                    .launch("contender")
+                    .expect_err("a launch opened a profile recovery kept");
+                assert_eq!(
+                    reply,
+                    json!({
+                        "outcome": "profile_recovery_pending",
+                        "reason": reason.as_str(),
+                        "remedy": reason.remedy(),
+                    })
+                );
+                assert!(reason.remedy().contains("browser.clear_launch_recovery"));
+                assert_eq!(
+                    crate::browser::validate_browser_result(
+                        crate::browser_session::BROWSER_LAUNCH,
+                        &reply
+                    ),
+                    Ok(())
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_clear_refuses_before_startup_recovery_has_published() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            // A plane whose launch service has not finished recovery: its
+            // registry is empty, which means "not looked yet".
+            let unpublished = ManagementPlane::new(Arc::new(NoTargets));
+            let (reply, question) = unpublished
+                .open_launch_recovery_clear(PROJECT, None, true)
+                .await;
+            assert!(question.is_none());
+            assert_eq!(reply["reason"], "not_ready", "{reply}");
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+        }
+
+        #[tokio::test]
+        async fn a_clear_refuses_a_project_recovery_did_not_keep() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            let (reply, question) = fixture
+                .plane
+                .open_launch_recovery_clear("project-2", None, true)
+                .await;
+            assert!(question.is_none());
+            assert_eq!(reply["reason"], "not_retained", "{reply}");
+            let (reply, _) = fixture
+                .plane
+                .open_launch_recovery_clear(PROJECT, Some(SEQUENCE + 1), true)
+                .await;
+            assert_eq!(reply["reason"], "not_retained", "{reply}");
+        }
+
+        #[tokio::test]
+        async fn a_clear_refuses_while_a_process_names_the_profile_directory() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            let child = process_naming(&fixture.profile_directory.0);
+            let reply = fixture.refusal().await;
+            let pid = child.id();
+            stop(child);
+            assert_eq!(reply["reason"], "profile_in_use", "{reply}");
+            assert_eq!(reply["pid"], pid);
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+        }
+
+        /// Chrome's own lock is the second, independent reading: a running
+        /// Chrome named there refuses, and so does a lock that cannot be read.
+        #[tokio::test]
+        async fn a_clear_refuses_what_chrome_s_singleton_lock_does_not_rule_out() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            let directory = &fixture.profile_directory.0;
+
+            let executables = TestRoot::new("chromium-named");
+            let child = chromium_named_process(&executables);
+            singleton_lock_to(directory, &format!("{}-{}", this_host(), child.id()));
+            let reply = fixture.refusal().await;
+            let pid = child.id();
+            stop(child);
+            assert_eq!(reply["reason"], "singleton_lock_held", "{reply}");
+            assert_eq!(reply["pid"], pid);
+
+            std::fs::remove_file(directory.join("SingletonLock")).expect("remove lock");
+            singleton_lock_to(directory, "no-pid-here");
+            assert_eq!(
+                fixture.refusal().await["reason"],
+                "singleton_lock_unreadable"
+            );
+
+            std::fs::remove_file(directory.join("SingletonLock")).expect("remove lock");
+            std::fs::write(directory.join("SingletonLock"), b"not a link").expect("write");
+            assert_eq!(
+                fixture.refusal().await["reason"],
+                "singleton_lock_unreadable"
+            );
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+        }
+
+        #[tokio::test]
+        async fn a_clear_refuses_when_the_process_table_cannot_be_read() {
+            let mut fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            // The plane holds the only other reference; swap the table in a
+            // fresh plane so the service's state can be changed first.
+            fixture.plane = ManagementPlane::new(Arc::new(NoTargets));
+            let service = Arc::get_mut(&mut fixture.service).expect("sole service owner");
+            let state = Arc::get_mut(&mut service.recovery).expect("sole recovery owner");
+            state.process_table = Arc::new(UnreadableTable);
+            fixture
+                .plane
+                .launch_recovery_registry()
+                .publish(service.recovery.clone());
+            assert_eq!(
+                fixture.refusal().await["reason"],
+                "process_table_unreadable"
+            );
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+        }
+
+        #[tokio::test]
+        async fn a_denied_clear_changes_nothing() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            let (_, ask_id) = fixture.ask().await;
+            assert_eq!(
+                fixture
+                    .plane
+                    .settle_launch_recovery_clear(&ask_id, Some(&json!({"decision": "keep"})))
+                    .await,
+                ClearSettlement::Kept
+            );
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+            let (reply, _) = fixture
+                .plane
+                .open_launch_recovery_clear(PROJECT, None, true)
+                .await;
+            assert_eq!(reply["previous_answer"]["outcome"], "kept", "{reply}");
+        }
+
+        #[tokio::test]
+        async fn a_late_answer_or_one_from_an_earlier_start_does_nothing() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            let (_, ask_id) = fixture.ask().await;
+            let late = Instant::now() + Duration::from_secs(31 * 60);
+            assert_eq!(
+                fixture
+                    .plane
+                    .settle_launch_recovery_clear_at(&ask_id, Some(&clear()), late)
+                    .await,
+                ClearSettlement::Expired
+            );
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "late");
+
+            // The module restarted: a new plane with a new startup identity
+            // receives an answer to the old question.
+            let (_, ask_id) = fixture.ask().await;
+            let restarted = ManagementPlane::new(Arc::new(NoTargets));
+            restarted
+                .launch_recovery_registry()
+                .publish(fixture.service.recovery.clone());
+            assert_eq!(
+                restarted
+                    .settle_launch_recovery_clear(&ask_id, Some(&clear()))
+                    .await,
+                ClearSettlement::AskedByEarlierStart
+            );
+            assert_eq!(
+                restarted
+                    .settle_launch_recovery_clear("browser-grant-consent-1", Some(&clear()))
+                    .await,
+                ClearSettlement::UnknownAsk
+            );
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "restarted");
+        }
+
+        #[tokio::test]
+        async fn an_allowed_clear_releases_the_profile_and_a_launch_proceeds() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            // A lock left by a crashed browser names a pid nobody holds, which
+            // does not stand in the way.
+            singleton_lock_to(
+                &fixture.profile_directory.0,
+                &format!("{}-4000000", this_host()),
+            );
+            let (question, ask_id) = fixture.ask().await;
+            let message = question["params"]["message"].as_str().expect("message");
+            assert!(message.contains(PROJECT), "{message}");
+            assert!(message.contains("attestation_untrusted"), "{message}");
+            assert!(message.contains("1970-01-01T00:00:00.000Z"), "{message}");
+            assert!(
+                message.contains("names pid 4000000, which is not running"),
+                "{message}"
+            );
+            assert_eq!(
+                question["params"]["requestedSchema"]["properties"]["decision"]["enum"],
+                json!(["clear", "keep"])
+            );
+
+            assert_eq!(
+                fixture
+                    .plane
+                    .settle_launch_recovery_clear(&ask_id, Some(&clear()))
+                    .await,
+                ClearSettlement::Cleared { sequence: SEQUENCE }
+            );
+            assert!(!fixture.record_is_active());
+            assert_eq!(lock_count(&fixture.root), 0);
+            assert!(fixture.launch("after-clear").is_ok());
+            let (reply, _) = fixture
+                .plane
+                .open_launch_recovery_clear(PROJECT, None, true)
+                .await;
+            assert_eq!(reply["reason"], "not_retained", "{reply}");
+            assert_eq!(reply["previous_answer"]["outcome"], "cleared", "{reply}");
+        }
+
+        /// The profile stays held under recovery's holder from the answer's
+        /// re-check until the release, so a launch in that window is still
+        /// refused by name.
+        #[tokio::test]
+        async fn a_launch_during_a_clear_is_refused_until_the_release() {
+            let fixture = retained(RecoveryPendingReason::TerminationFailed);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let service = Arc::clone(&fixture.service);
+            let root = fixture.root.clone();
+            let record = Arc::clone(&seen);
+            fixture
+                .service
+                .recovery
+                .stage_hook
+                .lock()
+                .expect("hook")
+                .replace(Box::new(move |stage| {
+                    let launch = service
+                        .take_and_return_profile_custody(&accepted(), "during-clear")
+                        .map_err(|reply| reply["outcome"].clone());
+                    record.lock().expect("record").push((
+                        stage,
+                        launch.map(|_| ()),
+                        lock_count(&root),
+                    ));
+                    true
+                }));
+            let (_, ask_id) = fixture.ask().await;
+            assert_eq!(
+                fixture
+                    .plane
+                    .settle_launch_recovery_clear(&ask_id, Some(&clear()))
+                    .await,
+                ClearSettlement::Cleared { sequence: SEQUENCE }
+            );
+            let refused: Result<(), Value> = Err(json!("profile_recovery_pending"));
+            assert_eq!(
+                *seen.lock().expect("seen"),
+                vec![
+                    (ClearStage::Rechecked, refused.clone(), 1),
+                    (ClearStage::Recorded, refused.clone(), 1),
+                    (ClearStage::Terminalized, refused, 1),
+                ]
+            );
+            assert!(fixture.launch("after-clear").is_ok());
+        }
+
+        /// The person answered minutes after the question; a browser that
+        /// opened the profile since stops the clear.
+        #[tokio::test]
+        async fn the_evidence_is_read_again_when_the_answer_arrives() {
+            let fixture = retained(RecoveryPendingReason::GenerationUnobservable);
+            let (_, ask_id) = fixture.ask().await;
+            let child = process_naming(&fixture.profile_directory.0);
+            let settlement = fixture
+                .plane
+                .settle_launch_recovery_clear(&ask_id, Some(&clear()))
+                .await;
+            let pid = child.id();
+            stop(child);
+            assert_eq!(
+                settlement,
+                ClearSettlement::Failed(ClearFailure::Refused(ClearRefusal::ProfileInUse { pid }))
+            );
+            fixture.assert_still_held(RecoveryPendingReason::GenerationUnobservable, "after");
+        }
+
+        /// A clear that stopped after its durable record, as a crash would,
+        /// is finished by the next start's recovery: the record is consumed
+        /// and the profile released without observing the browser again.
+        #[tokio::test]
+        async fn a_clear_stopped_after_its_record_is_finished_by_the_next_start() {
+            let fixture = retained(RecoveryPendingReason::TerminationFailed);
+            fixture
+                .service
+                .recovery
+                .stage_hook
+                .lock()
+                .expect("hook")
+                .replace(Box::new(|stage| stage != ClearStage::Recorded));
+            let (_, ask_id) = fixture.ask().await;
+            assert_eq!(
+                fixture
+                    .plane
+                    .settle_launch_recovery_clear(&ask_id, Some(&clear()))
+                    .await,
+                ClearSettlement::Failed(ClearFailure::Terminalization { sequence: SEQUENCE })
+            );
+            assert!(fixture.record_is_active());
+            assert_eq!(lock_count(&fixture.root), 1);
+
+            // The next start runs in a new process, so this one reads as gone.
+            let mut journal =
+                DurableLaunchJournal::open(launch_journal_config(), fixture.storage.clone())
+                    .expect("reopen launch journal at the next start");
+            let mut custody = RootCustody {
+                root: fixture.root.clone(),
+                supervisor: SupervisorGeneration {
+                    pid: u32::MAX - 1,
+                    start_time: 19,
+                    boot_id: None,
+                },
+                liveness: NoLiveSupervisor,
+            };
+            // Its kill would fail; a cleared record must not reach it.
+            let outcomes = recover_browser_launches(
+                &mut journal,
+                &mut LiveOrphan {
+                    kill_succeeds: false,
+                },
+                &mut custody,
+            )
+            .expect("the next start finishes the clear");
+            assert_eq!(
+                outcomes[0].process,
+                RecoveredBrowserProcess::OperatorCleared
+            );
+            assert!(outcomes[0].journal_action.is_some());
+            assert_eq!(lock_count(&fixture.root), 0);
+            assert!(!fixture.record_is_active());
+        }
     }
 }
 

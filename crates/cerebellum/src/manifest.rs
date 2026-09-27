@@ -155,6 +155,13 @@ fn management_surface() -> ProviderRole {
                  file deleted after 10 minutes, and return the ck auth commands the operator \
                  runs to store it for insula. No cookie value is returned.",
             ),
+            (
+                crate::management::CLEAR_LAUNCH_RECOVERY,
+                "Operator-only. Ask the person to clear a browser launch record that startup \
+                 recovery kept because it could not prove a browser from before a restart gone. \
+                 Refuses unless no running process names the profile and Chrome's lock names no \
+                 running browser; both are read again before anything is cleared.",
+            ),
         ]
         .into_iter()
         .map(|(name, description)| ManagementOperation {
@@ -921,6 +928,7 @@ mod tests {
                 crate::management::RESUME,
                 crate::management::REBIND_PROFILE_ROOT,
                 crate::management::CAPTURE_LOGIN,
+                crate::management::CLEAR_LAUNCH_RECOVERY,
             ]
         );
         let dispatchable = crate::management::OPERATIONS

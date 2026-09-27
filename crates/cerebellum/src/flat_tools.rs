@@ -694,6 +694,45 @@ mod tests {
             .contains(&json!("launch")));
     }
 
+    /// Clearing a stuck launch record is for an operator, after a person
+    /// consents; a model must never find it among its tools. Checked against
+    /// every place a model reads tools from: the flat browser tool's action
+    /// list with every browser capability admitted, what that tool will
+    /// translate, and the browser tool definitions the manifest advertises.
+    #[test]
+    fn clearing_a_launch_record_is_in_no_model_visible_catalog() {
+        let every_browser_capability = crate::browser::tool_definitions()
+            .into_iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect::<Vec<_>>();
+        let tool = browser_tool(&every_browser_capability).unwrap();
+        let actions = tool.schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(actions.contains(&json!("present")), "{actions:?}");
+        for hidden in [
+            json!("clear_launch_recovery"),
+            json!(crate::management::CLEAR_LAUNCH_RECOVERY),
+        ] {
+            assert!(!actions.contains(&hidden), "{actions:?}");
+        }
+        assert!(!serde_json::to_string(&tool)
+            .unwrap()
+            .contains("clear_launch_recovery"));
+        assert!(translate_browser(&json!({"action": "clear_launch_recovery"})).is_err());
+        assert!(
+            translate_browser(&json!({"action": crate::management::CLEAR_LAUNCH_RECOVERY}))
+                .is_err()
+        );
+        assert!(crate::browser::tool_definitions()
+            .iter()
+            .all(|(name, _, _)| *name != crate::management::CLEAR_LAUNCH_RECOVERY));
+        assert!(crate::manifest::browser_wire_tools()
+            .iter()
+            .chain(crate::manifest::browser_control_tools().iter())
+            .all(|tool| !tool.name.contains("clear_launch_recovery")));
+    }
+
     #[test]
     fn computer_actions_require_exact_model_chosen_fields() {
         let tool = computer_tool(&computer_names()).unwrap();

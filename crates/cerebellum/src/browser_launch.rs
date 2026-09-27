@@ -25,6 +25,16 @@ use crate::profile_custody::{
 
 const GENERATION_SLOT: &str = "browser.launch.generation";
 const ATTESTATION_SLOT: &str = "browser.launch.attestation";
+/// An operator's clear of a record startup recovery kept active, written
+/// before the record is consumed; see [`LaunchRecoveryClearRecord`].
+///
+/// An attachment slot rather than a new record kind, so the journal's stored
+/// format does not change. A build from before this slot existed reads only the
+/// attestation slot and ignores it: after a rollback such a build treats a
+/// cleared-but-unfinished record exactly as it did before the clear (kept
+/// active, profile refused), which is the safe direction.
+const RECOVERY_CLEAR_SLOT: &str = "browser.launch.recovery_clear";
+const RECOVERY_CLEAR_FORMAT_VERSION: &str = "ck-browser-launch-recovery-clear/v1";
 /// Version 5 admits `capture` as a launch profile (see [`LaunchProfile`]).
 const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v5";
 /// Version 4 added `boot_id` to the process generation. When present, the
@@ -540,6 +550,11 @@ pub enum RecoveredBrowserProcess {
     /// The record was dispatched, so its browser may have been released, but
     /// the attestation naming that browser is missing or not trustworthy.
     AttestationUntrusted,
+    /// An earlier process durably recorded that an operator cleared this
+    /// record, after reading that no process used its profile directory and
+    /// asking a person, and then stopped before finishing. The clear is
+    /// completed now; the process is not observed again.
+    OperatorCleared,
 }
 
 impl RecoveredBrowserProcess {
@@ -551,12 +566,137 @@ impl RecoveredBrowserProcess {
             Self::TerminatedAndReaped
             | Self::StartTimeMismatch
             | Self::NotRunning
-            | Self::Unattested => true,
+            | Self::Unattested
+            | Self::OperatorCleared => true,
             Self::TerminationFailed | Self::GenerationUnobservable | Self::AttestationUntrusted => {
                 false
             }
         }
     }
+
+    /// Why the record stays active and its profile refused, when it does.
+    pub const fn pending_reason(self) -> Option<RecoveryPendingReason> {
+        match self {
+            Self::TerminationFailed => Some(RecoveryPendingReason::TerminationFailed),
+            Self::GenerationUnobservable => Some(RecoveryPendingReason::GenerationUnobservable),
+            Self::AttestationUntrusted => Some(RecoveryPendingReason::AttestationUntrusted),
+            Self::TerminatedAndReaped
+            | Self::StartTimeMismatch
+            | Self::NotRunning
+            | Self::Unattested
+            | Self::OperatorCleared => None,
+        }
+    }
+}
+
+/// Why startup recovery could not prove a browser from before the module
+/// restarted gone, so kept its launch record active and its profile refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPendingReason {
+    /// Dispatched, with no attestation this module trusts. Retrying at the
+    /// next start re-reads the same record, so this never clears by itself.
+    AttestationUntrusted,
+    /// The recorded browser was running and could not be stopped.
+    TerminationFailed,
+    /// Whether the recorded browser still runs could not be read.
+    GenerationUnobservable,
+}
+
+impl RecoveryPendingReason {
+    pub const ALL: [Self; 3] = [
+        Self::AttestationUntrusted,
+        Self::TerminationFailed,
+        Self::GenerationUnobservable,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AttestationUntrusted => "attestation_untrusted",
+            Self::TerminationFailed => "termination_failed",
+            Self::GenerationUnobservable => "generation_unobservable",
+        }
+    }
+
+    /// What the caller of a refused launch can do. Only the operator can act:
+    /// no session holds the profile, so there is nothing for the caller to
+    /// close, and for an untrusted attestation retrying never helps.
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::TerminationFailed | Self::GenerationUnobservable => {
+                "a browser from before the module restarted may still be running on this \
+                 profile; the next module start retries; if it persists, an operator can clear \
+                 it with browser.clear_launch_recovery"
+            }
+            Self::AttestationUntrusted => {
+                "the module can't prove a browser from before its restart is gone; an operator \
+                 must check and clear it with browser.clear_launch_recovery"
+            }
+        }
+    }
+}
+
+/// Durable proof that an operator cleared one launch record startup recovery
+/// had kept active, written (and synced) before the record is consumed and its
+/// profile released. A start that finds it on a still-active record finishes
+/// the clear instead of refusing the profile again.
+///
+/// Carries only what identifies the decision: which record, why recovery kept
+/// it, and which question the person answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchRecoveryClearRecord {
+    pub format_version: String,
+    pub sequence: u64,
+    pub launch_attempt_id: String,
+    pub holder_id: String,
+    pub reason: RecoveryPendingReason,
+    pub ask_id: String,
+}
+
+impl LaunchRecoveryClearRecord {
+    pub fn new(
+        sequence: u64,
+        intent: &AuthorizedLaunchIntent,
+        reason: RecoveryPendingReason,
+        ask_id: &str,
+    ) -> Self {
+        Self {
+            format_version: RECOVERY_CLEAR_FORMAT_VERSION.to_string(),
+            sequence,
+            launch_attempt_id: intent.launch_attempt_id.clone(),
+            holder_id: intent.holder_id.clone(),
+            reason,
+            ask_id: ask_id.to_string(),
+        }
+    }
+
+    /// Whether this clear names exactly the record it is attached to.
+    fn applies_to(&self, sequence: u64, intent: &AuthorizedLaunchIntent) -> bool {
+        self.format_version == RECOVERY_CLEAR_FORMAT_VERSION
+            && self.sequence == sequence
+            && self.launch_attempt_id == intent.launch_attempt_id
+            && self.holder_id == intent.holder_id
+    }
+}
+
+/// One launch record still active in the journal, as the journal alone
+/// describes it: no process is observed to build this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveLaunchRecord {
+    pub sequence: u64,
+    pub intent: AuthorizedLaunchIntent,
+    /// The record reached dispatch, so its browser may have been released.
+    pub dispatched: bool,
+    /// A dispatched record whose attestation this module trusts. A dispatched
+    /// record without one is what recovery calls `attestation_untrusted`.
+    pub attestation_trusted: bool,
+    /// When the recorded browser started, in microseconds since the epoch,
+    /// when the record says so in that unit (a Linux record counts ticks since
+    /// boot instead, which says nothing about the wall clock).
+    pub browser_started_at_micros: Option<u64>,
+    /// An operator's clear is already written on this record.
+    pub cleared: bool,
 }
 
 /// Result for one active record examined by startup recovery.
@@ -666,6 +806,11 @@ struct ActiveLaunchAttempt {
     /// the attestation and strictly before it releases the browser.
     dispatched: bool,
     attested_generation: Option<BrowserProcessGeneration>,
+    /// The browser's recorded generation, trusted or not, kept only to show a
+    /// person when the browser started.
+    recorded_generation: Option<BrowserProcessGeneration>,
+    /// A valid operator clear is attached to this record.
+    cleared: bool,
 }
 
 /// Terminal mismatch record. The process is still barred when this is written.
@@ -1160,8 +1305,79 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
     ) -> Result<Vec<ActiveLaunchAttempt>, BrowserLaunchRecoveryFailure> {
         let mut attempts = Vec::new();
         for sequence in 1..self.core.next_sequence() {
+            if let Some(attempt) = self.active_launch_attempt(sequence)? {
+                attempts.push(attempt);
+            }
+        }
+        Ok(attempts)
+    }
+
+    /// The launch record at `sequence` as the journal alone describes it, or
+    /// `None` when that record is no longer active (or has no intent this
+    /// module wrote).
+    pub fn active_launch_record(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<ActiveLaunchRecord>, BrowserLaunchRecoveryFailure> {
+        let Some(attempt) = self.active_launch_attempt(sequence)? else {
+            return Ok(None);
+        };
+        let Some(intent) = attempt.intent else {
+            return Ok(None);
+        };
+        let browser_started_at_micros = attempt
+            .attested_generation
+            .or(attempt.recorded_generation)
+            .filter(|generation| generation.boot_id.is_none())
+            .map(|generation| generation.start_time_micros);
+        Ok(Some(ActiveLaunchRecord {
+            sequence,
+            intent,
+            dispatched: attempt.dispatched,
+            attestation_trusted: attempt.attested_generation.is_some(),
+            browser_started_at_micros,
+            cleared: attempt.cleared,
+        }))
+    }
+
+    /// Write an operator's clear onto the still-active record it names, and
+    /// make it durable, before anything acts on it.
+    ///
+    /// Refused when the record is no longer active or already carries a
+    /// clear: either means another path settled or is settling it.
+    pub fn record_recovery_clear(
+        &mut self,
+        record: &LaunchRecoveryClearRecord,
+    ) -> Result<(), CoreJournalError> {
+        let handle = self
+            .core
+            .active_reservation_handle(record.sequence)
+            .ok_or(CoreJournalError::ObligationUnknown)?;
+        let bytes = serde_json::to_vec(record).map_err(|_| CoreJournalError::CodecFailed)?;
+        self.core
+            .attach_obligation_material(handle, RECOVERY_CLEAR_SLOT, 0, bytes)
+            .map(|_| ())
+    }
+
+    /// Consume one active record the way startup recovery consumes a record
+    /// whose browser is proven gone. `None` when it was not active or the
+    /// terminal record could not be written.
+    pub fn terminalize_recovered(
+        &mut self,
+        sequence: u64,
+    ) -> Option<cerebellum_core::journal::RecoveryAction> {
+        self.core
+            .recover_record(sequence)
+            .map(|recovered| recovered.recovery_action)
+    }
+
+    fn active_launch_attempt(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<ActiveLaunchAttempt>, BrowserLaunchRecoveryFailure> {
+        {
             let Some(classification) = self.core.classify(sequence) else {
-                continue;
+                return Ok(None);
             };
             let audit = self
                 .core
@@ -1218,14 +1434,43 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
             } else {
                 None
             };
-            attempts.push(ActiveLaunchAttempt {
+            let recorded_generation = intent.as_ref().and_then(|intent| {
+                audit
+                    .attachment_slots
+                    .iter()
+                    .find(|attachment| attachment.slot == GENERATION_SLOT)
+                    .and_then(|attachment| {
+                        serde_json::from_slice::<LaunchGenerationRecord>(&attachment.opaque_bytes)
+                            .ok()
+                    })
+                    .filter(|generation| generation.intent == *intent)
+                    .map(|generation| generation.process_generation)
+            });
+            // A clear that does not name exactly this record and its holder is
+            // ignored, so the record is kept and refused again: a stray or
+            // damaged clear must never release a profile.
+            let cleared = intent.as_ref().is_some_and(|intent| {
+                audit
+                    .attachment_slots
+                    .iter()
+                    .find(|attachment| attachment.slot == RECOVERY_CLEAR_SLOT)
+                    .and_then(|attachment| {
+                        serde_json::from_slice::<LaunchRecoveryClearRecord>(
+                            &attachment.opaque_bytes,
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|clear| clear.applies_to(sequence, intent))
+            });
+            Ok(Some(ActiveLaunchAttempt {
                 sequence,
                 intent,
                 dispatched,
                 attested_generation,
-            });
+                recorded_generation,
+                cleared,
+            }))
         }
-        Ok(attempts)
     }
 }
 
@@ -1272,6 +1517,10 @@ where
 
     for attempt in &attempts {
         let process_outcome = match attempt.attested_generation {
+            // Checked first: the clear was written only after the operator's
+            // evidence and a person's consent, so this start finishes it rather
+            // than repeating the observation that could not settle it.
+            _ if attempt.cleared => RecoveredBrowserProcess::OperatorCleared,
             None if attempt.dispatched => RecoveredBrowserProcess::AttestationUntrusted,
             None => RecoveredBrowserProcess::Unattested,
             Some(generation) => {
@@ -4322,12 +4571,27 @@ impl LaunchCleanupStage {
 /// profile contention identity this type can carry is a custody holder id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserLaunchOutcome {
-    ProfileBusy { holder_id: HolderId },
+    ProfileBusy {
+        holder_id: HolderId,
+    },
+    /// The profile is held by startup recovery, not by a session: a browser
+    /// from before the module restarted could not be proven gone.
+    ProfileRecoveryPending {
+        reason: RecoveryPendingReason,
+    },
     ProfileGrantRequired,
-    ProfileRegistryUntrustedRoot { reason: UntrustworthyRegistryReason },
-    ProfileStorageUnavailable { reason_code: &'static str },
-    InternalFailure { reason_code: &'static str },
-    CleanupFailure { stage: LaunchCleanupStage },
+    ProfileRegistryUntrustedRoot {
+        reason: UntrustworthyRegistryReason,
+    },
+    ProfileStorageUnavailable {
+        reason_code: &'static str,
+    },
+    InternalFailure {
+        reason_code: &'static str,
+    },
+    CleanupFailure {
+        stage: LaunchCleanupStage,
+    },
 }
 
 impl BrowserLaunchOutcome {
@@ -4348,6 +4612,11 @@ impl BrowserLaunchOutcome {
                                close that session's browser or retry once it releases",
                 })
             }
+            Self::ProfileRecoveryPending { reason } => json!({
+                "outcome": "profile_recovery_pending",
+                "reason": reason.as_str(),
+                "remedy": reason.remedy(),
+            }),
             Self::ProfileGrantRequired => json!({"outcome": "profile_grant_required"}),
             Self::ProfileRegistryUntrustedRoot { reason } => {
                 let mut response = json!({
@@ -4832,6 +5101,7 @@ fn cleanup_stage_after_profile_completion(attempt: &PreparedProfileAttempt) -> L
 /// carry a profile UUID or profile path without updating the structural fence.
 const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
+    | BrowserLaunchOutcome::ProfileRecoveryPending { reason: _ }
     | BrowserLaunchOutcome::ProfileGrantRequired
     | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason: _ }
     | BrowserLaunchOutcome::ProfileStorageUnavailable { reason_code: _ }
@@ -4854,6 +5124,10 @@ mod launch_outcome_schema_tests {
                 holder_id: serde_json::from_value(json!("holder-under-test"))
                     .expect("a holder id deserializes from its string"),
             }],
+            BrowserLaunchOutcome::ProfileRecoveryPending { .. } => RecoveryPendingReason::ALL
+                .into_iter()
+                .map(|reason| BrowserLaunchOutcome::ProfileRecoveryPending { reason })
+                .collect(),
             BrowserLaunchOutcome::ProfileGrantRequired => {
                 vec![BrowserLaunchOutcome::ProfileGrantRequired]
             }
@@ -4939,6 +5213,9 @@ mod launch_outcome_schema_tests {
             BrowserLaunchOutcome::ProfileBusy {
                 holder_id: serde_json::from_value(json!("seed")).expect("holder id"),
             },
+            BrowserLaunchOutcome::ProfileRecoveryPending {
+                reason: RecoveryPendingReason::AttestationUntrusted,
+            },
             BrowserLaunchOutcome::ProfileGrantRequired,
             BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
                 reason: UntrustworthyRegistryReason::MalformedRegistry,
@@ -4969,9 +5246,10 @@ mod launch_outcome_schema_tests {
             }
         }
         // One rendering each for busy, grant, storage and internal failure,
-        // eighteen untrusted-root reasons, and three cleanup stages: 25. A
-        // lower count means a rendering was dropped from the check.
-        assert_eq!(checked, 25);
+        // three recovery-pending reasons, eighteen untrusted-root reasons, and
+        // three cleanup stages: 28. A lower count means a rendering was
+        // dropped from the check.
+        assert_eq!(checked, 28);
     }
 
     /// Platform launch refusals reach the caller through the launch service's

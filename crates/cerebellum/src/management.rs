@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerebellum_computer::platform::{ProcessGrant, TargetCandidate, TargetResolution};
 use cerebellum_core::clock::MonotonicClock;
@@ -34,6 +34,7 @@ use crate::authorization::{
     OBSERVE,
 };
 use crate::classification::canonical_grant_origin;
+use crate::launch_recovery::{ClearFailure, ClearPreview, LaunchRecoveryRegistry};
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
 
 /// The computer-target operation this surface serves.
@@ -50,7 +51,11 @@ pub const RESUME: &str = "browser.resume";
 pub const REBIND_PROFILE_ROOT: &str = "browser.rebind_profile_root";
 /// Capture a fresh login in a throwaway profile, for the operator to store.
 pub const CAPTURE_LOGIN: &str = "browser.capture_login";
-pub const OPERATIONS: [&str; 7] = [
+/// Clear a launch record startup recovery kept because it could not prove a
+/// browser from before a restart gone. Operator-only: it is a management
+/// operation, never a tool, so no model sees it in a tool catalog.
+pub const CLEAR_LAUNCH_RECOVERY: &str = "browser.clear_launch_recovery";
+pub const OPERATIONS: [&str; 8] = [
     OPEN_TARGET,
     OPEN_GRANT,
     IMPORT_LOGIN,
@@ -58,6 +63,7 @@ pub const OPERATIONS: [&str; 7] = [
     RESUME,
     REBIND_PROFILE_ROOT,
     CAPTURE_LOGIN,
+    CLEAR_LAUNCH_RECOVERY,
 ];
 
 /// Read an action kind from its wire spelling.
@@ -239,6 +245,13 @@ pub struct ManagementPlane {
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
     profile_lifecycle: Option<Arc<ProfileLifecycle>>,
     pending_profile_root_rebinds: Mutex<BTreeMap<String, PendingProfileRootRebind>>,
+    /// Where the launch service publishes what startup recovery kept.
+    launch_recovery: Arc<LaunchRecoveryRegistry>,
+    pending_launch_recovery_clears: Mutex<BTreeMap<String, PendingLaunchRecoveryClear>>,
+    /// The last answer to a clear question, by project, reported on the next
+    /// request for that project. The answer arrives on a task nobody waits
+    /// on, so this is where an answer that did nothing says so.
+    launch_recovery_settlements: Mutex<BTreeMap<String, Value>>,
     /// Targets whose last consent question reached no person, by the ask that
     /// was never put.
     ///
@@ -264,6 +277,65 @@ struct PendingProfileRootRebind {
     preview: RebindReport,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLaunchRecoveryClear {
+    preview: ClearPreview,
+    /// The module startup that asked. An answer is acted on only by the same
+    /// one: after a restart, recovery has run again and the question no
+    /// longer describes what it kept.
+    incarnation: String,
+    asked_at: Instant,
+}
+
+/// What one answer to a clear question did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearSettlement {
+    Cleared {
+        sequence: u64,
+    },
+    /// The person chose to keep the record, or gave no usable answer.
+    Kept,
+    /// Answered after the question's deadline.
+    Expired,
+    /// Asked by an earlier start of this module; nothing was done.
+    AskedByEarlierStart,
+    /// No question with this identity is pending.
+    UnknownAsk,
+    /// The re-check at answer time, or a later step, stopped the clear.
+    Failed(ClearFailure),
+}
+
+impl ClearSettlement {
+    pub fn as_json(&self) -> Value {
+        match self {
+            Self::Cleared { sequence } => json!({"outcome": "cleared", "sequence": sequence}),
+            Self::Kept => json!({"outcome": "kept"}),
+            Self::Expired => json!({
+                "outcome": "expired",
+                "remedy": "the answer arrived after the question's deadline and did nothing; ask again",
+            }),
+            Self::AskedByEarlierStart => json!({
+                "outcome": "stale_incarnation",
+                "remedy": "the question was asked before the module restarted and did nothing; ask again",
+            }),
+            Self::UnknownAsk => json!({"outcome": "unknown_ask"}),
+            Self::Failed(ClearFailure::Refused(refusal)) => refusal.as_json(),
+            Self::Failed(ClearFailure::Terminalization { sequence }) => json!({
+                "outcome": "clear_unfinished",
+                "stage": "record_terminalization",
+                "sequence": sequence,
+                "remedy": "the clear is recorded; the next module start finishes it",
+            }),
+            Self::Failed(ClearFailure::CustodyRelease { sequence }) => json!({
+                "outcome": "clear_unfinished",
+                "stage": "custody_release",
+                "sequence": sequence,
+                "remedy": "the record is cleared but the profile is still held; restarting the module releases it",
+            }),
+        }
+    }
+}
+
 impl ManagementPlane {
     pub fn new(resolver: Arc<dyn TargetResolver>) -> Self {
         Self {
@@ -273,6 +345,9 @@ impl ManagementPlane {
             pending_browser_grants: Mutex::new(BTreeMap::new()),
             profile_lifecycle: None,
             pending_profile_root_rebinds: Mutex::new(BTreeMap::new()),
+            launch_recovery: Arc::new(LaunchRecoveryRegistry::new()),
+            pending_launch_recovery_clears: Mutex::new(BTreeMap::new()),
+            launch_recovery_settlements: Mutex::new(BTreeMap::new()),
             unreached: Mutex::new(BTreeMap::new()),
         }
     }
@@ -605,6 +680,151 @@ impl ManagementPlane {
 
     pub async fn profile_root_rebind_pending_count(&self) -> usize {
         self.pending_profile_root_rebinds.lock().await.len()
+    }
+
+    /// The registry the launch service publishes its clear into once startup
+    /// recovery has finished.
+    pub fn launch_recovery_registry(&self) -> Arc<LaunchRecoveryRegistry> {
+        Arc::clone(&self.launch_recovery)
+    }
+
+    /// Read what startup recovery kept for `agent_project_id` and the evidence
+    /// that no browser uses its profile, and prepare the consent question.
+    /// Nothing changes until a person answers.
+    pub async fn open_launch_recovery_clear(
+        &self,
+        agent_project_id: &str,
+        sequence: Option<u64>,
+        can_relay_to_a_person: bool,
+    ) -> (Value, Option<Question>) {
+        let previous = self
+            .launch_recovery_settlements
+            .lock()
+            .await
+            .get(agent_project_id)
+            .cloned();
+        let with_previous = |mut reply: Value| {
+            if let Some(previous) = previous.as_ref() {
+                reply["previous_answer"] = previous.clone();
+            }
+            reply
+        };
+        let preview = match self.launch_recovery.preview(agent_project_id, sequence) {
+            Ok(preview) => preview,
+            Err(refusal) => return (with_previous(refusal.as_json()), None),
+        };
+        let described = json!({
+            "agent_project_id": preview.agent_project_id,
+            "sequence": preview.sequence,
+            "reason": preview.reason.as_str(),
+            "launched_at": preview.launched_at,
+            "evidence": preview.evidence.as_json(),
+        });
+        if !can_relay_to_a_person {
+            let mut reply = described;
+            reply["outcome"] = json!("consent_unavailable");
+            reply["remedy"] =
+                json!("reconnect declaring the ability to relay a question to a person");
+            return (with_previous(reply), None);
+        }
+
+        let incarnation = self.launch_recovery.incarnation().to_string();
+        let ask_id = new_launch_recovery_clear_ask_id(&incarnation);
+        let question = Question {
+            ask_id: ask_id.clone(),
+            body: launch_recovery_clear_question(&ask_id, &preview),
+            deadline: PHONE_CONSENT_DEADLINE,
+        };
+        self.pending_launch_recovery_clears.lock().await.insert(
+            ask_id.clone(),
+            PendingLaunchRecoveryClear {
+                preview,
+                incarnation,
+                asked_at: Instant::now(),
+            },
+        );
+        let mut reply = described;
+        reply["outcome"] = json!("consent_pending");
+        reply["ask_id"] = json!(ask_id);
+        reply["remedy"] = json!(
+            "wait for the person to answer; the evidence is read again before anything is cleared"
+        );
+        (with_previous(reply), Some(question))
+    }
+
+    /// Apply one answer to a clear question.
+    pub async fn settle_launch_recovery_clear(
+        &self,
+        ask_id: &str,
+        answer: Option<&Value>,
+    ) -> ClearSettlement {
+        self.settle_launch_recovery_clear_at(ask_id, answer, Instant::now())
+            .await
+    }
+
+    /// [`Self::settle_launch_recovery_clear`] as if answered at `answered_at`,
+    /// so a test can answer after the deadline without waiting for it.
+    pub async fn settle_launch_recovery_clear_at(
+        &self,
+        ask_id: &str,
+        answer: Option<&Value>,
+        answered_at: Instant,
+    ) -> ClearSettlement {
+        let incarnation = self.launch_recovery.incarnation();
+        let pending = self
+            .pending_launch_recovery_clears
+            .lock()
+            .await
+            .remove(ask_id);
+        let (settlement, project) = match pending {
+            // A question this start never asked. One whose identity names
+            // another start was asked before a restart: say so, since the
+            // person may believe they cleared something.
+            None => {
+                let settlement = if ask_id.starts_with(LAUNCH_RECOVERY_CLEAR_ASK_PREFIX)
+                    && !ask_id
+                        .starts_with(&format!("{LAUNCH_RECOVERY_CLEAR_ASK_PREFIX}{incarnation}-"))
+                {
+                    ClearSettlement::AskedByEarlierStart
+                } else {
+                    ClearSettlement::UnknownAsk
+                };
+                return settlement;
+            }
+            Some(pending) => {
+                let project = pending.preview.agent_project_id.clone();
+                let settlement = if pending.incarnation != incarnation {
+                    ClearSettlement::AskedByEarlierStart
+                } else if answered_at.saturating_duration_since(pending.asked_at)
+                    > PHONE_CONSENT_DEADLINE
+                {
+                    ClearSettlement::Expired
+                } else if answer
+                    .and_then(|body| body.get("decision"))
+                    .and_then(Value::as_str)
+                    != Some("clear")
+                {
+                    ClearSettlement::Kept
+                } else {
+                    match self.launch_recovery.clear(&pending.preview, ask_id) {
+                        Ok(()) => ClearSettlement::Cleared {
+                            sequence: pending.preview.sequence,
+                        },
+                        Err(failure) => ClearSettlement::Failed(failure),
+                    }
+                };
+                (settlement, project)
+            }
+        };
+        self.launch_recovery_settlements
+            .lock()
+            .await
+            .insert(project, settlement.as_json());
+        settlement
+    }
+
+    pub async fn launch_recovery_clear_pending_count(&self) -> usize {
+        self.pending_launch_recovery_clears.lock().await.len()
     }
 
     /// Resolve an application name and report what authority exists over it.
@@ -1046,6 +1266,50 @@ fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindR
     })
 }
 
+/// The consent question for clearing a launch record, worded like the
+/// profile-root rebind: it names what will change and shows the evidence, and
+/// asks for consent. The person is not asked to judge whether a browser is
+/// running; the module read that, and reads it again before acting.
+fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value {
+    let launched_at = preview
+        .launched_at
+        .clone()
+        .unwrap_or_else(|| "an unrecorded time".to_string());
+    json!({
+        "jsonrpc": "2.0",
+        "id": ask_id,
+        "method": "elicitation/create",
+        "params": {
+            "message": format!(
+                "Clear the stuck browser record for project {}? Its browser was launched at {} \
+                 and, after the module restarted, recovery could not prove it gone ({}). \
+                 Evidence now: {}. Clearing lets the agent open its browser on that profile \
+                 again; the evidence is read again before anything is cleared.",
+                preview.agent_project_id,
+                launched_at,
+                preview.reason.as_str(),
+                preview.evidence.describe(),
+            ),
+            "agent_project_id": preview.agent_project_id,
+            "sequence": preview.sequence,
+            "reason": preview.reason.as_str(),
+            "launched_at": preview.launched_at,
+            "evidence": preview.evidence.as_json(),
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["clear", "keep"],
+                    }
+                },
+                "required": ["decision"],
+                "additionalProperties": false,
+            },
+        },
+    })
+}
+
 fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
     match refusal {
         RebindRefusal::RegistryMissing => json!({
@@ -1267,6 +1531,19 @@ fn new_profile_root_rebind_ask_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
         "browser-profile-root-rebind-consent-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed) + 1
+    )
+}
+
+const LAUNCH_RECOVERY_CLEAR_ASK_PREFIX: &str = "browser-launch-recovery-clear-";
+
+/// Carries the asking start's identity, so an answer that reaches a later
+/// start is recognised as belonging to an earlier one.
+fn new_launch_recovery_clear_ask_id(incarnation: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{LAUNCH_RECOVERY_CLEAR_ASK_PREFIX}{incarnation}-{}",
         NEXT.fetch_add(1, Ordering::Relaxed) + 1
     )
 }
