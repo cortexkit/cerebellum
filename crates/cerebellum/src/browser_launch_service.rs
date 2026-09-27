@@ -2557,6 +2557,11 @@ mod cleanup_ordering_tests {
 /// session cleanup. The fixture binds no launch journal, so every ending also
 /// reports `record_terminalization`; that failure is independent of the
 /// directory, which is the point: the delete must not depend on it.
+///
+/// Each test checks the directory is gone the moment the cleanup's after-reap
+/// step returns, not merely by the end of the test: dropping the cleanup also
+/// deletes it as a last resort, and a delete that happened only there would
+/// leave a failure unreported.
 #[cfg(all(test, target_os = "macos"))]
 mod crash_reports_teardown_tests {
     use super::*;
@@ -2628,17 +2633,42 @@ mod crash_reports_teardown_tests {
         }
     }
 
+    /// What the after-reap step left: `None` until it ran, then whether the
+    /// crash-report directory still existed when it returned.
+    type AfterReapObservation = Arc<Mutex<Option<bool>>>;
+
+    /// Production's cleanup, observed right after its after-reap step.
+    struct ObservedCleanup {
+        inner: ProductionSessionCleanup,
+        path: PathBuf,
+        observed: AfterReapObservation,
+    }
+
+    impl SessionCleanup for ObservedCleanup {
+        fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
+            self.inner.set_terminal_outcome(outcome);
+        }
+
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            let result = self.inner.after_reap();
+            *self.observed.lock().unwrap() = Some(self.path.exists());
+            result
+        }
+    }
+
     /// A ready session on `route` whose cleanup owns a fresh crash-report
-    /// directory, returned with the session id and the directory's path.
+    /// directory holding a report, returned with the session id, the
+    /// directory's path, and what the after-reap step will observe.
     fn session_with_crash_reports(
         sessions: &BrowserSessions,
         route: &str,
         clock: &FakeClock,
         alive: bool,
-    ) -> (String, PathBuf) {
+    ) -> (String, PathBuf, AfterReapObservation) {
         let crash_reports = excluded_directory();
         let path = crash_reports.path().to_path_buf();
         std::fs::write(path.join("minidump"), b"page memory").expect("write a report");
+        let observed = AfterReapObservation::default();
         let _ = sessions.acquire_launch_slot(route);
         let (id, _, cancelled) = sessions
             .establish_ready(
@@ -2647,53 +2677,64 @@ mod crash_reports_teardown_tests {
                 &config(),
                 clock,
                 Box::new(ExitingProcess { alive }),
-                Box::new(cleanup_owning(crash_reports)),
+                Box::new(ObservedCleanup {
+                    inner: cleanup_owning(crash_reports),
+                    path: path.clone(),
+                    observed: Arc::clone(&observed),
+                }),
             )
             .expect("establish test session");
         assert!(!cancelled);
         assert!(path.is_dir());
-        (id, path)
+        (id, path, observed)
+    }
+
+    fn assert_deleted_by_after_reap(ending: &str, path: &Path, observed: &AfterReapObservation) {
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(false),
+            "{ending}: the crash-report directory was still there when the session's \
+             after-reap step returned (None: the step never ran)"
+        );
+        assert!(!path.exists(), "{ending} left the crash-report directory");
     }
 
     #[test]
     fn crash_reports_are_deleted_when_a_session_is_closed() {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
-        let (id, path) = session_with_crash_reports(&sessions, "close", &clock, true);
+        let (id, path, observed) = session_with_crash_reports(&sessions, "close", &clock, true);
         sessions.close("close", &id, &config());
-        assert!(!path.exists(), "close left the crash-report directory");
+        assert_deleted_by_after_reap("close", &path, &observed);
     }
 
     #[test]
     fn crash_reports_are_deleted_when_an_idle_session_is_swept() {
         let sessions = BrowserSessions::default();
         let mut clock = FakeClock::new();
-        let (_, path) = session_with_crash_reports(&sessions, "idle", &clock, true);
+        let (_, path, observed) = session_with_crash_reports(&sessions, "idle", &clock, true);
         clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
         assert!(sessions.expire_idle("idle", &clock, &config()));
-        assert!(
-            !path.exists(),
-            "the idle sweep left the crash-report directory"
-        );
+        assert_deleted_by_after_reap("idle sweep", &path, &observed);
     }
 
     #[test]
     fn crash_reports_are_deleted_when_the_browser_crashes() {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
-        let (_, path) = session_with_crash_reports(&sessions, "crash", &clock, false);
+        let (_, path, observed) = session_with_crash_reports(&sessions, "crash", &clock, false);
         sessions.observe_exits_all(&config());
         sessions.observe_exits_all(&config());
-        assert!(!path.exists(), "a crash left the crash-report directory");
+        assert_deleted_by_after_reap("crash", &path, &observed);
     }
 
     #[test]
     fn crash_reports_are_deleted_at_module_shutdown() {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
-        let (_, path) = session_with_crash_reports(&sessions, "shutdown", &clock, true);
+        let (_, path, observed) = session_with_crash_reports(&sessions, "shutdown", &clock, true);
         sessions.teardown_all(&config());
-        assert!(!path.exists(), "shutdown left the crash-report directory");
+        assert_deleted_by_after_reap("shutdown", &path, &observed);
     }
 
     #[test]
