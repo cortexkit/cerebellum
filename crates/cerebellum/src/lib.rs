@@ -10,6 +10,8 @@
 pub mod authorization;
 pub mod browser;
 pub mod browser_config;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod browser_crash_reports;
 pub mod browser_executable_identity;
 pub mod browser_launch;
 pub mod browser_launch_readiness;

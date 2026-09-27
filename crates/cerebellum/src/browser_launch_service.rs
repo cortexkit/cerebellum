@@ -15,6 +15,7 @@ use crate::browser::navigation::{
 };
 use crate::browser::Tracker;
 use crate::browser_config::BrowserConfig;
+use crate::browser_crash_reports::CrashReportDirectory;
 use crate::browser_executable_identity::verify_configured_executable;
 use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
 use serde_json::{json, Value};
@@ -227,6 +228,14 @@ impl ProductionLaunchService {
                     {
                         startup_failure = Some(failure);
                     }
+                    // After the orphaned browsers are stopped, so none of them
+                    // is still writing into a directory being deleted. Only for
+                    // the durable service: an isolated one (a test) must not act
+                    // on state that other processes on this machine share.
+                    #[cfg(target_os = "macos")]
+                    if persistence == crate::JournalPersistence::Durable {
+                        crate::browser_crash_reports::remove_leftover_directories();
+                    }
                     Some(journal)
                 }
                 Err(_) => {
@@ -328,6 +337,10 @@ impl ProductionLaunchService {
             agent_project_id: accepted.identity.agent_project_id.clone(),
             session_kind: accepted.identity.session_kind,
         };
+        let (environment, crash_reports) = match prepare_launch_environment(&profile_directory) {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Err(cleanup_before_spawn(rollback.clone(), refusal)),
+        };
         let request = AttestedLaunchRequest {
             launch_attempt_id: browser_session_id.to_string(),
             holder_id,
@@ -339,7 +352,7 @@ impl ProductionLaunchService {
             },
             executable: executable.clone(),
             arguments,
-            environment: browser_launch_environment(&profile_directory),
+            environment,
             verified_executable_identity: expected_identity,
             pre_spawn_identity_verification,
         };
@@ -414,6 +427,7 @@ impl ProductionLaunchService {
                     launch_started_at,
                 },
                 profile: rollback,
+                crash_reports,
             }),
         })
     }
@@ -628,6 +642,7 @@ impl ProductionLaunchService {
         if !crate::custody::arguments_are_quarantinable(&argument_text) {
             return Err(json!({"outcome": "internal_failure", "stage": "argument_quarantine"}));
         }
+        let (environment, crash_reports) = prepare_launch_environment(&profile_directory)?;
 
         let request = AttestedLaunchRequest {
             launch_attempt_id: launch_attempt_id.to_string(),
@@ -649,7 +664,7 @@ impl ProductionLaunchService {
             },
             executable: executable.clone(),
             arguments,
-            environment: browser_launch_environment(&profile_directory),
+            environment,
             verified_executable_identity: expected_identity,
             pre_spawn_identity_verification,
         };
@@ -700,6 +715,7 @@ impl ProductionLaunchService {
             launch_attempt_id: launch_attempt_id.to_string(),
             grace_period: Duration::from_millis(self.config.termination_grace_period_ms),
             closed: false,
+            crash_reports,
         }))
     }
 }
@@ -724,6 +740,8 @@ struct ProductionCaptureBrowser {
     launch_attempt_id: String,
     grace_period: Duration,
     closed: bool,
+    /// Deleted when the capture browser is closed; see [`CrashReportDirectory`].
+    crash_reports: Option<CrashReportDirectory>,
 }
 
 fn capture_drive<T>(
@@ -822,9 +840,15 @@ impl crate::login_capture::CaptureBrowser for ProductionCaptureBrowser {
             &self.launch_attempt_id,
             &mut Some(BrowserSessionTerminalOutcome::Closed),
         );
+        // Deleted whatever the reap did too, for the same reason; a failure is
+        // reported with the others rather than dropped.
+        let crash_reports_deleted = self
+            .crash_reports
+            .take()
+            .map_or(Ok(()), CrashReportDirectory::remove);
         self.closed = true;
-        match (reaped, recorded) {
-            (Ok(()), Ok(())) => Ok(()),
+        match (reaped, recorded, crash_reports_deleted) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
             _ => Err(crate::login_capture::CaptureDriveError),
         }
     }
@@ -859,6 +883,11 @@ fn launch_recovery_refusal(_failure: BrowserLaunchRecoveryFailure) -> Value {
 /// than one that fails, because it certifies something nobody built.
 ///
 /// Not part of the module's supported surface; it exists for the probe.
+///
+/// Unlike macOS, this sets no crash-report location: `XDG_CONFIG_HOME` below
+/// already points into the agent's own profile directory, and Chromium on
+/// Linux derives its crash database from it, so crash reports stay inside the
+/// profile the agent owns rather than reaching the person's own Chrome folder.
 #[doc(hidden)]
 #[cfg(target_os = "linux")]
 pub fn browser_launch_environment(profile_directory: &Path) -> Vec<(OsString, OsString)> {
@@ -875,10 +904,49 @@ pub fn browser_launch_environment(profile_directory: &Path) -> Vec<(OsString, Os
 /// than one that fails, because it certifies something nobody built.
 ///
 /// Not part of the module's supported surface; it exists for the probe.
+///
+/// The one variable moves Chrome's crash database into `crash_reports`. Without
+/// it, macOS Chrome writes crash reports into the person's own Chrome folder
+/// whatever `--user-data-dir` says; see [`crate::browser_crash_reports`].
 #[doc(hidden)]
 #[cfg(target_os = "macos")]
-pub fn browser_launch_environment(_profile_directory: &Path) -> Vec<(OsString, OsString)> {
-    Vec::new()
+pub fn browser_launch_environment(
+    _profile_directory: &Path,
+    crash_reports: &CrashReportDirectory,
+) -> Vec<(OsString, OsString)> {
+    vec![(
+        OsString::from(crate::browser_crash_reports::BREAKPAD_DUMP_LOCATION),
+        crash_reports.path().as_os_str().to_os_string(),
+    )]
+}
+
+/// A launch's environment, and the crash-report directory it names (macOS
+/// only), which the launch's session cleanup deletes.
+type PreparedLaunchEnvironment = (Vec<(OsString, OsString)>, Option<CrashReportDirectory>);
+
+/// A launch's environment, with the crash-report directory it names (macOS),
+/// or the refusal when no directory safe from backup could be made. The
+/// directory is deleted when the returned value is dropped, so a launch that
+/// fails after this does not leave it behind.
+#[cfg(target_os = "macos")]
+fn prepare_launch_environment(
+    profile_directory: &Path,
+) -> Result<PreparedLaunchEnvironment, Value> {
+    let crash_reports = CrashReportDirectory::create()
+        .map_err(crate::browser_crash_reports::CrashReportRefusal::launch_refusal)?;
+    Ok((
+        browser_launch_environment(profile_directory, &crash_reports),
+        Some(crash_reports),
+    ))
+}
+
+/// Linux needs no crash-report directory of its own; see its
+/// [`browser_launch_environment`].
+#[cfg(target_os = "linux")]
+fn prepare_launch_environment(
+    profile_directory: &Path,
+) -> Result<PreparedLaunchEnvironment, Value> {
+    Ok((browser_launch_environment(profile_directory), None))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1803,22 +1871,38 @@ fn profile_directory_is_writable(profile_directory: &Path) -> bool {
     result.is_ok()
 }
 
-fn run_cleanup_obligations<P, J, C>(
+fn run_cleanup_obligations<P, J, C, R>(
     persistence_check: P,
     journal_finalization: J,
     profile_cleanup: C,
+    crash_reports_cleanup: R,
 ) -> Result<SessionCleanupOutcome, CleanupStage>
 where
     P: FnOnce() -> SessionCleanupOutcome,
     J: FnOnce() -> Result<(), CleanupStage>,
     C: FnOnce() -> Result<(), CleanupStage>,
+    R: FnOnce() -> Result<(), CleanupStage>,
 {
     let persistence_outcome = persistence_check();
     let journal_result = journal_finalization();
     let profile_result = profile_cleanup();
+    let crash_reports_result = crash_reports_cleanup();
     journal_result
         .and(profile_result)
+        .and(crash_reports_result)
         .map(|()| persistence_outcome)
+}
+
+/// Delete a session's crash-report directory, once, naming the stage when it
+/// could not be deleted.
+fn delete_crash_reports(
+    crash_reports: &mut Option<CrashReportDirectory>,
+) -> Result<(), CleanupStage> {
+    crash_reports.take().map_or(Ok(()), |directory| {
+        directory
+            .remove()
+            .map_err(|_| CleanupStage::CrashReportsDelete)
+    })
 }
 
 struct ProductionSessionCleanup {
@@ -1827,6 +1911,8 @@ struct ProductionSessionCleanup {
     terminal_outcome: Option<BrowserSessionTerminalOutcome>,
     persistence: ProfilePersistenceCheck,
     profile: SharedRollback,
+    /// Deleted after the browser is reaped, whichever way the session ended.
+    crash_reports: Option<CrashReportDirectory>,
 }
 
 impl ProductionSessionCleanup {
@@ -1871,11 +1957,13 @@ impl SessionCleanup for ProductionSessionCleanup {
             terminal_outcome,
             persistence,
             profile,
+            crash_reports,
         } = self;
         run_cleanup_obligations(
             || persistence.observe(),
             || Self::finalize_journal(journal, launch_attempt_id, terminal_outcome),
             || profile.after_reap(),
+            || delete_crash_reports(crash_reports),
         )
     }
 }
@@ -2131,10 +2219,39 @@ mod executable_identity_launch_tests {
         assert!(!without_display.iter().any(|(name, _)| name == "DISPLAY"));
     }
 
+    /// Without the variable, macOS Chrome writes its crash reports into the
+    /// person's own `~/Library/Application Support/Google/Chrome/Crashpad`,
+    /// whatever `--user-data-dir` says.
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_browser_launch_environment_remains_empty() {
-        assert!(browser_launch_environment(Path::new("/tmp/browser-profile")).is_empty());
+    fn macos_browser_launch_environment_moves_crash_reports_into_a_per_launch_temporary_directory()
+    {
+        use crate::browser_crash_reports::{
+            test_support::excluded_directory, BREAKPAD_DUMP_LOCATION,
+            CRASH_REPORTS_DIRECTORY_PREFIX,
+        };
+        let crash_reports = excluded_directory();
+        let environment =
+            browser_launch_environment(Path::new("/tmp/browser-profile"), &crash_reports);
+
+        let location = environment
+            .iter()
+            .find(|(name, _)| name == BREAKPAD_DUMP_LOCATION)
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("the macOS launch environment must relocate Chrome's crash database");
+        let temporary = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve the temporary directory");
+        assert_eq!(location.parent(), Some(temporary.as_path()));
+        assert!(location
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(CRASH_REPORTS_DIRECTORY_PREFIX)));
+        assert!(location.is_dir());
+        if let Some(home) = std::env::var_os("HOME") {
+            assert!(!location.starts_with(Path::new(&home).join("Library")));
+        }
+        assert!(!location.to_string_lossy().contains("/Library/"));
     }
 
     #[test]
@@ -2358,6 +2475,7 @@ mod cleanup_ordering_tests {
                 launch_started_at: SystemTime::now(),
             },
             profile: rollback,
+            crash_reports: None,
         };
 
         let result = cleanup.after_reap();
@@ -2381,6 +2499,7 @@ mod cleanup_ordering_tests {
         let persistence_events = Arc::clone(&events);
         let journal_events = Arc::clone(&events);
         let custody_events = Arc::clone(&events);
+        let crash_reports_events = Arc::clone(&events);
 
         let result = run_cleanup_obligations(
             move || {
@@ -2398,6 +2517,10 @@ mod cleanup_ordering_tests {
                 custody_events.lock().unwrap().push("custody");
                 Ok(())
             },
+            move || {
+                crash_reports_events.lock().unwrap().push("crash_reports");
+                Ok(())
+            },
         );
 
         assert_eq!(
@@ -2409,7 +2532,190 @@ mod cleanup_ordering_tests {
         );
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            ["persistence", "journal", "custody"]
+            ["persistence", "journal", "custody", "crash_reports"]
+        );
+    }
+
+    /// The crash-report directory can hold page memory from the session, so
+    /// failing to delete it is a cleanup failure with its own stage, reported
+    /// even when every other obligation succeeded.
+    #[test]
+    fn a_crash_reports_delete_failure_is_reported_when_everything_else_succeeds() {
+        let result = run_cleanup_obligations(
+            || SessionCleanupOutcome::Complete,
+            || Ok(()),
+            || Ok(()),
+            || Err(CleanupStage::CrashReportsDelete),
+        );
+        assert_eq!(result, Err(CleanupStage::CrashReportsDelete));
+    }
+}
+
+/// The crash-report directory of a launch is deleted however its session ends.
+///
+/// Each ending is driven through the session registry with production's own
+/// session cleanup. The fixture binds no launch journal, so every ending also
+/// reports `record_terminalization`; that failure is independent of the
+/// directory, which is the point: the delete must not depend on it.
+#[cfg(all(test, target_os = "macos"))]
+mod crash_reports_teardown_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    use cerebellum_core::clock::FakeClock;
+
+    use crate::browser_crash_reports::test_support::excluded_directory;
+    use crate::browser_session::{BrowserSessions, OwnedBrowserProcess, ProcessControlFailure};
+
+    /// A browser that exits as soon as it is asked to. `alive` is what an
+    /// exit observation sees, so `false` makes the session read as crashed.
+    struct ExitingProcess {
+        alive: bool,
+    }
+
+    impl OwnedBrowserProcess for ExitingProcess {
+        fn generation_matches(&self) -> bool {
+            self.alive
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_for_exit(
+            &mut self,
+            _grace_period: Duration,
+        ) -> Result<bool, ProcessControlFailure> {
+            Ok(true)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+    }
+
+    fn config() -> BrowserConfig {
+        BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 10,
+            termination_grace_period_ms: 10,
+            browser_idle_timeout_ms: 100,
+            browser_exit_observation_deadline_ms: 10,
+            navigation_settle_deadline_ms: 10,
+        }
+    }
+
+    fn cleanup_owning(crash_reports: CrashReportDirectory) -> ProductionSessionCleanup {
+        ProductionSessionCleanup {
+            journal: Arc::new(Mutex::new(None)),
+            launch_attempt_id: "crash-reports-teardown".to_string(),
+            terminal_outcome: None,
+            persistence: ProfilePersistenceCheck {
+                disposition: ProfileDisposition::Disposable,
+                profile_directory: PathBuf::from("/nonexistent/profile"),
+                launch_started_at: SystemTime::now(),
+            },
+            // No profile custody to give back.
+            profile: SharedRollback {
+                state: Arc::new(Mutex::new(None)),
+            },
+            crash_reports: Some(crash_reports),
+        }
+    }
+
+    /// A ready session on `route` whose cleanup owns a fresh crash-report
+    /// directory, returned with the session id and the directory's path.
+    fn session_with_crash_reports(
+        sessions: &BrowserSessions,
+        route: &str,
+        clock: &FakeClock,
+        alive: bool,
+    ) -> (String, PathBuf) {
+        let crash_reports = excluded_directory();
+        let path = crash_reports.path().to_path_buf();
+        std::fs::write(path.join("minidump"), b"page memory").expect("write a report");
+        let _ = sessions.acquire_launch_slot(route);
+        let (id, _, cancelled) = sessions
+            .establish_ready(
+                route,
+                ProfileDisposition::Disposable,
+                &config(),
+                clock,
+                Box::new(ExitingProcess { alive }),
+                Box::new(cleanup_owning(crash_reports)),
+            )
+            .expect("establish test session");
+        assert!(!cancelled);
+        assert!(path.is_dir());
+        (id, path)
+    }
+
+    #[test]
+    fn crash_reports_are_deleted_when_a_session_is_closed() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (id, path) = session_with_crash_reports(&sessions, "close", &clock, true);
+        sessions.close("close", &id, &config());
+        assert!(!path.exists(), "close left the crash-report directory");
+    }
+
+    #[test]
+    fn crash_reports_are_deleted_when_an_idle_session_is_swept() {
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let (_, path) = session_with_crash_reports(&sessions, "idle", &clock, true);
+        clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
+        assert!(sessions.expire_idle("idle", &clock, &config()));
+        assert!(
+            !path.exists(),
+            "the idle sweep left the crash-report directory"
+        );
+    }
+
+    #[test]
+    fn crash_reports_are_deleted_when_the_browser_crashes() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (_, path) = session_with_crash_reports(&sessions, "crash", &clock, false);
+        sessions.observe_exits_all(&config());
+        sessions.observe_exits_all(&config());
+        assert!(!path.exists(), "a crash left the crash-report directory");
+    }
+
+    #[test]
+    fn crash_reports_are_deleted_at_module_shutdown() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (_, path) = session_with_crash_reports(&sessions, "shutdown", &clock, true);
+        sessions.teardown_all(&config());
+        assert!(!path.exists(), "shutdown left the crash-report directory");
+    }
+
+    #[test]
+    fn a_crash_reports_directory_that_cannot_be_deleted_is_a_named_cleanup_failure() {
+        let crash_reports = excluded_directory();
+        let path = crash_reports.path().to_path_buf();
+        std::fs::write(path.join("minidump"), b"page memory").expect("write a report");
+        // Without write permission on the directory its report cannot be
+        // unlinked, so the delete fails.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))
+            .expect("make the directory unwritable");
+        let mut owned = Some(crash_reports);
+
+        let result = delete_crash_reports(&mut owned);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        std::fs::remove_dir_all(&path).expect("remove the fixture directory");
+        assert_eq!(result, Err(CleanupStage::CrashReportsDelete));
+        assert!(
+            owned.is_none(),
+            "the delete is attempted once, not again on drop"
         );
     }
 }

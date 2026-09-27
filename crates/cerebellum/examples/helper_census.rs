@@ -66,6 +66,7 @@ mod census {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use cerebellum::browser_crash_reports::CrashReportDirectory;
     use cerebellum::browser_launch_service::{
         browser_launch_arguments, browser_launch_environment,
     };
@@ -341,7 +342,19 @@ mod census {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root)
             .map_err(|error| format!("creating {}: {error}", root.display()))?;
-        let result = launch_in(spec, setup, &root);
+        // Production's own crash-report directory, made the way a launch
+        // makes it; a failed launch drops it, which deletes it.
+        let crash_reports = match CrashReportDirectory::create() {
+            Ok(crash_reports) => crash_reports,
+            Err(refusal) => {
+                let _ = std::fs::remove_dir_all(&root);
+                return Err(format!(
+                    "production refused the crash-report directory: {}",
+                    refusal.reason_code()
+                ));
+            }
+        };
+        let result = launch_in(spec, setup, &root, crash_reports);
         if result.is_err() {
             // The launch failed before a watch owned the root, so nothing else
             // will remove it. Any process that did start is still found by
@@ -358,13 +371,14 @@ mod census {
         spec: RunSpec,
         setup: &Setup,
         root: &Path,
+        crash_reports: CrashReportDirectory,
     ) -> Result<(JoinHandle<Observation>, String), String> {
         let profile = root.join("profile");
         let crash_dumps = root.join("crash-dumps");
         // Production's own builders, not a copy of them: a probe whose launch
         // drifts from production measures a browser nobody runs.
         let arguments = browser_launch_arguments(&profile, &crash_dumps);
-        let environment = browser_launch_environment(&profile);
+        let environment = browser_launch_environment(&profile, &crash_reports);
 
         // The same descriptor layout production sets up: the child reads
         // commands from one socket pair and writes responses into another,
@@ -420,7 +434,7 @@ mod census {
         }
         std::thread::sleep(SETTLE);
 
-        let census = take_census(main, root);
+        let census = take_census(main, root, crash_reports.path());
         if !census.iter().any(|member| member.kind == "renderer") {
             return Err(format!(
                 "no renderer was running after {} s, so this run would measure nothing \
@@ -445,7 +459,15 @@ mod census {
         let torn_down_at = Instant::now();
         let root = root.to_path_buf();
         let watch = std::thread::spawn(move || {
-            watch_for_survivors(spec, census, teardown, planted, root, torn_down_at)
+            watch_for_survivors(
+                spec,
+                census,
+                teardown,
+                planted,
+                root,
+                crash_reports,
+                torn_down_at,
+            )
         });
         Ok((watch, product))
     }
@@ -538,6 +560,7 @@ mod census {
         teardown: String,
         planted: Option<Member>,
         root: PathBuf,
+        crash_reports: CrashReportDirectory,
         torn_down_at: Instant,
     ) -> Observation {
         sleep_until(torn_down_at + FIRST_LOOK);
@@ -552,10 +575,22 @@ mod census {
             .iter()
             .map(|member| (member.pid, member.start_time_micros))
             .collect();
-        let late_arrivals: Vec<Member> = processes_naming(&root)
+        // The crash handler names the per-launch crash-report directory rather
+        // than the root, so both are looked for.
+        let mut late_arrivals: Vec<Member> = Vec::new();
+        for member in processes_naming(&root)
             .into_iter()
-            .filter(|member| !census_pids.contains(&(member.pid, member.start_time_micros)))
-            .collect();
+            .chain(processes_naming(crash_reports.path()))
+        {
+            let key = (member.pid, member.start_time_micros);
+            if !census_pids.contains(&key)
+                && !late_arrivals
+                    .iter()
+                    .any(|seen| (seen.pid, seen.start_time_micros) == key)
+            {
+                late_arrivals.push(member);
+            }
+        }
 
         let mut cleanup_problems = Vec::new();
         for member in survivors_second.iter().chain(&late_arrivals) {
@@ -572,6 +607,13 @@ mod census {
         }
         if let Err(error) = std::fs::remove_dir_all(&root) {
             cleanup_problems.push(format!("removing {}: {error}", root.display()));
+        }
+        let crash_reports_path = crash_reports.path().to_path_buf();
+        if let Err(error) = crash_reports.remove() {
+            cleanup_problems.push(format!(
+                "removing {}: {error}",
+                crash_reports_path.display()
+            ));
         }
         Observation {
             spec,
@@ -652,9 +694,13 @@ mod census {
     /// The browser's whole subtree plus every process whose argv names the
     /// root. The second half is what catches `chrome_crashpad_handler`, which
     /// double-forks away from the browser and is parented by launchd.
-    fn take_census(main: ProcessGeneration, root: &Path) -> Vec<Member> {
+    /// The browser's descendants, and every process whose argv names the root
+    /// or the per-launch crash-report directory: the crash handler is
+    /// reparented to launchd and names the latter.
+    fn take_census(main: ProcessGeneration, root: &Path, crash_reports: &Path) -> Vec<Member> {
         let table = process_table();
         let root_text = root.to_string_lossy().to_string();
+        let crash_reports_text = crash_reports.to_string_lossy().to_string();
         let mut selected = BTreeSet::new();
         let mut queue = VecDeque::from([main.pid]);
         while let Some(pid) = queue.pop_front() {
@@ -671,7 +717,9 @@ mod census {
         selected.extend(
             table
                 .iter()
-                .filter(|(_, listed)| listed.args.contains(&root_text))
+                .filter(|(_, listed)| {
+                    listed.args.contains(&root_text) || listed.args.contains(&crash_reports_text)
+                })
                 .map(|(pid, _)| *pid),
         );
         selected

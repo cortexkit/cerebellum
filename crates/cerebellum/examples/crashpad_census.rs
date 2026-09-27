@@ -39,21 +39,31 @@
 //!   (chrome_crash_reporter_client.cc:166-169). The bit layout is
 //!   third_party/crashpad/crashpad/client/settings.cc:120-143.
 //!
-//! Each arm below launches Chrome through production's own argument and
-//! environment builders, applies one candidate change on top, and records
-//! every `chrome_crashpad_handler` that starts system-wide during the launch:
-//! its `--database` and `--url`, whether that database lets it upload, and
-//! when it exits relative to that browser's teardown. The control arm applies
-//! nothing and must reproduce the handler pointing outside the throwaway root;
-//! if it does not, none of the arms measured anything.
+//! Production now sets `BREAKPAD_DUMP_LOCATION` on every macOS launch, to a
+//! per-launch directory under the per-user temporary directory that it
+//! creates, checks is excluded from backup, and deletes when the session ends
+//! (`cerebellum::browser_crash_reports`).
 //!
-//! Only throwaway roots under `/tmp` are created. The control arm (and the
-//! switch-only arm, which Chrome does not read) necessarily starts a handler
-//! on the person's own crash database, exactly as every production launch
-//! does today; the probe never reads that database, only whether the consent
-//! file beside it exists. The arm that sets `CHROME_HEADLESS` is only ever run
-//! together with a relocated database, because on the person's database it
-//! would switch their Chrome's uploads off until their Chrome next starts.
+//! Each arm below launches Chrome through production's own argument and
+//! environment builders, with a crash-report directory production itself
+//! created, applies one candidate change on top, and records every
+//! `chrome_crashpad_handler` that starts system-wide during the launch: its
+//! `--database` and `--url`, whether that database lets it upload, and when it
+//! exits relative to that browser's teardown. The control arm applies nothing
+//! and must show the handler's database UNDER that per-launch directory. The
+//! unrelocated arm removes the variable and must show the handler on a
+//! database outside every directory the probe made -- the person's own folder,
+//! which is what a launch without the variable gets. If either does not hold,
+//! none of the arms measured anything.
+//!
+//! Only throwaway roots under `/tmp` and production's per-launch directories
+//! are created. The unrelocated arm (and the switch-only arms, which Chrome
+//! does not read) necessarily starts a handler on the person's own crash
+//! database, as every production launch did before the relocation; the probe
+//! never reads that database, only whether the consent file beside it exists.
+//! The arm that sets `CHROME_HEADLESS` is only ever run together with a
+//! relocated database, because on the person's database it would switch their
+//! Chrome's uploads off until their Chrome next starts.
 //!
 //! Run it with:
 //!
@@ -188,6 +198,7 @@ mod census {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use cerebellum::browser_crash_reports::{CrashReportDirectory, BREAKPAD_DUMP_LOCATION};
     use cerebellum::browser_launch_service::{
         browser_launch_arguments, browser_launch_environment,
     };
@@ -220,20 +231,27 @@ mod census {
 
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
     enum Candidate {
-        /// Production's launch, unchanged.
+        /// Production's launch, unchanged: relocated into its per-launch
+        /// crash-report directory.
         Control,
-        /// `--breakpad-dump-location=<root>/crashpad-by-switch`.
+        /// Production's launch with `BREAKPAD_DUMP_LOCATION` removed, which is
+        /// what a launch without the relocation gets: the person's folder.
+        Unrelocated,
+        /// The variable removed and
+        /// `--breakpad-dump-location=<root>/crashpad-by-switch` added instead.
         BreakpadSwitch,
-        /// `BREAKPAD_DUMP_LOCATION=<root>/crashpad-by-env`.
+        /// The variable pointed at `<root>/crashpad-by-env` instead.
         BreakpadEnv,
-        /// The environment override plus `CHROME_HEADLESS=1`, which should
-        /// also clear the upload bit in the relocated database.
+        /// The variable pointed into the root plus `CHROME_HEADLESS=1`, which
+        /// should also clear the upload bit in the relocated database.
         BreakpadEnvUnattended,
-        /// Switches that sound as if they disable crash reporting but that
-        /// macOS Chrome does not read; expected to behave as the control.
+        /// The variable removed and switches added that sound as if they
+        /// disable crash reporting but that macOS Chrome does not read;
+        /// expected to behave as the unrelocated arm.
         DisableSwitches,
-        /// `CFFIXED_USER_HOME=<root>/home`, moving the default user-data
-        /// directory and with it the crash database. Opt-in only.
+        /// The variable removed and `CFFIXED_USER_HOME=<root>/home` added,
+        /// moving the default user-data directory and with it the crash
+        /// database. Opt-in only.
         FakeHome,
     }
 
@@ -241,6 +259,7 @@ mod census {
         fn label(self) -> &'static str {
             match self {
                 Candidate::Control => "CONTROL (production launch)",
+                Candidate::Unrelocated => "production launch without BREAKPAD_DUMP_LOCATION",
                 Candidate::BreakpadSwitch => "--breakpad-dump-location",
                 Candidate::BreakpadEnv => "BREAKPAD_DUMP_LOCATION",
                 Candidate::BreakpadEnvUnattended => "BREAKPAD_DUMP_LOCATION + CHROME_HEADLESS",
@@ -258,27 +277,26 @@ mod census {
             arguments: &mut Vec<OsString>,
             environment: &mut Vec<(OsString, OsString)>,
         ) -> Result<(), String> {
+            // Every arm but the control replaces production's relocation, so
+            // each one measures its own change rather than production's.
+            if self != Candidate::Control {
+                environment.retain(|(name, _)| name != BREAKPAD_DUMP_LOCATION);
+            }
             let mut set = |name: &str, value: OsString| {
                 environment.push((OsString::from(name), value));
             };
             match self {
-                Candidate::Control => {}
+                Candidate::Control | Candidate::Unrelocated => {}
                 Candidate::BreakpadSwitch => {
                     let mut switch = OsString::from("--breakpad-dump-location=");
                     switch.push(root.join("crashpad-by-switch"));
                     arguments.push(switch);
                 }
                 Candidate::BreakpadEnv => {
-                    set(
-                        "BREAKPAD_DUMP_LOCATION",
-                        root.join("crashpad-by-env").into(),
-                    );
+                    set(BREAKPAD_DUMP_LOCATION, root.join("crashpad-by-env").into());
                 }
                 Candidate::BreakpadEnvUnattended => {
-                    set(
-                        "BREAKPAD_DUMP_LOCATION",
-                        root.join("crashpad-by-env").into(),
-                    );
+                    set(BREAKPAD_DUMP_LOCATION, root.join("crashpad-by-env").into());
                     set("CHROME_HEADLESS", OsString::from("1"));
                 }
                 Candidate::DisableSwitches => {
@@ -317,6 +335,9 @@ mod census {
     struct Run {
         spec: RunSpec,
         root: PathBuf,
+        /// The per-launch crash-report directory production created for this
+        /// run, deleted once every handler has exited and its settings are read.
+        crash_reports: CrashReportDirectory,
         spawned_at: Instant,
         torn_down_at: Instant,
         teardown: String,
@@ -471,6 +492,7 @@ mod census {
 
         let mut candidates = vec![
             Candidate::Control,
+            Candidate::Unrelocated,
             Candidate::BreakpadSwitch,
             Candidate::BreakpadEnv,
             Candidate::BreakpadEnvUnattended,
@@ -551,9 +573,13 @@ mod census {
             .iter()
             .filter(|handler| !runs.iter().any(|run| owns(run, handler)))
             .collect();
-        for run in &runs {
+        for run in runs {
             if let Err(error) = std::fs::remove_dir_all(&run.root) {
                 cleanup_problems.push(format!("removing {}: {error}", run.root.display()));
+            }
+            let crash_reports = run.crash_reports.path().to_path_buf();
+            if let Err(error) = run.crash_reports.remove() {
+                cleanup_problems.push(format!("removing {}: {error}", crash_reports.display()));
             }
         }
 
@@ -688,7 +714,24 @@ mod census {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root)
             .map_err(|error| format!("creating {}: {error}", root.display()))?;
-        let result = launch_in(spec, setup, &root);
+        // On macOS `/tmp` is a symlink to `/private/tmp`, and Chrome reports
+        // the resolved path; without this, a database under the root would
+        // read as outside it.
+        let root = std::fs::canonicalize(&root)
+            .map_err(|error| format!("resolving {}: {error}", root.display()))?;
+        // Production's own directory, made the way a launch makes it. A
+        // refusal here is what production would refuse the launch with.
+        let crash_reports = match CrashReportDirectory::create() {
+            Ok(crash_reports) => crash_reports,
+            Err(refusal) => {
+                let _ = std::fs::remove_dir_all(&root);
+                return Err(format!(
+                    "production refused the crash-report directory: {}",
+                    refusal.reason_code()
+                ));
+            }
+        };
+        let result = launch_in(spec, setup, &root, crash_reports);
         if result.is_err() {
             // A browser that started before the failure still names the root
             // in its argv; it is killed here so it cannot outlive the probe.
@@ -704,14 +747,19 @@ mod census {
         result
     }
 
-    fn launch_in(spec: RunSpec, setup: &Setup, root: &Path) -> Result<(Run, String), String> {
+    fn launch_in(
+        spec: RunSpec,
+        setup: &Setup,
+        root: &Path,
+        crash_reports: CrashReportDirectory,
+    ) -> Result<(Run, String), String> {
         let profile = root.join("profile");
         let crash_dumps = root.join("crash-dumps");
         // Production's own builders, not a copy of them, with the candidate's
         // change added on top: a probe whose baseline drifts from production
         // measures a browser nobody runs.
         let mut arguments = browser_launch_arguments(&profile, &crash_dumps);
-        let mut environment = browser_launch_environment(&profile);
+        let mut environment = browser_launch_environment(&profile, &crash_reports);
         spec.candidate
             .apply(root, &mut arguments, &mut environment)?;
 
@@ -768,6 +816,7 @@ mod census {
             Run {
                 spec,
                 root: root.to_path_buf(),
+                crash_reports,
                 spawned_at,
                 torn_down_at: Instant::now(),
                 teardown,
@@ -838,8 +887,40 @@ mod census {
             && handler.first_seen <= run.torn_down_at + ATTRIBUTION_SLACK
     }
 
+    /// Where a handler's database is, relative to the directories this run made.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Location {
+        /// Under the per-launch crash-report directory production created:
+        /// where every production launch's handler must write.
+        PerLaunch,
+        /// Under the run's throwaway root, where a candidate arm pointed it.
+        UnderRoot,
+        /// Anywhere else: the person's own folder, for a launch that did not
+        /// relocate the database.
+        Outside,
+    }
+
+    impl Location {
+        fn describe(self) -> &'static str {
+            match self {
+                Location::PerLaunch => "under the per-launch crash-report directory",
+                Location::UnderRoot => "under the throwaway root",
+                Location::Outside => "OUTSIDE every directory the probe made",
+            }
+        }
+
+        fn short(self) -> &'static str {
+            match self {
+                Location::PerLaunch => "per-launch dir",
+                Location::UnderRoot => "under root",
+                Location::Outside => "outside",
+            }
+        }
+    }
+
     enum UploadState {
-        /// The database is outside the throwaway root and is not read.
+        /// The database is outside every directory the probe made and is not
+        /// read.
         NotRead {
             consent_file_beside_it: bool,
         },
@@ -853,7 +934,7 @@ mod census {
         database: String,
         url: String,
         metrics_dir: String,
-        under_root: bool,
+        location: Location,
         uploads: UploadState,
         /// Seconds from this run's teardown to the first poll that no longer
         /// saw the handler; `None` when it was still alive at the cap.
@@ -873,8 +954,16 @@ mod census {
             .map(|handler| {
                 let database = handler.argv.database.clone().unwrap_or_default();
                 let database_path = Path::new(&database);
-                let under_root = !database.is_empty() && database_path.starts_with(&run.root);
-                let uploads = if under_root {
+                let location = if database.is_empty() {
+                    Location::Outside
+                } else if database_path.starts_with(run.crash_reports.path()) {
+                    Location::PerLaunch
+                } else if database_path.starts_with(&run.root) {
+                    Location::UnderRoot
+                } else {
+                    Location::Outside
+                };
+                let uploads = if location != Location::Outside {
                     match std::fs::read(database_path.join("settings.dat")) {
                         Ok(bytes) => match uploads_from_settings(&bytes) {
                             Ok(uploads) => UploadState::Read(uploads),
@@ -905,7 +994,7 @@ mod census {
                     database,
                     url: handler.argv.url.clone().unwrap_or_default(),
                     metrics_dir: handler.argv.metrics_dir.clone().unwrap_or_default(),
-                    under_root,
+                    location,
                     uploads,
                     exit_after_teardown,
                 }
@@ -923,7 +1012,7 @@ mod census {
             UploadState::NotRead {
                 consent_file_beside_it,
             } => format!(
-                "not read (outside the root); consent file beside it: {}",
+                "not read (outside the probe's directories); consent file beside it: {}",
                 if *consent_file_beside_it {
                     "present"
                 } else {
@@ -963,11 +1052,7 @@ mod census {
             println!(
                 "    --database={} [{}]",
                 handler.database,
-                if handler.under_root {
-                    "under the throwaway root"
-                } else {
-                    "OUTSIDE the throwaway root"
-                }
+                handler.location.describe()
             );
             println!("    --url={}", handler.url);
             println!("    --metrics-dir={}", handler.metrics_dir);
@@ -1002,13 +1087,7 @@ mod census {
             let databases = join(
                 handlers
                     .iter()
-                    .map(|handler| {
-                        if handler.under_root {
-                            "under root".to_string()
-                        } else {
-                            "outside root".to_string()
-                        }
-                    })
+                    .map(|handler| handler.location.short().to_string())
                     .collect(),
             );
             let uploads = join(
@@ -1053,32 +1132,66 @@ mod census {
             );
             return 1;
         }
-        // The control is what makes every other row mean something: it must
-        // show the handler this probe exists to find, one per launch, on a
-        // database outside the root. A control with no handler would make an
-        // arm's "no handler started" indistinguishable from a blind watch.
-        let controls: Vec<&RunReport> = reports
-            .iter()
-            .filter(|report| report.spec.candidate == Candidate::Control)
-            .collect();
-        if controls.len() != RUNS_PER_ARM {
-            println!(
-                "VERDICT: CONTROL FAILED -- {} control runs, expected {RUNS_PER_ARM}",
-                controls.len()
-            );
-            return 1;
-        }
-        for control in &controls {
-            if control.handlers.is_empty()
-                || control.handlers.iter().any(|handler| handler.under_root)
-            {
+        // The control and the unrelocated arm are what make every other row
+        // mean something. The control is production's launch and must show
+        // its handler, one per launch, on a database under the per-launch
+        // directory production made. The unrelocated arm must show the
+        // handler on a database outside every directory the probe made, which
+        // proves the relocation is what moved it. A run with no handler would
+        // make an arm's "no handler started" indistinguishable from a blind
+        // watch.
+        let runs_of = |candidate: Candidate| -> Vec<&RunReport> {
+            reports
+                .iter()
+                .filter(|report| report.spec.candidate == candidate)
+                .collect()
+        };
+        for (candidate, expected, name) in [
+            (Candidate::Control, Location::PerLaunch, "CONTROL"),
+            (
+                Candidate::Unrelocated,
+                Location::Outside,
+                "UNRELOCATED BASELINE",
+            ),
+        ] {
+            let runs = runs_of(candidate);
+            if runs.len() != RUNS_PER_ARM {
                 println!(
-                    "VERDICT: CONTROL FAILED -- {} did not show a handler on a database \
-                     outside the root, so no arm below measured anything",
-                    control.spec.label()
+                    "VERDICT: {name} FAILED -- {} runs, expected {RUNS_PER_ARM}",
+                    runs.len()
                 );
                 return 1;
             }
+            for run in &runs {
+                if run.handlers.is_empty()
+                    || run
+                        .handlers
+                        .iter()
+                        .any(|handler| handler.location != expected)
+                {
+                    println!(
+                        "VERDICT: {name} FAILED -- {} did not show every handler on a database \
+                         {}, so no arm below measured anything",
+                        run.spec.label(),
+                        expected.describe()
+                    );
+                    return 1;
+                }
+            }
+        }
+        // The relocated database is a fresh one, so its own settings must
+        // read uploads as disabled; enabled would mean the relocation moved
+        // the reports but not the decision to send them.
+        if runs_of(Candidate::Control)
+            .iter()
+            .flat_map(|run| &run.handlers)
+            .any(|handler| !matches!(handler.uploads, UploadState::Read(Uploads::Disabled)))
+        {
+            println!(
+                "VERDICT: CONTROL FAILED -- a production handler's relocated database did not \
+                 read uploads as disabled"
+            );
+            return 1;
         }
         let mut findings = Vec::new();
         let mut arms: BTreeMap<Candidate, Vec<&RunReport>> = BTreeMap::new();
@@ -1086,31 +1199,40 @@ mod census {
             arms.entry(report.spec.candidate).or_default().push(report);
         }
         for (candidate, runs) in arms {
-            if candidate == Candidate::Control {
+            if matches!(candidate, Candidate::Control | Candidate::Unrelocated) {
                 continue;
             }
             let handlers: Vec<&HandlerReport> = runs.iter().flat_map(|run| &run.handlers).collect();
+            let locations: BTreeSet<&'static str> = handlers
+                .iter()
+                .map(|handler| handler.location.short())
+                .collect();
             let outcome = if handlers.is_empty() {
                 "no handler started".to_string()
-            } else if handlers.iter().all(|handler| handler.under_root) {
+            } else if locations.len() > 1 {
+                format!(
+                    "MIXED: handlers {}",
+                    locations.into_iter().collect::<Vec<_>>().join(" / ")
+                )
+            } else if handlers[0].location == Location::Outside {
+                "database outside, as without the relocation".to_string()
+            } else {
                 let uploads: BTreeSet<String> = handlers
                     .iter()
                     .map(|handler| describe_uploads(&handler.uploads))
                     .collect();
                 format!(
-                    "database under the root, uploads {}",
+                    "database {}, uploads {}",
+                    handlers[0].location.describe(),
                     uploads.into_iter().collect::<Vec<_>>().join(" / ")
                 )
-            } else if handlers.iter().any(|handler| handler.under_root) {
-                "MIXED: some handlers under the root, some outside".to_string()
-            } else {
-                "database outside the root, as the control".to_string()
             };
             findings.push(format!("{}: {outcome}", candidate.label()));
         }
         println!(
-            "VERDICT: CONTROL REPRODUCED (handler on a database outside the root in every \
-             control run). Arms: {}",
+            "VERDICT: RELOCATION CONFIRMED (every production handler on a database under its \
+             per-launch directory with uploads disabled; every unrelocated handler outside). \
+             Arms: {}",
             findings.join(" | ")
         );
         0

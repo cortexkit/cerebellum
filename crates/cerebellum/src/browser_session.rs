@@ -256,6 +256,10 @@ pub enum CleanupStage {
     /// profile's custody was deliberately left held; the next start's launch
     /// recovery stops the browser and releases it.
     CustodyHeld,
+    /// The directory the browser's crash handler wrote to could not be
+    /// deleted. It can hold page memory from the session, so a failure is
+    /// reported rather than passed over; the next start retries the delete.
+    CrashReportsDelete,
 }
 
 impl CleanupStage {
@@ -266,6 +270,7 @@ impl CleanupStage {
             Self::CustodyRelease => "custody_release",
             Self::DisposableDelete => "disposable_delete",
             Self::CustodyHeld => "custody_held",
+            Self::CrashReportsDelete => "crash_reports_delete",
         }
     }
 }
