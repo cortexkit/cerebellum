@@ -15,21 +15,12 @@ const PRINT_MACROS: &[&str] = &["println!(", "print!(", "dbg!("];
 
 /// Prints allowed outside test code, as (path from the workspace root, the
 /// text of the line, the reason).
-const ALLOWED: &[(&str, &str, &str)] = &[
-    (
-        "crates/cerebellum/src/main.rs",
-        "println!(",
-        "`--version`, the one output the module ships; it runs before the module \
+const ALLOWED: &[(&str, &str, &str)] = &[(
+    "crates/cerebellum/src/main.rs",
+    "println!(",
+    "`--version`, the one output the module ships; it runs before the module \
          starts and is read by the person who asked for it",
-    ),
-    (
-        "crates/cerebellum/src/lib.rs",
-        "eprintln!(\"ck-cerebellum: SIGTERM listener not installed: {error}\");",
-        "predates this fence and prints at startup when the SIGTERM listener cannot \
-         be installed; listed so that it is a recorded exception rather than an \
-         unnoticed one",
-    ),
-];
+)];
 
 #[test]
 fn shipped_code_prints_nothing() {

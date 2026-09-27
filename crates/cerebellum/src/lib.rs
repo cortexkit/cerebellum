@@ -1356,18 +1356,56 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
     ending
 }
 
+/// Set when the SIGTERM listener could not be installed, and read by the
+/// health reply as `sigtermListener`. A counter rather than a print because the
+/// module writes nothing to its standard streams: the daemon keeps them in a
+/// backed-up file whose constant size is how printing is detected.
+static SIGTERM_LISTENER_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(unix)]
 fn listen_for_sigterm() -> Option<tokio::signal::unix::Signal> {
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+    listen_for_sigterm_with(|| {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    })
+}
+
+/// [`listen_for_sigterm`] with the installation supplied, so a test can drive
+/// the failure branch.
+#[cfg(unix)]
+fn listen_for_sigterm_with(
+    install: impl FnOnce() -> std::io::Result<tokio::signal::unix::Signal>,
+) -> Option<tokio::signal::unix::Signal> {
+    match install() {
         Ok(listener) => Some(listener),
-        Err(error) => {
+        Err(_) => {
             // Without a listener SIGTERM keeps its default action: the module
             // still dies by the signal, just without its teardown, which is
             // how it behaved before it listened at all.
-            eprintln!("ck-cerebellum: SIGTERM listener not installed: {error}");
+            SIGTERM_LISTENER_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
             None
         }
     }
+}
+
+/// The health reply's `sigtermListener`: `not_installed` only when installing
+/// the listener failed. The listener is installed before the module connects,
+/// so no health request can arrive before the attempt.
+#[cfg(unix)]
+fn sigterm_listener_state() -> &'static str {
+    if SIGTERM_LISTENER_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        "not_installed"
+    } else {
+        "installed"
+    }
+}
+
+/// There is no SIGTERM to listen for off unix, so no listener is ever
+/// installed; `not_supported` says why rather than implying a failure.
+#[cfg(not(unix))]
+fn sigterm_listener_state() -> &'static str {
+    let _ = &SIGTERM_LISTENER_FAILED;
+    "not_supported"
 }
 
 /// Serve until the daemon connection ends or SIGTERM arrives, whichever is
@@ -3355,7 +3393,7 @@ async fn handle_control_request(
             // Insulated health-v2 lane: the report is a mechanical mapper over
             // atomics stamped by the dispatch path. It never blocks on a lock
             // and never forms its own opinion (Health-Path-Rule-v2).
-            with_crash_report_leftovers(health_state.report())
+            with_process_gauges(health_state.report())
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -4153,14 +4191,18 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
     send(writer, frame).await
 }
 
-/// Add the browser crash-report cleanup counts to a health reply, as
-/// `crashReportLeftovers: {removed, failed}`.
+/// Add the process-wide gauges to a health reply:
 ///
-/// They are how a person learns that a crash-report directory, which can hold
-/// page memory from an agent's signed-in sessions, could not be deleted where
-/// no session was there to report it. The counts are atomics, so reading them
-/// keeps the health lane insulated, and they never change the status.
-fn with_crash_report_leftovers(mut report: ModuleControlResponse) -> ModuleControlResponse {
+/// - `crashReportLeftovers: {removed, failed}`, how a person learns that a
+///   browser crash-report directory, which can hold page memory from an
+///   agent's signed-in sessions, could not be deleted where no session was
+///   there to report it;
+/// - `sigtermListener`, whether SIGTERM will run the module's teardown or
+///   just end the process (see [`sigterm_listener_state`]).
+///
+/// Both are atomics, so reading them keeps the health lane insulated, and
+/// neither changes the status.
+fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlResponse {
     if let ModuleControlResponse::HealthCheck {
         metrics: Some(serde_json::Value::Object(metrics)),
         ..
@@ -4170,6 +4212,10 @@ fn with_crash_report_leftovers(mut report: ModuleControlResponse) -> ModuleContr
         metrics.insert(
             "crashReportLeftovers".to_string(),
             serde_json::json!({"removed": counts.removed, "failed": counts.failed}),
+        );
+        metrics.insert(
+            "sigtermListener".to_string(),
+            serde_json::Value::from(sigterm_listener_state()),
         );
     }
     report
@@ -7237,5 +7283,48 @@ mod cancel_frame_tests {
         assert_eq!(reply.header.ty, FrameType::Error);
         let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["code"], "request_not_interruptible");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sigterm_listener_tests {
+    use super::*;
+
+    /// The health reply's metrics, from the module's own control handler.
+    async fn health_metrics() -> serde_json::Value {
+        let (tx, mut rx) = mpsc::channel(8);
+        let request = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
+        )
+        .unwrap();
+        let health = Arc::new(HealthState::new());
+        handle_control_request_for_test(request, &tx, &health)
+            .await
+            .unwrap();
+        let reply = rx.recv().await.unwrap();
+        let ModuleControlResponse::HealthCheck {
+            metrics: Some(metrics),
+            ..
+        } = serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("health reply")
+        };
+        metrics
+    }
+
+    /// A listener that could not be installed leaves SIGTERM ending the module
+    /// with no teardown. Nothing is printed about it, so the health reply is
+    /// where it shows.
+    #[tokio::test]
+    async fn a_sigterm_listener_that_failed_to_install_is_reported_on_the_health_reply() {
+        let listener = listen_for_sigterm_with(|| Err(std::io::Error::other("fixture")));
+        assert!(listener.is_none());
+        assert_eq!(health_metrics().await["sigtermListener"], "not_installed");
     }
 }
