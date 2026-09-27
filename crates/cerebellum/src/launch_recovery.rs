@@ -381,21 +381,102 @@ pub fn launched_at(start_time_micros: Option<u64>) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unreadable;
 
-/// The facts about running processes the evidence needs, behind a seam so a
-/// test can make the table unreadable.
+/// One fact about one process, as the operating system answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessFact<T> {
+    Read(T),
+    /// No process holds the pid (any more).
+    Gone,
+    /// The system refused to show it. Not evidence of whose process it is.
+    NotPermitted,
+    Unreadable,
+}
+
+/// Who runs a process, and whether it has exited and only waits to be reaped.
+///
+/// `uid` is the effective user: the credentials the process opens files with,
+/// and the user the system itself goes by when it decides whether one process
+/// may read another's arguments. A setuid program started by this user (such
+/// as `login`, behind every Terminal window) runs as its owner, not as this
+/// user, and its arguments are hidden for exactly that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessUsers {
+    pub uid: u32,
+    pub zombie: bool,
+}
+
+/// The raw facts about running processes the evidence needs, behind a seam so
+/// a test can answer them. What counts as "every process read" is decided once,
+/// in [`user_process_arguments`], not by each platform.
 pub trait ProcessTable {
-    /// The arguments of every running process of this user. Another user's
-    /// process is skipped: without privilege its arguments cannot be read at
-    /// all, so "completely" here means every process this module's user runs,
-    /// which is where this module launches its browsers. Chrome's lock, read
-    /// separately, does not depend on whose process holds the profile.
-    /// `Err` when the table or any of this user's processes cannot be read.
-    fn arguments_of_user_processes(&self) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable>;
+    /// The user this module runs as.
+    fn this_user(&self) -> Option<u32>;
+
+    /// Every pid the system reports.
+    fn process_ids(&self) -> Result<Vec<u32>, Unreadable>;
+
+    /// Who runs `pid`. Must answer for another user's process too: that is
+    /// the only evidence that lets a process be skipped.
+    fn users(&self, pid: u32) -> ProcessFact<ProcessUsers>;
+
+    fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>>;
 
     /// The executable `pid` runs, `Ok(None)` when no process holds it.
     fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable>;
 
     fn host_name(&self) -> Option<String>;
+}
+
+/// How many more times an unreadable process of this user is read before the
+/// table counts as unreadable, and how long apart. A process part-way through
+/// exiting or exec'ing refuses the argument read for a moment.
+const UNREADABLE_RETRIES: u32 = 5;
+const UNREADABLE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The arguments of every running process of this module's user.
+///
+/// A process is skipped only on positive evidence: it is gone, it is a zombie,
+/// or its effective user was read and is not this user. Another user's process
+/// is skipped because without privilege its arguments cannot be read at all,
+/// so "every process" means every process this module's user runs, which is
+/// where this module launches its browsers; Chrome's lock, read separately,
+/// does not depend on whose process holds the profile. A process whose user
+/// cannot be read, or one of this user's whose arguments stay unreadable
+/// (refused or not), makes the whole reading `Err`, so a clear is refused.
+pub fn user_process_arguments(
+    table: &dyn ProcessTable,
+) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable> {
+    let this_user = table.this_user().ok_or(Unreadable)?;
+    let mut processes = Vec::new();
+    for pid in table.process_ids()? {
+        match table.users(pid) {
+            ProcessFact::Gone => continue,
+            ProcessFact::Read(users) if users.zombie => continue,
+            ProcessFact::Read(users) if users.uid != this_user => continue,
+            ProcessFact::Read(_) => {}
+            ProcessFact::NotPermitted | ProcessFact::Unreadable => return Err(Unreadable),
+        }
+        let mut retries = 0;
+        loop {
+            match table.arguments(pid) {
+                ProcessFact::Read(arguments) => {
+                    processes.push((pid, arguments));
+                    break;
+                }
+                ProcessFact::Gone => break,
+                ProcessFact::NotPermitted | ProcessFact::Unreadable => match table.users(pid) {
+                    ProcessFact::Gone => break,
+                    ProcessFact::Read(users) if users.zombie => break,
+                    _ if retries < UNREADABLE_RETRIES => {
+                        retries += 1;
+                        std::thread::sleep(UNREADABLE_RETRY_PAUSE);
+                    }
+                    _ => return Err(Unreadable),
+                },
+            }
+        }
+    }
+    Ok(processes)
 }
 
 /// Read both pieces of evidence for `profile_directory`.
@@ -414,7 +495,7 @@ pub fn read_profile_evidence(
 }
 
 fn read_processes(profile_directory: &Path, table: &dyn ProcessTable) -> ProcessReading {
-    let Ok(processes) = table.arguments_of_user_processes() else {
+    let Ok(processes) = user_process_arguments(table) else {
         return ProcessReading::Unreadable;
     };
     let examined = processes.len();
@@ -508,61 +589,43 @@ pub struct SystemProcessTable;
 
 #[cfg(target_os = "macos")]
 impl ProcessTable for SystemProcessTable {
-    fn arguments_of_user_processes(&self) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable> {
-        use cerebellum_macos::{ProcessArguments, ProcessOwner};
-        let ProcessOwner::Running { uid: this_user, .. } =
-            cerebellum_macos::process_owner(std::process::id())
-        else {
-            return Err(Unreadable);
-        };
-        let mut processes = Vec::new();
-        for pid in cerebellum_macos::all_process_ids().map_err(|_| Unreadable)? {
-            match cerebellum_macos::process_owner(pid) {
-                ProcessOwner::NoSuchProcess => continue,
-                // Another user's process: the kernel lets a process inspect
-                // only its own user's processes without privilege.
-                ProcessOwner::NotPermitted => continue,
-                ProcessOwner::Unreadable(_) => return Err(Unreadable),
-                ProcessOwner::Running { zombie: true, .. } => continue,
-                ProcessOwner::Running { uid, .. } if uid != this_user => continue,
-                ProcessOwner::Running { .. } => {}
-            }
-            // A process part-way through exiting or exec'ing answers the
-            // argument read with EINVAL for a moment, so an unreadable one is
-            // read a few more times. Only a process that stays running and
-            // unreadable refuses.
-            let mut attempts = 0;
-            loop {
-                match cerebellum_macos::process_arguments(pid) {
-                    ProcessArguments::Read(arguments) => {
-                        processes.push((pid, arguments));
-                        break;
-                    }
-                    ProcessArguments::NoSuchProcess => break,
-                    ProcessArguments::Unreadable(_) => match cerebellum_macos::process_owner(pid) {
-                        ProcessOwner::NoSuchProcess
-                        | ProcessOwner::Running { zombie: true, .. } => break,
-                        _ if attempts < 5 => {
-                            attempts += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
-                        _ => return Err(Unreadable),
-                    },
-                }
-            }
+    fn this_user(&self) -> Option<u32> {
+        match cerebellum_macos::process_owner(std::process::id()) {
+            cerebellum_macos::ProcessOwner::Running { uid, .. } => Some(uid),
+            _ => None,
         }
-        Ok(processes)
+    }
+
+    fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
+        cerebellum_macos::all_process_ids().map_err(|_| Unreadable)
+    }
+
+    fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
+        match cerebellum_macos::process_owner(pid) {
+            cerebellum_macos::ProcessOwner::Running { uid, zombie } => {
+                ProcessFact::Read(ProcessUsers { uid, zombie })
+            }
+            cerebellum_macos::ProcessOwner::NoSuchProcess => ProcessFact::Gone,
+            cerebellum_macos::ProcessOwner::NotPermitted => ProcessFact::NotPermitted,
+            cerebellum_macos::ProcessOwner::Unreadable(_) => ProcessFact::Unreadable,
+        }
+    }
+
+    fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
+        match cerebellum_macos::process_arguments(pid) {
+            cerebellum_macos::ProcessArguments::Read(arguments) => ProcessFact::Read(arguments),
+            cerebellum_macos::ProcessArguments::NoSuchProcess => ProcessFact::Gone,
+            cerebellum_macos::ProcessArguments::Unreadable(1) => ProcessFact::NotPermitted,
+            cerebellum_macos::ProcessArguments::Unreadable(_) => ProcessFact::Unreadable,
+        }
     }
 
     fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable> {
-        match cerebellum_macos::process_owner(pid) {
-            cerebellum_macos::ProcessOwner::NoSuchProcess
-            | cerebellum_macos::ProcessOwner::Running { zombie: true, .. } => return Ok(None),
-            // Alive, but another user's: its executable is still readable, and
-            // is what tells a reused pid from Chrome.
-            cerebellum_macos::ProcessOwner::NotPermitted
-            | cerebellum_macos::ProcessOwner::Running { .. } => {}
-            cerebellum_macos::ProcessOwner::Unreadable(_) => return Err(Unreadable),
+        match self.users(pid) {
+            ProcessFact::Gone => return Ok(None),
+            ProcessFact::Read(users) if users.zombie => return Ok(None),
+            ProcessFact::Read(_) => {}
+            ProcessFact::NotPermitted | ProcessFact::Unreadable => return Err(Unreadable),
         }
         cerebellum_macos::process_executable_path(pid).map_err(|_| Unreadable)
     }
@@ -572,57 +635,109 @@ impl ProcessTable for SystemProcessTable {
     }
 }
 
+/// Map a failed read under `/proc` to what it says about the process.
+#[cfg(target_os = "linux")]
+fn proc_fact<T>(result: std::io::Result<T>) -> ProcessFact<T> {
+    match result {
+        Ok(value) => ProcessFact::Read(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessFact::Gone,
+        // ESRCH: the process exited while its files were being read.
+        Err(error) if error.raw_os_error() == Some(3) => ProcessFact::Gone,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            ProcessFact::NotPermitted
+        }
+        Err(_) => ProcessFact::Unreadable,
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl ProcessTable for SystemProcessTable {
-    fn arguments_of_user_processes(&self) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable> {
-        use std::os::unix::ffi::OsStringExt;
-        use std::os::unix::fs::MetadataExt;
-        let this_user = std::fs::metadata("/proc/self")
-            .map_err(|_| Unreadable)?
-            .uid();
-        let mut processes = Vec::new();
+    fn this_user(&self) -> Option<u32> {
+        match self.users(std::process::id()) {
+            ProcessFact::Read(users) => Some(users.uid),
+            _ => None,
+        }
+    }
+
+    fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
+        let mut pids = Vec::new();
         for entry in std::fs::read_dir("/proc").map_err(|_| Unreadable)? {
             let entry = entry.map_err(|_| Unreadable)?;
-            let Some(pid) = entry
+            if let Some(pid) = entry
                 .file_name()
                 .to_str()
                 .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let owner = match entry.metadata() {
-                Ok(metadata) => metadata.uid(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return Err(Unreadable),
-            };
-            if owner != this_user {
-                continue;
+            {
+                pids.push(pid);
             }
-            let command_line = match std::fs::read(entry.path().join("cmdline")) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return Err(Unreadable),
-            };
-            // A zombie's command line is empty; it holds no files.
-            let arguments = command_line
-                .split(|byte| *byte == 0)
-                .filter(|argument| !argument.is_empty())
-                .map(|argument| OsString::from_vec(argument.to_vec()))
-                .collect();
-            processes.push((pid, arguments));
         }
-        Ok(processes)
+        Ok(pids)
+    }
+
+    /// Read from `status`, which any process may read, rather than from the
+    /// owner of `/proc/<pid>`: a process that made itself non-dumpable (as
+    /// Chrome's sandboxed helpers do) has that directory owned by root, which
+    /// would read as another user's process.
+    fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
+        let status = match proc_fact(std::fs::read_to_string(format!("/proc/{pid}/status"))) {
+            ProcessFact::Read(status) => status,
+            ProcessFact::Gone => return ProcessFact::Gone,
+            ProcessFact::NotPermitted => return ProcessFact::NotPermitted,
+            ProcessFact::Unreadable => return ProcessFact::Unreadable,
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        // `Uid:` lists the real, effective, saved and filesystem user ids;
+        // the effective one is second.
+        let uids: Option<Vec<u32>> = field("Uid:").map(|value| {
+            value
+                .split_whitespace()
+                .map(|id| id.parse().ok())
+                .collect::<Option<Vec<u32>>>()
+                .unwrap_or_default()
+        });
+        match (uids, field("State:")) {
+            (Some(uids), Some(state)) if uids.len() == 4 => ProcessFact::Read(ProcessUsers {
+                uid: uids[1],
+                zombie: state.starts_with('Z'),
+            }),
+            _ => ProcessFact::Unreadable,
+        }
+    }
+
+    fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+        match proc_fact(std::fs::read(format!("/proc/{pid}/cmdline"))) {
+            ProcessFact::Read(bytes) => ProcessFact::Read(
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .map(|argument| OsString::from_vec(argument.to_vec()))
+                    .collect(),
+            ),
+            ProcessFact::Gone => ProcessFact::Gone,
+            ProcessFact::NotPermitted => ProcessFact::NotPermitted,
+            ProcessFact::Unreadable => ProcessFact::Unreadable,
+        }
     }
 
     fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable> {
-        let process = PathBuf::from(format!("/proc/{pid}"));
-        if !process.exists() {
-            return Ok(None);
+        match self.users(pid) {
+            ProcessFact::Gone => return Ok(None),
+            ProcessFact::Read(users) if users.zombie => return Ok(None),
+            ProcessFact::Read(_) => {}
+            ProcessFact::NotPermitted | ProcessFact::Unreadable => return Err(Unreadable),
         }
-        match std::fs::read_link(process.join("exe")) {
-            Ok(path) => Ok(Some(path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(Unreadable),
+        match proc_fact(std::fs::read_link(format!("/proc/{pid}/exe"))) {
+            ProcessFact::Read(path) => Ok(Some(path)),
+            ProcessFact::Gone => Ok(None),
+            // Another user's process hides its executable; it is alive, and
+            // not knowing what it runs cannot rule out Chrome.
+            ProcessFact::NotPermitted | ProcessFact::Unreadable => Err(Unreadable),
         }
     }
 
@@ -653,6 +768,77 @@ mod tests {
         assert!(names_profile_directory(&joined, directory));
         assert!(names_profile_directory(&split, directory));
         assert!(!names_profile_directory(&other, directory));
+    }
+
+    /// Answers from a fixed list: pid 10 is this user's, whose arguments read
+    /// as `arguments`; pid 20 is `other`'s, whose arguments are refused.
+    struct FixedTable {
+        users_of_10: ProcessFact<ProcessUsers>,
+        arguments_of_10: ProcessFact<Vec<OsString>>,
+    }
+
+    const THIS_USER: u32 = 501;
+
+    fn run_by(uid: u32) -> ProcessFact<ProcessUsers> {
+        ProcessFact::Read(ProcessUsers { uid, zombie: false })
+    }
+
+    impl ProcessTable for FixedTable {
+        fn this_user(&self) -> Option<u32> {
+            Some(THIS_USER)
+        }
+        fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
+            Ok(vec![10, 20])
+        }
+        fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
+            match pid {
+                10 => self.users_of_10.clone(),
+                _ => run_by(0),
+            }
+        }
+        fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
+            match pid {
+                10 => self.arguments_of_10.clone(),
+                _ => ProcessFact::NotPermitted,
+            }
+        }
+        fn executable(&self, _pid: u32) -> Result<Option<PathBuf>, Unreadable> {
+            Ok(None)
+        }
+        fn host_name(&self) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn only_a_process_read_as_another_user_s_is_skipped() {
+        let readable = FixedTable {
+            users_of_10: run_by(THIS_USER),
+            arguments_of_10: ProcessFact::Read(vec![OsString::from("x")]),
+        };
+        assert_eq!(
+            user_process_arguments(&readable),
+            Ok(vec![(10, vec![OsString::from("x")])])
+        );
+        for hidden in [ProcessFact::NotPermitted, ProcessFact::Unreadable] {
+            let same_user_hidden = FixedTable {
+                users_of_10: run_by(THIS_USER),
+                arguments_of_10: hidden,
+            };
+            assert_eq!(user_process_arguments(&same_user_hidden), Err(Unreadable));
+        }
+        for unknown in [ProcessFact::NotPermitted, ProcessFact::Unreadable] {
+            let unknown_user = FixedTable {
+                users_of_10: unknown,
+                arguments_of_10: ProcessFact::Read(Vec::new()),
+            };
+            assert_eq!(user_process_arguments(&unknown_user), Err(Unreadable));
+        }
+        let gone = FixedTable {
+            users_of_10: ProcessFact::Gone,
+            arguments_of_10: ProcessFact::NotPermitted,
+        };
+        assert_eq!(user_process_arguments(&gone), Ok(Vec::new()));
     }
 
     #[test]
