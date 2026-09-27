@@ -4138,6 +4138,10 @@ fn browser_launch_result_schema() -> Value {
             // needs; left undeclared, the reply boundary replaced them with a
             // schema violation that told the caller nothing.
             "profile_busy",
+            // The profile is held by startup recovery for a browser from
+            // before a restart that could not be proven gone. `reason` names
+            // why and `remedy` names the operator's clear.
+            "profile_recovery_pending",
             "profile_grant_required",
             "profile_registry_untrusted_root",
             "profile_storage_unavailable",

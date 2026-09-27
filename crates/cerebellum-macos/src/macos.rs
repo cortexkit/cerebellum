@@ -590,6 +590,59 @@ fn start_time_failure(errno: i32) -> ProcessStartTime {
     }
 }
 
+/// Who runs a process, as the kernel's BSD process information reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOwner {
+    /// The process exists. `zombie` is true when it has exited and only waits
+    /// to be reaped: it holds no open files and runs no code.
+    Running {
+        uid: u32,
+        zombie: bool,
+    },
+    NoSuchProcess,
+    /// The kernel refused with `EPERM`: this process may not inspect that one.
+    /// Without privilege that is what a process of another user answers; a
+    /// process of the same user is always inspectable.
+    NotPermitted,
+    /// The kernel refused for another reason, carrying the errno. Not
+    /// evidence that the process is gone.
+    Unreadable(i32),
+}
+
+/// `SZOMB` from `<sys/proc.h>`: exited, not yet reaped.
+const PROCESS_STATUS_ZOMBIE: u32 = 5;
+
+/// The effective user a process runs as, and whether it is a zombie.
+pub fn process_owner(pid: u32) -> ProcessOwner {
+    let mut info = ProcBsdInfo::default();
+    let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
+    // SAFETY: the buffer is owned here and its true size is passed, so the call
+    // cannot write past it. The pid is passed by value.
+    let written = unsafe {
+        errno_location().write(0);
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut ProcBsdInfo as *mut std::ffi::c_void,
+            size,
+        )
+    };
+    if written != size {
+        // SAFETY: reads a thread-local set by the call above.
+        let errno = unsafe { errno_location().read() };
+        return match errno {
+            3 => ProcessOwner::NoSuchProcess,
+            1 => ProcessOwner::NotPermitted,
+            other => ProcessOwner::Unreadable(other),
+        };
+    }
+    ProcessOwner::Running {
+        uid: info.pbi_uid,
+        zombie: info.pbi_status == PROCESS_STATUS_ZOMBIE,
+    }
+}
+
 /// When a process started, or `None` for every reason it cannot be told.
 ///
 /// Kept for callers that only need the value. A caller deciding what to do about

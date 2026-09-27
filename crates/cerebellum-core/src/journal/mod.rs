@@ -916,6 +916,24 @@ where
         Ok(Committed)
     }
 
+    /// A handle for a reservation that is still active in the durable state,
+    /// including one an earlier process created.
+    ///
+    /// Handles are otherwise minted only by `reserve`, so a record left active
+    /// by a previous process could never gain another attachment. A plane whose
+    /// recovery keeps such a record active on purpose needs one: it must write
+    /// down, durably and before acting, why it is about to settle that record,
+    /// so that a crash part-way through leaves a next start able to finish the
+    /// job. `None` when the sequence is not an active reservation.
+    pub fn active_reservation_handle(&self, sequence: u64) -> Option<ReservationHandle> {
+        self.state
+            .reservations
+            .contains_key(&sequence)
+            .then_some(ReservationHandle {
+                action_obligation_id: sequence,
+            })
+    }
+
     /// Compare-and-set an opaque attachment revision.
     pub fn attach_obligation_material(
         &mut self,

@@ -32,6 +32,7 @@ pub mod flat_tools;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
+pub mod launch_recovery;
 pub mod login_capture;
 pub mod login_import;
 pub mod management;
@@ -766,6 +767,7 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
             | management::IMPORT_LOGIN
             | management::REBIND_PROFILE_ROOT
             | management::CAPTURE_LOGIN
+            | management::CLEAR_LAUNCH_RECOVERY
     ) || (matches!(name, management::PRESENT | management::RESUME)
         && browser::has_wire_dispatch_route(name))
 }
@@ -1308,10 +1310,13 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
             // the transport it can serve launch requests, so publishing the
             // production service any later would let a fresh spawn race an
             // attested orphan from the previous module process.
-            let service = Arc::new(browser_launch_service::ProductionLaunchService::open(
-                browser,
-                JournalPersistence::Durable,
-            ));
+            let service = Arc::new(
+                browser_launch_service::ProductionLaunchService::open_publishing(
+                    browser,
+                    JournalPersistence::Durable,
+                    &planes.management.launch_recovery_registry(),
+                ),
+            );
             planes.capture.set_launcher(service.clone());
             planes.launch_service =
                 Some(service as Arc<dyn browser_session::BrowserSessionLauncher>);
@@ -2094,6 +2099,11 @@ impl Planes {
                     .map_or(30_000, |config| config.navigation_settle_deadline_ms),
             ),
         ));
+        // Built before the launch service, which publishes what its startup
+        // recovery kept into this plane's registry.
+        let management = Arc::new(ManagementPlane::new(Arc::new(
+            management::PlatformResolver::new(),
+        )));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
             browser_config
@@ -2108,9 +2118,13 @@ impl Planes {
                     // One service for route sessions and captures, so both
                     // write the one launch journal whose startup recovery
                     // reaps an orphan of either kind.
-                    let service = Arc::new(browser_launch_service::ProductionLaunchService::open(
-                        config, journal,
-                    ));
+                    let service = Arc::new(
+                        browser_launch_service::ProductionLaunchService::open_publishing(
+                            config,
+                            journal,
+                            &management.launch_recovery_registry(),
+                        ),
+                    );
                     capture.set_launcher(service.clone());
                     service as Arc<dyn browser_session::BrowserSessionLauncher>
                 });
@@ -2118,9 +2132,6 @@ impl Planes {
         let launch_service = None;
         let sessions = browser_session::BrowserSessions::default();
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
-        let management = Arc::new(ManagementPlane::new(Arc::new(
-            management::PlatformResolver::new(),
-        )));
         let browser_grants = management.browser_grants();
         let browser = if let Some(config) = browser_config.as_ref() {
             Arc::new(
@@ -2673,6 +2684,7 @@ async fn handle_management_request(
         ComputerTarget,
         BrowserGrant,
         ProfileRootRebind,
+        LaunchRecoveryClear,
     }
 
     let (reply, question, settlement) = if method == management::OPEN_TARGET {
@@ -2896,6 +2908,64 @@ async fn handle_management_request(
             }
         };
         (reply, question, Settlement::BrowserGrant)
+    } else if method == management::CLEAR_LAUNCH_RECOVERY {
+        if let Some(field) = params_object
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "agent_project_id" | "sequence"))
+            .min()
+        {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
+        // The project is named explicitly: the operator clears another
+        // project's record from their own desk route.
+        let Some(agent_project_id) = params_object
+            .get("agent_project_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|project| !project.is_empty())
+        else {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "agent_project_id",
+                "missing_field",
+            )
+            .await;
+        };
+        let sequence = match params_object.get("sequence") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(sequence) => Some(sequence),
+                None => {
+                    return send_invalid_request_response(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "sequence",
+                        "wrong_type",
+                    )
+                    .await
+                }
+            },
+        };
+        let (reply, question) = planes
+            .management
+            .open_launch_recovery_clear(agent_project_id, sequence, facts.declares_elicitation())
+            .await;
+        (reply, question, Settlement::LaunchRecoveryClear)
     } else {
         if let Some(field) = params_object.keys().min() {
             return send_invalid_request_response(
@@ -2966,6 +3036,14 @@ async fn handle_management_request(
                 Settlement::ProfileRootRebind => {
                     management_plane
                         .settle_profile_root_rebind(&question.ask_id, answer.as_ref())
+                        .await;
+                }
+                Settlement::LaunchRecoveryClear => {
+                    // Settled on this task because the clear re-reads the
+                    // process table and writes the journal; the outcome is
+                    // kept by the plane and reported on the next request.
+                    management_plane
+                        .settle_launch_recovery_clear(&question.ask_id, answer.as_ref())
                         .await;
                 }
             }
