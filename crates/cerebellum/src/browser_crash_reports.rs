@@ -33,6 +33,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The environment variable Chrome reads to relocate its crash database.
 pub const BREAKPAD_DUMP_LOCATION: &str = "BREAKPAD_DUMP_LOCATION";
@@ -88,9 +89,9 @@ impl CrashReportRefusal {
 ///
 /// The session cleanup deletes it with [`Self::remove`], which reports failure
 /// so the session records it. Dropping it without that call (a launch that
-/// failed part-way) still deletes it, and writes a failure to standard error
-/// because there is no session to record it in; the next startup's sweep
-/// retries either way.
+/// failed part-way) still deletes it; with no session to record a failure in,
+/// the failure is counted in [`leftover_counts`], which the health reply
+/// carries. The next startup's sweep retries the delete either way.
 #[derive(Debug)]
 pub struct CrashReportDirectory {
     path: PathBuf,
@@ -116,15 +117,44 @@ impl Drop for CrashReportDirectory {
             return;
         }
         self.removed = true;
-        if let Err(error) = remove_directory(&self.path) {
-            // The error's text carries no path, and the kind is enough to act
-            // on; the directory itself is retried by the next startup's sweep.
-            eprintln!(
-                "ck-cerebellum: a browser crash-report directory could not be deleted ({:?}); \
-                 the next start will retry",
-                error.kind()
-            );
+        if remove_directory(&self.path).is_err() {
+            DELETES_FAILED.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Crash-report directories deleted by startup sweeps, since this process
+/// started.
+static LEFTOVERS_REMOVED: AtomicU64 = AtomicU64::new(0);
+
+/// Crash-report directories that could not be deleted outside a session's
+/// cleanup, since this process started: by a startup sweep, or when a launch
+/// that failed part-way dropped its directory.
+static DELETES_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// What [`leftover_counts`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashReportLeftovers {
+    /// Directories left by earlier processes that a startup sweep deleted.
+    pub removed: u64,
+    /// Deletes that failed with no session to report them: in a startup
+    /// sweep, on a failed launch, or when the temporary directory could not
+    /// be resolved for a sweep at all.
+    pub failed: u64,
+}
+
+/// The counts the health reply carries as `crashReportLeftovers`.
+///
+/// Kept in counters rather than printed because the module writes nothing to
+/// its standard streams: the daemon captures them into a file under the
+/// backed-up data home, and that file's size staying constant is how a
+/// shipped path is checked for printing. The counters are process-wide
+/// because every directory lives in one per-user temporary directory, and
+/// reading them never waits, so the insulated health lane may read them.
+pub fn leftover_counts() -> CrashReportLeftovers {
+    CrashReportLeftovers {
+        removed: LEFTOVERS_REMOVED.load(Ordering::Relaxed),
+        failed: DELETES_FAILED.load(Ordering::Relaxed),
     }
 }
 
@@ -142,7 +172,6 @@ pub use macos::*;
 mod macos {
     use super::*;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// How long `tmutil isexcluded` may take before the launch is refused.
@@ -297,28 +326,30 @@ mod macos {
     }
 
     /// Delete the crash-report directories that processes no longer running
-    /// left under the per-user temporary directory, and write any failure to
-    /// standard error.
+    /// left under the per-user temporary directory, and count the result in
+    /// [`leftover_counts`].
     ///
     /// A directory whose creator is still running is kept: another module
     /// process on this machine may be running a browser that writes to it.
     pub fn remove_leftover_directories() -> LeftoverSweep {
         let Ok(parent) = crash_reports_parent() else {
-            eprintln!(
-                "ck-cerebellum: the temporary directory could not be resolved, so crash-report \
-                 directories left by an earlier process were not looked for"
-            );
+            // Counted as one failure: nothing was looked for, so any leftover
+            // stays, and a person reading the health reply should know.
+            DELETES_FAILED.fetch_add(1, Ordering::Relaxed);
             return LeftoverSweep::default();
         };
-        let sweep = remove_leftover_directories_in(&parent, creator_is_running);
-        if sweep.failed > 0 {
-            eprintln!(
-                "ck-cerebellum: {} crash-report director{} left by an earlier process could not \
-                 be deleted; the next start will retry",
-                sweep.failed,
-                if sweep.failed == 1 { "y" } else { "ies" }
-            );
-        }
+        sweep_leftover_directories_in(&parent, creator_is_running)
+    }
+
+    /// [`remove_leftover_directories_in`], with its result counted in
+    /// [`leftover_counts`] the way the startup sweep counts it.
+    pub fn sweep_leftover_directories_in(
+        parent: &Path,
+        creator_is_live: impl Fn(u32, u64) -> bool,
+    ) -> LeftoverSweep {
+        let sweep = remove_leftover_directories_in(parent, creator_is_live);
+        LEFTOVERS_REMOVED.fetch_add(sweep.removed as u64, Ordering::Relaxed);
+        DELETES_FAILED.fetch_add(sweep.failed as u64, Ordering::Relaxed);
         sweep
     }
 
@@ -635,6 +666,28 @@ mod macos {
                 "a directory without the prefix was deleted"
             );
             assert!(elsewhere.0.is_dir(), "a symlink was followed");
+        }
+
+        /// A launch that fails part-way drops its directory with no session
+        /// to report a failed delete in, so the failure is counted for the
+        /// health reply. Other tests in this process may count too, and only
+        /// ever upward, so the check is that this drop added at least one.
+        #[test]
+        fn a_dropped_directory_that_cannot_be_deleted_is_counted() {
+            let directory = excluded_directory();
+            let path = directory.path().to_path_buf();
+            std::fs::write(path.join("minidump"), b"page memory").expect("write a report");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))
+                .expect("make the directory unwritable");
+            let before = leftover_counts().failed;
+
+            drop(directory);
+
+            let after = leftover_counts().failed;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("restore permissions");
+            std::fs::remove_dir_all(&path).expect("remove the fixture directory");
+            assert!(after > before, "the failed delete was not counted");
         }
 
         #[test]

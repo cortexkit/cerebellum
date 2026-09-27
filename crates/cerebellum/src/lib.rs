@@ -10,7 +10,6 @@
 pub mod authorization;
 pub mod browser;
 pub mod browser_config;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod browser_crash_reports;
 pub mod browser_executable_identity;
 pub mod browser_launch;
@@ -3356,7 +3355,7 @@ async fn handle_control_request(
             // Insulated health-v2 lane: the report is a mechanical mapper over
             // atomics stamped by the dispatch path. It never blocks on a lock
             // and never forms its own opinion (Health-Path-Rule-v2).
-            health_state.report()
+            with_crash_report_leftovers(health_state.report())
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -4152,6 +4151,28 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
+}
+
+/// Add the browser crash-report cleanup counts to a health reply, as
+/// `crashReportLeftovers: {removed, failed}`.
+///
+/// They are how a person learns that a crash-report directory, which can hold
+/// page memory from an agent's signed-in sessions, could not be deleted where
+/// no session was there to report it. The counts are atomics, so reading them
+/// keeps the health lane insulated, and they never change the status.
+fn with_crash_report_leftovers(mut report: ModuleControlResponse) -> ModuleControlResponse {
+    if let ModuleControlResponse::HealthCheck {
+        metrics: Some(serde_json::Value::Object(metrics)),
+        ..
+    } = &mut report
+    {
+        let counts = browser_crash_reports::leftover_counts();
+        metrics.insert(
+            "crashReportLeftovers".to_string(),
+            serde_json::json!({"removed": counts.removed, "failed": counts.failed}),
+        );
+    }
+    report
 }
 
 pub async fn handle_control_request_for_test(
