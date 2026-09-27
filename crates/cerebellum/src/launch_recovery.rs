@@ -527,17 +527,28 @@ impl ProcessTable for SystemProcessTable {
                 ProcessOwner::Running { uid, .. } if uid != this_user => continue,
                 ProcessOwner::Running { .. } => {}
             }
-            match cerebellum_macos::process_arguments(pid) {
-                ProcessArguments::Read(arguments) => processes.push((pid, arguments)),
-                ProcessArguments::NoSuchProcess => continue,
-                // It may have exited or become a zombie between the two reads;
-                // only a process that is still running and unreadable refuses.
-                ProcessArguments::Unreadable(_) => match cerebellum_macos::process_owner(pid) {
-                    ProcessOwner::NoSuchProcess | ProcessOwner::Running { zombie: true, .. } => {
-                        continue
+            // A process part-way through exiting or exec'ing answers the
+            // argument read with EINVAL for a moment, so an unreadable one is
+            // read a few more times. Only a process that stays running and
+            // unreadable refuses.
+            let mut attempts = 0;
+            loop {
+                match cerebellum_macos::process_arguments(pid) {
+                    ProcessArguments::Read(arguments) => {
+                        processes.push((pid, arguments));
+                        break;
                     }
-                    _ => return Err(Unreadable),
-                },
+                    ProcessArguments::NoSuchProcess => break,
+                    ProcessArguments::Unreadable(_) => match cerebellum_macos::process_owner(pid) {
+                        ProcessOwner::NoSuchProcess
+                        | ProcessOwner::Running { zombie: true, .. } => break,
+                        _ if attempts < 5 => {
+                            attempts += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        _ => return Err(Unreadable),
+                    },
+                }
             }
         }
         Ok(processes)

@@ -4136,12 +4136,48 @@ mod orphan_recovery_tests {
 
         /// A running process whose executable is named like Chromium.
         fn chromium_named_process(directory: &TestRoot) -> std::process::Child {
+            // A copy of this test binary, because macOS kills a copy of a
+            // system binary such as /bin/sleep moments after it starts; this
+            // binary's own signature survives the copy. It runs only the
+            // sleeper below.
             let executable = directory.0.join("Chromium");
-            std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
-            std::process::Command::new(&executable)
-                .arg("30")
+            std::fs::copy(std::env::current_exe().expect("test binary"), &executable)
+                .expect("copy test binary");
+            let child = std::process::Command::new(&executable)
+                .args(["--ignored", "--exact", "--nocapture"])
+                .arg(format!(
+                    "{}::chromium_named_sleeper",
+                    module_path!()
+                        .split_once("::")
+                        .map_or(module_path!(), |(_, path)| path)
+                ))
+                .env(SLEEPER, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
-                .expect("spawn a Chromium-named process")
+                .expect("spawn a Chromium-named process");
+            // Wait until it is really sleeping: alive, and not killed at start.
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(
+                crate::launch_recovery::SystemProcessTable
+                    .executable(child.id())
+                    .expect("read the sleeper"),
+                Some(executable.canonicalize().expect("canonical sleeper path")),
+                "the Chromium-named sleeper is not running"
+            );
+            child
+        }
+
+        const SLEEPER: &str = "CK_CHROMIUM_NAMED_SLEEPER";
+
+        /// Only sleeps when started by `chromium_named_process`; an ordinary
+        /// run of ignored tests returns at once.
+        #[test]
+        #[ignore = "started by chromium_named_process as a stand-in browser"]
+        fn chromium_named_sleeper() {
+            if std::env::var_os(SLEEPER).is_some() {
+                std::thread::sleep(Duration::from_secs(30));
+            }
         }
 
         fn stop(mut child: std::process::Child) {
