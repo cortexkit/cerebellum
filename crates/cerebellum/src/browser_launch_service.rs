@@ -3524,7 +3524,9 @@ mod orphan_recovery_tests {
             ExecutableIdentityRecord, LaunchGenerationRecord, LaunchJournalPort,
             RecoveredBrowserProcess, RecoveryPendingReason,
         };
-        use crate::launch_recovery::{ClearFailure, ClearRefusal, ProcessTable, Unreadable};
+        use crate::launch_recovery::{
+            ClearFailure, ClearRefusal, ProcessFact, ProcessTable, ProcessUsers, Unreadable,
+        };
         use crate::management::{ClearSettlement, ManagementPlane, TargetResolver};
         use cerebellum_core::identity::{
             AcceptedBindFacts, RouteIdentity, RouteSurface, SessionKind,
@@ -3561,12 +3563,85 @@ mod orphan_recovery_tests {
             }
         }
 
-        /// A process table that cannot be read.
-        struct UnreadableTable;
+        /// The real process table plus one planted process, whose users and
+        /// arguments read as the test says.
+        struct PlantedTable {
+            users: ProcessFact<ProcessUsers>,
+            arguments: ProcessFact<Vec<OsString>>,
+        }
 
-        impl ProcessTable for UnreadableTable {
-            fn arguments_of_user_processes(&self) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable> {
+        /// A pid above macOS's limit, so no real process has it.
+        const PLANTED_PID: u32 = 4_000_001;
+
+        impl PlantedTable {
+            fn this_user() -> u32 {
+                crate::launch_recovery::SystemProcessTable
+                    .this_user()
+                    .expect("this user")
+            }
+
+            fn run_by(uid: u32, arguments: ProcessFact<Vec<OsString>>) -> Self {
+                Self {
+                    users: ProcessFact::Read(ProcessUsers { uid, zombie: false }),
+                    arguments,
+                }
+            }
+        }
+
+        impl ProcessTable for PlantedTable {
+            fn this_user(&self) -> Option<u32> {
+                Some(Self::this_user())
+            }
+
+            fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
+                let mut pids = crate::launch_recovery::SystemProcessTable.process_ids()?;
+                pids.push(PLANTED_PID);
+                Ok(pids)
+            }
+
+            fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
+                if pid == PLANTED_PID {
+                    self.users.clone()
+                } else {
+                    crate::launch_recovery::SystemProcessTable.users(pid)
+                }
+            }
+
+            fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
+                if pid == PLANTED_PID {
+                    self.arguments.clone()
+                } else {
+                    crate::launch_recovery::SystemProcessTable.arguments(pid)
+                }
+            }
+
+            fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable> {
+                crate::launch_recovery::SystemProcessTable.executable(pid)
+            }
+
+            fn host_name(&self) -> Option<String> {
+                crate::launch_recovery::SystemProcessTable.host_name()
+            }
+        }
+
+        /// A process table whose pid list cannot be read.
+        struct UnlistableTable;
+
+        impl ProcessTable for UnlistableTable {
+            fn this_user(&self) -> Option<u32> {
+                Some(PlantedTable::this_user())
+            }
+
+            fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
                 Err(Unreadable)
+            }
+
+            fn users(&self, _pid: u32) -> ProcessFact<ProcessUsers> {
+                ProcessFact::Unreadable
+            }
+
+            fn arguments(&self, _pid: u32) -> ProcessFact<Vec<OsString>> {
+                ProcessFact::Unreadable
             }
 
             fn executable(&self, _pid: u32) -> Result<Option<PathBuf>, Unreadable> {
@@ -3948,24 +4023,75 @@ mod orphan_recovery_tests {
             fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
         }
 
-        #[tokio::test]
-        async fn a_clear_refuses_when_the_process_table_cannot_be_read() {
+        /// A kept profile whose clear reads processes through `table`.
+        fn retained_reading(table: impl ProcessTable + Send + Sync + 'static) -> Fixture {
             let mut fixture = retained(RecoveryPendingReason::AttestationUntrusted);
             // The plane holds the only other reference; swap the table in a
             // fresh plane so the service's state can be changed first.
             fixture.plane = ManagementPlane::new(Arc::new(NoTargets));
             let service = Arc::get_mut(&mut fixture.service).expect("sole service owner");
             let state = Arc::get_mut(&mut service.recovery).expect("sole recovery owner");
-            state.process_table = Arc::new(UnreadableTable);
+            state.process_table = Arc::new(table);
             fixture
                 .plane
                 .launch_recovery_registry()
                 .publish(service.recovery.clone());
+            fixture
+        }
+
+        #[tokio::test]
+        async fn a_clear_refuses_when_the_process_table_cannot_be_read() {
+            let fixture = retained_reading(UnlistableTable);
             assert_eq!(
                 fixture.refusal().await["reason"],
                 "process_table_unreadable"
             );
             fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+        }
+
+        /// A process of this module's user whose arguments the system refuses
+        /// to show could be the browser, so the clear is refused.
+        #[tokio::test]
+        async fn a_clear_refuses_when_a_process_of_this_user_hides_its_arguments() {
+            for hidden in [ProcessFact::NotPermitted, ProcessFact::Unreadable] {
+                let fixture =
+                    retained_reading(PlantedTable::run_by(PlantedTable::this_user(), hidden));
+                assert_eq!(
+                    fixture.refusal().await["reason"],
+                    "process_table_unreadable"
+                );
+                fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+            }
+        }
+
+        /// A process whose user cannot be read might be this user's, so the
+        /// clear is refused rather than the process skipped.
+        #[tokio::test]
+        async fn a_clear_refuses_when_a_process_s_user_cannot_be_read() {
+            for users in [ProcessFact::NotPermitted, ProcessFact::Unreadable] {
+                let fixture = retained_reading(PlantedTable {
+                    users,
+                    arguments: ProcessFact::NotPermitted,
+                });
+                assert_eq!(
+                    fixture.refusal().await["reason"],
+                    "process_table_unreadable"
+                );
+            }
+        }
+
+        /// A process whose user was read as another user's is skipped, even
+        /// though its arguments cannot be read.
+        #[tokio::test]
+        async fn another_user_s_process_with_hidden_arguments_is_skipped() {
+            let other_user = PlantedTable::this_user().wrapping_add(1);
+            let fixture =
+                retained_reading(PlantedTable::run_by(other_user, ProcessFact::NotPermitted));
+            let (reply, _) = fixture.ask().await;
+            assert_eq!(
+                reply["params"]["evidence"]["processes"]["reading"],
+                "none_names_profile"
+            );
         }
 
         #[tokio::test]

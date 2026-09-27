@@ -235,6 +235,25 @@ mod tests {
         assert!(host_name().is_some_and(|name| !name.is_empty()));
     }
 
+    /// The owner read must answer for another user's process, or the only
+    /// evidence that lets such a process be skipped is missing. launchd runs
+    /// as root; this test does not.
+    #[test]
+    fn the_owner_of_another_user_s_process_is_readable() {
+        let crate::macos::ProcessOwner::Running { uid: this_user, .. } =
+            crate::macos::process_owner(std::process::id())
+        else {
+            panic!("this process's owner is readable");
+        };
+        if this_user == 0 {
+            return;
+        }
+        assert!(matches!(
+            crate::macos::process_owner(1),
+            crate::macos::ProcessOwner::Running { uid: 0, .. }
+        ));
+    }
+
     #[test]
     fn a_short_answer_is_unreadable_not_empty() {
         let mut buffer = 2_i32.to_ne_bytes().to_vec();
