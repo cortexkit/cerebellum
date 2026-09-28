@@ -7,6 +7,7 @@
 //! one effect status, and never changes a mode to make a failed post succeed.
 
 mod attendance;
+mod bracket;
 mod effect;
 pub mod post_condition;
 mod retry;
@@ -14,6 +15,7 @@ mod seize;
 mod wait;
 
 pub use attendance::*;
+pub use bracket::*;
 pub use effect::*;
 pub use retry::*;
 pub use seize::*;
@@ -32,7 +34,8 @@ use crate::platform::containment::{
 };
 use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
-    DriverError, ElementResolutionResult, GlobalDispatchRequest, HeldStateDisposition,
+    DriverError, EffectStatus, ElementResolutionResult, FrontedDispatchRequest,
+    GlobalDispatchRequest, HeldStateDisposition,
     PermissionLiveness, PlatformDriver, ProcessEventRefusal, ProcessGrant, SemanticActionIntent,
     SemanticActionPlatform, SemanticDispatchRequest, SemanticDriverError, SyntheticAction,
     SyntheticDispatchRequest, TargetDisposition,
@@ -179,6 +182,17 @@ pub struct DispatchRequest {
     #[serde(skip)]
     pub once_dispatch_token: Option<OnceDispatchToken>,
     pub now_ms: u64,
+    /// Present when a background delivery must bring the target forward for
+    /// the length of each post, because it is not frontmost.
+    #[serde(default)]
+    pub fronting_bracket: Option<FrontingBracketPlan>,
+}
+
+/// How a fronting bracket is bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontingBracketPlan {
+    /// The longest the target may stay in front at a time.
+    pub maximum_interval_ms: u64,
 }
 
 impl DispatchRequest {
@@ -203,7 +217,17 @@ impl DispatchRequest {
             focus_plan: None,
             once_dispatch_token: None,
             now_ms,
+            fronting_bracket: None,
         }
+    }
+
+    /// Deliver in the background through a fronting bracket bounded at
+    /// `maximum_interval_ms`.
+    pub fn with_fronting_bracket(mut self, maximum_interval_ms: u64) -> Self {
+        self.fronting_bracket = Some(FrontingBracketPlan {
+            maximum_interval_ms,
+        });
+        self
     }
 
     pub fn with_semantic(
@@ -351,6 +375,15 @@ pub enum DispatchError {
         sourced_input_kind: Option<SourcedInputKind>,
     },
     AttendanceUnavailable,
+    /// A fronting bracket could not bring the target forward; nothing was
+    /// posted in the chunk that tried.
+    FrontingFailed,
+    /// A fronting bracket could not fit its posts inside the bound on how
+    /// long the target may stay in front.
+    FrontingBoundExceeded,
+    /// A fronting bracket could not put the previous application back, and
+    /// stopped rather than front the target again.
+    FrontingRestoreFailed,
     TargetFocusMismatch,
     GroundingUntrusted,
     StaleElement,
@@ -414,6 +447,9 @@ mod reason_code_tests {
                 sourced_input_kind: None,
             },
             DispatchError::AttendanceUnavailable,
+            DispatchError::FrontingFailed,
+            DispatchError::FrontingBoundExceeded,
+            DispatchError::FrontingRestoreFailed,
             DispatchError::TargetFocusMismatch,
             DispatchError::GroundingUntrusted,
             DispatchError::StaleElement,
@@ -474,6 +510,9 @@ impl DispatchError {
             Self::IdleGateRefused(IdleGateRefusal::BelowThreshold { .. }) => "not_idle",
             Self::UserSeizedControl { .. } => "user_seized_control",
             Self::AttendanceUnavailable => "attendance_unavailable",
+            Self::FrontingFailed => "fronting_failed",
+            Self::FrontingBoundExceeded => "fronting_bound_exceeded",
+            Self::FrontingRestoreFailed => "restore_failed",
             Self::TargetFocusMismatch => "target_focus_mismatch",
             Self::GroundingUntrusted => "grounding_untrusted",
             Self::StaleElement => "stale_element",
@@ -500,6 +539,7 @@ pub struct Dispatcher<'a, D> {
     driver: D,
     trace: Vec<DispatchPhase>,
     last_observed_abort: Option<AbortDecision>,
+    last_bracket: Option<BracketReport>,
 }
 
 #[derive(Debug)]
@@ -534,7 +574,15 @@ impl<'a, D> Dispatcher<'a, D> {
             cancelled,
             trace: Vec::new(),
             last_observed_abort: None,
+            last_bracket: None,
         }
+    }
+
+    /// What the last dispatch's fronting bracket did, whatever the dispatch
+    /// returned. A caller needs it even from a refusal: a bracket that
+    /// stopped may still have left another application in front.
+    pub fn last_bracket(&self) -> Option<&BracketReport> {
+        self.last_bracket.as_ref()
     }
 
     pub fn driver(&self) -> &D {
@@ -571,6 +619,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         S: JournalStorage,
     {
         self.last_observed_abort = None;
+        self.last_bracket = None;
         let mut audit_state = if request.row.action_kind == ActionKind::Observe {
             None
         } else {
@@ -1115,6 +1164,11 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     .as_deref_mut()
                     .ok_or(DispatchError::AuditUnavailable)?;
                 Self::commit_audit_intent(audit, state, &intent)?;
+                if let Some(plan) = request.fronting_bracket {
+                    let result = self.deliver_fronted(audit, state, request, synthetic, plan)?;
+                    self.trace.push(DispatchPhase::PerPidDispatch);
+                    return Ok((DeliveryPrimitive::PerPidSynthetic, result, None));
+                }
                 let result = match self.driver.dispatch_per_pid(synthetic, self.cancelled) {
                     Ok(result) => {
                         Self::finalize_audit_outcome(
@@ -1257,6 +1311,126 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                 };
                 self.trace.push(DispatchPhase::GlobalDispatch);
                 Ok((DeliveryPrimitive::GlobalSynthetic, result, None))
+            }
+        }
+    }
+
+    /// Deliver through a fronting bracket, and journal how it ended.
+    ///
+    /// The bracket's report is kept whatever happens, because a bracket that
+    /// stopped can still have left another application in front, and the
+    /// caller must be able to say so.
+    fn deliver_fronted<R, T, S>(
+        &mut self,
+        audit: &mut ComputerAudit<R, T, S>,
+        state: &mut ActuationAuditState,
+        request: &DispatchRequest,
+        synthetic: SyntheticDispatchRequest,
+        plan: FrontingBracketPlan,
+    ) -> Result<PlatformDispatchResult, DispatchError>
+    where
+        R: Redactor,
+        T: SeverityTaxonomy,
+        S: JournalStorage,
+    {
+        let fronted = self.driver.dispatch_fronted(
+            FrontedDispatchRequest {
+                synthetic,
+                maximum_interval_ms: plan.maximum_interval_ms,
+                maximum_seize_detection_latency_ms: request.row.maximum_seize_detection_latency_ms,
+            },
+            self.cancelled,
+        );
+        let report = match fronted {
+            Ok(report) => report,
+            Err(_) => {
+                let refusal = DispatchError::SyntheticUnavailable;
+                Self::finalize_audit_outcome(
+                    audit,
+                    state,
+                    &ActuationOutcome::Refused {
+                        refusal: refusal.clone(),
+                        abort: None,
+                    },
+                )?;
+                return Err(refusal);
+            }
+        };
+        self.last_bracket = Some(report.clone());
+        let refusal = match &report.stop {
+            None => None,
+            Some(BracketStop::Aborted(abort)) => {
+                self.last_observed_abort = Some(*abort);
+                Some((Self::dispatch_error_for_abort(*abort), Some(*abort)))
+            }
+            Some(BracketStop::Cancelled) => Some((
+                DispatchError::Cancelled {
+                    posts_returned: report.posts_returned,
+                    held_state: HeldStateDisposition::NoneHeld,
+                },
+                None,
+            )),
+            Some(BracketStop::PostFailed(failure)) => Some((
+                if failure.refusal == ProcessEventRefusal::Cancelled {
+                    DispatchError::Cancelled {
+                        posts_returned: report.posts_returned,
+                        held_state: failure.held_state,
+                    }
+                } else {
+                    DispatchError::SyntheticSequenceFailed {
+                        posts_returned: report.posts_returned,
+                        refusal: failure.refusal.clone(),
+                        held_state: failure.held_state,
+                    }
+                },
+                None,
+            )),
+            Some(BracketStop::PreviousUnknown | BracketStop::FrontFailed) => {
+                Some((DispatchError::FrontingFailed, None))
+            }
+            Some(BracketStop::ObserverUnavailable) => {
+                Some((DispatchError::ObserverUnavailable, None))
+            }
+            Some(BracketStop::BoundExceeded) => Some((DispatchError::FrontingBoundExceeded, None)),
+            Some(BracketStop::RestoreFailed) => Some((DispatchError::FrontingRestoreFailed, None)),
+        };
+        match refusal {
+            None => {
+                let result = PlatformDispatchResult {
+                    accepted_by_platform: report.posts_returned > 0,
+                    effect_status: EffectStatus::EffectIndeterminate,
+                    unreadable_subtrees: 0,
+                    delivery_posts_returned: report.posts_returned,
+                    delivery_generation_verifications: report.generation_verifications,
+                };
+                Self::finalize_audit_outcome(
+                    audit,
+                    state,
+                    &ActuationOutcome::HandlerReturned {
+                        unreadable_subtrees: 0,
+                    },
+                )?;
+                Ok(result)
+            }
+            Some((refusal, abort)) => {
+                Self::finalize_audit_outcome(
+                    audit,
+                    state,
+                    &match &refusal {
+                        DispatchError::Cancelled {
+                            posts_returned,
+                            held_state,
+                        } => ActuationOutcome::Cancelled {
+                            posts_returned: *posts_returned,
+                            held_state: *held_state,
+                        },
+                        _ => ActuationOutcome::Refused {
+                            refusal: refusal.clone(),
+                            abort,
+                        },
+                    },
+                )?;
+                Err(refusal)
             }
         }
     }

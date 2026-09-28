@@ -593,8 +593,8 @@ fn recreated_v12() -> Value {
     let mut v13: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
 
     // The keystroke rows gained the consent envelope, the bundle-resolution
-    // fields, the diff and the focused element, and their outcome a
-    // description of the v13 refusals.
+    // fields, the diff with its truncation and unreadable count, the focused
+    // element, and their outcome a description of the v13 outcomes.
     for id in ["computer.type", "computer.keys"] {
         let keystroke = row_mut(&mut v13, id);
         remove_properties(
@@ -610,6 +610,8 @@ fn recreated_v12() -> Value {
                 "added",
                 "removed",
                 "focused_element_id",
+                "truncation",
+                "unreadable_subtrees",
             ],
         );
         keystroke["result_schema"]["properties"]["outcome"] = json!({"type": "string"});

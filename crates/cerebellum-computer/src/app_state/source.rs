@@ -150,14 +150,138 @@ impl AppStateReadError {
     }
 }
 
-/// Reads an application's state. One implementation per platform, and a
-/// fixture for tests.
+/// What an action needs to know about one element before acting on it, read
+/// fresh at action time rather than taken from the read that numbered it: an
+/// element's title, settability and actions can all change in between.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElementFacts {
+    /// The process the element belongs to, when the platform reports it.
+    pub pid: Option<u32>,
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+    pub title: Option<String>,
+    /// The actions the element advertises, as the application names them.
+    pub actions: Vec<String>,
+    /// Whether `AXValue` may be written.
+    pub value_settable: bool,
+    /// Whether `AXSelectedText` may be written.
+    pub selected_text_settable: bool,
+}
+
+impl ElementFacts {
+    /// Whether the element carries the secure-text subrole. Trustworthy when
+    /// present; its absence says nothing.
+    pub fn is_secure(&self) -> bool {
+        self.subrole.as_deref() == Some("AXSecureTextField")
+            || self.role.as_deref() == Some("AXSecureTextField")
+    }
+}
+
+/// Why an action on an element did not happen or could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementActionError {
+    /// This process may not use the accessibility API.
+    NotPermitted,
+    /// The element or its application no longer exists.
+    Gone,
+    /// The element does not offer the attribute or action.
+    Unsupported,
+    /// The application answered with some other failure.
+    Failed,
+    /// This platform has no implementation.
+    UnsupportedOnPlatform,
+}
+
+/// Which text attribute a write sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAttribute {
+    /// The element's whole value.
+    Value,
+    /// The current selection, which is the caret when nothing is selected.
+    SelectedText,
+}
+
+/// Where a hit test looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitScope {
+    /// Only this process's elements, so the hit belongs to it or to nothing.
+    Application { pid: u32 },
+    /// Whatever is on top at the point, in any application. Nothing that acts
+    /// on a hit uses it: an element found this way may belong to an
+    /// application the caller holds no grant for.
+    SystemWide,
+}
+
+/// Reads an application's state and acts on its elements. One implementation
+/// per platform, and a fixture for tests.
+///
+/// Everything but the read has a refusing default, so a platform or fixture
+/// that only reads still compiles and every action on it is refused by name.
 pub trait AppStateSource: Send + Sync {
     fn read_app_state(
         &self,
         target: &ProcessGrant,
         bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError>;
+
+    /// What the element is now: owner, role, title, actions, settability.
+    fn element_facts(&self, _element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// Ask the element to perform its press action.
+    fn press(&self, _element: &ElementHandle) -> Result<(), ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// The element's value when it is text; `Ok(None)` when it has none.
+    fn text_value(&self, _element: &ElementHandle) -> Result<Option<String>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// The selection as `(start, length)` in UTF-16 code units; `Ok(None)`
+    /// when the element reports none.
+    fn selected_range(
+        &self,
+        _element: &ElementHandle,
+    ) -> Result<Option<(usize, usize)>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// Set one text attribute. `Ok` means the application accepted the
+    /// message, not that the text is there.
+    fn write_text(
+        &self,
+        _element: &ElementHandle,
+        _attribute: TextAttribute,
+        _text: &str,
+    ) -> Result<(), ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// The element at a desktop point, with the pid that owns it when known.
+    fn element_at(
+        &self,
+        _scope: HitScope,
+        _point: (f64, f64),
+    ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// The target application's own focused element, asked of that
+    /// application rather than of whichever one is frontmost.
+    fn focused_element(
+        &self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<ElementHandle>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// The pid of the frontmost application, or `None` when it cannot be
+    /// read.
+    fn frontmost_pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The reader for a platform with none: every read is refused by name.

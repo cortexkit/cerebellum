@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "d8489580346fc14d683a67999270379fe012fa7f1ee899ceafbc44fb4d5a4621";
+    "4826862749807aab695402ff0fdc1599f012f9a5040186884fbeffc31be3ba65";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -727,6 +727,22 @@ fn result_schema_table() -> Result<&'static BTreeMap<String, Value>, CapabilityR
         Ok(table) => Ok(table),
         Err(error) => Err(error.clone()),
     }
+}
+
+/// One of a frozen row's millisecond bounds, such as
+/// `maximum_fronting_bracket_interval_ms`, read from the artifact itself so a
+/// served path is held to the number the vocabulary publishes rather than to
+/// a copy of it. `None` when the row or field is absent or null.
+pub fn frozen_row_bound_ms(capability_id: &str, field: &str) -> Option<u64> {
+    static ROWS: OnceLock<Option<Value>> = OnceLock::new();
+    ROWS.get_or_init(|| serde_json::from_slice(COMPUTER_ACTION_VOCABULARY_ARTIFACT).ok())
+        .as_ref()?
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("capability_id").and_then(Value::as_str) == Some(capability_id))?
+        .get(field)?
+        .as_u64()
 }
 
 fn collect_result_violations(

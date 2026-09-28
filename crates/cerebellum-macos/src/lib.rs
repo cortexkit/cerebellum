@@ -17,8 +17,9 @@
 //! The action request asks an application to invoke one control action that the
 //! application itself advertised. Input construction produces owned framework
 //! events without targeting them, and each event-post request only forwards one
-//! such event. Direct focus changes and window-raising actions remain outside
-//! this seam.
+//! such event. The element actions press a retained element, write its text,
+//! and ask an application to become frontmost; whether any of those may happen
+//! is decided by the platform-neutral code that calls them.
 //!
 //! Read anything added here as code that no continuous build can check.
 
@@ -26,6 +27,8 @@
 // input-bound checks run even where the macOS framework APIs are unavailable.
 #[cfg(any(target_os = "macos", test))]
 mod accessibility;
+#[cfg(target_os = "macos")]
+mod ax_actions;
 #[cfg(target_os = "macos")]
 mod ax_state;
 #[cfg(any(target_os = "macos", test))]
@@ -61,6 +64,12 @@ pub use accessibility::{
 pub use accessibility::{
     accessibility_is_permitted, focused_application_pid, read_accessibility_element,
     read_accessibility_tree, request_accessibility_action, FocusReadError,
+};
+#[cfg(target_os = "macos")]
+pub use ax_actions::{
+    element_at_position, element_facts, element_selected_range, element_text_value,
+    focused_element, press_element, request_frontmost, write_element_text, AxElementActionError,
+    AxElementFacts, AxHitScope, AxTextAttribute,
 };
 #[cfg(target_os = "macos")]
 pub use ax_state::{

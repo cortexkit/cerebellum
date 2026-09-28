@@ -4,13 +4,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use cerebellum_macos::{
-    read_app_state, AxAppStateBounds, AxAppStateError, AxRetainedElement, AxStateElement,
-    AxStateValue,
+    read_app_state, AxAppStateBounds, AxAppStateError, AxElementActionError, AxHitScope,
+    AxRetainedElement, AxStateElement, AxStateValue, AxTextAttribute,
 };
 
 use super::source::{
-    AppStateReadError, AppStateSource, ElementHandle, ElementToken, ElementValue, RawAppState,
-    RawElement, ReadBounds,
+    AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
+    ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds, TextAttribute,
 };
 use crate::platform::native::{verify_grant, GrantVerification};
 use crate::platform::ProcessGrant;
@@ -38,6 +38,24 @@ impl ElementToken for MacElementToken {
 
 fn handle(element: AxRetainedElement) -> ElementHandle {
     Arc::new(MacElementToken(element))
+}
+
+/// The retained element behind a token, when the token is this reader's.
+fn retained(element: &ElementHandle) -> Result<&AxRetainedElement, ElementActionError> {
+    element
+        .as_any()
+        .downcast_ref::<MacElementToken>()
+        .map(|token| &token.0)
+        .ok_or(ElementActionError::Gone)
+}
+
+fn action_error(error: AxElementActionError) -> ElementActionError {
+    match error {
+        AxElementActionError::NotPermitted => ElementActionError::NotPermitted,
+        AxElementActionError::ElementGone => ElementActionError::Gone,
+        AxElementActionError::Unsupported => ElementActionError::Unsupported,
+        AxElementActionError::Failed { .. } => ElementActionError::Failed,
+    }
 }
 
 fn convert(element: AxStateElement) -> RawElement {
@@ -106,5 +124,87 @@ impl AppStateSource for MacAppStateSource {
             unreadable_subtrees: state.unreadable_subtrees,
             read_bound_reached: state.bound_reached,
         })
+    }
+
+    fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        let facts = cerebellum_macos::element_facts(retained(element)?).map_err(action_error)?;
+        Ok(ElementFacts {
+            pid: facts.pid,
+            role: facts.role,
+            subrole: facts.subrole,
+            title: facts.title,
+            actions: facts.actions,
+            value_settable: facts.value_settable,
+            selected_text_settable: facts.selected_text_settable,
+        })
+    }
+
+    fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
+        cerebellum_macos::press_element(retained(element)?).map_err(action_error)
+    }
+
+    fn text_value(&self, element: &ElementHandle) -> Result<Option<String>, ElementActionError> {
+        cerebellum_macos::element_text_value(retained(element)?).map_err(action_error)
+    }
+
+    fn selected_range(
+        &self,
+        element: &ElementHandle,
+    ) -> Result<Option<(usize, usize)>, ElementActionError> {
+        cerebellum_macos::element_selected_range(retained(element)?).map_err(action_error)
+    }
+
+    fn write_text(
+        &self,
+        element: &ElementHandle,
+        attribute: TextAttribute,
+        text: &str,
+    ) -> Result<(), ElementActionError> {
+        let attribute = match attribute {
+            TextAttribute::Value => AxTextAttribute::Value,
+            TextAttribute::SelectedText => AxTextAttribute::SelectedText,
+        };
+        cerebellum_macos::write_element_text(retained(element)?, attribute, text)
+            .map_err(action_error)
+    }
+
+    fn element_at(
+        &self,
+        scope: HitScope,
+        point: (f64, f64),
+    ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
+        let scope = match scope {
+            HitScope::Application { pid } => AxHitScope::Application(pid),
+            HitScope::SystemWide => AxHitScope::SystemWide,
+        };
+        Ok(
+            cerebellum_macos::element_at_position(scope, point.0, point.1)
+                .map_err(action_error)?
+                .map(|(element, pid)| (handle(element), pid)),
+        )
+    }
+
+    /// Read only while the process is still the granted one, for the same
+    /// reason a state read is.
+    fn focused_element(
+        &self,
+        target: &ProcessGrant,
+    ) -> Result<Option<ElementHandle>, ElementActionError> {
+        match verify_grant(target.pid, target) {
+            GrantVerification::Current => {}
+            GrantVerification::TargetGone | GrantVerification::TargetReplaced => {
+                return Err(ElementActionError::Gone)
+            }
+            GrantVerification::TargetUnreadable | GrantVerification::DifferentProcess => {
+                return Err(ElementActionError::Failed)
+            }
+        }
+        Ok(cerebellum_macos::focused_element(target.pid)
+            .map_err(action_error)?
+            .map(handle))
+    }
+
+    fn frontmost_pid(&self) -> Option<u32> {
+        cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
     }
 }

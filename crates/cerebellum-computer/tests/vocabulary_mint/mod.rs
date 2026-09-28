@@ -215,6 +215,17 @@ fn diff_fields(properties: &mut Map<String, Value>) {
     properties.insert("removed".into(), element_ids("Elements that are gone."));
 }
 
+/// How much of the state read behind a diff could not be opened. An action's
+/// diff is only as complete as that read, so an empty diff over an unreadable
+/// subtree says nothing changed only where the read could see.
+fn diff_unreadable_subtrees() -> Value {
+    json!({
+        "type": "integer",
+        "description": "Subtrees the read behind the diff could not open; nothing is known of \
+                        changes inside them.",
+    })
+}
+
 fn truncation() -> Value {
     json!({
         "type": "object",
@@ -472,6 +483,7 @@ fn element_action_result(tokens: &[&[&str]], description: &str) -> Map<String, V
     diff_fields(&mut result);
     result.insert("focused_element_id".into(), focused_element_id());
     result.insert("truncation".into(), truncation());
+    result.insert("unreadable_subtrees".into(), diff_unreadable_subtrees());
     result.insert("ask_id".into(), ask_id());
     result.insert("grant_persisted".into(), grant_persisted());
     result.insert("remedy".into(), remedy());
@@ -491,10 +503,13 @@ fn press_element() -> Value {
                 "no_press_action",
                 "invalid_request",
                 "audit_unavailable",
+                "cancelled",
             ],
             &CONSENT_OUTCOMES,
         ],
-        "completed carries the diff from the previous state of this application session.",
+        "completed carries the diff from the previous state of this application session; \
+         cancelled means the caller cancelled while the call waited for the person, before \
+         anything was pressed.",
     );
     json!({
         "capability_id": "computer.press_element",
@@ -567,11 +582,14 @@ fn press_point() -> Value {
                 "no_press_action",
                 "invalid_request",
                 "audit_unavailable",
+                "cancelled",
             ],
             &CONSENT_OUTCOMES,
         ],
-        "completed carries the diff; app_grant_required means the hit test landed in an \
-         application this conversation holds no grant for.",
+        "completed carries the diff; no_element_at_point means the hit test found nothing of \
+         the image's own application there; app_grant_required means the hit test landed in an \
+         application this conversation holds no grant for; cancelled means the caller \
+         cancelled while the call waited for the person, before anything was pressed.",
     );
     result.insert("bundle_identity".into(), bundle_identity());
     json!({
@@ -644,11 +662,14 @@ fn write_text() -> Value {
                 "caret_position_unknown",
                 "invalid_request",
                 "audit_unavailable",
+                "cancelled",
             ],
             &CONSENT_OUTCOMES,
         ],
         "completed means a read-back confirmed the text; delivery_unconfirmed means the write \
-         returned but could not be confirmed, and it is never retried with keystrokes.",
+         returned but could not be confirmed, and it is never retried with keystrokes; \
+         cancelled means the caller cancelled while the call waited for the person, before \
+         anything was written.",
     );
     result.insert("effect_status".into(), effect_status());
     json!({
@@ -973,24 +994,48 @@ fn widen_retained_result(row: &mut Value) {
     properties.insert("unreadable".into(), unreadable());
 }
 
+/// The refusals both keystroke rows share, for their outcome descriptions.
+const KEYSTROKE_REFUSALS: &str = "Refusals include keystrokes_need_foreground (the target is \
+     not frontmost and cannot be brought forward in this build or conversation), \
+     secure_field_refused (the target's focused element is a secure field, or its focus could \
+     not be read), chord_blocked, invalid_request, not_running, ambiguous, targets_unreadable \
+     and the consent outcomes. A target brought forward to receive the keystrokes can also \
+     answer fronting_failed (it did not come forward; nothing was posted in that attempt), \
+     fronting_bound_exceeded (the posts could not fit the fronting bound), restore_failed (the \
+     previous application could not be put back; bundle_identity or remedy names what was left \
+     in front), and the idle, seize and cancel refusals of observed dispatch.";
+
 /// Keystroke rows also return the diff and focus, like the element actions,
-/// and their outcome word gains the v13 refusals. The outcome stays an open
-/// string rather than a closed enum: the keystroke path keeps answering with
-/// its current refusal words until it is moved to the accessibility-first
-/// behaviour, and a closed enum would withhold those replies.
+/// with how much of the read behind the diff was open and whether the diff
+/// was cut to fit. The outcome stays an open string rather than a closed
+/// enum: the dispatch refusal words it carries come from the dispatcher's own
+/// closed taxonomy, and a second closed copy here would withhold any reply the
+/// two disagreed on.
+///
+/// The descriptions differ because the rows confirm differently. Typed text
+/// can be confirmed by reading the focused element's value back and finding
+/// the text in what changed; a chord changes no value that could show it
+/// arrived, so keys is never reported as delivered.
 fn widen_keystroke_result(row: &mut Value) {
     widen_retained_result(row);
+    let id = row["capability_id"].as_str().unwrap().to_owned();
     let properties = object_mut(row, "/result_schema/properties");
     diff_fields(properties);
     properties.insert("focused_element_id".into(), focused_element_id());
+    properties.insert("truncation".into(), truncation());
+    properties.insert("unreadable_subtrees".into(), diff_unreadable_subtrees());
+    let delivery = if id == "computer.type" {
+        "completed means a read-back of the target's focused element showed this call's text \
+         in the part of its value that changed, with effect_status effect_observed. Any other \
+         dispatch that posts answers delivery_unconfirmed with effect_status \
+         effect_indeterminate, including a field that already held the text before the call."
+    } else {
+        "A chord changes no value that could confirm it arrived, so a dispatch that posts \
+         always answers delivery_unconfirmed with effect_status effect_indeterminate."
+    };
     properties.insert(
         "outcome".into(),
-        string_field(
-            "Keystrokes are never reported as delivered: a dispatch that posts answers \
-             delivery_unconfirmed with effect_status effect_indeterminate. Refusals include \
-             keystrokes_need_foreground, secure_field_refused, chord_blocked, invalid_request, \
-             not_running, ambiguous, targets_unreadable and the consent outcomes.",
-        ),
+        string_field(&format!("{delivery} {KEYSTROKE_REFUSALS}")),
     );
 }
 

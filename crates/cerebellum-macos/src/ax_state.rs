@@ -65,7 +65,7 @@ extern "C" {
 /// Opaque on purpose: nothing outside this crate can act on it, and the only
 /// questions it answers are whether it names the same element as another
 /// reference and a hash that agrees with that answer.
-pub struct AxRetainedElement(CFRetained<CFType>);
+pub struct AxRetainedElement(pub(crate) CFRetained<CFType>);
 
 // SAFETY: an AXUIElement is an immutable Core Foundation value naming an
 // element in another process. Retain and release are thread-safe, and the
@@ -92,7 +92,7 @@ impl AxRetainedElement {
         CFHash(Some(&self.0)) as u64
     }
 
-    fn as_ptr(&self) -> CfTypeRef {
+    pub(crate) fn as_ptr(&self) -> CfTypeRef {
         CFRetained::as_ptr(&self.0).as_ptr().cast()
     }
 }
@@ -171,7 +171,7 @@ const ATTRIBUTES: [&str; 11] = [
     "AXChildren",
 ];
 
-fn process_exists(pid: c_int) -> bool {
+pub(crate) fn process_exists(pid: c_int) -> bool {
     // SAFETY: signal zero sends nothing; it asks whether the pid exists.
     let result = unsafe { process_signal(pid, 0) };
     if result == 0 {
@@ -187,7 +187,7 @@ fn process_exists(pid: c_int) -> bool {
 /// # Safety
 ///
 /// `value` must be null or carry one retain count the caller owns.
-unsafe fn owned(value: CfTypeRef) -> Option<CFRetained<CFType>> {
+pub(crate) unsafe fn owned(value: CfTypeRef) -> Option<CFRetained<CFType>> {
     NonNull::new(value.cast_mut().cast::<CFType>()).map(|value| CFRetained::from_raw(value))
 }
 
@@ -196,7 +196,7 @@ fn type_id(value: &CFType) -> usize {
     unsafe { CFGetTypeID((value as *const CFType).cast()) }
 }
 
-fn is_ax_element(value: &CFType) -> bool {
+pub(crate) fn is_ax_element(value: &CFType) -> bool {
     // SAFETY: takes no arguments and returns a stable type identifier.
     type_id(value) == unsafe { AXUIElementGetTypeID() }
 }

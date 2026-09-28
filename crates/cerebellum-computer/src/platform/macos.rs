@@ -111,6 +111,10 @@ pub struct MacOs26PlatformDriver {
     accessibility_trees: BTreeMap<String, CachedAccessibilityTree>,
     expected_post_condition_available: bool,
     global_dispatch_review_revision: Option<String>,
+    /// The review that admits the fronting bracket. Bringing an application
+    /// forward can take the person's keystrokes, so the driver refuses the
+    /// bracket itself without it, whatever its caller decided.
+    takeover_dispatch_review_revision: Option<String>,
     /// Shared across every driver the plane builds. The plane builds a driver
     /// per dispatch (its accessibility cache must not outlive a process
     /// generation), but the idle estimator's whole purpose is to remember the
@@ -296,6 +300,172 @@ fn heartbeat_observation(
     }
 }
 
+/// The heartbeat marker one observed sequence posts, ready to post once.
+///
+/// Shared by the global pointer sequence and the fronting bracket, so both
+/// prove their observer live the same way.
+struct HeartbeatPoster {
+    marker: HeartbeatMarker,
+    event: Option<cerebellum_macos::OwnedCgEvent>,
+    started: Instant,
+    our_pid: i64,
+}
+
+impl HeartbeatPoster {
+    /// Post the marker, returning the probe to look for and when it went.
+    fn post(&mut self) -> (HeartbeatProbe, Instant) {
+        let posted_at_ms = elapsed_millis(self.started);
+        if let Some(event) = self.event.take() {
+            let _ = cerebellum_macos::post_event_globally(event);
+        }
+        (
+            HeartbeatProbe {
+                marker: self.marker,
+                posted_at_ms,
+                our_pid: self.our_pid,
+            },
+            Instant::now(),
+        )
+    }
+}
+
+/// Start watching session input for one observed sequence: the tap, and the
+/// heartbeat that will prove it live.
+///
+/// The tap is created here, before the caller reads idle, so a hardware
+/// event between that read and the heartbeat is seen.
+fn open_session_observation(
+    started: Instant,
+) -> Result<(cerebellum_macos::SessionEventTap, HeartbeatPoster), DriverError> {
+    let our_pid = i64::from(std::process::id());
+    let nonce = NEXT_HEARTBEAT_NONCE.fetch_add(1, Ordering::Relaxed) & i64::MAX as u64;
+    let marker = HeartbeatMarker::new(nonce.max(1));
+    let event = cerebellum_macos::heartbeat_marker_event(marker.nonce)
+        .map_err(|_| DriverError::EventConstructionFailed("observer heartbeat marker"))?;
+    let tap = cerebellum_macos::SessionEventTap::listen(SESSION_TAP_UNREAD_BOUND)
+        .map_err(|_| DriverError::StartupRefused("session input observer is unavailable"))?;
+    Ok((
+        tap,
+        HeartbeatPoster {
+            marker,
+            event: Some(event),
+            started,
+            our_pid,
+        },
+    ))
+}
+
+/// Time since the last hardware input, from the HID table.
+fn read_hid_idle() -> IdleReading {
+    IdleReading::from_seconds(cerebellum_macos::seconds_since_last_input(
+        cerebellum_macos::EventSourceStateTable::HidSystem,
+    ))
+}
+
+/// The fronting bracket's view of this Mac: the frontmost application through
+/// the window list, fronting through accessibility, and posting to the
+/// target's exact process generation. Session observation is the same as the
+/// global pointer sequence's.
+struct MacBracketHost {
+    started: Instant,
+    tap: Option<cerebellum_macos::SessionEventTap>,
+    heartbeat: HeartbeatPoster,
+    target: ProcessEventTarget,
+    units: Vec<Option<Vec<SyntheticStep<cerebellum_macos::OwnedCgEvent>>>>,
+    transport: MacOsPerProcessEventTransport,
+}
+
+impl crate::dispatch::FrontingBracketHost for MacBracketHost {
+    type Tap = cerebellum_macos::SessionEventTap;
+
+    fn now_ms(&mut self) -> u64 {
+        elapsed_millis(self.started)
+    }
+
+    fn pause_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    fn request_front(&mut self, pid: u32) -> bool {
+        cerebellum_macos::request_frontmost(pid).is_ok()
+    }
+
+    fn our_pid(&self) -> i64 {
+        self.heartbeat.our_pid
+    }
+
+    fn create_tap(&mut self) -> Option<Self::Tap> {
+        self.tap.take()
+    }
+
+    fn read_idle(&mut self) -> IdleReading {
+        read_hid_idle()
+    }
+
+    fn drain(&mut self, tap: &Self::Tap) -> Vec<SourcedInputEvent> {
+        sourced_from_tap(tap)
+    }
+
+    fn post_heartbeat(&mut self) -> HeartbeatProbe {
+        self.heartbeat.post().0
+    }
+
+    fn observe_heartbeat(
+        &mut self,
+        tap: &Self::Tap,
+        probe: HeartbeatProbe,
+        watcher: &mut SeizeWatcher,
+    ) -> HeartbeatObservation {
+        heartbeat_observation(tap, watcher, probe, self.started)
+    }
+
+    fn post_unit(
+        &mut self,
+        index: usize,
+    ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
+        let steps = self
+            .units
+            .get_mut(index)
+            .and_then(Option::take)
+            .unwrap_or_default();
+        let report = post_event_sequence(self.target, steps, &mut self.transport, &|| false)?;
+        Ok(crate::dispatch::UnitPosted {
+            posts_returned: report.posts_returned,
+            generation_verifications: report.generation_verifications,
+        })
+    }
+}
+
+/// The units a bracket posts one at a time: each character of typed text on
+/// its own, so a long text can be split between chunks, and a chord whole,
+/// so its modifiers are never left held while another application is in
+/// front.
+fn bracket_units(
+    action: &SyntheticAction,
+) -> Result<Vec<Option<Vec<SyntheticStep<cerebellum_macos::OwnedCgEvent>>>>, DriverError> {
+    match action {
+        SyntheticAction::TypeText { text } => text
+            .chars()
+            .map(|character| {
+                super::macos_synthetic::synthetic_event_steps(&SyntheticAction::type_text(
+                    character.to_string(),
+                ))
+                .map(Some)
+            })
+            .collect(),
+        SyntheticAction::KeyCombination { .. } => Ok(vec![Some(
+            super::macos_synthetic::synthetic_event_steps(action)?,
+        )]),
+        _ => Err(DriverError::InvalidRequest(
+            "only keystrokes are posted through a fronting bracket",
+        )),
+    }
+}
+
 /// Deliver one action through the session-global transport under observed gates.
 ///
 /// The tap precedes the idle read and stays live through the HID table's update
@@ -321,12 +491,7 @@ fn dispatch_synthetic_globally(
     let steps = super::macos_synthetic::synthetic_event_steps(&synthetic.action)?;
     let our_pid = i64::from(std::process::id());
     let started = Instant::now();
-    let nonce = NEXT_HEARTBEAT_NONCE.fetch_add(1, Ordering::Relaxed) & i64::MAX as u64;
-    let marker = HeartbeatMarker::new(nonce.max(1));
-    let marker_event = cerebellum_macos::heartbeat_marker_event(marker.nonce)
-        .map_err(|_| DriverError::EventConstructionFailed("observer heartbeat marker"))?;
-    let tap = cerebellum_macos::SessionEventTap::listen(SESSION_TAP_UNREAD_BOUND)
-        .map_err(|_| DriverError::StartupRefused("session input observer is unavailable"))?;
+    let (tap, mut heartbeat) = open_session_observation(started)?;
     let mut watcher = SeizeWatcher::new(maximum_seize_detection_latency_ms);
     for _ in &steps {
         watcher.queue_post();
@@ -340,25 +505,9 @@ fn dispatch_synthetic_globally(
         idle_read_at,
         ObservedSequenceHooks {
             create_tap: || tap,
-            read_idle: || {
-                IdleReading::from_seconds(cerebellum_macos::seconds_since_last_input(
-                    cerebellum_macos::EventSourceStateTable::HidSystem,
-                ))
-            },
+            read_idle: read_hid_idle,
             drain: |tap: &cerebellum_macos::SessionEventTap| sourced_from_tap(tap),
-            post_heartbeat: || {
-                let posted_at_ms = elapsed_millis(started);
-                let _ = cerebellum_macos::post_event_globally(marker_event);
-                let last_post_at = Instant::now();
-                (
-                    HeartbeatProbe {
-                        marker,
-                        posted_at_ms,
-                        our_pid,
-                    },
-                    last_post_at,
-                )
-            },
+            post_heartbeat: || heartbeat.post(),
         },
     );
     let (tap, user_idle, (probe, mut last_post_at)) = match begin {
@@ -876,8 +1025,16 @@ impl MacOs26PlatformDriver {
             accessibility_trees: BTreeMap::new(),
             expected_post_condition_available: true,
             global_dispatch_review_revision: None,
+            takeover_dispatch_review_revision: None,
             user_idle: Arc::new(Mutex::new(UserIdleEstimator::new())),
         }
+    }
+
+    /// Store the review that admits the fronting bracket. The bracket stays
+    /// unavailable unless this revision is supplied.
+    pub fn with_takeover_dispatch_review_revision(mut self, revision: Option<String>) -> Self {
+        self.takeover_dispatch_review_revision = revision;
+        self
     }
 
     /// Share one idle estimator across drivers. The plane's driver factory
@@ -1174,6 +1331,56 @@ impl PlatformDriver for MacOs26PlatformDriver {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         dispatch_synthetic_globally(request, &mut user_idle, cancelled)
+    }
+    fn dispatch_fronted(
+        &mut self,
+        request: FrontedDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::dispatch::BracketReport, DriverError> {
+        if self
+            .takeover_dispatch_review_revision
+            .as_deref()
+            .is_none_or(|revision| revision.trim().is_empty())
+        {
+            return Err(DriverError::StartupRefused(
+                "takeover_dispatch_review_revision is not bound",
+            ));
+        }
+        let target = &request.synthetic.target;
+        target.validate()?;
+        let start_time_micros = target.process_generation_evidence.parse::<u64>().map_err(|_| {
+            DriverError::InvalidRequest("process generation evidence is not a kernel start time")
+        })?;
+        let units = bracket_units(&request.synthetic.action)?;
+        let started = Instant::now();
+        let (tap, heartbeat) = open_session_observation(started)?;
+        let plan = crate::dispatch::BracketPlan {
+            target_pid: target.pid,
+            units: units.len(),
+            maximum_interval_ms: request.maximum_interval_ms,
+            maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
+        };
+        let mut host = MacBracketHost {
+            started,
+            tap: Some(tap),
+            heartbeat,
+            target: ProcessEventTarget {
+                pid: target.pid,
+                start_time_micros,
+            },
+            units,
+            transport: MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT),
+        };
+        let mut user_idle = self
+            .user_idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(crate::dispatch::run_fronting_bracket(
+            &mut host,
+            &mut user_idle,
+            plan,
+            cancelled,
+        ))
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;

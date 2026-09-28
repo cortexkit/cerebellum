@@ -1015,6 +1015,17 @@ pub struct GlobalDispatchRequest {
     pub minimum_inter_post_interval_ms: u32,
 }
 
+/// A per-process delivery to a target that is not frontmost, posted inside a
+/// fronting bracket: the target is brought forward for at most
+/// `maximum_interval_ms` at a time, under the idle gate and the seize
+/// watcher, and the previous application is put back after each chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontedDispatchRequest {
+    pub synthetic: SyntheticDispatchRequest,
+    pub maximum_interval_ms: u64,
+    pub maximum_seize_detection_latency_ms: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchResult {
     pub accepted_by_platform: bool,
@@ -1391,6 +1402,16 @@ pub trait PlatformDriver {
         request: GlobalDispatchRequest,
         _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError>;
+    /// Post to a target that is not frontmost through a fronting bracket.
+    /// Returns the bracket's report however it ended once it started; an
+    /// error means it never started.
+    fn dispatch_fronted(
+        &mut self,
+        _request: FrontedDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::dispatch::BracketReport, DriverError> {
+        Err(DriverError::Unsupported("fronted per-process synthetic dispatch"))
+    }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)
         -> Result<FrontingSnapshot, DriverError>;

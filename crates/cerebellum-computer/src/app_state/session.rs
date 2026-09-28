@@ -177,6 +177,19 @@ pub enum ElementResolution {
     Stale,
 }
 
+/// What giving a hit-tested element an id came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adoption {
+    /// The element's id in the session.
+    Numbered(String),
+    /// A session-ending menu item the session already knows: never pressable.
+    Refusing,
+    /// The session is at its element cap; the element goes unnumbered.
+    Full,
+    /// The conversation has not read this process generation.
+    NoSession,
+}
+
 /// An image the conversation was given, and how its pixels map to the screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegisteredImage {
@@ -357,6 +370,81 @@ impl AppStateSessions {
             unreadable_subtrees: read.unreadable_subtrees,
             diff,
         }
+    }
+
+    /// Give an element found some other way than by a read -- a hit test --
+    /// an id in the conversation's session for its process, so it can be
+    /// named in the diff that follows an action on it.
+    ///
+    /// An element the session already numbered keeps its id. A new one is
+    /// numbered but not yet part of the baseline, so the next read reports it
+    /// as added if it is visible.
+    pub fn adopt(
+        &self,
+        conversation_key: &str,
+        target: &ProcessGrant,
+        handle: &ElementHandle,
+    ) -> Adoption {
+        let key = SessionKey::new(conversation_key, target);
+        let mut state = self.lock();
+        let Some(session) = state.sessions.get_mut(&key) else {
+            return Adoption::NoSession;
+        };
+        if let Some(number) = session.find(handle) {
+            return if session
+                .entries
+                .get(&number)
+                .is_some_and(|entry| entry.refusing)
+            {
+                Adoption::Refusing
+            } else {
+                Adoption::Numbered(session.element_id(number))
+            };
+        }
+        match session.insert(handle.clone(), String::new(), false) {
+            Some(number) => Adoption::Numbered(session.element_id(number)),
+            None => Adoption::Full,
+        }
+    }
+
+    /// Whether a read differs from the conversation's baseline for this
+    /// process, without moving the baseline. Used to wait for an action's
+    /// effect to show before the diff is taken; a session with no baseline
+    /// counts as changed, since there is nothing to wait against.
+    pub fn differs_from_baseline(
+        &self,
+        conversation_key: &str,
+        target: &ProcessGrant,
+        read: &RawAppState,
+    ) -> bool {
+        let key = SessionKey::new(conversation_key, target);
+        let state = self.lock();
+        let Some(session) = state.sessions.get(&key) else {
+            return true;
+        };
+        if !session.has_baseline {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut stack: Vec<&RawElement> = read.roots.iter().collect();
+        while let Some(element) = stack.pop() {
+            stack.extend(element.children.iter());
+            match session.find(&element.handle) {
+                Some(number) => {
+                    let entry = &session.entries[&number];
+                    if !entry.in_baseline || entry.signature != describe(element).signature() {
+                        return true;
+                    }
+                    seen.insert(number);
+                }
+                None => return true,
+            }
+        }
+        read.is_complete()
+            && session
+                .entries
+                .values()
+                .any(|entry| entry.in_baseline && !seen.contains(&entry.number))
     }
 
     /// Where an element id leads, for the conversation holding it.
