@@ -3,7 +3,7 @@
 #
 # Every durable reader in this module refuses a record newer than it knows,
 # which is right, but on its own that is discovered only when a build meets
-# such a record -- after a rollback, on the live desk, with a browser profile
+# such a record -- after a rollback, in production, with a browser profile
 # locked until someone deletes the lock by hand. So each writer raises a floor
 # in `<data home>/cortexkit/cerebellum/format-floor.json` before it first
 # writes a format, and this gate compares that floor with what the build
@@ -14,8 +14,9 @@
 #
 # Builds and runs the `format_versions` example from THIS tree, which prints
 # the highest version of each format the tree reads, taken from the constants
-# its readers check. Writes that JSON to <versions-out> for the staging card,
-# so a placer can compare it with the floor on the machine it places onto.
+# its readers check. Writes that JSON to <versions-out>; stage.sh copies it
+# beside the staged binary, so whoever places that binary onto a machine can
+# compare it with the floor there too.
 #
 # A missing floor file is floor zero for every format: nothing that raises a
 # floor has written there yet. A format named in the floor that this build does
@@ -104,7 +105,7 @@ if short:
     for name, floor, reads in short:
         print(f"  {name}: on disk at version {floor}, this build reads up to {reads}", file=sys.stderr)
     print(
-        "Placing it would refuse those records on the live desk. Stage a build\n"
+        "Placed, it would refuse those records in production. Stage a build\n"
         "that reads them, or move the records aside deliberately first.",
         file=sys.stderr,
     )

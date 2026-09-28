@@ -2,10 +2,10 @@
 //!
 //! Every durable reader in this module is strict: it refuses a record whose
 //! version it does not know. That is the right answer, but on its own it is
-//! discovered only when a build meets such a record, which after a rollback is
-//! on the live desk: an older build that finds a lock written in a newer format
-//! refuses it, and the profile stays locked until someone removes the file by
-//! hand.
+//! discovered only when a build meets such a record, and after a rollback that
+//! happens in production: an older build that finds a lock written in a newer
+//! format refuses it, and the profile stays locked until someone removes the
+//! file by hand.
 //!
 //! Three pieces close that gap, and this file holds the shared parts of all
 //! three:
@@ -635,7 +635,8 @@ mod tests {
                 },
             })
         );
-        // Raising over it refuses too, and leaves it as found.
+        // Raising a floor over a newer floor file refuses too, and leaves the
+        // file exactly as found rather than rewriting it in the older shape.
         assert!(FormatFloor::at(scratch.floor_path()).raise(ALPHA).is_err());
         assert!(fs::read_to_string(scratch.floor_path())
             .unwrap()
@@ -690,7 +691,7 @@ mod tests {
             FormatFloor::governing_under(&module.join("x.json"), None).path(),
             None
         );
-        // Deciding creates nothing.
+        // Choosing which floor governs a path creates nothing on disk.
         assert!(!data_home.exists());
     }
 
