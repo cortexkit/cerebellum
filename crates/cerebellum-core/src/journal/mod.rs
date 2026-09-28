@@ -508,6 +508,19 @@ where
         self.config
     }
 
+    /// Raise the storage's format floor for a format the caller is about to
+    /// write through this binding, such as an attachment with its own
+    /// version. Entries in the codec's own format are raised on every commit
+    /// without asking. A failure means nothing may be written.
+    pub fn raise_format_floor(
+        &self,
+        format: crate::format_floor::DurableFormat,
+    ) -> Result<(), JournalError> {
+        self.storage
+            .raise_format(format)
+            .map_err(|_| JournalError::StorageUnavailable)
+    }
+
     pub fn redactor_available(&self) -> bool {
         self.redactor.as_ref().is_some_and(Redactor::available)
     }
@@ -1393,6 +1406,11 @@ where
     }
 
     fn commit_state(&mut self, candidate: DurableState) -> Result<(), JournalError> {
+        // Before the save: an entry a reader decodes, on disk in a version no
+        // floor names, is what lets staging pass a build that cannot read it.
+        if let Some(format) = self.codec.entry_format() {
+            self.raise_format_floor(format)?;
+        }
         self.storage
             .save(&candidate)
             .map_err(|_| JournalError::StorageUnavailable)?;
@@ -1627,6 +1645,10 @@ mod tests {
         ) -> Result<EncodedJournalState, JournalCodecError> {
             Ok(encoded(format!("y:{}", input.action_obligation_id)))
         }
+
+        fn entry_format(&self) -> Option<crate::format_floor::DurableFormat> {
+            None
+        }
     }
 
     fn encoded(text: String) -> EncodedJournalState {
@@ -1689,6 +1711,118 @@ mod tests {
         assert_eq!(transitions[0].action_obligation_id, 1);
         assert_eq!(transitions[0].cursor, 1);
         assert_eq!(journal.export_bytes(), b"c:1");
+    }
+
+    /// The fixture codec, declaring an entry format as a codec whose entries
+    /// are decoded again would.
+    #[derive(Debug, Clone, Copy)]
+    struct DecodedEntryCodec;
+
+    const DECODED_ENTRY: crate::format_floor::DurableFormat =
+        crate::format_floor::DurableFormat::new("fixture-entry", 4);
+
+    impl PlaneJournalCodec for DecodedEntryCodec {
+        fn encode_provisional(
+            &self,
+            input: &ProvisionalInput,
+        ) -> Result<EncodedJournalState, JournalCodecError> {
+            FixtureCodec.encode_provisional(input)
+        }
+        fn encode_dispatched(
+            &self,
+            input: &DispatchedInput,
+        ) -> Result<EncodedJournalState, JournalCodecError> {
+            FixtureCodec.encode_dispatched(input)
+        }
+        fn encode_rejection(
+            &self,
+            input: &RejectionInput,
+        ) -> Result<EncodedJournalState, JournalCodecError> {
+            FixtureCodec.encode_rejection(input)
+        }
+        fn encode_completion(
+            &self,
+            input: &CompletionInput,
+        ) -> Result<EncodedJournalState, JournalCodecError> {
+            FixtureCodec.encode_completion(input)
+        }
+        fn encode_reduced_terminal(
+            &self,
+            input: &ReducedTerminalInput,
+        ) -> Result<EncodedJournalState, JournalCodecError> {
+            FixtureCodec.encode_reduced_terminal(input)
+        }
+        fn encode_recovery_terminal(
+            &self,
+            input: &RecoveryTerminalInput,
+        ) -> Result<EncodedJournalState, JournalCodecError> {
+            FixtureCodec.encode_recovery_terminal(input)
+        }
+        fn entry_format(&self) -> Option<crate::format_floor::DurableFormat> {
+            Some(DECODED_ENTRY)
+        }
+    }
+
+    #[test]
+    fn a_decoded_entry_format_is_floored_before_its_first_entry_is_written() {
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-entry-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let floor_directory = directory.join("floor");
+        std::fs::create_dir_all(&floor_directory).unwrap();
+        let floor_path = floor_directory.join("format-floor.json");
+        let journal_path = directory.join("journal.json");
+        let storage = FilesystemJournalStorage::new(&journal_path)
+            .with_format_floor(crate::format_floor::FormatFloor::at(&floor_path));
+        let config = JournalConfig {
+            journal_retention_bytes: 1000,
+            journal_max_entry_bytes: 100,
+        };
+        let mut journal =
+            JournalBinding::new_without_policies(DecodedEntryCodec, config, storage.clone())
+                .unwrap();
+        // Opening writes no entry, so the entry format's floor is not raised.
+        assert_eq!(
+            crate::format_floor::read_floors(&floor_path)
+                .unwrap()
+                .get("fixture-entry"),
+            None
+        );
+
+        journal.reserve(identity(), vec![1]).unwrap();
+        assert_eq!(
+            crate::format_floor::read_floors(&floor_path)
+                .unwrap()
+                .get("fixture-entry"),
+            Some(&4)
+        );
+
+        // A journal whose floor becomes unwritable after it opened: the
+        // entry's floor cannot be raised, so the entry is refused and the
+        // journal is not written.
+        let blocked_floor = directory.join("blocked");
+        std::fs::create_dir_all(&blocked_floor).unwrap();
+        let blocked_journal_path = directory.join("blocked-journal.json");
+        let blocked = FilesystemJournalStorage::new(&blocked_journal_path).with_format_floor(
+            crate::format_floor::FormatFloor::at(blocked_floor.join("format-floor.json")),
+        );
+        let mut blocked_journal =
+            JournalBinding::new_without_policies(DecodedEntryCodec, config, blocked).unwrap();
+        std::fs::remove_dir_all(&blocked_floor).unwrap();
+        std::fs::write(&blocked_floor, b"now a file").unwrap();
+        assert!(matches!(
+            blocked_journal.reserve(identity(), vec![1]),
+            Err(JournalError::StorageUnavailable)
+        ));
+        assert!(!blocked_journal_path.exists());
+        assert_eq!(blocked_journal.next_sequence(), 1);
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

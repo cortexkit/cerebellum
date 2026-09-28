@@ -174,6 +174,13 @@ impl JournalStorage for RecordingJournalStorage {
         self.probe.lock().unwrap().latest_state = Some(serde_json::to_value(state).unwrap());
         Ok(())
     }
+
+    fn raise_format(
+        &self,
+        format: cerebellum_core::format_floor::DurableFormat,
+    ) -> Result<(), StorageError> {
+        self.inner.raise_format(format)
+    }
 }
 
 fn has_durable_intent(state: &Value) -> bool {

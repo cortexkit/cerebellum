@@ -271,10 +271,22 @@ pub struct ComputerJournalCodec {
     pub codec_version: String,
 }
 
+/// The version of the computer journal's entries, as the codec writes it and
+/// startup reconciliation reads it back.
+pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v1";
+
+/// The computer journal's entry format, as the format floor and staging name
+/// it.
+pub const COMPUTER_ENTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new(
+        "computer-journal-entry",
+        cerebellum_core::format_floor::tag_version(COMPUTER_JOURNAL_CODEC_VERSION),
+    );
+
 impl Default for ComputerJournalCodec {
     fn default() -> Self {
         Self {
-            codec_version: "ck-computer-journal/v1".to_string(),
+            codec_version: COMPUTER_JOURNAL_CODEC_VERSION.to_string(),
         }
     }
 }
@@ -418,6 +430,13 @@ impl PlaneJournalCodec for ComputerJournalCodec {
             "severity_inputs": Self::severity(input.severity_inputs),
             "terminal_kind": terminal_kind.as_str(),
         }))
+    }
+
+    /// Floored only when writing the version startup reconciliation reads
+    /// back; a codec built with another version string (fixtures) writes a
+    /// family no reader here decodes.
+    fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
+        (self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION).then_some(COMPUTER_ENTRY_FORMAT)
     }
 }
 
@@ -1194,6 +1213,10 @@ pub enum ComputerAuditError {
     BindingUnavailable,
     Journal(JournalError),
     Custody(CustodyError),
+    /// The journal holds an entry a newer build wrote. Reconciliation stops
+    /// before acting on anything: settling or sweeping records it cannot
+    /// read could destroy captures the newer build still holds.
+    NewerWriter(cerebellum_core::format_floor::NewerWriter),
 }
 
 impl From<JournalError> for ComputerAuditError {
@@ -1842,6 +1865,7 @@ where
 
     /// Restore journal, custody, and terminal-feed state before exposing reads.
     pub fn startup_reconcile(&mut self, now: u64) -> Result<(), ComputerAuditError> {
+        self.refuse_newer_entries()?;
         self.custody.begin_process_epoch();
         self.recover_active();
         if self.journal.status().active_reservation_count != 0 {
@@ -1864,6 +1888,19 @@ where
             return Err(ComputerAuditError::Custody(
                 CustodyError::StorageUnavailable,
             ));
+        }
+        Ok(())
+    }
+
+    /// Refuse, by name, a journal holding an entry in a newer version of this
+    /// codec's format, before reconciliation recovers or reads any of it.
+    fn refuse_newer_entries(&self) -> Result<(), ComputerAuditError> {
+        for sequence in 1..self.journal.next_sequence() {
+            if let Ok(record) = self.journal.read_obligation_audit(sequence) {
+                COMPUTER_ENTRY_FORMAT
+                    .refuse_newer_tag(&record.codec_id, COMPUTER_JOURNAL_CODEC_VERSION)
+                    .map_err(ComputerAuditError::NewerWriter)?;
+            }
         }
         Ok(())
     }

@@ -45,32 +45,19 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 # THE FORMAT FLOOR GATE, before anything is built for release. Every writer
-# raises a floor in the module's data directory before it first writes a
-# format, so the floor names at least every record version on this disk. A
-# build that reads less than that would refuse those records once placed --
-# placing a build from before the custody lock's v2 while a browser holds a
-# profile leaves that profile locked until the lock is deleted by hand -- so
-# it is refused here, naming each format it falls short on. The data home follows the daemon's ladder as the module resolves
-# it on this host: XDG_DATA_HOME when set, else ~/.local/share. A relative
-# XDG_DATA_HOME is refused, as the module refuses it: the floor it names
-# depends on the working directory rather than on anything the module wrote.
-if [ -n "${XDG_DATA_HOME:-}" ]; then
-  DATA_HOME="$XDG_DATA_HOME"
-else
-  DATA_HOME="$HOME/.local/share"
-fi
-case "$DATA_HOME" in
-  /*) ;;
-  *)
-    echo "REFUSING TO STAGE: the data home '$DATA_HOME' is not absolute, so the" >&2
-    echo "format floor it would name is not the one the module writes." >&2
-    exit 1
-    ;;
-esac
-FORMAT_FLOOR="$DATA_HOME/cortexkit/cerebellum/format-floor.json"
+# raises a floor in the data tree it writes into (the journal tree and the
+# browser tree each keep one) before it first writes a format, so the floors
+# name at least every record version on this disk. A build that reads less
+# would refuse those records once placed -- placing a build from before the
+# custody lock's v2 while a browser holds a profile leaves that profile locked
+# until the lock is deleted by hand -- so it is refused here, naming each
+# format it falls short on. The floor paths come from the tree's own
+# `format_versions` example, through the module's data-home resolver: this
+# script resolves no data home itself, so it cannot disagree with the module
+# about where the floors are.
 FORMAT_VERSIONS="$(mktemp)"
 trap 'rm -f "$FORMAT_VERSIONS"' EXIT
-./scripts/lib/format-floor-gate.sh "$FORMAT_FLOOR" "$FORMAT_VERSIONS"
+./scripts/lib/format-floor-gate.sh "$FORMAT_VERSIONS"
 
 # Unfiltered and unpiped: this script's refusals must reach the terminal. The
 # fleet lost a refusal twice by sending it through a filter whose exit code
@@ -199,7 +186,6 @@ echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
 echo "    reads:       $(cat "$STAGE/format-versions.json")  ($CARD.format-versions.json beside the card)"
-echo "    floor:       $FORMAT_FLOOR"
 echo
 echo "Place engram-catalog.json into the module data directory"
 echo "(~/.local/share/cortexkit/cerebellum/) alongside the binary placement, or"

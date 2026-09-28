@@ -2840,6 +2840,13 @@ mod startup_reconciliation_tests {
             })? = state.clone();
             Ok(())
         }
+
+        fn raise_format(
+            &self,
+            _format: cerebellum_core::format_floor::DurableFormat,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
     }
 
     fn custody() -> CaptureCustody {

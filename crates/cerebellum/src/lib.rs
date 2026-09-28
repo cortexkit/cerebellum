@@ -2208,6 +2208,16 @@ impl cerebellum_core::journal::JournalStorage for PlaneJournalStorage {
             Self::InMemory(storage) => storage.save(state),
         }
     }
+
+    fn raise_format(
+        &self,
+        format: cerebellum_core::format_floor::DurableFormat,
+    ) -> Result<(), cerebellum_core::journal::StorageError> {
+        match self {
+            Self::Filesystem(storage) => storage.raise_format(format),
+            Self::InMemory(storage) => storage.raise_format(format),
+        }
+    }
 }
 
 impl Planes {

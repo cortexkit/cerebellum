@@ -69,6 +69,10 @@ impl PlaneJournalCodec for AccountingCodec {
     ) -> Result<EncodedJournalState, cerebellum_core::journal::JournalCodecError> {
         Ok(Self::encoded("recovered", input.action_obligation_id))
     }
+
+    fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
+        None
+    }
 }
 
 fn identity() -> JournalIdentity {

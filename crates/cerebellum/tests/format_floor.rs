@@ -374,10 +374,11 @@ const ISOLATED_CHILD: &str = "CEREBELLUM_FORMAT_FLOOR_ISOLATED_CHILD";
 /// Isolated and in-memory stores never create or read the operator's floor.
 ///
 /// The child runs with its data home pointed at a scratch directory whose
-/// floor file is a DIRECTORY: reading or rewriting it fails, so any store
-/// that touched it would fail its write. A durable journal under that data
-/// home is written last as the control, and must fail, which shows the
-/// planted floor is where the operator's floor resolves.
+/// floor files (one per data tree) are DIRECTORIES: reading or rewriting one
+/// fails, so any store that touched it would fail its write. A durable
+/// journal under that data home is written last as the control, and must
+/// fail, which shows the planted journal floor is where the operator's floor
+/// resolves.
 #[test]
 fn isolated_stores_neither_create_nor_read_the_operator_floor() {
     if std::env::var_os(ISOLATED_CHILD).is_some() {
@@ -387,8 +388,10 @@ fn isolated_stores_neither_create_nor_read_the_operator_floor() {
     let scratch = Scratch::new("isolated");
     let data_home = scratch.path().join("data");
     let module = data_home.join("cortexkit").join("cerebellum");
-    let floor = module.join(FORMAT_FLOOR_FILE);
-    fs::create_dir_all(&floor).unwrap();
+    let journal_floor = module.join("journal").join(FORMAT_FLOOR_FILE);
+    let browser_floor = module.join("browser").join(FORMAT_FLOOR_FILE);
+    fs::create_dir_all(&journal_floor).unwrap();
+    fs::create_dir_all(&browser_floor).unwrap();
 
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -417,14 +420,23 @@ fn isolated_stores_neither_create_nor_read_the_operator_floor() {
         "the child ran no test:\n{stdout}"
     );
 
-    let mut entries: Vec<_> = fs::read_dir(&module)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    entries.sort();
-    // Only the planted floor, and the floor's lock left by the control.
-    assert_eq!(entries, [".format-floor.json.lock", FORMAT_FLOOR_FILE]);
-    assert!(fs::read_dir(&floor).unwrap().next().is_none());
+    let entries = |directory: &Path| {
+        let mut names: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    // Only the planted floors, and the journal floor's lock left by the
+    // control.
+    assert_eq!(
+        entries(&module.join("journal")),
+        [".format-floor.json.lock", FORMAT_FLOOR_FILE]
+    );
+    assert_eq!(entries(&module.join("browser")), [FORMAT_FLOOR_FILE]);
+    assert!(entries(&journal_floor).is_empty());
+    assert!(entries(&browser_floor).is_empty());
 }
 
 fn write_through_isolated_stores() {

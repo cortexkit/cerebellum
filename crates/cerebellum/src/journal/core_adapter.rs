@@ -93,6 +93,13 @@ impl PlaneJournalCodec for BrowserJournalCodec {
     ) -> Result<EncodedJournalState, JournalCodecError> {
         Self::encoded(&input.dispatch_material)
     }
+
+    /// Browser entries are carried as opaque bytes and exported as written;
+    /// nothing in this module decodes them again, so no build can fail on a
+    /// newer one and none is floored.
+    fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
+        None
+    }
 }
 
 /// A core binding with no implicit policy fallback.

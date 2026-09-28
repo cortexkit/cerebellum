@@ -36,6 +36,14 @@ struct StoredJournal {
 pub trait JournalStorage: Clone {
     fn load(&self) -> Result<DurableState, StorageError>;
     fn save(&self, state: &DurableState) -> Result<(), StorageError>;
+    /// Raise the format floor governing this storage for a format about to
+    /// be written into it: an entry or attachment format inside the journal.
+    /// A storage with no floor (in memory, or outside the data home) returns
+    /// `Ok` without touching anything.
+    ///
+    /// Required rather than defaulted: a wrapper that forgot to forward it
+    /// would write decoded formats to the operator's disk with no floor.
+    fn raise_format(&self, format: DurableFormat) -> Result<(), StorageError>;
 }
 
 /// A process-independent durable state model for fixtures and compatibility
@@ -70,6 +78,10 @@ impl JournalStorage for InMemoryJournalStorage {
             .map_err(|_| StorageError::LockPoisoned {
                 binding: "in-memory journal".to_string(),
             })
+    }
+
+    fn raise_format(&self, _format: DurableFormat) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 
@@ -371,6 +383,10 @@ fn migrate_byte_field(
 }
 
 impl JournalStorage for FilesystemJournalStorage {
+    fn raise_format(&self, format: DurableFormat) -> Result<(), StorageError> {
+        self.floor.raise(format).map_err(StorageError::FormatFloor)
+    }
+
     fn load(&self) -> Result<DurableState, StorageError> {
         match self.read_existing() {
             Ok(state) => Ok(state),

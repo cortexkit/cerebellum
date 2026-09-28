@@ -182,6 +182,13 @@ impl JournalStorage for FailAfterInitialization {
             })
         }
     }
+
+    fn raise_format(
+        &self,
+        _format: cerebellum_core::format_floor::DurableFormat,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /// The Team ID the fixture application is signed by.

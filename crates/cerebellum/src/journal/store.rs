@@ -63,6 +63,16 @@ impl JournalStorage for BrowserJournalStorage {
             Self::Memory(storage) => storage.save(state),
         }
     }
+
+    fn raise_format(
+        &self,
+        format: cerebellum_core::format_floor::DurableFormat,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Filesystem(storage) => storage.raise_format(format),
+            Self::Memory(storage) => storage.raise_format(format),
+        }
+    }
 }
 
 pub type BrowserCoreStore = JournalBinding<

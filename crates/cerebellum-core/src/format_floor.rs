@@ -18,10 +18,16 @@
 //! - Staging compares the floor file against the versions a build can read,
 //!   and refuses to hand over a build that could not read what is on disk.
 //!
-//! The floor file is `<data home>/cortexkit/cerebellum/format-floor.json`,
-//! shaped `{"version": 1, "floors": {"<format>": <version>, ...}}`. Floors
-//! only ever rise: a lowered floor would let staging pass a build that cannot
-//! read a record some other build already wrote.
+//! There is one floor file per data tree the module keeps, inside that tree:
+//! `<data home>/cortexkit/cerebellum/journal/format-floor.json` for the
+//! journals and the grant store, `.../browser/format-floor.json` for the
+//! profile registry and custody locks. Each sits inside the tree it governs
+//! because the trees are backed up separately (the journal travels between
+//! machines, the browser profiles stay on theirs), and a floor must arrive
+//! wherever its records do. Each is shaped
+//! `{"version": 1, "floors": {"<format>": <version>, ...}}`. Floors only ever
+//! rise: a lowered floor would let staging pass a build that cannot read a
+//! record some other build already wrote.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,8 +39,12 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-/// The floor file's name, directly under the module's data directory.
+/// The floor file's name, directly inside each data tree it governs.
 pub const FORMAT_FLOOR_FILE: &str = "format-floor.json";
+
+/// The data trees under the module's directory that each keep a floor: every
+/// durable store this module writes to the operator's disk lives in one.
+pub const FLOOR_TREES: [&str; 2] = ["journal", "browser"];
 
 /// The floor file's own format. It is read by staging as well as by the
 /// module, so it is versioned and refused by name like every other record.
@@ -132,7 +142,7 @@ fn tag_family_version(found_tag: &str, current_tag: &str) -> Option<u64> {
 ///
 /// The remedy is to run a build that reads it, not to repair or delete the
 /// record, which is why this is never reported as corruption.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewerWriter {
     pub format: &'static str,
     pub found: u64,
@@ -247,10 +257,18 @@ pub fn read_floors(path: &Path) -> Result<BTreeMap<String, u64>, FloorError> {
     Ok(document.floors)
 }
 
-/// The module's data directory under a data home, where the floor file and
-/// every durable store this module writes to the operator's disk live.
+/// The module's data directory under a data home, holding every data tree
+/// this module writes to the operator's disk.
 pub fn module_directory(data_home: &Path) -> PathBuf {
     data_home.join("cortexkit").join("cerebellum")
+}
+
+/// The floor file for one data tree (one of [`FLOOR_TREES`]) under a data
+/// home.
+pub fn floor_path(data_home: &Path, tree: &str) -> PathBuf {
+    module_directory(data_home)
+        .join(tree)
+        .join(FORMAT_FLOOR_FILE)
 }
 
 /// Where a durable writer records the formats it has put on disk.
@@ -335,8 +353,8 @@ impl FormatFloor {
     }
 
     /// The floor that governs a store at `store_path`: the operator's floor
-    /// file when the store lives under the module's data directory, and an
-    /// isolated floor otherwise.
+    /// file of the data tree the store lives in, and an isolated floor for a
+    /// store in none of them.
     ///
     /// Chosen from where the store is rather than by each caller, because a
     /// production store that forgot to name its floor would write a newer
@@ -354,16 +372,19 @@ impl FormatFloor {
             return Self::isolated();
         };
         let module = module_directory(data_home);
-        // Also compared canonically: a store opened through its canonical
-        // path (the profile registry holds its root that way) is still under
-        // a data home reached through a symlink.
-        let inside = store_path.starts_with(&module)
-            || fs::canonicalize(&module).is_ok_and(|canonical| store_path.starts_with(canonical));
-        if inside {
-            Self::shared(module.join(FORMAT_FLOOR_FILE))
-        } else {
-            Self::isolated()
+        for tree in FLOOR_TREES {
+            let tree_directory = module.join(tree);
+            // Also compared canonically: a store opened through its canonical
+            // path (the profile registry holds its root that way) is still
+            // under a data home reached through a symlink.
+            let inside = store_path.starts_with(&tree_directory)
+                || fs::canonicalize(&tree_directory)
+                    .is_ok_and(|canonical| store_path.starts_with(canonical));
+            if inside {
+                return Self::shared(tree_directory.join(FORMAT_FLOOR_FILE));
+            }
         }
+        Self::isolated()
     }
 
     /// The file this floor writes, or `None` for an isolated floor.
@@ -661,22 +682,41 @@ mod tests {
     }
 
     #[test]
-    fn only_a_store_under_the_module_directory_is_governed_by_the_operator_floor() {
+    fn each_data_tree_is_governed_by_the_floor_inside_it() {
         let scratch = Scratch::new("governing");
         let data_home = scratch.0.join("data");
         let module = module_directory(&data_home);
 
-        let governed = FormatFloor::governing_under(
-            &module.join("journal").join("browser.json"),
-            Some(&data_home),
-        );
+        for (store, tree) in [
+            (module.join("journal").join("browser.json"), "journal"),
+            (
+                module.join("journal").join("computer_grants.json"),
+                "journal",
+            ),
+            // The profile registry's root is the tree directory itself.
+            (module.join("browser"), "browser"),
+            (
+                module.join("browser").join(".ck-browser-profile-custody"),
+                "browser",
+            ),
+        ] {
+            assert_eq!(
+                FormatFloor::governing_under(&store, Some(&data_home)).path(),
+                Some(floor_path(&data_home, tree).as_path()),
+                "{}",
+                store.display()
+            );
+        }
         assert_eq!(
-            governed.path(),
-            Some(module.join(FORMAT_FLOOR_FILE).as_path())
+            floor_path(&data_home, "journal"),
+            module.join("journal").join(FORMAT_FLOOR_FILE)
         );
 
         for elsewhere in [
             scratch.0.join("fixture").join("browser.json"),
+            // Under the module but in no data tree.
+            module.join("x.json"),
+            module.join("journal-other").join("x.json"),
             data_home.join("cortexkit").join("other").join("x.json"),
             PathBuf::from("relative").join("browser.json"),
         ] {
@@ -688,7 +728,7 @@ mod tests {
             );
         }
         assert_eq!(
-            FormatFloor::governing_under(&module.join("x.json"), None).path(),
+            FormatFloor::governing_under(&module.join("journal").join("x.json"), None).path(),
             None
         );
         // Choosing which floor governs a path creates nothing on disk.
@@ -699,13 +739,13 @@ mod tests {
     fn stores_governed_by_one_file_share_what_was_raised() {
         let scratch = Scratch::new("shared");
         let data_home = scratch.0.join("data");
-        let module = module_directory(&data_home);
-        let first = FormatFloor::governing_under(&module.join("a.json"), Some(&data_home));
+        let journal = module_directory(&data_home).join("journal");
+        let first = FormatFloor::governing_under(&journal.join("a.json"), Some(&data_home));
         first.raise(ALPHA).unwrap();
-        fs::remove_file(module.join(FORMAT_FLOOR_FILE)).unwrap();
-        let second = FormatFloor::governing_under(&module.join("b.json"), Some(&data_home));
+        fs::remove_file(journal.join(FORMAT_FLOOR_FILE)).unwrap();
+        let second = FormatFloor::governing_under(&journal.join("b.json"), Some(&data_home));
         second.raise(ALPHA).unwrap();
-        assert!(!module.join(FORMAT_FLOOR_FILE).exists());
+        assert!(!journal.join(FORMAT_FLOOR_FILE).exists());
     }
 
     #[test]

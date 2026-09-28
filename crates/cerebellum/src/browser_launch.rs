@@ -732,6 +732,15 @@ pub enum BrowserLaunchRecoveryFailure {
     InvalidIntent {
         sequence: u64,
     },
+    /// An active record (its intent, or a clear attached to it) was written by
+    /// a newer build. Recovery stops before acting on any record: this build
+    /// cannot tell whether that launch's browser is still running, so it must
+    /// neither reap it nor release its profile, nor consume the record the
+    /// newer build needs.
+    NewerWriter {
+        sequence: u64,
+        newer: cerebellum_core::format_floor::NewerWriter,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1175,7 +1184,27 @@ impl LaunchJournalCodec {
     }
 }
 
+/// The launch journal's entry format. Every launch entry carries this codec
+/// version, and startup recovery decodes the intent and attestation by it.
+pub const LAUNCH_ENTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new(
+        "launch-attestation",
+        cerebellum_core::format_floor::tag_version(LAUNCH_CODEC_VERSION),
+    );
+
+/// The format of an operator's recovery clear, attached to a launch record
+/// and read back by startup recovery.
+pub const LAUNCH_RECOVERY_CLEAR_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new(
+        "launch-recovery-clear",
+        cerebellum_core::format_floor::tag_version(RECOVERY_CLEAR_FORMAT_VERSION),
+    );
+
 impl PlaneJournalCodec for LaunchJournalCodec {
+    fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
+        Some(LAUNCH_ENTRY_FORMAT)
+    }
+
     fn encode_provisional(
         &self,
         input: &ProvisionalInput,
@@ -1354,6 +1383,9 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
             .active_reservation_handle(record.sequence)
             .ok_or(CoreJournalError::ObligationUnknown)?;
         let bytes = serde_json::to_vec(record).map_err(|_| CoreJournalError::CodecFailed)?;
+        // A clear is its own format inside the entry, read back by recovery,
+        // so its floor is raised before the first one is written.
+        self.core.raise_format_floor(LAUNCH_RECOVERY_CLEAR_FORMAT)?;
         self.core
             .attach_obligation_material(handle, RECOVERY_CLEAR_SLOT, 0, bytes)
             .map(|_| ())
@@ -1383,6 +1415,7 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                 .core
                 .read_obligation_audit(sequence)
                 .map_err(|_| BrowserLaunchRecoveryFailure::JournalRead { sequence })?;
+            refuse_newer_launch_record(sequence, &audit)?;
             let intent = serde_json::from_slice::<AuthorizedLaunchIntent>(&audit.descriptor_bytes)
                 .ok()
                 .filter(|intent| match intent.format_version.as_str() {
@@ -1472,6 +1505,49 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
             }))
         }
     }
+}
+
+/// Refuse, by name, an active launch record a newer build wrote: its entry,
+/// its intent, or a recovery clear attached to it.
+///
+/// Checked before the intent is parsed, because a newer intent may not parse
+/// at all. Without this a newer intent read as "no intent this module wrote",
+/// and recovery consumed the record: the launch it described vanished from
+/// the journal while its browser might still be running on that profile.
+fn refuse_newer_launch_record(
+    sequence: u64,
+    audit: &cerebellum_core::journal::ObligationAuditRecord,
+) -> Result<(), BrowserLaunchRecoveryFailure> {
+    let refuse = |newer| BrowserLaunchRecoveryFailure::NewerWriter { sequence, newer };
+    let version_of = |bytes: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    };
+    LAUNCH_ENTRY_FORMAT
+        .refuse_newer_tag(&audit.codec_id, LAUNCH_CODEC_VERSION)
+        .map_err(refuse)?;
+    if let Some(found) = version_of(&audit.descriptor_bytes) {
+        LAUNCH_ENTRY_FORMAT
+            .refuse_newer_tag(&found, LAUNCH_CODEC_VERSION)
+            .map_err(refuse)?;
+    }
+    if let Some(found) = audit
+        .attachment_slots
+        .iter()
+        .find(|attachment| attachment.slot == RECOVERY_CLEAR_SLOT)
+        .and_then(|attachment| version_of(&attachment.opaque_bytes))
+    {
+        LAUNCH_RECOVERY_CLEAR_FORMAT
+            .refuse_newer_tag(&found, RECOVERY_CLEAR_FORMAT_VERSION)
+            .map_err(refuse)?;
+    }
+    Ok(())
 }
 
 /// Reclaim every launch record left active by an earlier module process.
@@ -3751,6 +3827,140 @@ mod tests {
         assert!(custody.releases.is_empty());
         assert_eq!(custody.retains, vec!["holder-1"]);
         assert_still_active(&journal, sequence);
+    }
+
+    /// An intent from the next codec version is a launch this build cannot
+    /// judge: its browser may still be running. Recovery refuses it by name
+    /// and acts on nothing -- no signal, no custody change, and the record
+    /// stays for the build that wrote it. Read as "not an intent this module
+    /// wrote", it was consumed instead, and the launch vanished.
+    #[test]
+    fn an_intent_from_a_newer_build_fails_recovery_closed_by_name() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let next = format!(
+            "ck-browser-launch-attestation/v{}",
+            LAUNCH_ENTRY_FORMAT.version + 1
+        );
+        let (sequence, _) = dispatch_attempt_as(&mut original, &request(), &next, None);
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(Some(sequence)), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+
+        let outcome = recover_browser_launches(&mut journal, &mut process, &mut custody);
+
+        assert_eq!(
+            outcome,
+            Err(BrowserLaunchRecoveryFailure::NewerWriter {
+                sequence,
+                newer: cerebellum_core::format_floor::NewerWriter {
+                    format: "launch-attestation",
+                    found: LAUNCH_ENTRY_FORMAT.version + 1,
+                    supported: LAUNCH_ENTRY_FORMAT.version,
+                },
+            })
+        );
+        assert_eq!(process.observation_calls, 0);
+        assert_eq!(process.termination_calls, 0);
+        assert!(custody.releases.is_empty());
+        assert!(custody.retains.is_empty());
+        assert_still_active(&journal, sequence);
+    }
+
+    /// A recovery clear from a newer build is refused the same way, rather
+    /// than ignored as a clear that names some other record.
+    #[test]
+    fn a_recovery_clear_from_a_newer_build_fails_recovery_closed_by_name() {
+        let storage = InMemoryJournalStorage::new();
+        let mut original = reopened_dispatched_journal(storage.clone());
+        let (sequence, attestation) = dispatch_attempt(&mut original, &request());
+        let mut clear = LaunchRecoveryClearRecord::new(
+            sequence,
+            &attestation.generation.intent,
+            RecoveryPendingReason::AttestationUntrusted,
+            "ask-1",
+        );
+        clear.format_version = format!(
+            "ck-browser-launch-recovery-clear/v{}",
+            LAUNCH_RECOVERY_CLEAR_FORMAT.version + 1
+        );
+        original
+            .record_recovery_clear(&clear)
+            .expect("record clear");
+        drop(original);
+        let mut journal = reopened_dispatched_journal(storage);
+        let events = Events::new();
+        let mut process = RecordingOrphanProcess::new(Ok(Some(sequence)), events.clone());
+        let mut custody = RecordingOrphanCustody::new(events);
+
+        let outcome = recover_browser_launches(&mut journal, &mut process, &mut custody);
+
+        assert_eq!(
+            outcome,
+            Err(BrowserLaunchRecoveryFailure::NewerWriter {
+                sequence,
+                newer: cerebellum_core::format_floor::NewerWriter {
+                    format: "launch-recovery-clear",
+                    found: LAUNCH_RECOVERY_CLEAR_FORMAT.version + 1,
+                    supported: LAUNCH_RECOVERY_CLEAR_FORMAT.version,
+                },
+            })
+        );
+        assert_eq!(process.termination_calls, 0);
+        assert!(custody.releases.is_empty());
+        assert_still_active(&journal, sequence);
+    }
+
+    /// Launch entries and recovery clears raise their own floors before the
+    /// first of each is written.
+    #[test]
+    fn launch_entries_and_clears_raise_their_floors_before_writing() {
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-launch-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let floor = directory.join("format-floor.json");
+        let storage =
+            cerebellum_core::journal::FilesystemJournalStorage::new(directory.join("launch.json"))
+                .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(&floor));
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            storage,
+        )
+        .unwrap();
+        let floors = || cerebellum_core::format_floor::read_floors(&floor).unwrap();
+        assert_eq!(floors().get("launch-attestation"), None);
+
+        let intent = request().durable_intent();
+        let handle = journal.record_intent(&intent).expect("record intent");
+        assert_eq!(
+            floors().get("launch-attestation"),
+            Some(&LAUNCH_ENTRY_FORMAT.version)
+        );
+        assert_eq!(floors().get("launch-recovery-clear"), None);
+
+        let clear = LaunchRecoveryClearRecord::new(
+            handle.sequence(),
+            &intent,
+            RecoveryPendingReason::AttestationUntrusted,
+            "ask-1",
+        );
+        journal.record_recovery_clear(&clear).expect("record clear");
+        assert_eq!(
+            floors().get("launch-recovery-clear"),
+            Some(&LAUNCH_RECOVERY_CLEAR_FORMAT.version)
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A live orphan per attempt whose kill fails only for one chosen

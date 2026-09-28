@@ -125,6 +125,15 @@ pub trait PlaneJournalCodec {
         &self,
         input: &RecoveryTerminalInput,
     ) -> Result<EncodedJournalState, JournalCodecError>;
+
+    /// The format of the entries this codec writes, when a reader in this
+    /// module decodes them again, so the lifecycle raises its floor before
+    /// every write. `None` for entries nothing reads back: no build can fail
+    /// on them, so no build should be refused over them.
+    ///
+    /// Required rather than defaulted, so a new codec states which it is
+    /// instead of silently writing a decoded format with no floor.
+    fn entry_format(&self) -> Option<crate::format_floor::DurableFormat>;
 }
 
 impl<T: PlaneJournalCodec + ?Sized> PlaneJournalCodec for Box<T> {
@@ -168,5 +177,9 @@ impl<T: PlaneJournalCodec + ?Sized> PlaneJournalCodec for Box<T> {
         input: &RecoveryTerminalInput,
     ) -> Result<EncodedJournalState, JournalCodecError> {
         (**self).encode_recovery_terminal(input)
+    }
+
+    fn entry_format(&self) -> Option<crate::format_floor::DurableFormat> {
+        (**self).entry_format()
     }
 }

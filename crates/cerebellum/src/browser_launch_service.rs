@@ -4901,6 +4901,14 @@ mod launch_refusal_schema_tests {
             BrowserLaunchRecoveryFailure::ProfileCustodyRelease { sequence: 7 },
             BrowserLaunchRecoveryFailure::ProfileCustodyRetain { sequence: 7 },
             BrowserLaunchRecoveryFailure::InvalidIntent { sequence: 7 },
+            BrowserLaunchRecoveryFailure::NewerWriter {
+                sequence: 7,
+                newer: cerebellum_core::format_floor::NewerWriter {
+                    format: "launch-attestation",
+                    found: 6,
+                    supported: 5,
+                },
+            },
         ];
         for failure in failures {
             match failure {
@@ -4909,7 +4917,8 @@ mod launch_refusal_schema_tests {
                 | BrowserLaunchRecoveryFailure::JournalTerminalization
                 | BrowserLaunchRecoveryFailure::ProfileCustodyRelease { .. }
                 | BrowserLaunchRecoveryFailure::ProfileCustodyRetain { .. }
-                | BrowserLaunchRecoveryFailure::InvalidIntent { .. } => {}
+                | BrowserLaunchRecoveryFailure::InvalidIntent { .. }
+                | BrowserLaunchRecoveryFailure::NewerWriter { .. } => {}
             }
             assert_declared(&launch_recovery_refusal(failure));
         }

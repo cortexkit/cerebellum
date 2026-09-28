@@ -1100,6 +1100,64 @@ fn crash_orphaned_capture_is_finalized_by_startup_reconciliation() {
 /// module would refuse to start on any machine that had ever clicked. The
 /// orphaned entries matter most: startup reconciliation must decode their
 /// descriptors to settle them, which is the path that fails first.
+/// Entries a newer build wrote are refused by name before reconciliation
+/// settles, reads or sweeps anything: acting on records this build cannot
+/// read could destroy captures the newer build still holds.
+#[test]
+fn a_journal_holding_newer_entries_is_refused_by_name_and_left_untouched() {
+    let current = cerebellum_computer::audit::COMPUTER_JOURNAL_CODEC_VERSION;
+    let next = format!(
+        "ck-computer-journal/v{}",
+        cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version + 1
+    );
+    let fixture = String::from_utf8(include_bytes!("fixtures/v12_computer_journal.json").to_vec())
+        .unwrap()
+        .replace(current, &next);
+    assert!(fixture.contains(&next));
+    let path = std::env::temp_dir().join(format!(
+        "cerebellum-newer-computer-journal-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, &fixture).unwrap();
+    let custody = CaptureCustody::new(
+        bounds(),
+        InMemoryGrantAuthority::default(),
+        InMemoryCustodyStorage::new(),
+    )
+    .unwrap();
+    let mut audit = ComputerAudit::new(
+        ExcludeApplicationText,
+        cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+        JournalConfig {
+            journal_retention_bytes: 8 * 1024 * 1024,
+            journal_max_entry_bytes: 64 * 1024,
+        },
+        cerebellum_core::journal::FilesystemJournalStorage::new(path.clone()),
+        custody,
+    )
+    .expect("the journal container is current, so it binds");
+
+    let reconciled = audit.startup_reconcile(10);
+    let after = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        reconciled,
+        Err(ComputerAuditError::NewerWriter(
+            cerebellum_core::format_floor::NewerWriter {
+                format: "computer-journal-entry",
+                found: cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version + 1,
+                supported: cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version,
+            }
+        ))
+    );
+    assert_eq!(after, fixture, "reconciliation rewrote a newer journal");
+}
+
 #[test]
 fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup() {
     const FIXTURE: &[u8] = include_bytes!("fixtures/v12_computer_journal.json");
