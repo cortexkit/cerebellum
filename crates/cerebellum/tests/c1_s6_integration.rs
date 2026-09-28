@@ -21,6 +21,8 @@ fn valid_inputs() -> ComputerReleaseInputs {
         capture_review_revision: Some("fixture-capture-review-v1".into()),
         semantic_actuation_review_revision: Some("fixture-semantic-actuation-review-v1".into()),
         app_state_review_revision: Some("fixture-app-state-review-v1".into()),
+        element_addressed_review_revision: Some("fixture-element-addressed-review-v1".into()),
+        takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review-v1".into()),
         windows_actuation_review_revision: Some("fixture-windows-actuation-review-v1".into()),
         release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
         vocabulary_digests: VocabularyDigestInputs {
@@ -107,8 +109,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
 
-    // Complete release identifiers with every permission live admit the two
-    // keystroke rows and wait: the only rows with a wire handler. This was
+    // Complete release identifiers with every permission live admit every row
+    // with a wire handler: the state read, the element presses and write, the
+    // two keystroke rows and wait. This was
     // originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
@@ -119,6 +122,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         available_capabilities(&context),
         vec![
             "computer.read_state",
+            "computer.press_element",
+            "computer.press_point",
+            "computer.write_text",
             "computer.type",
             "computer.keys",
             "computer.wait"
@@ -129,6 +135,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         if cfg!(target_os = "macos") {
             vec![
                 "computer.read_state",
+                "computer.press_element",
+                "computer.press_point",
+                "computer.write_text",
                 "computer.type",
                 "computer.keys",
                 "computer.wait",
@@ -155,9 +164,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. It is PARTIAL: the state read, the keystroke rows and wait are
-    // served, while the element actions and pointer rows have no wire handler
-    // yet.
+    // admit. It is PARTIAL: the state read, the element actions, the keystroke
+    // rows and wait are served, while the takeover pointer rows have no wire
+    // handler yet.
     //
     // PARTIAL rather than EMPTY is a release-visible claim: it says a caller can
     // act on the computer plane rather than only read its declarations. Changing
@@ -172,6 +181,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         if cfg!(target_os = "macos") {
             vec![
                 "computer.read_state",
+                "computer.press_element",
+                "computer.press_point",
+                "computer.write_text",
                 "computer.type",
                 "computer.keys",
                 "computer.wait",
@@ -179,7 +191,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         } else {
             vec!["computer.wait"]
         },
-        "the advertised set is no longer exactly the state read, the keystroke rows and wait"
+        "the advertised set is no longer exactly the state read, the element actions, the \
+         keystroke rows and wait"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -231,15 +244,19 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
     assert!(offered.contains("computer.type"), "{offered:?}");
     assert!(offered.contains("computer.keys"), "{offered:?}");
     assert!(offered.contains("computer.read_state"), "{offered:?}");
+    for served in [
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+    ] {
+        assert!(offered.contains(served), "{served} was not offered: {offered:?}");
+    }
     for never in [
         "computer.click",
         "computer.screenshot",
         "computer.move",
         "computer.drag",
         "computer.scroll",
-        "computer.press_element",
-        "computer.press_point",
-        "computer.write_text",
         "computer.takeover_move",
         "computer.takeover_drag",
         "computer.takeover_scroll",
@@ -392,7 +409,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 12],
+        vec![ComputerGateOutcome::Pass; 14],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -405,6 +422,8 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "semantic_actuation_review_revision",
         "windows_actuation_review_revision",
         "app_state_review_revision",
+        "element_addressed_review_revision",
+        "takeover_dispatch_review_revision",
         "release_signing_topology_revision",
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
@@ -423,6 +442,8 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             }
             "windows_actuation_review_revision" => inputs.windows_actuation_review_revision = None,
             "app_state_review_revision" => inputs.app_state_review_revision = None,
+            "element_addressed_review_revision" => inputs.element_addressed_review_revision = None,
+            "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision = None,
             "release_signing_topology_revision" => inputs.release_signing_topology_revision = None,
             "vocabulary_manifest_digest" => inputs.vocabulary_digests.manifest_digest = None,
             "vocabulary_source_lock_digest" => inputs.vocabulary_digests.source_lock_digest = None,
@@ -457,7 +478,13 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             | "input_review_revision" => {
                 assert_eq!(
                     admitted,
-                    vec!["computer.read_state", "computer.wait"],
+                    vec![
+                        "computer.read_state",
+                        "computer.press_element",
+                        "computer.press_point",
+                        "computer.write_text",
+                        "computer.wait"
+                    ],
                     "{gate} governs the keystroke rows"
                 )
             }
@@ -468,8 +495,33 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             ),
             "app_state_review_revision" => assert_eq!(
                 admitted,
-                vec!["computer.type", "computer.keys", "computer.wait"],
+                vec![
+                    "computer.press_element",
+                    "computer.press_point",
+                    "computer.write_text",
+                    "computer.type",
+                    "computer.keys",
+                    "computer.wait"
+                ],
                 "{gate} governs the state read alone"
+            ),
+            "element_addressed_review_revision" => assert_eq!(
+                admitted,
+                vec![
+                    "computer.read_state",
+                    "computer.type",
+                    "computer.keys",
+                    "computer.wait"
+                ],
+                "{gate} governs the element presses and writes alone"
+            ),
+            // The fronting bracket is gated where it is served, not where the
+            // keystroke rows are advertised: without it they still serve a
+            // frontmost target.
+            "takeover_dispatch_review_revision" => assert_eq!(
+                admitted,
+                available_capabilities(&complete),
+                "{gate} withholds no advertised row"
             ),
             // No served row is reviewed under these any more, so withholding
             // one withholds nothing.
@@ -528,8 +580,9 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
 
 /// With every other release input and permission live, the missing
 /// global-dispatch review withholds nothing: no served row posts globally.
-/// The pointer rows it used to govern are gone, and the rows that replace them
-/// have no wire handler, so they are withheld whether it is bound or not.
+/// The pointer rows it used to govern are gone, and the takeover rows that
+/// replace them have no wire handler, so they are withheld whether it is bound
+/// or not.
 #[test]
 fn global_dispatch_review_gate_governs_no_served_row() {
     let mut inputs = valid_inputs();
@@ -544,6 +597,9 @@ fn global_dispatch_review_gate_governs_no_served_row() {
         available_capabilities(&context),
         vec![
             "computer.read_state",
+            "computer.press_element",
+            "computer.press_point",
+            "computer.write_text",
             "computer.type",
             "computer.keys",
             "computer.wait"

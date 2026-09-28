@@ -31,8 +31,8 @@ use cerebellum_core::journal::{
 };
 use serde_json::{json, Value};
 use support::computer::{
-    audit, grant, granted_management, identity, management, no_relay, TestRedactor, GRANTEE,
-    TARGET_BUNDLE_ID,
+    audit, focused_text_desk, grant, granted_management, identity, management, no_relay,
+    TestRedactor, GRANTEE, TARGET_BUNDLE_ID,
 };
 
 /// One synthetic dispatch the platform driver was asked to perform.
@@ -230,8 +230,12 @@ type TestPlane = ComputerPlane<
     SyntheticDriver,
 >;
 
+/// A plane whose target application is frontmost with a plain text field
+/// focused, so the keystroke rows' secure-field check and frontmost check
+/// both pass and a dispatch reaches the driver.
 fn plane_with(shared: &Arc<Mutex<Shared>>) -> TestPlane {
     ComputerPlane::with_synthetic_driver(audit(), SyntheticDriver::factory(Arc::clone(shared)))
+        .with_app_state_source(focused_text_desk().source())
 }
 
 /// Snapshot the dispatch calls made so far, without holding the lock into an
@@ -274,10 +278,11 @@ fn keys_request(keys: &[&str]) -> Value {
     json!({"keys": keys, "target": TARGET_BUNDLE_ID})
 }
 
-/// Typing reaches the named application's process generation and reports structural
-/// containment even when the target process is not frontmost.
+/// Typing reaches the named application's process generation and reports
+/// structural containment, and a post that nothing confirmed arrived is
+/// reported as unconfirmed delivery, with the diff that followed it.
 #[tokio::test]
-async fn computer_type_reports_pid_structural_for_an_unfocused_target() {
+async fn computer_type_reports_pid_structural_and_unconfirmed_delivery() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
@@ -289,10 +294,14 @@ async fn computer_type_reports_pid_structural_for_an_unfocused_target() {
     assert_eq!(
         reply,
         json!({
-            "outcome": "completed",
+            "outcome": "delivery_unconfirmed",
             "containment_rung": "pid_structural",
             "target_fronted": false,
             "effect_status": "effect_indeterminate",
+            "changed": [],
+            "added": [],
+            "removed": [],
+            "unreadable_subtrees": 0,
         })
     );
     let calls = dispatched_calls(&shared);
@@ -329,7 +338,7 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
     )
     .await;
 
-    assert_eq!(reply["outcome"], "completed");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed");
     let calls = dispatched_calls(&shared);
     let [DispatchedCall::PerPid(request)] = &calls[..] else {
         panic!("keys must deliver per-process exactly once: {calls:?}");
@@ -528,7 +537,7 @@ async fn session_floor_leaves_command_near_misses_grantable() {
         .await;
         assert_eq!(
             reply["outcome"],
-            "completed",
+            "delivery_unconfirmed",
             "{} was blocked",
             keys.join("+")
         );
@@ -628,7 +637,7 @@ async fn a_command_chord_is_admitted_by_the_app_grant() {
         &clock,
     )
     .await;
-    assert_eq!(reply["outcome"], "completed");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed");
     let calls = dispatched_calls(&shared);
     let [DispatchedCall::PerPid(request)] = &calls[..] else {
         panic!("the durable chord did not dispatch: {calls:?}");
@@ -763,7 +772,8 @@ async fn typed_text_never_reaches_the_journal() {
     let plane = ComputerPlane::with_synthetic_driver(
         support::computer::audit_with_storage(storage.clone()),
         SyntheticDriver::factory(Arc::clone(&shared)),
-    );
+    )
+    .with_app_state_source(focused_text_desk().source());
     let clock = FakeClock::new();
     let management = granted_management().await;
 
@@ -775,7 +785,7 @@ async fn typed_text_never_reaches_the_journal() {
         &clock,
     )
     .await;
-    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     assert!(
         plane.journal_entry_count().await > 0,
         "the action must be journaled, or this test proves nothing"

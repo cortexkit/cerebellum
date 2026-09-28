@@ -148,9 +148,12 @@ type TestPlane = ComputerPlane<
     CountingDriver,
 >;
 
+/// A plane whose target is frontmost with a plain text field focused, so a
+/// keystroke call that is admitted reaches the driver.
 fn plane(driver: &CountingDriver) -> TestPlane {
     let driver = driver.clone();
     ComputerPlane::with_synthetic_driver(audit(), move || driver.clone())
+        .with_app_state_source(support::computer::focused_text_desk().source())
 }
 
 fn caller(conversation: &str, attested: bool) -> GrantCaller {
@@ -279,7 +282,7 @@ async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_re
         ),
         answering
     );
-    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     assert_eq!(
         driver.0.lock().unwrap().len(),
         1,
@@ -302,7 +305,7 @@ async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_re
         asking(&carrier, caller("conversation-1", false)),
     )
     .await;
-    assert_eq!(keys["outcome"], "completed", "{keys}");
+    assert_eq!(keys["outcome"], "delivery_unconfirmed", "{keys}");
     let again = serve(
         &plane,
         "computer.type",
@@ -311,7 +314,7 @@ async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_re
         asking(&carrier, caller("conversation-1", false)),
     )
     .await;
-    assert_eq!(again["outcome"], "completed", "{again}");
+    assert_eq!(again["outcome"], "delivery_unconfirmed", "{again}");
     let waited = serve(
         &plane,
         "computer.wait",
@@ -346,7 +349,7 @@ async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_re
         asking(&carrier, caller("conversation-2", false)),
     )
     .await;
-    assert_eq!(elsewhere["outcome"], "completed", "{elsewhere}");
+    assert_eq!(elsewhere["outcome"], "delivery_unconfirmed", "{elsewhere}");
     assert_eq!(
         carrier.questions().len(),
         2,
@@ -401,7 +404,7 @@ async fn an_unanswered_wait_is_consent_pending_and_a_later_answer_still_grants()
         asking(&carrier, caller("conversation-1", false)),
     )
     .await;
-    assert_eq!(retried["outcome"], "completed", "{retried}");
+    assert_eq!(retried["outcome"], "delivery_unconfirmed", "{retried}");
     assert_eq!(carrier.questions().len(), 1, "the retry asked again");
 }
 
@@ -660,7 +663,7 @@ async fn a_failed_always_write_grants_the_conversation_and_says_so() {
         asking(&carrier, caller("conversation-1", true)),
     )
     .await;
-    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     assert_eq!(reply["grant_persisted"], false, "{reply}");
     assert_eq!(reply["reason"], "grant_store_write_failed", "{reply}");
     assert_eq!(driver.0.lock().unwrap().len(), 1);
@@ -673,7 +676,7 @@ async fn a_failed_always_write_grants_the_conversation_and_says_so() {
         asking(&carrier, caller("conversation-1", true)),
     )
     .await;
-    assert_eq!(again["outcome"], "completed", "{again}");
+    assert_eq!(again["outcome"], "delivery_unconfirmed", "{again}");
     assert!(again.get("grant_persisted").is_none(), "{again}");
     assert_eq!(carrier.questions().len(), 1);
     assert_eq!(management.computer_grants().list()["grants"], json!([]));
@@ -715,7 +718,7 @@ async fn an_always_answer_is_stored_before_the_waiting_call_is_released() {
         asking(&carrier, caller("conversation-1", true)),
     )
     .await;
-    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     assert_eq!(reply["grant_persisted"], true, "{reply}");
     assert_eq!(
         storage.0.load().unwrap().records.len(),
@@ -831,7 +834,10 @@ async fn two_concurrent_calls_raise_exactly_one_question() {
         second["outcome"].as_str().unwrap().to_string(),
     ];
     outcomes.sort();
-    assert_eq!(outcomes, ["completed", "consent_granted_not_executed"]);
+    assert_eq!(
+        outcomes,
+        ["consent_granted_not_executed", "delivery_unconfirmed"]
+    );
     assert_eq!(
         driver.0.lock().unwrap().len(),
         1,

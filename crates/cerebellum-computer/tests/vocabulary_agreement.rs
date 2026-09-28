@@ -478,15 +478,15 @@ fn only_keyboard_rows_claim_background_synthetic_support() {
     assert_eq!(keyboard_rows, 2, "the keyboard rows are not all present");
 }
 
-/// No row claims semantic support while nothing serves a semantic path.
+/// Semantic support is claimed only by the rows something serves it for.
 ///
-/// The press rows name ax_press and write_text names ax_value, and neither is
-/// reachable yet: pressing a retained element and writing an element's value
-/// need a retained-handle store and an attribute-write call the platform layer
-/// does not have. A declaration that mirrored the artifact -- Supported
-/// wherever the row named anything other than none -- would restate what the
-/// row WANTS rather than what the driver can do, which is the same shape as a
-/// frozen column nothing verifies: the claim and its subject never meet.
+/// The press rows name ax_press and write_text names ax_value, and the
+/// application-state reader's element actions serve both, so those three
+/// claim it where the reader exists and nowhere else. A declaration that
+/// mirrored the artifact -- Supported wherever the row named anything other
+/// than none -- would restate what the row WANTS rather than what the driver
+/// can do, which is the same shape as a frozen column nothing verifies: the
+/// claim and its subject never meet.
 ///
 /// Every row is checked against the literal answer, so a row that starts
 /// claiming support fails here by name.
@@ -497,13 +497,30 @@ fn semantic_support_is_claimed_only_where_something_serves_it() {
         permissions: PermissionLivenessReport::default(),
         startup: StartupCapabilityProbe::default(),
     };
+    let served = [
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+    ];
     let declarations = capability_declarations(&context, true);
     assert_eq!(declarations.len(), 10, "every row was checked");
     for declaration in &declarations {
+        let expected = if served.contains(&declaration.capability_id.as_str()) {
+            SupportState::Supported
+        } else {
+            SupportState::Unsupported
+        };
+        assert_eq!(
+            declaration.semantic_path, expected,
+            "{} claims the wrong semantic support",
+            declaration.capability_id
+        );
+    }
+    for declaration in capability_declarations(&context, false) {
         assert_eq!(
             declaration.semantic_path,
             SupportState::Unsupported,
-            "{} claims a semantic path nothing serves",
+            "{} claims a semantic path on a platform with no reader",
             declaration.capability_id
         );
     }
@@ -523,6 +540,8 @@ fn fully_bound_context() -> CapabilityAdvertisementContext {
         capture_review_revision: Some("fixture-capture-review-v1".to_string()),
         semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
         app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
+        element_addressed_review_revision: Some("fixture-element-addressed-review-v1".to_string()),
+        takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review-v1".to_string()),
         windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
         release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
         vocabulary_digests: VocabularyDigestInputs {

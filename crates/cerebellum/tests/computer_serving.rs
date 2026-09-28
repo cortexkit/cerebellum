@@ -53,6 +53,9 @@ fn journal_boot_failure_message_names_its_path_and_typed_cause() {
 fn only_the_capabilities_with_a_wire_handler_are_servable() {
     for (name, capability) in [
         ("computer.read_state", ComputerCapability::ReadState),
+        ("computer.press_element", ComputerCapability::PressElement),
+        ("computer.press_point", ComputerCapability::PressPoint),
+        ("computer.write_text", ComputerCapability::WriteText),
         ("computer.type", ComputerCapability::Type),
         ("computer.keys", ComputerCapability::Keys),
         ("computer.wait", ComputerCapability::Wait),
@@ -69,9 +72,6 @@ fn only_the_capabilities_with_a_wire_handler_are_servable() {
         "computer.move",
         "computer.drag",
         "computer.scroll",
-        "computer.press_element",
-        "computer.press_point",
-        "computer.write_text",
         "computer.takeover_move",
         "computer.takeover_drag",
         "computer.takeover_scroll",

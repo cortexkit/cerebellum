@@ -755,9 +755,13 @@ impl WindowsPlatformDriver {
                         None
                     };
                 }
-                // The application-state reader is macOS accessibility; Windows
-                // has none, and the Windows review never covered it.
-                "computer.read_state" => {
+                // The application-state reader, and the element presses and
+                // writes built on it, are macOS accessibility; Windows has
+                // none of them, and the Windows review never covered them.
+                "computer.read_state"
+                | "computer.press_element"
+                | "computer.press_point"
+                | "computer.write_text" => {
                     declaration.advertised = false;
                     declaration.suppression_reason =
                         Some("no application-state reader on Windows".to_owned());
@@ -1120,6 +1124,8 @@ mod tests {
             capture_review_revision: Some("fixture-capture".to_owned()),
             semantic_actuation_review_revision: Some("fixture-macos-semantic".to_owned()),
             app_state_review_revision: Some("fixture-app-state-review".to_owned()),
+            element_addressed_review_revision: Some("fixture-element-addressed-review".to_owned()),
+            takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review".to_owned()),
             windows_actuation_review_revision: Some("fixture-windows-actuation".to_owned()),
             release_signing_topology_revision: Some("fixture-signing".to_owned()),
             vocabulary_digests: VocabularyDigestInputs {
@@ -1479,8 +1485,13 @@ mod tests {
             .iter()
             .all(
                 |declaration| declaration.capability_id != "computer.screenshot"
-                    && !(declaration.capability_id == "computer.read_state"
-                        && declaration.advertised)
+                    && !(matches!(
+                        declaration.capability_id.as_str(),
+                        "computer.read_state"
+                            | "computer.press_element"
+                            | "computer.press_point"
+                            | "computer.write_text"
+                    ) && declaration.advertised)
             ));
     }
 }

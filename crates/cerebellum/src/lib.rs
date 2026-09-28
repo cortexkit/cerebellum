@@ -212,7 +212,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 20] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 22] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -255,6 +255,14 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 20] = [
     },
     ComputerReleaseGate {
         name: "app_state_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "element_addressed_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "takeover_dispatch_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     ComputerReleaseGate {
@@ -391,6 +399,8 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         }
         "windows_actuation_review_revision" => inputs.windows_actuation_review_revision.as_deref(),
         "app_state_review_revision" => inputs.app_state_review_revision.as_deref(),
+        "element_addressed_review_revision" => inputs.element_addressed_review_revision.as_deref(),
+        "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision.as_deref(),
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
         _ => unreachable!("every external release gate has a bound input"),
     }
@@ -420,6 +430,19 @@ fn declaration_gate_passes(
         // pinned to a stable signature.
         [
             "app_state_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
+    } else if matches!(
+        id,
+        "computer.press_element" | "computer.press_point" | "computer.write_text"
+    ) {
+        // Pressing and writing through accessibility on retained elements,
+        // and the hit test that finds an element under a point, are a
+        // reviewed surface of their own, apart from reading the tree.
+        [
+            "element_addressed_review_revision",
             "release_signing_topology_revision",
         ]
         .iter()
@@ -926,7 +949,7 @@ fn computer_permission_readings(
 /// Collect the release attestations supplied to the compiler and derive the
 /// vocabulary mirrors from their independent checked-in sources.
 ///
-/// The nine external identifiers use `option_env!` so a release invocation must
+/// The eleven external identifiers use `option_env!` so a release invocation must
 /// supply each attestation before compilation. Starting a binary with a new
 /// environment value cannot manufacture a review after the binary was built.
 fn compiled_release_inputs() -> ComputerReleaseInputs {
@@ -935,6 +958,10 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
     let windows_actuation_review_revision =
         option_env!("CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION");
     let app_state_review_revision = option_env!("CEREBELLUM_APP_STATE_REVIEW_REVISION");
+    let element_addressed_review_revision =
+        option_env!("CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION");
+    let takeover_dispatch_review_revision =
+        option_env!("CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION");
     let release_signing_topology_revision =
         option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION");
     release_inputs_from_build_bindings(BuildReleaseBindings {
@@ -946,6 +973,8 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         semantic_actuation_review_revision,
         windows_actuation_review_revision,
         app_state_review_revision,
+        element_addressed_review_revision,
+        takeover_dispatch_review_revision,
         release_signing_topology_revision,
     })
 }
@@ -959,6 +988,8 @@ struct BuildReleaseBindings<'a> {
     semantic_actuation_review_revision: Option<&'a str>,
     windows_actuation_review_revision: Option<&'a str>,
     app_state_review_revision: Option<&'a str>,
+    element_addressed_review_revision: Option<&'a str>,
+    takeover_dispatch_review_revision: Option<&'a str>,
     release_signing_topology_revision: Option<&'a str>,
 }
 
@@ -979,6 +1010,12 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
             .windows_actuation_review_revision
             .map(str::to_owned),
         app_state_review_revision: bindings.app_state_review_revision.map(str::to_owned),
+        element_addressed_review_revision: bindings
+            .element_addressed_review_revision
+            .map(str::to_owned),
+        takeover_dispatch_review_revision: bindings
+            .takeover_dispatch_review_revision
+            .map(str::to_owned),
         release_signing_topology_revision: bindings
             .release_signing_topology_revision
             .map(str::to_owned),
@@ -2286,6 +2323,9 @@ impl Planes {
         #[cfg(target_os = "macos")]
         let global_dispatch_review_revision =
             compiled_release_inputs().global_dispatch_review_revision;
+        #[cfg(target_os = "macos")]
+        let takeover_dispatch_review_revision =
+            compiled_release_inputs().takeover_dispatch_review_revision;
         Self {
             health,
             routes: Arc::new(RouteBindings::new()),
@@ -2318,9 +2358,19 @@ impl Planes {
                             .with_global_dispatch_review_revision(
                                 global_dispatch_review_revision.clone(),
                             )
+                            .with_takeover_dispatch_review_revision(
+                                takeover_dispatch_review_revision.clone(),
+                            )
                             .with_shared_user_idle(user_idle.clone());
                         driver
                     },
+                )
+                // The fronting bracket is served only by a build carrying
+                // its review; without it a background target is refused.
+                .with_fronting_bracket_admitted(
+                    compiled_release_inputs()
+                        .takeover_dispatch_review_revision
+                        .is_some(),
                 ))
             }),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -4816,8 +4866,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            9,
-            "expected nine attestations, found {read_here:?}"
+            11,
+            "expected eleven attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -6325,6 +6375,8 @@ mod tests {
             semantic_actuation_review_revision: None,
             windows_actuation_review_revision: None,
             app_state_review_revision: None,
+            element_addressed_review_revision: None,
+            takeover_dispatch_review_revision: None,
             release_signing_topology_revision: None,
         });
         assert_eq!(
@@ -6338,6 +6390,8 @@ mod tests {
                 semantic_actuation_review_revision: None,
                 windows_actuation_review_revision: None,
                 app_state_review_revision: None,
+                element_addressed_review_revision: None,
+                takeover_dispatch_review_revision: None,
                 release_signing_topology_revision: None,
                 vocabulary_digests: computer::platform::VocabularyDigestInputs {
                     manifest_digest: Some(
@@ -6399,6 +6453,8 @@ mod tests {
                 semantic_actuation_review_revision: Some("fixture-semantic-actuation-review"),
                 windows_actuation_review_revision: Some("fixture-windows-actuation-review"),
                 app_state_review_revision: Some("fixture-app-state-review"),
+                element_addressed_review_revision: Some("fixture-element-addressed-review"),
+                takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review"),
                 release_signing_topology_revision: Some("fixture-signing-topology"),
             }),
             permissions: Default::default(),
@@ -6407,7 +6463,7 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 12]
+            vec![ComputerGateOutcome::Pass; 14]
         );
     }
 }

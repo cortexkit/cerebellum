@@ -575,3 +575,272 @@ pub async fn granted_management() -> Arc<ManagementPlane> {
     grant_app(&management).await;
     management
 }
+
+// ---------------------------------------------------------------------------
+// A desk of fixture elements the element actions and keystroke checks act on
+// ---------------------------------------------------------------------------
+
+use cerebellum_computer::app_state::source::{
+    AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
+    FixtureElementToken, HitScope, RawAppState, RawElement, ReadBounds, TextAttribute,
+};
+
+/// One element's behaviour on the desk.
+#[derive(Debug, Clone, Default)]
+pub struct DeskElement {
+    pub facts: ElementFacts,
+    pub value: Option<String>,
+    /// `(start, length)` in UTF-16 code units.
+    pub selection: Option<(usize, usize)>,
+    /// Values the next reads return, in order, before `value` is read again.
+    /// How a test makes a value change between two reads without a write.
+    pub readbacks: std::collections::VecDeque<Option<String>>,
+    /// Whether a write changes `value`. An application that accepts a write
+    /// and keeps its old value is how a read-back mismatch is produced.
+    pub applies_writes: bool,
+}
+
+/// What focus the desk reports for the target application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskFocus {
+    Nothing,
+    Unreadable,
+    Element(u64),
+}
+
+#[derive(Debug)]
+pub struct DeskState {
+    pub roots: Vec<RawElement>,
+    /// Swapped in for `roots` by the first press or write, so the diff that
+    /// follows has something to report.
+    pub after_action: Option<Vec<RawElement>>,
+    pub focused_in_tree: Option<u64>,
+    pub elements: std::collections::HashMap<u64, DeskElement>,
+    pub focus: DeskFocus,
+    pub frontmost: Option<u32>,
+    /// What an application-scoped hit test finds, and what a system-wide one
+    /// finds: an element token and the pid that owns it.
+    pub application_hit: Option<(u64, Option<u32>)>,
+    pub system_wide_hit: Option<(u64, Option<u32>)>,
+    pub presses: Vec<u64>,
+    pub writes: Vec<(u64, TextAttribute)>,
+    pub hit_scopes: Vec<HitScope>,
+    pub focus_reads: usize,
+}
+
+/// A fixture application: its tree, its elements' facts and text, its focus,
+/// and which application is frontmost. Records every press, write and hit
+/// test so a test can assert what was done rather than what was replied.
+#[derive(Debug, Clone)]
+pub struct Desk(pub Arc<Mutex<DeskState>>);
+
+#[allow(dead_code)]
+impl Desk {
+    pub fn new(roots: Vec<RawElement>) -> Self {
+        Self(Arc::new(Mutex::new(DeskState {
+            roots,
+            after_action: None,
+            focused_in_tree: None,
+            elements: std::collections::HashMap::new(),
+            focus: DeskFocus::Nothing,
+            frontmost: Some(grant().pid),
+            application_hit: None,
+            system_wide_hit: None,
+            presses: Vec::new(),
+            writes: Vec::new(),
+            hit_scopes: Vec::new(),
+            focus_reads: 0,
+        })))
+    }
+
+    pub fn state(&self) -> std::sync::MutexGuard<'_, DeskState> {
+        self.0.lock().unwrap()
+    }
+
+    pub fn with_element(self, token: u64, element: DeskElement) -> Self {
+        self.state().elements.insert(token, element);
+        self
+    }
+
+    pub fn source(&self) -> Arc<dyn AppStateSource> {
+        Arc::new(self.clone())
+    }
+}
+
+fn token_of(handle: &ElementHandle) -> Option<u64> {
+    handle
+        .as_any()
+        .downcast_ref::<FixtureElementToken>()
+        .map(|token| token.0)
+}
+
+fn fixture_handle(token: u64) -> ElementHandle {
+    Arc::new(FixtureElementToken(token))
+}
+
+fn utf16_byte_offset(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units >= utf16 {
+            return byte;
+        }
+        units += character.len_utf16();
+    }
+    text.len()
+}
+
+impl AppStateSource for Desk {
+    fn read_app_state(
+        &self,
+        _target: &ProcessGrant,
+        _bounds: ReadBounds,
+    ) -> Result<RawAppState, AppStateReadError> {
+        let state = self.state();
+        Ok(RawAppState {
+            roots: state.roots.clone(),
+            focused: state.focused_in_tree.map(fixture_handle),
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+
+    fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        self.state()
+            .elements
+            .get(&token)
+            .map(|element| element.facts.clone())
+            .ok_or(ElementActionError::Gone)
+    }
+
+    fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        let mut state = self.state();
+        state.presses.push(token);
+        if let Some(after) = state.after_action.take() {
+            state.roots = after;
+        }
+        Ok(())
+    }
+
+    fn text_value(&self, element: &ElementHandle) -> Result<Option<String>, ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        let mut state = self.state();
+        let element = state
+            .elements
+            .get_mut(&token)
+            .ok_or(ElementActionError::Gone)?;
+        if let Some(value) = element.readbacks.pop_front() {
+            return Ok(value);
+        }
+        Ok(element.value.clone())
+    }
+
+    fn selected_range(
+        &self,
+        element: &ElementHandle,
+    ) -> Result<Option<(usize, usize)>, ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        Ok(self
+            .state()
+            .elements
+            .get(&token)
+            .ok_or(ElementActionError::Gone)?
+            .selection)
+    }
+
+    fn write_text(
+        &self,
+        element: &ElementHandle,
+        attribute: TextAttribute,
+        text: &str,
+    ) -> Result<(), ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        let mut state = self.state();
+        state.writes.push((token, attribute));
+        if let Some(after) = state.after_action.take() {
+            state.roots = after;
+        }
+        let element = state
+            .elements
+            .get_mut(&token)
+            .ok_or(ElementActionError::Gone)?;
+        if element.applies_writes {
+            element.value = Some(match attribute {
+                TextAttribute::Value => text.to_string(),
+                TextAttribute::SelectedText => {
+                    let before = element.value.clone().unwrap_or_default();
+                    let (start, length) = element.selection.unwrap_or((0, 0));
+                    let from = utf16_byte_offset(&before, start);
+                    let to = utf16_byte_offset(&before, start + length);
+                    format!("{}{}{}", &before[..from], text, &before[to..])
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn element_at(
+        &self,
+        scope: HitScope,
+        _point: (f64, f64),
+    ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
+        let mut state = self.state();
+        state.hit_scopes.push(scope);
+        let hit = match scope {
+            HitScope::Application { .. } => state.application_hit,
+            HitScope::SystemWide => state.system_wide_hit,
+        };
+        Ok(hit.map(|(token, pid)| (fixture_handle(token), pid)))
+    }
+
+    fn focused_element(
+        &self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<ElementHandle>, ElementActionError> {
+        let mut state = self.state();
+        state.focus_reads += 1;
+        match state.focus {
+            DeskFocus::Nothing => Ok(None),
+            DeskFocus::Unreadable => Err(ElementActionError::Failed),
+            DeskFocus::Element(token) => Ok(Some(fixture_handle(token))),
+        }
+    }
+
+    fn frontmost_pid(&self) -> Option<u32> {
+        self.state().frontmost
+    }
+}
+
+/// Facts for an ordinary element: the given role, owned by the fixture
+/// process, offering the given actions.
+#[allow(dead_code)]
+pub fn facts(role: &str, actions: &[&str]) -> ElementFacts {
+    ElementFacts {
+        pid: Some(grant().pid),
+        role: Some(role.to_string()),
+        actions: actions.iter().map(|action| action.to_string()).collect(),
+        ..ElementFacts::default()
+    }
+}
+
+/// A plain text field focused in the fixture application, whose value
+/// follows writes: the focus every keystroke test that is not about the
+/// secure-field check starts from.
+#[allow(dead_code)]
+pub fn focused_text_desk() -> Desk {
+    let desk = Desk::new(vec![RawElement::fixture(1, "AXWindow")
+        .titled("Fixture")
+        .with_children(vec![RawElement::fixture(2, "AXTextField")])])
+    .with_element(
+        2,
+        DeskElement {
+            facts: facts("AXTextField", &[]),
+            value: Some(String::new()),
+            applies_writes: true,
+            ..DeskElement::default()
+        },
+    );
+    desk.state().focus = DeskFocus::Element(2);
+    desk
+}

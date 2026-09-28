@@ -78,6 +78,9 @@ use cerebellum_core::journal::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+mod element_actions;
+mod keystrokes;
+
 use crate::computer_grants::{ConsentContext, ConsentRefusal};
 use crate::management::{AppRefusal, ManagementPlane};
 
@@ -293,6 +296,9 @@ pub struct Servable(Served);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Served {
     ReadState,
+    PressElement,
+    PressPoint,
+    WriteText,
     Type,
     Keys,
     Wait,
@@ -302,6 +308,9 @@ impl Servable {
     pub fn capability(self) -> ComputerCapability {
         match self.0 {
             Served::ReadState => ComputerCapability::ReadState,
+            Served::PressElement => ComputerCapability::PressElement,
+            Served::PressPoint => ComputerCapability::PressPoint,
+            Served::WriteText => ComputerCapability::WriteText,
             Served::Type => ComputerCapability::Type,
             Served::Keys => ComputerCapability::Keys,
             Served::Wait => ComputerCapability::Wait,
@@ -327,11 +336,11 @@ pub fn servable(name: &str) -> Option<Servable> {
         ComputerCapability::Keys => Served::Keys,
         ComputerCapability::Wait => Served::Wait,
         ComputerCapability::ReadState => Served::ReadState,
+        ComputerCapability::PressElement => Served::PressElement,
+        ComputerCapability::PressPoint => Served::PressPoint,
+        ComputerCapability::WriteText => Served::WriteText,
         // In the vocabulary, with no wire handler yet.
-        ComputerCapability::PressElement
-        | ComputerCapability::PressPoint
-        | ComputerCapability::WriteText
-        | ComputerCapability::TakeoverMove
+        ComputerCapability::TakeoverMove
         | ComputerCapability::TakeoverDrag
         | ComputerCapability::TakeoverScroll => return None,
         // Readable from the journal only; never served.
@@ -424,6 +433,11 @@ where
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
     refusal_ring: Mutex<RefusalRing<ComputerRefusalReason>>,
     make_synthetic_driver: Arc<dyn Fn() -> D + Send + Sync>,
+    /// Whether this build's release review admits the fronting bracket, the
+    /// only way keystrokes reach an application in the background. Without
+    /// it such keystrokes are refused, and the refusal names only what the
+    /// build can do instead.
+    fronting_bracket_admitted: bool,
 }
 
 impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
@@ -511,7 +525,15 @@ where
                 .expect("the fixed computer refusal-ring capacity is valid"),
             ),
             make_synthetic_driver,
+            fronting_bracket_admitted: false,
         }
+    }
+
+    /// Admit the fronting bracket, as a build carrying its release review
+    /// does.
+    pub fn with_fronting_bracket_admitted(mut self, admitted: bool) -> Self {
+        self.fronting_bracket_admitted = admitted;
+        self
     }
 
     /// Read application state from `source` instead of the platform's reader.
@@ -616,6 +638,9 @@ where
                     .await
             }
             Served::Wait => self.serve_wait(arguments, context).await,
+            Served::PressElement => self.serve_press_element(arguments, context).await,
+            Served::PressPoint => self.serve_press_point(arguments, context).await,
+            Served::WriteText => self.serve_write_text(arguments, context).await,
             Served::Type => synthetic_wire_envelope(
                 self.serve_synthetic(ComputerCapability::Type, arguments, context)
                     .await,
@@ -963,7 +988,7 @@ where
         }
         // Keystrokes stay bound to the named application's process generation.
         let mode = DispatchMode::Background;
-        let (grant, admission) = match management
+        let (mut grant, mut admission) = match management
             .admit_app(&parsed.target, &consent, &cancel)
             .await
         {
@@ -979,7 +1004,97 @@ where
             Err(refusal) => return refusal.reply(&parsed.target),
         };
 
+        // Before anything is posted or fronted: the target's own focused
+        // element must be readable and must not be a secure field. Asked of
+        // the target rather than of the frontmost application, because the
+        // keystrokes go to the target whichever application is in front.
+        let source = self.app_state_source.clone();
+        let focus_grant = grant.clone();
+        let focus = tokio::task::spawn_blocking(move || {
+            keystrokes::read_target_focus(source.as_ref(), &focus_grant)
+        })
+        .await
+        .unwrap_or(Err(keystrokes::FocusRefusal::Unreadable));
+        let focus = match focus {
+            Ok(focus) => focus,
+            Err(refusal) => {
+                let mut reply = refusal.reply();
+                admission.decorate(&mut reply);
+                return reply;
+            }
+        };
+
+        // A target in the background gets its keystrokes only through the
+        // fronting bracket, which needs its own release review and the
+        // conversation's takeover grant, because bringing an application
+        // forward can take the person's own keystrokes.
         let capability_id = capability.capability_id();
+        let frontmost = self.app_state_source.frontmost_pid();
+        let mut bracket_bound = None;
+        if frontmost != Some(grant.pid) {
+            if !self.fronting_bracket_admitted {
+                let mut reply = keystrokes::needs_foreground_reply();
+                admission.decorate(&mut reply);
+                return reply;
+            }
+            match management
+                .computer_grants()
+                .require(&crate::computer_grants::GrantNeed::Takeover, &consent, &cancel)
+                .await
+            {
+                Ok(takeover) => {
+                    if takeover.waited {
+                        // The person may have taken a while; act only on the
+                        // process that answers to the name now, and only if
+                        // it is still the one the app grant was checked for.
+                        match management.resolve_process(&parsed.target) {
+                            Ok(current)
+                                if current.pid == grant.pid
+                                    && current.process_generation_evidence
+                                        == grant.process_generation_evidence =>
+                            {
+                                grant = current;
+                            }
+                            Ok(_) | Err(_) => {
+                                return management
+                                    .resolve_process(&parsed.target)
+                                    .err()
+                                    .unwrap_or_else(|| {
+                                        json!({
+                                            "outcome": "not_running",
+                                            "bundle_identity": parsed.target,
+                                            "remedy": "the application restarted while the \
+                                                       person was asked; retry",
+                                        })
+                                    })
+                            }
+                        }
+                    }
+                    if takeover.persisted.is_some() {
+                        admission.persisted = takeover.persisted;
+                    }
+                }
+                Err(ConsentRefusal::Cancelled) => {
+                    return synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                        posts_returned: 0,
+                        held_state: HeldStateDisposition::NoneHeld,
+                    })
+                }
+                Err(refusal) => {
+                    let mut reply = refusal.reply(None);
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
+            }
+            bracket_bound = Some(
+                cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
+                    capability_id,
+                    "maximum_fronting_bracket_interval_ms",
+                )
+                .unwrap_or(100),
+            );
+        }
+
         // Every served capability has a dispatch row; a missing one is a table
         // disagreement to report, not a reason to take the module down.
         let Some(mut row) = FrozenDispatchRow::for_capability(capability_id) else {
@@ -1022,31 +1137,43 @@ where
         );
 
         // Neither keystroke request schema declares a post-condition, so there
-        // is no effect claim to evaluate. The placeholder exists because the
-        // dispatcher serializes a predicate before dispatch; the production
-        // driver is built with post-condition evaluation disabled, which
-        // records the effect as indeterminate rather than claiming one a post
-        // call cannot evidence.
+        // is no effect claim for the dispatcher to evaluate. The placeholder
+        // exists because the dispatcher serializes a predicate before
+        // dispatch; the production driver is built with post-condition
+        // evaluation disabled, which records the effect as indeterminate.
+        // Typed text is confirmed separately below, by reading the focused
+        // element back.
         let expected = ExpectedPostCondition::new(
             "computer-synthetic-wire-no-effect-claim-v1",
             PostCondition::ElementPresent {
                 element: parsed.placeholder_element,
             },
         );
-        let request = DispatchRequest::new(row, mode, grant, expected, attendance, dispatch_at_ms)
-            .with_synthetic(parsed.action);
+        let typed_text = match &parsed.action {
+            SyntheticAction::TypeText { text } => Some(text.clone()),
+            _ => None,
+        };
+        let mut request =
+            DispatchRequest::new(row, mode, grant.clone(), expected, attendance, dispatch_at_ms)
+                .with_synthetic(parsed.action);
+        if let Some(bound) = bracket_bound {
+            request = request.with_fronting_bracket(bound);
+        }
 
         // Posting is synchronous and may take seconds. Keep the frame reader
         // runnable even on a single-thread runtime so Cancel can set the signal.
         let audit = self.audit.clone();
         let make_driver = self.make_synthetic_driver.clone();
-        let dispatched = tokio::task::spawn_blocking(move || {
+        let conversation_key = identity.conversation_key.clone();
+        let (dispatched, bracket) = tokio::task::spawn_blocking(move || {
             let mut audit = audit.blocking_lock();
-            Dispatcher::new(make_driver(), &|| cancel.is_cancelled())
-                .dispatch(&mut audit, identity, request)
+            let cancelled = || cancel.is_cancelled();
+            let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
+            let dispatched = dispatcher.dispatch(&mut audit, identity, request);
+            (dispatched, dispatcher.last_bracket().cloned())
         })
         .await
-        .unwrap_or(Err(DispatchError::Platform));
+        .unwrap_or((Err(DispatchError::Platform), None));
         let mut reply = match dispatched {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
@@ -1063,27 +1190,70 @@ where
                 // target_fronted rides alongside rather than inside the rung
                 // because it is a different claim: the rung says the input was
                 // contained to a process, this says whether the window that
-                // received it was pinned down. An action can be fully contained
-                // and land in a window nobody was looking at, and a caller that
-                // cannot see both halves cannot tell that from an uncontained
-                // one.
+                // received it was pinned down. Through a fronting bracket it
+                // says whether the target was brought forward and the previous
+                // application put back inside the bound.
                 //
                 // The reason key is omitted rather than sent as null when no
                 // condition denied the rung: absence is unambiguous here because
                 // target_fronted is always present, so a caller can tell a build
                 // that reports these from one that does not.
+                let (target_fronted, forfeiture) = match (&bracket, bracket_bound) {
+                    (Some(bracket), Some(bound)) => keystrokes::bracket_fronting(bracket, bound),
+                    _ => (
+                        report.containment.fronting_stable,
+                        report
+                            .containment
+                            .forfeiture_reason
+                            .map(|reason| reason.as_str()),
+                    ),
+                };
                 synthetic_success_reply(
                     DispatchContainmentRung::as_str(containment_rung),
-                    report.containment.fronting_stable,
+                    target_fronted,
                     effect_status_name(report.effect.status),
-                    report
-                        .containment
-                        .forfeiture_reason
-                        .map(|reason| reason.as_str()),
+                    forfeiture,
                 )
             }
-            Err(refusal) => synthetic_dispatch_refusal(&refusal),
+            Err(refusal) => keystrokes::dispatch_refusal_reply(&refusal),
         };
+        // A previous application left behind the target is reported whatever
+        // else happened, because the person's next keystrokes go to it.
+        if let Some(bracket) = &bracket {
+            keystrokes::disclose_failed_restore(&mut reply, bracket, &grant);
+        }
+
+        let posted = matches!(
+            reply["outcome"].as_str(),
+            Some("delivery_unconfirmed" | "restore_failed")
+        );
+        if posted {
+            let source = self.app_state_source.clone();
+            let sessions = management.app_state_sessions().clone();
+            let settle = element_actions::settle_bound(capability);
+            let mut finished = reply;
+            reply = tokio::task::spawn_blocking(move || {
+                if let (Some(text), Some(focused)) = (typed_text.as_deref(), focus.as_ref()) {
+                    if finished["outcome"] == "delivery_unconfirmed"
+                        && keystrokes::typed_text_arrived(source.as_ref(), focused, text)
+                    {
+                        finished["outcome"] = json!("completed");
+                        finished["effect_status"] = json!("effect_observed");
+                    }
+                }
+                let (diff, focused_id, unreadable) = element_actions::settle_and_observe(
+                    source.as_ref(),
+                    &sessions,
+                    &conversation_key,
+                    &grant,
+                    settle,
+                );
+                element_actions::add_diff(&mut finished, diff, focused_id, unreadable);
+                finished
+            })
+            .await
+            .unwrap_or_else(|_| json!({"outcome": "delivery_unconfirmed"}));
+        }
         admission.decorate(&mut reply);
         reply
     }
@@ -1265,6 +1435,18 @@ pub(crate) fn served_request_fields(
             Some((&READ_STATE_REQUEST_FIELDS, &READ_STATE_REQUIRED_FIELDS))
         }
         ComputerCapability::Wait => Some((&WAIT_REQUEST_FIELDS, &WAIT_REQUEST_FIELDS)),
+        ComputerCapability::PressElement => Some((
+            &element_actions::PRESS_ELEMENT_FIELDS,
+            &element_actions::PRESS_ELEMENT_FIELDS,
+        )),
+        ComputerCapability::PressPoint => Some((
+            &element_actions::PRESS_POINT_FIELDS,
+            &element_actions::PRESS_POINT_FIELDS,
+        )),
+        ComputerCapability::WriteText => Some((
+            &element_actions::WRITE_TEXT_FIELDS,
+            &element_actions::WRITE_TEXT_FIELDS,
+        )),
         ComputerCapability::Type | ComputerCapability::Keys => {
             let fields = synthetic_request_fields(capability)?;
             Some((fields, fields))
@@ -1284,6 +1466,11 @@ pub(crate) fn parse_served_request(
     match capability {
         ComputerCapability::ReadState => parse_read_state_request(arguments).map(|_| ()),
         ComputerCapability::Wait => parse_wait_request(arguments).map(|_| ()),
+        ComputerCapability::PressElement => {
+            element_actions::parse_press_element(arguments).map(|_| ())
+        }
+        ComputerCapability::PressPoint => element_actions::parse_press_point(arguments).map(|_| ()),
+        ComputerCapability::WriteText => element_actions::parse_write_text(arguments).map(|_| ()),
         _ => parse_synthetic_request(capability, arguments).map(|_| ()),
     }
 }
@@ -1673,7 +1860,12 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
 /// Give every synthetic-input outcome the result envelope its vocabulary row
 /// declares.
 ///
-/// Build the reply for a synthetic action that completed.
+/// Build the reply for a synthetic dispatch whose posts all went out.
+///
+/// Its outcome is `delivery_unconfirmed`: a post call returning says nothing
+/// about whether the application received the keystrokes. Typed text is
+/// upgraded to `completed` afterwards only when a read-back shows it arrived;
+/// a chord never is.
 ///
 /// Extracted from its one production call site so a test can assert the exact
 /// shape this surface emits against the frozen result schema. The two had no
@@ -1690,7 +1882,7 @@ fn synthetic_success_reply(
     forfeiture_reason: Option<&str>,
 ) -> Value {
     let mut reply = json!({
-        "outcome": "completed",
+        "outcome": "delivery_unconfirmed",
         "containment_rung": containment_rung,
         "target_fronted": target_fronted,
         "effect_status": effect_status,

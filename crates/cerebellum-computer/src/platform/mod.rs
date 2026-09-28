@@ -236,6 +236,14 @@ pub struct ImmutableReleaseInputs {
     /// The review of `computer.read_state`: the application-state tree, its
     /// element ids, and its window image.
     pub app_state_review_revision: Option<String>,
+    /// The review of `computer.press_element`, `computer.press_point` and
+    /// `computer.write_text`: pressing and writing retained elements through
+    /// accessibility, and the hit test that finds one under a point.
+    pub element_addressed_review_revision: Option<String>,
+    /// The review of anything that can take the person's input focus: the
+    /// takeover pointer rows and the fronting bracket that brings a
+    /// background application forward for keystrokes.
+    pub takeover_dispatch_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
 }
@@ -325,18 +333,39 @@ fn capability_declaration(
         // Keep the permission-lookup failure reason unchanged. It identifies
         // an inability to resolve required permissions, which is more useful
         // to the caller than a release-input status.
-    } else if id == "computer.read_state" {
-        // A read through the accessibility API: advertised on its own review
-        // and the accessibility grant. Screen Recording is deliberately not a
-        // condition, because it serves only the optional image, and folding
-        // it in would hide the tree on every machine where it is off; a
-        // missing grant is reported on the image instead.
+    } else if matches!(
+        id,
+        "computer.read_state"
+            | "computer.press_element"
+            | "computer.press_point"
+            | "computer.write_text"
+    ) {
+        // Reads and actions through the accessibility API: each advertised on
+        // its own review and the accessibility grant. The state read has one
+        // review and the presses and writes another, because acting on an
+        // element is a different surface from reading it. Screen Recording is
+        // deliberately not a condition, because it serves only the optional
+        // image, and folding it in would hide the tree on every machine where
+        // it is off; a missing grant is reported on the image instead.
+        let review_missing = if id == "computer.read_state" {
+            context
+                .inputs
+                .app_state_review_revision
+                .is_none()
+                .then_some("application state review revision is not bound")
+        } else {
+            context
+                .inputs
+                .element_addressed_review_revision
+                .is_none()
+                .then_some("element-addressed action review revision is not bound")
+        };
         suppression_reason = if !platform_available {
             Some("no application-state reader on this platform".to_string())
         } else if !context.inputs.vocabulary_ready() {
             Some("computer action vocabulary input unresolved".to_string())
-        } else if context.inputs.app_state_review_revision.is_none() {
-            Some("application state review revision is not bound".to_string())
+        } else if let Some(missing) = review_missing {
+            Some(missing.to_string())
         } else if context.inputs.release_signing_topology_revision.is_none() {
             Some("release signing topology revision is not bound".to_string())
         } else {
@@ -435,8 +464,19 @@ fn capability_declaration(
 
     // Claimed only where something serves the path the frozen row names,
     // rather than wherever the row names one. The press and write rows name
-    // ax_press and ax_value, and nothing serves either over the wire yet.
-    let semantic_support = SupportState::Unsupported;
+    // ax_press and ax_value, which the accessibility element actions serve
+    // wherever the application-state reader exists.
+    let semantic_support = if platform_available
+        && matches!(
+            capability,
+            ComputerCapability::PressElement
+                | ComputerCapability::PressPoint
+                | ComputerCapability::WriteText
+        ) {
+        SupportState::Supported
+    } else {
+        SupportState::Unsupported
+    };
 
     // Background delivery is claimed per SYNTHETIC EVENT CLASS, because the
     // per-process path carries one and not the other. Measured on macOS 26

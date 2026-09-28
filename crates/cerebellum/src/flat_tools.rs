@@ -50,7 +50,7 @@ fn describe_computer_field(name: &str, schema: &mut Value) {
     let description = match name {
         "target" => "Bundle identity of the application to act in, such as com.apple.TextEdit.",
         "app" => "Bundle identity of the application whose elements the predicate names, such as com.apple.TextEdit.",
-        "text" => "Text to enter; credential, permission, and payment fields are refused.",
+        "text" => "Text to enter; a secure text field is refused.",
         "keys" => "Ordered key names for the chord or sequence. Modifiers are command, shift, option, and control; for example [\"command\", \"s\"]. Session-ending chords are refused.",
         // The outcomes are named here because the two failure words mean opposite
         // things and a reader who conflates them draws the wrong conclusion: a
@@ -547,7 +547,15 @@ mod tests {
         let all = computer_tool(&computer_names()).unwrap();
         assert_eq!(
             all.schema["properties"]["action"]["enum"],
-            json!(["read_state", "type", "keys", "wait"])
+            json!([
+                "read_state",
+                "press_element",
+                "press_point",
+                "write_text",
+                "type",
+                "keys",
+                "wait"
+            ])
         );
         let without_keys: Vec<_> = computer_names()
             .into_iter()
@@ -644,6 +652,9 @@ mod tests {
         };
         for (action, required) in [
             ("read_state", vec!["target"]),
+            ("press_element", vec!["element_id"]),
+            ("press_point", vec!["image_id", "x", "y"]),
+            ("write_text", vec!["element_id", "text", "write_mode"]),
             ("type", vec!["target", "text"]),
             ("keys", vec!["keys", "target"]),
             ("wait", vec!["app", "predicate", "timeout_ms"]),
@@ -688,9 +699,6 @@ mod tests {
             "move",
             "drag",
             "scroll",
-            "press_element",
-            "press_point",
-            "write_text",
             "takeover_move",
             "takeover_drag",
             "takeover_scroll",

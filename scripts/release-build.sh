@@ -193,6 +193,25 @@ export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
 # a named reason until then. Its identifier is
 # CEREBELLUM_APP_STATE_REVIEW_REVISION.
 
+# Acting on an element through accessibility: computer.press_element (AXPress
+# on an element a state read numbered), computer.press_point (a point in a
+# returned image, hit-tested within that image's own application and pressed
+# the same way; the pointer never moves), and computer.write_text (AXValue or
+# AXSelectedText written, then read back). Retained-handle actions are a new
+# semantic surface, apart from reading the tree, so they have their own
+# review; UNSET until it is minted, and the three rows are withheld with a
+# named reason until then. Its identifier is
+# CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION.
+
+# Anything that can take the person's input focus: the takeover pointer rows,
+# and the fronting bracket computer.type and computer.keys use to reach an
+# application that is not frontmost (bring it forward for at most 100 ms at a
+# time, post, put the previous application back, under the idle gate and the
+# seize watcher). UNSET until that review is minted. Without it, type and
+# keys still serve a frontmost target under the input review above, and
+# refuse a background one with keystrokes_need_foreground. Its identifier is
+# CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION.
+
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
 # "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
@@ -209,6 +228,8 @@ readonly ATTESTATIONS=(
   CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION
   CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION
   CEREBELLUM_APP_STATE_REVIEW_REVISION
+  CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION
+  CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION
   CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION
