@@ -1326,3 +1326,145 @@ async fn a_platform_with_no_signature_reader_refuses_before_anything_is_posted()
         "a keystroke was posted"
     );
 }
+
+/// A resolver whose answer can be swapped while a call waits for the person,
+/// with each process's signature looked up by pid.
+struct SwappingResolver {
+    current: Mutex<ProcessGrant>,
+    codes: Vec<(u32, InjectedCode)>,
+}
+
+impl SwappingResolver {
+    fn swap_to(&self, process: ProcessGrant) {
+        *self.current.lock().unwrap() = process;
+    }
+}
+
+impl TargetResolver for SwappingResolver {
+    fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+        TargetResolution::Resolved(self.current.lock().unwrap().clone())
+    }
+
+    fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn cerebellum::computer_grants::AppCode> {
+        let code = self
+            .codes
+            .iter()
+            .find(|(pid, _)| *pid == grant.pid)
+            .map(|(_, code)| code.clone())
+            .expect("every fixture process has a signature");
+        Arc::new(code)
+    }
+}
+
+/// Process A, resolved before the question, and process B, a different pid
+/// answering to the same bundle identity once the person has answered.
+fn swapped_processes() -> (ProcessGrant, ProcessGrant) {
+    let first = grant();
+    let second = ProcessGrant {
+        pid: first.pid + 1000,
+        process_generation_evidence: format!("{}-later", first.process_generation_evidence),
+        ..first.clone()
+    };
+    (first, second)
+}
+
+fn swapping_management(
+    first: &ProcessGrant,
+    second: &ProcessGrant,
+    second_identity: AppIdentity,
+) -> (Arc<ManagementPlane>, Arc<SwappingResolver>) {
+    let resolver = Arc::new(SwappingResolver {
+        current: Mutex::new(first.clone()),
+        codes: vec![
+            (first.pid, InjectedCode::default()),
+            (second.pid, InjectedCode::new(Ok(second_identity))),
+        ],
+    });
+    let management = Arc::new(ManagementPlane::with_computer_grants(
+        Arc::clone(&resolver) as Arc<dyn TargetResolver>,
+        Arc::new(ComputerGrants::in_memory()),
+    ));
+    (management, resolver)
+}
+
+/// The person answers about process A; by the time the call resumes, process
+/// B, signed by someone else, answers to the same bundle identity. B does not
+/// act under the answer: the call is refused with `grant_not_recorded`,
+/// nothing is posted, and the grant made for A still holds for A.
+#[tokio::test]
+async fn a_differently_signed_process_swapped_in_during_the_wait_does_not_act() {
+    let driver = CountingDriver::default();
+    let plane = plane(&driver);
+    let (first, second) = swapped_processes();
+    let (management, resolver) = swapping_management(&first, &second, team_identity("IMPOSTOR01"));
+    let carrier = ScriptedCarrier::default();
+    let conversation = caller("conversation-1", false);
+
+    let answering = {
+        let carrier = carrier.clone();
+        let resolver = Arc::clone(&resolver);
+        async move {
+            until(|| carrier.questions().len() == 1).await;
+            resolver.swap_to(second.clone());
+            assert!(carrier.answer_next(answer("allow_conversation")));
+        }
+    };
+    let (reply, ()) = tokio::join!(
+        serve(
+            &plane,
+            "computer.type",
+            type_request(),
+            &management,
+            asking(&carrier, conversation.clone()),
+        ),
+        answering
+    );
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["reason"], "grant_not_recorded", "{reply}");
+    assert!(
+        driver.0.lock().unwrap().is_empty(),
+        "the swapped-in process was posted to"
+    );
+    assert!(
+        management
+            .computer_grants()
+            .holds(&conversation, &need_for(&InjectedCode::default())),
+        "the grant made for the first process was lost"
+    );
+    assert_eq!(carrier.questions().len(), 1);
+}
+
+/// When the process swapped in during the wait carries the same signature
+/// the person approved (the application restarted), it is admitted under
+/// the answer and nobody is asked again.
+#[tokio::test]
+async fn a_same_signed_process_swapped_in_during_the_wait_is_admitted() {
+    let (first, second) = swapped_processes();
+    let (management, resolver) = swapping_management(&first, &second, team_identity(FIXTURE_TEAM));
+    let carrier = ScriptedCarrier::default();
+
+    let answering = {
+        let carrier = carrier.clone();
+        let resolver = Arc::clone(&resolver);
+        let second = second.clone();
+        async move {
+            until(|| carrier.questions().len() == 1).await;
+            resolver.swap_to(second);
+            assert!(carrier.answer_next(answer("allow_conversation")));
+        }
+    };
+    let consent = asking(&carrier, caller("conversation-1", false));
+    let cancel = cerebellum::CancelHandle::pending();
+    let (admitted, ()) = tokio::join!(management.admit_app(APP, &consent, &cancel), answering);
+    let (process, admission) = admitted.map_err(|refusal| refusal.reply(APP)).unwrap();
+    assert!(admission.waited);
+    assert_eq!(
+        process, second,
+        "the call did not act on the process answering now"
+    );
+    assert_eq!(
+        carrier.questions().len(),
+        1,
+        "the same signature was asked again"
+    );
+}
