@@ -1292,9 +1292,12 @@ async fn feature_gated_identity_observer_records_resolved_facts() {
 /// unknown method -- a refusal naming the wrong subsystem, and indistinguishable
 /// from the module not having the capability at all.
 ///
-/// The plane refuses this particular request, because the test module holds no
-/// lease. That refusal is the evidence: only the computer plane produces it, so
-/// receiving it establishes which handler ran.
+/// The plane refuses this particular request before asking anyone, because the
+/// application it names cannot be resolved to one running process. That
+/// refusal is the evidence: only the computer plane resolves a bundle identity,
+/// so receiving it, naming the application, establishes which handler ran.
+/// Which of the three resolution refusals comes back depends on what this
+/// host's window server can be read to say, so any of them is accepted.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_computer_capability_reaches_the_computer_plane() {
@@ -1329,22 +1332,17 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
-    // Predicate waiting reaches the computer plane's observe authority. This
-    // test module has no lease, so typed indeterminate evidence is expected;
-    // the browser handler has no such capability and would refuse it as unknown.
-    assert_eq!(
-        body["outcome"], "indeterminate",
+    // The computer plane resolves the named application before it asks for
+    // its grant; the browser handler has no such capability and would refuse
+    // it as unknown.
+    assert!(
+        matches!(
+            body["outcome"].as_str(),
+            Some("not_running" | "targets_unreadable" | "ambiguous")
+        ),
         "computer.wait was not served by the computer plane: {body}"
     );
-    assert_eq!(body["settle_path"], "poll_with_deadline");
-    let evidence: Value = serde_json::from_str(
-        body["evidence"]
-            .as_str()
-            .expect("wait evidence is a JSON string"),
-    )
-    .expect("wait evidence contains a typed value");
-    assert_eq!(evidence["status"], "indeterminate");
-    assert_eq!(evidence["predicate"]["kind"], "element_present");
+    assert_eq!(body["bundle_identity"], "com.example.App", "{body}");
 }
 
 #[cfg(target_os = "macos")]
