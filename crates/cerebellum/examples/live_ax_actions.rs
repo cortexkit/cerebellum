@@ -151,9 +151,12 @@ mod macos_probe {
         )
     }
 
+    /// One sample: milliseconds since sampling began, and the frontmost pid.
+    type Sample = (u128, Option<i32>);
+
     /// The frontmost application, sampled every 100 ms until stopped.
     struct Sampler {
-        samples: Arc<Mutex<Vec<(u128, Option<i32>)>>>,
+        samples: Arc<Mutex<Vec<Sample>>>,
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -183,7 +186,7 @@ mod macos_probe {
             }
         }
 
-        fn finish(mut self) -> Vec<(u128, Option<i32>)> {
+        fn finish(mut self) -> Vec<Sample> {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
