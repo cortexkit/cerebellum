@@ -15,7 +15,9 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v13.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v14.json");
+const V13_ARTIFACT_SHA256: &str =
+    "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 /// The digest of the v12 artifact, measured before v13 was minted.
 const V12_ARTIFACT_SHA256: &str =
@@ -101,6 +103,17 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => panic!("cannot inspect {path}: {error}"),
         };
+        // The retained frozen artifact is historical evidence, not an active mirror.
+        // Pin its bytes before exempting only that exact path from the active scan.
+        if path
+            == format!(
+                "crates/cerebellum-computer/resources/{}.json",
+                historical_revision(13).as_str().unwrap()
+            )
+        {
+            assert_eq!(hex_digest(&bytes), V13_ARTIFACT_SHA256);
+            continue;
+        }
         for (offset, _) in bytes
             .windows(prefix.len())
             .enumerate()
@@ -590,7 +603,7 @@ fn remove_properties(row: &mut Value, schema: &str, names: &[&str]) {
 /// come back from a fixture holding them as v12 wrote them, since they exist
 /// nowhere else now.
 fn recreated_v12() -> Value {
-    let mut v13: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let mut v13 = recreated_v13();
 
     // Every retained row gained the screen-lock disclosure, and its outcome
     // description the sentence naming the screen_locked refusal. The keystroke
@@ -730,7 +743,8 @@ fn v13_only_makes_the_changes_recreated_v12_undoes() {
 #[test]
 fn the_minted_artifact_is_the_generator_output_from_v12() {
     let generated =
-        vocabulary_mint::v13_from_v12(&recreated_v12(), COMPUTER_ACTION_VOCABULARY_REVISION);
+        vocabulary_mint::v13_from_v12(&recreated_v12(), historical_revision(13).as_str().unwrap());
+    let generated = vocabulary_mint::v14_from_v13(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -889,4 +903,65 @@ fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
             );
         }
     }
+}
+
+/// Undo only the two closed-enum additions; open keystroke outcomes need no artifact change.
+fn recreated_v13() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(13);
+    for (id, pointer, word) in [
+        (
+            "computer.read_state",
+            "/result_schema/properties/image_unavailable/properties/reason/enum",
+            "window_covered_may_be_stale",
+        ),
+        (
+            "computer.write_text",
+            "/result_schema/properties/outcome/enum",
+            "web_content_needs_type",
+        ),
+    ] {
+        let tokens = row_mut(&mut vocabulary, id)
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        assert_eq!(tokens.pop(), Some(json!(word)));
+    }
+    vocabulary
+}
+
+#[test]
+fn v14_only_makes_the_changes_recreated_v13_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v13()).unwrap()),
+        V13_ARTIFACT_SHA256
+    );
+}
+
+#[test]
+fn v14_refusal_words_validate_in_their_declared_fields() {
+    use cerebellum_computer::platform::vocabulary::validate_capability_result;
+    for (id, outcome) in [
+        ("computer.keys", "modifier_chord_needs_foreground"),
+        ("computer.keys", "private_input_auth_failed"),
+        ("computer.type", "private_input_auth_failed"),
+        ("computer.write_text", "web_content_needs_type"),
+    ] {
+        let mut reply = json!({"outcome": outcome});
+        if id == "computer.keys" || id == "computer.type" {
+            reply["containment_rung"] = json!("pid_structural");
+            reply["effect_status"] = json!("effect_indeterminate");
+            reply["target_fronted"] = json!(false);
+        }
+        validate_capability_result(id, &reply).unwrap();
+    }
+    validate_capability_result(
+        "computer.read_state",
+        &json!({
+            "outcome": "completed", "tree": "", "unreadable_subtrees": 0,
+            "image_unavailable": {"reason": "window_covered_may_be_stale"}
+        }),
+    )
+    .unwrap();
 }

@@ -1173,3 +1173,31 @@ pub fn v13_from_v12(v12: &Value, revision: &str) -> Value {
         "rows": rows,
     })
 }
+
+/// Add the stale-image refusal and the semantic web-content refusal.
+/// Keystroke outcomes remain open strings, so their new words require no schema change.
+pub fn v14_from_v13(v13: &Value, revision: &str) -> Value {
+    let mut v14 = v13.clone();
+    v14["revision"] = json!(revision);
+    for row in v14["rows"].as_array_mut().unwrap() {
+        let pointer = match row["capability_id"].as_str().unwrap() {
+            "computer.read_state" => Some((
+                "/result_schema/properties/image_unavailable/properties/reason/enum",
+                "window_covered_may_be_stale",
+            )),
+            "computer.write_text" => Some((
+                "/result_schema/properties/outcome/enum",
+                "web_content_needs_type",
+            )),
+            _ => None,
+        };
+        if let Some((pointer, word)) = pointer {
+            row.pointer_mut(pointer)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(json!(word));
+        }
+    }
+    v14
+}
