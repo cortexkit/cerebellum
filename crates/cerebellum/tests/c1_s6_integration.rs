@@ -512,9 +512,10 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                 "{gate} governs the element presses and writes alone"
             ),
             // Both reviews govern the takeover rows and nothing else. The
-            // fronting bracket is gated where it is served, not where the
-            // keystroke rows are advertised: without it they still serve a
-            // frontmost target.
+            // takeover review also admits bringing a background application
+            // forward for keystrokes, but that is checked when a keystroke is
+            // served: without it the keystroke rows are still advertised and
+            // still serve an application that is already frontmost.
             "takeover_dispatch_review_revision" | "global_dispatch_review_revision" => {
                 assert_eq!(
                     admitted,

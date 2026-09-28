@@ -398,6 +398,12 @@ mod probe {
                 .map_err(|error| format!("{name} reply did not parse: {error}"))
         }
 
+        /// One tool call, answered before returning.
+        async fn call(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+            let id = self.start_tool_call(name, arguments).await?;
+            self.finish_tool_call(name, id, ROUTINE_REPLY_TIMEOUT).await
+        }
+
         async fn tiny_wait(&mut self) -> Result<(RequestId, Value), String> {
             let request = wait_arguments(&self.impossible_identifier, TINY_WAIT_MS);
             let id = self.start_tool_call("computer.wait", request).await?;
@@ -573,11 +579,11 @@ mod probe {
                 "cancelled_drag_releases_button",
                 "desk arm not requested",
             )
-        } else if !tools.contains("computer.drag") {
+        } else if !tools.contains("computer.takeover_drag") {
             Arm::unmeasurable(
                 "4",
                 "cancelled_drag_releases_button",
-                "the running daemon does not advertise computer.drag",
+                "the running daemon does not advertise computer.takeover_drag",
             )
         } else {
             arm_four(&mut wire).await
@@ -817,6 +823,53 @@ mod probe {
         {
             return Arm::unmeasurable(NUMBER, NAME, reason);
         }
+        // The drag names its points in an image of the application's window,
+        // so read its state with one.
+        let image = match wire
+            .call(
+                "computer.read_state",
+                json!({"target": bundle_identity, "include_image": true}),
+            )
+            .await
+        {
+            Ok(reply) => reply["image"].clone(),
+            Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
+        };
+        let (Some(image_id), Some(width), Some(height)) = (
+            image["image_id"].as_str().map(str::to_string),
+            image["width_px"].as_u64(),
+            image["height_px"].as_u64(),
+        ) else {
+            return Arm::unmeasurable(
+                NUMBER,
+                NAME,
+                format!("read_state on {bundle_identity} returned no image (is Screen Recording granted?)"),
+            );
+        };
+        let point = |x: f64, y: f64| json!({"x": (width as f64 * x) as u64, "y": (height as f64 * y) as u64});
+        // The takeover question has to be answered before the drag: once the
+        // drag is sent this probe blocks on the heartbeat and reads no frames,
+        // so a question raised by the drag itself would never be answered. A
+        // move to where the drag starts raises it and is answered here.
+        wire.elicitation_decision = "allow_conversation";
+        let settled = wire
+            .call(
+                "computer.takeover_move",
+                json!({"image_id": image_id, "to": point(0.30, 0.40)}),
+            )
+            .await;
+        wire.elicitation_decision = "deny";
+        match settled {
+            Ok(reply) if reply["outcome"] == json!("completed") => {}
+            Ok(reply) => {
+                return Arm::unmeasurable(
+                    NUMBER,
+                    NAME,
+                    format!("the takeover grant was not settled by a move: {reply}"),
+                )
+            }
+            Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
+        }
 
         // Invoking the probe is itself recent desk input. Wait beyond the
         // one-second idle threshold so, if no new desk input lands, the drag
@@ -826,12 +879,11 @@ mod probe {
         let started = Instant::now();
         let request = match wire
             .start_tool_call(
-                "computer.drag",
+                "computer.takeover_drag",
                 json!({
-                    "from": "400,400",
-                    "to": "520,460",
-                    "button": "left",
-                    "modifiers": [],
+                    "image_id": image_id,
+                    "from": point(0.30, 0.40),
+                    "to": point(0.55, 0.60),
                 }),
             )
             .await
@@ -847,7 +899,7 @@ mod probe {
             Err(reason) => {
                 let _ = wire.send_cancel(request).await;
                 let reply = wire
-                    .finish_tool_call("computer.drag", request, ROUTINE_REPLY_TIMEOUT)
+                    .finish_tool_call("computer.takeover_drag", request, ROUTINE_REPLY_TIMEOUT)
                     .await;
                 return Arm::unmeasurable(
                     NUMBER,
@@ -861,7 +913,7 @@ mod probe {
             return Arm::unmeasurable(NUMBER, NAME, reason);
         }
         let reply = match wire
-            .finish_tool_call("computer.drag", request, ROUTINE_REPLY_TIMEOUT)
+            .finish_tool_call("computer.takeover_drag", request, ROUTINE_REPLY_TIMEOUT)
             .await
         {
             Ok(reply) => reply,

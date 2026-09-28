@@ -81,15 +81,9 @@ mod macos_probe {
     const GRANTEE: &str = "pj-live-synthetic-input-probe";
     const CONVERSATION: &str = "live-synthetic-input-probe";
     const INPUT_LABEL: &str = "Synthetic input text";
-    const MOVE_LABEL: &str = "Synthetic move zone";
-    const DRAG_LABEL: &str = "Synthetic drag zone";
     const TYPE_TEXT: &str = "Cerebellum café";
     const KEY_REPORT_PREFIX: &str = "KEY_REPORT=";
-    const SCROLL_REPORT_PREFIX: &str = "SCROLL_REPORT=";
-    const MOVE_REPORT_PREFIX: &str = "MOVE_REPORT=";
-    const DRAG_REPORT_PREFIX: &str = "DRAG_REPORT=";
     const EXPECTED_CHORD: &str = "control+shift+k";
-    const SCROLL_LINES: i32 = -3;
 
     const PAGE: &str = r#"<!doctype html>
 <html>
@@ -424,135 +418,10 @@ mod macos_probe {
         println!("KEYS VERDICT: {}", keys_verdict.label());
         verdicts.push(("keys", keys_verdict));
 
-        let scroll_before =
-            report_after_snapshot(planes, &mut snapshot_corr, SCROLL_REPORT_PREFIX).await;
-        let scroll_reply = invoke_tool(
-            planes,
-            32,
-            "computer.scroll",
-            json!({
-                "target": "probe-scrollbox",
-                "axis": "vertical",
-                "amount_lines": SCROLL_LINES
-            }),
-        )
-        .await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let scroll_after =
-            report_after_snapshot(planes, &mut snapshot_corr, SCROLL_REPORT_PREFIX).await;
-        let scroll_agrees = parse_i64(&scroll_before)
-            .zip(parse_i64(&scroll_after))
-            .is_some_and(|(before, after)| after > before);
-        let scroll_verdict = verdict(&scroll_reply, scroll_agrees);
-        println!("\nSCROLL sent: vertical {SCROLL_LINES} lines");
-        println!("SCROLL production reply: {scroll_reply}");
-        println!("SCROLL page reported over CDP: scrollTop {scroll_before:?} -> {scroll_after:?}");
-        println!("SCROLL agrees: {scroll_agrees}");
-        println!("SCROLL VERDICT: {}", scroll_verdict.label());
-        verdicts.push(("scroll", scroll_verdict));
-
-        // A pointer target that never becomes addressable costs the MOVE and
-        // DRAG verdicts and nothing else. Propagating here would discard the
-        // three verdicts already measured and fail the whole probe, which reads
-        // as "synthetic input does not work" when what happened is that a window
-        // never realised -- the exact misreading the locked-screen note exists
-        // to prevent.
-        let pointer_frames = match wait_for_pointer_frames(compose_target.pid).await {
-            Ok(frames) => Some(frames),
-            Err(reason) => {
-                println!(
-                    "\nMOVE VERDICT: {} ({reason})",
-                    Verdict::Unmeasurable.label()
-                );
-                println!(
-                    "DRAG VERDICT: {} (same pointer target)",
-                    Verdict::Unmeasurable.label()
-                );
-                verdicts.push(("move", Verdict::Unmeasurable));
-                verdicts.push(("drag", Verdict::Unmeasurable));
-                None
-            }
-        };
-        if let Some((move_frame, drag_frame)) = pointer_frames {
-            let move_point = frame_point(move_frame, 0.5, 0.5);
-            let move_reply = invoke_tool(
-                planes,
-                33,
-                "computer.move",
-                json!({"to": wire_point(move_point)}),
-            )
-            .await?;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let move_report =
-                report_after_snapshot(planes, &mut snapshot_corr, MOVE_REPORT_PREFIX).await;
-            let move_agrees = parse_pair(&move_report).is_some_and(|reported| {
-                (reported.0 - move_point.0).abs() <= 3.0 && (reported.1 - move_point.1).abs() <= 3.0
-            });
-            let move_verdict = verdict(&move_reply, move_agrees);
-            println!(
-                "\nMOVE sent: global point ({:.1}, {:.1}) over {MOVE_LABEL:?}",
-                move_point.0, move_point.1
-            );
-            println!("MOVE production reply: {move_reply}");
-            println!("MOVE page reported over CDP (screenX,screenY): {move_report:?}");
-            println!("MOVE agrees: {move_agrees}");
-            println!("MOVE VERDICT: {}", move_verdict.label());
-            verdicts.push(("move", move_verdict));
-
-            // One app grant covers every action in the application, so this second request
-            // answers `granted` at once; it is kept to re-resolve the target before the drag.
-            let durable_target = mint_target_lease(
-                planes,
-                bundle_identity,
-                21,
-                "drag mutate_durable target lease",
-            )
-            .await?;
-            if durable_target.pid != compose_target.pid
-                || durable_target.bundle_identity != compose_target.bundle_identity
-                || durable_target.process_generation_evidence
-                    != compose_target.process_generation_evidence
-            {
-                return Err(format!(
-                "drag lease widened or changed target: compose={compose_target:?} durable={durable_target:?}"
-            ));
-            }
-
-            let drag_from = frame_point(drag_frame, 0.25, 0.5);
-            let drag_to = frame_point(drag_frame, 0.75, 0.5);
-            let drag_reply = invoke_tool(
-                planes,
-                34,
-                "computer.drag",
-                json!({
-                    "from": wire_point(drag_from),
-                    "to": wire_point(drag_to),
-                    "button": "left",
-                    "modifiers": []
-                }),
-            )
-            .await?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let drag_report =
-                report_after_snapshot(planes, &mut snapshot_corr, DRAG_REPORT_PREFIX).await;
-            let drag_agrees = drag_report == "press>move>release";
-            let drag_verdict = verdict(&drag_reply, drag_agrees);
-            println!(
-                "\nDRAG sent: ({:.1}, {:.1}) -> ({:.1}, {:.1}) over {DRAG_LABEL:?}",
-                drag_from.0, drag_from.1, drag_to.0, drag_to.1
-            );
-            println!("DRAG production reply: {drag_reply}");
-            println!("DRAG page reported over CDP: {drag_report:?}");
-            println!("DRAG agrees: {drag_agrees}");
-            println!(
-            "DRAG VERDICT: {} (minted lease: pid={} bundle_identity={} generation={} action_kind=mutate_durable)",
-            drag_verdict.label(),
-            durable_target.pid,
-            durable_target.bundle_identity,
-            durable_target.process_generation_evidence
-        );
-            verdicts.push(("drag", drag_verdict));
-        }
+        // The pointer is measured by live_global_cursor, not here: pointer
+        // actions are the takeover rows, which act only in a frontmost
+        // application and only under the takeover grant, while this probe
+        // exists to show delivery to a target that never leads.
 
         // A run the target led at any point proves nothing about targeting.
         if !control_run && focus_watch.load(Ordering::SeqCst) {
@@ -669,15 +538,6 @@ mod macos_probe {
             .find_map(|line| line.name.strip_prefix(prefix).map(str::to_string))
     }
 
-    fn parse_i64(value: &str) -> Option<i64> {
-        value.parse().ok()
-    }
-
-    fn parse_pair(value: &str) -> Option<(f64, f64)> {
-        let (x, y) = value.split_once(',')?;
-        Some((x.parse().ok()?, y.parse().ok()?))
-    }
-
     /// The pid macOS currently considers frontmost, or None if it cannot say.
     fn frontmost_process_id() -> Option<i32> {
         let out = std::process::Command::new("/usr/bin/osascript")
@@ -702,114 +562,6 @@ mod macos_probe {
             .args(["-a", "Finder"])
             .status();
         std::thread::sleep(Duration::from_millis(1500));
-    }
-
-    async fn wait_for_pointer_frames(
-        pid: u32,
-    ) -> Result<(cerebellum_macos::AxFrame, cerebellum_macos::AxFrame), String> {
-        let started = Instant::now();
-        let deadline = started + Duration::from_secs(10);
-        let mut last = "no accessibility read completed".to_string();
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let options = cerebellum_macos::AxReadOptions {
-                timeout: remaining.min(cerebellum_macos::AxReadOptions::default().timeout),
-                ..Default::default()
-            };
-            match cerebellum_macos::read_accessibility_tree(pid, options) {
-                Ok(tree) => {
-                    // Web element frames first, then the WINDOW as a fallback.
-                    //
-                    // Chromium does not publish its web content in the macOS
-                    // accessibility tree, so the page's own buttons are usually
-                    // absent there however long we wait -- measured across live
-                    // apps in August: native interfaces reach 72-95% element
-                    // addressability, web-rendered ones 33-39%, and web CONTENT
-                    // specifically is largely missing. Waiting longer for an
-                    // element the platform never publishes is the shape of the
-                    // locked-screen misdiagnosis: a real absence read as a
-                    // delivery defect.
-                    //
-                    // The WINDOW is published, and it is enough for what this
-                    // probe measures. The claim is that a pointer sequence is
-                    // delivered to the target process in press-move-release
-                    // order and that the page sees it -- the page reports the
-                    // coordinates it received over CDP, so the browser's own
-                    // hit-testing supplies the precision the frame does not.
-                    let move_frame = find_button_frame(&tree.root, MOVE_LABEL)
-                        .or_else(|| page_area_frame(&tree.root));
-                    let drag_frame = find_button_frame(&tree.root, DRAG_LABEL)
-                        .or_else(|| page_area_frame(&tree.root));
-                    last = format!(
-                        "completeness={:?} move_frame={move_frame:?} drag_frame={drag_frame:?}",
-                        tree.completeness
-                    );
-                    if tree.completeness == cerebellum_macos::AxTreeCompleteness::Complete {
-                        if let (Some(move_frame), Some(drag_frame)) = (move_frame, drag_frame) {
-                            return Ok((move_frame, drag_frame));
-                        }
-                    }
-                }
-                Err(error) => last = format!("accessibility read refused: {error:?}"),
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Err(format!(
-            "pointer targets did not become addressable after {}ms: {last}",
-            started.elapsed().as_millis()
-        ))
-    }
-
-    /// The target window's content area, in screen coordinates.
-    ///
-    /// Used when the page's own elements are not published to the macOS
-    /// accessibility tree. The top 15% is skipped so a point lands in rendered
-    /// content rather than in the tab strip or address bar, where a click would
-    /// measure the browser's chrome instead of the page.
-    fn page_area_frame(root: &cerebellum_macos::AxElement) -> Option<cerebellum_macos::AxFrame> {
-        fn first_window(
-            element: &cerebellum_macos::AxElement,
-        ) -> Option<cerebellum_macos::AxFrame> {
-            if element.role.as_deref() == Some("AXWindow") {
-                return element.frame;
-            }
-            element.children.iter().find_map(first_window)
-        }
-        let frame = first_window(root)?;
-        let chrome = frame.height * 0.15;
-        Some(cerebellum_macos::AxFrame {
-            x: frame.x,
-            y: frame.y + chrome,
-            width: frame.width,
-            height: frame.height - chrome,
-        })
-    }
-
-    fn find_button_frame(
-        element: &cerebellum_macos::AxElement,
-        title: &str,
-    ) -> Option<cerebellum_macos::AxFrame> {
-        if element.role.as_deref() == Some("AXButton") && element.title.as_deref() == Some(title) {
-            return element.frame;
-        }
-        element
-            .children
-            .iter()
-            .find_map(|child| find_button_frame(child, title))
-    }
-
-    fn frame_point(frame: cerebellum_macos::AxFrame, x_ratio: f64, y_ratio: f64) -> (f64, f64) {
-        (
-            frame.x + frame.width * x_ratio,
-            frame.y + frame.height * y_ratio,
-        )
-    }
-
-    fn wire_point(point: (f64, f64)) -> String {
-        format!("{:.3},{:.3}", point.0, point.1)
     }
 
     async fn mint_browser_grant(planes: &Planes, origin: &str) -> Result<(), String> {

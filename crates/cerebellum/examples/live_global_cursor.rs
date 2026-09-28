@@ -1,9 +1,15 @@
-//! Drive the three global-cursor capabilities OVER THE WIRE and report each
+//! Drive the three takeover capabilities OVER THE WIRE and report each
 //! verification arm on its own line.
 //!
-//! `computer.move`, `computer.scroll` and `computer.drag` post input to the
-//! whole session rather than to one process, and ship withheld behind the
-//! `CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION` build key. Their guards -- the
+//! `computer.takeover_move`, `computer.takeover_scroll` and
+//! `computer.takeover_drag` post input to the whole session rather than to one
+//! process, and ship withheld behind two build keys:
+//! `CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION` and
+//! `CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION`. The move and drag name
+//! points in an image a `computer.read_state` call returned, so the probe
+//! reads TextEdit's state with its image first; that call raises the app
+//! question, and the first takeover call raises the takeover question. The
+//! probe answers both "allow for this conversation". Their guards -- the
 //! containment rung they record, the focus re-check, the idle gate, and the
 //! abort on hardware input -- are covered by unit tests over fake drivers as
 //! far as fake drivers can go. What no unit test can supply is a real cursor
@@ -36,12 +42,11 @@
 //! never reported as a pass.
 //!
 //! WHERE EACH FACT IS READ, because the two sources say different things.
-//! Vocabulary v8 decides what a reply may carry, and for these rows it carries
-//! very little: `computer.move` and `computer.drag` declare no
-//! `containment_rung` at all, and no synthetic row declares the seize source or
-//! the idle numbers. Those facts live in the audit journal, which is why the
-//! journal is read here rather than trusted to agree with the wire. Each arm
-//! names its source in its evidence line.
+//! The vocabulary decides what a reply may carry, and for these rows it
+//! carries very little: a takeover reply is `completed` or a refusal, with no
+//! containment rung, seize source or idle numbers. Those facts live in the
+//! audit journal, which is why the journal is read here rather than trusted to
+//! agree with the wire. Each arm names its source in its evidence line.
 
 use std::process::ExitCode;
 
@@ -109,11 +114,11 @@ mod probe {
     /// that silently changed the number would still pass; this way the probe
     /// fails when the desk stops enforcing the second that was specified.
     const IDLE_THRESHOLD_MS: u64 = 1_000;
-    /// How long the probe waits for a Once lease to become live after the
-    /// consent answer goes out. The answer settles on another task inside the
-    /// module, so readiness is polled rather than slept off.
-    const LEASE_POLL_ATTEMPTS: u32 = 40;
-    const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    /// Points inside TextEdit's window, as fractions of the image the probe
+    /// read, so they land in the window whatever its size on this desk.
+    const MOVE_AT: (f64, f64) = (0.40, 0.45);
+    const DRAG_FROM: (f64, f64) = (0.30, 0.40);
+    const DRAG_TO: (f64, f64) = (0.55, 0.60);
 
     /// One arm's verdict.
     ///
@@ -249,13 +254,6 @@ mod probe {
         for arm in &arms {
             arm.report();
         }
-        // On the record for the next vocabulary revision rather than
-        // rediscovered by the next person to read a reply and find the field
-        // missing.
-        println!(
-            "note: vocabulary v8 omits containment_rung from the computer.move and \
-             computer.drag result schemas; computer.scroll declares it."
-        );
         if arms.iter().all(Arm::held) {
             ExitCode::SUCCESS
         } else {
@@ -377,7 +375,7 @@ mod probe {
             // previous attempt's own posts are carried by the estimator, but
             // the poke was another process's input and clears the carry.
             sleep(Duration::from_millis(1300)).await;
-            if let Err(reason) = wire.take_once_lease().await {
+            if let Err(reason) = wire.read_image().await {
                 return (
                     Arm::unmeasurable(ONE, ONE_NAME, reason),
                     Arm::unmeasurable(SEVEN, SEVEN_NAME, "arm 1 did not run"),
@@ -422,18 +420,8 @@ mod probe {
                     );
                 }
             }
-            let reply = match wire
-                .tool_call(
-                    "computer.drag",
-                    json!({
-                        "from": "400,400",
-                        "to": "520,460",
-                        "button": "left",
-                        "modifiers": [],
-                    }),
-                )
-                .await
-            {
+            let arguments = wire.drag(DRAG_FROM, DRAG_TO);
+            let reply = match wire.tool_call("computer.takeover_drag", arguments).await {
                 Ok(reply) => reply,
                 Err(reason) => {
                     return (
@@ -461,7 +449,7 @@ mod probe {
                     continue;
                 }
             }
-            let record = match settled_record(&before, "computer.drag") {
+            let record = match settled_record(&before, "computer.takeover_drag") {
                 Ok(record) => record,
                 Err(reason) => {
                     return (
@@ -593,31 +581,26 @@ mod probe {
     // ---------------------------------------------------------------- arm 4
 
     /// A global post records the weakest containment rung and the severity tier
-    /// that follows from it, on both sources that can carry the claim.
+    /// that follows from it.
     ///
-    /// Split across three actions because the two sources do not cover the same
-    /// ground. Vocabulary v8 gives `computer.move` and `computer.drag` a result
-    /// schema without `containment_rung` -- their delivery is always
-    /// coordinate-addressed, so the row declines to state a distinction it never
-    /// makes -- and the module strips the field before replying. For those two
-    /// the rung and the tier are read from the journal, and the wire is checked
-    /// for what v8 DOES declare. `computer.scroll` declares the field and
-    /// requires it, so the wire literal `global_none` is asserted there.
+    /// The takeover rows' replies declare no containment rung: a pointer post
+    /// is always the global stream, so the row states no distinction it never
+    /// makes, and the reply is checked to carry none. The rung and the tier
+    /// are read from the journal for each of the three rows.
     async fn arm_four(wire: &mut Wire) -> Arm {
         const NUMBER: &str = "4";
         const NAME: &str = "global_none_tier4_on_wire_and_journal";
         let mut evidence = Vec::new();
 
+        if let Err(reason) = wire.read_image().await {
+            return Arm::unmeasurable(NUMBER, NAME, reason);
+        }
         for (capability, arguments) in [
-            ("computer.move", json!({"to": "420,360"})),
+            ("computer.takeover_move", wire.move_to(MOVE_AT)),
+            ("computer.takeover_drag", wire.drag(MOVE_AT, DRAG_TO)),
             (
-                "computer.drag",
-                json!({
-                    "from": "420,360",
-                    "to": "560,470",
-                    "button": "left",
-                    "modifiers": [],
-                }),
+                "computer.takeover_scroll",
+                json!({"target": TARGET_BUNDLE, "axis": "vertical", "amount_lines": -1}),
             ),
         ] {
             let before = match journal_entries() {
@@ -635,23 +618,13 @@ mod probe {
                     format!("{capability} did not complete: {reply}"),
                 );
             }
-            // What v8 declares for these two rows, asserted as declared.
-            for field in ["outcome", "effect_status", "target_fronted"] {
-                if reply.get(field).is_none() {
-                    return Arm::fail(
-                        NUMBER,
-                        NAME,
-                        format!("{capability} reply omits the declared field {field}: {reply}"),
-                    );
-                }
-            }
             if reply.get("containment_rung").is_some() {
                 return Arm::fail(
                     NUMBER,
                     NAME,
                     format!(
-                        "{capability} reply carries containment_rung, which its v8 result \
-                         schema does not declare: {reply}"
+                        "{capability} reply carries containment_rung, which its result schema \
+                         does not declare: {reply}"
                     ),
                 );
             }
@@ -680,49 +653,18 @@ mod probe {
                 );
             }
             evidence.push(format!(
-                "{capability} wire outcome=completed effect_status={} target_fronted={} \
-                 containment_rung absent as v8 declares; journal rung=global_none tier=4",
-                reply["effect_status"], reply["target_fronted"]
+                "{capability} wire outcome=completed, no containment_rung as declared; journal \
+                 rung=global_none tier=4"
             ));
         }
-
-        // The one row whose result schema declares the rung, so the claim
-        // "global_none reaches the wire" is asserted somewhere real.
-        let reply = match wire
-            .pointer_action(
-                "computer.scroll",
-                json!({"target": "probe", "axis": "vertical", "amount_lines": -1}),
-            )
-            .await
-        {
-            Ok(reply) => reply,
-            Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
-        };
-        if reply["outcome"] != json!("completed") {
-            return Arm::fail(
-                NUMBER,
-                NAME,
-                format!("computer.scroll did not complete: {reply}"),
-            );
-        }
-        if reply["containment_rung"] != json!("global_none") {
-            return Arm::fail(
-                NUMBER,
-                NAME,
-                format!(
-                    "computer.scroll wire rung is {}, not global_none",
-                    reply["containment_rung"]
-                ),
-            );
-        }
-        evidence.push("computer.scroll wire containment_rung=global_none".to_string());
         Arm::pass(NUMBER, NAME, evidence.join(" | "))
     }
 
     // ---------------------------------------------------------------- arm 3
 
-    /// The front is re-checked between taking the lease and posting, so an
-    /// application that steals it in between stops the post.
+    /// The front is re-checked before the post, so an application that steals
+    /// it after the call is admitted stops the post. A takeover action never
+    /// brings its target forward to recover.
     ///
     /// The positive control is not decoration. A refusal on its own is also what
     /// a probe that can never post produces, and the two read identically; the
@@ -732,7 +674,7 @@ mod probe {
         const NUMBER: &str = "3";
         const NAME: &str = "focus_toctou_refused";
 
-        if let Err(reason) = wire.take_once_lease().await {
+        if let Err(reason) = wire.read_image().await {
             return Arm::unmeasurable(NUMBER, NAME, reason);
         }
         if let Err(reason) = front(INTRUDER_APP) {
@@ -742,25 +684,24 @@ mod probe {
             Ok(entries) => entries,
             Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
         };
-        let reply = match wire
-            .tool_call("computer.move", json!({"to": "300,300"}))
-            .await
-        {
+        let arguments = wire.move_to(MOVE_AT);
+        let reply = match wire.tool_call("computer.takeover_move", arguments).await {
             Ok(reply) => reply,
             Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
         };
-        if reply["outcome"] != json!("target_focus_mismatch") {
+        if reply["outcome"] != json!("target_not_frontmost")
+            || reply["reason"] != json!("target_focus_mismatch")
+        {
             return Arm::fail(
                 NUMBER,
                 NAME,
                 format!(
-                    "a move issued while {INTRUDER_APP} was frontmost answered {}, not \
-                     target_focus_mismatch",
-                    reply["outcome"]
+                    "a move issued while {INTRUDER_APP} was frontmost answered {reply}, not \
+                     target_not_frontmost for target_focus_mismatch"
                 ),
             );
         }
-        let record = match settled_record(&before, "computer.move") {
+        let record = match settled_record(&before, "computer.takeover_move") {
             Ok(record) => record,
             Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
         };
@@ -793,8 +734,9 @@ mod probe {
         if let Err(reason) = front(TARGET_APP) {
             return Arm::unmeasurable(NUMBER, NAME, reason);
         }
+        let arguments = wire.move_to(DRAG_FROM);
         let control = match wire
-            .pointer_action("computer.move", json!({"to": "320,320"}))
+            .pointer_action("computer.takeover_move", arguments)
             .await
         {
             Ok(reply) => reply,
@@ -814,9 +756,9 @@ mod probe {
             NUMBER,
             NAME,
             format!(
-                "wire outcome=target_focus_mismatch with {INTRUDER_APP} fronted; journal \
-                 terminal=refused abort.reason=focus_mismatch (no post delivered); positive \
-                 control completed with {TARGET_APP} fronted"
+                "wire outcome=target_not_frontmost reason=target_focus_mismatch with \
+                 {INTRUDER_APP} fronted; journal terminal=refused abort.reason=focus_mismatch \
+                 (no post delivered); positive control completed with {TARGET_APP} fronted"
             ),
         )
     }
@@ -831,16 +773,14 @@ mod probe {
         const NUMBER: &str = "2+";
         const NAME: &str = "idle_gate_passes_when_idle";
 
-        if let Err(reason) = wire.take_once_lease().await {
+        if let Err(reason) = wire.read_image().await {
             return Arm::unmeasurable(NUMBER, NAME, reason);
         }
-        // Longer than the threshold, and measured from after the lease is taken
-        // so the request itself does not shorten the idle window.
+        // Longer than the threshold, and measured from after the image is
+        // read so the read itself does not shorten the idle window.
         sleep(Duration::from_secs(2)).await;
-        let reply = match wire
-            .tool_call("computer.move", json!({"to": "340,340"}))
-            .await
-        {
+        let arguments = wire.move_to(MOVE_AT);
+        let reply = match wire.tool_call("computer.takeover_move", arguments).await {
             Ok(reply) => reply,
             Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
         };
@@ -870,7 +810,7 @@ mod probe {
     /// hand and the probe's clock are not synchronised and a single sample
     /// would turn a timing miss into a defect report. Any attempt inside the
     /// window refusing is the arm; the numbers come from the journal, since no
-    /// synthetic row declares them on the wire.
+    /// takeover row declares them on the wire.
     async fn arm_two_minus(wire: &mut Wire) -> Arm {
         const NUMBER: &str = "2-";
         const NAME: &str = "idle_gate_refuses_after_input";
@@ -881,22 +821,20 @@ mod probe {
         // instruction every cue gets, so the refusal can arrive anywhere in
         // the first few seconds rather than only at once.
         for attempt in 1..=15 {
-            if let Err(reason) = wire.take_once_lease().await {
+            if let Err(reason) = wire.read_image().await {
                 return Arm::unmeasurable(NUMBER, NAME, reason);
             }
             let before = match journal_entries() {
                 Ok(entries) => entries,
                 Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
             };
-            let reply = match wire
-                .tool_call("computer.move", json!({"to": "360,360"}))
-                .await
-            {
+            let arguments = wire.move_to(DRAG_TO);
+            let reply = match wire.tool_call("computer.takeover_move", arguments).await {
                 Ok(reply) => reply,
                 Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
             };
             if reply["outcome"] == json!("not_idle") {
-                let record = match settled_record(&before, "computer.move") {
+                let record = match settled_record(&before, "computer.takeover_move") {
                     Ok(record) => record,
                     Err(reason) => return Arm::unmeasurable(NUMBER, NAME, reason),
                 };
@@ -1004,25 +942,15 @@ mod probe {
                 if burst_started.elapsed() > BURST {
                     break None;
                 }
-                if let Err(reason) = wire.take_once_lease().await {
+                if let Err(reason) = wire.read_image().await {
                     return Arm::unmeasurable(ONE, ONE_NAME, reason);
                 }
                 let before = match journal_entries() {
                     Ok(entries) => entries,
                     Err(reason) => return Arm::unmeasurable(ONE, ONE_NAME, reason),
                 };
-                let reply = match wire
-                    .tool_call(
-                        "computer.drag",
-                        json!({
-                            "from": "400,400",
-                            "to": "520,460",
-                            "button": "left",
-                            "modifiers": [],
-                        }),
-                    )
-                    .await
-                {
+                let arguments = wire.drag(DRAG_FROM, DRAG_TO);
+                let reply = match wire.tool_call("computer.takeover_drag", arguments).await {
                     Ok(reply) => reply,
                     Err(reason) => return Arm::unmeasurable(ONE, ONE_NAME, reason),
                 };
@@ -1052,7 +980,7 @@ mod probe {
                 ));
                 continue;
             };
-            let record = match settled_record(&before, "computer.drag") {
+            let record = match settled_record(&before, "computer.takeover_drag") {
                 Ok(record) => record,
                 Err(reason) => return Arm::unmeasurable(ONE, ONE_NAME, reason),
             };
@@ -1145,6 +1073,9 @@ mod probe {
         tool: (u16, u32),
         management: (u16, u32),
         next_corr: u64,
+        /// The image of TextEdit's window the takeover points are named in:
+        /// its id, width and height in pixels.
+        image: Option<(String, u64, u64)>,
     }
 
     impl Wire {
@@ -1175,6 +1106,7 @@ mod probe {
                 tool: (0, 0),
                 management: (0, 0),
                 next_corr: 1,
+                image: None,
             };
             wire.tool = wire
                 .open_route(RouteTarget::ToolProvider {
@@ -1272,30 +1204,69 @@ mod probe {
                     served.extend(tools.iter().map(|tool| tool.name.clone()));
                 }
             }
-            let missing: Vec<_> = ["computer.move", "computer.scroll", "computer.drag"]
-                .into_iter()
-                .filter(|wanted| !served.iter().any(|name| name == wanted))
-                .collect();
+            let missing: Vec<_> = [
+                "computer.read_state",
+                "computer.takeover_move",
+                "computer.takeover_scroll",
+                "computer.takeover_drag",
+            ]
+            .into_iter()
+            .filter(|wanted| !served.iter().any(|name| name == wanted))
+            .collect();
             if missing.is_empty() {
                 Ok(())
             } else {
                 Err(format!(
                     "the daemon's catalogue for {MODULE_ID} does not advertise {missing:?}; \
-                     the running module was built without \
-                     CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION set, which withholds these \
-                     capabilities"
+                     the running module was built without both \
+                     CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION and \
+                     CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION set, which withholds \
+                     the takeover capabilities"
                 ))
             }
         }
 
-        /// Take a Once lease and then run one pointer action with it.
+        /// Make sure an image to name points in is held, then run one
+        /// pointer action.
         async fn pointer_action(
             &mut self,
             capability: &str,
             arguments: Value,
         ) -> Result<Value, String> {
-            self.take_once_lease().await?;
+            self.read_image().await?;
             self.tool_call(capability, arguments).await
+        }
+
+        /// A move to a point of TextEdit's window, as fractions of its image.
+        fn move_to(&self, (x, y): (f64, f64)) -> Value {
+            json!({"image_id": self.image_id(), "to": self.pixel(x, y)})
+        }
+
+        /// A drag between two points of TextEdit's window.
+        fn drag(&self, from: (f64, f64), to: (f64, f64)) -> Value {
+            json!({
+                "image_id": self.image_id(),
+                "from": self.pixel(from.0, from.1),
+                "to": self.pixel(to.0, to.1),
+            })
+        }
+
+        fn image_id(&self) -> String {
+            self.image
+                .as_ref()
+                .map(|(id, _, _)| id.clone())
+                .unwrap_or_default()
+        }
+
+        fn pixel(&self, x: f64, y: f64) -> Value {
+            let (width, height) = self
+                .image
+                .as_ref()
+                .map_or((0, 0), |(_, width, height)| (*width, *height));
+            json!({
+                "x": (width as f64 * x) as u64,
+                "y": (height as f64 * y) as u64,
+            })
         }
 
         async fn tool_call(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -1313,69 +1284,41 @@ mod probe {
                 .map_err(|error| format!("{name} reply did not parse: {error}"))
         }
 
-        async fn management_call(&mut self, method: &str, params: Value) -> Result<Value, String> {
-            let (channel, epoch) = self.management;
-            let corr = self.corr();
-            self.send(
-                channel,
-                epoch,
-                corr,
-                json!({"method": method, "params": params}),
-            )
-            .await?;
-            let reply = self.await_response(corr).await?;
-            serde_json::from_slice(&reply.body)
-                .map_err(|error| format!("{method} reply did not parse: {error}"))
-        }
-
-        /// Ask for the target, answer the consent question, and wait until the
-        /// lease is actually live.
+        /// Read TextEdit's state with an image of its window, once, so the
+        /// takeover points have an image to be named in.
         ///
-        /// Every pointer action consumes the Once lease, so this runs before
-        /// each one. Readiness is POLLED rather than slept off: the answer is
-        /// settled on another task inside the module, and a fixed sleep either
-        /// wastes time or races it. `already_held` is the module's own word for
-        /// a live lease, so it is the signal used.
-        async fn take_once_lease(&mut self) -> Result<(), String> {
-            let params = json!({
-                "bundle_identity": TARGET_BUNDLE,
-                "action_kind": "mutate_durable",
-            });
+        /// The read asks for TextEdit's app grant the first time, and the
+        /// question arrives as a reverse request that `await_response`
+        /// answers while the call waits; the reply is the state itself. The
+        /// takeover question is raised the same way by the first takeover
+        /// call, and both grants last the conversation, so nothing is taken
+        /// again before each action.
+        async fn read_image(&mut self) -> Result<(), String> {
+            if self.image.is_some() {
+                return Ok(());
+            }
             let reply = self
-                .management_call("computer.open_target", params.clone())
+                .tool_call(
+                    "computer.read_state",
+                    json!({"target": TARGET_BUNDLE, "include_image": true}),
+                )
                 .await?;
-            match reply["outcome"].as_str() {
-                Some("already_held") => return Ok(()),
-                Some("consent_pending") => {}
-                _ => {
-                    return Err(format!(
-                        "computer.open_target for {TARGET_BUNDLE} answered {reply}"
-                    ))
+            let image = &reply["image"];
+            match (
+                image["image_id"].as_str(),
+                image["width_px"].as_u64(),
+                image["height_px"].as_u64(),
+            ) {
+                (Some(id), Some(width), Some(height)) => {
+                    self.image = Some((id.to_string(), width, height));
+                    Ok(())
                 }
+                _ => Err(format!(
+                    "computer.read_state for {TARGET_BUNDLE} returned no image to name points \
+                     in (is Screen Recording granted?): {}",
+                    reply["outcome"]
+                )),
             }
-            // The question arrives as a reverse request on the management
-            // channel; `await_response` answers any it meets while waiting.
-            for _ in 0..LEASE_POLL_ATTEMPTS {
-                sleep(LEASE_POLL_INTERVAL).await;
-                let reply = self
-                    .management_call("computer.open_target", params.clone())
-                    .await?;
-                match reply["outcome"].as_str() {
-                    Some("already_held") => return Ok(()),
-                    Some("consent_pending") => continue,
-                    _ => {
-                        return Err(format!(
-                            "computer.open_target for {TARGET_BUNDLE} answered {reply} while \
-                             waiting for the lease"
-                        ))
-                    }
-                }
-            }
-            Err(format!(
-                "no Once lease for {TARGET_BUNDLE} became live within {}ms of answering the \
-                 consent question",
-                LEASE_POLL_ATTEMPTS as u64 * LEASE_POLL_INTERVAL.as_millis() as u64
-            ))
         }
 
         async fn send(
@@ -1466,7 +1409,7 @@ mod probe {
                 question.header.channel,
                 question.header.epoch,
                 question.header.corr,
-                serde_json::to_vec(&json!({"decision": "allow_once"}))
+                serde_json::to_vec(&json!({"decision": "allow_conversation"}))
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| format!("build consent answer frame: {error}"))?;
