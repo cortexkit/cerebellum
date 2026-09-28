@@ -152,6 +152,16 @@ mod nowhere;
 RUST
 expect "a test module with no file refuses rather than skipping it" 2 "test module \`nowhere\` has no file" "$tree"
 
+tree="$(fresh_tree format_floor)"
+cat >>"$tree/crates/demo/tests/wire.rs" <<'RUST'
+
+#[test]
+fn floor() {
+    let _ = FormatFloor::governing(&journal_path());
+}
+RUST
+expect "a test choosing the format floor from the process data home" 1 "crates/demo/tests/wire.rs:8: FormatFloor::governing(" "$tree"
+
 mkdir -p "$TMP_DIR/empty"
 expect "an empty tree refuses rather than passing" 2 "nothing was scanned" "$TMP_DIR/empty"
 

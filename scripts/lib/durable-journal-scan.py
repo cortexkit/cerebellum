@@ -62,6 +62,14 @@ OFFENDERS: List[Tuple[str, List[str]]] = [
         ["DurableLaunchJournal", ":", ":", "open_filesystem", "("],
     ),
     ("production_profile_lifecycle(", ["production_profile_lifecycle", "("]),
+    # The format floor chosen from the process's own data home, which in a
+    # test is the operator's: any store it names under that home would raise
+    # the operator's floor file. Tests choose with `governing_under` and a
+    # scratch data home, or name a scratch floor file outright.
+    (
+        "FormatFloor::governing(",
+        ["FormatFloor", ":", ":", "governing", "("],
+    ),
 ]
 
 FIRST_TOKENS = {sequence[0] for _, sequence in OFFENDERS}

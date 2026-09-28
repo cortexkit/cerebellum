@@ -44,6 +44,34 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+# THE FORMAT FLOOR GATE, before anything is built for release. Every writer
+# raises a floor in the module's data directory before it first writes a
+# format, so the floor names at least every record version on this disk. A
+# build that reads less than that would refuse those records once placed --
+# placing a build from before the custody lock's v2 while a browser holds a
+# profile leaves that profile locked until the lock is deleted by hand -- so
+# it is refused here, naming each format it falls short on. The data home follows the daemon's ladder as the module resolves
+# it on this host: XDG_DATA_HOME when set, else ~/.local/share. A relative
+# XDG_DATA_HOME is refused, as the module refuses it: the floor it names
+# depends on the working directory rather than on anything the module wrote.
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+  DATA_HOME="$XDG_DATA_HOME"
+else
+  DATA_HOME="$HOME/.local/share"
+fi
+case "$DATA_HOME" in
+  /*) ;;
+  *)
+    echo "REFUSING TO STAGE: the data home '$DATA_HOME' is not absolute, so the" >&2
+    echo "format floor it would name is not the one the module writes." >&2
+    exit 1
+    ;;
+esac
+FORMAT_FLOOR="$DATA_HOME/cortexkit/cerebellum/format-floor.json"
+FORMAT_VERSIONS="$(mktemp)"
+trap 'rm -f "$FORMAT_VERSIONS"' EXIT
+./scripts/lib/format-floor-gate.sh "$FORMAT_FLOOR" "$FORMAT_VERSIONS"
+
 # Unfiltered and unpiped: this script's refusals must reach the terminal. The
 # fleet lost a refusal twice by sending it through a filter whose exit code
 # replaced the script's.
@@ -51,6 +79,10 @@ fi
 
 mkdir -p "$STAGE"
 cp target/release/"$DEPLOYED_NAME" "$STAGE/"
+
+# What this build reads, beside the binary, so the placer can check it against
+# the floor on the machine it places onto rather than trusting this host's.
+cp "$FORMAT_VERSIONS" "$STAGE/format-versions.json"
 
 # The backup catalog travels with the binary. It lives in the repo because it is
 # a reviewable declaration rather than generated state, and it is placed into the
@@ -148,6 +180,9 @@ cp "$STAGE/$DEPLOYED_NAME" "$FLEET_STAGING/$CARD"
   echo "REFUSING: the fleet staging card does not match the staged bytes" >&2
   exit 1
 }
+# The card's readable formats travel beside it. The declaration line in
+# `.current` keeps its shasum shape, since the placement gate parses it.
+cp "$STAGE/format-versions.json" "$FLEET_STAGING/$CARD.format-versions.json"
 
 echo
 # The DECLARED path leads, because that is the only one a placement gate can
@@ -163,6 +198,8 @@ echo "    rev:         $HEAD_REV"
 echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar beside both copies)"
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
+echo "    reads:       $(cat "$STAGE/format-versions.json")  ($CARD.format-versions.json beside the card)"
+echo "    floor:       $FORMAT_FLOOR"
 echo
 echo "Place engram-catalog.json into the module data directory"
 echo "(~/.local/share/cortexkit/cerebellum/) alongside the binary placement, or"

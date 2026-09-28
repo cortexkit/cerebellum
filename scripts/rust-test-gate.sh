@@ -335,7 +335,9 @@ run_phase "sibling matches the declared revisions" \
 # constructors, naming `JournalPersistence::Durable` outright, and the openers
 # that always take the operator's own files -- the computer audit, the launch
 # journal (whose startup recovery can kill a live browser and move profile
-# custody) and the profile registry of real browser profiles.
+# custody) and the profile registry of real browser profiles -- and the format
+# floor chosen from the process's data home, which is the operator's floor
+# file for any store under it.
 #
 # Its planted-offender proofs run first: a scan that reports nothing looks the
 # same whether the tree is clean or the scan is blind. The scan prints how many
@@ -491,6 +493,13 @@ run_phase "cargo test --workspace --quiet" \
 # the seam could rot unnoticed.
 run_phase "cargo test -p cerebellum --features test-observer --test conformance --quiet" \
   cargo test -p cerebellum --features test-observer --test conformance --quiet
+
+# Phase 5b: staging refuses a build below the format floor. The gate lives in a
+# script rather than a test, so a test run never exercises it; its proofs point
+# it at scratch floor files, one version above what this tree reads, equal to
+# it, and missing, and never at the operator's data home.
+run_phase "scripts/lib/format-floor-gate.test.sh" \
+  scripts/lib/format-floor-gate.test.sh
 
 # Phase 6: a generated file must be committed in the form its generator emits.
 # An entry that is semantically right but textually different -- a hand-written
