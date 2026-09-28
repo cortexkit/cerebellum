@@ -4210,14 +4210,21 @@ mod orphan_recovery_tests {
         }
 
         /// A running process whose executable is named like Chromium.
-        fn chromium_named_process(directory: &TestRoot) -> std::process::Child {
+        fn chromium_named_process() -> std::process::Child {
             // A copy of this test binary, because macOS kills a copy of a
             // system binary such as /bin/sleep moments after it starts; this
             // binary's own signature survives the copy. It runs only the
-            // sleeper below.
-            let executable = directory.0.join("Chromium");
-            std::fs::copy(std::env::current_exe().expect("test binary"), &executable)
-                .expect("copy test binary");
+            // sleeper below. The copy is content-named, so the same test build
+            // reuses one path and macOS assesses the new executable once, not
+            // on every run.
+            let bytes = std::fs::read(std::env::current_exe().expect("test binary"))
+                .expect("read test binary");
+            let executable = crate::content_named_fixture::content_named_fixture(
+                "chromium-named",
+                "Chromium",
+                &bytes,
+                0o755,
+            );
             let child = std::process::Command::new(&executable)
                 .args(["--ignored", "--exact", "--nocapture"])
                 .arg(format!(
@@ -4346,8 +4353,7 @@ mod orphan_recovery_tests {
             let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
             let directory = &fixture.profile_directory.0;
 
-            let executables = TestRoot::new("chromium-named");
-            let child = chromium_named_process(&executables);
+            let child = chromium_named_process();
             singleton_lock_to(directory, &format!("{}-{}", this_host(), child.id()));
             let reply = fixture.refusal().await;
             let pid = child.id();

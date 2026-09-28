@@ -434,23 +434,15 @@ mod tests {
         // A fake verifier that outlives any sane deadline, so the bound is
         // measured rather than assumed. Using a real wedged codesign would
         // make this test depend on the host's system-policy daemon, which is
-        // the condition that motivated the bound and cannot be staged.
-        let directory = std::env::temp_dir().join(format!(
-            "ck-slow-verifier-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).expect("create slow verifier directory");
-        let verifier = directory.join("codesign");
-        std::fs::write(&verifier, "#!/bin/sh\nsleep 600\n").expect("write slow verifier");
-        let mut permissions = std::fs::metadata(&verifier)
-            .expect("read slow verifier metadata")
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-        std::fs::set_permissions(&verifier, permissions).expect("make slow verifier executable");
+        // the condition that motivated the bound and cannot be staged. It is
+        // content-named so macOS assesses the new executable once, not on every
+        // run.
+        let verifier = crate::content_named_fixture::content_named_fixture(
+            "slow-verifier",
+            "codesign",
+            b"#!/bin/sh\nsleep 600\n",
+            0o755,
+        );
 
         let started = std::time::Instant::now();
         let refusal =
@@ -467,7 +459,6 @@ mod tests {
             elapsed < VERIFIER_DEADLINE * 2,
             "the read returned after {elapsed:?}, which is not bounded by the deadline"
         );
-        std::fs::remove_dir_all(&directory).expect("remove slow verifier directory");
     }
 
     #[cfg(target_os = "macos")]
