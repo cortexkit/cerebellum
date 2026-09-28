@@ -600,6 +600,9 @@ pub struct DeskElement {
     pub applies_writes: bool,
 }
 
+/// What a hit test finds: an element token and the pid that owns it.
+pub type DeskHit = (u64, Option<u32>);
+
 /// What focus the desk reports for the target application.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,7 +629,7 @@ pub struct DeskState {
     /// System-wide hits at particular desktop points, which take the place
     /// of `system_wide_hit` there. How a test puts two applications under
     /// the two ends of one drag.
-    pub system_wide_hits_at: Vec<((f64, f64), (u64, Option<u32>))>,
+    pub system_wide_hits_at: Vec<((f64, f64), DeskHit)>,
     pub presses: Vec<u64>,
     pub writes: Vec<(u64, TextAttribute)>,
     pub hit_scopes: Vec<HitScope>,

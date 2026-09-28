@@ -1694,17 +1694,20 @@ mod tests {
                 declaration.suppression_reason
             );
         }
-        let unbind: [(&str, fn(&mut ImmutableReleaseInputs)); 2] = [
-            ("global dispatch review revision is not bound", |inputs| {
-                inputs.global_dispatch_review_revision = None
-            }),
-            ("takeover dispatch review revision is not bound", |inputs| {
-                inputs.takeover_dispatch_review_revision = None
-            }),
-        ];
-        for (reason, spoil) in unbind {
-            let mut inputs = fully_bound_inputs();
-            spoil(&mut inputs);
+        let mut without_global = fully_bound_inputs();
+        without_global.global_dispatch_review_revision = None;
+        let mut without_takeover = fully_bound_inputs();
+        without_takeover.takeover_dispatch_review_revision = None;
+        for (reason, inputs) in [
+            (
+                "global dispatch review revision is not bound",
+                without_global,
+            ),
+            (
+                "takeover dispatch review revision is not bound",
+                without_takeover,
+            ),
+        ] {
             for id in rows {
                 let declaration = driver.declaration(id, &context(inputs.clone()));
                 assert!(!declaration.advertised, "{id} was advertised: {reason}");
