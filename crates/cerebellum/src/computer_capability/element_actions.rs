@@ -44,7 +44,9 @@ const SETTLE_POLL: Duration = Duration::from_millis(50);
 pub(crate) const MAX_DIFF_ENTRIES: usize = 1_500;
 
 /// The longest an action waits for its effect to show before taking the
-/// diff, from the row's own settle bound.
+/// diff, from the row's own settle bound. A row that declares none (keys)
+/// waits the 500 ms the element rows declare, since its diff is taken the
+/// same way.
 pub(crate) fn settle_bound(capability: ComputerCapability) -> Duration {
     Duration::from_millis(
         frozen_row_bound_ms(
@@ -606,7 +608,7 @@ where
     })
 }
 
-/// What a point in an image hit.
+/// The result of hit-testing a point of an image.
 pub(crate) enum PointHit {
     Element(ElementHandle),
     Nothing,

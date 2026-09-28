@@ -529,8 +529,9 @@ where
         }
     }
 
-    /// Admit the fronting bracket, as a build carrying its release review
-    /// does.
+    /// Allow keystrokes to reach an application in the background by bringing
+    /// it forward briefly. Only a build whose release carries the review of
+    /// that mechanism sets this; without it such keystrokes are refused.
     pub fn with_fronting_bracket_admitted(mut self, admitted: bool) -> Self {
         self.fronting_bracket_admitted = admitted;
         self

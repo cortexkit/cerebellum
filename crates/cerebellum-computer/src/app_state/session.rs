@@ -177,7 +177,8 @@ pub enum ElementResolution {
     Stale,
 }
 
-/// What giving a hit-tested element an id came to.
+/// The possible results of giving a session id to an element found by a hit
+/// test rather than by a read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Adoption {
     /// The element's id in the session.
