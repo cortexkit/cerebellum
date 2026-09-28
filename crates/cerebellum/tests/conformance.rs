@@ -1345,6 +1345,7 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     assert_eq!(evidence["predicate"]["kind"], "element_present");
 }
 
+#[cfg(target_os = "macos")]
 async fn one_reply(request: Value, admitted: Option<&[&str]>, channel: u16) -> Frame {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
