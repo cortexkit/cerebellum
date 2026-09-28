@@ -1412,8 +1412,7 @@ fn question_body(ask_id: &str, need: &GrantNeed, offered: &[&'static str]) -> Va
     match need {
         GrantNeed::App { display_name, .. } => {
             params["app"] = json!(display_name);
-            params["message"] =
-                json!("Covers reading and acting inside this application for this conversation.");
+            params["message"] = json!("Covers reading and acting inside this application.");
         }
         GrantNeed::Takeover => {
             params["message"] = json!(
