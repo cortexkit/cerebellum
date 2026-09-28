@@ -1,6 +1,6 @@
 //! Platform-neutral routing for one synthesized event to one process.
 //!
-//! This module decides whether the public per-process transport may be called.
+//! This module decides whether the selected per-process transport may be called.
 //! It does not expose a global transport, and the event is moved into the
 //! selected transport even when that transport reports failure. That ownership
 //! boundary makes retrying the same event through another transport impossible.
@@ -37,6 +37,39 @@ pub enum WindowServerVisibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerProcessTransport {
     PublicCoreGraphics,
+    PrivateSkyLight,
+}
+
+impl PerProcessTransport {
+    pub fn journal_name(self) -> &'static str {
+        match self {
+            Self::PublicCoreGraphics => "public_core_graphics",
+            Self::PrivateSkyLight => "private_skylight",
+        }
+    }
+}
+
+/// Private keyboard posting wakes background renderers. Public posting is a
+/// fallback only when the private entry point is unavailable, never a retry
+/// after a post whose delivery is uncertain.
+pub fn keyboard_transport(skylight_available: bool) -> PerProcessTransport {
+    if skylight_available {
+        PerProcessTransport::PrivateSkyLight
+    } else {
+        PerProcessTransport::PublicCoreGraphics
+    }
+}
+
+pub fn post_on_selected_route<E, R>(
+    route: PerProcessTransport,
+    event: E,
+    private: impl FnOnce(E) -> R,
+    public: impl FnOnce(E) -> R,
+) -> R {
+    match route {
+        PerProcessTransport::PrivateSkyLight => private(event),
+        PerProcessTransport::PublicCoreGraphics => public(event),
+    }
 }
 
 /// Evidence that the selected transport's post call returned.
@@ -100,6 +133,7 @@ pub enum ProcessEventRefusal {
 pub trait PerProcessEventTransport {
     type Event;
 
+    fn set_recovery(&mut self, _recovery: bool) {}
     fn process_generation(&mut self, pid: u32) -> ProcessGenerationReading;
     fn window_server_visibility(&mut self, pid: u32) -> WindowServerVisibility;
     fn post_to_pid(
@@ -167,9 +201,14 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
     transport: &mut T,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SequencePostReport, SequencePostFailure> {
-    post_guarded_event_sequence(steps, cancelled, |_, event, _recovery| match event {
-        Some(event) => route_event_to_process(target, event, transport).map(|(_, checks)| checks),
-        None => Ok(0),
+    post_guarded_event_sequence(steps, cancelled, |_, event, recovery| {
+        transport.set_recovery(recovery);
+        match event {
+            Some(event) => {
+                route_event_to_process(target, event, transport).map(|(_, checks)| checks)
+            }
+            None => Ok(0),
+        }
     })
     .map_err(|failure| SequencePostFailure {
         posts_returned: failure.posts_returned,
@@ -410,9 +449,12 @@ pub struct SequencePostFailure {
 
 /// Public CoreGraphics transport readings for production macOS callers.
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MacOsPerProcessEventTransport {
     window_list_timeout: Duration,
+    keyboard: Option<super::input_route::KeyboardRoute>,
+    recovery: bool,
+    pub evidence: super::input_route::InputRouteEvidence,
 }
 
 #[cfg(target_os = "macos")]
@@ -420,6 +462,22 @@ impl MacOsPerProcessEventTransport {
     pub fn new(window_list_timeout: Duration) -> Self {
         Self {
             window_list_timeout,
+            keyboard: None,
+            recovery: false,
+            evidence: Default::default(),
+        }
+    }
+
+    pub fn for_keyboard(window_list_timeout: Duration) -> Self {
+        Self {
+            window_list_timeout,
+            keyboard: Some(super::input_route::KeyboardRoute {
+                reviewed: super::input_route::private_route_review_bound(),
+                symbol_available: cerebellum_macos::skylight_available(),
+                factory_available: cerebellum_macos::keyboard_auth_available(),
+            }),
+            recovery: false,
+            evidence: Default::default(),
         }
     }
 }
@@ -427,6 +485,10 @@ impl MacOsPerProcessEventTransport {
 #[cfg(target_os = "macos")]
 impl PerProcessEventTransport for MacOsPerProcessEventTransport {
     type Event = cerebellum_macos::OwnedCgEvent;
+
+    fn set_recovery(&mut self, recovery: bool) {
+        self.recovery = recovery;
+    }
 
     fn process_generation(&mut self, pid: u32) -> ProcessGenerationReading {
         match cerebellum_macos::process_start_time(pid) {
@@ -460,8 +522,36 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
     ) -> Result<PostCallMade, PostCallFailure> {
         let pid = i32::try_from(pid)
             .map_err(|_| PostCallFailure::new("process id does not fit macOS pid_t"))?;
-        let _call_made_not_delivery = cerebellum_macos::post_event_to_pid(pid, &event);
-        Ok(PostCallMade::public_core_graphics())
+        let public = || {
+            let _call_made_not_delivery = cerebellum_macos::post_event_to_pid(pid, &event);
+            Ok(())
+        };
+        if let Some(keyboard) = self.keyboard {
+            keyboard.post(
+                self.recovery,
+                &mut self.evidence,
+                |attach_auth| match cerebellum_macos::post_single_key_to_pid(
+                    pid,
+                    &event,
+                    attach_auth,
+                ) {
+                    cerebellum_macos::PostResult::Posted { .. } => Ok(()),
+                    cerebellum_macos::PostResult::AuthUnavailable
+                    | cerebellum_macos::PostResult::AuthFailed => Err(PostCallFailure::new(
+                        super::input_route::PRIVATE_INPUT_AUTH_FAILED,
+                    )),
+                    error => Err(PostCallFailure::new(format!(
+                        "SkyLight post failed: {error:?}"
+                    ))),
+                },
+                public,
+            )
+        } else {
+            public()?;
+            self.evidence
+                .record(PerProcessTransport::PublicCoreGraphics, self.recovery);
+            Ok(PostCallMade::public_core_graphics())
+        }
     }
 }
 
@@ -488,6 +578,8 @@ mod tests {
         visibility: WindowServerVisibility,
         post_results: VecDeque<Result<PostCallMade, PostCallFailure>>,
         calls: Vec<Call>,
+        route: PerProcessTransport,
+        selected_routes: Vec<PerProcessTransport>,
     }
 
     impl FakeTransport {
@@ -501,6 +593,8 @@ mod tests {
                 visibility,
                 post_results: post_results.into_iter().collect(),
                 calls: Vec::new(),
+                route: PerProcessTransport::PublicCoreGraphics,
+                selected_routes: Vec::new(),
             }
         }
 
@@ -543,6 +637,13 @@ mod tests {
             pid: u32,
             event: Self::Event,
         ) -> Result<PostCallMade, PostCallFailure> {
+            let selected = post_on_selected_route(
+                self.route,
+                (),
+                |_| PerProcessTransport::PrivateSkyLight,
+                |_| PerProcessTransport::PublicCoreGraphics,
+            );
+            self.selected_routes.push(selected);
             self.calls.push(Call::Post { pid, event });
             self.post_results
                 .pop_front()
@@ -734,55 +835,76 @@ mod tests {
 
     #[test]
     fn every_sequence_event_is_posted_only_after_its_own_generation_reads() {
-        let mut transport = posting_transport(
-            [
-                current(),
-                current(),
-                current(),
-                current(),
-                current(),
-                current(),
-            ],
-            [
-                Ok(PostCallMade::public_core_graphics()),
-                Ok(PostCallMade::public_core_graphics()),
-                Ok(PostCallMade::public_core_graphics()),
-            ],
-        );
+        for selected in [
+            PerProcessTransport::PublicCoreGraphics,
+            PerProcessTransport::PrivateSkyLight,
+        ] {
+            let mut transport = posting_transport(
+                [
+                    current(),
+                    current(),
+                    current(),
+                    current(),
+                    current(),
+                    current(),
+                ],
+                [
+                    Ok(PostCallMade::public_core_graphics()),
+                    Ok(PostCallMade::public_core_graphics()),
+                    Ok(PostCallMade::public_core_graphics()),
+                ],
+            );
 
-        let report = post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
-            .expect("a fully routed sequence completes");
+            transport.route = selected;
+            let report =
+                post_event_sequence(target(), drag_steps(), &mut transport, &never_cancelled)
+                    .expect("a fully routed sequence completes");
+            assert_eq!(transport.selected_routes, vec![selected; 3]);
 
-        assert_eq!(report.posts_returned, 3);
-        // The generation is read once before the visibility read and again
-        // immediately before EVERY post — the check covering the first event
-        // of a drag says nothing about the process at the fifth.
-        assert_eq!(
-            transport.calls,
-            vec![
-                Call::ReadGeneration,
-                Call::ReadVisibility,
-                Call::ReadGeneration,
-                Call::Post {
-                    pid: PID,
-                    event: FakeEvent(1),
-                },
-                Call::ReadGeneration,
-                Call::ReadVisibility,
-                Call::ReadGeneration,
-                Call::Post {
-                    pid: PID,
-                    event: FakeEvent(2),
-                },
-                Call::ReadGeneration,
-                Call::ReadVisibility,
-                Call::ReadGeneration,
-                Call::Post {
-                    pid: PID,
-                    event: FakeEvent(3),
-                },
-            ]
-        );
+            assert_eq!(report.posts_returned, 3);
+            // The generation is read once before the visibility read and again
+            // immediately before EVERY post — the check covering the first event
+            // of a drag says nothing about the process at the fifth.
+            assert_eq!(
+                transport.calls,
+                vec![
+                    Call::ReadGeneration,
+                    Call::ReadVisibility,
+                    Call::ReadGeneration,
+                    Call::Post {
+                        pid: PID,
+                        event: FakeEvent(1),
+                    },
+                    Call::ReadGeneration,
+                    Call::ReadVisibility,
+                    Call::ReadGeneration,
+                    Call::Post {
+                        pid: PID,
+                        event: FakeEvent(2),
+                    },
+                    Call::ReadGeneration,
+                    Call::ReadVisibility,
+                    Call::ReadGeneration,
+                    Call::Post {
+                        pid: PID,
+                        event: FakeEvent(3),
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn private_keyboard_route_is_preferred_and_public_is_only_the_unavailable_fallback() {
+        for (available, expected) in [
+            (true, PerProcessTransport::PrivateSkyLight),
+            (false, PerProcessTransport::PublicCoreGraphics),
+        ] {
+            let route = keyboard_transport(available);
+            let selected = post_on_selected_route(route, 42, |_| "private", |_| "public");
+            assert_eq!(route, expected);
+            assert_eq!(selected, if available { "private" } else { "public" });
+        }
     }
 
     #[test]

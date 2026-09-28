@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub mod blocked_chord;
 pub mod containment;
+pub mod input_route;
 pub mod process_event;
 pub mod severity;
 pub mod synthetic;
@@ -1488,6 +1489,17 @@ pub trait PlatformDriver {
         &mut self,
         request: SemanticDispatchRequest,
     ) -> Result<DispatchResult, DriverError>;
+    /// Consume only aggregate transport facts; no key identity enters the journal.
+    fn take_input_route_evidence(&mut self) -> input_route::InputRouteEvidence {
+        input_route::InputRouteEvidence::default()
+    }
+    /// Selected transport for the audit intent, not a claim of delivery.
+    fn per_process_transport(
+        &self,
+        _action: &SyntheticAction,
+    ) -> Option<process_event::PerProcessTransport> {
+        None
+    }
     fn dispatch_per_pid(
         &mut self,
         request: SyntheticDispatchRequest,

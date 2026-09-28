@@ -156,9 +156,11 @@ mod imp {
         /// The private posting entry point did not resolve, so nothing private
         /// could be posted at all.
         SpiUnavailable,
-        /// An authentication object was asked for but could not be produced or
-        /// attached, so nothing was posted.
+        /// Authentication was requested but its factory symbols are absent.
         AuthUnavailable,
+        /// The factory exists but an event record or authentication object could
+        /// not be produced. Nothing was posted; this is not an absent factory.
+        AuthFailed,
         /// The event pair could not be constructed, so nothing was posted.
         EventBuildFailed,
     }
@@ -251,8 +253,8 @@ mod imp {
             }
         }
 
-        fn pair(&self) -> Option<(&CGEvent, &CGEvent)> {
-            Some((self.down.as_deref()?, self.up.as_deref()?))
+        fn pair(&self) -> Option<(&crate::OwnedCgEvent, &crate::OwnedCgEvent)> {
+            Some((self.down.as_ref()?, self.up.as_ref()?))
         }
     }
 
@@ -299,72 +301,66 @@ mod imp {
         (!message.is_null()).then_some(message)
     }
 
-    /// Post one key-down/key-up pair to `pid` through the private entry point.
-    ///
-    /// With `attach_auth`, an authentication object is built from each event and
-    /// attached before posting; the whole pair is posted only if both objects
-    /// were produced, so a failure leaves nothing half-sent. Returns which of
-    /// the outcomes occurred; it is not evidence the target acted on the keys.
+    /// Post a pair through the same single-event path as production dispatch.
+    /// A failure on the release may leave the key held; callers needing recovery
+    /// must own the events separately and use the single-event API.
     pub fn post_key_to_pid(pid: i32, event: &OwnedKeyEvent, attach_auth: bool) -> PostResult {
+        let Some((down, up)) = event.pair() else {
+            return PostResult::EventBuildFailed;
+        };
+        let result = post_single_key_to_pid(pid, down, attach_auth);
+        if !matches!(result, PostResult::Posted { .. }) {
+            return result;
+        }
+        post_single_key_to_pid(pid, up, attach_auth)
+    }
+
+    /// Post one retained keyboard event, leaving cancellation, identity checks
+    /// and paired-release recovery to the owner of the sequence. Authentication
+    /// failure never posts the event. A returned post is not proof of delivery.
+    pub fn post_single_key_to_pid(
+        pid: i32,
+        event: &crate::OwnedCgEvent,
+        attach_auth: bool,
+    ) -> PostResult {
         let symbols = symbols();
         let Some(post_address) = symbols.post_to_pid else {
             return PostResult::SpiUnavailable;
         };
-        let Some((down, up)) = event.pair() else {
-            return PostResult::EventBuildFailed;
-        };
         if attach_auth && !keyboard_auth_available() {
             return PostResult::AuthUnavailable;
         }
-        let Some(set_address) = symbols.set_auth_message else {
-            // Only reachable with attach_auth false; without the setter there is
-            // no auth path, and the plain post below still runs.
-            return post_pair(post_address, pid, down, up);
-        };
-
-        // SAFETY: the addresses are the resolved private symbols retyped to
-        // their C signatures; the events are live for the duration of the call.
-        // The autorelease pool drains the authentication objects, which the
-        // factory returns autoreleased and this module does not own.
+        // SAFETY: resolved addresses have these C signatures; the borrowed
+        // event remains alive throughout the call. Authentication messages are
+        // autoreleased and stay alive until the post returns.
         objc2::rc::autoreleasepool(|_| unsafe {
-            let down_ptr = (down as *const CGEvent).cast_mut().cast::<c_void>();
-            let up_ptr = (up as *const CGEvent).cast_mut().cast::<c_void>();
+            let raw = (event.as_ref() as *const CGEvent)
+                .cast_mut()
+                .cast::<c_void>();
             if attach_auth {
+                let Some(set_address) = symbols.set_auth_message else {
+                    return PostResult::AuthFailed;
+                };
+                let Some(message) = authentication_message(symbols, raw, pid) else {
+                    return PostResult::AuthFailed;
+                };
                 let set_auth: unsafe extern "C" fn(*mut c_void, *mut c_void) =
                     std::mem::transmute(set_address);
-                for raw in [down_ptr, up_ptr] {
-                    let Some(message) = authentication_message(symbols, raw, pid) else {
-                        return PostResult::AuthUnavailable;
-                    };
-                    set_auth(raw, message);
-                }
+                set_auth(raw, message);
             }
             let post: unsafe extern "C" fn(i32, *mut c_void) = std::mem::transmute(post_address);
-            post(pid, down_ptr);
-            post(pid, up_ptr);
+            post(pid, raw);
             PostResult::Posted {
                 auth_attached: attach_auth,
             }
         })
     }
-
-    fn post_pair(post_address: usize, pid: i32, down: &CGEvent, up: &CGEvent) -> PostResult {
-        // SAFETY: `post_address` is the resolved posting symbol retyped to its C
-        // signature, and both events are live for the call.
-        unsafe {
-            let post: unsafe extern "C" fn(i32, *mut c_void) = std::mem::transmute(post_address);
-            post(pid, (down as *const CGEvent).cast_mut().cast::<c_void>());
-            post(pid, (up as *const CGEvent).cast_mut().cast::<c_void>());
-        }
-        PostResult::Posted {
-            auth_attached: false,
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    keyboard_auth_available, post_key_to_pid, skylight_available, OwnedKeyEvent, PostResult,
+    keyboard_auth_available, post_key_to_pid, post_single_key_to_pid, skylight_available,
+    OwnedKeyEvent, PostResult,
 };
 
 #[cfg(test)]

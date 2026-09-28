@@ -53,6 +53,7 @@ struct Shared {
     per_pid: Result<DispatchResult, DriverError>,
     global: Result<DispatchResult, DriverError>,
     fronted: FrontedScript,
+    route_evidence: cerebellum_computer::platform::input_route::InputRouteEvidence,
 }
 
 impl Shared {
@@ -75,6 +76,7 @@ impl Shared {
                 delivery_generation_verifications: 0,
             }),
             fronted: FrontedScript::default(),
+            route_evidence: Default::default(),
         }))
     }
 }
@@ -90,6 +92,11 @@ impl SyntheticDriver {
 }
 
 impl PlatformDriver for SyntheticDriver {
+    fn take_input_route_evidence(
+        &mut self,
+    ) -> cerebellum_computer::platform::input_route::InputRouteEvidence {
+        std::mem::take(&mut self.0.lock().unwrap().route_evidence)
+    }
     fn capability_declarations(
         &self,
         _context: &CapabilityAdvertisementContext,
@@ -1154,82 +1161,98 @@ async fn an_unreadable_focus_refuses_keystrokes() {
     assert!(dispatched_calls(&shared).is_empty());
 }
 
-/// In a build without the bracket's review, a background target is refused
-/// without asking anyone, and the remedy names only what that build can do.
+/// Plain typing needs no takeover, even in a build without a fronting bracket.
 #[tokio::test]
-async fn a_background_target_in_a_build_without_the_bracket_needs_the_foreground() {
+async fn background_plain_and_shift_typing_use_per_process_without_takeover() {
     let shared = Shared::handle();
     let desk = background(focused_text_desk());
     let plane = plane_on(&shared, &desk, false);
     let management = granted_management().await;
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::default();
     for (name, request) in [
         ("computer.type", type_request()),
         ("computer.keys", keys_request(&["a"])),
+        ("computer.keys", keys_request(&["shift", "a"])),
     ] {
         let reply = serve_asking(&plane, name, request, &management, relayed(&carrier)).await;
-        assert_eq!(reply["outcome"], "keystrokes_need_foreground", "{reply}");
-        let remedy = reply["remedy"].as_str().unwrap();
-        assert!(remedy.contains("write_text"), "{remedy}");
-        assert!(!remedy.contains("takeover"), "{remedy}");
+        assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     }
-    assert!(carrier.questions().is_empty(), "a question was raised");
-    assert!(dispatched_calls(&shared).is_empty());
+    assert!(carrier.questions().is_empty());
+    let calls = dispatched_calls(&shared);
+    assert_eq!(calls.len(), 3);
+    assert!(calls
+        .iter()
+        .all(|call| matches!(call, DispatchedCall::PerPid(_))));
 }
 
-/// In a build with the bracket's review, a background target raises the
-/// takeover question; declining it posts nothing.
 #[tokio::test]
-async fn a_background_target_raises_the_takeover_question_and_a_deny_posts_nothing() {
+async fn background_modifier_chords_refuse_without_takeover_and_post_nothing() {
     let shared = Shared::handle();
     let desk = background(focused_text_desk());
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
-    let carrier = ScriptedCarrier::answering(&["deny"]);
-    let reply = serve_asking(
-        &plane,
-        "computer.type",
-        type_request(),
-        &management,
-        relayed(&carrier),
-    )
-    .await;
-    assert_eq!(reply["outcome"], "consent_denied", "{reply}");
-    let questions = carrier.questions();
-    assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0]["params"]["grant_kind"], "takeover");
-    assert!(dispatched_calls(&shared).is_empty());
+    let carrier = ScriptedCarrier::default();
+    for modifier in ["command", "control", "option"] {
+        let reply = serve_asking(
+            &plane,
+            "computer.keys",
+            keys_request(&[modifier, "a"]),
+            &management,
+            relayed(&carrier),
+        )
+        .await;
+        assert!(
+            dispatched_calls(&shared).is_empty(),
+            "a background shortcut was posted"
+        );
+        assert_eq!(
+            reply["reason"], "modifier_chord_needs_foreground",
+            "{reply}"
+        );
+    }
+    assert!(
+        carrier.questions().is_empty(),
+        "refusal must not silently request takeover"
+    );
 }
 
-/// With the takeover grant, a background target is posted to through the
-/// fronting bracket, which fronts it and puts the previous application back
-/// inside the bound; both keystroke rows take the same path.
+async fn grant_takeover(management: &Arc<ManagementPlane>) {
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    management
+        .computer_grants()
+        .require(
+            &cerebellum::computer_grants::GrantNeed::Takeover,
+            &relayed(&carrier),
+            &cerebellum::CancelHandle::pending(),
+        )
+        .await
+        .unwrap();
+}
+
+/// A held takeover permits a background shortcut to front and restore.
 #[tokio::test]
 async fn a_background_target_with_the_takeover_grant_is_posted_through_the_bracket() {
     let shared = Shared::handle();
     let desk = background(focused_text_desk());
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
-    for (name, request) in [
-        ("computer.type", type_request()),
-        ("computer.keys", keys_request(&["a"])),
-    ] {
-        let reply = serve_asking(&plane, name, request, &management, relayed(&carrier)).await;
-        assert_eq!(reply["outcome"], "delivery_unconfirmed", "{name}: {reply}");
-        assert_eq!(reply["target_fronted"], true, "{name}: {reply}");
-        assert!(reply.get("changed").is_some(), "{reply}");
-    }
-    assert_eq!(carrier.questions().len(), 1, "one takeover question");
-    let calls = dispatched_calls(&shared);
-    assert!(
-        matches!(
-            &calls[..],
-            [DispatchedCall::Fronted(_), DispatchedCall::Fronted(_)]
-        ),
-        "{calls:?}"
-    );
-    assert!(plane.result_schema_findings().is_empty());
+    grant_takeover(&management).await;
+    let carrier = ScriptedCarrier::default();
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&carrier),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(reply["target_fronted"], true, "{reply}");
+    assert!(matches!(
+        &dispatched_calls(&shared)[..],
+        [DispatchedCall::Fronted(_)]
+    ));
+    assert!(carrier.questions().is_empty());
 }
 
 /// A frontmost target is posted to per process, and no takeover question is
@@ -1267,11 +1290,12 @@ async fn a_failed_restore_is_reported_naming_the_application_left_in_front() {
     let desk = background(focused_text_desk());
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
+    grant_takeover(&management).await;
     let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
     let reply = serve_asking(
         &plane,
-        "computer.type",
-        type_request(),
+        "computer.keys",
+        keys_request(&["command", "a"]),
         &management,
         relayed(&carrier),
     )
@@ -1282,10 +1306,9 @@ async fn a_failed_restore_is_reported_naming_the_application_left_in_front() {
     assert!(reply["remedy"].as_str().unwrap().contains(TARGET_BUNDLE_ID));
 }
 
-/// A cancel is honoured at the next chunk boundary: text too long for one
-/// chunk stops after the first, and says how many posts went out.
+/// Plain text never enters the bracket, even with its cancel fixture armed.
 #[tokio::test]
-async fn a_cancel_mid_bracket_stops_at_a_chunk_boundary() {
+async fn plain_background_text_never_enters_the_fronting_bracket() {
     let shared = Shared::handle();
     shared.lock().unwrap().fronted.cancel_after_first_chunk = true;
     let desk = background(focused_text_desk());
@@ -1300,9 +1323,11 @@ async fn a_cancel_mid_bracket_stops_at_a_chunk_boundary() {
         relayed(&carrier),
     )
     .await;
-    assert_eq!(reply["outcome"], "cancelled", "{reply}");
-    let posts = reply["posts_returned"].as_u64().unwrap();
-    assert!(posts > 0 && posts < 120, "{reply}");
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert!(matches!(
+        &dispatched_calls(&shared)[..],
+        [DispatchedCall::PerPid(_)]
+    ));
 }
 
 /// Typed text that shows up in the part of the focused value that changed
@@ -1366,4 +1391,72 @@ async fn keys_are_never_reported_delivered() {
     )
     .await;
     assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+}
+
+#[tokio::test]
+async fn route_summaries_reach_the_journal_not_the_wire_on_success_and_auth_failure() {
+    use cerebellum_computer::platform::input_route::*;
+    use cerebellum_computer::platform::process_event::*;
+    for fail in [false, true] {
+        let shared = Shared::handle();
+        let evidence = InputRouteEvidence {
+            routes: RouteCounts {
+                skylight: 1,
+                public: 1,
+            },
+            release_routes: RouteCounts {
+                skylight: u64::from(fail),
+                public: 0,
+            },
+            auth: AuthEvidence::Attached,
+            fallback_reason: Some("skylight_symbol_missing".into()),
+        };
+        {
+            let mut state = shared.lock().unwrap();
+            state.route_evidence = evidence.clone();
+            if fail {
+                state.per_pid = Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+                    posts_returned: 2,
+                    refusal: ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
+                        PRIVATE_INPUT_AUTH_FAILED,
+                    )),
+                    held_state: HeldStateDisposition::Released { posts_returned: 1 },
+                }));
+            }
+        }
+        let storage = InMemoryJournalStorage::new();
+        let plane = ComputerPlane::with_synthetic_driver(
+            support::computer::audit_with_storage(storage.clone()),
+            SyntheticDriver::factory(Arc::clone(&shared)),
+        )
+        .with_app_state_source(focused_text_desk().source());
+        let management = granted_management().await;
+        let reply = serve(
+            &plane,
+            "computer.type",
+            type_request(),
+            &management,
+            &FakeClock::new(),
+        )
+        .await;
+        if fail {
+            assert_eq!(reply["reason"], "private_input_auth_failed", "{reply}");
+        }
+        for name in ["routes", "release_routes", "auth", "fallback_reason"] {
+            assert!(
+                reply.get(name).is_none(),
+                "audit material leaked onto the wire: {reply}"
+            );
+        }
+        let saved = serde_json::to_string(&storage.load().unwrap()).unwrap();
+        let entry = base64_decoded_strings(&saved)
+            .into_iter()
+            .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+            .find(|entry| entry.get("completed_result").is_some())
+            .expect("finalized journal entry");
+        let bytes: Vec<u8> = serde_json::from_value(entry["completed_result"].clone()).unwrap();
+        let outcome: cerebellum_computer::audit::RecordedActuationOutcome =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(outcome.routes, evidence);
+    }
 }

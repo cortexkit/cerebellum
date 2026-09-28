@@ -1138,14 +1138,25 @@ where
             }
         };
 
-        // A target in the background gets its keystrokes only through the
-        // fronting bracket, which needs its own release review and the
-        // conversation's takeover grant, because bringing an application
-        // forward can take the person's own keystrokes.
+        // Only shortcut modifiers need the fronting bracket. Plain typing
+        // stays inside the target process without taking the person's focus.
         let capability_id = capability.capability_id();
         let frontmost = self.app_state_source.frontmost_pid();
         let mut bracket_bound = None;
-        if frontmost != Some(grant.pid) {
+        let delivery = keystrokes::key_delivery(
+            &parsed.action,
+            frontmost == Some(grant.pid),
+            management.computer_grants().holds(
+                &consent.caller,
+                &crate::computer_grants::GrantNeed::Takeover,
+            ),
+        );
+        if delivery == keystrokes::KeyDelivery::Refuse {
+            let mut reply = keystrokes::modifier_chord_refusal();
+            admission.decorate(&mut reply);
+            return reply;
+        }
+        if delivery == keystrokes::KeyDelivery::BringForward {
             if !self.fronting_bracket_admitted {
                 let mut reply = keystrokes::needs_foreground_reply();
                 admission.decorate(&mut reply);
@@ -2007,6 +2018,17 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
         other => other.reason_code(),
     };
     let mut reply = json!({"outcome": outcome});
+    if let DispatchError::SyntheticSequenceFailed {
+        refusal:
+            cerebellum_computer::platform::process_event::ProcessEventRefusal::PostCallFailed(failure),
+        ..
+    } = refusal
+    {
+        if failure.reason == cerebellum_computer::platform::input_route::PRIVATE_INPUT_AUTH_FAILED {
+            reply["reason"] = json!("private_input_auth_failed");
+            reply["remedy"] = json!("private keyboard authentication failed; no public retry was made. Read the state before retrying");
+        }
+    }
     if let DispatchError::SyntheticSequenceFailed { posts_returned, .. } = refusal {
         reply["posts_returned"] = json!(posts_returned);
     }

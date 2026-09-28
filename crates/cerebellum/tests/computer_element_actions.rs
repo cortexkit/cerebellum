@@ -556,6 +556,38 @@ async fn write(
     .await
 }
 
+#[tokio::test]
+async fn web_content_refuses_without_calling_value_or_selection_setter() {
+    for mode in ["replace_value", "insert_at_caret"] {
+        let desk = desk();
+        {
+            let mut state = desk.state();
+            let fields = std::mem::take(&mut state.roots[0].children);
+            state.roots[0].children =
+                vec![RawElement::fixture(90, "AXWebArea").with_children(vec![
+                    RawElement::fixture(91, "AXGroup").with_children(fields),
+                ])];
+        }
+        let plane = plane(&desk);
+        let management = granted_management().await;
+        let tree = read(&plane, &management).await;
+        let reply = write(
+            &plane,
+            &management,
+            &id_of(&tree, "Composer"),
+            "draft",
+            mode,
+        )
+        .await;
+        assert!(
+            desk.state().writes.is_empty(),
+            "web editor setter was called"
+        );
+        assert_eq!(reply["reason"], "web_content_needs_type", "{reply}");
+        assert!(reply["remedy"].as_str().unwrap().contains("press_element"));
+    }
+}
+
 /// replace_value sets the whole value and is confirmed by reading it back.
 #[tokio::test]
 async fn replace_writes_the_value_and_confirms_it() {
@@ -647,7 +679,7 @@ async fn a_field_that_cannot_be_written_names_type() {
 }
 
 /// An application that updates its value a moment after accepting the write
-/// (Discord's editor does, measured live) is confirmed once the value shows,
+/// is confirmed once the value shows,
 /// not reported unconfirmed on the first read.
 #[tokio::test]
 async fn a_value_that_lands_after_a_delay_is_confirmed() {

@@ -432,6 +432,22 @@ fn elements_of(value: Option<CFRetained<CFType>>) -> Vec<AxRetainedElement> {
 /// Windows are taken from both the application's children and its window
 /// list, because some applications report windows in only one of the two.
 pub fn read_app_state(pid: u32, bounds: AxAppStateBounds) -> Result<AxAppState, AxAppStateError> {
+    fn populated_web(nodes: &[AxStateElement]) -> bool {
+        nodes.iter().any(|node| {
+            (node.role.as_deref() == Some("AXWebArea") && !node.children.is_empty())
+                || populated_web(&node.children)
+        })
+    }
+    crate::manual_accessibility::read_with_manual_accessibility(
+        |force| crate::manual_accessibility::prepare(pid, force),
+        |timeout| read_app_state_once(pid, AxAppStateBounds { timeout, ..bounds }),
+        |state| populated_web(&state.roots),
+        std::thread::sleep,
+        bounds.timeout,
+    )
+}
+
+fn read_app_state_once(pid: u32, bounds: AxAppStateBounds) -> Result<AxAppState, AxAppStateError> {
     let Ok(pid) = c_int::try_from(pid) else {
         return Err(AxAppStateError::ProcessGone);
     };

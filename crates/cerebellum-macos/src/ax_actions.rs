@@ -2,8 +2,7 @@
 //! writing its text, finding the element under a point, reading its focused
 //! element, and bringing its application to the front.
 //!
-//! Kept apart from `ax_state`, which only reads, so a reader of that module
-//! can trust that nothing there changes another application. Every function
+//! Accessibility reads may opt Chromium into building its tree. Every function
 //! here takes the retained element the state read produced, or a pid; no
 //! handle leaves this crate as anything but the opaque
 //! [`AxRetainedElement`].
@@ -169,6 +168,40 @@ fn element_pid(element: CfTypeRef) -> Option<u32> {
         .flatten()
 }
 
+/// Opt a renderer into exposing accessibility without activating its window.
+/// Native applications normally reject this optional attribute.
+pub fn enable_manual_accessibility(pid: u32) -> crate::ManualAccessibility {
+    use crate::ManualAccessibility;
+    let Ok(element) = application(pid) else {
+        return ManualAccessibility::Failed(AX_ERROR_INVALID_ELEMENT);
+    };
+    let attribute = CFString::from_static_str("AXManualAccessibility");
+    let value = CFBoolean::new(true);
+    // SAFETY: all references remain alive for the call. A short messaging
+    // timeout keeps an unresponsive renderer from extending the read retry.
+    let code = unsafe {
+        AXUIElementSetMessagingTimeout(element.as_ptr(), 0.05);
+        AXUIElementSetAttributeValue(
+            element.as_ptr(),
+            CFRetained::as_ptr(&attribute).as_ptr().cast(),
+            value as *const CFBoolean as CfTypeRef,
+        )
+    };
+    match code {
+        AX_ERROR_SUCCESS => ManualAccessibility::Enabled,
+        AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NOT_IMPLEMENTED => {
+            ManualAccessibility::NotSupported
+        }
+        code => ManualAccessibility::Failed(code),
+    }
+}
+
+fn prepare_element(element: CfTypeRef) {
+    if let Some(pid) = element_pid(element) {
+        crate::manual_accessibility::prepare(pid, false);
+    }
+}
+
 fn application(pid: u32) -> Result<AxRetainedElement, AxElementActionError> {
     let Ok(raw_pid) = c_int::try_from(pid) else {
         return Err(AxElementActionError::ElementGone);
@@ -204,6 +237,7 @@ pub struct AxElementFacts {
 pub fn element_facts(element: &AxRetainedElement) -> Result<AxElementFacts, AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
+    prepare_element(pointer);
     bound_messages(pointer);
     let role = match string(pointer, "AXRole") {
         Ok(role) => role,
@@ -250,6 +284,7 @@ pub fn element_facts(element: &AxRetainedElement) -> Result<AxElementFacts, AxEl
 pub fn press_element(element: &AxRetainedElement) -> Result<(), AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
+    prepare_element(pointer);
     bound_messages(pointer);
     let action = CFString::from_static_str("AXPress");
     // SAFETY: element and action name are retained for the call.
@@ -269,6 +304,7 @@ pub fn element_text_value(
 ) -> Result<Option<String>, AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
+    prepare_element(pointer);
     bound_messages(pointer);
     string(pointer, "AXValue").map_err(classify)
 }
@@ -281,6 +317,7 @@ pub fn element_selected_range(
 ) -> Result<Option<(usize, usize)>, AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
+    prepare_element(pointer);
     bound_messages(pointer);
     let value = match copy(pointer, "AXSelectedTextRange") {
         Ok(Some(value)) => value,
@@ -325,6 +362,7 @@ pub fn write_element_text(
 ) -> Result<(), AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
+    prepare_element(pointer);
     bound_messages(pointer);
     let name = CFString::from_static_str(match attribute {
         AxTextAttribute::Value => "AXValue",
@@ -364,7 +402,10 @@ pub fn element_at_position(
 ) -> Result<Option<(AxRetainedElement, Option<u32>)>, AxElementActionError> {
     require_trust()?;
     let root = match scope {
-        AxHitScope::Application(pid) => application(pid)?,
+        AxHitScope::Application(pid) => {
+            crate::manual_accessibility::prepare(pid, false);
+            application(pid)?
+        }
         AxHitScope::SystemWide => {
             // SAFETY: creates the system-wide element; returns one owned
             // reference or null.
@@ -406,6 +447,7 @@ pub fn element_at_position(
 /// asked of that application rather than of whichever one is frontmost.
 /// `Ok(None)` when the application reports no focused element.
 pub fn focused_element(pid: u32) -> Result<Option<AxRetainedElement>, AxElementActionError> {
+    crate::manual_accessibility::prepare(pid, false);
     require_trust()?;
     let application = application(pid)?;
     match copy(application.as_ptr(), "AXFocusedUIElement") {

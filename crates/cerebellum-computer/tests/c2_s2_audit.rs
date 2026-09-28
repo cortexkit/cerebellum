@@ -1105,14 +1105,14 @@ fn crash_orphaned_capture_is_finalized_by_startup_reconciliation() {
 /// read could destroy captures the newer build still holds.
 #[test]
 fn a_journal_holding_newer_entries_is_refused_by_name_and_left_untouched() {
-    let current = cerebellum_computer::audit::COMPUTER_JOURNAL_CODEC_VERSION;
+    let fixture_version = "ck-computer-journal/v1";
     let next = format!(
         "ck-computer-journal/v{}",
         cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version + 1
     );
     let fixture = String::from_utf8(include_bytes!("fixtures/v12_computer_journal.json").to_vec())
         .unwrap()
-        .replace(current, &next);
+        .replace(fixture_version, &next);
     assert!(fixture.contains(&next));
     let path = std::env::temp_dir().join(format!(
         "cerebellum-newer-computer-journal-{}-{}.json",
@@ -1226,4 +1226,66 @@ fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup(
         ],
         "the two orphaned entries were settled by reconciliation"
     );
+}
+
+#[test]
+fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
+    use cerebellum_computer::audit::{ActuationOutcome, RecordedActuationOutcome};
+    use cerebellum_computer::platform::input_route::{
+        AuthEvidence, InputRouteEvidence, RouteCounts,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/v12_computer_journal.json")).unwrap();
+    let bytes = cerebellum_core::serde_base64::decode(
+        fixture["state"]["entries"]["1"]["bytes"].as_str().unwrap(),
+    )
+    .unwrap();
+    let old = ComputerJournalCodec::decode_entry(&bytes).unwrap();
+    assert_eq!(old["codec_version"], "ck-computer-journal/v1");
+    let completed: Vec<u8> = serde_json::from_value(old["completed_result"].clone()).unwrap();
+    let old_outcome: RecordedActuationOutcome = serde_json::from_slice(&completed).unwrap();
+    assert_eq!(old_outcome.routes, InputRouteEvidence::default());
+    assert_eq!(
+        old_outcome.outcome,
+        ActuationOutcome::HandlerReturned {
+            unreadable_subtrees: 0
+        }
+    );
+
+    let mut audit = audit();
+    let descriptor = actuation_descriptor();
+    let handle = audit.reserve(identity(), descriptor.clone()).unwrap();
+    let token = audit
+        .commit_actuation_intent(
+            handle,
+            &descriptor,
+            &ActuationIntent {
+                element: None,
+                action: "computer.type".into(),
+                grant_identity: target_grant(),
+            },
+        )
+        .unwrap();
+    let routes = InputRouteEvidence {
+        routes: RouteCounts {
+            skylight: 2,
+            public: 1,
+        },
+        release_routes: RouteCounts {
+            skylight: 1,
+            public: 0,
+        },
+        auth: AuthEvidence::Attached,
+        fallback_reason: Some("skylight_symbol_missing".into()),
+    };
+    audit
+        .finalize_actuation_outcome_with_routes(token, &old_outcome.outcome, &routes)
+        .unwrap();
+    let new = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+    assert_eq!(new["codec_version"], "ck-computer-journal/v2");
+    let completed: Vec<u8> = serde_json::from_value(new["completed_result"].clone()).unwrap();
+    let recorded: RecordedActuationOutcome = serde_json::from_slice(&completed).unwrap();
+    assert_eq!(recorded.routes, routes);
+    assert_eq!(recorded.outcome, old_outcome.outcome);
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
 }

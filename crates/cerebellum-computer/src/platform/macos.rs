@@ -115,6 +115,7 @@ pub struct MacOs26PlatformDriver {
     /// forward can take the person's keystrokes, so the driver refuses the
     /// bracket itself without it, whatever its caller decided.
     takeover_dispatch_review_revision: Option<String>,
+    input_route_evidence: super::input_route::InputRouteEvidence,
     /// Shared across every driver the plane builds. The plane builds a driver
     /// per dispatch (its accessibility cache must not outlive a process
     /// generation), but the idle estimator's whole purpose is to remember the
@@ -1026,6 +1027,7 @@ impl MacOs26PlatformDriver {
             expected_post_condition_available: true,
             global_dispatch_review_revision: None,
             takeover_dispatch_review_revision: None,
+            input_route_evidence: Default::default(),
             user_idle: Arc::new(Mutex::new(UserIdleEstimator::new())),
         }
     }
@@ -1302,14 +1304,44 @@ impl PlatformDriver for MacOs26PlatformDriver {
             Ok(dispatch_result_for_accepted_action(outcome))
         }
     }
+    fn take_input_route_evidence(&mut self) -> super::input_route::InputRouteEvidence {
+        std::mem::take(&mut self.input_route_evidence)
+    }
+    fn per_process_transport(
+        &self,
+        action: &SyntheticAction,
+    ) -> Option<super::process_event::PerProcessTransport> {
+        Some(
+            if matches!(
+                action,
+                SyntheticAction::TypeText { .. } | SyntheticAction::KeyCombination { .. }
+            ) {
+                super::process_event::keyboard_transport(
+                    super::input_route::private_route_review_bound()
+                        && cerebellum_macos::skylight_available(),
+                )
+            } else {
+                super::process_event::PerProcessTransport::PublicCoreGraphics
+            },
+        )
+    }
     fn dispatch_per_pid(
         &mut self,
         request: SyntheticDispatchRequest,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         request.target.validate()?;
-        let mut transport = MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT);
-        dispatch_synthetic_to_pid(&request, &mut transport, cancelled)
+        let mut transport = if matches!(
+            request.action,
+            SyntheticAction::TypeText { .. } | SyntheticAction::KeyCombination { .. }
+        ) {
+            MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT)
+        } else {
+            MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT)
+        };
+        let result = dispatch_synthetic_to_pid(&request, &mut transport, cancelled);
+        self.input_route_evidence = transport.evidence;
+        result
     }
     fn dispatch_global(
         &mut self,
@@ -1375,18 +1407,16 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 start_time_micros,
             },
             units,
-            transport: MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT),
+            transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
         };
         let mut user_idle = self
             .user_idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(crate::dispatch::run_fronting_bracket(
-            &mut host,
-            &mut user_idle,
-            plan,
-            cancelled,
-        ))
+        let report =
+            crate::dispatch::run_fronting_bracket(&mut host, &mut user_idle, plan, cancelled);
+        self.input_route_evidence = host.transport.evidence;
+        Ok(report)
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;

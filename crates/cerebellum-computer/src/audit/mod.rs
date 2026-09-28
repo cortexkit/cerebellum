@@ -273,7 +273,7 @@ pub struct ComputerJournalCodec {
 
 /// The version of the computer journal's entries, as the codec writes it and
 /// startup reconciliation reads it back.
-pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v1";
+pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v2";
 
 /// The computer journal's entry format. Its floor is raised before entries are
 /// written, and staging refuses a build whose readers stop short of it.
@@ -807,6 +807,33 @@ pub enum ActuationOutcome {
     NoAction {
         refusal: DispatchError,
     },
+}
+
+fn add_route_defaults(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(Value::Object(mut outcome)) = serde_json::from_slice::<Value>(&bytes) else {
+        return bytes;
+    };
+    let Value::Object(defaults) =
+        serde_json::to_value(crate::platform::input_route::InputRouteEvidence::default())
+            .expect("route evidence is serializable")
+    else {
+        unreachable!()
+    };
+    for (name, value) in defaults {
+        outcome.entry(name).or_insert(value);
+    }
+    serde_json::to_vec(&outcome).expect("JSON object is serializable")
+}
+
+/// Aggregate transport facts are flattened alongside the existing outcome.
+/// Old entries have no route facts and decode with zero counts, not invented
+/// evidence of a historical transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedActuationOutcome {
+    #[serde(flatten)]
+    pub outcome: ActuationOutcome,
+    #[serde(flatten, default)]
+    pub routes: crate::platform::input_route::InputRouteEvidence,
 }
 
 /// Adapter-owned gate used when building capability advertisements.
@@ -1477,8 +1504,20 @@ where
         token: DispatchCommitmentToken,
         outcome: &ActuationOutcome,
     ) -> Result<Committed, ComputerAuditError> {
-        let bytes = serde_json::to_vec(outcome)
-            .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
+        self.finalize_actuation_outcome_with_routes(token, outcome, &Default::default())
+    }
+
+    pub fn finalize_actuation_outcome_with_routes(
+        &mut self,
+        token: DispatchCommitmentToken,
+        outcome: &ActuationOutcome,
+        routes: &crate::platform::input_route::InputRouteEvidence,
+    ) -> Result<Committed, ComputerAuditError> {
+        let bytes = serde_json::to_vec(&RecordedActuationOutcome {
+            outcome: outcome.clone(),
+            routes: routes.clone(),
+        })
+        .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
         self.finalize_dispatched(token, bytes, Vec::new())
     }
 
@@ -1492,7 +1531,7 @@ where
             refusal: refusal.clone(),
         })
         .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
-        self.finalize_rejected(handle, bytes)
+        self.finalize_rejected(handle, add_route_defaults(bytes))
     }
 
     pub fn finalize_dispatched(
@@ -1501,6 +1540,7 @@ where
         completed_result: Vec<u8>,
         final_context: Vec<u8>,
     ) -> Result<Committed, ComputerAuditError> {
+        let completed_result = add_route_defaults(completed_result);
         let result = self.journal.finalize_dispatched(
             token,
             CompletedResult { completed_result },

@@ -492,10 +492,9 @@ pub(crate) fn expected_after_insert(
 /// Write text into one element, journaling the attempt, and confirm it by
 /// reading the value back until it matches or `readback_bound` passes.
 ///
-/// Polled rather than read once: Discord's editor (Electron) accepts an
-/// AXValue write and updates its value a moment later, so a single read taken
-/// straight after the write reported a mismatch for text that had in fact
-/// landed (measured live: the next read showed the exact text).
+/// Native fields may update asynchronously, so confirmation polls their value.
+/// Web editors must never receive AXValue or AXSelectedText writes: those can
+/// bypass the editor's state and leave the visible text impossible to edit.
 pub(crate) fn write_blocking<R, T, S>(
     source: &dyn AppStateSource,
     journal: &mut ElementJournal<'_, R, T, S>,
@@ -531,6 +530,24 @@ where
             "remedy": "this is a secure text field; nothing was written. Ask the person to fill \
                        it in themselves",
         });
+    }
+    let tree = match source.read_app_state(grant, ReadBounds::default()) {
+        Ok(tree) => tree,
+        Err(_) => return stale_element_reply(),
+    };
+    match web_ancestry(&tree.roots, handle, false) {
+        Some(true) => {
+            if journal.refused(&role, "web_content_needs_type").is_err() {
+                return audit_unavailable_reply(false);
+            }
+            return json!({
+                "outcome": "element_not_settable",
+                "reason": "web_content_needs_type",
+                "remedy": "web editors must be typed into; press_element the field to place the caret, then use type, which appends at the caret and confirms by readback. To replace existing text, clear it first",
+            });
+        }
+        Some(false) => {}
+        None => return stale_element_reply(),
     }
     let (settable, attribute, action) = match mode {
         WriteMode::ReplaceValue => (facts.value_settable, TextAttribute::Value, "AXValue"),
@@ -608,6 +625,25 @@ where
         return audit_unavailable_reply(true);
     }
     reply
+}
+
+/// Find the target in the read tree rather than guessing from its field role:
+/// native and web text fields can expose the same accessibility role.
+fn web_ancestry(
+    nodes: &[cerebellum_computer::app_state::source::RawElement],
+    handle: &ElementHandle,
+    inside_web: bool,
+) -> Option<bool> {
+    for node in nodes {
+        let inside_web = inside_web || node.role.as_deref() == Some("AXWebArea");
+        if node.handle.same_element(handle.as_ref()) {
+            return Some(inside_web);
+        }
+        if let Some(found) = web_ancestry(&node.children, handle, inside_web) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn caret_unknown<R, T, S>(journal: &mut ElementJournal<'_, R, T, S>, role: &str) -> Value

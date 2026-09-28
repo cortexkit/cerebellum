@@ -1102,7 +1102,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
 
                 match self.driver.dispatch_semantic(semantic.clone()) {
                     Ok(result) => {
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::HandlerReturned {
@@ -1114,7 +1114,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     }
                     Err(error) => {
                         let refusal = Self::semantic_refusal(error, &semantic);
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::Refused {
@@ -1149,6 +1149,16 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
             || request.row.capability_id.clone(),
             |semantic| semantic.action.clone(),
         );
+        let action = if request.mode == DispatchMode::Background {
+            self.driver
+                .per_process_transport(&synthetic.action)
+                .map_or_else(
+                    || action.clone(),
+                    |route| format!("{action} via {}", route.journal_name()),
+                )
+        } else {
+            action
+        };
         let intent = ActuationIntent {
             element,
             action,
@@ -1171,7 +1181,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                 }
                 let result = match self.driver.dispatch_per_pid(synthetic, self.cancelled) {
                     Ok(result) => {
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::HandlerReturned {
@@ -1205,7 +1215,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                             }
                             _ => DispatchError::SyntheticUnavailable,
                         };
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &match &refusal {
@@ -1247,7 +1257,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     self.cancelled,
                 ) {
                     Ok(result) => {
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::HandlerReturned {
@@ -1263,7 +1273,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                             posts_returned: failure.posts_returned,
                             held_state: failure.held_state,
                         };
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::Cancelled {
@@ -1286,7 +1296,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                         // how long detection took, which action stopped, how
                         // many queued posts were cancelled -- are readable from
                         // the audit record rather than from the wire.
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::Refused {
@@ -1298,7 +1308,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     }
                     Err(_) => {
                         let refusal = DispatchError::SyntheticUnavailable;
-                        Self::finalize_audit_outcome(
+                        self.finalize_audit_outcome(
                             audit,
                             state,
                             &ActuationOutcome::Refused {
@@ -1345,7 +1355,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
             Ok(report) => report,
             Err(_) => {
                 let refusal = DispatchError::SyntheticUnavailable;
-                Self::finalize_audit_outcome(
+                self.finalize_audit_outcome(
                     audit,
                     state,
                     &ActuationOutcome::Refused {
@@ -1403,7 +1413,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     delivery_posts_returned: report.posts_returned,
                     delivery_generation_verifications: report.generation_verifications,
                 };
-                Self::finalize_audit_outcome(
+                self.finalize_audit_outcome(
                     audit,
                     state,
                     &ActuationOutcome::HandlerReturned {
@@ -1413,7 +1423,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                 Ok(result)
             }
             Some((refusal, abort)) => {
-                Self::finalize_audit_outcome(
+                self.finalize_audit_outcome(
                     audit,
                     state,
                     &match &refusal {
@@ -1461,6 +1471,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
     }
 
     fn finalize_audit_outcome<R, T, S>(
+        &mut self,
         audit: &mut ComputerAudit<R, T, S>,
         state: &mut ActuationAuditState,
         outcome: &ActuationOutcome,
@@ -1471,7 +1482,8 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         S: JournalStorage,
     {
         let token = state.token.ok_or(DispatchError::AuditUnavailable)?;
-        match audit.finalize_actuation_outcome(token, outcome) {
+        let routes = self.driver.take_input_route_evidence();
+        match audit.finalize_actuation_outcome_with_routes(token, outcome, &routes) {
             Ok(_) => {
                 state.finalized = true;
                 Ok(())

@@ -68,6 +68,40 @@ pub(crate) fn read_target_focus(
     Ok(Some(TargetFocus { handle, before }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyDelivery {
+    PerProcess,
+    BringForward,
+    Refuse,
+}
+
+/// Background delivery loses shortcut modifiers even when key posts return.
+/// Shift alone still describes typing and needs no foreground takeover.
+pub(crate) fn key_delivery(
+    action: &cerebellum_computer::platform::SyntheticAction,
+    frontmost: bool,
+    takeover_held: bool,
+) -> KeyDelivery {
+    let shortcut = matches!(action,
+        cerebellum_computer::platform::SyntheticAction::KeyCombination { modifiers, .. }
+        if modifiers.command || modifiers.control || modifiers.option);
+    if frontmost || !shortcut {
+        KeyDelivery::PerProcess
+    } else if takeover_held {
+        KeyDelivery::BringForward
+    } else {
+        KeyDelivery::Refuse
+    }
+}
+
+pub(crate) fn modifier_chord_refusal() -> Value {
+    json!({
+        "outcome": "keystrokes_need_foreground",
+        "reason": "modifier_chord_needs_foreground",
+        "remedy": "background applications do not reliably receive shortcut modifiers; use the equivalent accessibility action or ask for takeover",
+    })
+}
+
 /// The refusal for a background target in a build whose fronting bracket is
 /// not admitted. The remedy names only what this build can do.
 pub(crate) fn needs_foreground_reply() -> Value {
@@ -200,7 +234,71 @@ pub(crate) fn changed_part<'a>(before: &str, after: &'a str) -> Option<&'a str> 
 
 #[cfg(test)]
 mod tests {
-    use super::changed_part;
+    use super::*;
+
+    #[test]
+    fn key_delivery_decision_covers_foreground_takeover_and_plain_typing() {
+        use cerebellum_computer::platform::{SyntheticAction, SyntheticKey, SyntheticKeyModifiers};
+        for foreground in [true, false] {
+            for takeover in [true, false] {
+                assert_eq!(
+                    key_delivery(&SyntheticAction::type_text("x"), foreground, takeover),
+                    KeyDelivery::PerProcess
+                );
+                for modifiers in [
+                    SyntheticKeyModifiers::default(),
+                    SyntheticKeyModifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                ] {
+                    assert_eq!(
+                        key_delivery(
+                            &SyntheticAction::KeyCombination {
+                                key: SyntheticKey::A,
+                                modifiers
+                            },
+                            foreground,
+                            takeover
+                        ),
+                        KeyDelivery::PerProcess
+                    );
+                }
+                for modifiers in [
+                    SyntheticKeyModifiers {
+                        command: true,
+                        ..Default::default()
+                    },
+                    SyntheticKeyModifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                    SyntheticKeyModifiers {
+                        option: true,
+                        ..Default::default()
+                    },
+                ] {
+                    assert_eq!(
+                        key_delivery(
+                            &SyntheticAction::KeyCombination {
+                                key: SyntheticKey::A,
+                                modifiers
+                            },
+                            foreground,
+                            takeover
+                        ),
+                        if foreground {
+                            KeyDelivery::PerProcess
+                        } else if takeover {
+                            KeyDelivery::BringForward
+                        } else {
+                            KeyDelivery::Refuse
+                        }
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_changed_part_is_what_was_inserted() {

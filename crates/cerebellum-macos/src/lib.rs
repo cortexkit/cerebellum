@@ -78,11 +78,15 @@ pub use accessibility::{
     read_accessibility_tree, request_accessibility_action, FocusReadError,
 };
 #[cfg(target_os = "macos")]
+pub use ax_actions::enable_manual_accessibility;
+#[cfg(target_os = "macos")]
 pub use ax_actions::{
     element_at_position, element_facts, element_selected_range, element_text_value,
     focused_element, press_element, request_frontmost, write_element_text, AxElementActionError,
     AxElementFacts, AxHitScope, AxTextAttribute,
 };
+#[cfg(any(target_os = "macos", test))]
+mod manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_state::{
     read_app_state, AxAppState, AxAppStateBounds, AxAppStateError, AxRetainedElement,
@@ -124,13 +128,16 @@ pub use macos::{
     CaptureError, CaptureSourceRect, CgEventPostCall, OwnedCgEvent, ProcessOwner, ProcessStartTime,
     RawCapture, RawWindow,
 };
+#[cfg(any(target_os = "macos", test))]
+pub use manual_accessibility::ManualAccessibility;
 #[cfg(target_os = "macos")]
 pub use process_table::{
     all_process_ids, host_name, process_arguments, process_executable_path, ProcessArguments,
 };
 #[cfg(target_os = "macos")]
 pub use skylight::{
-    keyboard_auth_available, post_key_to_pid, skylight_available, OwnedKeyEvent, PostResult,
+    keyboard_auth_available, post_key_to_pid, post_single_key_to_pid, skylight_available,
+    OwnedKeyEvent, PostResult,
 };
 #[cfg(target_os = "macos")]
 pub use window_image::{encode_scaled_jpeg, frontmost_window_id, window_visibility};
