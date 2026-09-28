@@ -87,3 +87,7 @@ test = true
 [[example]]
 name = "crashpad_census"
 test = true
+
+[[example]]
+name = "live_discord_task"
+test = true
