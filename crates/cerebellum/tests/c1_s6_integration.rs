@@ -30,21 +30,31 @@ fn valid_inputs() -> ComputerReleaseInputs {
     }
 }
 
-fn startup_with_screen_recording(screen_recording: PermissionLiveness) -> StartupCapabilityProbe {
+/// Every permission live except accessibility, which reads as `accessibility`.
+fn startup_with_accessibility(accessibility: PermissionLiveness) -> StartupCapabilityProbe {
     StartupCapabilityProbe {
         os_major: 26,
         private_envelope_recognized: true,
-        permissions: PermissionLivenessReport::from_results([PermissionProbeResult {
-            service: PermissionService::ScreenRecording,
-            liveness: screen_recording,
-            responsible_process: "ck-subc".into(),
-            off_main: true,
-        }]),
+        permissions: PermissionLivenessReport::from_results(
+            [
+                (PermissionService::ScreenRecording, PermissionLiveness::Live),
+                (PermissionService::Accessibility, accessibility),
+                (PermissionService::PostEvent, PermissionLiveness::Live),
+                (PermissionService::InputMonitoring, PermissionLiveness::Live),
+            ]
+            .into_iter()
+            .map(|(service, liveness)| PermissionProbeResult {
+                service,
+                liveness,
+                responsible_process: "ck-subc".into(),
+                off_main: true,
+            }),
+        ),
     }
 }
 
 fn valid_context() -> ComputerCapabilityAdvertisementContext {
-    let startup = startup_with_screen_recording(PermissionLiveness::Live);
+    let startup = startup_with_accessibility(PermissionLiveness::Live);
     ComputerCapabilityAdvertisementContext {
         inputs: valid_inputs(),
         permissions: startup.permissions.clone(),
@@ -68,15 +78,15 @@ fn tools(manifest: &subc_protocol::manifest::ModuleManifest) -> Vec<&Tool> {
 }
 
 #[test]
-fn empty_runtime_advertisement_reports_frozen_eight_row_scope_without_functional_claim() {
+fn empty_runtime_advertisement_reports_every_frozen_row_without_functional_claim() {
     let context = ComputerCapabilityAdvertisementContext {
         inputs: ComputerReleaseInputs::default(),
         permissions: Default::default(),
         startup: StartupCapabilityProbe::default(),
     };
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.frozen_row_count, 8);
-    assert_eq!(evidence.canonical_row_count, 8);
+    assert_eq!(evidence.frozen_row_count, 10);
+    assert_eq!(evidence.canonical_row_count, 10);
     assert_eq!(evidence.advertised_row_count, 0);
     assert_eq!(evidence.exercised_row_count, 0);
     assert_eq!(
@@ -96,8 +106,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
 
-    // Complete release identifiers admit semantic click and the two read-only
-    // rows. This was originally asserted against the manifest, on the assumption that
+    // Complete release identifiers with every permission live admit the two
+    // keystroke rows and wait: the only rows with a wire handler. This was
+    // originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
     // Advertisement is now the conjunction of gate admission and
@@ -105,12 +116,12 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // half below.
     assert_eq!(
         available_capabilities(&context),
-        vec!["computer.click", "computer.screenshot", "computer.wait"]
+        vec!["computer.type", "computer.keys", "computer.wait"]
     );
     assert_eq!(
         evidence.gate_admitted_capabilities,
         if cfg!(target_os = "macos") {
-            vec!["computer.click", "computer.screenshot", "computer.wait"]
+            vec!["computer.type", "computer.keys", "computer.wait"]
         } else {
             vec!["computer.wait"]
         }
@@ -129,12 +140,12 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         .iter()
         .all(|name| cerebellum::dispatchable_tool(name).is_some()));
 
-    assert_eq!(evidence.frozen_row_count, 8);
+    assert_eq!(evidence.frozen_row_count, 10);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. It is PARTIAL: semantic click and the two observing capabilities
-    // are served, while the other five actuating rows remain unavailable.
+    // admit. It is PARTIAL: the keystroke rows and wait are served, while the
+    // element-addressed and pointer rows have no wire handler yet.
     //
     // PARTIAL rather than EMPTY is a release-visible claim: it says a caller can
     // act on the computer plane rather than only read its declarations. Changing
@@ -147,11 +158,11 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(
         computer_tools,
         if cfg!(target_os = "macos") {
-            vec!["computer.click", "computer.screenshot", "computer.wait"]
+            vec!["computer.type", "computer.keys", "computer.wait"]
         } else {
             vec!["computer.wait"]
         },
-        "the advertised set is no longer exactly semantic click plus the two observing capabilities"
+        "the advertised set is no longer exactly the keystroke rows plus wait"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -177,9 +188,11 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert!(!computer_release_evidence_with_exercised_rows(&empty, 1).functional_computer_plane);
 }
 
-/// The manifest consumes the semantic review rather than the synthetic review.
+/// The keystroke rows are advertised under the input review and nothing
+/// else, and no retired or unserved capability is ever offered, whatever is
+/// bound.
 #[test]
-fn caller_manifest_requires_the_semantic_review_to_advertise_computer_click() {
+fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
     let advertised = |context: &ComputerCapabilityAdvertisementContext| {
         #[cfg(target_os = "macos")]
         {
@@ -197,17 +210,32 @@ fn caller_manifest_requires_the_semantic_review_to_advertise_computer_click() {
     };
 
     let bound = valid_context();
-    assert!(advertised(&bound).contains("computer.click"));
+    let offered = advertised(&bound);
+    assert!(offered.contains("computer.type"), "{offered:?}");
+    assert!(offered.contains("computer.keys"), "{offered:?}");
+    for never in [
+        "computer.click",
+        "computer.screenshot",
+        "computer.move",
+        "computer.drag",
+        "computer.scroll",
+        "computer.read_state",
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+        "computer.takeover_move",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
+    ] {
+        assert!(!offered.contains(never), "{never} was offered");
+    }
 
     let mut unreviewed = bound;
-    unreviewed.inputs.semantic_actuation_review_revision = None;
+    unreviewed.inputs.input_review_revision = None;
+    let offered = advertised(&unreviewed);
     assert!(
-        unreviewed.inputs.input_review_revision.is_some(),
-        "the unrelated synthetic-input review must stay bound in this tripwire"
-    );
-    assert!(
-        !advertised(&unreviewed).contains("computer.click"),
-        "the caller manifest offered semantic click without its review"
+        !offered.contains("computer.type") && !offered.contains("computer.keys"),
+        "the caller manifest offered keystrokes without their review: {offered:?}"
     );
 }
 
@@ -226,30 +254,30 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     let declaration_reason = |context: &ComputerCapabilityAdvertisementContext| {
         capability_declarations(context, true)
             .into_iter()
-            .find(|declaration| declaration.capability_id == "computer.screenshot")
-            .expect("the frozen rows always include screenshot")
+            .find(|declaration| declaration.capability_id == "computer.keys")
+            .expect("the frozen rows always include keys")
             .suppression_reason
     };
 
-    // The permission is granted and every input present, so nothing is
+    // The permissions are granted and every input present, so nothing is
     // suppressed. Without this the cases below would all pass against a
     // capability that is never advertised for some fourth reason.
     assert_eq!(declaration_reason(&valid_context()), None);
 
-    let mut missing_capture_input = valid_context();
-    missing_capture_input.inputs.capture_review_revision = None;
+    let mut missing_input_review = valid_context();
+    missing_input_review.inputs.input_review_revision = None;
     assert_eq!(
-        declaration_reason(&missing_capture_input),
-        Some("capture release input unresolved".to_string())
+        declaration_reason(&missing_input_review),
+        Some("synthetic input review revision is not bound".to_string())
     );
 
     let mut permission_denied = valid_context();
-    let denied = startup_with_screen_recording(PermissionLiveness::Unavailable);
+    let denied = startup_with_accessibility(PermissionLiveness::Unavailable);
     permission_denied.permissions = denied.permissions.clone();
     permission_denied.startup = denied;
     assert_eq!(
         declaration_reason(&permission_denied),
-        Some("screen recording permission is not granted".to_string())
+        Some("Accessibility permission is not granted".to_string())
     );
 
     // An unresolved permission is a DIFFERENT case from a denied one: nothing
@@ -266,7 +294,7 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     permission_unresolved.startup = unresolved;
     assert_eq!(
         declaration_reason(&permission_unresolved),
-        Some("screen recording permission is not established".to_string())
+        Some("Accessibility permission is not established".to_string())
     );
 }
 
@@ -408,31 +436,21 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "attendance_contract_owner"
             | "attendance_contract_revision"
             | "input_review_revision"
-            | "global_dispatch_review_revision" => assert_eq!(
+            | "release_signing_topology_revision" => assert_eq!(
                 admitted,
-                vec!["computer.click", "computer.screenshot", "computer.wait"],
-                "the synthetic-input gates must not govern reviewed semantic click"
+                vec!["computer.wait"],
+                "{gate} governs the keystroke rows"
             ),
-            "capture_review_revision" => {
-                assert!(admitted.iter().any(|id| id == "computer.click"));
-                assert!(!admitted.iter().any(|id| id == "computer.screenshot"));
-                assert!(admitted.iter().any(|id| id == "computer.wait"));
-            }
-            "semantic_actuation_review_revision" => {
-                assert!(!admitted.iter().any(|id| id == "computer.click"));
-                assert!(admitted.iter().any(|id| id == "computer.screenshot"));
-                assert!(admitted.iter().any(|id| id == "computer.wait"));
-            }
-            "windows_actuation_review_revision" => assert_eq!(
+            // No served row is reviewed under these any more, so withholding
+            // one withholds nothing.
+            "global_dispatch_review_revision"
+            | "capture_review_revision"
+            | "semantic_actuation_review_revision"
+            | "windows_actuation_review_revision" => assert_eq!(
                 admitted,
                 available_capabilities(&complete),
-                "the Windows-specific review must not govern another platform"
+                "{gate} governs no served row"
             ),
-            "release_signing_topology_revision" => {
-                assert!(!admitted.iter().any(|id| id == "computer.click"));
-                assert!(!admitted.iter().any(|id| id == "computer.screenshot"));
-                assert!(admitted.iter().any(|id| id == "computer.wait"));
-            }
             _ => assert!(
                 admitted.is_empty(),
                 "common missing pin {gate} must suppress rows"
@@ -445,7 +463,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
 fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresolved_input() {
     for invalid_value in ["placeholder", "tbd", "unknown"] {
         let mut inputs = valid_inputs();
-        inputs.capture_review_revision = Some(invalid_value.into());
+        inputs.input_review_revision = Some(invalid_value.into());
         let context = ComputerCapabilityAdvertisementContext {
             inputs,
             permissions: valid_context().permissions,
@@ -456,74 +474,45 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
             matches!(
                 outcome,
                 ComputerGateOutcome::ImplementationFailure { gate }
-                    if gate == "capture_review_revision"
+                    if gate == "input_review_revision"
             )
         });
         assert_eq!(
             actual,
             Some(&ComputerGateOutcome::ImplementationFailure {
-                gate: "capture_review_revision".to_string(),
+                gate: "input_review_revision".to_string(),
             }),
             "{invalid_value} must not be accepted as a review attestation"
         );
         assert_eq!(
-            evidence.gate_outcomes.iter().find(|outcome| matches!(outcome, ComputerGateOutcome::MissingExternalInput { gate } if gate == "capture_review_revision")),
+            evidence.gate_outcomes.iter().find(|outcome| matches!(outcome, ComputerGateOutcome::MissingExternalInput { gate } if gate == "input_review_revision")),
             None,
             "a supplied {invalid_value} value must not be classified as an absent review"
         );
         assert!(!evidence
             .gate_admitted_capabilities
             .iter()
-            .any(|id| id == "computer.screenshot"));
+            .any(|id| id == "computer.type" || id == "computer.keys"));
     }
 }
 
-/// All other release inputs and runtime permissions are live; pointer rows are
-/// withheld only because authorization for session-global dispatch is absent.
+/// With every other release input and permission live, the missing
+/// global-dispatch review withholds nothing: no served row posts globally.
+/// The pointer rows it used to govern are gone, and the rows that replace them
+/// have no wire handler, so they are withheld whether it is bound or not.
 #[test]
-fn global_dispatch_review_gate_isolated_from_every_other_release_input() {
+fn global_dispatch_review_gate_governs_no_served_row() {
     let mut inputs = valid_inputs();
     inputs.global_dispatch_review_revision = None;
-    assert!(
-        inputs.input_review_revision.is_some(),
-        "the isolation fixture must bind the ordinary input review"
-    );
-    let permissions = PermissionLivenessReport::from_results(
-        [
-            PermissionService::ScreenRecording,
-            PermissionService::Accessibility,
-            PermissionService::PostEvent,
-            PermissionService::InputMonitoring,
-            PermissionService::RawHidObservation,
-        ]
-        .into_iter()
-        .map(|service| PermissionProbeResult {
-            service,
-            liveness: PermissionLiveness::Live,
-            responsible_process: "ck-subc".into(),
-            off_main: true,
-        }),
-    );
     let context = ComputerCapabilityAdvertisementContext {
         inputs,
-        permissions: permissions.clone(),
-        startup: StartupCapabilityProbe {
-            os_major: 26,
-            private_envelope_recognized: true,
-            permissions,
-        },
+        permissions: valid_context().permissions,
+        startup: valid_context().startup,
     };
 
     assert_eq!(
         available_capabilities(&context),
-        vec![
-            "computer.click",
-            "computer.type",
-            "computer.keys",
-            "computer.screenshot",
-            "computer.wait",
-        ],
-        "a missing global review must withhold exactly scroll, move, and drag"
+        vec!["computer.type", "computer.keys", "computer.wait"],
     );
     assert!(
         computer_release_evidence(&context).gate_outcomes.contains(
@@ -531,6 +520,6 @@ fn global_dispatch_review_gate_isolated_from_every_other_release_input() {
                 gate: "global_dispatch_review_revision".to_string(),
             }
         ),
-        "the withheld rows must name the missing global-dispatch gate"
+        "the missing gate is still reported as an unresolved input"
     );
 }

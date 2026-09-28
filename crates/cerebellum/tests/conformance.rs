@@ -1301,6 +1301,7 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     let request = json!({
         "name": "computer.wait",
         "arguments": {
+            "app": "com.example.App",
             "predicate": {
                 "kind": "element_present",
                 "element": {"Identifier": "ready"},
@@ -1344,94 +1345,98 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     assert_eq!(evidence["predicate"]["kind"], "element_present");
 }
 
-/// Reviewed semantic click reaches the computer plane and its compose authority.
-///
-/// This module holds no compose lease, so the authority chain refuses before
-/// accessibility is read. The typed no-lease recipe proves click reached the
-/// serving handler rather than falling through as an unknown method.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn reviewed_semantic_click_reaches_the_compose_authority_chain() {
+async fn one_reply(request: Value, admitted: Option<&[&str]>, channel: u16) -> Frame {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
-    let request = json!({
-        "name": "computer.click",
-        "arguments": {
-            "target": {"by": "identifier", "identifier": "save-button"},
-            "button": "left",
-            "click_count": 1,
-            "modifiers": [],
-        },
-    });
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        7,
+        channel,
         1,
         102,
         serde_json::to_vec(&request).unwrap(),
     )
     .unwrap();
-
-    cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
-        .await
-        .unwrap();
-
-    let response = rx.recv().await.expect("a response frame");
-    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(
-        body["outcome"], "no_lease",
-        "semantic click did not reach compose authority: {body}"
-    );
-    assert!(
-        body["remedy"]
-            .as_str()
-            .is_some_and(|remedy| remedy.contains("action_kind 'compose'")),
-        "the refusal does not request a compose lease: {body}"
-    );
+    match admitted {
+        Some(admitted) => {
+            cerebellum::handle_tool_request_for_test_admitting(frame, &tx, &health_state, admitted)
+                .await
+                .unwrap()
+        }
+        None => cerebellum::handle_tool_request_for_test(frame, &tx, &health_state)
+            .await
+            .unwrap(),
+    }
+    rx.recv().await.expect("exactly one reply frame")
 }
 
-/// Semantic click cannot be served when its review gate withholds it.
+/// A retired computer capability is refused with a typed route error, never a
+/// panic and never an empty reply.
+///
+/// `click`, `screenshot`, `move`, `drag` and `scroll` were served before, so
+/// callers and published vocabularies name them; the module must still answer
+/// them. A capability the current vocabulary carries but nothing serves yet is
+/// refused as not admitted, which tells the caller it exists and is withheld.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn every_retired_or_unserved_computer_name_gets_a_typed_refusal() {
+    for (name, code) in [
+        ("computer.click", "unknown_method"),
+        ("computer.screenshot", "unknown_method"),
+        ("computer.move", "unknown_method"),
+        ("computer.drag", "unknown_method"),
+        ("computer.scroll", "unknown_method"),
+        ("computer.read_state", "capability_not_admitted"),
+        ("computer.press_element", "capability_not_admitted"),
+        ("computer.takeover_move", "capability_not_admitted"),
+    ] {
+        let reply = one_reply(json!({"name": name, "arguments": {}}), None, 7).await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{name}");
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], code, "{name}: {body}");
+    }
+    // Through the flat tool the retired names are not actions at all.
+    for action in ["click", "screenshot", "move", "drag", "scroll", "open_target"] {
+        let reply = one_reply(
+            json!({"name": "computer_use", "arguments": {"action": action}}),
+            None,
+            7,
+        )
+        .await;
+        assert!(!reply.body.is_empty(), "{action} answered with nothing");
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        let text = body.to_string();
+        assert!(
+            text.contains("invalid_request") && text.contains("unsupported_value"),
+            "{action}: {body}"
+        );
+    }
+}
+
+/// A served keystroke capability cannot be served when its review gate
+/// withholds it.
 ///
 /// The request is valid enough to reach compose authority if the admission check
 /// is removed, so an argument refusal cannot make this tripwire pass by accident.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn unadvertised_semantic_click_is_refused_before_its_serving_handler() {
-    let (tx, mut rx) = mpsc::channel::<Frame>(16);
-    let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
-    let request = json!({
-        "name": "computer.click",
-        "arguments": {
-            "target": {"by": "identifier", "identifier": "save-button"},
-            "button": "left",
-            "click_count": 1,
-            "modifiers": [],
-        },
-    });
-    let frame = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        FrameType::Request,
-        Flags::new(false, Priority::Interactive, false),
+async fn an_unadmitted_keystroke_is_refused_before_its_serving_handler() {
+    let reply = one_reply(
+        json!({
+            "name": "computer.keys",
+            "arguments": {"keys": ["s"], "target": "com.example.App"},
+        }),
+        Some(&[]),
         8,
-        1,
-        103,
-        serde_json::to_vec(&request).unwrap(),
     )
-    .unwrap();
-
-    cerebellum::handle_tool_request_for_test_admitting(frame, &tx, &health_state, &[])
-        .await
-        .unwrap();
-
-    let response = rx.recv().await.expect("a response frame");
-    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    .await;
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
     // The same code the browser plane answers for a withheld tool: one
     // meaning, one spelling, on both planes.
     assert_eq!(
         body["code"], "capability_not_admitted",
-        "unadvertised semantic click reached its serving handler: {body}"
+        "an unadmitted keystroke reached its serving handler: {body}"
     );
     assert_ne!(body["outcome"], "no_lease");
 }
@@ -1456,6 +1461,7 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
     let request = json!({
         "name": "computer.wait",
         "arguments": {
+            "app": "com.example.App",
             "predicate": {
                 "kind": "element_present",
                 "element": {"Identifier": "ready"},

@@ -1,4 +1,4 @@
-//! Serving the five synthetic input capabilities over the wire.
+//! Serving the keystroke capabilities over the wire.
 //!
 //! Every test here drives `ComputerPlane::serve` -- the boundary the wire
 //! route calls -- and asserts on the events the platform driver was asked to
@@ -23,7 +23,7 @@ use cerebellum_computer::platform::{
     FrontingSnapshot, HeldStateDisposition, InputObservationRequest, InputObservationResult,
     InputObserverLiveness, PlatformDriver, PostCallFailure, ProcessEventRefusal, ProcessGrant,
     SemanticDispatchRequest, SequencePostFailure, SyntheticAction, SyntheticDispatchRequest,
-    SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit, BLOCKED_CHORDS,
+    SyntheticKey, SyntheticKeyModifiers, BLOCKED_CHORDS,
 };
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::consent::ActionKind;
@@ -269,45 +269,12 @@ async fn management_leased(kind: ActionKind, clock: &FakeClock) -> Arc<Managemen
     management
 }
 
-async fn management_once(clock: &FakeClock) -> Arc<ManagementPlane> {
-    let management = management();
-    let (reply, _) = management
-        .open_target(
-            GRANTEE,
-            support::computer::TARGET_BUNDLE_ID,
-            ActionKind::MutateDurable,
-            true,
-            clock,
-        )
-        .await;
-    let ask_id = reply["ask_id"].as_str().expect("an ask is minted");
-    assert!(
-        management
-            .settle(ask_id, Some(&json!({"decision": "allow_once"})), clock,)
-            .await,
-        "the fixture Once lease settles"
-    );
-    management
-}
-
 fn type_request() -> Value {
-    json!({"target": "editor", "text": "hi", "replace_selection": false})
+    json!({"target": "editor", "text": "hi"})
 }
 
 fn keys_request(keys: &[&str]) -> Value {
     json!({"keys": keys, "target": "editor"})
-}
-
-fn scroll_request() -> Value {
-    json!({"target": "editor", "axis": "vertical", "amount_lines": -3})
-}
-
-fn move_request() -> Value {
-    json!({"to": "812,460"})
-}
-
-fn drag_request() -> Value {
-    json!({"from": "1,2", "to": "3.5,4", "button": "left", "modifiers": []})
 }
 
 /// Typing reaches the target's leased process generation and reports structural
@@ -384,148 +351,6 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
     assert!(
         plane.result_schema_findings().is_empty(),
         "{:?}",
-        plane.result_schema_findings()
-    );
-}
-
-/// Scrolling reaches the leased process as the wheel delta requested.
-#[tokio::test]
-async fn computer_scroll_dispatches_its_wheel_event_through_observed_global_input() {
-    let shared = Shared::handle();
-    let plane = plane_with(&shared);
-    let clock = FakeClock::new();
-    let management = management_once(&clock).await;
-
-    let reply = serve(
-        &plane,
-        "computer.scroll",
-        scroll_request(),
-        &management,
-        &clock,
-    )
-    .await;
-
-    assert_eq!(reply["outcome"], "completed");
-    let calls = dispatched_calls(&shared);
-    let [DispatchedCall::Global(request)] = &calls[..] else {
-        panic!("scroll must deliver through observed global dispatch exactly once: {calls:?}");
-    };
-    assert_eq!(request.target, grant());
-    assert_eq!(
-        request.action,
-        SyntheticAction::scroll(SyntheticScrollUnit::Line, -3)
-    );
-    assert!(
-        plane.result_schema_findings().is_empty(),
-        "{:?}",
-        plane.result_schema_findings()
-    );
-}
-
-/// computer.move is frozen observed-only: it goes through the global path,
-/// never the per-process one, and its reply carries no containment rung.
-#[tokio::test]
-async fn computer_move_dispatches_through_the_global_path_while_observed() {
-    let shared = Shared::handle();
-    let plane = plane_with(&shared);
-    let clock = FakeClock::new();
-    let management = management_once(&clock).await;
-
-    let reply = serve(&plane, "computer.move", move_request(), &management, &clock).await;
-
-    assert_eq!(
-        reply,
-        json!({
-            "outcome": "completed",
-            "containment_rung": "global_none",
-            "containment_forfeited_because": "coordinate_addressed",
-            "target_fronted": false,
-            "effect_status": "effect_indeterminate",
-        }),
-        "the move row reports the measured rung and why it was forfeited"
-    );
-    let calls = dispatched_calls(&shared);
-    let [DispatchedCall::Global(request)] = &calls[..] else {
-        panic!("move must deliver through the global path exactly once: {calls:?}");
-    };
-    assert_eq!(request.target, grant());
-    assert_eq!(
-        request.action,
-        SyntheticAction::move_pointer(SyntheticPoint { x: 812.0, y: 460.0 })
-    );
-    assert!(
-        plane.result_schema_findings().is_empty(),
-        "{:?}",
-        plane.result_schema_findings()
-    );
-}
-
-/// An Until lease cannot authorize global dispatch. A Once lease admits one
-/// move and is gone before a second move asks, proving the wire consumes it.
-#[tokio::test]
-async fn computer_move_requires_and_consumes_a_once_mutate_durable_lease() {
-    let clock = FakeClock::new();
-
-    let shared = Shared::handle();
-    let plane = plane_with(&shared);
-    let until = management_leased(ActionKind::MutateDurable, &clock).await;
-    let refused = serve(&plane, "computer.move", move_request(), &until, &clock).await;
-    assert_eq!(refused["outcome"], "once_grant_required");
-    assert!(
-        dispatched_calls(&shared).is_empty(),
-        "an Until lease reached global dispatch"
-    );
-
-    let shared = Shared::handle();
-    let plane = plane_with(&shared);
-    let once = management_once(&clock).await;
-    let first = serve(&plane, "computer.move", move_request(), &once, &clock).await;
-    assert_eq!(first["outcome"], "completed");
-    assert_eq!(dispatched_calls(&shared).len(), 1);
-
-    let second = serve(&plane, "computer.move", move_request(), &once, &clock).await;
-    assert_eq!(second["outcome"], "once_grant_required");
-    assert_eq!(
-        dispatched_calls(&shared).len(),
-        1,
-        "the consumed Once lease admitted a second global post"
-    );
-}
-
-/// A once-grant refusal keeps its repair instruction when the production serving
-/// boundary enforces the frozen result schema instead of merely detecting it.
-#[tokio::test]
-async fn withholding_mode_preserves_move_once_grant_remedy() {
-    let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
-        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
-    let clock = FakeClock::new();
-    let management = management_leased(ActionKind::MutateDurable, &clock).await;
-
-    let reply = plane
-        .serve(
-            servable("computer.move").expect("move is servable"),
-            &move_request(),
-            ServeContext {
-                cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
-                grantee: GRANTEE,
-                identity: identity(),
-                management: &management,
-                clock: &clock,
-                now_ms: 10,
-            },
-            |_| InMemoryCaptureBackend::default(),
-        )
-        .await
-        .expect("a declared refusal reaches the caller in withholding mode");
-
-    assert_eq!(reply["outcome"], "once_grant_required");
-    assert_eq!(
-        reply["remedy"],
-        "call computer.open_target for action_kind 'mutate_durable', choose the 'once' grant kind, then retry"
-    );
-    assert!(
-        plane.result_schema_findings().is_empty(),
-        "withholding a declared refusal recorded a schema finding: {:?}",
         plane.result_schema_findings()
     );
 }
@@ -713,32 +538,6 @@ async fn session_floor_leaves_command_near_misses_grantable() {
     }
 }
 
-/// Semantic click titles lack the key-chord information this floor uses; a
-/// locale- and role-aware session-action policy would be needed to cover them.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn semantic_click_log_out_title_is_not_refused_by_the_chord_floor() {
-    let shared = Shared::handle();
-    let plane = plane_with(&shared);
-    let clock = FakeClock::new();
-    let management = management();
-    let reply = serve(
-        &plane,
-        "computer.click",
-        json!({
-            "target": {"by": "role_and_title", "role": "AXMenuItem", "title": "Log Out…"},
-            "button": "left",
-            "click_count": 1,
-            "modifiers": [],
-        }),
-        &management,
-        &clock,
-    )
-    .await;
-
-    assert_ne!(reply["outcome"], "chord_blocked");
-}
-
 /// Invalid synthetic requests preserve both the failed field and its one-word
 /// reason when the production serving boundary enforces the frozen schema.
 #[tokio::test]
@@ -775,53 +574,12 @@ async fn withholding_mode_preserves_keys_invalid_request_diagnostics() {
     );
 }
 
-/// Dragging is mutate_durable outright and globally delivers its three events
-/// while observed: press, move, release at the requested points.
-#[tokio::test]
-async fn computer_drag_dispatches_its_drag_events_through_observed_global_input() {
-    let shared = Shared::handle();
-    let plane = plane_with(&shared);
-    let clock = FakeClock::new();
-    let management = management_once(&clock).await;
-
-    let reply = serve(&plane, "computer.drag", drag_request(), &management, &clock).await;
-
-    assert_eq!(
-        reply,
-        json!({
-            "outcome": "completed",
-            "containment_rung": "global_none",
-            "containment_forfeited_because": "coordinate_addressed",
-            "target_fronted": false,
-            "effect_status": "effect_indeterminate",
-        }),
-        "the drag row reports the measured rung and why it was forfeited"
-    );
-    let calls = dispatched_calls(&shared);
-    let [DispatchedCall::Global(request)] = &calls[..] else {
-        panic!("drag must deliver through observed global dispatch exactly once: {calls:?}");
-    };
-    assert_eq!(request.target, grant());
-    assert_eq!(
-        request.action,
-        SyntheticAction::drag_pointer(
-            SyntheticPoint { x: 1.0, y: 2.0 },
-            SyntheticPoint { x: 3.5, y: 4.0 },
-        )
-    );
-    assert!(
-        plane.result_schema_findings().is_empty(),
-        "{:?}",
-        plane.result_schema_findings()
-    );
-}
-
 /// A lease that authorised observing an application authorises no input into
-/// it. Asserted for each of the five, and by the ABSENCE of a dispatched
+/// it. Asserted for each keystroke row, and by the ABSENCE of a dispatched
 /// event and of a journal entry: a handler that asked the wrong action kind
 /// would pass the lease check and post.
 #[tokio::test]
-async fn an_observe_only_lease_is_refused_for_each_of_the_five() {
+async fn an_observe_only_lease_is_refused_for_each_keystroke_row() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
@@ -830,20 +588,12 @@ async fn an_observe_only_lease_is_refused_for_each_of_the_five() {
     let cases = [
         ("computer.type", type_request()),
         ("computer.keys", keys_request(&["s"])),
-        ("computer.scroll", scroll_request()),
-        ("computer.move", move_request()),
-        ("computer.drag", drag_request()),
     ];
     for (name, request) in cases {
         let before = plane.journal_entry_count().await;
         let reply = serve(&plane, name, request, &management, &clock).await;
-        let expected = if matches!(name, "computer.scroll" | "computer.move" | "computer.drag") {
-            "once_grant_required"
-        } else {
-            "no_lease"
-        };
         assert_eq!(
-            reply["outcome"], expected,
+            reply["outcome"], "no_lease",
             "{name} ran under an observe-only lease"
         );
         assert_eq!(
@@ -1041,7 +791,7 @@ async fn typed_text_never_reaches_the_journal() {
     let reply = serve(
         &plane,
         "computer.type",
-        json!({"target": "field", "text": SECRET, "replace_selection": false}),
+        json!({"target": "field", "text": SECRET}),
         &management,
         &clock,
     )
@@ -1149,7 +899,7 @@ async fn a_single_thread_runtime_can_interrupt_a_posting_computer_action() {
     let clock = FakeClock::new();
     let management = management_leased(ActionKind::Compose, &clock).await;
     let cancel = cerebellum::CancelHandle::pending();
-    let arguments = json!({"target":"editor", "text":"abcde", "replace_selection": false});
+    let arguments = json!({"target":"editor", "text":"abcde"});
     let serving = plane.serve(
         servable("computer.type").unwrap(),
         &arguments,

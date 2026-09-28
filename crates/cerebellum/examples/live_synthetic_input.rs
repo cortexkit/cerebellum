@@ -391,8 +391,7 @@ mod macos_probe {
             "computer.type",
             json!({
                 "target": "probe-input",
-                "text": TYPE_TEXT,
-                "replace_selection": false
+                "text": TYPE_TEXT
             }),
         )
         .await?;
