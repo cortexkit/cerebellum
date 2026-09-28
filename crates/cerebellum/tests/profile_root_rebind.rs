@@ -848,13 +848,26 @@ async fn management_wire_allows_rebinding_the_recreated_root() {
     let (reply, question_frame, question) = open_rebind_over_wire(&planes, &writer, &mut rx).await;
     assert_eq!(reply["outcome"], "consent_pending");
     assert_eq!(
-        question["params"]["root_path"],
+        question["params"]["facts"][0]["value"],
         fs::canonicalize(root.path()).unwrap().display().to_string()
     );
-    assert_eq!(question["params"]["old_identity"], reply["old_identity"]);
-    assert_eq!(question["params"]["new_identity"], reply["new_identity"]);
-    assert_eq!(question["params"]["record_count"], 1);
-    assert_eq!(question["params"]["generation_before"], reply["generation"]);
+    assert_eq!(question["params"]["facts"][1]["value"], "1");
+    assert_eq!(question["params"]["kind"], "consent");
+    assert_eq!(question["params"]["default"], "deny");
+    assert_eq!(question["params"]["on_expiry"], "deny");
+    assert_eq!(
+        question["params"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["allow", "deny"]
+    );
+    assert_eq!(
+        question["params"]["requestedSchema"]["properties"]["decision"]["enum"],
+        json!(["allow", "deny"])
+    );
 
     answer_rebind(&planes, &writer, &question_frame, "allow").await;
     let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();

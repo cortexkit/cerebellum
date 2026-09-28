@@ -559,8 +559,8 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
     assert_screen_locked("computer.takeover_scroll", &reply);
     assert!(rig.posted.lock().unwrap().is_empty(), "the scroll posted");
     assert_eq!(
-        carrier.questions()[0]["params"]["grant_kind"],
-        "takeover",
+        carrier.questions()[0]["params"]["target"]["kind"],
+        "machine",
         "the question answered was the takeover grant's"
     );
 }

@@ -1755,54 +1755,57 @@ fn wall_clock_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// The question the person is shown.
-///
-/// Structured rather than worded: the host renders the headline itself from
-/// `grant_kind` and `app`, so the two kinds can look different on the phone.
-/// The message carries only the context line the headline cannot.
+/// Display effects describe consent; settlement still validates the original offered words.
 fn question_body(
     ask_id: &str,
     need: &GrantNeed,
     offered: &[&'static str],
     signature_changed: bool,
 ) -> Value {
-    let mut params = json!({
-        "grant_kind": need.grant_kind(),
-        "requestedSchema": {
-            "type": "object",
-            "properties": {
-                "decision": {"type": "string", "enum": offered},
-            },
-            "required": ["decision"],
+    use crate::consent_card::*;
+    let (title, prompt, target, deadline) = match need {
+        GrantNeed::App { display_name, .. } => (
+            format!("Allow access to {display_name}?"),
+            "Covers reading and acting inside this application.".to_string(),
+            Target { kind: TargetKind::App, label: display_name.clone() }, APP_QUESTION_DEADLINE,
+        ),
+        GrantNeed::Takeover => (
+            "Allow control of your mouse and keyboard?".to_string(),
+            "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It is machine-wide for this conversation and can reach every application on the screen.".to_string(),
+            Target { kind: TargetKind::Machine, label: "your mouse and keyboard".into() }, TAKEOVER_QUESTION_DEADLINE,
+        ),
+    };
+    let options = offered
+        .iter()
+        .map(|id| match *id {
+            ALLOW_CONVERSATION => ConsentOption::grant(*id, "Allow for this conversation"),
+            ALLOW_ALWAYS => ConsentOption::grant(*id, "Always allow"),
+            DENY => ConsentOption::decline(*id, "Don't allow"),
+            _ => unreachable!("only known decisions are offered"),
+        })
+        .collect();
+    let facts = if signature_changed {
+        vec![Fact::new("Application changed", "This application's code signature has changed since it was approved, so it may not be the application you approved")]
+    } else {
+        vec![]
+    };
+    ConsentCard {
+        title,
+        prompt,
+        target,
+        facts,
+        options,
+        expires_in: deadline,
+        material_damage: true,
+        scope: None,
+        duration: if offered.contains(&ALLOW_ALWAYS) {
+            None
+        } else {
+            Some(json!("conversation"))
         },
-    });
-    match need {
-        GrantNeed::App { display_name, .. } => {
-            params["app"] = json!(display_name);
-            params["message"] = if signature_changed {
-                json!(
-                    "This application's code signature has changed since it was approved, so \
-                     it may not be the application you approved. Covers reading and acting \
-                     inside this application."
-                )
-            } else {
-                json!("Covers reading and acting inside this application.")
-            };
-        }
-        GrantNeed::Takeover => {
-            params["message"] = json!(
-                "Takeover lets the agent bring apps to the front, type into them, and move \
-                 your real mouse pointer. It is machine-wide for this conversation and can \
-                 reach every application on the screen."
-            );
-        }
     }
-    json!({
-        "jsonrpc": "2.0",
-        "id": ask_id,
-        "method": "elicitation/create",
-        "params": params,
-    })
+    .render(ask_id)
+    .expect("computer consent has one decline")
 }
 
 /// What the answer to a question is applied against, copied out so the store
@@ -1836,4 +1839,22 @@ enum Ending {
     TimedOut,
     Draining,
     Cancelled,
+}
+
+#[cfg(test)]
+mod consent_card_tests {
+    use super::*;
+
+    #[test]
+    fn takeover_card_has_a_decline_and_conversation_duration() {
+        let body = question_body(
+            "takeover",
+            &GrantNeed::Takeover,
+            &[ALLOW_CONVERSATION, DENY],
+            false,
+        );
+        crate::consent_card::assert_contract(&body, &["allow_conversation", "deny"], "deny");
+        assert_eq!(body["params"]["duration"], "conversation");
+        assert_eq!(body["params"]["expires_in_ms"], 300_000);
+    }
 }

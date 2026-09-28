@@ -681,7 +681,7 @@ async fn a_scroll_without_the_takeover_grant_asks_for_it_even_under_an_app_grant
     assert_eq!(reply["outcome"], "consent_denied", "{reply}");
     let questions = carrier.questions();
     assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0]["params"]["grant_kind"], "takeover");
+    assert_eq!(questions[0]["params"]["target"]["kind"], "machine");
     assert!(rig.dispatched().is_empty());
     assert!(rig.posts().is_empty());
 }

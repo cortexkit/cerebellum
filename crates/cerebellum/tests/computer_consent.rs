@@ -296,9 +296,9 @@ async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_re
     let questions = carrier.questions();
     assert_eq!(questions.len(), 1);
     let params = &questions[0]["params"];
-    assert_eq!(params["grant_kind"], "app");
+    assert_eq!(params["target"]["kind"], "app");
     // No running name can be read in a test, so the bundle identity is shown.
-    assert_eq!(params["app"], APP);
+    assert_eq!(params["target"]["label"], APP);
     assert_eq!(decisions(&questions[0]), ["allow_conversation", "deny"]);
 
     let keys = serve(
@@ -482,6 +482,28 @@ async fn an_always_answer_survives_a_module_restart() {
     let admission = admit(&first, &carrier, caller("conversation-1", true))
         .await
         .expect("the always answer admits the call");
+    let questions = carrier.questions();
+    let params = &questions[0]["params"];
+    assert_eq!(params["kind"], "consent");
+    assert_eq!(params["default"], "deny");
+    assert_eq!(params["on_expiry"], "deny");
+    assert!(params.get("duration").is_none());
+    assert_eq!(
+        params["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["allow_conversation", "allow_always", "deny"]
+    );
+    assert_eq!(
+        decisions(&questions[0]),
+        ["allow_conversation", "allow_always", "deny"]
+    );
+    assert_eq!(params["options"][0]["label"], "Allow for this conversation");
+    assert_eq!(params["options"][1]["label"], "Always allow");
+    assert_eq!(params["options"][2]["effect"], "decline");
     assert_eq!(admission.persisted, Some(Ok(())));
     let mut reply = json!({"outcome": "completed"});
     admission.decorate(&mut reply);
@@ -776,14 +798,14 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
     let questions = carrier.questions();
     assert_eq!(questions.len(), 2, "takeover was not asked on its own");
     let takeover = &questions[1];
-    assert_eq!(takeover["params"]["grant_kind"], "takeover");
+    assert_eq!(takeover["params"]["target"]["kind"], "machine");
     assert_eq!(decisions(takeover), ["allow_conversation", "deny"]);
     assert!(takeover["params"].get("app").is_none());
     // Pinned byte for byte: the host shows this line unchanged, and it has to
     // cover both uses of the grant, fronting an application for keystrokes
     // and driving the real pointer.
     assert_eq!(
-        takeover["params"]["message"],
+        takeover["params"]["prompt"],
         "Takeover lets the agent bring apps to the front, type into them, and move your real \
          mouse pointer. It is machine-wide for this conversation and can reach every \
          application on the screen."
@@ -969,10 +991,7 @@ fn need_for(code: &InjectedCode) -> GrantNeed {
 }
 
 fn question_message(question: &Value) -> String {
-    question["params"]["message"]
-        .as_str()
-        .expect("an app question carries a message")
-        .to_string()
+    question["params"]["facts"].to_string()
 }
 
 const SIGNATURE_CHANGED: &str = "code signature has changed since it was approved";

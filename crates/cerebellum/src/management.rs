@@ -1130,8 +1130,8 @@ fn browser_grant_severity(hazards: &BTreeSet<HazardClass>) -> Severity {
 
 /// The consent question's text, written for the person answering, often on a
 /// phone. It states what the grant allows and, just as plainly, what it still
-/// refuses, because that is what the person is deciding. The structured
-/// `origins`, `hazards` and `severity_ceiling` beside it stay the exact scope.
+/// refuses, because that is what the person is deciding. The card keeps the
+/// exact origins, hazards and severity ceiling in its scope.
 fn browser_grant_message(origins: &[String], hazards: &[String], ceiling_tier: u8) -> String {
     // Each hazard class unlocks submitting one kind of form. Listed in a fixed
     // order so the sentence does not change with the order a caller sent them.
@@ -1217,113 +1217,121 @@ fn browser_grant_question(
     hazards: &[String],
     severity: Severity,
 ) -> Value {
-    let severity_value = browser_grant_severity_value(severity);
-    json!({
-        "jsonrpc": "2.0",
-        "id": ask_id,
-        "method": "elicitation/create",
-        "params": {
-            "message": browser_grant_message(origins, hazards, severity.tier),
-            // These values are the exact scope that an affirmative answer mints.
-            // Keeping them beside the prose lets a relay render structured scope
-            // without translating or reconstructing the grant.
-            "origins": origins,
-            "hazards": hazards,
-            "severity_ceiling": severity_value,
-            "requestedSchema": {
-                "type": "object",
-                "properties": {
-                    "decision": {
-                        "type": "string",
-                        "enum": ["allow", "deny"],
-                    }
+    use crate::consent_card::*;
+    let hosts: Vec<String> = origins
+        .iter()
+        .map(|origin| crate::login_import::origin_host(origin).unwrap_or_else(|| origin.clone()))
+        .collect();
+    let mut facts = Vec::new();
+    let message = browser_grant_message(&hosts, hazards, severity.tier);
+    // Separate the capabilities from the headline without losing the ceiling's meaning.
+    if let Some((_, capabilities)) = message.split_once("? ") {
+        for sentence in capabilities.split(". ") {
+            facts.push(Fact::new(
+                if sentence.contains("can't") {
+                    "Can't"
+                } else {
+                    "Can"
                 },
-                "required": ["decision"],
-                "additionalProperties": false,
-            },
-        },
-    })
+                sentence.trim_end_matches('.'),
+            ));
+        }
+    }
+    if origins.iter().any(|o| !o.starts_with("https://"))
+        || hosts
+            .iter()
+            .enumerate()
+            .any(|(i, h)| hosts[..i].contains(h))
+    {
+        facts.push(Fact::new("Exact sites", origins.join(", ")));
+    }
+    ConsentCard {
+        title: format!("Allow access to {}?", hosts.join(", ")),
+        prompt: format!("Let the agent use its own browser on {} to read pages and click{}.", hosts.join(", "), if severity.tier >= MUTATE_DURABLE { ", including actions that make lasting changes" } else if severity.tier == MUTATE_REVERSIBLE { " and make changes that can be undone" } else { "" }),
+        target: Target { kind: TargetKind::Site, label: hosts.join(", ") }, facts,
+        options: vec![ConsentOption::grant("allow", "Allow"), ConsentOption::decline("deny", "Don't allow")],
+        expires_in: PHONE_CONSENT_DEADLINE, material_damage: true,
+        scope: Some(json!({"origins": origins, "hazards": hazards, "severity_ceiling": browser_grant_severity_value(severity)})), duration: None,
+    }.render(ask_id).expect("site grant has one decline")
 }
 
 fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindReport) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": ask_id,
-        "method": "elicitation/create",
-        "params": {
-            "message": format!(
-                "Re-identify browser profile root {root_path} from identity {} to {}? \
-                 The registry has {} record(s) at generation {}; allowing advances it to generation {}. \
-                 This operation refuses rather than adopts any profile directory the registry did not mint.",
-                preview.old_identity,
-                preview.new_identity,
-                preview.record_count,
-                preview.generation_before,
-                preview.generation_after,
-            ),
-            "root_path": root_path,
-            "old_identity": preview.old_identity,
-            "new_identity": preview.new_identity,
-            "generation_before": preview.generation_before,
-            "generation_after": preview.generation_after,
-            "record_count": preview.record_count,
-            "requestedSchema": {
-                "type": "object",
-                "properties": {
-                    "decision": {
-                        "type": "string",
-                        "enum": ["allow", "deny"],
-                    }
-                },
-                "required": ["decision"],
-                "additionalProperties": false,
-            },
+    use crate::consent_card::*;
+    ConsentCard {
+        title: "Re-identify browser profiles?".into(),
+        prompt: "Re-identify the agent's browser profiles at their current location.".into(),
+        target: Target {
+            kind: TargetKind::Machine,
+            label: "the agent's browser profiles".into(),
         },
-    })
+        facts: vec![
+            Fact::new("Path", root_path),
+            Fact::new("Profiles affected", preview.record_count.to_string()),
+            Fact::new(
+                "Protection",
+                "Only profiles created by the registry can be re-identified",
+            ),
+        ],
+        options: vec![
+            ConsentOption::grant("allow", "Re-identify"),
+            ConsentOption::decline("deny", "Don't allow"),
+        ],
+        expires_in: PHONE_CONSENT_DEADLINE,
+        material_damage: true,
+        scope: None,
+        duration: None,
+    }
+    .render(ask_id)
+    .expect("rebind has one decline")
 }
 
-/// The consent question for clearing a launch record, worded like the
-/// profile-root rebind: it names what will change and shows the evidence, and
-/// asks for consent. The person is not asked to judge whether a browser is
-/// running; the module read that, and reads it again before acting.
+/// Evidence is checked again before clearing; consent is not proof the browser exited.
 fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value {
-    let launched_at = preview
-        .launched_at
-        .clone()
-        .unwrap_or_else(|| "an unrecorded time".to_string());
-    json!({
-        "jsonrpc": "2.0",
-        "id": ask_id,
-        "method": "elicitation/create",
-        "params": {
-            "message": format!(
-                "Clear the stuck browser record for project {}? Its browser was launched at {} \
-                 and, after the module restarted, recovery could not prove it gone ({}). \
-                 Evidence now: {}. Clearing lets the agent open its browser on that profile \
-                 again; the evidence is read again before anything is cleared.",
-                preview.agent_project_id,
-                launched_at,
-                preview.reason.as_str(),
-                preview.evidence.describe(),
-            ),
-            "agent_project_id": preview.agent_project_id,
-            "sequence": preview.sequence,
-            "reason": preview.reason.as_str(),
-            "launched_at": preview.launched_at,
-            "evidence": preview.evidence.as_json(),
-            "requestedSchema": {
-                "type": "object",
-                "properties": {
-                    "decision": {
-                        "type": "string",
-                        "enum": ["clear", "keep"],
-                    }
-                },
-                "required": ["decision"],
-                "additionalProperties": false,
-            },
+    use crate::consent_card::*;
+    ConsentCard {
+        title: "Clear the stuck browser record?".into(),
+        prompt: "Clear the stuck record so the agent can open its browser on this profile again."
+            .into(),
+        target: Target {
+            kind: TargetKind::Machine,
+            label: "the agent's browser profile".into(),
         },
-    })
+        facts: vec![
+            Fact::new(
+                "Browser launched",
+                preview
+                    .launched_at
+                    .as_deref()
+                    .unwrap_or("Time not recorded"),
+            ),
+            Fact::new(
+                "Verified evidence",
+                preview
+                    .evidence
+                    .describe()
+                    .replace("Chrome's SingletonLock", "The browser lock")
+                    .replace("pid ", "process "),
+            ),
+            Fact::new(
+                "Recovery",
+                "After restarting, the module could not prove the previous browser had exited",
+            ),
+            Fact::new(
+                "Safety check",
+                "The evidence is read again before anything is cleared",
+            ),
+        ],
+        options: vec![
+            ConsentOption::grant("clear", "Clear it"),
+            ConsentOption::decline("keep", "Keep it locked"),
+        ],
+        expires_in: PHONE_CONSENT_DEADLINE,
+        material_damage: true,
+        scope: None,
+        duration: None,
+    }
+    .render(ask_id)
+    .expect("clear has one decline")
 }
 
 fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
@@ -1521,6 +1529,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn site_card_discloses_ambiguous_origins() {
+        for origins in [
+            vec!["https://github.com", "http://localhost:3000"],
+            vec!["https://github.com", "https://github.com:8443"],
+        ] {
+            let origins = origins.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let body =
+                browser_grant_question("sites", &origins, &[], Severity::new(2, false, false));
+            assert_eq!(body["params"]["scope"]["origins"], json!(origins));
+            assert!(body["params"]["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["label"] == "Exact sites" && f["value"] == origins.join(", ")));
+        }
+        let body = browser_grant_question(
+            "site",
+            &["https://github.com".into()],
+            &[],
+            Severity::new(2, false, false),
+        );
+        assert!(!body["params"]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["label"] == "Exact sites"));
+    }
+
+    fn card_capabilities(body: &Value) -> String {
+        body["params"]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["label"] == "Can" || f["label"] == "Can't")
+            .map(|f| format!("{}.", f["value"].as_str().unwrap()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[tokio::test]
     async fn browser_grant_question_renders_and_mints_the_exact_disclosed_scope() {
         let plane = plane(TargetResolution::NotRunning);
@@ -1540,19 +1588,31 @@ mod tests {
             .await
             .unwrap();
         let question = question.unwrap();
-        assert_eq!(reply["outcome"], "consent_pending");
-        assert_eq!(question.body["params"]["origins"], reply["origins"]);
-        assert_eq!(question.body["params"]["hazards"], reply["hazards"]);
+        crate::consent_card::assert_contract(&question.body, &["allow", "deny"], "deny");
         assert_eq!(
-            question.body["params"]["severity_ceiling"],
+            question.body["params"]["target"]["label"],
+            "login.example, pay.example"
+        );
+        let prompt = question.body["params"]["prompt"].as_str().unwrap();
+        assert!(prompt.contains("login.example") && prompt.contains("pay.example"));
+        assert_eq!(reply["outcome"], "consent_pending");
+        assert_eq!(
+            question.body["params"]["scope"]["origins"],
+            reply["origins"]
+        );
+        assert_eq!(
+            question.body["params"]["scope"]["hazards"],
+            reply["hazards"]
+        );
+        assert_eq!(
+            question.body["params"]["scope"]["severity_ceiling"],
             reply["severity_ceiling"]
         );
         // The prose is for the person; the structured fields above are the
         // scope. It must say what the grant allows AND what it still refuses.
         assert_eq!(
-            question.body["params"]["message"],
-            "Let this agent use its own browser on https://login.example and \
-             https://pay.example? It can open and read pages there and click ordinary \
+            card_capabilities(&question.body),
+            "It can open and read pages there and click ordinary \
              buttons and links. It can also follow links that lead to other sites and \
              submit other forms, which can make lasting changes such as posting, saving \
              or sending something. It can also submit sign-in forms and payment forms. \
@@ -1596,8 +1656,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            question.unwrap().body["params"]["message"],
-            "Let this agent use its own browser on https://example.com? It can open and \
+            card_capabilities(&question.unwrap().body),
+            "It can open and \
              read pages there and click ordinary buttons and links. It can't submit \
              sign-in forms, payment forms or forms whose purpose it couldn't check."
         );
@@ -1625,12 +1685,12 @@ mod tests {
             json!({"tier": 4, "name": "mutate_durable", "credential": false, "financial": false})
         );
         assert_eq!(
-            question.body["params"]["severity_ceiling"],
+            question.body["params"]["scope"]["severity_ceiling"],
             reply["severity_ceiling"]
         );
         assert_eq!(
-            question.body["params"]["message"],
-            "Let this agent use its own browser on https://example.com? It can open and \
+            card_capabilities(&question.body),
+            "It can open and \
              read pages there and click ordinary buttons and links. It can also follow \
              links that lead to other sites and submit other forms, which can make \
              lasting changes such as posting, saving or sending something. It can't \
@@ -1658,8 +1718,8 @@ mod tests {
             .unwrap();
         assert_eq!(reply["severity_ceiling"]["name"], "mutate_reversible");
         assert_eq!(
-            question.unwrap().body["params"]["message"],
-            "Let this agent use its own browser on https://example.com? It can open and \
+            card_capabilities(&question.unwrap().body),
+            "It can open and \
              read pages there and click ordinary buttons and links. It can also make \
              changes on those sites that can be undone afterwards. It can't submit \
              sign-in forms, payment forms or forms whose purpose it couldn't check."
@@ -1679,8 +1739,8 @@ mod tests {
             .unwrap();
         assert_eq!(reply["severity_ceiling"]["tier"], 2);
         assert_eq!(
-            question.unwrap().body["params"]["message"],
-            "Let this agent use its own browser on https://example.com? It can open and \
+            card_capabilities(&question.unwrap().body),
+            "It can open and \
              read pages there and click ordinary buttons and links. It can't submit \
              sign-in forms, payment forms or forms whose purpose it couldn't check."
         );

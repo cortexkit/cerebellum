@@ -1451,34 +1451,41 @@ fn new_capture_id() -> String {
     )
 }
 
-/// The consent question. Nothing from any cookie can appear in it: it is built
-/// before the browser exists.
+/// Built before a browser exists so no captured cookie can enter the question.
 pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Value {
+    use crate::consent_card::*;
     let minutes = file_lifetime.as_secs().div_ceil(60);
     let site = &request.credential_domain;
-    json!({
-        "jsonrpc": "2.0",
-        "id": format!("capture-login-{}", new_capture_id()),
-        "method": "elicitation/create",
-        "params": {
-            "message": format!("{HOLDER_DISPLAY_NAME} will hold a copy of your {site} login"),
-            "context": format!(
-                "Site: {site}. Account: {account}. You log in to {site} in a new, empty browser window; your own browser is not touched. The login is written to one local file on this Mac, which is deleted after {minutes} minutes. The operator stores it for {HOLDER_DISPLAY_NAME} with ck auth put.",
-                account = request.account,
-            ),
-            "domain": site,
-            "account": request.account,
-            "holder": HOLDER,
-            "requestedSchema": {
-                "type": "object",
-                "properties": {
-                    "decision": {"type": "string", "enum": [ALLOW_DECISION, DENY_DECISION]},
-                },
-                "required": ["decision"],
-                "additionalProperties": false,
-            },
+    ConsentCard {
+        title: format!("Save your {site} login?"),
+        prompt: format!("{HOLDER_DISPLAY_NAME} will hold a copy of your {site} login."),
+        target: Target {
+            kind: TargetKind::Site,
+            label: site.clone(),
         },
-    })
+        facts: vec![
+            Fact::new("Account", &request.account),
+            Fact::new(
+                "Browser",
+                "Sign in in a new, empty browser window; your own browser is not touched",
+            ),
+            Fact::new("Local copy", format!("Deleted after {minutes} minutes")),
+            Fact::new(
+                "Storage",
+                format!("The operator stores the login for {HOLDER_DISPLAY_NAME} with ck auth put"),
+            ),
+        ],
+        options: vec![
+            ConsentOption::grant(ALLOW_DECISION, "Allow"),
+            ConsentOption::decline(DENY_DECISION, "Don't allow"),
+        ],
+        expires_in: crate::login_import::ELICITATION_DEADLINE,
+        material_damage: true,
+        scope: None,
+        duration: None,
+    }
+    .render(&format!("capture-login-{}", new_capture_id()))
+    .expect("capture has one decline")
 }
 
 /// `None` only for an affirmative answer. Every other ending -- a refusal,

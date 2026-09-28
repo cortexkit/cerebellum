@@ -135,8 +135,13 @@ impl Elicitor {
         // by each question builder so the number on the wire is the number
         // the timeout below uses, not a copy that can drift.
         if let Some(params) = body.get_mut("params").and_then(Value::as_object_mut) {
+            let deadline_field = if params.get("kind").and_then(Value::as_str) == Some("consent") {
+                "expires_in_ms"
+            } else {
+                "deadline_ms"
+            };
             params.insert(
-                "deadline_ms".to_string(),
+                deadline_field.to_string(),
                 Value::from(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)),
             );
         }

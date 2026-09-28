@@ -24,6 +24,7 @@ pub mod classification;
 pub mod computer_capability;
 pub mod computer_grants;
 pub mod connector_evidence;
+mod consent_card;
 #[cfg(test)]
 mod content_named_fixture;
 pub mod coordinate;
@@ -5603,23 +5604,24 @@ mod tests {
         assert_eq!(pending["outcome"], "consent_pending", "{pending}");
         let (question_frame, question) = question.expect("the consumer receives a question");
         assert_eq!(
-            question["params"]["origins"],
+            question["params"]["scope"]["origins"],
             json!(["https://requested.example"])
         );
         assert_eq!(
-            question["params"]["hazards"],
+            question["params"]["scope"]["hazards"],
             json!(["credential_form_submit", "unverified_form_contents"])
         );
         // The person must be told, in words they can act on, what the grant
         // unlocks: each disclosed hazard names the kind of form it allows.
-        let message = question["params"]["message"].as_str().unwrap();
+        let message =
+            json!([question["params"]["prompt"], question["params"]["facts"]]).to_string();
         for disclosed in [
-            "https://requested.example",
+            "requested.example",
             // A disclosed hazard mints the durable tier, so the question must
             // state that tier's whole reach, not only the form kinds.
             "It can also follow links that lead to other sites",
-            "It can also submit sign-in forms and forms whose purpose it couldn't check.",
-            "It can't submit payment forms.",
+            "It can also submit sign-in forms and forms whose purpose it couldn't check",
+            "It can't submit payment forms",
         ] {
             assert!(
                 message.contains(disclosed),
@@ -5628,7 +5630,7 @@ mod tests {
         }
         // A grant is usually answered from a phone, so the deadline the
         // question carries on the wire is the 30-minute one.
-        assert_eq!(question["params"]["deadline_ms"], json!(1_800_000));
+        assert_eq!(question["params"]["expires_in_ms"], json!(1_800_000));
 
         let answer = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
@@ -6250,8 +6252,8 @@ mod tests {
         assert_eq!(question.header.ty, FrameType::Request);
         let asked: Value = serde_json::from_slice(&question.body).unwrap();
         assert_eq!(
-            asked["params"]["message"],
-            "insula will hold a copy of your ollama.com login"
+            asked["params"]["prompt"],
+            "insula will hold a copy of your ollama.com login."
         );
         assert!(planes.elicitor.deliver(
             question.header.channel,
@@ -8203,7 +8205,7 @@ mod computer_consent_wire_tests {
             .unwrap();
         assert_eq!(question.header.ty, FrameType::Request);
         let body: Value = serde_json::from_slice(&question.body).unwrap();
-        assert_eq!(body["params"]["grant_kind"], "app");
+        assert_eq!(body["params"]["target"]["kind"], "app");
         settle_to(planes, (0, 1)).await;
         body["id"].as_str().unwrap().to_string()
     }

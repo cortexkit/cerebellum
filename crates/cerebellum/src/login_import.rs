@@ -244,51 +244,61 @@ impl LoginImportPlan {
         &self.domains
     }
 
-    pub fn question(&self, ask_id: &str, agent: &str) -> Value {
-        let options = self
+    pub fn question(&self, ask_id: &str, _agent: &str) -> Value {
+        use crate::consent_card::*;
+        let mut options: Vec<_> = self
             .presence
             .iter()
-            .filter(|browser| browser.transfer == "available")
-            .map(|browser| format!("transfer:{}", browser.browser))
-            .chain(["hand_off".to_string(), "deny".to_string()])
-            .collect::<Vec<_>>();
-        let descriptions = self
-            .presence
-            .iter()
-            .map(|browser| {
-                let availability = browser.reason.unwrap_or(browser.transfer);
-                format!(
-                    "{}: {} persistent row(s), {availability}",
-                    browser.name, browser.persistent_rows
+            .filter(|b| b.transfer == "available")
+            .map(|b| {
+                ConsentOption::grant(
+                    format!("transfer:{}", b.browser),
+                    format!("Copy my login from {}", b.name),
                 )
             })
-            .collect::<Vec<_>>()
-            .join("; ");
-        json!({
-            "jsonrpc": "2.0",
-            "id": ask_id,
-            "method": "elicitation/create",
-            "params": {
-                "message": format!(
-                    "Allow agent {agent} to import the persistent login for {} from a browser on this Mac? {}. No cookie value will be decrypted by the agent.",
-                    self.host,
-                    descriptions,
-                ),
-                "domain": self.host,
-                "browsers": self.presence,
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {
-                        "decision": {
-                            "type": "string",
-                            "enum": options,
+            .collect();
+        options.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
+        options.push(ConsentOption::decline("deny", "Don't allow"));
+        let mut facts: Vec<_> = self
+            .presence
+            .iter()
+            .map(|b| {
+                Fact::new(
+                    &b.name,
+                    match b.reason {
+                        Some("different_keychain_item") => "can't be copied (different keychain)",
+                        Some("session_only") if b.session_rows > 0 => {
+                            "only a temporary login is saved"
                         }
+                        Some("session_only") => "nothing saved",
+                        Some("unreadable") => "can't read saved logins",
+                        Some("safari_transfer_unsupported") => "can't be copied from Safari",
+                        _ if b.transfer == "available" => "login available",
+                        _ => "can't be copied",
                     },
-                    "required": ["decision"],
-                    "additionalProperties": false,
-                },
+                )
+            })
+            .collect();
+        facts.push(Fact::new("Privacy", "No cookie value is read by the agent"));
+        ConsentCard {
+            title: format!("Copy your {} login?", self.host),
+            prompt: format!(
+                "Copy your {} login from a browser on this Mac into the agent's browser.",
+                self.host
+            ),
+            target: Target {
+                kind: TargetKind::Site,
+                label: self.host.clone(),
             },
-        })
+            facts,
+            options,
+            expires_in: ELICITATION_DEADLINE,
+            material_damage: true,
+            scope: None,
+            duration: None,
+        }
+        .render(ask_id)
+        .expect("login import has one decline")
     }
 
     pub fn refusal(&self, code: &'static str, remedy: &'static str) -> ImportResult {
@@ -788,7 +798,7 @@ fn valid_import_origin(origin: &str) -> bool {
     crate::classification::canonical_grant_origin(origin).as_deref() == Some(origin)
 }
 
-fn origin_host(origin: &str) -> Option<String> {
+pub(crate) fn origin_host(origin: &str) -> Option<String> {
     if !valid_import_origin(origin) {
         return None;
     }
@@ -2057,6 +2067,57 @@ mod tests {
             ) else {
                 panic!("supported fixture browser");
             };
+            let mut plan = plan;
+            for (browser, name, reason, session_rows) in [
+                ("canary", "Chrome Canary", "different_keychain_item", 0),
+                ("brave", "Brave", "session_only", 0),
+                ("edge", "Microsoft Edge", "session_only", 1),
+                ("unreadable", "Unreadable browser", "unreadable", 0),
+                ("safari", "Safari", "safari_transfer_unsupported", 0),
+            ] {
+                plan.presence.push(BrowserPresence {
+                    browser: browser.into(),
+                    name: name.into(),
+                    persistent_rows: 0,
+                    session_rows,
+                    transfer: "unsupported",
+                    reason: Some(reason),
+                });
+            }
+            let card = plan.question("import-card", "agent_private");
+            let facts = &card["params"]["facts"];
+            assert_eq!(facts[0]["value"], "login available");
+            assert_eq!(facts[1]["value"], "can't be copied (different keychain)");
+            assert_eq!(facts[2]["value"], "nothing saved");
+            assert_eq!(facts[3]["value"], "only a temporary login is saved");
+            assert_eq!(facts[4]["value"], "can't read saved logins");
+            assert_eq!(facts[5]["value"], "can't be copied from Safari");
+            assert_eq!(facts[6]["value"], "No cookie value is read by the agent");
+            crate::consent_card::assert_contract(
+                &card,
+                &["transfer:chrome", "hand_off", "deny"],
+                "deny",
+            );
+            let banned = [
+                "agent_",
+                "persistent row",
+                "different_keychain_item",
+                "session_only",
+                "source",
+                "existing",
+            ];
+            let leaks = |text: &str| banned.iter().any(|token| text.contains(token));
+            for token in banned {
+                assert!(leaks(&format!("fixture {token}")));
+            }
+            let text = json!([
+                card["params"]["title"],
+                card["params"]["prompt"],
+                card["params"]["facts"]
+            ])
+            .to_string();
+            assert!(!leaks(&text), "{text}");
+            assert_eq!(card["params"]["options"][1]["effect"], "grant");
             assert_eq!(
                 plan.decide(Some(decision)).outcome,
                 decision.replace("deny", "denied")

@@ -431,18 +431,15 @@ async fn only_an_affirmative_answer_proceeds() {
 #[test]
 fn the_question_names_the_holder_site_account_and_lifetime() {
     let question = consent_question(&ollama(), FILE_LIFETIME);
+    crate::consent_card::assert_contract(&question, &["allow", "deny"], "deny");
     assert_eq!(
-        question["params"]["message"],
-        "insula will hold a copy of your ollama.com login"
+        question["params"]["prompt"],
+        "insula will hold a copy of your ollama.com login."
     );
-    let context = question["params"]["context"].as_str().unwrap();
-    assert!(context.contains("Account: work"));
-    assert!(context.contains("deleted after 10 minutes"));
-    assert!(context.contains("ck auth put"));
-    assert_eq!(
-        question["params"]["requestedSchema"]["properties"]["decision"]["enum"],
-        json!(["allow", "deny"])
-    );
+    let facts = &question["params"]["facts"];
+    assert_eq!(facts[0], json!({"label": "Account", "value": "work"}));
+    assert!(facts.to_string().contains("Deleted after 10 minutes"));
+    assert!(facts.to_string().contains("ck auth put"));
 }
 
 #[tokio::test]

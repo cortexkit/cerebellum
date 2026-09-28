@@ -4494,10 +4494,10 @@ mod orphan_recovery_tests {
             let fixture =
                 retained_reading(PlantedTable::run_by(other_user, ProcessFact::NotPermitted));
             let (reply, _) = fixture.ask().await;
-            assert_eq!(
-                reply["params"]["evidence"]["processes"]["reading"],
-                "none_names_profile"
-            );
+            assert!(reply["params"]["facts"][1]["value"]
+                .as_str()
+                .unwrap()
+                .contains("none of the"));
         }
 
         #[tokio::test]
@@ -4565,12 +4565,13 @@ mod orphan_recovery_tests {
                 &format!("{}-4000000", this_host()),
             );
             let (question, ask_id) = fixture.ask().await;
-            let message = question["params"]["message"].as_str().expect("message");
-            assert!(message.contains(PROJECT), "{message}");
-            assert!(message.contains("attestation_untrusted"), "{message}");
+            crate::consent_card::assert_contract(&question, &["clear", "keep"], "keep");
+            let message = question["params"]["facts"].to_string();
+            assert!(!message.contains(PROJECT), "{message}");
+            assert!(!message.contains("attestation_untrusted"), "{message}");
             assert!(message.contains("1970-01-01T00:00:00.000Z"), "{message}");
             assert!(
-                message.contains("names pid 4000000, which is not running"),
+                message.contains("names process 4000000, which is not running"),
                 "{message}"
             );
             assert_eq!(
