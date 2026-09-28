@@ -114,7 +114,7 @@ mod tests {
     }
 
     /// Every size across the shapes a window takes fits both limits after
-    /// fitting, keeps its aspect to within a pixel, and is no larger than the
+    /// fitting, keeps its aspect up to rounding, and is no larger than the
     /// original on either side.
     #[test]
     fn every_fitted_size_satisfies_both_limits_without_growing() {
@@ -133,9 +133,14 @@ mod tests {
             let (fitted_width, fitted_height) = fit_within_vision_limits(width, height).unwrap();
             assert!(fits(fitted_width, fitted_height), "{width}x{height}");
             assert!(fitted_width <= width && fitted_height <= height);
-            let expected_height = f64::from(fitted_width) * f64::from(height) / f64::from(width);
+            // Both sides are the original scaled by one factor and rounded
+            // down, so their ratios to the original differ by at most one
+            // pixel's worth of the shorter side.
+            let width_ratio = f64::from(fitted_width) / f64::from(width);
+            let height_ratio = f64::from(fitted_height) / f64::from(height);
+            let tolerance = 1.0 / f64::from(width.min(height));
             assert!(
-                (f64::from(fitted_height) - expected_height).abs() <= 1.0,
+                (width_ratio - height_ratio).abs() <= tolerance,
                 "{width}x{height} became {fitted_width}x{fitted_height}"
             );
         }

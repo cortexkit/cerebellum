@@ -411,8 +411,8 @@ fn read_state() -> Value {
             [
                 // The same shape as the keystroke rows' target, so the flat tool,
                 // which merges one property per name across actions, shows
-                // one target field rather than two alternatives. The handler
-                // refuses an empty target by name.
+                // one target field rather than two alternatives. An empty
+                // target is refused as invalid_request naming the field.
                 ("target".to_string(), json!({"type": "string"})),
                 (
                     "role_filter".to_string(),

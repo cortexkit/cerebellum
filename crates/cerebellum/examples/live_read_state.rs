@@ -41,8 +41,8 @@ mod macos_probe {
     use cerebellum_computer::platform::native::resolve_target;
     use cerebellum_computer::platform::TargetResolution;
 
-    /// Applications tried in order when none is named. Discord first, because
-    /// the redesign this reader serves was measured against it.
+    /// Applications tried in order when none is named. Discord first: it is
+    /// the Electron application whose tree this reader was built to reach.
     const CANDIDATES: [&str; 5] = [
         "com.hnc.Discord",
         "com.openai.codex",
