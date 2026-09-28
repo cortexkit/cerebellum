@@ -674,6 +674,12 @@ enum Settlement {
     },
 }
 
+/// How a question ended, and which parked call (by join order) runs under the
+/// answer. `None` until the question is settled.
+type Settled = Option<(Settlement, Option<u64>)>;
+type SettledSignal = watch::Sender<Settled>;
+type SettledWatch = watch::Receiver<Settled>;
+
 /// A question put to the person and not yet answered.
 struct OpenQuestion {
     subject: Subject,
@@ -686,7 +692,7 @@ struct OpenQuestion {
     /// Calls parked on this question, by the order they joined.
     parked: BTreeSet<u64>,
     next_waiter: u64,
-    settled: watch::Sender<Option<(Settlement, Option<u64>)>>,
+    settled: SettledSignal,
     asking: Option<tokio::task::AbortHandle>,
 }
 
@@ -1000,10 +1006,7 @@ impl ComputerGrants {
         caller: &GrantCaller,
         need: &GrantNeed,
         carrier: &Arc<dyn QuestionCarrier>,
-    ) -> (
-        Waiter<'_>,
-        watch::Receiver<Option<(Settlement, Option<u64>)>>,
-    ) {
+    ) -> (Waiter<'_>, SettledWatch) {
         let subject = Subject::of(caller, need);
         let offers_always = matches!(need, GrantNeed::App { .. }) && self.offers_always(caller);
         let mut state = lock(&self.state);
