@@ -43,6 +43,10 @@ mod launch;
 mod macos;
 #[cfg(target_os = "macos")]
 mod process_table;
+// The record-offset selection is pure and compiled for unit tests on every
+// host; the framework calls it guards are macOS-only.
+#[cfg(any(target_os = "macos", test))]
+mod skylight;
 #[cfg(target_os = "macos")]
 mod window_image;
 
@@ -117,6 +121,10 @@ pub use macos::{
 #[cfg(target_os = "macos")]
 pub use process_table::{
     all_process_ids, host_name, process_arguments, process_executable_path, ProcessArguments,
+};
+#[cfg(target_os = "macos")]
+pub use skylight::{
+    keyboard_auth_available, post_key_to_pid, skylight_available, OwnedKeyEvent, PostResult,
 };
 #[cfg(target_os = "macos")]
 pub use window_image::{encode_scaled_jpeg, frontmost_window_id};

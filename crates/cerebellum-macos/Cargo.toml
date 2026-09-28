@@ -18,6 +18,14 @@ name = "source_rect_pattern"
 path = "tests/source_rect_pattern.rs"
 harness = false
 
+# Cargo defaults an example target to test = false, which builds the example's
+# #[cfg(test)] module but never runs it. This probe's pure decision rules carry
+# host-neutral tests, so the target must opt in to running them.
+[[example]]
+name = "background_keys_matrix"
+path = "examples/background_keys_matrix.rs"
+test = true
+
 # Framework bindings are needed only where the frameworks exist. On every other
 # host this crate compiles to nothing, so the workspace still builds and tests
 # there without them.
