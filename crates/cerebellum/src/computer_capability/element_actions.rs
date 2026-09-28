@@ -31,7 +31,7 @@ use cerebellum_core::journal::{
 };
 use serde_json::{json, Value};
 
-use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission, GrantNeed};
+use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission};
 use crate::management::ManagementPlane;
 use crate::CancelHandle;
 
@@ -230,10 +230,7 @@ pub(crate) async fn admit_session_app(
     if !same_process(&grant) {
         return SessionAdmission::Gone;
     }
-    let need = GrantNeed::App {
-        bundle_identity: bundle_identity.to_string(),
-        display_name: management.application_name(&grant),
-    };
+    let need = management.app_need(bundle_identity, &grant, management.application_name(&grant));
     let admission = match management
         .computer_grants()
         .require(&need, consent, cancel)

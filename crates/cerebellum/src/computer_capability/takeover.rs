@@ -44,7 +44,7 @@ use cerebellum_core::consent::OnceDispatchToken;
 use cerebellum_core::journal::{JournalIdentity, JournalStorage, Redactor, SeverityTaxonomy};
 use serde_json::{json, Value};
 
-use crate::computer_grants::{ConsentRefusal, GrantCaller, GrantNeed};
+use crate::computer_grants::{ConsentRefusal, GrantCaller};
 use crate::management::ManagementPlane;
 use crate::CancelHandle;
 
@@ -279,10 +279,7 @@ fn require_app_grant(
     caller: &GrantCaller,
     grant: &ProcessGrant,
 ) -> Result<(), Value> {
-    let need = GrantNeed::App {
-        bundle_identity: grant.bundle_identity.clone(),
-        display_name: grant.bundle_identity.clone(),
-    };
+    let need = management.app_need(&grant.bundle_identity, grant, grant.bundle_identity.clone());
     if management.computer_grants().holds(caller, &need) {
         return Ok(());
     }

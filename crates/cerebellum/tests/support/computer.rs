@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cerebellum::computer_grants::{ConsentContext, GrantCaller, QuestionCarrier};
+use cerebellum::computer_grants::{
+    AppCode, AppIdentity, AppIdentityUnreadable, ConsentContext, GrantCaller, QuestionCarrier,
+};
 use cerebellum::elicit::AskOutcome;
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::audit::ComputerAudit;
@@ -182,12 +184,98 @@ impl JournalStorage for FailAfterInitialization {
     }
 }
 
-/// A resolver that answers from a fixture instead of the window server.
+/// The Team ID the fixture application is signed by.
+#[allow(dead_code)]
+pub const FIXTURE_TEAM: &str = "FIXTURE001";
+
+/// A code-signing identity signed by `team`, with the designated requirement
+/// such an application states: its identifier, and a leaf certificate issued
+/// to that team.
+#[allow(dead_code)]
+pub fn team_identity(team: &str) -> AppIdentity {
+    AppIdentity {
+        team_id: Some(team.to_string()),
+        designated_requirement: format!(
+            "identifier \"{TARGET_BUNDLE_ID}\" and anchor apple generic and \
+             certificate leaf[subject.OU] = \"{team}\""
+        ),
+        ad_hoc: false,
+        apple_anchored: false,
+    }
+}
+
+/// The code of a resolved process, with an injected identity in place of a
+/// real signature. A requirement is satisfied exactly when it is the
+/// identity's own designated requirement, which is how a different signer
+/// fails a recorded one. Clones share the identity, so a test can replace
+/// the application behind a bundle identity after a grant was made.
+#[derive(Clone)]
+pub struct InjectedCode(Arc<Mutex<Result<AppIdentity, AppIdentityUnreadable>>>);
+
+#[allow(dead_code)]
+impl InjectedCode {
+    pub fn new(identity: Result<AppIdentity, AppIdentityUnreadable>) -> Self {
+        Self(Arc::new(Mutex::new(identity)))
+    }
+
+    pub fn replace(&self, identity: Result<AppIdentity, AppIdentityUnreadable>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+    }
+
+    fn current(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Default for InjectedCode {
+    fn default() -> Self {
+        Self::new(Ok(team_identity(FIXTURE_TEAM)))
+    }
+}
+
+impl AppCode for InjectedCode {
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        self.current()
+    }
+
+    fn satisfies(&self, designated_requirement: &str) -> Result<bool, AppIdentityUnreadable> {
+        self.current()
+            .map(|identity| identity.designated_requirement == designated_requirement)
+    }
+}
+
+/// A resolver that answers from a fixture instead of the window server, and
+/// whose process is signed by the fixture team.
 pub struct Fixed(pub TargetResolution);
 
 impl TargetResolver for Fixed {
     fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
         self.0.clone()
+    }
+
+    fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        Arc::new(InjectedCode::default())
+    }
+}
+
+/// A resolver that answers from a fixture, whose process's signature is the
+/// shared injected one.
+#[allow(dead_code)]
+pub struct FixedWithCode(pub TargetResolution, pub InjectedCode);
+
+impl TargetResolver for FixedWithCode {
+    fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+        self.0.clone()
+    }
+
+    fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        Arc::new(self.1.clone())
     }
 }
 
@@ -224,6 +312,10 @@ impl TargetResolver for MutableTargetResolver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        Arc::new(InjectedCode::default())
     }
 }
 

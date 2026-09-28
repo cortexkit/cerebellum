@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
 use cerebellum::computer_grants::{
-    AlwaysGrantRecord, ComputerGrants, ConsentContext, ConsentRefusal, FilesystemGrantStorage,
-    GrantCaller, GrantNeed, GrantStorage, GrantStoreError, GrantStoreState, InMemoryGrantStorage,
-    QuestionCarrier, GRANT_STORE_VERSION,
+    AlwaysGrantRecord, AppIdentity, AppIdentityUnreadable, ComputerGrants, ConsentContext,
+    ConsentRefusal, FilesystemGrantStorage, GrantCaller, GrantNeed, GrantStorage, GrantStoreError,
+    GrantStoreState, InMemoryGrantStorage, QuestionCarrier, GRANT_STORE_VERSION,
 };
 use cerebellum::elicit::AskOutcome;
-use cerebellum::management::ManagementPlane;
+use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::capture::InMemoryCaptureBackend;
 use cerebellum_computer::platform::{
     AccessibilityTreeRequest, AccessibilityTreeResult, AttendancePreconditionRequest,
@@ -30,7 +30,10 @@ use cerebellum_computer::platform::{
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{InMemoryJournalStorage, ValidatedSeverityTaxonomy};
 use serde_json::{json, Value};
-use support::computer::{audit, grant, identity, Fixed, ScriptedCarrier, TestRedactor, GRANTEE};
+use support::computer::{
+    audit, grant, identity, team_identity, Fixed, FixedWithCode, InjectedCode, ScriptedCarrier,
+    TestRedactor, FIXTURE_TEAM, GRANTEE,
+};
 
 const APP: &str = "com.apple.Safari";
 const MACHINE: &str = "11111111-2222-3333-4444-555555555555";
@@ -248,6 +251,7 @@ fn app_need() -> GrantNeed {
     GrantNeed::App {
         bundle_identity: APP.to_string(),
         display_name: APP.to_string(),
+        code: Arc::new(InjectedCode::default()),
     }
 }
 
@@ -516,6 +520,8 @@ async fn a_record_naming_another_machine_grants_nothing() {
             records: vec![AlwaysGrantRecord {
                 agent_project_id: GRANTEE.to_string(),
                 bundle_identity: APP.to_string(),
+                team_id: Some(FIXTURE_TEAM.to_string()),
+                designated_requirement: Some(team_identity(FIXTURE_TEAM).designated_requirement),
                 machine_uuid: OTHER_MACHINE.to_string(),
                 created_at_ms: 1,
             }],
@@ -616,15 +622,24 @@ async fn a_corrupt_store_fails_closed_and_is_disclosed() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
 
-    // A version this build does not read is withheld the same way.
-    std::fs::write(&path, br#"{"version": 2, "records": []}"#).unwrap();
+    // A version this build does not read is withheld the same way. The
+    // version is one past the current one, so this keeps meaning "a newer
+    // build wrote it" whenever the format moves on.
+    let newer_version = GRANT_STORE_VERSION + 1;
+    std::fs::write(
+        &path,
+        format!(r#"{{"version": {newer_version}, "records": []}}"#),
+    )
+    .unwrap();
     let newer = ComputerGrants::open(
         Arc::new(FilesystemGrantStorage::new(&path)),
         Some(MACHINE.to_string()),
     );
     assert_eq!(
         newer.store_error(),
-        Some(GrantStoreError::UnknownVersion { found: 2 })
+        Some(GrantStoreError::UnknownVersion {
+            found: newer_version
+        })
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -924,4 +939,390 @@ async fn nobody_asked_and_nobody_answered_are_not_reported_as_pending() {
         "the second call did not ask again"
     );
     assert!(driver.0.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// App grants are bound to the application's code-signing identity
+// ---------------------------------------------------------------------------
+
+/// A plane whose application's signature is `code`, over grants that can
+/// offer "always" on this machine.
+fn signed_management(code: &InjectedCode, storage: &InMemoryGrantStorage) -> Arc<ManagementPlane> {
+    Arc::new(ManagementPlane::with_computer_grants(
+        Arc::new(FixedWithCode(
+            TargetResolution::Resolved(grant()),
+            code.clone(),
+        )),
+        Arc::new(ComputerGrants::open(
+            Arc::new(storage.clone()),
+            Some(MACHINE.to_string()),
+        )),
+    ))
+}
+
+fn need_for(code: &InjectedCode) -> GrantNeed {
+    GrantNeed::App {
+        bundle_identity: APP.to_string(),
+        display_name: APP.to_string(),
+        code: Arc::new(code.clone()),
+    }
+}
+
+fn question_message(question: &Value) -> String {
+    question["params"]["message"]
+        .as_str()
+        .expect("an app question carries a message")
+        .to_string()
+}
+
+const SIGNATURE_CHANGED: &str = "code signature has changed since it was approved";
+
+/// A grant made for one signature admits later calls from a process with
+/// that same signature without asking again, and both kinds of grant record
+/// the signature they were made for.
+#[tokio::test]
+async fn the_signature_a_grant_was_made_for_is_admitted_without_asking_again() {
+    let code = InjectedCode::default();
+    let storage = InMemoryGrantStorage::new();
+    let management = signed_management(&code, &storage);
+    let carrier = ScriptedCarrier::answering(&["allow_conversation", "allow_always"]);
+
+    admit(&management, &carrier, caller("conversation-1", false))
+        .await
+        .expect("the conversation answer admits");
+    admit(&management, &carrier, caller("conversation-1", false))
+        .await
+        .expect("the same signature is admitted again");
+    assert_eq!(
+        carrier.questions().len(),
+        1,
+        "the same signature was asked again"
+    );
+
+    admit(&management, &carrier, caller("conversation-2", true))
+        .await
+        .expect("the always answer admits");
+    let stored = storage.load().unwrap();
+    assert_eq!(stored.records.len(), 1);
+    let expected = team_identity(FIXTURE_TEAM);
+    assert_eq!(stored.records[0].team_id, expected.team_id);
+    assert_eq!(
+        stored.records[0].designated_requirement,
+        Some(expected.designated_requirement)
+    );
+    admit(&management, &carrier, caller("conversation-3", true))
+        .await
+        .expect("the stored always grant admits the same signature");
+    assert_eq!(
+        carrier.questions().len(),
+        2,
+        "the always grant was asked again"
+    );
+}
+
+/// Another application declaring the same bundle identity holds none of the
+/// grants the real one was given. A different Team ID fails a conversation
+/// grant, and a different requirement under the same Team ID fails an
+/// "always" record; each time the person is asked again and told the
+/// signature changed, and a deny leaves nothing granted to the impostor. The
+/// stored record still admits the real application afterwards.
+#[tokio::test]
+async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
+    let code = InjectedCode::default();
+    let storage = InMemoryGrantStorage::new();
+    let management = signed_management(&code, &storage);
+    let grants = Arc::clone(management.computer_grants());
+    let carrier =
+        ScriptedCarrier::answering(&["allow_conversation", "deny", "allow_always", "deny"]);
+
+    // A conversation grant, then a process signed by another team.
+    let conversation = caller("conversation-1", false);
+    admit(&management, &carrier, conversation.clone())
+        .await
+        .expect("the conversation answer admits");
+    code.replace(Ok(team_identity("IMPOSTOR01")));
+    assert!(
+        !grants.holds(&conversation, &need_for(&code)),
+        "a grant made for one team admitted another team's process"
+    );
+    let refused = admit(&management, &carrier, conversation.clone()).await;
+    assert_eq!(refused.unwrap_err()["outcome"], "consent_denied");
+    let questions = carrier.questions();
+    assert_eq!(
+        questions.len(),
+        2,
+        "the changed signature was not asked about"
+    );
+    assert!(
+        !question_message(&questions[0]).contains(SIGNATURE_CHANGED),
+        "{}",
+        question_message(&questions[0])
+    );
+    assert!(
+        question_message(&questions[1]).contains(SIGNATURE_CHANGED),
+        "{}",
+        question_message(&questions[1])
+    );
+    assert!(!grants.holds(&conversation, &need_for(&code)));
+
+    // An "always" record, then a process under the same team with another
+    // requirement (another program the team signs, claiming this identity).
+    code.replace(Ok(team_identity(FIXTURE_TEAM)));
+    admit(&management, &carrier, caller("conversation-2", true))
+        .await
+        .expect("the always answer admits");
+    let mut other_program = team_identity(FIXTURE_TEAM);
+    other_program.designated_requirement = format!(
+        "identifier \"com.example.Other\" and anchor apple generic and \
+         certificate leaf[subject.OU] = \"{FIXTURE_TEAM}\""
+    );
+    code.replace(Ok(other_program));
+    let attested = caller("conversation-3", true);
+    let refused = admit(&management, &carrier, attested.clone()).await;
+    assert_eq!(refused.unwrap_err()["outcome"], "consent_denied");
+    let questions = carrier.questions();
+    assert_eq!(
+        questions.len(),
+        4,
+        "the changed requirement was not asked about"
+    );
+    assert!(question_message(&questions[3]).contains(SIGNATURE_CHANGED));
+    assert!(!grants.holds(&attested, &need_for(&code)));
+    assert_eq!(
+        storage.load().unwrap().records.len(),
+        1,
+        "the real application's record was lost"
+    );
+
+    code.replace(Ok(team_identity(FIXTURE_TEAM)));
+    admit(&management, &carrier, caller("conversation-4", true))
+        .await
+        .expect("the record still admits the real application");
+    assert_eq!(carrier.questions().len(), 4);
+}
+
+/// A process whose signature cannot be read is refused with a declared
+/// reason, whether it is being asked about or holds a grant already, and
+/// nobody is asked about it.
+#[tokio::test]
+async fn an_unreadable_signature_is_refused_and_nobody_is_asked() {
+    let unreadable = || {
+        Err(AppIdentityUnreadable::Failed {
+            detail: "fixture".to_string(),
+        })
+    };
+    let code = InjectedCode::new(unreadable());
+    let storage = InMemoryGrantStorage::new();
+    let management = signed_management(&code, &storage);
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+
+    let refused = admit(&management, &carrier, caller("conversation-1", true))
+        .await
+        .unwrap_err();
+    assert_eq!(refused["outcome"], "consent_unavailable", "{refused}");
+    assert_eq!(refused["reason"], "app_identity_unreadable", "{refused}");
+    assert!(
+        carrier.questions().is_empty(),
+        "an unreadable process was asked about"
+    );
+
+    code.replace(Ok(team_identity(FIXTURE_TEAM)));
+    admit(&management, &carrier, caller("conversation-1", true))
+        .await
+        .expect("a readable signature is asked about and admitted");
+    code.replace(unreadable());
+    let refused = admit(&management, &carrier, caller("conversation-1", true))
+        .await
+        .unwrap_err();
+    assert_eq!(refused["reason"], "app_identity_unreadable", "{refused}");
+    assert_eq!(carrier.questions().len(), 1);
+}
+
+/// An ad-hoc signature names one build, and a signature with no Team ID that
+/// Apple did not make names no lasting signer: neither is offered "always",
+/// though each can be allowed for the conversation.
+#[tokio::test]
+async fn an_ad_hoc_or_teamless_application_is_not_offered_always() {
+    let ad_hoc = AppIdentity {
+        team_id: None,
+        designated_requirement: "cdhash H\"0123456789abcdef0123456789abcdef01234567\"".to_string(),
+        ad_hoc: true,
+        apple_anchored: false,
+    };
+    let teamless = AppIdentity {
+        team_id: None,
+        designated_requirement: format!(
+            "identifier \"{APP}\" and certificate root = H\"89abcdef89abcdef89abcdef89abcdef89abcdef\""
+        ),
+        ad_hoc: false,
+        apple_anchored: false,
+    };
+    for (index, identity) in [ad_hoc, teamless].into_iter().enumerate() {
+        let code = InjectedCode::new(Ok(identity));
+        let storage = InMemoryGrantStorage::new();
+        let management = signed_management(&code, &storage);
+        let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+        let conversation = caller(&format!("conversation-{index}"), true);
+        admit(&management, &carrier, conversation.clone())
+            .await
+            .expect("a conversation grant still works");
+        assert_eq!(
+            decisions(&carrier.questions()[0]),
+            ["allow_conversation", "deny"],
+            "always was offered to an application with no lasting signer"
+        );
+        assert!(management
+            .computer_grants()
+            .holds(&conversation, &need_for(&code)));
+        assert!(storage.load().unwrap().records.is_empty());
+    }
+}
+
+/// Apple's own applications carry no Team ID, and are still offered
+/// "always": their signature chains to Apple's root, which no other
+/// developer can satisfy. The record keeps the requirement and no team.
+#[tokio::test]
+async fn an_apple_anchored_application_is_offered_always() {
+    let code = InjectedCode::new(Ok(AppIdentity {
+        team_id: None,
+        designated_requirement: "identifier \"com.apple.TextEdit\" and anchor apple".to_string(),
+        ad_hoc: false,
+        apple_anchored: true,
+    }));
+    let storage = InMemoryGrantStorage::new();
+    let management = signed_management(&code, &storage);
+    let carrier = ScriptedCarrier::answering(&["allow_always"]);
+    admit(&management, &carrier, caller("conversation-1", true))
+        .await
+        .expect("the always answer admits");
+    assert_eq!(
+        decisions(&carrier.questions()[0]),
+        ["allow_conversation", "allow_always", "deny"]
+    );
+    let stored = storage.load().unwrap();
+    assert_eq!(stored.records[0].team_id, None);
+    assert_eq!(
+        stored.records[0].designated_requirement.as_deref(),
+        Some("identifier \"com.apple.TextEdit\" and anchor apple")
+    );
+}
+
+/// A stored record that names no signature grants nothing, and the listing
+/// reports it apart. A store written before signatures were recorded is a
+/// version this build does not read, and is refused and disclosed.
+#[tokio::test]
+async fn a_record_without_a_signing_identity_grants_nothing() {
+    let storage = InMemoryGrantStorage::new();
+    storage
+        .save(&GrantStoreState {
+            version: GRANT_STORE_VERSION,
+            records: vec![AlwaysGrantRecord {
+                agent_project_id: GRANTEE.to_string(),
+                bundle_identity: APP.to_string(),
+                team_id: None,
+                designated_requirement: None,
+                machine_uuid: MACHINE.to_string(),
+                created_at_ms: 1,
+            }],
+        })
+        .unwrap();
+    let code = InjectedCode::default();
+    let management = signed_management(&code, &storage);
+    let carrier = ScriptedCarrier::answering(&["deny"]);
+    let refused = admit(&management, &carrier, caller("conversation-1", true)).await;
+    assert_eq!(
+        carrier.questions().len(),
+        1,
+        "a record naming no signature admitted the call without asking"
+    );
+    assert_eq!(refused.unwrap_err()["outcome"], "consent_denied");
+    assert!(
+        !question_message(&carrier.questions()[0]).contains(SIGNATURE_CHANGED),
+        "a record naming no signature was reported as a changed signature"
+    );
+    let listing = management.computer_grants().list();
+    assert_eq!(listing["grants"], json!([]));
+    assert_eq!(listing["unbound_grants"][0]["bundle_identity"], APP);
+
+    let directory = scratch_directory("version-one-grants");
+    let path = directory.join("computer_grants.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"version": 1, "records": [{{"agent_project_id": "{GRANTEE}",
+                "bundle_identity": "{APP}", "machine_uuid": "{MACHINE}",
+                "created_at_ms": 1}}]}}"#
+        ),
+    )
+    .unwrap();
+    let old = ComputerGrants::open(
+        Arc::new(FilesystemGrantStorage::new(&path)),
+        Some(MACHINE.to_string()),
+    );
+    assert_eq!(
+        old.store_error(),
+        Some(GrantStoreError::UnknownVersion { found: 1 })
+    );
+    assert_eq!(old.list()["store"]["reason"], "grant_store_version_unknown");
+    let old = Arc::new(ManagementPlane::with_computer_grants(
+        Arc::new(FixedWithCode(TargetResolution::Resolved(grant()), code)),
+        Arc::new(old),
+    ));
+    let carrier = ScriptedCarrier::answering(&["deny"]);
+    let _ = admit(&old, &carrier, caller("conversation-1", true)).await;
+    assert_eq!(
+        carrier.questions().len(),
+        1,
+        "a version 1 record admitted the call"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A resolver with no signature reader, as on a platform that has none.
+struct NoReaderResolver;
+
+impl TargetResolver for NoReaderResolver {
+    fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+        TargetResolution::Resolved(grant())
+    }
+}
+
+/// Where no code-signing identity can be read, every app grant is refused
+/// with a reason naming that, before anyone is asked and before anything is
+/// posted. The executable name such a platform resolves by can be claimed by
+/// any program, so a grant keyed by it alone would be a grant to whoever
+/// claims it.
+#[tokio::test]
+async fn a_platform_with_no_signature_reader_refuses_before_anything_is_posted() {
+    let driver = CountingDriver::default();
+    let plane = plane(&driver);
+    let management = Arc::new(ManagementPlane::with_computer_grants(
+        Arc::new(NoReaderResolver),
+        Arc::new(ComputerGrants::open(
+            Arc::new(InMemoryGrantStorage::new()),
+            Some(MACHINE.to_string()),
+        )),
+    ));
+    let carrier = ScriptedCarrier::answering(&["allow_always"]);
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        asking(&carrier, caller("conversation-1", true)),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["reason"], "app_identity_unreadable", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("this platform reads no code-signing identity")),
+        "{reply}"
+    );
+    assert!(carrier.questions().is_empty(), "the person was asked");
+    assert!(
+        driver.0.lock().unwrap().is_empty(),
+        "a keystroke was posted"
+    );
 }

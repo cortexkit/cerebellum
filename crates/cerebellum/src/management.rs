@@ -27,7 +27,11 @@ use crate::authorization::{
     OBSERVE,
 };
 use crate::classification::canonical_grant_origin;
-use crate::computer_grants::{ComputerGrants, ConsentContext, GrantNeed};
+use crate::computer_grants::{
+    AppCode, ComputerGrants, ConsentContext, GrantNeed, NoIdentityReader,
+};
+#[cfg(target_os = "macos")]
+use crate::computer_grants::{AppIdentity, AppIdentityUnreadable};
 use crate::launch_recovery::{ClearFailure, ClearPreview, LaunchRecoveryRegistry};
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
 use crate::CancelHandle;
@@ -98,6 +102,96 @@ pub trait TargetResolver: Send + Sync {
     /// process cannot be identified; nothing may act on it then.
     fn process_for_pid(&self, _pid: u32) -> Option<ProcessGrant> {
         None
+    }
+
+    /// The code-signing identity of the resolved process, which every app
+    /// grant is recorded against and checked against. Where no reader exists
+    /// every reading is refused, so no app grant admits a process there.
+    fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        Arc::new(NoIdentityReader)
+    }
+}
+
+/// How long one code-signing reading may take before the process is refused
+/// as unreadable.
+///
+/// Measured on Apple silicon: reading the identity took 9 ms for Finder,
+/// 4 ms for TextEdit and 81 ms for Discord on first read, and checking a
+/// requirement took 2 to 5 ms for each. The bound is far above that so a slow
+/// disk does not refuse a real application, and still short enough that a
+/// process whose image sits on a stalled volume cannot hold a call for long.
+#[cfg(target_os = "macos")]
+const CODE_SIGNING_BOUND: Duration = Duration::from_secs(2);
+
+/// The code of one resolved process, read through Security.framework.
+#[cfg(target_os = "macos")]
+struct RunningCode {
+    grant: ProcessGrant,
+}
+
+#[cfg(target_os = "macos")]
+impl RunningCode {
+    /// Confirm the pid still belongs to the process that was resolved.
+    ///
+    /// Checked after each reading: the framework looks the code up by pid,
+    /// and a process that exited mid-reading could have handed its pid to
+    /// another, whose signature would then have been read instead. The start
+    /// time tells the two apart.
+    fn same_process(&self) -> Result<(), AppIdentityUnreadable> {
+        match cerebellum_macos::process_start_time_micros(self.grant.pid) {
+            Some(micros) if micros.to_string() == self.grant.process_generation_evidence => Ok(()),
+            _ => Err(AppIdentityUnreadable::Failed {
+                detail: "the process changed while its signature was read".to_string(),
+            }),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signing_failure(error: cerebellum_macos::CodeSigningError) -> AppIdentityUnreadable {
+    AppIdentityUnreadable::Failed {
+        detail: format!("{error:?}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl AppCode for RunningCode {
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        let pid = self.grant.pid;
+        let reading = cerebellum_macos::code_signing_identity(pid, CODE_SIGNING_BOUND)
+            .map_err(signing_failure)?;
+        let designated_requirement = match reading.designated_requirement {
+            Some(requirement) if reading.signed => requirement,
+            _ => return Err(AppIdentityUnreadable::Unsigned),
+        };
+        // Evaluated rather than read off the requirement text, so that only a
+        // signature that chains to Apple's own root counts as Apple's.
+        let apple_anchored = !reading.ad_hoc
+            && cerebellum_macos::code_satisfies_requirement(
+                pid,
+                "anchor apple",
+                CODE_SIGNING_BOUND,
+            )
+            .map_err(signing_failure)?
+                == cerebellum_macos::RequirementCheck::Satisfied;
+        self.same_process()?;
+        Ok(AppIdentity {
+            team_id: reading.team_id,
+            designated_requirement,
+            ad_hoc: reading.ad_hoc,
+            apple_anchored,
+        })
+    }
+
+    fn satisfies(&self, designated_requirement: &str) -> Result<bool, AppIdentityUnreadable> {
+        let check = cerebellum_macos::code_satisfies_requirement(
+            self.grant.pid,
+            designated_requirement,
+            CODE_SIGNING_BOUND,
+        )
+        .map_err(signing_failure)?;
+        self.same_process()?;
+        Ok(check == cerebellum_macos::RequirementCheck::Satisfied)
     }
 }
 
@@ -170,6 +264,13 @@ impl TargetResolver for PlatformResolver {
     #[cfg(target_os = "macos")]
     fn process_for_pid(&self, pid: u32) -> Option<ProcessGrant> {
         cerebellum_computer::platform::native::grant_for_pid(pid, self.timeout)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        Arc::new(RunningCode {
+            grant: grant.clone(),
+        })
     }
 
     /// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
@@ -404,6 +505,21 @@ impl ManagementPlane {
             .unwrap_or_else(|| grant.bundle_identity.clone())
     }
 
+    /// The app grant a call on this process needs, carrying the process's
+    /// code so the grant is recorded and checked against its signature.
+    pub fn app_need(
+        &self,
+        bundle_identity: &str,
+        grant: &ProcessGrant,
+        display_name: String,
+    ) -> GrantNeed {
+        GrantNeed::App {
+            bundle_identity: bundle_identity.to_string(),
+            display_name,
+            code: self.resolver.app_code(grant),
+        }
+    }
+
     /// The application a process belongs to, identified by its start time,
     /// or `None` when it cannot be identified. Used where an action learns a
     /// pid rather than a name, such as the application under a point.
@@ -426,18 +542,34 @@ impl ManagementPlane {
         let grant = self
             .resolve_process(bundle_identity)
             .map_err(AppRefusal::Resolution)?;
-        let need = GrantNeed::App {
-            bundle_identity: bundle_identity.to_string(),
-            display_name: self.application_name(&grant),
-        };
+        let need = self.app_need(bundle_identity, &grant, self.application_name(&grant));
         let admission = self
             .computer_grants
             .require(&need, consent, cancel)
             .await
             .map_err(AppRefusal::Consent)?;
         let grant = if admission.waited {
-            self.resolve_process(bundle_identity)
-                .map_err(AppRefusal::Resolution)?
+            let current = self
+                .resolve_process(bundle_identity)
+                .map_err(AppRefusal::Resolution)?;
+            // A different process may answer to the name after the wait. The
+            // grant is then checked against it too, so a process that did not
+            // satisfy the signature the person approved does not act under
+            // the answer; its retry asks again.
+            if current != grant
+                && !self.computer_grants.holds(
+                    &consent.caller,
+                    &self.app_need(bundle_identity, &current, String::new()),
+                )
+            {
+                return Err(AppRefusal::Consent(
+                    crate::computer_grants::ConsentRefusal::Unavailable {
+                        reason: "grant_not_recorded",
+                        remedy: "retry this call",
+                    },
+                ));
+            }
+            current
         } else {
             grant
         };

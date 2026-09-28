@@ -5218,6 +5218,13 @@ mod tests {
                 process_generation_evidence: "test-generation".to_string(),
             })
         }
+
+        fn app_code(
+            &self,
+            _grant: &cerebellum_computer::platform::ProcessGrant,
+        ) -> Arc<dyn computer_grants::AppCode> {
+            Arc::new(computer_grants::SignedByFixtureTeam)
+        }
     }
 
     impl management::TargetResolver for NothingRunning {
@@ -7803,6 +7810,10 @@ mod computer_consent_wire_tests {
                 process_generation_evidence: "1700000000000000".to_string(),
             })
         }
+
+        fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn computer_grants::AppCode> {
+            Arc::new(computer_grants::SignedByFixtureTeam)
+        }
     }
 
     /// Planes with one tool route that declares it can relay a question, and
@@ -7987,6 +7998,7 @@ mod computer_consent_wire_tests {
         let need = computer_grants::GrantNeed::App {
             bundle_identity: APP.to_string(),
             display_name: APP.to_string(),
+            code: Arc::new(computer_grants::SignedByFixtureTeam),
         };
         assert!(
             !grants.holds(&caller, &need),

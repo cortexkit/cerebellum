@@ -20,7 +20,7 @@ use std::time::Instant;
 use cerebellum::computer_capability::{
     servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
 };
-use cerebellum::computer_grants::{ConsentContext, GrantNeed};
+use cerebellum::computer_grants::{AppCode, ConsentContext, GrantNeed};
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::app_state::image::ImageMapping;
 use cerebellum_computer::app_state::session::RegisteredImage;
@@ -46,8 +46,8 @@ use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{InMemoryJournalStorage, ValidatedSeverityTaxonomy};
 use serde_json::{json, Value};
 use support::computer::{
-    audit, grant, grant_app, identity, no_relay, relayed, Desk, ScriptedCarrier, TestRedactor,
-    GRANTEE, TARGET_BUNDLE_ID,
+    audit, grant, grant_app, identity, no_relay, relayed, Desk, InjectedCode, ScriptedCarrier,
+    TestRedactor, GRANTEE, TARGET_BUNDLE_ID,
 };
 
 /// A second application, with no grant unless a test gives it one.
@@ -80,6 +80,10 @@ impl TargetResolver for TwoApplications {
         [grant(), other()]
             .into_iter()
             .find(|process| process.pid == pid)
+    }
+
+    fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        Arc::new(InjectedCode::default())
     }
 }
 

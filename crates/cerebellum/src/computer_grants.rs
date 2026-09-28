@@ -23,6 +23,16 @@
 //! machine grants nothing there. The file is read once when the module starts;
 //! if it cannot be read, no "always" grant applies and the failure is
 //! disclosed, rather than the file being treated as empty and overwritten.
+//!
+//! An app grant is also bound to the code-signing identity of the process it
+//! was made for. A bundle identity is only what an application says about
+//! itself, and any application can say it is `com.hnc.Discord`; a signature
+//! that validates can only come from whoever holds the signing key. So when
+//! a grant is made, the process's designated requirement is recorded, and
+//! every use checks the process in front of it against that requirement. A
+//! process that does not satisfy it holds no grant, and the person is asked
+//! again, told that the application's signature changed. A process whose
+//! signature cannot be read is refused: nothing is admitted unchecked.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -47,7 +57,11 @@ use crate::CancelHandle;
 pub const GRANT_STORE_FILE: &str = "computer_grants.json";
 
 /// The only store format this build reads or writes.
-pub const GRANT_STORE_VERSION: u64 = 1;
+///
+/// Version 2 added the code-signing identity to each record. A version 1
+/// file is refused like any other version this build does not read: its
+/// records name no signer, so none of them could grant anything.
+pub const GRANT_STORE_VERSION: u64 = 2;
 
 /// How long a call waits in place for the person's answer before replying
 /// `consent_pending`.
@@ -86,6 +100,17 @@ pub struct AlwaysGrantRecord {
     /// The daemon-attested durable agent identity the person answered for.
     pub agent_project_id: String,
     pub bundle_identity: String,
+    /// The Apple Developer Team ID of the application the person approved.
+    /// Absent for Apple's own applications, which are signed by Apple rather
+    /// than by a team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    /// The designated requirement of the application the person approved, in
+    /// its text form. Every use checks the running process against it. A
+    /// record without one grants nothing, since there is nothing to check the
+    /// process against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub designated_requirement: Option<String>,
     /// The hardware identity of the machine the answer was given on. A record
     /// naming any other machine grants nothing here, so restoring a backup onto
     /// a different machine cannot carry the person's trust across.
@@ -377,8 +402,122 @@ pub struct GrantCaller {
     pub durable_identity_attested: bool,
 }
 
-/// Which grant a call needs.
+/// The code-signing identity of an application's running process, as it is
+/// recorded when a grant is made.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppIdentity {
+    /// The Apple Developer Team ID of the signing certificate. Absent for
+    /// ad-hoc code and for Apple's own applications.
+    pub team_id: Option<String>,
+    /// The rule any process must satisfy to count as this application. For
+    /// ad-hoc code it names the exact build by its code hash.
+    pub designated_requirement: String,
+    /// Signed without a certificate: the signature names one build and no
+    /// signer, so the next build of the same application will not satisfy it.
+    pub ad_hoc: bool,
+    /// The code satisfies the requirement `anchor apple`: Apple signed it.
+    pub apple_anchored: bool,
+}
+
+impl AppIdentity {
+    /// Whether a grant bound to this identity can be offered "always".
+    ///
+    /// Only for a signature another developer cannot produce and the next
+    /// release of the same application keeps: a team's certificate, or
+    /// Apple's own anchor. An ad-hoc signature names a single build, and
+    /// unsigned code names nothing, so neither can carry a standing answer.
+    pub fn names_a_lasting_signer(&self) -> bool {
+        !self.ad_hoc && (self.team_id.is_some() || self.apple_anchored)
+    }
+}
+
+/// Why an application's code-signing identity could not be read or checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppIdentityUnreadable {
+    /// This platform has no reader for code-signing identities.
+    NoReader,
+    /// The application carries no signature, so there is nothing to bind a
+    /// grant to.
+    Unsigned,
+    /// The reading failed, or took longer than it is allowed to.
+    Failed { detail: String },
+}
+
+impl AppIdentityUnreadable {
+    fn remedy(&self) -> &'static str {
+        match self {
+            Self::NoReader => {
+                "this platform reads no code-signing identity yet, so no application grant can \
+                 be bound to the application and nothing was done"
+            }
+            Self::Unsigned => {
+                "the application is not code-signed, so no grant can be bound to it and \
+                 nothing was done"
+            }
+            Self::Failed { .. } => {
+                "the application's code-signing identity could not be read, so whether it is \
+                 the application that was approved is unknown and nothing was done; retry"
+            }
+        }
+    }
+
+    fn refusal(&self) -> ConsentRefusal {
+        ConsentRefusal::Unavailable {
+            reason: "app_identity_unreadable",
+            remedy: self.remedy(),
+        }
+    }
+}
+
+/// The code-signing identity of one resolved process, read on demand.
+///
+/// Behind a trait so the grant logic can be exercised with injected
+/// identities on every host, while the real reading lives only where the
+/// operating system provides one.
+pub trait AppCode: Send + Sync {
+    /// Read the process's identity, to record with a grant made for it.
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable>;
+    /// Whether the process satisfies a designated requirement recorded
+    /// earlier: `Ok(false)` when it was read and does not.
+    fn satisfies(&self, designated_requirement: &str) -> Result<bool, AppIdentityUnreadable>;
+}
+
+/// The identity source for a platform that has no reader: every reading is
+/// refused, so no app grant is ever admitted there unchecked.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoIdentityReader;
+
+impl AppCode for NoIdentityReader {
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        Err(AppIdentityUnreadable::NoReader)
+    }
+    fn satisfies(&self, _designated_requirement: &str) -> Result<bool, AppIdentityUnreadable> {
+        Err(AppIdentityUnreadable::NoReader)
+    }
+}
+
+/// A process signed by one fixed team, for this crate's own tests of paths
+/// that hold an app grant but are not about signatures.
+#[cfg(test)]
+pub(crate) struct SignedByFixtureTeam;
+
+#[cfg(test)]
+impl AppCode for SignedByFixtureTeam {
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        Ok(AppIdentity {
+            team_id: Some("FIXTURE001".to_string()),
+            designated_requirement: "certificate leaf[subject.OU] = \"FIXTURE001\"".to_string(),
+            ad_hoc: false,
+            apple_anchored: false,
+        })
+    }
+    fn satisfies(&self, designated_requirement: &str) -> Result<bool, AppIdentityUnreadable> {
+        Ok(designated_requirement == self.identity()?.designated_requirement)
+    }
+}
+
+/// Which grant a call needs.
+#[derive(Clone)]
 pub enum GrantNeed {
     /// The app grant for one application.
     App {
@@ -386,9 +525,29 @@ pub enum GrantNeed {
         /// What the person sees the application called: its running name, or
         /// the bundle identity when no name could be read.
         display_name: String,
+        /// The code of the process the call resolved, which a grant is
+        /// recorded against and checked against.
+        code: Arc<dyn AppCode>,
     },
     /// The conversation's takeover grant.
     Takeover,
+}
+
+impl std::fmt::Debug for GrantNeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::App {
+                bundle_identity,
+                display_name,
+                ..
+            } => formatter
+                .debug_struct("App")
+                .field("bundle_identity", bundle_identity)
+                .field("display_name", display_name)
+                .finish_non_exhaustive(),
+            Self::Takeover => formatter.write_str("Takeover"),
+        }
+    }
 }
 
 impl GrantNeed {
@@ -698,6 +857,9 @@ struct OpenQuestion {
     /// The attested agent an `allow_always` answer is recorded for, present
     /// only when the question offered it.
     always_grantee: Option<String>,
+    /// For an app question, the signing identity of the process the question
+    /// was raised for. An allowing answer is bound to it.
+    identity: Option<AppIdentity>,
     /// Calls parked on this question, by the order they joined.
     parked: BTreeSet<u64>,
     next_waiter: u64,
@@ -707,7 +869,9 @@ struct OpenQuestion {
 
 #[derive(Default)]
 struct GrantState {
-    conversation_apps: HashSet<(String, String)>,
+    /// Each conversation's app grants, by conversation and bundle identity,
+    /// with the signing identity the grant was made for.
+    conversation_apps: HashMap<(String, String), AppIdentity>,
     conversation_app_denies: HashSet<(String, String)>,
     takeovers: HashSet<String>,
     takeover_denies: HashSet<String>,
@@ -720,6 +884,15 @@ enum Standing {
     Denied,
     Asking,
     Unasked,
+    /// A grant exists for the application's bundle identity, and the process
+    /// answering to it now does not satisfy the signature it was made for.
+    /// Carries the conversation grant that no longer applies, if one does not.
+    SignatureChanged {
+        stale: Option<AppIdentity>,
+    },
+    /// The process's signature could not be read, so no grant can be applied
+    /// to it.
+    IdentityUnreadable(AppIdentityUnreadable),
 }
 
 /// Every computer grant this module holds, and the questions it is waiting on.
@@ -806,32 +979,44 @@ impl ComputerGrants {
         }
     }
 
-    /// Whether a question to this caller may offer `allow_always`.
+    /// Whether a question to this caller about this process may offer
+    /// `allow_always`.
     ///
-    /// All three must hold: a daemon-attested identity to key the record by, a
-    /// machine identity to bind it to, and a store that was read, so that
-    /// writing does not overwrite one that could not be.
-    fn offers_always(&self, caller: &GrantCaller) -> bool {
+    /// All four must hold: a daemon-attested identity to key the record by, a
+    /// machine identity to bind it to, a store that was read, so that writing
+    /// does not overwrite one that could not be, and a signature naming a
+    /// signer that lasts beyond this one build.
+    fn offers_always(&self, caller: &GrantCaller, identity: Option<&AppIdentity>) -> bool {
         caller.durable_identity_attested
             && self.machine_uuid.is_some()
             && matches!(&*lock(&self.always), AlwaysState::Loaded(_))
+            && identity.is_some_and(AppIdentity::names_a_lasting_signer)
     }
 
-    /// Whether an "always" record on this machine admits the caller's app.
-    fn always_admits(&self, caller: &GrantCaller, bundle_identity: &str) -> bool {
+    /// The designated requirement of each "always" record on this machine for
+    /// the caller's app, or `None` for a record that names none.
+    fn always_requirements(
+        &self,
+        caller: &GrantCaller,
+        bundle_identity: &str,
+    ) -> Vec<Option<String>> {
         if !caller.durable_identity_attested {
-            return false;
+            return Vec::new();
         }
         let Some(machine) = self.machine_uuid.as_deref() else {
-            return false;
+            return Vec::new();
         };
         match &*lock(&self.always) {
-            AlwaysState::Loaded(records) => records.iter().any(|record| {
-                record.agent_project_id == caller.agent_project_id
-                    && record.bundle_identity == bundle_identity
-                    && record.machine_uuid == machine
-            }),
-            AlwaysState::Failed(_) => false,
+            AlwaysState::Loaded(records) => records
+                .iter()
+                .filter(|record| {
+                    record.agent_project_id == caller.agent_project_id
+                        && record.bundle_identity == bundle_identity
+                        && record.machine_uuid == machine
+                })
+                .map(|record| record.designated_requirement.clone())
+                .collect(),
+            AlwaysState::Failed(_) => Vec::new(),
         }
     }
 
@@ -840,7 +1025,9 @@ impl ComputerGrants {
         let state = lock(&self.state);
         match need {
             GrantNeed::App {
-                bundle_identity, ..
+                bundle_identity,
+                code,
+                ..
             } => {
                 let key = (caller.conversation_key.clone(), bundle_identity.clone());
                 // A deny given in this conversation holds even over an older
@@ -848,12 +1035,41 @@ impl ComputerGrants {
                 if state.conversation_app_denies.contains(&key) {
                     return Standing::Denied;
                 }
-                if state.conversation_apps.contains(&key) {
-                    return Standing::Granted;
-                }
+                let conversation = state.conversation_apps.get(&key).cloned();
+                // Released before the signature checks, which read the
+                // process and must not hold every other call up meanwhile.
                 drop(state);
-                if self.always_admits(caller, bundle_identity) {
-                    return Standing::Granted;
+                let mut stale = None;
+                let mut recorded = false;
+                let always = self.always_requirements(caller, bundle_identity);
+                let requirements = conversation
+                    .iter()
+                    .map(|identity| (Some(identity.designated_requirement.as_str()), true))
+                    .chain(
+                        always
+                            .iter()
+                            .map(|requirement| (requirement.as_deref(), false)),
+                    );
+                for (requirement, from_conversation) in requirements {
+                    // A record that names no signature grants nothing, the
+                    // same as a record from another machine: there is nothing
+                    // to check the process against.
+                    let Some(requirement) = requirement else {
+                        continue;
+                    };
+                    recorded = true;
+                    match code.satisfies(requirement) {
+                        Ok(true) => return Standing::Granted,
+                        Ok(false) => {
+                            if from_conversation {
+                                stale = conversation.clone();
+                            }
+                        }
+                        Err(unreadable) => return Standing::IdentityUnreadable(unreadable),
+                    }
+                }
+                if recorded {
+                    return Standing::SignatureChanged { stale };
                 }
                 let state = lock(&self.state);
                 match state.open_by_subject.get(&subject) {
@@ -893,6 +1109,7 @@ impl ComputerGrants {
         cancel: &CancelHandle,
     ) -> Result<GrantAdmission, ConsentRefusal> {
         let caller = &context.caller;
+        let mut signature_changed = false;
         match self.standing(caller, need) {
             Standing::Granted => return Ok(GrantAdmission::default()),
             // Remembered, so a call after a refusal is answered at once and no
@@ -903,8 +1120,26 @@ impl ComputerGrants {
                     remembered: true,
                 })
             }
+            // Never admitted unchecked: a grant whose process cannot be
+            // checked is a grant for whoever holds the bundle identity.
+            Standing::IdentityUnreadable(unreadable) => return Err(unreadable.refusal()),
             Standing::Asking | Standing::Unasked => {}
+            Standing::SignatureChanged { stale } => {
+                signature_changed = true;
+                if let Some(stale) = stale {
+                    self.drop_conversation_grant(caller, need, &stale);
+                }
+            }
         }
+        // The identity a grant made by this question is bound to. Read before
+        // asking, so nobody is asked about a process no grant could be bound
+        // to.
+        let identity = match need {
+            GrantNeed::App { code, .. } => {
+                Some(code.identity().map_err(|unreadable| unreadable.refusal())?)
+            }
+            GrantNeed::Takeover => None,
+        };
         let Some(carrier) = context.carrier.as_ref() else {
             // Nobody can be asked, so nothing can be granted. Reported as its
             // own outcome: waiting on a question that cannot be put would read
@@ -915,7 +1150,8 @@ impl ComputerGrants {
             });
         };
 
-        let (waiter, mut settled) = self.join_or_ask(caller, need, carrier);
+        let (waiter, mut settled) =
+            self.join_or_ask(caller, need, carrier, identity, signature_changed);
 
         // Parked for the whole wait: a call waiting on a person is neither busy
         // nor stuck, and counting it as either would report a person reading
@@ -1034,9 +1270,12 @@ impl ComputerGrants {
         caller: &GrantCaller,
         need: &GrantNeed,
         carrier: &Arc<dyn QuestionCarrier>,
+        identity: Option<AppIdentity>,
+        signature_changed: bool,
     ) -> (Waiter<'_>, SettledWatch) {
         let subject = Subject::of(caller, need);
-        let offers_always = matches!(need, GrantNeed::App { .. }) && self.offers_always(caller);
+        let offers_always =
+            matches!(need, GrantNeed::App { .. }) && self.offers_always(caller, identity.as_ref());
         let mut state = lock(&self.state);
         if let Some(ask_id) = state.open_by_subject.get(&subject).cloned() {
             if let Some(question) = state.questions.get_mut(&ask_id) {
@@ -1065,7 +1304,7 @@ impl ComputerGrants {
             GrantNeed::Takeover => TAKEOVER_QUESTION_DEADLINE,
         };
         let ask_id = new_ask_id(grant_kind);
-        let body = question_body(&ask_id, need, &offered);
+        let body = question_body(&ask_id, need, &offered, signature_changed);
         let (settled_tx, settled) = watch::channel(None);
         state.questions.insert(
             ask_id.clone(),
@@ -1073,6 +1312,7 @@ impl ComputerGrants {
                 subject: subject.clone(),
                 offered,
                 always_grantee: offers_always.then(|| caller.agent_project_id.clone()),
+                identity,
                 parked: BTreeSet::from([0]),
                 next_waiter: 1,
                 settled: settled_tx,
@@ -1120,6 +1360,7 @@ impl ComputerGrants {
                 subject: question.subject.clone(),
                 offered: question.offered.clone(),
                 always_grantee: question.always_grantee.clone(),
+                identity: question.identity.clone(),
             }
         };
         // The grant, and for "always" the store, is written before any waiting
@@ -1165,24 +1406,29 @@ impl ComputerGrants {
             });
         match decision {
             Some(ALLOW_CONVERSATION) => {
-                self.grant_conversation(&open.subject);
+                self.grant_conversation(&open.subject, open.identity.as_ref());
                 Settlement::Allowed { persisted: None }
             }
             Some(ALLOW_ALWAYS) => {
-                let written = match (&open.subject, open.always_grantee.as_deref()) {
+                let written = match (
+                    &open.subject,
+                    open.always_grantee.as_deref(),
+                    open.identity.as_ref(),
+                ) {
                     (
                         Subject::App {
                             bundle_identity, ..
                         },
                         Some(grantee),
-                    ) => self.write_always(grantee, bundle_identity),
+                        Some(identity),
+                    ) => self.write_always(grantee, bundle_identity, identity),
                     _ => Err(GrantStoreError::NoMachineIdentity),
                 };
                 // A failed write still grants for this conversation: the
                 // person said yes, and refusing the action because a file
                 // could not be written would punish them for a fault here.
                 if written.is_err() {
-                    self.grant_conversation(&open.subject);
+                    self.grant_conversation(&open.subject, open.identity.as_ref());
                 }
                 Settlement::Allowed {
                     persisted: Some(written.map_err(|error| error.reason_code().to_string())),
@@ -1216,16 +1462,24 @@ impl ComputerGrants {
         let _ = question.settled.send(Some((settlement, executor)));
     }
 
-    fn grant_conversation(&self, subject: &Subject) {
+    /// Record an allowing answer for the conversation.
+    ///
+    /// An app grant is recorded only with the identity it was asked for; a
+    /// question raised without one cannot have been an app question, and a
+    /// grant with nothing to check against would admit any process.
+    fn grant_conversation(&self, subject: &Subject, identity: Option<&AppIdentity>) {
         let mut state = lock(&self.state);
         match subject {
             Subject::App {
                 conversation_key,
                 bundle_identity,
             } => {
-                state
-                    .conversation_apps
-                    .insert((conversation_key.clone(), bundle_identity.clone()));
+                if let Some(identity) = identity {
+                    state.conversation_apps.insert(
+                        (conversation_key.clone(), bundle_identity.clone()),
+                        identity.clone(),
+                    );
+                }
             }
             Subject::Takeover { conversation_key } => {
                 state.takeovers.insert(conversation_key.clone());
@@ -1250,7 +1504,28 @@ impl ComputerGrants {
         }
     }
 
-    fn write_always(&self, grantee: &str, bundle_identity: &str) -> Result<(), GrantStoreError> {
+    /// Forget a conversation's app grant whose process no longer satisfies
+    /// the signature it was made for, unless it was replaced meanwhile.
+    fn drop_conversation_grant(&self, caller: &GrantCaller, need: &GrantNeed, stale: &AppIdentity) {
+        let GrantNeed::App {
+            bundle_identity, ..
+        } = need
+        else {
+            return;
+        };
+        let key = (caller.conversation_key.clone(), bundle_identity.clone());
+        let mut state = lock(&self.state);
+        if state.conversation_apps.get(&key) == Some(stale) {
+            state.conversation_apps.remove(&key);
+        }
+    }
+
+    fn write_always(
+        &self,
+        grantee: &str,
+        bundle_identity: &str,
+        identity: &AppIdentity,
+    ) -> Result<(), GrantStoreError> {
         let machine = self
             .machine_uuid
             .clone()
@@ -1268,6 +1543,8 @@ impl ComputerGrants {
         records.push(AlwaysGrantRecord {
             agent_project_id: grantee.to_string(),
             bundle_identity: bundle_identity.to_string(),
+            team_id: identity.team_id.clone(),
+            designated_requirement: Some(identity.designated_requirement.clone()),
             machine_uuid: machine,
             created_at_ms: wall_clock_ms(),
         });
@@ -1308,7 +1585,7 @@ impl ComputerGrants {
         let mut state = lock(&self.state);
         state
             .conversation_apps
-            .retain(|(conversation, _)| conversation != conversation_key);
+            .retain(|(conversation, _), _| conversation != conversation_key);
         state
             .conversation_app_denies
             .retain(|(conversation, _)| conversation != conversation_key);
@@ -1337,19 +1614,25 @@ impl ComputerGrants {
     ///
     /// Records naming another machine are listed apart: they grant nothing
     /// here, and an operator who restored a backup should be able to see that
-    /// they arrived and were not honoured.
+    /// they arrived and were not honoured. Records on this machine that name
+    /// no signature are listed apart for the same reason.
     pub fn list(&self) -> Value {
         let describe = |record: &AlwaysGrantRecord| {
-            json!({
+            let mut described = json!({
                 "grantee": record.agent_project_id,
                 "bundle_identity": record.bundle_identity,
                 "created_at_ms": record.created_at_ms,
-            })
+            });
+            if let Some(team_id) = &record.team_id {
+                described["team_id"] = json!(team_id);
+            }
+            described
         };
         match &*lock(&self.always) {
             AlwaysState::Failed(error) => json!({
                 "grants": [],
                 "other_machine_grants": [],
+                "unbound_grants": [],
                 "store": {
                     "state": "unreadable",
                     "reason": error.reason_code(),
@@ -1360,11 +1643,21 @@ impl ComputerGrants {
                 let here = |record: &&AlwaysGrantRecord| {
                     self.machine_uuid.as_deref() == Some(record.machine_uuid.as_str())
                 };
+                let bound = |record: &&AlwaysGrantRecord| record.designated_requirement.is_some();
                 json!({
-                    "grants": records.iter().filter(here).map(describe).collect::<Vec<_>>(),
+                    "grants": records
+                        .iter()
+                        .filter(|record| here(record) && bound(record))
+                        .map(describe)
+                        .collect::<Vec<_>>(),
                     "other_machine_grants": records
                         .iter()
                         .filter(|record| !here(record))
+                        .map(describe)
+                        .collect::<Vec<_>>(),
+                    "unbound_grants": records
+                        .iter()
+                        .filter(|record| here(record) && !bound(record))
                         .map(describe)
                         .collect::<Vec<_>>(),
                     "store": {"state": "loaded"},
@@ -1443,7 +1736,12 @@ fn wall_clock_ms() -> u64 {
 /// Structured rather than worded: the host renders the headline itself from
 /// `grant_kind` and `app`, so the two kinds can look different on the phone.
 /// The message carries only the context line the headline cannot.
-fn question_body(ask_id: &str, need: &GrantNeed, offered: &[&'static str]) -> Value {
+fn question_body(
+    ask_id: &str,
+    need: &GrantNeed,
+    offered: &[&'static str],
+    signature_changed: bool,
+) -> Value {
     let mut params = json!({
         "grant_kind": need.grant_kind(),
         "requestedSchema": {
@@ -1457,7 +1755,15 @@ fn question_body(ask_id: &str, need: &GrantNeed, offered: &[&'static str]) -> Va
     match need {
         GrantNeed::App { display_name, .. } => {
             params["app"] = json!(display_name);
-            params["message"] = json!("Covers reading and acting inside this application.");
+            params["message"] = if signature_changed {
+                json!(
+                    "This application's code signature has changed since it was approved, so \
+                     it may not be the application you approved. Covers reading and acting \
+                     inside this application."
+                )
+            } else {
+                json!("Covers reading and acting inside this application.")
+            };
         }
         GrantNeed::Takeover => {
             params["message"] = json!(
@@ -1482,6 +1788,7 @@ struct AnsweredQuestion {
     subject: Subject,
     offered: Vec<&'static str>,
     always_grantee: Option<String>,
+    identity: Option<AppIdentity>,
 }
 
 /// A call parked on a question. Dropping it takes the call off the question.
