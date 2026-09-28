@@ -870,3 +870,48 @@ async fn a_revoked_always_grant_is_asked_for_again() {
         "a revoked grant still admitted the call"
     );
 }
+
+/// The carrier's words for "nobody was asked" and "nobody answered" end the
+/// question honestly: neither is reported as pending, and the next call asks
+/// again rather than waiting on a question that is over.
+#[tokio::test]
+async fn nobody_asked_and_nobody_answered_are_not_reported_as_pending() {
+    let driver = CountingDriver::default();
+    let plane = plane(&driver);
+    let management = in_memory_management();
+    let carrier = ScriptedCarrier::default();
+    carrier.queue(AskOutcome::NotPutToAnyone);
+    carrier.queue(AskOutcome::NoAnswer);
+
+    let unreached = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        asking(&carrier, caller("conversation-1", false)),
+    )
+    .await;
+    assert_eq!(unreached["outcome"], "consent_unavailable", "{unreached}");
+    assert_eq!(unreached["reason"], "not_put_to_anyone", "{unreached}");
+    assert_eq!(
+        unreached["remedy"],
+        "Nobody could be asked; retry when the person is available."
+    );
+
+    let unanswered = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        asking(&carrier, caller("conversation-1", false)),
+    )
+    .await;
+    assert_eq!(unanswered["outcome"], "consent_unavailable", "{unanswered}");
+    assert_eq!(unanswered["reason"], "no_answer", "{unanswered}");
+    assert_eq!(
+        carrier.questions().len(),
+        2,
+        "the second call did not ask again"
+    );
+    assert!(driver.0.lock().unwrap().is_empty());
+}
