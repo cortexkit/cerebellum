@@ -262,6 +262,9 @@ pub struct FormatFloor {
     target: FloorTarget,
 }
 
+/// The versions already raised in this process, per format name.
+type RaisedThisRun = Arc<Mutex<BTreeMap<String, u64>>>;
+
 #[derive(Clone)]
 enum FloorTarget {
     /// No file. For stores that are not the operator's: in-memory stores,
@@ -270,7 +273,7 @@ enum FloorTarget {
     Isolated,
     File {
         path: PathBuf,
-        raised: Arc<Mutex<BTreeMap<String, u64>>>,
+        raised: RaisedThisRun,
     },
 }
 
@@ -318,8 +321,7 @@ impl FormatFloor {
     /// The floor file at `path`, sharing its in-process memory with every
     /// other store in this process that uses the same file.
     fn shared(path: PathBuf) -> Self {
-        static SHARED: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<BTreeMap<String, u64>>>>>> =
-            OnceLock::new();
+        static SHARED: OnceLock<Mutex<BTreeMap<PathBuf, RaisedThisRun>>> = OnceLock::new();
         let raised = SHARED
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
