@@ -1775,15 +1775,13 @@ fn question_body(
             Target { kind: TargetKind::Machine, label: "your mouse and keyboard".into() }, TAKEOVER_QUESTION_DEADLINE,
         ),
     };
-    let options = offered
-        .iter()
-        .map(|id| match *id {
-            ALLOW_CONVERSATION => ConsentOption::grant(*id, "Allow for this conversation"),
-            ALLOW_ALWAYS => ConsentOption::grant(*id, "Always allow"),
-            DENY => ConsentOption::decline(*id, "Don't allow"),
-            _ => unreachable!("only known decisions are offered"),
-        })
-        .collect();
+    let mut grants = vec![ConsentOption::grant(
+        ALLOW_CONVERSATION,
+        "Allow for this conversation",
+    )];
+    if offered.contains(&ALLOW_ALWAYS) {
+        grants.push(ConsentOption::grant(ALLOW_ALWAYS, "Always allow"));
+    }
     let facts = if signature_changed {
         vec![Fact::new("Application changed", "This application's code signature has changed since it was approved, so it may not be the application you approved")]
     } else {
@@ -1794,7 +1792,8 @@ fn question_body(
         prompt,
         target,
         facts,
-        options,
+        grants,
+        decline: ConsentOption::decline(DENY, "Don't allow"),
         expires_in: deadline,
         material_damage: true,
         scope: None,
@@ -1805,7 +1804,6 @@ fn question_body(
         },
     }
     .render(ask_id)
-    .expect("computer consent has one decline")
 }
 
 /// What the answer to a question is applied against, copied out so the store

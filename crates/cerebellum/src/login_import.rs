@@ -246,7 +246,7 @@ impl LoginImportPlan {
 
     pub fn question(&self, ask_id: &str, _agent: &str) -> Value {
         use crate::consent_card::*;
-        let mut options: Vec<_> = self
+        let mut grants: Vec<_> = self
             .presence
             .iter()
             .filter(|b| b.transfer == "available")
@@ -257,8 +257,7 @@ impl LoginImportPlan {
                 )
             })
             .collect();
-        options.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
-        options.push(ConsentOption::decline("deny", "Don't allow"));
+        grants.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
         let mut facts: Vec<_> = self
             .presence
             .iter()
@@ -291,14 +290,14 @@ impl LoginImportPlan {
                 label: self.host.clone(),
             },
             facts,
-            options,
+            grants,
+            decline: ConsentOption::decline("deny", "Don't allow"),
             expires_in: ELICITATION_DEADLINE,
             material_damage: true,
             scope: None,
             duration: None,
         }
         .render(ask_id)
-        .expect("login import has one decline")
     }
 
     pub fn refusal(&self, code: &'static str, remedy: &'static str) -> ImportResult {

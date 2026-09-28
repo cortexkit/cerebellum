@@ -1475,17 +1475,14 @@ pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Va
                 format!("The operator stores the login for {HOLDER_DISPLAY_NAME} with ck auth put"),
             ),
         ],
-        options: vec![
-            ConsentOption::grant(ALLOW_DECISION, "Allow"),
-            ConsentOption::decline(DENY_DECISION, "Don't allow"),
-        ],
+        grants: vec![ConsentOption::grant(ALLOW_DECISION, "Allow")],
+        decline: ConsentOption::decline(DENY_DECISION, "Don't allow"),
         expires_in: crate::login_import::ELICITATION_DEADLINE,
         material_damage: true,
         scope: None,
         duration: None,
     }
     .render(&format!("capture-login-{}", new_capture_id()))
-    .expect("capture has one decline")
 }
 
 /// `None` only for an affirmative answer. Every other ending -- a refusal,

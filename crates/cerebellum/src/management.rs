@@ -1249,10 +1249,11 @@ fn browser_grant_question(
         title: format!("Allow access to {}?", hosts.join(", ")),
         prompt: format!("Let the agent use its own browser on {} to read pages and click{}.", hosts.join(", "), if severity.tier >= MUTATE_DURABLE { ", including actions that make lasting changes" } else if severity.tier == MUTATE_REVERSIBLE { " and make changes that can be undone" } else { "" }),
         target: Target { kind: TargetKind::Site, label: hosts.join(", ") }, facts,
-        options: vec![ConsentOption::grant("allow", "Allow"), ConsentOption::decline("deny", "Don't allow")],
+        grants: vec![ConsentOption::grant("allow", "Allow")],
+        decline: ConsentOption::decline("deny", "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE, material_damage: true,
         scope: Some(json!({"origins": origins, "hazards": hazards, "severity_ceiling": browser_grant_severity_value(severity)})), duration: None,
-    }.render(ask_id).expect("site grant has one decline")
+    }.render(ask_id)
 }
 
 fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindReport) -> Value {
@@ -1272,17 +1273,14 @@ fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindR
                 "Only profiles created by the registry can be re-identified",
             ),
         ],
-        options: vec![
-            ConsentOption::grant("allow", "Re-identify"),
-            ConsentOption::decline("deny", "Don't allow"),
-        ],
+        grants: vec![ConsentOption::grant("allow", "Re-identify")],
+        decline: ConsentOption::decline("deny", "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
         scope: None,
         duration: None,
     }
     .render(ask_id)
-    .expect("rebind has one decline")
 }
 
 /// Evidence is checked again before clearing; consent is not proof the browser exited.
@@ -1321,17 +1319,14 @@ fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value
                 "The evidence is read again before anything is cleared",
             ),
         ],
-        options: vec![
-            ConsentOption::grant("clear", "Clear it"),
-            ConsentOption::decline("keep", "Keep it locked"),
-        ],
+        grants: vec![ConsentOption::grant("clear", "Clear it")],
+        decline: ConsentOption::decline("keep", "Keep it locked"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
         scope: None,
         duration: None,
     }
     .render(ask_id)
-    .expect("clear has one decline")
 }
 
 fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {

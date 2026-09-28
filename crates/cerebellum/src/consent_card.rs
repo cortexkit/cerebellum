@@ -5,16 +5,23 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Effect {
+enum Effect {
     Grant,
     Decline,
 }
 
 #[derive(Serialize)]
 pub(crate) struct ConsentOption {
-    pub id: String,
-    pub label: String,
-    pub effect: Effect,
+    id: String,
+    label: String,
+    effect: Effect,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DeclineOption {
+    id: String,
+    label: String,
+    effect: Effect,
 }
 
 impl ConsentOption {
@@ -25,8 +32,8 @@ impl ConsentOption {
             effect: Effect::Grant,
         }
     }
-    pub fn decline(id: impl Into<String>, label: impl Into<String>) -> Self {
-        Self {
+    pub fn decline(id: impl Into<String>, label: impl Into<String>) -> DeclineOption {
+        DeclineOption {
             id: id.into(),
             label: label.into(),
             effect: Effect::Decline,
@@ -67,7 +74,8 @@ pub(crate) struct ConsentCard {
     pub prompt: String,
     pub target: Target,
     pub facts: Vec<Fact>,
-    pub options: Vec<ConsentOption>,
+    pub grants: Vec<ConsentOption>,
+    pub decline: DeclineOption,
     pub expires_in: Duration,
     pub material_damage: bool,
     pub scope: Option<Value>,
@@ -75,21 +83,24 @@ pub(crate) struct ConsentCard {
 }
 
 impl ConsentCard {
-    /// Require exactly one decline option so an unanswered question always declines.
-    pub fn render(self, ask_id: &str) -> Result<Value, &'static str> {
-        let declines: Vec<_> = self
-            .options
+    /// The separate decline is always last, and silence selects it rather than a grant.
+    pub fn render(self, ask_id: &str) -> Value {
+        let default = &self.decline.id;
+        let ids: Vec<_> = self
+            .grants
             .iter()
-            .filter(|o| o.effect == Effect::Decline)
+            .map(|o| &o.id)
+            .chain(std::iter::once(&self.decline.id))
             .collect();
-        if declines.len() != 1 {
-            return Err("consent requires exactly one decline option");
-        }
-        let default = &declines[0].id;
-        let ids: Vec<_> = self.options.iter().map(|o| &o.id).collect();
+        let options: Vec<_> = self
+            .grants
+            .iter()
+            .map(|o| json!(o))
+            .chain(std::iter::once(json!(self.decline)))
+            .collect();
         let mut params = json!({
             "kind": "consent", "title": self.title, "prompt": self.prompt,
-            "target": self.target, "facts": self.facts, "options": self.options,
+            "target": self.target, "facts": self.facts, "options": options,
             "default": default, "on_expiry": "deny",
             "expires_in_ms": self.expires_in.as_millis() as u64,
             "material_damage": self.material_damage, "late_execution": "notify_only",
@@ -103,9 +114,7 @@ impl ConsentCard {
         if let Some(duration) = self.duration {
             params["duration"] = duration;
         }
-        Ok(
-            json!({"jsonrpc": "2.0", "method": "elicitation/create", "id": ask_id, "params": params}),
-        )
+        json!({"jsonrpc": "2.0", "method": "elicitation/create", "id": ask_id, "params": params})
     }
 }
 
@@ -144,7 +153,7 @@ pub(crate) fn assert_contract(body: &Value, ids: &[&str], decline: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn card(options: Vec<ConsentOption>) -> ConsentCard {
+    fn card(grants: Vec<ConsentOption>) -> ConsentCard {
         ConsentCard {
             title: "Consent".into(),
             prompt: "Allow access?".into(),
@@ -153,7 +162,8 @@ mod tests {
                 label: "machine".into(),
             },
             facts: vec![],
-            options,
+            grants,
+            decline: ConsentOption::decline("deny", "Don't allow"),
             expires_in: Duration::from_secs(300),
             material_damage: true,
             scope: None,
@@ -161,25 +171,22 @@ mod tests {
         }
     }
     #[test]
-    fn construction_refuses_missing_or_multiple_declines() {
-        assert!(card(vec![ConsentOption::grant("allow", "Allow")])
-            .render("missing")
-            .is_err());
-        assert!(card(vec![
-            ConsentOption::decline("deny", "Deny"),
-            ConsentOption::decline("keep", "Keep")
+    fn decline_is_last_and_is_the_default() {
+        let body = card(vec![
+            ConsentOption::grant("first", "First"),
+            ConsentOption::grant("second", "Second"),
         ])
-        .render("multiple")
-        .is_err());
+        .render("order");
+        assert_contract(&body, &["first", "second", "deny"], "deny");
+        assert_eq!(body["params"]["options"][2]["effect"], "decline");
+        assert_eq!(
+            body["params"]["options"][2]["id"],
+            body["params"]["default"]
+        );
     }
     #[test]
     fn default_is_the_decline_not_a_grant() {
-        let body = card(vec![
-            ConsentOption::grant("allow", "Allow"),
-            ConsentOption::decline("deny", "Don't allow"),
-        ])
-        .render("default")
-        .unwrap();
+        let body = card(vec![ConsentOption::grant("allow", "Allow")]).render("default");
         assert_contract(&body, &["allow", "deny"], "deny");
     }
 }
