@@ -1088,6 +1088,7 @@ impl ComputerGrants {
                 return;
             };
             AnsweredQuestion {
+                ask_id: ask_id.to_string(),
                 subject: question.subject.clone(),
                 offered: question.offered.clone(),
                 always_grantee: question.always_grantee.clone(),
@@ -1097,7 +1098,7 @@ impl ComputerGrants {
         // call is released, so a released call always finds the grant it was
         // released for.
         let settlement = self.apply_answer(&open, &outcome);
-        self.release_waiters(ask_id, settlement);
+        self.release_waiters(&open.ask_id, settlement);
     }
 
     fn apply_answer(&self, open: &AnsweredQuestion, outcome: &AskOutcome) -> Settlement {
@@ -1449,6 +1450,7 @@ fn question_body(ask_id: &str, need: &GrantNeed, offered: &[&'static str]) -> Va
 /// What the answer to a question is applied against, copied out so the store
 /// can be written without holding the grant state.
 struct AnsweredQuestion {
+    ask_id: String,
     subject: Subject,
     offered: Vec<&'static str>,
     always_grantee: Option<String>,
