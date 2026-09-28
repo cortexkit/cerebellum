@@ -3590,7 +3590,7 @@ impl BrowserPlane {
             });
         let mut snapshot = coherent.into_snapshot(id.clone(), source_origin);
         snapshot.source_document = source_document;
-        let result = json!({"outcome":"ok","snapshot_id":snapshot.snapshot_id,"document_epoch":snapshot.document_epoch,"source_origin":snapshot.source_origin,"image_png_b64":snapshot.image_png_b64,"image_width_px":snapshot.image_width_px,"image_height_px":snapshot.image_height_px,"input_rect":{"x_input_css":snapshot.input_rect.x_input_css,"y_input_css":snapshot.input_rect.y_input_css,"width_input_css":snapshot.input_rect.width_input_css,"height_input_css":snapshot.input_rect.height_input_css},"device_scale_factor":snapshot.device_scale_factor,"visual_viewport_scale":snapshot.visual_viewport_scale});
+        let result = json!({"outcome":"ok","snapshot_id":snapshot.snapshot_id,"document_epoch":snapshot.document_epoch,"source_origin":snapshot.source_origin,"image":{"mime":"image/png","data_b64":snapshot.image_png_b64,"width_px":snapshot.image_width_px,"height_px":snapshot.image_height_px},"image_width_px":snapshot.image_width_px,"image_height_px":snapshot.image_height_px,"input_rect":{"x_input_css":snapshot.input_rect.x_input_css,"y_input_css":snapshot.input_rect.y_input_css,"width_input_css":snapshot.input_rect.width_input_css,"height_input_css":snapshot.input_rect.height_input_css},"device_scale_factor":snapshot.device_scale_factor,"visual_viewport_scale":snapshot.visual_viewport_scale});
         context
             .snapshots
             .retain_screenshot(snapshot)
@@ -3948,7 +3948,12 @@ fn screenshot_properties() -> Value {
         "snapshot_id":string_schema(),
         "document_epoch":integer_schema(),
         "source_origin":string_schema(),
-        "image_png_b64":string_schema(),
+        "image":closed_object(json!({
+            "mime":string_schema(),
+            "data_b64":string_schema(),
+            "width_px":integer_schema(),
+            "height_px":integer_schema(),
+        }), &["mime", "data_b64", "width_px", "height_px"]),
         "image_width_px":integer_schema(),
         "image_height_px":integer_schema(),
         "input_rect":closed_object(json!({"x_input_css":number_schema(),"y_input_css":number_schema(),"width_input_css":number_schema(),"height_input_css":number_schema()}), &["x_input_css", "y_input_css", "width_input_css", "height_input_css"]),

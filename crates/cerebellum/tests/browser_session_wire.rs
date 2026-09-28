@@ -3896,7 +3896,7 @@ async fn a_page_that_stays_put_reads_as_before() {
     let screenshot = response_body(&planes, 6, "browser.screenshot", json!({})).await;
     assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
     assert_eq!(
-        screenshot["image_png_b64"], ONE_BY_ONE_PNG_B64,
+        screenshot["image"]["data_b64"], ONE_BY_ONE_PNG_B64,
         "{screenshot}"
     );
     assert_eq!(
@@ -4002,6 +4002,9 @@ async fn actuation_planes() -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) 
             Arc::clone(&planes.lease_clock),
             config.navigation_settle_deadline_ms,
         )
+        .with_result_schema_enforcement(
+            cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+        )
         .with_grants_installed(GrantStore::new([ActionGrant::new(
             "act",
             1,
@@ -4055,6 +4058,42 @@ async fn click_screenshot_point(planes: &Planes, corr: u64, screenshot: &Value) 
         }),
     )
     .await
+}
+
+#[tokio::test]
+async fn screenshot_wire_preserves_liftable_image_and_click_dimensions() {
+    let (planes, _page, commands) = actuation_planes().await;
+    let screenshot = response_body(&planes, 100, "browser.screenshot", json!({})).await;
+    assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+    assert!(screenshot.get("image_png_b64").is_none(), "{screenshot}");
+    let image = &screenshot["image"];
+    assert_eq!(image["mime"], "image/png", "{screenshot}");
+    assert_eq!(image["data_b64"], ONE_BY_ONE_PNG_B64, "{screenshot}");
+    let png = cerebellum_core::serde_base64::decode(image["data_b64"].as_str().unwrap()).unwrap();
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    // Read dimensions directly from the PNG header, independently of the
+    // capture adapter, to check the reported size against the image bytes.
+    let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+    assert!(width > 0 && height > 0);
+    assert_eq!(image["width_px"], width);
+    assert_eq!(image["height_px"], height);
+    assert_eq!(screenshot["image_width_px"], width);
+    assert_eq!(screenshot["image_height_px"], height);
+    assert!(screenshot["snapshot_id"].as_str().is_some());
+
+    let mut wrong_size = screenshot.clone();
+    wrong_size["image_width_px"] = json!(width + 1);
+    let before = mouse_events(&commands);
+    let refused = click_screenshot_point(&planes, 101, &wrong_size).await;
+    assert_eq!(
+        refused["detail"]["reason_code"], "image_size_mismatch",
+        "{refused}"
+    );
+    assert_eq!(mouse_events(&commands), before);
+    let clicked = click_screenshot_point(&planes, 102, &screenshot).await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(mouse_events(&commands) > before);
 }
 
 #[tokio::test]
