@@ -50,8 +50,11 @@ extern "C" {
         attribute: CfTypeRef,
         value: *mut CfTypeRef,
     ) -> i32;
-    fn AXUIElementSetAttributeValue(element: CfTypeRef, attribute: CfTypeRef, value: CfTypeRef)
-        -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: CfTypeRef,
+        attribute: CfTypeRef,
+        value: CfTypeRef,
+    ) -> i32;
     fn AXUIElementIsAttributeSettable(
         element: CfTypeRef,
         attribute: CfTypeRef,
@@ -133,11 +136,9 @@ fn copy(element: CfTypeRef, name: &'static str) -> Result<Option<CFRetained<CFTy
 /// not a string.
 fn string(element: CfTypeRef, name: &'static str) -> Result<Option<String>, i32> {
     match copy(element, name) {
-        Ok(value) => Ok(value.and_then(|value| {
-            value
-                .downcast_ref::<CFString>()
-                .map(ToString::to_string)
-        })),
+        Ok(value) => {
+            Ok(value.and_then(|value| value.downcast_ref::<CFString>().map(ToString::to_string)))
+        }
         Err(AX_ERROR_NO_VALUE | AX_ERROR_ATTRIBUTE_UNSUPPORTED) => Ok(None),
         Err(code) => Err(code),
     }
@@ -377,9 +378,8 @@ pub fn element_at_position(
     let mut hit: CfTypeRef = std::ptr::null();
     // SAFETY: the root element is retained for the call; `hit` is writable
     // storage for one returned reference.
-    let code = unsafe {
-        AXUIElementCopyElementAtPosition(root.as_ptr(), x as f32, y as f32, &mut hit)
-    };
+    let code =
+        unsafe { AXUIElementCopyElementAtPosition(root.as_ptr(), x as f32, y as f32, &mut hit) };
     match code {
         AX_ERROR_SUCCESS => {}
         AX_ERROR_NO_VALUE | AX_ERROR_CANNOT_COMPLETE | AX_ERROR_ATTRIBUTE_UNSUPPORTED => {

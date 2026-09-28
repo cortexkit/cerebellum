@@ -35,10 +35,10 @@ use crate::platform::containment::{
 use crate::platform::{
     AccessibilityKeyForm, ActionKind, DispatchMode, DispatchResult as PlatformDispatchResult,
     DriverError, EffectStatus, ElementResolutionResult, FrontedDispatchRequest,
-    GlobalDispatchRequest, HeldStateDisposition,
-    PermissionLiveness, PlatformDriver, ProcessEventRefusal, ProcessGrant, SemanticActionIntent,
-    SemanticActionPlatform, SemanticDispatchRequest, SemanticDriverError, SyntheticAction,
-    SyntheticDispatchRequest, TargetDisposition,
+    GlobalDispatchRequest, HeldStateDisposition, PermissionLiveness, PlatformDriver,
+    ProcessEventRefusal, ProcessGrant, SemanticActionIntent, SemanticActionPlatform,
+    SemanticDispatchRequest, SemanticDriverError, SyntheticAction, SyntheticDispatchRequest,
+    TargetDisposition,
 };
 use cerebellum_core::consent::OnceDispatchToken;
 use cerebellum_core::journal::redaction::Redactor;

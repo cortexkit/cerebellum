@@ -601,6 +601,7 @@ pub struct DeskElement {
 }
 
 /// What focus the desk reports for the target application.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeskFocus {
     Nothing,

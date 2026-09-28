@@ -1450,7 +1450,9 @@ pub trait PlatformDriver {
         _request: FrontedDispatchRequest,
         _cancelled: &dyn Fn() -> bool,
     ) -> Result<crate::dispatch::BracketReport, DriverError> {
-        Err(DriverError::Unsupported("fronted per-process synthetic dispatch"))
+        Err(DriverError::Unsupported(
+            "fronted per-process synthetic dispatch",
+        ))
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)

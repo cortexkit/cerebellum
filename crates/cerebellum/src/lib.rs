@@ -2344,34 +2344,37 @@ impl Planes {
                 let user_idle = Arc::new(std::sync::Mutex::new(
                     cerebellum_computer::dispatch::UserIdleEstimator::new(),
                 ));
-                Arc::new(computer_capability::ComputerPlane::with_synthetic_driver(
-                    audit,
-                    // Built fresh per dispatch: each platform driver caches
-                    // accessibility trees, and a stale cache may name a process
-                    // generation that is gone. Synthetic requests declare no
-                    // post-condition, so their effects remain indeterminate.
-                    move || {
-                        let driver = computer_capability::NativeComputerPlatformDriver::default()
-                            .without_expected_post_condition();
-                        #[cfg(target_os = "macos")]
-                        let driver = driver
-                            .with_global_dispatch_review_revision(
-                                global_dispatch_review_revision.clone(),
-                            )
-                            .with_takeover_dispatch_review_revision(
-                                takeover_dispatch_review_revision.clone(),
-                            )
-                            .with_shared_user_idle(user_idle.clone());
-                        driver
-                    },
+                Arc::new(
+                    computer_capability::ComputerPlane::with_synthetic_driver(
+                        audit,
+                        // Built fresh per dispatch: each platform driver caches
+                        // accessibility trees, and a stale cache may name a process
+                        // generation that is gone. Synthetic requests declare no
+                        // post-condition, so their effects remain indeterminate.
+                        move || {
+                            let driver =
+                                computer_capability::NativeComputerPlatformDriver::default()
+                                    .without_expected_post_condition();
+                            #[cfg(target_os = "macos")]
+                            let driver = driver
+                                .with_global_dispatch_review_revision(
+                                    global_dispatch_review_revision.clone(),
+                                )
+                                .with_takeover_dispatch_review_revision(
+                                    takeover_dispatch_review_revision.clone(),
+                                )
+                                .with_shared_user_idle(user_idle.clone());
+                            driver
+                        },
+                    )
+                    // The fronting bracket is served only by a build carrying
+                    // its review; without it a background target is refused.
+                    .with_fronting_bracket_admitted(
+                        compiled_release_inputs()
+                            .takeover_dispatch_review_revision
+                            .is_some(),
+                    ),
                 )
-                // The fronting bracket is served only by a build carrying
-                // its review; without it a background target is refused.
-                .with_fronting_bracket_admitted(
-                    compiled_release_inputs()
-                        .takeover_dispatch_review_revision
-                        .is_some(),
-                ))
             }),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::new(

@@ -375,9 +375,9 @@ fn describe_actions(actions: &[String]) -> String {
         .map(String::as_str)
         .filter(|action| {
             action.len() <= 48
-                && action
-                    .strip_prefix("AX")
-                    .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic()))
+                && action.strip_prefix("AX").is_some_and(|rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic())
+                })
         })
         .collect();
     let custom = actions.len() - standard.len();
@@ -617,7 +617,11 @@ pub(crate) enum PointHit {
 /// The hit test is scoped to that application, so an element of another
 /// application on top of it is not what is found; an element reported as
 /// belonging to another process anyway is treated as no hit.
-pub(crate) fn hit_test(source: &dyn AppStateSource, grant: &ProcessGrant, point: (f64, f64)) -> PointHit {
+pub(crate) fn hit_test(
+    source: &dyn AppStateSource,
+    grant: &ProcessGrant,
+    point: (f64, f64),
+) -> PointHit {
     match source.element_at(HitScope::Application { pid: grant.pid }, point) {
         Ok(Some((handle, owner))) if owner.is_none_or(|owner| owner == grant.pid) => {
             PointHit::Element(handle)

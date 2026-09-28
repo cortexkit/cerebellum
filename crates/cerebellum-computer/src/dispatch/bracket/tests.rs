@@ -171,10 +171,15 @@ fn long_text_is_chunked_so_every_fronted_interval_fits_the_bound() {
     assert_eq!(report.units_posted, 60);
     assert!(report.chunks > 1, "{report:?}");
     assert_eq!(desk.posted, (0..60).collect::<Vec<_>>());
-    assert!(desk.frontmost_at_post.iter().all(|pid| *pid == Some(TARGET)));
+    assert!(desk
+        .frontmost_at_post
+        .iter()
+        .all(|pid| *pid == Some(TARGET)));
     assert_eq!(desk.fronted_intervals.len() as u32, report.chunks);
     assert!(
-        desk.fronted_intervals.iter().all(|interval| *interval <= 100),
+        desk.fronted_intervals
+            .iter()
+            .all(|interval| *interval <= 100),
         "{:?}",
         desk.fronted_intervals
     );
@@ -344,12 +349,7 @@ fn a_post_failure_is_reported_with_what_it_left_held() {
         }
     }
     let mut desk = Failing(FakeDesk::new());
-    let report = run_fronting_bracket(
-        &mut desk,
-        &mut UserIdleEstimator::new(),
-        plan(5),
-        &|| false,
-    );
+    let report = run_fronting_bracket(&mut desk, &mut UserIdleEstimator::new(), plan(5), &|| false);
     assert!(matches!(report.stop, Some(BracketStop::PostFailed(_))));
     assert_eq!(report.posts_returned, 1);
     assert_eq!(desk.0.frontmost, Some(PREVIOUS));

@@ -249,7 +249,10 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         "computer.press_point",
         "computer.write_text",
     ] {
-        assert!(offered.contains(served), "{served} was not offered: {offered:?}");
+        assert!(
+            offered.contains(served),
+            "{served} was not offered: {offered:?}"
+        );
     }
     for never in [
         "computer.click",

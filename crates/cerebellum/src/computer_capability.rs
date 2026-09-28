@@ -1039,7 +1039,11 @@ where
             }
             match management
                 .computer_grants()
-                .require(&crate::computer_grants::GrantNeed::Takeover, &consent, &cancel)
+                .require(
+                    &crate::computer_grants::GrantNeed::Takeover,
+                    &consent,
+                    &cancel,
+                )
                 .await
             {
                 Ok(takeover) => {
@@ -1153,9 +1157,15 @@ where
             SyntheticAction::TypeText { text } => Some(text.clone()),
             _ => None,
         };
-        let mut request =
-            DispatchRequest::new(row, mode, grant.clone(), expected, attendance, dispatch_at_ms)
-                .with_synthetic(parsed.action);
+        let mut request = DispatchRequest::new(
+            row,
+            mode,
+            grant.clone(),
+            expected,
+            attendance,
+            dispatch_at_ms,
+        )
+        .with_synthetic(parsed.action);
         if let Some(bound) = bracket_bound {
             request = request.with_fronting_bracket(bound);
         }

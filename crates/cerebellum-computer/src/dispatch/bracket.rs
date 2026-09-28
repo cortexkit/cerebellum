@@ -146,7 +146,10 @@ impl BracketReport {
     /// application is back.
     pub fn held(&self, maximum_interval_ms: u64) -> bool {
         self.stop.is_none()
-            && matches!(self.restore, RestoreStatus::Restored | RestoreStatus::NotNeeded)
+            && matches!(
+                self.restore,
+                RestoreStatus::Restored | RestoreStatus::NotNeeded
+            )
             && self.longest_fronted_interval_ms <= maximum_interval_ms
     }
 }
@@ -280,11 +283,18 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
         // time the application takes to come forward is inside the bound.
         let fronted_at = host.borrow_mut().now_ms();
         report.chunks += 1;
-        let requested = plan.target_pid == previous
-            || host.borrow_mut().request_front(plan.target_pid);
+        let requested =
+            plan.target_pid == previous || host.borrow_mut().request_front(plan.target_pid);
         if !requested || !await_front(&host, plan.target_pid, fronted_at, bound) {
             report.stop = Some(BracketStop::FrontFailed);
-            restore(&host, &mut report, previous, plan.target_pid, fronted_at, bound);
+            restore(
+                &host,
+                &mut report,
+                previous,
+                plan.target_pid,
+                fronted_at,
+                bound,
+            );
             break;
         }
 
@@ -347,7 +357,14 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
             }
         }
 
-        let interval = restore(&host, &mut report, previous, plan.target_pid, fronted_at, bound);
+        let interval = restore(
+            &host,
+            &mut report,
+            previous,
+            plan.target_pid,
+            fronted_at,
+            bound,
+        );
         if stop.is_some() {
             report.stop = stop;
             break;

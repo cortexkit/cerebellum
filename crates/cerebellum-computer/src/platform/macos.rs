@@ -1348,9 +1348,15 @@ impl PlatformDriver for MacOs26PlatformDriver {
         }
         let target = &request.synthetic.target;
         target.validate()?;
-        let start_time_micros = target.process_generation_evidence.parse::<u64>().map_err(|_| {
-            DriverError::InvalidRequest("process generation evidence is not a kernel start time")
-        })?;
+        let start_time_micros =
+            target
+                .process_generation_evidence
+                .parse::<u64>()
+                .map_err(|_| {
+                    DriverError::InvalidRequest(
+                        "process generation evidence is not a kernel start time",
+                    )
+                })?;
         let units = bracket_units(&request.synthetic.action)?;
         let started = Instant::now();
         let (tap, heartbeat) = open_session_observation(started)?;
@@ -1626,8 +1632,12 @@ mod tests {
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
             semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
             app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
-            element_addressed_review_revision: Some("fixture-element-addressed-review-v1".to_string()),
-            takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review-v1".to_string()),
+            element_addressed_review_revision: Some(
+                "fixture-element-addressed-review-v1".to_string(),
+            ),
+            takeover_dispatch_review_revision: Some(
+                "fixture-takeover-dispatch-review-v1".to_string(),
+            ),
             windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
             release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
             vocabulary_digests: VocabularyDigestInputs {
@@ -1804,8 +1814,12 @@ mod tests {
                 capture_review_revision: Some("fixture-capture-review-v1".to_string()),
                 semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
                 app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
-                element_addressed_review_revision: Some("fixture-element-addressed-review-v1".to_string()),
-                takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review-v1".to_string()),
+                element_addressed_review_revision: Some(
+                    "fixture-element-addressed-review-v1".to_string(),
+                ),
+                takeover_dispatch_review_revision: Some(
+                    "fixture-takeover-dispatch-review-v1".to_string(),
+                ),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
                 vocabulary_digests: VocabularyDigestInputs {
@@ -1851,8 +1865,12 @@ mod tests {
                 capture_review_revision: Some("fixture-capture-review-v1".to_string()),
                 semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
                 app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
-                element_addressed_review_revision: Some("fixture-element-addressed-review-v1".to_string()),
-                takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review-v1".to_string()),
+                element_addressed_review_revision: Some(
+                    "fixture-element-addressed-review-v1".to_string(),
+                ),
+                takeover_dispatch_review_revision: Some(
+                    "fixture-takeover-dispatch-review-v1".to_string(),
+                ),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
                 vocabulary_digests: VocabularyDigestInputs {

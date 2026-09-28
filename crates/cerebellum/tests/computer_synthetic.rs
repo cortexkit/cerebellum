@@ -40,6 +40,7 @@ use support::computer::{
 enum DispatchedCall {
     PerPid(SyntheticDispatchRequest),
     Global(SyntheticDispatchRequest),
+    Fronted(SyntheticDispatchRequest),
 }
 
 /// What every driver instance built for one test shares: the calls made, and
@@ -51,6 +52,7 @@ struct Shared {
     interrupt_after_two: Option<Arc<tokio::sync::Notify>>,
     per_pid: Result<DispatchResult, DriverError>,
     global: Result<DispatchResult, DriverError>,
+    fronted: FrontedScript,
 }
 
 impl Shared {
@@ -72,6 +74,7 @@ impl Shared {
                 delivery_posts_returned: 0,
                 delivery_generation_verifications: 0,
             }),
+            fronted: FrontedScript::default(),
         }))
     }
 }
@@ -163,6 +166,48 @@ impl PlatformDriver for SyntheticDriver {
         shared.global.clone()
     }
 
+    /// Runs the real fronting bracket over a fake desk, so the plane's
+    /// handling of every way a bracket ends is exercised end to end.
+    fn dispatch_fronted(
+        &mut self,
+        request: cerebellum_computer::platform::FrontedDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<cerebellum_computer::dispatch::BracketReport, DriverError> {
+        let script = {
+            let mut shared = self.0.lock().unwrap();
+            shared
+                .calls
+                .push(DispatchedCall::Fronted(request.synthetic.clone()));
+            shared.fronted.clone()
+        };
+        let units = match &request.synthetic.action {
+            SyntheticAction::TypeText { text } => text.chars().count(),
+            _ => 1,
+        };
+        let mut desk = FrontingDesk {
+            now: 0,
+            frontmost: Some(OTHER_APPLICATION_PID),
+            pending: None,
+            refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
+        };
+        let chunks_started = std::cell::Cell::new(0);
+        let scripted_cancel = || {
+            chunks_started.set(chunks_started.get() + 1);
+            cancelled() || (script.cancel_after_first_chunk && chunks_started.get() > 1)
+        };
+        Ok(cerebellum_computer::dispatch::run_fronting_bracket(
+            &mut desk,
+            &mut cerebellum_computer::dispatch::UserIdleEstimator::new(),
+            cerebellum_computer::dispatch::BracketPlan {
+                target_pid: request.synthetic.target.pid,
+                units,
+                maximum_interval_ms: request.maximum_interval_ms,
+                maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
+            },
+            &scripted_cancel,
+        ))
+    }
+
     fn query_focus(
         &mut self,
         _request: FocusQueryRequest,
@@ -218,6 +263,99 @@ impl PlatformDriver for SyntheticDriver {
             valid: true,
             lease_generation: Some("lease-1".to_string()),
             age_ms: Some(1),
+        })
+    }
+}
+
+/// How the fake desk behind a fronting bracket misbehaves.
+#[derive(Debug, Clone, Default)]
+struct FrontingScript {
+    refuse_restore: bool,
+    cancel_after_first_chunk: bool,
+}
+
+type FrontedScript = FrontingScript;
+
+/// The application in front when a bracket starts.
+const OTHER_APPLICATION_PID: u32 = 100;
+
+/// A desk on a fake clock: a fronting request takes effect 2 ms later, and
+/// each unit takes 3 ms to post.
+struct FrontingDesk {
+    now: u64,
+    frontmost: Option<u32>,
+    pending: Option<(u32, u64)>,
+    refuse_front_of: Option<u32>,
+}
+
+impl FrontingDesk {
+    fn advance(&mut self, milliseconds: u64) {
+        self.now += milliseconds;
+        if let Some((pid, at)) = self.pending {
+            if self.now >= at {
+                self.frontmost = Some(pid);
+                self.pending = None;
+            }
+        }
+    }
+}
+
+impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
+    type Tap = ();
+    fn now_ms(&mut self) -> u64 {
+        self.now
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        self.advance(milliseconds);
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        self.frontmost
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        if self.refuse_front_of != Some(pid) {
+            self.pending = Some((pid, self.now + 2));
+        }
+        true
+    }
+    fn our_pid(&self) -> i64 {
+        7
+    }
+    fn create_tap(&mut self) -> Option<()> {
+        Some(())
+    }
+    fn read_idle(&mut self) -> cerebellum_computer::platform::IdleReading {
+        cerebellum_computer::platform::IdleReading::Milliseconds(60_000)
+    }
+    fn drain(&mut self, _tap: &()) -> Vec<cerebellum_computer::dispatch::SourcedInputEvent> {
+        Vec::new()
+    }
+    fn post_heartbeat(&mut self) -> cerebellum_computer::dispatch::HeartbeatProbe {
+        cerebellum_computer::dispatch::HeartbeatProbe {
+            marker: cerebellum_computer::dispatch::HeartbeatMarker::new(1),
+            posted_at_ms: self.now,
+            our_pid: 7,
+        }
+    }
+    fn observe_heartbeat(
+        &mut self,
+        _tap: &(),
+        probe: cerebellum_computer::dispatch::HeartbeatProbe,
+        _watcher: &mut cerebellum_computer::dispatch::SeizeWatcher,
+    ) -> cerebellum_computer::dispatch::HeartbeatObservation {
+        cerebellum_computer::dispatch::HeartbeatObservation::Seen {
+            marker: probe.marker,
+            source_unix_process_id: 7,
+            observed_at_ms: probe.posted_at_ms,
+        }
+    }
+    fn post_unit(
+        &mut self,
+        _index: usize,
+    ) -> Result<cerebellum_computer::dispatch::UnitPosted, SequencePostFailure> {
+        self.advance(3);
+        Ok(cerebellum_computer::dispatch::UnitPosted {
+            posts_returned: 2,
+            generation_verifications: 4,
         })
     }
 }
@@ -917,4 +1055,309 @@ async fn a_single_thread_runtime_can_interrupt_a_posting_computer_action() {
         plane.obligation_lifecycle(1).await,
         Some(LifecycleState::Finalized)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The secure-field check, background targets and honest delivery
+// ---------------------------------------------------------------------------
+
+use support::computer::{relayed, Desk, DeskFocus, ScriptedCarrier};
+
+/// A plane over `desk` that withholds any reply its row does not declare, in
+/// a build that does or does not carry the fronting bracket's review.
+fn plane_on(shared: &Arc<Mutex<Shared>>, desk: &Desk, bracket_admitted: bool) -> TestPlane {
+    ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+        audit(),
+        ResultSchemaEnforcement::Withhold,
+        SyntheticDriver::factory(Arc::clone(shared)),
+    )
+    .with_app_state_source(desk.source())
+    .with_fronting_bracket_admitted(bracket_admitted)
+}
+
+async fn serve_asking(
+    plane: &TestPlane,
+    name: &str,
+    arguments: Value,
+    management: &Arc<ManagementPlane>,
+    consent: cerebellum::computer_grants::ConsentContext,
+) -> Value {
+    let clock = FakeClock::new();
+    plane
+        .serve(
+            servable(name).expect("the capability is servable"),
+            &arguments,
+            ServeContext {
+                cancel: cerebellum::CancelHandle::pending(),
+                grantee: GRANTEE,
+                identity: identity(),
+                management,
+                consent,
+                clock: &clock,
+                now_ms: 10,
+            },
+            |_| InMemoryCaptureBackend::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{name} replied outside its row: {error:?}"))
+}
+
+fn background(desk: Desk) -> Desk {
+    desk.state().frontmost = Some(OTHER_APPLICATION_PID);
+    desk
+}
+
+/// A secure field focused in the target refuses both keystroke rows before
+/// anything is posted or fronted.
+#[tokio::test]
+async fn a_secure_focused_field_refuses_keystrokes_before_anything_is_posted() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve(&plane, name, request, &management, &FakeClock::new()).await;
+        assert_eq!(reply["outcome"], "secure_field_refused", "{name}: {reply}");
+        assert_eq!(reply["reason"], "secure_field_focused");
+    }
+    assert!(dispatched_calls(&shared).is_empty());
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A focus that cannot be read cannot be shown not to be secure, so the
+/// check fails closed.
+#[tokio::test]
+async fn an_unreadable_focus_refuses_keystrokes() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().focus = DeskFocus::Unreadable;
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve(&plane, name, request, &management, &FakeClock::new()).await;
+        assert_eq!(reply["outcome"], "secure_field_refused", "{name}: {reply}");
+        assert_eq!(reply["reason"], "focus_unreadable");
+    }
+    assert!(dispatched_calls(&shared).is_empty());
+}
+
+/// In a build without the bracket's review, a background target is refused
+/// without asking anyone, and the remedy names only what that build can do.
+#[tokio::test]
+async fn a_background_target_in_a_build_without_the_bracket_needs_the_foreground() {
+    let shared = Shared::handle();
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve_asking(&plane, name, request, &management, relayed(&carrier)).await;
+        assert_eq!(reply["outcome"], "keystrokes_need_foreground", "{reply}");
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(remedy.contains("write_text"), "{remedy}");
+        assert!(!remedy.contains("takeover"), "{remedy}");
+    }
+    assert!(carrier.questions().is_empty(), "a question was raised");
+    assert!(dispatched_calls(&shared).is_empty());
+}
+
+/// In a build with the bracket's review, a background target raises the
+/// takeover question; declining it posts nothing.
+#[tokio::test]
+async fn a_background_target_raises_the_takeover_question_and_a_deny_posts_nothing() {
+    let shared = Shared::handle();
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let carrier = ScriptedCarrier::answering(&["deny"]);
+    let reply = serve_asking(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        relayed(&carrier),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "consent_denied", "{reply}");
+    let questions = carrier.questions();
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0]["params"]["grant_kind"], "takeover");
+    assert!(dispatched_calls(&shared).is_empty());
+}
+
+/// With the takeover grant, a background target is posted to through the
+/// fronting bracket, which fronts it and puts the previous application back
+/// inside the bound; both keystroke rows take the same path.
+#[tokio::test]
+async fn a_background_target_with_the_takeover_grant_is_posted_through_the_bracket() {
+    let shared = Shared::handle();
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve_asking(&plane, name, request, &management, relayed(&carrier)).await;
+        assert_eq!(reply["outcome"], "delivery_unconfirmed", "{name}: {reply}");
+        assert_eq!(reply["target_fronted"], true, "{name}: {reply}");
+        assert!(reply.get("changed").is_some(), "{reply}");
+    }
+    assert_eq!(carrier.questions().len(), 1, "one takeover question");
+    let calls = dispatched_calls(&shared);
+    assert!(
+        matches!(
+            &calls[..],
+            [DispatchedCall::Fronted(_), DispatchedCall::Fronted(_)]
+        ),
+        "{calls:?}"
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A frontmost target is posted to per process, and no takeover question is
+/// raised even in a build that could ask one.
+#[tokio::test]
+async fn a_frontmost_target_is_posted_per_process_without_a_takeover_question() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let carrier = ScriptedCarrier::default();
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["a"]),
+        &management,
+        relayed(&carrier),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert!(carrier.questions().is_empty());
+    assert!(matches!(
+        &dispatched_calls(&shared)[..],
+        [DispatchedCall::PerPid(_)]
+    ));
+}
+
+/// A previous application that cannot be put back is reported by name,
+/// whatever else happened: the person's next keystrokes go to what was left
+/// in front.
+#[tokio::test]
+async fn a_failed_restore_is_reported_naming_the_application_left_in_front() {
+    let shared = Shared::handle();
+    shared.lock().unwrap().fronted.refuse_restore = true;
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let reply = serve_asking(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        relayed(&carrier),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "restore_failed", "{reply}");
+    assert_eq!(reply["bundle_identity"], TARGET_BUNDLE_ID);
+    assert_eq!(reply["target_fronted"], false);
+    assert!(reply["remedy"].as_str().unwrap().contains(TARGET_BUNDLE_ID));
+}
+
+/// A cancel is honoured at the next chunk boundary: text too long for one
+/// chunk stops after the first, and says how many posts went out.
+#[tokio::test]
+async fn a_cancel_mid_bracket_stops_at_a_chunk_boundary() {
+    let shared = Shared::handle();
+    shared.lock().unwrap().fronted.cancel_after_first_chunk = true;
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let reply = serve_asking(
+        &plane,
+        "computer.type",
+        json!({"target": TARGET_BUNDLE_ID, "text": "a".repeat(60)}),
+        &management,
+        relayed(&carrier),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "cancelled", "{reply}");
+    let posts = reply["posts_returned"].as_u64().unwrap();
+    assert!(posts > 0 && posts < 120, "{reply}");
+}
+
+/// Typed text that shows up in the part of the focused value that changed
+/// is confirmed.
+#[tokio::test]
+async fn typed_text_found_in_what_changed_is_completed() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().readbacks =
+        [Some("ab".to_string()), Some("ahib".to_string())].into();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_observed");
+}
+
+/// A field that already held the text, and did not change, proves nothing
+/// about this call.
+#[tokio::test]
+async fn a_field_that_already_held_the_text_is_not_confirmed() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().value = Some("hi".into());
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate");
+}
+
+/// A chord is never reported delivered, even when the focused value changed.
+#[tokio::test]
+async fn keys_are_never_reported_delivered() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().readbacks =
+        [Some(String::new()), Some("a".to_string())].into();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.keys",
+        keys_request(&["a"]),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
 }

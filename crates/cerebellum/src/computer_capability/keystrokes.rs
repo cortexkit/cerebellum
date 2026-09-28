@@ -110,9 +110,9 @@ pub(crate) fn dispatch_refusal_reply(refusal: &DispatchError) -> Value {
             "the keystrokes could not be posted inside the time the application may stay in \
              front; use write_text on a settable element, or send shorter text",
         ),
-        DispatchError::FrontingRestoreFailed => Some(
-            "the previous application could not be brought back, so nothing more was posted",
-        ),
+        DispatchError::FrontingRestoreFailed => {
+            Some("the previous application could not be brought back, so nothing more was posted")
+        }
         _ => None,
     };
     if let Some(remedy) = remedy {
@@ -125,7 +125,11 @@ pub(crate) fn dispatch_refusal_reply(refusal: &DispatchError) -> Value {
 /// previous application back, naming what it left in front. The person's
 /// next keystrokes go to that application, so this outranks every other
 /// outcome, delivered or not.
-pub(crate) fn disclose_failed_restore(reply: &mut Value, bracket: &BracketReport, target: &ProcessGrant) {
+pub(crate) fn disclose_failed_restore(
+    reply: &mut Value,
+    bracket: &BracketReport,
+    target: &ProcessGrant,
+) {
     let RestoreStatus::Failed { left_in_front } = bracket.restore else {
         return;
     };
@@ -137,9 +141,10 @@ pub(crate) fn disclose_failed_restore(reply: &mut Value, bracket: &BracketReport
         Some(pid) => format!("the application with pid {pid}"),
         None => "an application that could not be identified".to_string(),
     };
-    let previous = bracket
-        .previous_frontmost
-        .map_or_else(|| "the previous application".to_string(), |pid| format!("pid {pid}"));
+    let previous = bracket.previous_frontmost.map_or_else(
+        || "the previous application".to_string(),
+        |pid| format!("pid {pid}"),
+    );
     reply["outcome"] = json!("restore_failed");
     reply["posts_returned"] = json!(bracket.posts_returned);
     reply["target_fronted"] = json!(false);
@@ -154,7 +159,11 @@ pub(crate) fn disclose_failed_restore(reply: &mut Value, bracket: &BracketReport
 /// changed from the one read before posting, and the text is inside the part
 /// that changed. A field that already held the text, and did not change,
 /// proves nothing.
-pub(crate) fn typed_text_arrived(source: &dyn AppStateSource, focus: &TargetFocus, text: &str) -> bool {
+pub(crate) fn typed_text_arrived(
+    source: &dyn AppStateSource,
+    focus: &TargetFocus,
+    text: &str,
+) -> bool {
     let Some(before) = focus.before.as_deref() else {
         return false;
     };
@@ -174,10 +183,7 @@ pub(crate) fn changed_part<'a>(before: &str, after: &'a str) -> Option<&'a str> 
         .char_indices()
         .zip(after.chars())
         .find(|((_, left), right)| left != right)
-        .map_or_else(
-            || before.len().min(after.len()),
-            |((index, _), _)| index,
-        );
+        .map_or_else(|| before.len().min(after.len()), |((index, _), _)| index);
     // Ensure the prefix ends on a boundary of `after` as well; it does,
     // because the shared prefix is the same characters in both.
     let before_rest = &before[prefix..];
@@ -199,7 +205,10 @@ mod tests {
     #[test]
     fn the_changed_part_is_what_was_inserted() {
         assert_eq!(changed_part("abc", "abXYc"), Some("XY"));
-        assert_eq!(changed_part("hello hello", "hello hellohello"), Some("hello"));
+        assert_eq!(
+            changed_part("hello hello", "hello hellohello"),
+            Some("hello")
+        );
         assert_eq!(changed_part("", "hi"), Some("hi"));
         assert_eq!(changed_part("same", "same"), None);
         assert_eq!(changed_part("héllo", "héXllo"), Some("X"));
