@@ -602,6 +602,7 @@ fn recreated_v12() -> Value {
             "result_schema",
             &[
                 "ask_id",
+                "grant_persisted",
                 "bundle_identity",
                 "instances",
                 "unreadable",
@@ -633,6 +634,7 @@ fn recreated_v12() -> Value {
             "reason",
             "remedy",
             "ask_id",
+            "grant_persisted",
             "bundle_identity",
             "instances",
             "unreadable",

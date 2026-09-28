@@ -117,6 +117,19 @@ fn ask_id() -> Value {
     )
 }
 
+/// Whether an "always allow" answer given while this call waited was written
+/// to the grant store. The call proceeds either way, because the conversation
+/// grant is held in memory; a caller told `false` knows the answer will not
+/// survive a restart, and `reason` names why the write failed.
+fn grant_persisted() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "Present when the person answered allow_always while this call waited: \
+                        whether that answer was written to the grant store. False means it \
+                        holds for this conversation only, and reason says why the write failed.",
+    })
+}
+
 fn remedy() -> Value {
     string_field("What the caller should do next after a refusal.")
 }
@@ -340,6 +353,7 @@ fn read_state() -> Value {
         json!({"type": "integer", "description": "Subtrees the read could not open."}),
     );
     result.insert("ask_id".into(), ask_id());
+    result.insert("grant_persisted".into(), grant_persisted());
     result.insert("remedy".into(), remedy());
     result.insert("reason".into(), reason());
     result.insert("field".into(), field());
@@ -428,6 +442,7 @@ fn element_action_result(tokens: &[&[&str]], description: &str) -> Map<String, V
     result.insert("focused_element_id".into(), focused_element_id());
     result.insert("truncation".into(), truncation());
     result.insert("ask_id".into(), ask_id());
+    result.insert("grant_persisted".into(), grant_persisted());
     result.insert("remedy".into(), remedy());
     result.insert("reason".into(), reason());
     result.insert("field".into(), field());
@@ -695,6 +710,7 @@ fn takeover_result(extra_outcomes: &[&str], description: &str) -> Map<String, Va
     );
     result.insert("posts_returned".into(), posts_returned());
     result.insert("ask_id".into(), ask_id());
+    result.insert("grant_persisted".into(), grant_persisted());
     result.insert("remedy".into(), remedy());
     result.insert("reason".into(), reason());
     result.insert("field".into(), field());
@@ -920,6 +936,7 @@ fn object_mut<'a>(value: &'a mut Value, path: &str) -> &'a mut Map<String, Value
 fn widen_retained_result(row: &mut Value) {
     let properties = object_mut(row, "/result_schema/properties");
     properties.insert("ask_id".into(), ask_id());
+    properties.insert("grant_persisted".into(), grant_persisted());
     properties.insert("bundle_identity".into(), bundle_identity());
     properties.insert("instances".into(), instances());
     properties.insert("unreadable".into(), unreadable());
