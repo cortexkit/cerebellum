@@ -553,10 +553,7 @@ mod probe {
                 Arm::unmeasurable("3", "cancelled_wait_stops_early", reason),
             ]
         } else {
-            match wire
-                .take_target(FINDER_BUNDLE, "allow_conversation")
-                .await
-            {
+            match wire.take_target(FINDER_BUNDLE, "allow_conversation").await {
                 Ok(()) => vec![
                     arm_one(&mut wire, &screen).await,
                     arm_two(&mut wire, &screen).await,

@@ -315,13 +315,8 @@ mod macos_probe {
             return Err(format!("navigation refused: {navigated}"));
         }
 
-        let compose_target = mint_target_lease(
-            planes,
-            bundle_identity,
-            20,
-            "compose target lease",
-        )
-        .await?;
+        let compose_target =
+            mint_target_lease(planes, bundle_identity, 20, "compose target lease").await?;
         println!(
             "compose target lease: pid={} bundle_identity={} generation={} action_kind=compose",
             compose_target.pid,

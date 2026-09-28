@@ -634,10 +634,7 @@ mod macos_probe {
         target: &ProcessGrant,
         button: &ElementObservation,
     ) -> Result<Value, String> {
-        let current = match planes
-            .management
-            .resolve_process(&target.bundle_identity)
-        {
+        let current = match planes.management.resolve_process(&target.bundle_identity) {
             Ok(grant) => grant,
             Err(refusal) => {
                 return Err(format!(

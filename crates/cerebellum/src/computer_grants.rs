@@ -139,7 +139,9 @@ impl GrantStoreError {
 impl std::fmt::Display for GrantStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreadable { detail } => write!(formatter, "the grant store is unreadable: {detail}"),
+            Self::Unreadable { detail } => {
+                write!(formatter, "the grant store is unreadable: {detail}")
+            }
             Self::Corrupt { detail } => write!(formatter, "the grant store is corrupt: {detail}"),
             Self::UnknownVersion { found } => write!(
                 formatter,
@@ -149,7 +151,10 @@ impl std::fmt::Display for GrantStoreError {
                 write!(formatter, "the grant store could not be written: {detail}")
             }
             Self::NoMachineIdentity => {
-                write!(formatter, "this host has no machine identity to bind a grant to")
+                write!(
+                    formatter,
+                    "this host has no machine identity to bind a grant to"
+                )
             }
         }
     }
@@ -246,11 +251,10 @@ impl GrantStorage for FilesystemGrantStorage {
                 })
             }
         }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-            GrantStoreError::Corrupt {
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|error| GrantStoreError::Corrupt {
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         // The version is read before the records, so a file from a newer build
         // is reported as a version this build does not read rather than as
         // corruption: the remedy differs (run the newer build, not repair).
@@ -271,11 +275,10 @@ impl GrantStorage for FilesystemGrantStorage {
         let failed = |error: std::io::Error| GrantStoreError::WriteFailed {
             detail: error.to_string(),
         };
-        let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
-            GrantStoreError::WriteFailed {
+        let bytes =
+            serde_json::to_vec_pretty(state).map_err(|error| GrantStoreError::WriteFailed {
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         let directory = self
             .path
             .parent()
@@ -636,8 +639,7 @@ impl ConsentRefusal {
             Self::RouteClosed => json!({"outcome": "route_closed"}),
             Self::Cancelled => json!({"outcome": "cancelled"}),
         };
-        if let (Some(bundle_identity), Self::Denied { grant_kind, .. }) = (bundle_identity, self)
-        {
+        if let (Some(bundle_identity), Self::Denied { grant_kind, .. }) = (bundle_identity, self) {
             if *grant_kind == "app" {
                 reply["bundle_identity"] = json!(bundle_identity);
             }
@@ -662,9 +664,14 @@ enum AlwaysState {
 /// How a question ended, as its waiters see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Settlement {
-    Allowed { persisted: Option<Result<(), String>> },
+    Allowed {
+        persisted: Option<Result<(), String>>,
+    },
     Denied,
-    Ended { reason: &'static str, remedy: &'static str },
+    Ended {
+        reason: &'static str,
+        remedy: &'static str,
+    },
 }
 
 /// A question put to the person and not yet answered.
@@ -721,7 +728,9 @@ fn new_ask_id(grant_kind: &str) -> String {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl ComputerGrants {
@@ -991,7 +1000,10 @@ impl ComputerGrants {
         caller: &GrantCaller,
         need: &GrantNeed,
         carrier: &Arc<dyn QuestionCarrier>,
-    ) -> (Waiter<'_>, watch::Receiver<Option<(Settlement, Option<u64>)>>) {
+    ) -> (
+        Waiter<'_>,
+        watch::Receiver<Option<(Settlement, Option<u64>)>>,
+    ) {
         let subject = Subject::of(caller, need);
         let offers_always = matches!(need, GrantNeed::App { .. }) && self.offers_always(caller);
         let mut state = lock(&self.state);
@@ -1113,7 +1125,12 @@ impl ComputerGrants {
         let decision = body
             .get("decision")
             .and_then(Value::as_str)
-            .and_then(|decision| open.offered.iter().copied().find(|offered| *offered == decision));
+            .and_then(|decision| {
+                open.offered
+                    .iter()
+                    .copied()
+                    .find(|offered| *offered == decision)
+            });
         match decision {
             Some(ALLOW_CONVERSATION) => {
                 self.grant_conversation(&open.subject);
@@ -1155,7 +1172,12 @@ impl ComputerGrants {
         let Some(question) = state.questions.remove(ask_id) else {
             return;
         };
-        if state.open_by_subject.get(&question.subject).map(String::as_str) == Some(ask_id) {
+        if state
+            .open_by_subject
+            .get(&question.subject)
+            .map(String::as_str)
+            == Some(ask_id)
+        {
             state.open_by_subject.remove(&question.subject);
         }
         let executor = question.parked.first().copied();
@@ -1362,7 +1384,12 @@ impl ComputerGrants {
 }
 
 fn withdraw_question(state: &mut GrantState, ask_id: &str, question: OpenQuestion) {
-    if state.open_by_subject.get(&question.subject).map(String::as_str) == Some(ask_id) {
+    if state
+        .open_by_subject
+        .get(&question.subject)
+        .map(String::as_str)
+        == Some(ask_id)
+    {
         state.open_by_subject.remove(&question.subject);
     }
     // Stopping the task drops its registration with the elicitor, so an answer
@@ -1398,9 +1425,8 @@ fn question_body(ask_id: &str, need: &GrantNeed, offered: &[&'static str]) -> Va
     match need {
         GrantNeed::App { display_name, .. } => {
             params["app"] = json!(display_name);
-            params["message"] = json!(
-                "Covers reading and acting inside this application for this conversation."
-            );
+            params["message"] =
+                json!("Covers reading and acting inside this application for this conversation.");
         }
         GrantNeed::Takeover => {
             params["message"] = json!(

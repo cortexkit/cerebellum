@@ -30,8 +30,8 @@ use cerebellum_computer::platform::{TargetResolution, UnreadableReason};
 use cerebellum_core::clock::FakeClock;
 use serde_json::{json, Value};
 use support::computer::{
-    audit, grant, grant_app, identity, no_relay, management as unleased_management, management_with,
-    MutableTargetResolver, GRANTEE, TARGET_BUNDLE_ID,
+    audit, grant, grant_app, identity, management as unleased_management, management_with,
+    no_relay, MutableTargetResolver, GRANTEE, TARGET_BUNDLE_ID,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

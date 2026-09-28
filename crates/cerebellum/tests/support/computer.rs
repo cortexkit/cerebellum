@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use cerebellum::computer_grants::{ConsentContext, GrantCaller, QuestionCarrier};
+use cerebellum::elicit::AskOutcome;
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::audit::ComputerAudit;
 use cerebellum_computer::capture::{
@@ -12,8 +14,6 @@ use cerebellum_computer::capture_custody::{
     InMemoryGrantAuthority,
 };
 use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
-use cerebellum::computer_grants::{ConsentContext, GrantCaller, QuestionCarrier};
-use cerebellum::elicit::AskOutcome;
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
     DurableState, EffectClass, InMemoryJournalStorage, IoDiagnostic, IsolationClass, JournalConfig,
