@@ -444,6 +444,12 @@ where
     /// it such keystrokes are refused, and the refusal names only what the
     /// build can do instead.
     fronting_bracket_admitted: bool,
+    /// The screen-lock reading this crate's own tests serve under, in place of
+    /// the machine's. Tests that drive the production plane through the frame
+    /// loop must not refuse or disclose according to whether the developer's
+    /// screen happens to be locked while they run.
+    #[cfg(test)]
+    session_lock_for_test: Option<Option<bool>>,
 }
 
 impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
@@ -532,7 +538,18 @@ where
             ),
             make_synthetic_driver,
             fronting_bracket_admitted: false,
+            #[cfg(test)]
+            session_lock_for_test: None,
         }
+    }
+
+    /// Serve as though the screen-lock reading were `state`, whatever the
+    /// machine running the test reports. Only the macOS frame-loop tests
+    /// serve the production plane, so it is compiled for them alone.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_session_lock_for_test(mut self, state: Option<bool>) -> Self {
+        self.session_lock_for_test = Some(state);
+        self
     }
 
     /// Allow keystrokes to reach an application in the background by bringing
@@ -639,7 +656,20 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
-        let reply = match capability.0 {
+        // Every served row reads or acts through accessibility or posts input,
+        // and a locked screen hides every application's interface from both.
+        // Checked before the request touches anything -- no target resolved,
+        // no person asked, nothing posted -- so the caller learns the reason
+        // by name instead of reading an empty tree as an empty application.
+        let lock_state = self.session_locked();
+        if lock_state == Some(true) {
+            let reply = match capability.0 {
+                Served::Type | Served::Keys => synthetic_wire_envelope(screen_locked_reply()),
+                _ => screen_locked_reply(),
+            };
+            return self.finish_reply(capability.capability(), reply);
+        }
+        let mut reply = match capability.0 {
             Served::ReadState => {
                 self.serve_read_state(arguments, context, make_backend)
                     .await
@@ -669,7 +699,45 @@ where
                     .await
             }
         };
+        // The call went ahead without knowing whether the screen was locked.
+        // Said on the reply so an empty tree or a missing element is not
+        // taken for an application that has nothing there.
+        if lock_state.is_none() {
+            if let Some(object) = reply.as_object_mut() {
+                object.insert("screen_lock_state".into(), json!("unknown"));
+            }
+        }
         self.finish_reply(capability.capability(), reply)
+    }
+
+    /// Whether the screen is locked now, read fresh from the platform driver.
+    fn session_locked(&self) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(state) = self.session_lock_for_test {
+            return state;
+        }
+        (self.make_synthetic_driver)().session_locked()
+    }
+
+    /// The refusal for a call whose wait for the person's answer ended with
+    /// the screen locked, or `None` when it may go on. `admission` supplies
+    /// the grant-persistence disclosure the refusal still carries.
+    ///
+    /// A consent question can hold a call for minutes, and the person may lock
+    /// the screen meanwhile, so the check made when the call arrived no longer
+    /// holds. Nothing is acted on; the grant the answer produced stays held,
+    /// so a retry once the screen is unlocked is admitted without asking again.
+    fn locked_after_wait(
+        &self,
+        waited: bool,
+        admission: &crate::computer_grants::GrantAdmission,
+    ) -> Option<Value> {
+        if !waited || self.session_locked() != Some(true) {
+            return None;
+        }
+        let mut reply = screen_locked_reply();
+        admission.decorate(&mut reply);
+        Some(reply)
     }
 
     /// Read the named application's state as a text tree, numbering its
@@ -708,6 +776,9 @@ where
             }
             Err(refusal) => return refusal.reply(&parsed.target),
         };
+        if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
+            return locked;
+        }
         let sessions = management.app_state_sessions().clone();
         let conversation_key = identity.conversation_key.clone();
 
@@ -916,6 +987,9 @@ where
             }
             Err(refusal) => return refusal.reply(&parsed.app),
         };
+        if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
+            return locked;
+        }
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
@@ -1022,6 +1096,9 @@ where
             }
             Err(refusal) => return refusal.reply(&parsed.target),
         };
+        if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
+            return locked;
+        }
 
         // Before anything is posted or fronted: the target's own focused
         // element must be readable and must not be a secure field. Asked of
@@ -1095,6 +1172,9 @@ where
                     }
                     if takeover.persisted.is_some() {
                         admission.persisted = takeover.persisted;
+                    }
+                    if let Some(locked) = self.locked_after_wait(takeover.waited, &admission) {
+                        return locked;
                     }
                 }
                 Err(ConsentRefusal::Cancelled) => {
@@ -1399,6 +1479,24 @@ fn parse_read_state_request(arguments: &Value) -> Result<ParsedReadState, Value>
         subtree_element_id: optional_text(object, "subtree_element_id")?,
         text_filter: optional_text(object, "text_filter")?,
         include_image,
+    })
+}
+
+/// What a call refused for a locked screen tells its caller to do.
+///
+/// The web version is named because a browser page is driven through the
+/// browser's own debugging protocol, which keeps working while the screen is
+/// locked; the remedy is useful to someone away from the machine.
+const SCREEN_LOCKED_REMEDY: &str = "The Mac's screen is locked, and macOS hides every app's \
+     interface while it is. Try again once the screen is unlocked, or use the site's web version \
+     with browser_use, which works while the screen is locked.";
+
+/// The refusal every served row gives while the screen is locked.
+fn screen_locked_reply() -> Value {
+    json!({
+        "outcome": "screen_locked",
+        "reason": "screen_locked",
+        "remedy": SCREEN_LOCKED_REMEDY,
     })
 }
 

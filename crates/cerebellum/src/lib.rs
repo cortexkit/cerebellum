@@ -7836,6 +7836,19 @@ mod computer_consent_wire_tests {
             JournalPersistence::Isolated,
         );
         planes.management = Arc::new(ManagementPlane::new(Arc::new(Running)));
+        // The production plane reads the real screen lock, and a locked
+        // developer machine would refuse the wait before it asks anyone.
+        // These tests are about the parked question, so the screen is unlocked.
+        planes.computer =
+            computer_capability::computer_audit(JournalPersistence::Isolated).map(|audit| {
+                Arc::new(
+                    computer_capability::ComputerPlane::with_synthetic_driver(audit, || {
+                        computer_capability::NativeComputerPlatformDriver::default()
+                            .without_expected_post_condition()
+                    })
+                    .with_session_lock_for_test(Some(false)),
+                )
+            });
         planes.computer_admitted = test_admitted_computer_capabilities();
         planes.routes.insert(
             CHANNEL,

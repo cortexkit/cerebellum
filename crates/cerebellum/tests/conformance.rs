@@ -1297,7 +1297,10 @@ async fn feature_gated_identity_observer_records_resolved_facts() {
 /// refusal is the evidence: only the computer plane resolves a bundle identity,
 /// so receiving it, naming the application, establishes which handler ran.
 /// Which of the three resolution refusals comes back depends on what this
-/// host's window server can be read to say, so any of them is accepted.
+/// host's window server can be read to say, so any of them is accepted. On a
+/// host whose screen is locked the plane refuses `screen_locked` before it
+/// resolves anything; only the computer plane gives that answer either, so it
+/// is accepted as the same evidence.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_computer_capability_reaches_the_computer_plane() {
@@ -1332,6 +1335,9 @@ async fn a_computer_capability_reaches_the_computer_plane() {
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
+    if body["outcome"] == "screen_locked" {
+        return;
+    }
     // The computer plane resolves the named application before it asks for
     // its grant; the browser handler has no such capability and would refuse
     // it as unknown.

@@ -592,6 +592,27 @@ fn remove_properties(row: &mut Value, schema: &str, names: &[&str]) {
 fn recreated_v12() -> Value {
     let mut v13: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
 
+    // Every retained row gained the screen-lock disclosure, and its outcome
+    // description the sentence naming the screen_locked refusal. The keystroke
+    // rows' outcome is replaced whole below; wait's keeps its v12 wording.
+    for id in ["computer.type", "computer.keys", "computer.wait"] {
+        remove_properties(
+            row_mut(&mut v13, id),
+            "result_schema",
+            &["screen_lock_state"],
+        );
+    }
+    let wait_outcome = &mut row_mut(&mut v13, "computer.wait")["result_schema"]["properties"]
+        ["outcome"]["description"];
+    let v12_description = wait_outcome
+        .as_str()
+        .unwrap()
+        .split(" screen_locked means")
+        .next()
+        .unwrap()
+        .to_owned();
+    *wait_outcome = json!(v12_description);
+
     // The keystroke rows gained the consent envelope, the bundle-resolution
     // fields, the diff with its truncation and unreadable count, the focused
     // element, and their outcome a description of the v13 outcomes.

@@ -1409,6 +1409,20 @@ impl PlatformDriver for MacOs26PlatformDriver {
             self_echo_filter_live: false,
         }
     }
+    /// Asked of the window server on every call, never cached: the person can
+    /// lock the screen between two actions, or while one waits for consent.
+    fn session_locked(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            cerebellum_macos::screen_is_locked()
+        }
+        // This driver also compiles on other hosts, for conformance tests
+        // that link no macOS framework; there is no session to ask there.
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
     fn observe_input(
         &mut self,
         _request: InputObservationRequest,

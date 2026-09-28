@@ -764,6 +764,9 @@ where
             SessionAdmission::Gone => return stale_element_reply(),
             SessionAdmission::Refused(reply) => return reply,
         };
+        if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
+            return locked;
+        }
         let mut reply = self
             .press_and_diff(
                 identity,
@@ -832,6 +835,9 @@ where
             SessionAdmission::Gone => return image_unknown(),
             SessionAdmission::Refused(reply) => return reply,
         };
+        if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
+            return locked;
+        }
         let point = image
             .mapping
             .pixel_to_desktop(parsed.x as f64, parsed.y as f64);
@@ -917,6 +923,9 @@ where
             SessionAdmission::Gone => return stale_element_reply(),
             SessionAdmission::Refused(reply) => return reply,
         };
+        if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
+            return locked;
+        }
         let audit = self.audit.clone();
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);

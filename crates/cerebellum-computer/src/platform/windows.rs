@@ -1005,6 +1005,13 @@ impl PlatformDriver for WindowsPlatformDriver {
         }
     }
 
+    /// No locked-workstation reader exists for Windows yet, so the state is
+    /// reported as unknown and replies say so rather than implying the
+    /// session was seen to be unlocked.
+    fn session_locked(&self) -> Option<bool> {
+        None
+    }
+
     fn observe_input(
         &mut self,
         _request: InputObservationRequest,

@@ -232,6 +232,12 @@ impl PlatformDriver for SyntheticDriver {
         }
     }
 
+    /// A machine whose screen was read and found unlocked, so the whole
+    /// replies asserted here carry no unknown-lock disclosure.
+    fn session_locked(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn observe_input(
         &mut self,
         _request: InputObservationRequest,

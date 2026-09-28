@@ -24,6 +24,8 @@
 //!   is produced by copying another row.
 //! * `type`, `keys` and `wait` are kept, with the changes listed at
 //!   `retained_row_changes`.
+//! * Every row can refuse `screen_locked` and can carry the
+//!   `screen_lock_state` disclosure; `screen_lock_refusal` says why.
 
 use serde_json::{json, Map, Value};
 
@@ -1095,6 +1097,49 @@ fn retained_row_changes(row: &mut Value) {
     }
 }
 
+/// The `screen_locked` refusal and the `screen_lock_state` disclosure, which
+/// every row gains.
+///
+/// Every row reads or acts through accessibility or posts input, and a locked
+/// screen hides every application's interface from both while the windows
+/// stay listed: a read returns an empty tree, a lookup finds nothing, and
+/// input lands nowhere anyone can confirm. Without its own outcome that looks
+/// exactly like an empty application. The disclosure covers the other case,
+/// where the lock state could not be read and the call went ahead.
+fn screen_lock_refusal(row: &mut Value) {
+    let properties = object_mut(row, "/result_schema/properties");
+    properties.insert(
+        "screen_lock_state".into(),
+        json!({
+            "type": "string",
+            "enum": ["unknown"],
+            "description": "Present when whether the screen was locked could not be read and \
+                            the call went ahead. A locked screen hides every application's \
+                            interface, so an empty tree or a missing element may mean the \
+                            screen was locked rather than that the application has nothing \
+                            there.",
+        }),
+    );
+    let outcome = properties
+        .get_mut("outcome")
+        .and_then(Value::as_object_mut)
+        .expect("every row declares its outcome");
+    // The keystroke rows keep their outcome an open string, so only their
+    // description names the new refusal.
+    if let Some(tokens) = outcome.get_mut("enum").and_then(Value::as_array_mut) {
+        tokens.push(json!("screen_locked"));
+    }
+    let description = outcome
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("every row describes its outcome");
+    let description = format!(
+        "{description} screen_locked means the screen is locked, which hides every \
+         application's interface, so nothing was read or done; remedy says what to do instead."
+    );
+    outcome.insert("description".into(), json!(description));
+}
+
 /// Produce revision 13 from revision 12.
 pub fn v13_from_v12(v12: &Value, revision: &str) -> Value {
     let mut retained: Vec<Value> = v12["rows"]
@@ -1113,11 +1158,13 @@ pub fn v13_from_v12(v12: &Value, revision: &str) -> Value {
     let rows: Vec<Value> = V13_ROW_IDS
         .iter()
         .map(|id| {
-            retained
+            let mut row = retained
                 .iter()
                 .find(|row| row["capability_id"] == *id)
                 .cloned()
-                .unwrap_or_else(|| authored_row(id))
+                .unwrap_or_else(|| authored_row(id));
+            screen_lock_refusal(&mut row);
+            row
         })
         .collect();
     json!({

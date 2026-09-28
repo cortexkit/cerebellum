@@ -422,6 +422,13 @@ where
             Err(ConsentRefusal::Cancelled) => return cancelled_before_posting(),
             Err(refusal) => return refusal.reply(None),
         };
+        // Before placing again: a hit test on a locked screen finds nothing,
+        // which would be reported as nothing at the point.
+        if let Some(locked) =
+            self.locked_after_wait(takeover.admission().waited, takeover.admission())
+        {
+            return locked;
+        }
         if takeover.admission().waited {
             // The person may have taken a while to answer, and windows,
             // processes and grants may have moved meanwhile: find the target

@@ -1527,6 +1527,20 @@ pub trait PlatformDriver {
         request: AttendancePreconditionRequest,
     ) -> Result<AttendancePreconditionResult, DriverError>;
 
+    /// Whether the interactive session's screen is locked right now: `None`
+    /// when this platform has no reader for it or the reading failed.
+    ///
+    /// A locked screen hides every application's interface from the
+    /// accessibility API while the windows themselves stay listed, so a read
+    /// returns an empty tree, an element lookup finds nothing, and posted input
+    /// lands nowhere anyone can confirm. Callers read it fresh before acting
+    /// rather than trusting an earlier answer, because the person can lock the
+    /// screen at any moment. Defaults to unknown, never to unlocked, so a
+    /// platform without a reader cannot pass for one that looked.
+    fn session_locked(&self) -> Option<bool> {
+        None
+    }
+
     fn bounded_duration(milliseconds: u64) -> Result<Duration, DriverError> {
         if milliseconds > 300_000 {
             return Err(DriverError::InvalidRequest(
