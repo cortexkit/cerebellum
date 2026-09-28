@@ -595,8 +595,8 @@ pub enum ConsentRefusal {
 
 impl ConsentRefusal {
     /// The reply for this refusal, in the envelope every consent-capable row
-    /// declares. `Cancelled` has no generic form: each row answers a cancel
-    /// the way it always has.
+    /// declares. For `Cancelled` this is only a bare fallback: the serving rows
+    /// answer a cancel in their own existing cancel shape instead.
     pub fn reply(&self, bundle_identity: Option<&str>) -> Value {
         let mut reply = match self {
             Self::Pending { ask_id } => json!({
