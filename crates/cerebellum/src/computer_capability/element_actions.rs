@@ -490,21 +490,31 @@ pub(crate) fn expected_after_insert(
 }
 
 /// Write text into one element, journaling the attempt, and confirm it by
-/// reading the value back.
+/// reading the value back until it matches or `readback_bound` passes.
+///
+/// Polled rather than read once: Discord's editor (Electron) accepts an
+/// AXValue write and updates its value a moment later, so a single read taken
+/// straight after the write reported a mismatch for text that had in fact
+/// landed (measured live: the next read showed the exact text).
 pub(crate) fn write_blocking<R, T, S>(
     source: &dyn AppStateSource,
     journal: &mut ElementJournal<'_, R, T, S>,
     grant: &ProcessGrant,
-    element_id: &str,
     handle: &ElementHandle,
-    text: &str,
-    mode: WriteMode,
+    request: &ParsedWriteText,
+    readback_bound: Duration,
 ) -> Value
 where
     R: Redactor,
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
+    let ParsedWriteText {
+        element_id,
+        text,
+        mode,
+    } = request;
+    let (element_id, text, mode) = (element_id.as_str(), text.as_str(), *mode);
     let facts = match source.element_facts(handle) {
         Ok(facts) if facts.pid.is_none_or(|pid| pid == grant.pid) => facts,
         _ => return stale_element_reply(),
@@ -565,7 +575,18 @@ where
     // One attempt. Whether the application accepted the message or not, the
     // value read back is what decides, and nothing is retried as keystrokes.
     let written = source.write_text(handle, attribute, text);
-    let confirmed = matches!(source.text_value(handle), Ok(Some(after)) if after == expected);
+    let deadline = Instant::now() + readback_bound;
+    let confirmed = written.is_ok()
+        && loop {
+            if matches!(source.text_value(handle), Ok(Some(after)) if after == expected) {
+                break true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            std::thread::sleep(SETTLE_POLL.min(deadline - now));
+        };
     let (outcome, reply) = if confirmed {
         (
             "completed",
@@ -941,10 +962,9 @@ where
                     source.as_ref(),
                     &mut journal,
                     &grant,
-                    &parsed.element_id,
                     &handle,
-                    &parsed.text,
-                    parsed.mode,
+                    &parsed,
+                    settle,
                 )
             };
             let mut reply = written;

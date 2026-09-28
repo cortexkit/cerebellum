@@ -646,6 +646,34 @@ async fn a_field_that_cannot_be_written_names_type() {
     assert!(desk.state().writes.is_empty());
 }
 
+/// An application that updates its value a moment after accepting the write
+/// (Discord's editor does, measured live) is confirmed once the value shows,
+/// not reported unconfirmed on the first read.
+#[tokio::test]
+async fn a_value_that_lands_after_a_delay_is_confirmed() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        let composer = state.elements.get_mut(&12).unwrap();
+        let before = composer.value.clone();
+        composer.readbacks = [before.clone(), before].into_iter().collect();
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reply = write(
+        &plane,
+        &management,
+        &id_of(&tree, "Composer"),
+        "draft",
+        "replace_value",
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_observed");
+    assert_eq!(desk.state().writes.len(), 1, "exactly one attempt");
+}
+
 /// An application that accepts the write and keeps its old value is not
 /// reported as written: the reply is unconfirmed, and the text is not echoed
 /// anywhere in it.

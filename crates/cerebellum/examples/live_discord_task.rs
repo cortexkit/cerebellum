@@ -452,6 +452,13 @@ mod task {
 
     /// The capability and arguments for a planned action, or the guard's
     /// refusal. Keys always go to Discord.
+    /// The write mode the probe asks for: `replace_value` unless
+    /// `CEREBELLUM_PROBE_WRITE_MODE` names another, so the modes can be
+    /// compared on the same composer without a rebuild.
+    fn write_mode() -> String {
+        std::env::var("CEREBELLUM_PROBE_WRITE_MODE").unwrap_or_else(|_| "replace_value".to_string())
+    }
+
     pub fn checked_request(planned: &Planned<'_>) -> Result<(&'static str, Value), String> {
         guard(planned)?;
         Ok(match planned {
@@ -460,7 +467,7 @@ mod task {
             }
             Planned::WriteText { element, text } => (
                 "computer.write_text",
-                json!({"element_id": element.id, "text": text, "write_mode": "replace_value"}),
+                json!({"element_id": element.id, "text": text, "write_mode": write_mode()}),
             ),
             Planned::Keys { keys, .. } => {
                 ("computer.keys", json!({"target": DISCORD, "keys": keys}))
@@ -1429,6 +1436,29 @@ mod macos_probe {
             ));
         }
 
+        // Cleanup mode: close an open panel a previous run left attached to
+        // Discord's window, through the same accessibility path, and stop.
+        if std::env::var_os("CEREBELLUM_PROBE_CANCEL_PANEL").is_some() {
+            let cancel = desk
+                .find(
+                    "panel Cancel button",
+                    Read {
+                        roles: &["button"],
+                        text: Some("Cancel".into()),
+                        ..Read::default()
+                    },
+                    |lines| {
+                        task::unique(lines, |line| {
+                            line.role == "button" && line.head() == "Cancel"
+                        })
+                    },
+                )
+                .await
+                .map_err(|failure| format!("the panel's Cancel button: {failure}"))?;
+            desk.act(Planned::Press(&cancel)).await;
+            return Ok(());
+        }
+
         let step = "2 open the direct message";
         let start = desk.begin(step);
         let opened = open_direct_message(desk, &user).await;
@@ -1460,7 +1490,8 @@ mod macos_probe {
             Err(failure) => return Err(format!("the composer: {failure}")),
         };
 
-        if let (Some(file), Some(composer)) = (file, composer.as_ref()) {
+        let skip_attach = std::env::var_os("CEREBELLUM_PROBE_SKIP_ATTACH").is_some();
+        if let (Some(file), Some(composer), false) = (file, composer.as_ref(), skip_attach) {
             let step = "4 attach";
             let start = desk.begin(step);
             let attached = attach(desk, composer, file).await;
@@ -1471,6 +1502,12 @@ mod macos_probe {
         if let (Some(text), Some(composer)) = (options.text.as_deref(), composer.as_ref()) {
             let step = "5 write the message";
             let start = desk.begin(step);
+            // Pressing the composer first gives it focus inside the app, which
+            // some editors need before they accept an accessibility write.
+            if std::env::var_os("CEREBELLUM_PROBE_PRESS_COMPOSER").is_some() {
+                desk.act(Planned::Press(composer)).await;
+                tokio::time::sleep(SETTLE).await;
+            }
             if let Some(reply) = desk
                 .act(Planned::WriteText {
                     element: composer,
