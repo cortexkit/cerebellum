@@ -498,10 +498,10 @@ impl AppCode for NoIdentityReader {
 
 /// A process signed by one fixed team, for this crate's own tests of paths
 /// that hold an app grant but are not about signatures.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) struct SignedByFixtureTeam;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl AppCode for SignedByFixtureTeam {
     fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
         Ok(AppIdentity {
