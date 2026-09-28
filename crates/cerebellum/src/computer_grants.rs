@@ -886,7 +886,8 @@ enum Standing {
     Unasked,
     /// A grant exists for the application's bundle identity, and the process
     /// answering to it now does not satisfy the signature it was made for.
-    /// Carries the conversation grant that no longer applies, if one does not.
+    /// Carries this conversation's grant when it was one of those that
+    /// failed, so it can be dropped; `None` when only "always" records failed.
     SignatureChanged {
         stale: Option<AppIdentity>,
     },

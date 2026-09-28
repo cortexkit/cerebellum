@@ -1465,6 +1465,62 @@ mod tests {
         ManagementPlane::new(Arc::new(Fixed(resolution)))
     }
 
+    /// The platform resolver reads a real application's signature: Finder is
+    /// Apple-anchored with no Team ID, so it may be offered "always"; it
+    /// satisfies its own designated requirement and not one naming another
+    /// signer; and a grant whose process was replaced reads as unreadable
+    /// rather than as the replacement's signature.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_platform_resolver_reads_and_checks_finders_signature() {
+        let finder = cerebellum_macos::all_process_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|pid| {
+                cerebellum_macos::process_executable_path(*pid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|path| {
+                        path.to_string_lossy()
+                            .ends_with("/Finder.app/Contents/MacOS/Finder")
+                    })
+            });
+        let Some(pid) = finder else {
+            // No desktop session in this environment; nothing to read.
+            return;
+        };
+        let generation =
+            cerebellum_macos::process_start_time_micros(pid).expect("Finder's start time reads");
+        let grant = ProcessGrant {
+            pid,
+            bundle_identity: "com.apple.finder".to_string(),
+            process_generation_evidence: generation.to_string(),
+        };
+        let code = PlatformResolver::new().app_code(&grant);
+        let identity = code.identity().expect("Finder's signature reads");
+        assert_eq!(identity.team_id, None);
+        assert!(!identity.ad_hoc);
+        assert!(identity.apple_anchored);
+        assert!(identity.names_a_lasting_signer());
+        assert_eq!(code.satisfies(&identity.designated_requirement), Ok(true));
+        assert_eq!(
+            code.satisfies(
+                "identifier \"com.apple.finder\" and anchor apple generic and \
+                 certificate leaf[subject.OU] = \"ABCDE12345\""
+            ),
+            Ok(false)
+        );
+
+        let replaced = ProcessGrant {
+            process_generation_evidence: (generation + 1).to_string(),
+            ..grant
+        };
+        assert!(matches!(
+            PlatformResolver::new().app_code(&replaced).identity(),
+            Err(AppIdentityUnreadable::Failed { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn browser_grant_question_renders_and_mints_the_exact_disclosed_scope() {
         let plane = plane(TargetResolution::NotRunning);
