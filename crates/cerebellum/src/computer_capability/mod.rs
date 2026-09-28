@@ -2885,7 +2885,7 @@ mod startup_reconciliation_tests {
     /// larger change than this fence.
     #[test]
     fn the_production_constructor_reaches_startup_reconciliation() {
-        let source = include_str!("computer_capability.rs");
+        let source = include_str!("mod.rs");
         // Split at the test module's own attribute, assembled at runtime so
         // this literal is not itself the first match. Writing the attribute
         // whole made the split land on THIS line, which put the test module --
