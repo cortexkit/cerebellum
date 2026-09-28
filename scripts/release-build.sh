@@ -2,7 +2,7 @@
 #
 # Build the module with the release attestations that have been minted.
 #
-# Eight identifiers gate what the computer plane may advertise and serve. Each
+# Nine identifiers gate what the computer plane may advertise and serve. Each
 # attests that something happened OUTSIDE this repository -- a review was
 # conducted, a doctrine was written down -- so none of them can be derived from
 # the code they govern. They are supplied to the COMPILER rather than read at
@@ -185,6 +185,14 @@ export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 # catch is a taxonomy change, not a tuning change.
 export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
 
+# The application-state read, computer.read_state: an application's windows,
+# sheets and menu bar as a text tree with element ids that persist across
+# reads, the diff between reads, and the optional image of its frontmost
+# window taken through capture custody. A new semantic surface, so it has its
+# own review; UNSET until that review is minted, and the row is withheld with
+# a named reason until then. Its identifier is
+# CEREBELLUM_APP_STATE_REVIEW_REVISION.
+
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
 # "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
@@ -200,6 +208,7 @@ readonly ATTESTATIONS=(
   CEREBELLUM_CAPTURE_REVIEW_REVISION
   CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION
   CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION
+  CEREBELLUM_APP_STATE_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION
   CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION

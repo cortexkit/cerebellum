@@ -1418,6 +1418,7 @@ mod tests {
             global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
             capture_review_revision: Some("fixture-capture-review-v1".to_string()),
             semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+            app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
             windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
             release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
             vocabulary_digests: VocabularyDigestInputs {
@@ -1462,7 +1463,6 @@ mod tests {
             },
         };
         for id in [
-            "computer.read_state",
             "computer.press_element",
             "computer.press_point",
             "computer.write_text",
@@ -1481,8 +1481,42 @@ mod tests {
                 declaration.suppression_reason
             );
         }
-        // The accepting case, so a gate that withheld everything would fail.
+        // The accepting cases, so a gate that withheld everything would fail.
         assert!(driver.declaration("computer.type", &context).advertised);
+        assert!(
+            driver
+                .declaration("computer.read_state", &context)
+                .advertised
+        );
+    }
+
+    /// computer.read_state is advertised on its own review and accessibility
+    /// alone: with its review unbound it is withheld and says why, and with
+    /// Screen Recording off it is still advertised, because only the optional
+    /// image needs that grant.
+    #[test]
+    fn read_state_is_gated_on_its_own_review_and_not_on_screen_recording() {
+        let driver = MacOs26PlatformDriver::default();
+        let accessibility_only = live(&[PermissionService::Accessibility]);
+        let context = |inputs: ImmutableReleaseInputs| CapabilityAdvertisementContext {
+            inputs,
+            permissions: accessibility_only.clone(),
+            startup: StartupCapabilityProbe {
+                permissions: accessibility_only.clone(),
+                ..driver.startup_probe().clone()
+            },
+        };
+        let bound = driver.declaration("computer.read_state", &context(fully_bound_inputs()));
+        assert!(bound.advertised, "{:?}", bound.suppression_reason);
+
+        let mut inputs = fully_bound_inputs();
+        inputs.app_state_review_revision = None;
+        let unbound = driver.declaration("computer.read_state", &context(inputs));
+        assert!(!unbound.advertised);
+        assert_eq!(
+            unbound.suppression_reason.as_deref(),
+            Some("application state review revision is not bound")
+        );
     }
 
     /// computer.keys is withheld when accessibility is denied.
@@ -1563,6 +1597,7 @@ mod tests {
                 global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
                 capture_review_revision: Some("fixture-capture-review-v1".to_string()),
                 semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+                app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
                 vocabulary_digests: VocabularyDigestInputs {
@@ -1607,6 +1642,7 @@ mod tests {
                 global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
                 capture_review_revision: Some("fixture-capture-review-v1".to_string()),
                 semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
+                app_state_review_revision: Some("fixture-app-state-review-v1".to_string()),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
                 vocabulary_digests: VocabularyDigestInputs {

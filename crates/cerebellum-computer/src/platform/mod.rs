@@ -233,6 +233,9 @@ pub struct ImmutableReleaseInputs {
     pub capture_review_revision: Option<String>,
     pub semantic_actuation_review_revision: Option<String>,
     pub windows_actuation_review_revision: Option<String>,
+    /// The review of `computer.read_state`: the application-state tree, its
+    /// element ids, and its window image.
+    pub app_state_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
 }
@@ -322,6 +325,45 @@ fn capability_declaration(
         // Keep the permission-lookup failure reason unchanged. It identifies
         // an inability to resolve required permissions, which is more useful
         // to the caller than a release-input status.
+    } else if id == "computer.read_state" {
+        // A read through the accessibility API: advertised on its own review
+        // and the accessibility grant. Screen Recording is deliberately not a
+        // condition, because it serves only the optional image, and folding
+        // it in would hide the tree on every machine where it is off; a
+        // missing grant is reported on the image instead.
+        suppression_reason = if !platform_available {
+            Some("no application-state reader on this platform".to_string())
+        } else if !context.inputs.vocabulary_ready() {
+            Some("computer action vocabulary input unresolved".to_string())
+        } else if context.inputs.app_state_review_revision.is_none() {
+            Some("application state review revision is not bound".to_string())
+        } else if context.inputs.release_signing_topology_revision.is_none() {
+            Some("release signing topology revision is not bound".to_string())
+        } else {
+            match context
+                .startup
+                .permissions
+                .state(PermissionService::Accessibility)
+            {
+                PermissionLiveness::Live => None,
+                PermissionLiveness::Unavailable => {
+                    Some("Accessibility permission is not granted".to_string())
+                }
+                PermissionLiveness::GrantedPendingRelaunch => Some(
+                    "Accessibility permission is granted but not usable until this process restarts"
+                        .to_string(),
+                ),
+                PermissionLiveness::Unresolved => {
+                    Some("Accessibility permission is not established".to_string())
+                }
+                PermissionLiveness::ProbeFailed => Some(
+                    "the permission probe did not complete (module fault, not a settings \
+                     state); check the module log rather than System Settings"
+                        .to_string(),
+                ),
+            }
+        };
+        advertised = suppression_reason.is_none();
     } else if id == "computer.wait" {
         advertised = context.inputs.vocabulary_ready();
         suppression_reason =

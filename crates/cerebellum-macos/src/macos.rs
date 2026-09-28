@@ -248,7 +248,17 @@ pub fn encode_png(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, S
     if width == 0 || height == 0 {
         return Err("an image with no area cannot be encoded".to_string());
     }
+    let image = bgra_image(bgra, width, height)?;
+    encode_image(&image, "public.png", std::ptr::null())
+}
 
+/// Wrap tightly-packed BGRA pixels, already checked against their dimensions,
+/// as an image the system encoders and drawing calls accept.
+pub(crate) fn bgra_image(
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<CFRetained<CGImage>, String> {
     let data = CFData::from_bytes(bgra);
     let provider = CGDataProvider::with_cf_data(Some(&data))
         .ok_or_else(|| "the pixels could not be wrapped for encoding".to_string())?;
@@ -258,9 +268,9 @@ pub fn encode_png(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, S
     // Little-endian 32-bit, alpha last: the order the capture path delivers.
     let bitmap_info = CGBitmapInfo(2 | (2 << 12));
     // SAFETY: the provider holds the pixels for the lifetime of the image, and
-    // the dimensions match the buffer length checked above. The decode array is
-    // null, which the constructor documents as permitted.
-    let image = unsafe {
+    // the dimensions match the buffer length the caller checked. The decode
+    // array is null, which the constructor documents as permitted.
+    unsafe {
         CGImage::new(
             width,
             height,
@@ -275,12 +285,21 @@ pub fn encode_png(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, S
             CGColorRenderingIntent::RenderingIntentDefault,
         )
     }
-    .ok_or_else(|| "the pixels could not be read as an image".to_string())?;
+    .ok_or_else(|| "the pixels could not be read as an image".to_string())
+}
 
-    let png_type = CFString::from_static_str("public.png");
+/// Encode one image with the system encoder for `uniform_type`, passing
+/// `options` (a CFDictionary, or null) as the image's encoding properties.
+pub(crate) fn encode_image(
+    image: &CGImage,
+    uniform_type: &'static str,
+    options: *const std::ffi::c_void,
+) -> Result<Vec<u8>, String> {
+    let image_type = CFString::from_static_str(uniform_type);
     // SAFETY: every object created here is released on every path out,
     // including the early return. The encoded bytes are copied before the
-    // buffer holding them is released.
+    // buffer holding them is released. `options` is null or a dictionary the
+    // caller keeps alive for this call.
     unsafe {
         let out = CFDataCreateMutable(std::ptr::null(), 0);
         if out.is_null() {
@@ -288,20 +307,16 @@ pub fn encode_png(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, S
         }
         let destination = CGImageDestinationCreateWithData(
             out,
-            CFRetained::as_ptr(&png_type).as_ptr().cast(),
+            CFRetained::as_ptr(&image_type).as_ptr().cast(),
             1,
             std::ptr::null(),
         );
         if destination.is_null() {
             CFRelease(out.cast());
-            return Err("the system offers no PNG encoder".to_string());
+            return Err(format!("the system offers no {uniform_type} encoder"));
         }
 
-        CGImageDestinationAddImage(
-            destination,
-            CFRetained::as_ptr(&image).as_ptr().cast(),
-            std::ptr::null(),
-        );
+        CGImageDestinationAddImage(destination, (image as *const CGImage).cast(), options);
         let finalized = CGImageDestinationFinalize(destination);
         let length = CFDataGetLength(out.cast()) as usize;
         let encoded = if finalized && length > 0 {

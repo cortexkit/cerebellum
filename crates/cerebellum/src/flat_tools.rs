@@ -547,7 +547,7 @@ mod tests {
         let all = computer_tool(&computer_names()).unwrap();
         assert_eq!(
             all.schema["properties"]["action"]["enum"],
-            json!(["type", "keys", "wait"])
+            json!(["read_state", "type", "keys", "wait"])
         );
         let without_keys: Vec<_> = computer_names()
             .into_iter()
@@ -643,6 +643,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for (action, required) in [
+            ("read_state", vec!["target"]),
             ("type", vec!["target", "text"]),
             ("keys", vec!["keys", "target"]),
             ("wait", vec!["app", "predicate", "timeout_ms"]),
@@ -687,7 +688,6 @@ mod tests {
             "move",
             "drag",
             "scroll",
-            "read_state",
             "press_element",
             "press_point",
             "write_text",

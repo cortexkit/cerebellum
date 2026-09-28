@@ -1388,7 +1388,6 @@ async fn every_retired_or_unserved_computer_name_gets_a_typed_refusal() {
         ("computer.move", "unknown_method"),
         ("computer.drag", "unknown_method"),
         ("computer.scroll", "unknown_method"),
-        ("computer.read_state", "capability_not_admitted"),
         ("computer.press_element", "capability_not_admitted"),
         ("computer.takeover_move", "capability_not_admitted"),
     ] {

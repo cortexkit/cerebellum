@@ -26,6 +26,8 @@
 // input-bound checks run even where the macOS framework APIs are unavailable.
 #[cfg(any(target_os = "macos", test))]
 mod accessibility;
+#[cfg(target_os = "macos")]
+mod ax_state;
 #[cfg(any(target_os = "macos", test))]
 mod event_tap;
 #[cfg(any(target_os = "macos", test))]
@@ -36,6 +38,8 @@ mod launch;
 mod macos;
 #[cfg(target_os = "macos")]
 mod process_table;
+#[cfg(target_os = "macos")]
+mod window_image;
 
 // The export gate MATCHES the module gate above. `accessibility` compiles off
 // macOS under `test` on purpose, so its platform-neutral logic -- cycle
@@ -57,6 +61,11 @@ pub use accessibility::{
 pub use accessibility::{
     accessibility_is_permitted, focused_application_pid, read_accessibility_element,
     read_accessibility_tree, request_accessibility_action, FocusReadError,
+};
+#[cfg(target_os = "macos")]
+pub use ax_state::{
+    read_app_state, AxAppState, AxAppStateBounds, AxAppStateError, AxRetainedElement,
+    AxStateElement, AxStateValue,
 };
 #[cfg(target_os = "macos")]
 pub use event_tap::{uptime_now_ns, SessionEventTap};
@@ -92,3 +101,5 @@ pub use macos::{
 pub use process_table::{
     all_process_ids, host_name, process_arguments, process_executable_path, ProcessArguments,
 };
+#[cfg(target_os = "macos")]
+pub use window_image::{encode_scaled_jpeg, frontmost_window_id};

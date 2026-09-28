@@ -755,6 +755,13 @@ impl WindowsPlatformDriver {
                         None
                     };
                 }
+                // The application-state reader is macOS accessibility; Windows
+                // has none, and the Windows review never covered it.
+                "computer.read_state" => {
+                    declaration.advertised = false;
+                    declaration.suppression_reason =
+                        Some("no application-state reader on Windows".to_owned());
+                }
                 _ => {
                     // Consent-gated observed delivery cannot be used here, and
                     // Windows has no background synthetic path. Recompute
@@ -1112,6 +1119,7 @@ mod tests {
             global_dispatch_review_revision: Some("fixture-global-review".to_owned()),
             capture_review_revision: Some("fixture-capture".to_owned()),
             semantic_actuation_review_revision: Some("fixture-macos-semantic".to_owned()),
+            app_state_review_revision: Some("fixture-app-state-review".to_owned()),
             windows_actuation_review_revision: Some("fixture-windows-actuation".to_owned()),
             release_signing_topology_revision: Some("fixture-signing".to_owned()),
             vocabulary_digests: VocabularyDigestInputs {

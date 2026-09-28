@@ -20,6 +20,7 @@ fn valid_inputs() -> ComputerReleaseInputs {
         global_dispatch_review_revision: Some("fixture-global-dispatch-review-v1".into()),
         capture_review_revision: Some("fixture-capture-review-v1".into()),
         semantic_actuation_review_revision: Some("fixture-semantic-actuation-review-v1".into()),
+        app_state_review_revision: Some("fixture-app-state-review-v1".into()),
         windows_actuation_review_revision: Some("fixture-windows-actuation-review-v1".into()),
         release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
         vocabulary_digests: VocabularyDigestInputs {
@@ -116,12 +117,22 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // half below.
     assert_eq!(
         available_capabilities(&context),
-        vec!["computer.type", "computer.keys", "computer.wait"]
+        vec![
+            "computer.read_state",
+            "computer.type",
+            "computer.keys",
+            "computer.wait"
+        ]
     );
     assert_eq!(
         evidence.gate_admitted_capabilities,
         if cfg!(target_os = "macos") {
-            vec!["computer.type", "computer.keys", "computer.wait"]
+            vec![
+                "computer.read_state",
+                "computer.type",
+                "computer.keys",
+                "computer.wait",
+            ]
         } else {
             vec!["computer.wait"]
         }
@@ -144,8 +155,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. It is PARTIAL: the keystroke rows and wait are served, while the
-    // element-addressed and pointer rows have no wire handler yet.
+    // admit. It is PARTIAL: the state read, the keystroke rows and wait are
+    // served, while the element actions and pointer rows have no wire handler
+    // yet.
     //
     // PARTIAL rather than EMPTY is a release-visible claim: it says a caller can
     // act on the computer plane rather than only read its declarations. Changing
@@ -158,11 +170,16 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(
         computer_tools,
         if cfg!(target_os = "macos") {
-            vec!["computer.type", "computer.keys", "computer.wait"]
+            vec![
+                "computer.read_state",
+                "computer.type",
+                "computer.keys",
+                "computer.wait",
+            ]
         } else {
             vec!["computer.wait"]
         },
-        "the advertised set is no longer exactly the keystroke rows plus wait"
+        "the advertised set is no longer exactly the state read, the keystroke rows and wait"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -213,13 +230,13 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
     let offered = advertised(&bound);
     assert!(offered.contains("computer.type"), "{offered:?}");
     assert!(offered.contains("computer.keys"), "{offered:?}");
+    assert!(offered.contains("computer.read_state"), "{offered:?}");
     for never in [
         "computer.click",
         "computer.screenshot",
         "computer.move",
         "computer.drag",
         "computer.scroll",
-        "computer.read_state",
         "computer.press_element",
         "computer.press_point",
         "computer.write_text",
@@ -375,7 +392,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 11],
+        vec![ComputerGateOutcome::Pass; 12],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -387,6 +404,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "capture_review_revision",
         "semantic_actuation_review_revision",
         "windows_actuation_review_revision",
+        "app_state_review_revision",
         "release_signing_topology_revision",
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
@@ -404,6 +422,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                 inputs.semantic_actuation_review_revision = None
             }
             "windows_actuation_review_revision" => inputs.windows_actuation_review_revision = None,
+            "app_state_review_revision" => inputs.app_state_review_revision = None,
             "release_signing_topology_revision" => inputs.release_signing_topology_revision = None,
             "vocabulary_manifest_digest" => inputs.vocabulary_digests.manifest_digest = None,
             "vocabulary_source_lock_digest" => inputs.vocabulary_digests.source_lock_digest = None,
@@ -435,11 +454,22 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         match gate {
             "attendance_contract_owner"
             | "attendance_contract_revision"
-            | "input_review_revision"
-            | "release_signing_topology_revision" => assert_eq!(
+            | "input_review_revision" => {
+                assert_eq!(
+                    admitted,
+                    vec!["computer.read_state", "computer.wait"],
+                    "{gate} governs the keystroke rows"
+                )
+            }
+            "release_signing_topology_revision" => assert_eq!(
                 admitted,
                 vec!["computer.wait"],
-                "{gate} governs the keystroke rows"
+                "{gate} governs every reviewed row"
+            ),
+            "app_state_review_revision" => assert_eq!(
+                admitted,
+                vec!["computer.type", "computer.keys", "computer.wait"],
+                "{gate} governs the state read alone"
             ),
             // No served row is reviewed under these any more, so withholding
             // one withholds nothing.
@@ -512,7 +542,12 @@ fn global_dispatch_review_gate_governs_no_served_row() {
 
     assert_eq!(
         available_capabilities(&context),
-        vec!["computer.type", "computer.keys", "computer.wait"],
+        vec![
+            "computer.read_state",
+            "computer.type",
+            "computer.keys",
+            "computer.wait"
+        ],
     );
     assert!(
         computer_release_evidence(&context).gate_outcomes.contains(

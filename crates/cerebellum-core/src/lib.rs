@@ -37,3 +37,4 @@ pub mod journal;
 pub mod platform_dirs;
 pub mod principal;
 pub mod serde_base64;
+pub mod vision;

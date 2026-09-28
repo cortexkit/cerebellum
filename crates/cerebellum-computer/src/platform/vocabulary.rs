@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "2cc073a40561aa431d4a4fcde44dd9502eb3a9a040913eb146e28a56c1f7fa19";
+    "d8489580346fc14d683a67999270379fe012fa7f1ee899ceafbc44fb4d5a4621";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {

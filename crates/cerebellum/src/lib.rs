@@ -212,7 +212,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 19] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 20] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -251,6 +251,10 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 19] = [
     },
     ComputerReleaseGate {
         name: "windows_actuation_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "app_state_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     ComputerReleaseGate {
@@ -386,6 +390,7 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
             inputs.semantic_actuation_review_revision.as_deref()
         }
         "windows_actuation_review_revision" => inputs.windows_actuation_review_revision.as_deref(),
+        "app_state_review_revision" => inputs.app_state_review_revision.as_deref(),
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
         _ => unreachable!("every external release gate has a bound input"),
     }
@@ -408,7 +413,18 @@ fn declaration_gate_passes(
         return false;
     }
     let id = declaration.capability_id.as_str();
-    if matches!(id, "computer.type" | "computer.keys") {
+    if id == "computer.read_state" {
+        // The state tree, its element ids and its image are one reviewed
+        // surface of their own. Signing topology is required as for every
+        // reviewed row, because the accessibility grant it reads under is
+        // pinned to a stable signature.
+        [
+            "app_state_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
+    } else if matches!(id, "computer.type" | "computer.keys") {
         [
             "attendance_contract_owner",
             "attendance_contract_revision",
@@ -910,7 +926,7 @@ fn computer_permission_readings(
 /// Collect the release attestations supplied to the compiler and derive the
 /// vocabulary mirrors from their independent checked-in sources.
 ///
-/// The eight external identifiers use `option_env!` so a release invocation must
+/// The nine external identifiers use `option_env!` so a release invocation must
 /// supply each attestation before compilation. Starting a binary with a new
 /// environment value cannot manufacture a review after the binary was built.
 fn compiled_release_inputs() -> ComputerReleaseInputs {
@@ -918,6 +934,7 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         option_env!("CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION");
     let windows_actuation_review_revision =
         option_env!("CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION");
+    let app_state_review_revision = option_env!("CEREBELLUM_APP_STATE_REVIEW_REVISION");
     let release_signing_topology_revision =
         option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION");
     release_inputs_from_build_bindings(BuildReleaseBindings {
@@ -928,6 +945,7 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         capture_review_revision: option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
         semantic_actuation_review_revision,
         windows_actuation_review_revision,
+        app_state_review_revision,
         release_signing_topology_revision,
     })
 }
@@ -940,6 +958,7 @@ struct BuildReleaseBindings<'a> {
     capture_review_revision: Option<&'a str>,
     semantic_actuation_review_revision: Option<&'a str>,
     windows_actuation_review_revision: Option<&'a str>,
+    app_state_review_revision: Option<&'a str>,
     release_signing_topology_revision: Option<&'a str>,
 }
 
@@ -959,6 +978,7 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
         windows_actuation_review_revision: bindings
             .windows_actuation_review_revision
             .map(str::to_owned),
+        app_state_review_revision: bindings.app_state_review_revision.map(str::to_owned),
         release_signing_topology_revision: bindings
             .release_signing_topology_revision
             .map(str::to_owned),
@@ -2447,7 +2467,6 @@ async fn handle_frame(
                 {
                     planes
                         .management
-                        .computer_grants()
                         .end_conversation(&facts.identity.conversation_key);
                 }
                 if let Some(config) = planes.browser_config.as_ref() {
@@ -4797,8 +4816,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            8,
-            "expected eight attestations, found {read_here:?}"
+            9,
+            "expected nine attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -6305,6 +6324,7 @@ mod tests {
             capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669"),
             semantic_actuation_review_revision: None,
             windows_actuation_review_revision: None,
+            app_state_review_revision: None,
             release_signing_topology_revision: None,
         });
         assert_eq!(
@@ -6317,6 +6337,7 @@ mod tests {
                 capture_review_revision: Some("cerebellum-capture-review/v1@cb1f669".to_string()),
                 semantic_actuation_review_revision: None,
                 windows_actuation_review_revision: None,
+                app_state_review_revision: None,
                 release_signing_topology_revision: None,
                 vocabulary_digests: computer::platform::VocabularyDigestInputs {
                     manifest_digest: Some(
@@ -6377,6 +6398,7 @@ mod tests {
                 capture_review_revision: Some("fixture-capture-review"),
                 semantic_actuation_review_revision: Some("fixture-semantic-actuation-review"),
                 windows_actuation_review_revision: Some("fixture-windows-actuation-review"),
+                app_state_review_revision: Some("fixture-app-state-review"),
                 release_signing_topology_revision: Some("fixture-signing-topology"),
             }),
             permissions: Default::default(),
@@ -6385,7 +6407,7 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 11]
+            vec![ComputerGateOutcome::Pass; 12]
         );
     }
 }

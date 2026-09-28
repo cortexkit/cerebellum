@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod app_state;
 pub mod audit;
 pub mod capture;
 pub mod capture_custody;

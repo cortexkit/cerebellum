@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cerebellum_computer::app_state::session::AppStateSessions;
 use cerebellum_computer::platform::{ProcessGrant, TargetCandidate, TargetResolution};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -207,6 +208,10 @@ pub struct ManagementPlane {
     /// The computer plane's app and takeover grants, and the questions out
     /// for them.
     computer_grants: Arc<ComputerGrants>,
+    /// Each conversation's element ids and the diff baselines behind them.
+    /// Held beside the grants because both belong to a conversation and end
+    /// with it.
+    app_state_sessions: Arc<AppStateSessions>,
     resolver: Arc<dyn TargetResolver>,
     browser_grants: Arc<Mutex<GrantStore>>,
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
@@ -309,6 +314,7 @@ impl ManagementPlane {
     ) -> Self {
         Self {
             computer_grants,
+            app_state_sessions: Arc::new(AppStateSessions::new()),
             resolver,
             browser_grants: Arc::new(Mutex::new(GrantStore::default())),
             pending_browser_grants: Mutex::new(BTreeMap::new()),
@@ -323,6 +329,21 @@ impl ManagementPlane {
     /// The computer plane's grants.
     pub fn computer_grants(&self) -> &Arc<ComputerGrants> {
         &self.computer_grants
+    }
+
+    /// Every conversation's application-state sessions.
+    pub fn app_state_sessions(&self) -> &Arc<AppStateSessions> {
+        &self.app_state_sessions
+    }
+
+    /// Forget everything the computer plane holds for a conversation whose
+    /// last route unbound: its grants, its remembered refusals, its open
+    /// questions, and its element ids. An id outliving its conversation would
+    /// let a later conversation with the same key act on elements it never
+    /// read.
+    pub fn end_conversation(&self, conversation_key: &str) {
+        self.computer_grants.end_conversation(conversation_key);
+        self.app_state_sessions.end_conversation(conversation_key);
     }
 
     /// Resolve an application name to the one process answering to it now,

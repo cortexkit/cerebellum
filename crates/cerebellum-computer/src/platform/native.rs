@@ -15,8 +15,8 @@ use super::{
 };
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
-    CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,
-    WindowChangeKind, WindowFrame,
+    CaptureBackend, EnumeratedWindow, VisionWindowFrame, WindowCaptureFrame, WindowCaptureRequest,
+    WindowChange, WindowChangeKind, WindowFrame,
 };
 
 /// The process this system attributes our permission grants to.
@@ -521,6 +521,65 @@ impl CaptureBackend for NativeCaptureBackend {
             captured_at_ms: request.captured_at_ms,
             artifact: CaptureArtifact::Bytes(png),
             accessibility_root: None,
+        })
+    }
+
+    /// The target's frontmost on-screen window, from the window server's
+    /// front-to-back list. Reading the list fronts nothing.
+    fn frontmost_window_id(
+        &mut self,
+        target: &ProcessGrant,
+    ) -> Result<Option<String>, BackendError> {
+        Ok(cerebellum_macos::frontmost_window_id(target.pid).map(|id| id.to_string()))
+    }
+
+    /// Capture one window, re-check its owner, and resample it to the vision
+    /// limits as JPEG.
+    ///
+    /// Scaled here, where the raw pixels are, so nothing past this point holds
+    /// a full-resolution copy. A capture with no area is returned as such,
+    /// with no image, so the caller can name that failure rather than a
+    /// scaling one.
+    fn capture_window_for_vision(
+        &mut self,
+        request: &WindowCaptureRequest,
+    ) -> Result<VisionWindowFrame, BackendError> {
+        let window_id: u32 = request.filter.window_id.parse().map_err(|_| {
+            BackendError::Capture(format!("not a window id: {}", request.filter.window_id))
+        })?;
+        let capture = cerebellum_macos::capture_window(window_id, self.timeout, None)
+            .map_err(map_macos_capture_error)?;
+        capture_ownership_verdict(
+            window_id,
+            capture.owner_pid_at_capture,
+            &request.target,
+            verify_grant(capture.owner_pid_at_capture, &request.target),
+        )?;
+        let captured_width_px = u32::try_from(capture.width)
+            .map_err(|_| BackendError::Capture("the capture is too wide".into()))?;
+        let captured_height_px = u32::try_from(capture.height)
+            .map_err(|_| BackendError::Capture("the capture is too tall".into()))?;
+        let jpeg = match cerebellum_core::vision::fit_within_vision_limits(
+            captured_width_px,
+            captured_height_px,
+        ) {
+            Some((width, height)) => cerebellum_macos::encode_scaled_jpeg(
+                &capture.bgra,
+                capture.width,
+                capture.height,
+                width as usize,
+                height as usize,
+            )
+            .map_err(BackendError::Capture)?,
+            None => Vec::new(),
+        };
+        Ok(VisionWindowFrame {
+            owner_identity: request.target.clone(),
+            owner_identity_verified: true,
+            captured_width_px,
+            captured_height_px,
+            jpeg,
+            captured_at_ms: request.captured_at_ms,
         })
     }
 

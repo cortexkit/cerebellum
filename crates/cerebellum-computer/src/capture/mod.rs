@@ -244,6 +244,39 @@ pub struct CapturedWindow {
     pub desktop_independent_filter: bool,
 }
 
+/// One window captured for a vision model to read: resampled to fit the
+/// vision limits and encoded as JPEG.
+///
+/// The captured size travels with the image because a point read off the
+/// image maps back to the screen through it; the image's own size is read
+/// from the encoded bytes by whoever releases it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionWindowFrame {
+    pub owner_identity: ProcessGrant,
+    pub owner_identity_verified: bool,
+    pub captured_width_px: u32,
+    pub captured_height_px: u32,
+    pub jpeg: Vec<u8>,
+    pub captured_at_ms: u64,
+}
+
+/// The one window a single-window capture took, with its image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleWindowCapture {
+    /// The window as enumerated: its id, verified owner, and desktop frame in
+    /// points.
+    pub window: EnumeratedWindow,
+    pub frame: VisionWindowFrame,
+}
+
+/// Why a single-window capture produced no image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleWindowCaptureError {
+    /// The target has no on-screen window whose owner verifies.
+    NoWindow,
+    Capture(CaptureError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowChangeKind {
@@ -437,6 +470,23 @@ pub trait CaptureBackend {
         &mut self,
         request: &BroadDisplayCaptureRequest,
     ) -> Result<CaptureArtifact, BackendError>;
+    /// The id of the target's frontmost on-screen window, if it has one.
+    ///
+    /// A backend with no way to tell which window is in front says so rather
+    /// than guessing from enumeration order, which is not front-to-back.
+    fn frontmost_window_id(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<String>, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+    /// Capture one window resampled for a vision model and encoded as JPEG.
+    fn capture_window_for_vision(
+        &mut self,
+        _request: &WindowCaptureRequest,
+    ) -> Result<VisionWindowFrame, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
     /// Begin teardown without waiting for the native stream to stop.
     fn begin_teardown(&mut self) -> Result<BackendTeardownProgress, BackendError>;
     /// Poll teardown using elapsed monotonic time; this operation must not wait.
@@ -588,6 +638,64 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             maximum_window_reenumeration_interval_ms: self.maximum_reenumeration_interval_ms,
             measured_reenumeration_interval_ms: measured_interval,
         })
+    }
+
+    /// Capture exactly one window: the target's frontmost on-screen window,
+    /// resampled for a vision model.
+    ///
+    /// The scoped capture above takes every window the target owns; an agent
+    /// reading an application's state needs the one in front, and each extra
+    /// window is pixels of the person's work nobody asked for. The window must
+    /// be among the target's verified enumerated windows, and the owner is
+    /// checked again on the capture itself, as for a scoped capture.
+    pub fn capture_frontmost_window_for_vision(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<SingleWindowCapture, SingleWindowCaptureError> {
+        self.ensure_capture_permission(now_ms)
+            .map_err(SingleWindowCaptureError::Capture)?;
+        if matches!(
+            self.state,
+            CaptureSessionState::RevokedTeardownPending
+                | CaptureSessionState::RevokedTeardownComplete
+                | CaptureSessionState::RevokedTeardownDetached
+        ) {
+            return Err(SingleWindowCaptureError::Capture(
+                CaptureError::PermissionUnavailable,
+            ));
+        }
+        self.refresh_if_needed(now_ms)
+            .map_err(SingleWindowCaptureError::Capture)?;
+        let frontmost = self
+            .backend
+            .frontmost_window_id(&self.target)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?
+            .ok_or(SingleWindowCaptureError::NoWindow)?;
+        let window = self
+            .windows
+            .iter()
+            .find(|window| window.window_id == frontmost)
+            .cloned()
+            .ok_or(SingleWindowCaptureError::NoWindow)?;
+        let request = WindowCaptureRequest {
+            target: self.target.clone(),
+            filter: DesktopIndependentWindowFilter::new(window.window_id.clone()),
+            captured_at_ms: now_ms,
+            region: None,
+        };
+        let frame = self
+            .backend
+            .capture_window_for_vision(&request)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        if !frame.owner_identity_verified || frame.owner_identity != self.target {
+            // Never return pixels whose owner changed between enumeration and
+            // capture.
+            return Err(SingleWindowCaptureError::Capture(
+                CaptureError::CaptureScopeUnavailable,
+            ));
+        }
+        self.state = CaptureSessionState::Active;
+        Ok(SingleWindowCapture { window, frame })
     }
 
     fn ensure_capture_permission(&mut self, now_ms: u64) -> Result<(), CaptureError> {
@@ -829,6 +937,10 @@ pub struct InMemoryCaptureBackend {
     display_requests: Vec<BroadDisplayCaptureRequest>,
     teardown_behavior: TeardownBehavior,
     teardown_started: bool,
+    frontmost_window: Option<String>,
+    /// Per window: the captured size and the scaled JPEG a vision capture
+    /// returns.
+    vision_frames: BTreeMap<String, (u32, u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,6 +962,8 @@ impl Default for InMemoryCaptureBackend {
             display_requests: Vec::new(),
             teardown_behavior: TeardownBehavior::CompleteImmediately,
             teardown_started: false,
+            frontmost_window: None,
+            vision_frames: BTreeMap::new(),
         }
     }
 }
@@ -889,11 +1003,60 @@ impl InMemoryCaptureBackend {
     pub fn teardown_started(&self) -> bool {
         self.teardown_started
     }
+
+    pub fn set_frontmost_window(&mut self, window_id: Option<String>) {
+        self.frontmost_window = window_id;
+    }
+
+    pub fn set_vision_frame(
+        &mut self,
+        window_id: impl Into<String>,
+        captured_width_px: u32,
+        captured_height_px: u32,
+        jpeg: Vec<u8>,
+    ) {
+        self.vision_frames.insert(
+            window_id.into(),
+            (captured_width_px, captured_height_px, jpeg),
+        );
+    }
 }
 
 impl CaptureBackend for InMemoryCaptureBackend {
     fn screen_recording_liveness(&self) -> PermissionLiveness {
         self.permission
+    }
+
+    fn frontmost_window_id(
+        &mut self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<String>, BackendError> {
+        Ok(self.frontmost_window.clone())
+    }
+
+    fn capture_window_for_vision(
+        &mut self,
+        request: &WindowCaptureRequest,
+    ) -> Result<VisionWindowFrame, BackendError> {
+        self.window_requests.push(request.clone());
+        let window = self
+            .windows
+            .iter()
+            .find(|window| window.window_id == request.filter.window_id)
+            .ok_or_else(|| BackendError::Capture("window no longer exists".into()))?;
+        let (captured_width_px, captured_height_px, jpeg) = self
+            .vision_frames
+            .get(&window.window_id)
+            .cloned()
+            .ok_or_else(|| BackendError::Capture("no image for this window".into()))?;
+        Ok(VisionWindowFrame {
+            owner_identity: window.owner_identity.clone(),
+            owner_identity_verified: window.owner_identity_verified,
+            captured_width_px,
+            captured_height_px,
+            jpeg,
+            captured_at_ms: request.captured_at_ms,
+        })
     }
 
     fn enumerate_windows(
@@ -1056,6 +1219,51 @@ mod tests {
 
     /// Map a backend screen-locked failure to the distinct capture error so callers can
     /// recognize that unlocking the screen may resolve it.
+    /// A single-window capture takes exactly the window the backend names as
+    /// frontmost, and only when that window's owner verifies; a target with
+    /// no such window has nothing to capture.
+    #[test]
+    fn a_single_window_capture_takes_only_the_verified_frontmost_window() {
+        let owner = target();
+        let mut backend = InMemoryCaptureBackend::default();
+        backend.set_windows(vec![
+            window("10", &owner, true),
+            window("11", &owner, true),
+            window("12", &owner, false),
+        ]);
+        backend.set_vision_frame("11", 800, 600, vec![0xFF, 0xD8]);
+        backend.set_frontmost_window(Some("11".into()));
+        let mut controller =
+            ScopedCaptureController::with_v1_bounds(backend, owner.clone()).unwrap();
+        let captured = controller.capture_frontmost_window_for_vision(5).unwrap();
+        assert_eq!(captured.window.window_id, "11");
+        assert_eq!(captured.frame.captured_width_px, 800);
+        assert_eq!(controller.backend().window_requests().len(), 1);
+
+        controller
+            .backend_mut()
+            .set_frontmost_window(Some("12".into()));
+        assert_eq!(
+            controller.capture_frontmost_window_for_vision(6),
+            Err(SingleWindowCaptureError::NoWindow),
+            "an unverified window was captured"
+        );
+        controller.backend_mut().set_frontmost_window(None);
+        assert_eq!(
+            controller.capture_frontmost_window_for_vision(7),
+            Err(SingleWindowCaptureError::NoWindow)
+        );
+        controller
+            .backend_mut()
+            .set_permission_liveness(PermissionLiveness::Unavailable);
+        assert!(matches!(
+            controller.capture_frontmost_window_for_vision(8),
+            Err(SingleWindowCaptureError::Capture(
+                CaptureError::PermissionUnavailable
+            ))
+        ));
+    }
+
     #[test]
     fn a_locked_backend_error_reaches_capture_callers_as_screen_is_locked() {
         assert_eq!(

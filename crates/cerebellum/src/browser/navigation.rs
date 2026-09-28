@@ -40,26 +40,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_AX_NODES: usize = MAX_REFS;
 const MAX_AX_DEPTH: usize = 64;
 
+use cerebellum_core::vision::max_vision_width_px;
 /// Standard-tier vision long-edge cap, in pixels.
 ///
-/// Claude's standard tier uses 1568 for two different limits: the longest
-/// side of an image, and the visual-token budget where an image costs
-/// `ceil(width / 28) * ceil(height / 28)` tokens. The high-resolution tier
-/// (Claude 4.7 and later) allows 2576 px and 4784 tokens. This module cannot
-/// know which model will read a capture. Undershooting costs a high-resolution
-/// consumer some detail; overshooting makes the API downscale again, so the
-/// model produces coordinates in a smaller space than we report. That is the
-/// mismatch `click_point` exists to prevent. Standard is the bound that keeps
-/// every consumer correct.
-pub const VISION_LONG_EDGE_PX: u32 = 1568;
-
-/// Pixel size of one visual-token patch.
-const VISION_PATCH_PX: u32 = 28;
-
-/// Standard-tier visual-token cap. Equal to [`VISION_LONG_EDGE_PX`] on the
-/// standard tier; a distinct constant because an image can satisfy the edge
-/// limit while still costing more tokens than this.
-const VISION_TOKEN_CAP: u32 = 1568;
+// The vision limits are shared with the computer plane's window image, so
+// both planes size an image for the same readers with the same arithmetic.
+pub use cerebellum_core::vision::VISION_LONG_EDGE_PX;
+#[cfg(test)]
+use cerebellum_core::vision::{VISION_PATCH_PX, VISION_TOKEN_CAP};
 
 /// Page data extracted by the session-owned CDP driver.
 ///
@@ -159,38 +147,6 @@ pub fn screenshot_clip_scale(
     } else {
         Some(target_width / native_width)
     }
-}
-
-/// Largest aspect-preserving width, in pixels, that satisfies both
-/// standard-tier vision limits.
-///
-/// Tokens are counted on a grid of [`VISION_PATCH_PX`] squares, so feasible
-/// sizes are `patch_w` by `patch_h` rectangles with `patch_w * patch_h` at
-/// most [`VISION_TOKEN_CAP`] and each side at most [`VISION_LONG_EDGE_PX`].
-/// The largest size on the native aspect line is the right edge of the best
-/// such rectangle.
-fn max_vision_width_px(native_width: f64, native_height: f64) -> f64 {
-    let patch = f64::from(VISION_PATCH_PX);
-    let max_patches = VISION_LONG_EDGE_PX / VISION_PATCH_PX;
-    let aspect = native_height / native_width;
-    let mut best_width: f64 = 0.0;
-    for patch_w in 1..=max_patches {
-        for patch_h in 1..=max_patches {
-            if patch_w.saturating_mul(patch_h) > VISION_TOKEN_CAP {
-                continue;
-            }
-            // Half-open pixel box for this patch pair: width in
-            // ((patch_w-1)*patch, patch_w*patch], same for height. Intersect
-            // the aspect line with that box and keep the largest width.
-            let width_lo =
-                (f64::from(patch_w - 1) * patch).max(f64::from(patch_h - 1) * patch / aspect);
-            let width_hi = (f64::from(patch_w) * patch).min(f64::from(patch_h) * patch / aspect);
-            if width_hi > width_lo {
-                best_width = best_width.max(width_hi);
-            }
-        }
-    }
-    best_width.min(native_width)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

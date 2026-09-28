@@ -15,8 +15,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use cerebellum_computer::app_state::image::{
+    release_through_custody, ImageUnavailable, ReleasedImage, WindowImageCapture,
+};
+use cerebellum_computer::app_state::render::{render, RenderFilter};
+use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage};
+use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
+use cerebellum_computer::app_state::AuditImageCustody;
 use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
-use cerebellum_computer::capture::CaptureBackend;
+use cerebellum_computer::capture::{
+    CaptureBackend, CaptureError, ScopedCaptureController, SingleWindowCaptureError,
+};
 use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
     AttendanceContext, AttendanceLease, DispatchError, DispatchRequest, Dispatcher,
@@ -57,8 +66,8 @@ pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
 }
 use cerebellum_computer::platform::{
     blocked_chord, current_blocked_chord_platform, ActionKind, DispatchMode, EffectStatus,
-    HeldStateDisposition, PlatformDriver, SyntheticAction, SyntheticKey, SyntheticKeyModifiers,
-    UnsupportedPlatformDriver,
+    HeldStateDisposition, PermissionLiveness, PlatformDriver, SyntheticAction, SyntheticKey,
+    SyntheticKeyModifiers, UnsupportedPlatformDriver,
 };
 use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::journal::JournalIdentity;
@@ -283,6 +292,7 @@ pub struct Servable(Served);
 /// exactly what it serves and nothing it would have to refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Served {
+    ReadState,
     Type,
     Keys,
     Wait,
@@ -291,6 +301,7 @@ enum Served {
 impl Servable {
     pub fn capability(self) -> ComputerCapability {
         match self.0 {
+            Served::ReadState => ComputerCapability::ReadState,
             Served::Type => ComputerCapability::Type,
             Served::Keys => ComputerCapability::Keys,
             Served::Wait => ComputerCapability::Wait,
@@ -315,9 +326,9 @@ pub fn servable(name: &str) -> Option<Servable> {
         ComputerCapability::Type => Served::Type,
         ComputerCapability::Keys => Served::Keys,
         ComputerCapability::Wait => Served::Wait,
+        ComputerCapability::ReadState => Served::ReadState,
         // In the vocabulary, with no wire handler yet.
-        ComputerCapability::ReadState
-        | ComputerCapability::PressElement
+        ComputerCapability::PressElement
         | ComputerCapability::PressPoint
         | ComputerCapability::WriteText
         | ComputerCapability::TakeoverMove
@@ -406,6 +417,9 @@ where
     /// served row captures today, so nothing is held; the type stays so the
     /// plane's shape does not change when the state read's image arrives.
     capture_backend: std::marker::PhantomData<fn() -> B>,
+    /// Where application state is read from: the platform's accessibility
+    /// reader in a running module, a fixture in tests.
+    app_state_source: Arc<dyn AppStateSource>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
     refusal_ring: Mutex<RefusalRing<ComputerRefusalReason>>,
@@ -414,7 +428,7 @@ where
 
 impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
 where
-    B: CaptureBackend + Send,
+    B: CaptureBackend + Send + 'static,
     R: Redactor + Send + 'static,
     T: SeverityTaxonomy + Send + 'static,
     S: JournalStorage + Send + 'static,
@@ -443,7 +457,7 @@ where
 
 impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
 where
-    B: CaptureBackend + Send,
+    B: CaptureBackend + Send + 'static,
     R: Redactor + Send + 'static,
     T: SeverityTaxonomy + Send + 'static,
     S: JournalStorage + Send + 'static,
@@ -487,6 +501,7 @@ where
         Self {
             audit: Arc::new(Mutex::new(audit)),
             capture_backend: std::marker::PhantomData,
+            app_state_source: native_app_state_source(),
             result_schema_enforcement,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
             refusal_ring: Mutex::new(
@@ -497,6 +512,12 @@ where
             ),
             make_synthetic_driver,
         }
+    }
+
+    /// Read application state from `source` instead of the platform's reader.
+    pub fn with_app_state_source(mut self, source: Arc<dyn AppStateSource>) -> Self {
+        self.app_state_source = source;
+        self
     }
 
     /// How many journal sequences have been allocated.
@@ -585,11 +606,15 @@ where
         capability: Servable,
         arguments: &Value,
         context: ServeContext<'_, C>,
-        // The capture backend for a served row that returns pixels. None of
-        // the rows served today does; the state read's image will.
-        _make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
+        // The capture backend for the state read's window image, the one
+        // served row that returns pixels.
+        make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
         let reply = match capability.0 {
+            Served::ReadState => {
+                self.serve_read_state(arguments, context, make_backend)
+                    .await
+            }
             Served::Wait => self.serve_wait(arguments, context).await,
             Served::Type => synthetic_wire_envelope(
                 self.serve_synthetic(ComputerCapability::Type, arguments, context)
@@ -601,6 +626,220 @@ where
             ),
         };
         self.finish_reply(capability.capability(), reply)
+    }
+
+    /// Read the named application's state as a text tree, numbering its
+    /// elements for this conversation, with one image of its frontmost window
+    /// when asked for.
+    ///
+    /// The read resets the diff baseline that later actions report against.
+    /// Filters narrow what is shown, never what is read, so the baseline
+    /// always covers everything the read reached.
+    async fn serve_read_state<C: MonotonicClock>(
+        &self,
+        arguments: &Value,
+        context: ServeContext<'_, C>,
+        make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
+    ) -> Value {
+        let parsed = match parse_read_state_request(arguments) {
+            Ok(parsed) => parsed,
+            Err(refusal) => return refusal,
+        };
+        let ServeContext {
+            cancel,
+            grantee: _,
+            identity,
+            management,
+            consent,
+            clock: _,
+            now_ms,
+        } = context;
+        let (grant, admission) = match management
+            .admit_app(&parsed.target, &consent, &cancel)
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(AppRefusal::Consent(ConsentRefusal::Cancelled)) => {
+                return json!({"outcome": "cancelled"})
+            }
+            Err(refusal) => return refusal.reply(&parsed.target),
+        };
+        let sessions = management.app_state_sessions().clone();
+        let conversation_key = identity.conversation_key.clone();
+
+        // An id from another application, another process generation or
+        // another conversation names nothing here; refused before reading so
+        // the caller learns it at once.
+        if let Some(subtree) = &parsed.subtree_element_id {
+            match sessions.resolve(&conversation_key, subtree) {
+                ElementResolution::Live {
+                    bundle_identity,
+                    pid,
+                    process_generation,
+                    ..
+                } if bundle_identity == grant.bundle_identity
+                    && pid == grant.pid
+                    && process_generation == grant.process_generation_evidence => {}
+                _ => {
+                    let mut reply = stale_subtree_reply();
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
+            }
+        }
+
+        let source = self.app_state_source.clone();
+        let read_grant = grant.clone();
+        let raw = tokio::task::spawn_blocking(move || {
+            source.read_app_state(&read_grant, ReadBounds::default())
+        })
+        .await
+        .unwrap_or(Err(AppStateReadError::Unreadable));
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(AppStateReadError::TargetGone) => {
+                let mut reply = json!({
+                    "outcome": "not_running",
+                    "bundle_identity": parsed.target,
+                    "remedy": "the application quit while it was being read; start it and read again",
+                });
+                admission.decorate(&mut reply);
+                return reply;
+            }
+            Err(error) => {
+                let mut reply = unreadable_application_reply(error);
+                admission.decorate(&mut reply);
+                return reply;
+            }
+        };
+
+        let observed = sessions.observe(&conversation_key, &grant, &raw);
+        let rendered = render(
+            &observed.roots,
+            &RenderFilter {
+                roles: &parsed.role_filter,
+                text: parsed.text_filter.as_deref(),
+                subtree: parsed.subtree_element_id.as_deref(),
+            },
+        );
+        if parsed.subtree_element_id.is_some() && !rendered.subtree_found {
+            let mut reply = stale_subtree_reply();
+            admission.decorate(&mut reply);
+            return reply;
+        }
+
+        let mut reply = json!({
+            "outcome": "completed",
+            "tree": rendered.tree,
+            "unreadable_subtrees": observed.unreadable_subtrees,
+        });
+        if let Some(focused) = observed.focused_element_id {
+            reply["focused_element_id"] = json!(focused);
+        }
+        if let Some(truncation) = rendered.truncation {
+            reply["truncation"] = json!({
+                "reason": truncation.reason.as_str(),
+                "omitted_elements": truncation.omitted_elements,
+            });
+        }
+        if parsed.include_image {
+            match self
+                .window_image(identity, &grant, now_ms, make_backend(&grant))
+                .await
+            {
+                Ok(image) => {
+                    let image_id = sessions.register_image(
+                        &conversation_key,
+                        RegisteredImage {
+                            bundle_identity: grant.bundle_identity.clone(),
+                            pid: grant.pid,
+                            process_generation: grant.process_generation_evidence.clone(),
+                            width_px: image.width_px,
+                            height_px: image.height_px,
+                            mapping: image.mapping,
+                        },
+                    );
+                    reply["image"] = json!({
+                        "image_id": image_id,
+                        "mime": "image/jpeg",
+                        "data_b64": cerebellum_core::serde_base64::encode(&image.jpeg),
+                        "width_px": image.width_px,
+                        "height_px": image.height_px,
+                    });
+                }
+                Err(reason) => {
+                    reply["image_unavailable"] = json!({"reason": reason.as_str()});
+                }
+            }
+        }
+        admission.decorate(&mut reply);
+        reply
+    }
+
+    /// Capture the target's frontmost window through custody.
+    ///
+    /// Screen Recording is checked first, so a machine without it answers
+    /// with that reason and journals nothing. Past that, the capture runs
+    /// inside the custody sequence: nothing is returned unless custody holds
+    /// the image and its journal record is final.
+    async fn window_image(
+        &self,
+        identity: JournalIdentity,
+        grant: &cerebellum_computer::platform::ProcessGrant,
+        now_ms: u64,
+        backend: B,
+    ) -> Result<ReleasedImage, ImageUnavailable> {
+        if backend.screen_recording_liveness() != PermissionLiveness::Live {
+            return Err(ImageUnavailable::ScreenRecordingNotLive);
+        }
+        let audit = self.audit.clone();
+        let grant = grant.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut audit = audit.blocking_lock();
+            let mut custody = AuditImageCustody {
+                audit: &mut audit,
+                identity,
+                now_ms,
+                bundle_identity: grant.bundle_identity.clone(),
+            };
+            release_through_custody(&mut custody, || {
+                let mut controller =
+                    ScopedCaptureController::with_v1_bounds(backend, grant.clone())
+                        .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
+                let captured = controller
+                    .capture_frontmost_window_for_vision(now_ms)
+                    .map_err(|error| match error {
+                        SingleWindowCaptureError::NoWindow => ImageUnavailable::NoWindowCaptured,
+                        SingleWindowCaptureError::Capture(
+                            CaptureError::PermissionUnavailable
+                            | CaptureError::PermissionPendingRelaunch,
+                        ) => ImageUnavailable::ScreenRecordingNotLive,
+                        SingleWindowCaptureError::Capture(CaptureError::UnsupportedOnPlatform) => {
+                            ImageUnavailable::CaptureUnavailable
+                        }
+                        SingleWindowCaptureError::Capture(_) => ImageUnavailable::CaptureFailed,
+                    })?;
+                Ok(WindowImageCapture {
+                    window_id: captured.window.window_id.clone(),
+                    owning_pid: grant.pid,
+                    window_origin: (
+                        f64::from(captured.window.frame.x),
+                        f64::from(captured.window.frame.y),
+                    ),
+                    window_points: (
+                        f64::from(captured.window.frame.width),
+                        f64::from(captured.window.frame.height),
+                    ),
+                    captured_px: (
+                        captured.frame.captured_width_px,
+                        captured.frame.captured_height_px,
+                    ),
+                    jpeg: captured.frame.jpeg,
+                })
+            })
+        })
+        .await
+        .unwrap_or(Err(ImageUnavailable::CaptureFailed))
     }
 
     /// Poll one accessibility predicate until it settles, expires, or is cancelled.
@@ -861,6 +1100,142 @@ where
     }
 }
 
+/// The platform's application-state reader, or one that refuses where there
+/// is none.
+fn native_app_state_source() -> Arc<dyn AppStateSource> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(cerebellum_computer::app_state::native::MacAppStateSource)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(cerebellum_computer::app_state::source::UnsupportedAppStateSource)
+    }
+}
+
+/// The most roles one `role_filter` may name.
+const MAX_ROLE_FILTERS: usize = 16;
+
+/// Every field `computer.read_state` accepts. Only `target` is required.
+const READ_STATE_REQUEST_FIELDS: [&str; 5] = [
+    "target",
+    "role_filter",
+    "subtree_element_id",
+    "text_filter",
+    "include_image",
+];
+#[cfg(test)]
+const READ_STATE_REQUIRED_FIELDS: [&str; 1] = ["target"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedReadState {
+    target: String,
+    role_filter: Vec<String>,
+    subtree_element_id: Option<String>,
+    text_filter: Option<String>,
+    include_image: bool,
+}
+
+fn invalid_read_state_request(field: &str, reason: &str) -> Value {
+    json!({"outcome": "invalid_request", "field": field, "reason": reason})
+}
+
+fn optional_text(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, Value> {
+    match object.get(field) {
+        None => Ok(None),
+        Some(Value::String(text)) if !text.trim().is_empty() => Ok(Some(text.clone())),
+        Some(Value::String(_)) => Err(invalid_read_state_request(field, "empty_value")),
+        Some(_) => Err(invalid_read_state_request(field, "wrong_type")),
+    }
+}
+
+fn parse_read_state_request(arguments: &Value) -> Result<ParsedReadState, Value> {
+    let Some(object) = arguments.as_object() else {
+        return Err(invalid_read_state_request("$", "wrong_type"));
+    };
+    if let Some(field) = object
+        .keys()
+        .filter(|field| !READ_STATE_REQUEST_FIELDS.contains(&field.as_str()))
+        .min()
+    {
+        return Err(invalid_read_state_request(field, "unknown_field"));
+    }
+    let target = match optional_text(object, "target")? {
+        Some(target) => target,
+        None => return Err(invalid_read_state_request("target", "missing_field")),
+    };
+    let role_filter = match object.get("role_filter") {
+        None => Vec::new(),
+        Some(Value::String(role)) if !role.trim().is_empty() => vec![role.clone()],
+        Some(Value::Array(roles)) if roles.is_empty() => {
+            return Err(invalid_read_state_request("role_filter", "empty_value"))
+        }
+        Some(Value::Array(roles)) if roles.len() > MAX_ROLE_FILTERS => {
+            return Err(invalid_read_state_request("role_filter", "exceeds_maximum"))
+        }
+        Some(Value::Array(roles)) => roles
+            .iter()
+            .map(|role| match role {
+                Value::String(role) if !role.trim().is_empty() => Ok(role.clone()),
+                Value::String(_) => Err(invalid_read_state_request("role_filter", "empty_value")),
+                _ => Err(invalid_read_state_request("role_filter", "wrong_type")),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(Value::String(_)) => {
+            return Err(invalid_read_state_request("role_filter", "empty_value"))
+        }
+        Some(_) => return Err(invalid_read_state_request("role_filter", "wrong_type")),
+    };
+    let include_image = match object.get("include_image") {
+        None => false,
+        Some(Value::Bool(include)) => *include,
+        Some(_) => return Err(invalid_read_state_request("include_image", "wrong_type")),
+    };
+    Ok(ParsedReadState {
+        target,
+        role_filter,
+        subtree_element_id: optional_text(object, "subtree_element_id")?,
+        text_filter: optional_text(object, "text_filter")?,
+        include_image,
+    })
+}
+
+fn stale_subtree_reply() -> Value {
+    json!({
+        "outcome": "stale_element",
+        "remedy": "subtree_element_id names no element of this application's current state; \
+                   read the state again without it and use an id from that read",
+    })
+}
+
+/// A read the application did not answer at all. Reported as a completed
+/// read of nothing, with the whole application counted as one unreadable
+/// subtree, because that is what it is: nothing was seen, and nothing may be
+/// concluded from the absence.
+fn unreadable_application_reply(error: AppStateReadError) -> Value {
+    let remedy = match error {
+        AppStateReadError::AccessibilityNotPermitted => {
+            "this module may not read other applications' accessibility trees; the \
+             Accessibility permission must be granted to it again"
+        }
+        AppStateReadError::UnsupportedOnPlatform => "this platform has no application-state reader",
+        AppStateReadError::TargetGone | AppStateReadError::Unreadable => {
+            "the application did not answer; read again, and if it keeps not answering it may \
+             be busy or hung"
+        }
+    };
+    json!({
+        "outcome": "completed",
+        "tree": "",
+        "unreadable_subtrees": 1,
+        "reason": error.as_str(),
+        "remedy": remedy,
+    })
+}
+
 pub(crate) const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -886,6 +1261,9 @@ pub(crate) fn served_request_fields(
     capability: ComputerCapability,
 ) -> Option<(&'static [&'static str], &'static [&'static str])> {
     match capability {
+        ComputerCapability::ReadState => {
+            Some((&READ_STATE_REQUEST_FIELDS, &READ_STATE_REQUIRED_FIELDS))
+        }
         ComputerCapability::Wait => Some((&WAIT_REQUEST_FIELDS, &WAIT_REQUEST_FIELDS)),
         ComputerCapability::Type | ComputerCapability::Keys => {
             let fields = synthetic_request_fields(capability)?;
@@ -904,6 +1282,7 @@ pub(crate) fn parse_served_request(
     arguments: &Value,
 ) -> Result<(), Value> {
     match capability {
+        ComputerCapability::ReadState => parse_read_state_request(arguments).map(|_| ()),
         ComputerCapability::Wait => parse_wait_request(arguments).map(|_| ()),
         _ => parse_synthetic_request(capability, arguments).map(|_| ()),
     }
