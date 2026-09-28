@@ -31,6 +31,8 @@ mod accessibility;
 mod ax_actions;
 #[cfg(target_os = "macos")]
 mod ax_state;
+#[cfg(target_os = "macos")]
+mod code_signing;
 #[cfg(any(target_os = "macos", test))]
 mod event_tap;
 #[cfg(any(target_os = "macos", test))]
@@ -75,6 +77,11 @@ pub use ax_actions::{
 pub use ax_state::{
     read_app_state, AxAppState, AxAppStateBounds, AxAppStateError, AxRetainedElement,
     AxStateElement, AxStateValue,
+};
+#[cfg(target_os = "macos")]
+pub use code_signing::{
+    code_satisfies_requirement, code_signing_identity, CodeSigningError, CodeSigningIdentity,
+    RequirementCheck,
 };
 #[cfg(target_os = "macos")]
 pub use event_tap::{uptime_now_ns, SessionEventTap};
