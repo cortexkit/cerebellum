@@ -4,6 +4,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use cerebellum_core::format_floor::{
+    tag_version, DurableFormat, FloorError, FormatFloor, NewerWriter,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -18,7 +21,15 @@ const JOURNAL_FILE: &str = "custody-events.jsonl";
 /// browser session open, or a lock left by a crash) refuses launches on that
 /// profile until the lock file is removed. Locks exist only while a session
 /// holds a profile, so a rollback with no browser running is unaffected.
+///
+/// Writing a lock raises the format floor to this version first, so staging
+/// refuses a build that could not read the locks on disk, and a build that
+/// meets a newer lock anyway refuses it by name rather than as invalid.
 const LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v2";
+
+/// The custody lock's format, as the format floor and staging name it.
+pub const CUSTODY_LOCK_FORMAT: DurableFormat =
+    DurableFormat::new("profile-custody-lock", tag_version(LOCK_FORMAT_VERSION));
 /// Written before the boot ID existed: the start time is always epoch microseconds.
 const V1_LOCK_FORMAT_VERSION: &str = "ck-browser-profile-custody-lock/v1";
 const JOURNAL_FORMAT_VERSION: &str = "ck-browser-profile-custody-event/v1";
@@ -632,6 +643,11 @@ pub enum ProfileCustodyRelease {
 pub enum ProfileCustodyLockError {
     Io(io::Error),
     InvalidRecord,
+    /// The lock was written by a newer build. Not invalid: a build that reads
+    /// its version reads it, so the remedy is that build, not deleting it.
+    NewerWriter(NewerWriter),
+    /// The format floor could not be raised, so no lock was written.
+    FormatFloor(FloorError),
     SupervisorGenerationUnavailable,
     SupervisorLivenessUnavailable,
     Journal(io::Error),
@@ -653,6 +669,7 @@ pub struct ProfileCustodyLocks<J, P> {
     supervisor: SupervisorGeneration,
     journal: J,
     liveness: P,
+    floor: FormatFloor,
 }
 
 impl<J, P> ProfileCustodyLocks<J, P>
@@ -675,12 +692,30 @@ where
             .read(true)
             .write(true)
             .open(coordination_path)?;
+        // Chosen from where the locks live: the operator's floor for the
+        // profiles under the module's data directory, none elsewhere.
+        let floor = FormatFloor::governing(&root);
         Ok(Self {
             root,
             supervisor,
             journal,
             liveness,
+            floor,
         })
+    }
+
+    /// Raise `floor` instead of the one chosen from the locks' location.
+    pub fn with_format_floor(mut self, floor: FormatFloor) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// Before any lock is written: a lock in this format on disk with no
+    /// floor naming it would let staging pass a build that cannot read it.
+    fn raise_format_floor(&self) -> Result<(), ProfileCustodyLockError> {
+        self.floor
+            .raise(CUSTODY_LOCK_FORMAT)
+            .map_err(ProfileCustodyLockError::FormatFloor)
     }
 
     pub fn mint_holder(&self) -> Result<HolderId, ProfileCustodyLockError> {
@@ -694,6 +729,7 @@ where
         key: ProfileCustodyKey,
         holder_id: HolderId,
     ) -> Result<ProfileCustodyAcquisition, ProfileCustodyLockError> {
+        self.raise_format_floor()?;
         let lock_path = self.root.join(key.filename());
         let stale = if let Some(installed) = read_record_if_present(&lock_path)? {
             match self.liveness.observe(installed.supervisor()) {
@@ -778,6 +814,7 @@ where
         directory: &Path,
     ) -> Result<(), ProfileCustodyLockError> {
         let canonical = fs::canonicalize(directory)?;
+        self.raise_format_floor()?;
         let _process_guard = IN_PROCESS_COORDINATION
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -941,8 +978,21 @@ fn read_record(path: &Path) -> Result<ProfileCustodyLockRecord, ProfileCustodyLo
 }
 
 fn decode_record(bytes: &[u8]) -> Result<ProfileCustodyLockRecord, ProfileCustodyLockError> {
-    let record: ProfileCustodyLockRecord =
+    let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| ProfileCustodyLockError::InvalidRecord)?;
+    // The version is read before the record: a newer build may add fields
+    // this build's strict reader rejects, and a newer lock must be refused as
+    // newer, never as invalid.
+    if let Some(found) = value
+        .get("format_version")
+        .and_then(serde_json::Value::as_str)
+    {
+        CUSTODY_LOCK_FORMAT
+            .refuse_newer_tag(found, LOCK_FORMAT_VERSION)
+            .map_err(ProfileCustodyLockError::NewerWriter)?;
+    }
+    let record: ProfileCustodyLockRecord =
+        serde_json::from_value(value).map_err(|_| ProfileCustodyLockError::InvalidRecord)?;
     // A version-1 record predates the boot ID, so one claiming a boot ID would
     // pair a boot with a start time in epoch microseconds.
     let version_known = match record.format_version.as_str() {

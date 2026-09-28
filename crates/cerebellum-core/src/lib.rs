@@ -31,6 +31,7 @@ pub mod clock;
 pub mod config;
 pub mod consent;
 pub mod dispatch;
+pub mod format_floor;
 pub mod health;
 pub mod identity;
 pub mod journal;

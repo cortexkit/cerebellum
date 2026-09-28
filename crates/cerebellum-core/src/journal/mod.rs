@@ -47,7 +47,7 @@ pub use late_events::{
 pub use redaction::{redact_then_truncate, RedactionUnavailable, Redactor};
 pub use refusal_ring::{
     CallerRefusalHistory, RefusalRecord, RefusalRing, RefusalRingConfig, RefusalRingError,
-    RefusalRingState,
+    RefusalRingState, REFUSAL_RING_FORMAT,
 };
 pub use severity::{
     taxonomy_digest, EffectClass, IsolationClass, ObservabilityClass, SeverityInputs,
@@ -55,6 +55,7 @@ pub use severity::{
 };
 pub use storage::{
     journal_data_path, FilesystemJournalStorage, InMemoryJournalStorage, JournalStorage,
+    AUDIT_JOURNAL_FORMAT,
 };
 
 pub type ActionObligationId = u64;
@@ -217,6 +218,10 @@ pub enum StorageError {
     LockPoisoned {
         binding: String,
     },
+    /// The format floor could not be raised, so nothing was written: a
+    /// journal on disk in a format no floor names is what lets a build that
+    /// cannot read it be staged.
+    FormatFloor(crate::format_floor::FloorError),
 }
 
 /// A lifecycle state visible from the read-only audit surface.

@@ -63,6 +63,10 @@ pub const GRANT_STORE_FILE: &str = "computer_grants.json";
 /// records name no signer, so none of them could grant anything.
 pub const GRANT_STORE_VERSION: u64 = 2;
 
+/// The grant store's format, as the format floor and staging name it.
+pub const GRANT_STORE_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new("computer-grants", GRANT_STORE_VERSION);
+
 /// How long a call waits in place for the person's answer before replying
 /// `consent_pending`.
 ///
@@ -234,13 +238,25 @@ impl GrantStorage for InMemoryGrantStorage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemGrantStorage {
     path: PathBuf,
+    floor: cerebellum_core::format_floor::FormatFloor,
 }
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl FilesystemGrantStorage {
+    /// A store at `path`, raising the format floor that governs where it is:
+    /// the operator's floor under the module's data directory, none for a
+    /// store anywhere else.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let floor = cerebellum_core::format_floor::FormatFloor::governing(&path);
+        Self { path, floor }
+    }
+
+    /// Raise `floor` instead of the one chosen from the store's location.
+    pub fn with_format_floor(mut self, floor: cerebellum_core::format_floor::FormatFloor) -> Self {
+        self.floor = floor;
+        self
     }
 
     /// The operator's store under the cerebellum data home, beside the audit
@@ -290,7 +306,7 @@ impl GrantStorage for FilesystemGrantStorage {
                 detail: "version is missing or is not an unsigned integer".to_string(),
             });
         };
-        if version != GRANT_STORE_VERSION {
+        if version != GRANT_STORE_FORMAT.version {
             return Err(GrantStoreError::UnknownVersion { found: version });
         }
         serde_json::from_value(value).map_err(|error| GrantStoreError::Corrupt {
@@ -302,6 +318,13 @@ impl GrantStorage for FilesystemGrantStorage {
         let failed = |error: std::io::Error| GrantStoreError::WriteFailed {
             detail: error.to_string(),
         };
+        // Before anything is written: a store in this format on disk with no
+        // floor naming it would let staging pass a build that cannot read it.
+        self.floor
+            .raise(GRANT_STORE_FORMAT)
+            .map_err(|error| GrantStoreError::WriteFailed {
+                detail: error.to_string(),
+            })?;
         let bytes =
             serde_json::to_vec_pretty(state).map_err(|error| GrantStoreError::WriteFailed {
                 detail: error.to_string(),

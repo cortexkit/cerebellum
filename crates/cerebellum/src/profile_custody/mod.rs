@@ -22,6 +22,7 @@ pub use holder_lock::{
     ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal, ProfileCustodyKey,
     ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks, ProfileCustodyRelease,
     StartTimeStability, SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
+    CUSTODY_LOCK_FORMAT,
 };
 
 /// The caller-visible reason for an unavailable profile-storage operation.

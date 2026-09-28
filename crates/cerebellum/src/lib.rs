@@ -28,6 +28,7 @@ pub mod connector_evidence;
 mod content_named_fixture;
 pub mod coordinate;
 pub mod custody;
+pub mod durable_formats;
 pub mod elicit;
 pub mod flat_tools;
 pub mod journal;

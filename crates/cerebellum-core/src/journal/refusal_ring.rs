@@ -13,7 +13,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::format_floor::{DurableFormat, FloorError, FormatFloor};
+
 const REFUSAL_RING_SCHEMA_VERSION: u64 = 1;
+
+/// The refusal ring's file format.
+pub const REFUSAL_RING_FORMAT: DurableFormat =
+    DurableFormat::new("refusal-ring", REFUSAL_RING_SCHEMA_VERSION);
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// The maximum number of detailed refusals retained independently for each caller.
@@ -89,6 +95,7 @@ impl<R> RefusalRingState<R> {
         if self.schema_version != REFUSAL_RING_SCHEMA_VERSION {
             return Err(RefusalRingError::UnsupportedSchemaVersion {
                 found: self.schema_version,
+                supported: REFUSAL_RING_SCHEMA_VERSION,
             });
         }
         if self.records_per_caller != config.records_per_caller {
@@ -119,10 +126,15 @@ pub enum RefusalRingError {
         configured: usize,
         stored: usize,
     },
+    /// The file names a schema version this build does not read. A version
+    /// above `supported` was written by a newer build.
     UnsupportedSchemaVersion {
         found: u64,
+        supported: u64,
     },
     Corrupt(String),
+    /// The format floor could not be raised, so the ring was not written.
+    FormatFloor(FloorError),
     Serialization(String),
     Io {
         operation: &'static str,
@@ -140,9 +152,15 @@ impl std::fmt::Display for RefusalRingError {
                 formatter,
                 "refusal ring capacity mismatch: configured {configured}, stored {stored}"
             ),
-            Self::UnsupportedSchemaVersion { found } => {
+            Self::UnsupportedSchemaVersion { found, supported } if found > supported => write!(
+                formatter,
+                "newer_writer: the refusal ring is schema version {found}, written by a newer \
+                 build; this build reads up to version {supported}"
+            ),
+            Self::UnsupportedSchemaVersion { found, .. } => {
                 write!(formatter, "unsupported refusal ring schema version {found}")
             }
+            Self::FormatFloor(error) => write!(formatter, "refusal ring not written: {error}"),
             Self::Corrupt(message) => write!(formatter, "corrupt refusal ring: {message}"),
             Self::Serialization(message) => {
                 write!(formatter, "refusal ring serialization failed: {message}")
@@ -166,7 +184,7 @@ impl std::error::Error for RefusalRingError {}
 #[derive(Debug)]
 enum RefusalPersistence {
     Memory,
-    Filesystem(PathBuf),
+    Filesystem { path: PathBuf, floor: FormatFloor },
 }
 
 /// A durable or isolated refusal store with an independent ring for each caller.
@@ -190,11 +208,21 @@ where
         let path = path.into();
         prepare_path(&path)?;
         let state = load_state(&path, config)?;
+        let floor = FormatFloor::governing(&path);
         Ok(Self {
             config,
-            persistence: RefusalPersistence::Filesystem(path),
+            persistence: RefusalPersistence::Filesystem { path, floor },
             state,
         })
+    }
+
+    /// Raise `floor` instead of the one chosen from the ring's location. An
+    /// in-memory ring has no file and ignores it.
+    pub fn with_format_floor(mut self, floor: FormatFloor) -> Self {
+        if let RefusalPersistence::Filesystem { floor: current, .. } = &mut self.persistence {
+            *current = floor;
+        }
+        self
     }
 
     /// Open an isolated ring that cannot touch durable operator data.
@@ -246,9 +274,12 @@ where
     }
 
     fn persist(&self, state: &RefusalRingState<R>) -> Result<(), RefusalRingError> {
-        let RefusalPersistence::Filesystem(path) = &self.persistence else {
+        let RefusalPersistence::Filesystem { path, floor } = &self.persistence else {
             return Ok(());
         };
+        floor
+            .raise(REFUSAL_RING_FORMAT)
+            .map_err(RefusalRingError::FormatFloor)?;
         let bytes = serde_json::to_vec(state)
             .map_err(|error| RefusalRingError::Serialization(error.to_string()))?;
         write_atomically(path, &bytes)
@@ -288,7 +319,26 @@ where
         }
         Err(error) => return Err(io_error("read", path, error)),
     };
-    let state: RefusalRingState<R> = serde_json::from_slice(&bytes)
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| RefusalRingError::Corrupt(error.to_string()))?;
+    // The version is read before the rest: a newer build may add fields this
+    // build's strict reader rejects, and that file must be refused as newer,
+    // not as corrupt.
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            RefusalRingError::Corrupt(
+                "schema_version is missing or is not an unsigned integer".to_string(),
+            )
+        })?;
+    if version != REFUSAL_RING_SCHEMA_VERSION {
+        return Err(RefusalRingError::UnsupportedSchemaVersion {
+            found: version,
+            supported: REFUSAL_RING_SCHEMA_VERSION,
+        });
+    }
+    let state: RefusalRingState<R> = serde_json::from_value(value)
         .map_err(|error| RefusalRingError::Corrupt(error.to_string()))?;
     state.validate(config)?;
     Ok(state)
@@ -353,7 +403,8 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
 
-    use super::{RefusalRing, RefusalRingConfig};
+    use super::{RefusalRing, RefusalRingConfig, RefusalRingError, REFUSAL_RING_SCHEMA_VERSION};
+    use crate::format_floor::{read_floors, FloorError, FormatFloor};
 
     static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -465,6 +516,75 @@ mod tests {
             first < 730,
             "a {first}-byte refusal row is not smaller than the measured actuation entry"
         );
+    }
+
+    #[test]
+    fn a_ring_from_the_next_version_is_refused_by_name_not_as_corrupt() {
+        let directory = temporary_directory();
+        let path = directory.join("refusals.json");
+        // Carries a field this build's strict reader rejects, so a reader that
+        // parsed before reading the version would call it corrupt.
+        let newer = serde_json::json!({
+            "schema_version": REFUSAL_RING_SCHEMA_VERSION + 1,
+            "records_per_caller": 1,
+            "callers": {},
+            "a_field_this_build_does_not_know": true,
+        });
+        fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
+
+        let error = RefusalRing::<Reason>::new(&path, config(1)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RefusalRingError::UnsupportedSchemaVersion { found, supported }
+                    if found == REFUSAL_RING_SCHEMA_VERSION + 1
+                        && supported == REFUSAL_RING_SCHEMA_VERSION
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().starts_with("newer_writer:"), "{error}");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_record_raises_the_format_floor_before_writing() {
+        let directory = temporary_directory();
+        let path = directory.join("refusals.json");
+        let floor_path = directory.join("format-floor.json");
+        let mut ring = RefusalRing::new(&path, config(1))
+            .unwrap()
+            .with_format_floor(FormatFloor::at(&floor_path));
+        ring.record_refusal("caller", "first", Reason::NoGrant)
+            .unwrap();
+
+        assert_eq!(
+            read_floors(&floor_path).unwrap().get("refusal-ring"),
+            Some(&REFUSAL_RING_SCHEMA_VERSION)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_floor_that_cannot_be_raised_refuses_the_record_and_writes_nothing() {
+        let directory = temporary_directory();
+        let path = directory.join("refusals.json");
+        let blocker = directory.join("not-a-directory");
+        fs::write(&blocker, b"file").unwrap();
+        let mut ring = RefusalRing::new(&path, config(1))
+            .unwrap()
+            .with_format_floor(FormatFloor::at(blocker.join("format-floor.json")));
+
+        let error = ring
+            .record_refusal("caller", "first", Reason::NoGrant)
+            .unwrap_err();
+        assert!(
+            matches!(error, RefusalRingError::FormatFloor(FloorError::Io { .. })),
+            "{error:?}"
+        );
+        assert!(!path.exists(), "the ring was written without a floor");
+        assert!(ring.history("caller").is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn temporary_directory() -> PathBuf {

@@ -13,8 +13,15 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use super::{DurableState, StorageError};
+use crate::format_floor::{DurableFormat, FormatFloor};
 
 const JOURNAL_SCHEMA_VERSION: u64 = 2;
+
+/// The journal file format, shared by every audit journal this module keeps
+/// (browser, computer and launch): they are written and read by this one
+/// storage, so they rise and fall together.
+pub const AUDIT_JOURNAL_FORMAT: DurableFormat =
+    DurableFormat::new("audit-journal", JOURNAL_SCHEMA_VERSION);
 const LEGACY_JOURNAL_SCHEMA_VERSION: u64 = 1;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -70,15 +77,31 @@ impl JournalStorage for InMemoryJournalStorage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilesystemJournalStorage {
     path: PathBuf,
+    floor: FormatFloor,
 }
 
 impl FilesystemJournalStorage {
+    /// A journal at `path`, raising the format floor that governs where it
+    /// is: the operator's floor under the module's data directory, none for a
+    /// journal anywhere else.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let floor = FormatFloor::governing(&path);
+        Self { path, floor }
+    }
+
+    /// Raise `floor` instead of the one chosen from the journal's location.
+    pub fn with_format_floor(mut self, floor: FormatFloor) -> Self {
+        self.floor = floor;
+        self
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn format_floor(&self) -> &FormatFloor {
+        &self.floor
     }
 
     /// Create and verify the journal directory before capabilities are offered.
@@ -360,6 +383,12 @@ impl JournalStorage for FilesystemJournalStorage {
     }
 
     fn save(&self, state: &DurableState) -> Result<(), StorageError> {
+        // Before anything is written: a journal in this format on disk with
+        // no floor naming it would let staging pass a build that cannot read
+        // it.
+        self.floor
+            .raise(AUDIT_JOURNAL_FORMAT)
+            .map_err(StorageError::FormatFloor)?;
         let stored = StoredJournal {
             schema_version: JOURNAL_SCHEMA_VERSION,
             state: state.clone(),
@@ -642,6 +671,69 @@ mod tests {
                 supported: 2,
             })
         );
+    }
+
+    #[test]
+    fn a_journal_from_the_next_version_is_refused_by_name_not_as_corrupt() {
+        let directory = TemporaryDirectory::new("newer-writer");
+        let path = directory.join("journal.json");
+        // A newer build may add fields this build's strict reader rejects;
+        // the version must be read, and refused, before any of them.
+        let newer = serde_json::json!({
+            "schema_version": JOURNAL_SCHEMA_VERSION + 1,
+            "state": {"a_field_this_build_does_not_know": true},
+            "another_new_top_level_field": 1,
+        });
+        fs::write(&path, serde_json::to_vec(&newer).unwrap()).expect("write newer journal");
+
+        assert_eq!(
+            FilesystemJournalStorage::new(&path).load(),
+            Err(StorageError::UnknownSchemaVersion {
+                path,
+                found: JOURNAL_SCHEMA_VERSION + 1,
+                supported: super::AUDIT_JOURNAL_FORMAT.version,
+            })
+        );
+    }
+
+    #[test]
+    fn a_save_raises_the_format_floor_before_writing() {
+        let directory = TemporaryDirectory::new("floor-raise");
+        let path = directory.join("journal.json");
+        let floor_path = directory.join("format-floor.json");
+        FilesystemJournalStorage::new(&path)
+            .with_format_floor(crate::format_floor::FormatFloor::at(&floor_path))
+            .save(&state(3))
+            .expect("save");
+
+        let floors = crate::format_floor::read_floors(&floor_path).expect("read floors");
+        assert_eq!(floors.get("audit-journal"), Some(&JOURNAL_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn a_floor_that_cannot_be_raised_refuses_the_save_and_writes_nothing() {
+        let directory = TemporaryDirectory::new("floor-refuses");
+        let path = directory.join("journal.json");
+        let blocker = directory.join("not-a-directory");
+        fs::write(&blocker, b"file").expect("plant a file where the floor's directory goes");
+        let result = FilesystemJournalStorage::new(&path)
+            .with_format_floor(crate::format_floor::FormatFloor::at(
+                blocker.join("format-floor.json"),
+            ))
+            .save(&state(3));
+
+        assert!(
+            matches!(result, Err(StorageError::FormatFloor(_))),
+            "{result:?}"
+        );
+        assert!(!path.exists(), "the journal was written without a floor");
+    }
+
+    #[test]
+    fn a_journal_outside_the_data_home_raises_no_floor() {
+        let directory = TemporaryDirectory::new("floor-isolated");
+        let storage = FilesystemJournalStorage::new(directory.join("journal.json"));
+        assert_eq!(storage.format_floor().path(), None);
     }
 
     #[test]

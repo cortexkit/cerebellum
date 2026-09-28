@@ -29,6 +29,12 @@ pub const REGISTRY_ARTIFACT: &[u8] =
 pub const REGISTRY_ARTIFACT_ID: &str = "ck-browser-profile-registry";
 pub const REGISTRY_ARTIFACT_REVISION: &str = "v1";
 pub const REGISTRY_SCHEMA: &str = "ck-browser-profile-registry/v1";
+/// The registry document's format, as the format floor and staging name it.
+pub const REGISTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new(
+        "profile-registry",
+        cerebellum_core::format_floor::tag_version(REGISTRY_SCHEMA),
+    );
 const REGISTRY_FILE: &str = ".ck-browser-profile-registry-v1.json";
 /// Append-only provenance for every re-identification of the managed root,
 /// kept BESIDE the registry rather than inside it. A rebound root is trusted
@@ -1581,6 +1587,34 @@ pub struct ProfileRegistry {
     artifact_report: ArtifactGateReport,
     config: RegistryConfig,
     instance_id: String,
+    format_floor: cerebellum_core::format_floor::FormatFloor,
+}
+
+/// Read a registry document, refusing one from a newer build by its schema
+/// before the strict parse. A newer document may carry fields this build
+/// rejects, and it must read as an unsupported schema, not as malformed.
+fn parse_registry_document(bytes: &[u8]) -> Result<RegistryDocument, RegistryDocumentRefusal> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| RegistryDocumentRefusal::Malformed)?;
+    if let Some(schema) = value.get("schema").and_then(Value::as_str) {
+        if REGISTRY_FORMAT
+            .refuse_newer_tag(schema, REGISTRY_SCHEMA)
+            .is_err()
+        {
+            return Err(RegistryDocumentRefusal::UnsupportedSchema);
+        }
+    }
+    let document: RegistryDocument =
+        serde_json::from_value(value).map_err(|_| RegistryDocumentRefusal::Malformed)?;
+    if document.schema != REGISTRY_SCHEMA {
+        return Err(RegistryDocumentRefusal::UnsupportedSchema);
+    }
+    Ok(document)
+}
+
+enum RegistryDocumentRefusal {
+    Malformed,
+    UnsupportedSchema,
 }
 
 fn empty_artifact_report() -> ArtifactGateReport {
@@ -1663,13 +1697,22 @@ impl ProfileRegistry {
                 root.canonical_path().to_string_lossy().as_bytes()
             ))[..16]
         );
+        let format_floor =
+            cerebellum_core::format_floor::FormatFloor::governing(root.canonical_path());
         Ok(Self {
             root,
             artifact,
             artifact_report,
             config,
             instance_id,
+            format_floor,
         })
+    }
+
+    /// Raise `floor` instead of the one chosen from the root's location.
+    pub fn with_format_floor(mut self, floor: cerebellum_core::format_floor::FormatFloor) -> Self {
+        self.format_floor = floor;
+        self
     }
 
     /// Construct a disabled registry without touching registry or profile state.
@@ -1681,12 +1724,15 @@ impl ProfileRegistry {
     ) -> Result<Self, RegistryError> {
         config.artifact_bytes = b"{}".to_vec();
         let root = Arc::new(HeldManagedRoot::open(root_path)?);
+        let format_floor =
+            cerebellum_core::format_floor::FormatFloor::governing(root.canonical_path());
         Ok(Self {
             root,
             artifact: Value::Null,
             artifact_report: empty_artifact_report(),
             config,
             instance_id: "disabled".to_string(),
+            format_floor,
         })
     }
 
@@ -1761,11 +1807,10 @@ impl ProfileRegistry {
             }
             Err(error) => return Err(RebindRefusal::Io(error)),
         };
-        let document: RegistryDocument =
-            serde_json::from_slice(&bytes).map_err(|_| RebindRefusal::MalformedRegistry)?;
-        if document.schema != REGISTRY_SCHEMA {
-            return Err(RebindRefusal::UnsupportedRegistrySchema);
-        }
+        let document = parse_registry_document(&bytes).map_err(|refusal| match refusal {
+            RegistryDocumentRefusal::Malformed => RebindRefusal::MalformedRegistry,
+            RegistryDocumentRefusal::UnsupportedSchema => RebindRefusal::UnsupportedRegistrySchema,
+        })?;
         if hex(&Sha256::digest(canonical_json(&document_payload(
             &document,
         )))) != document.integrity
@@ -1954,14 +1999,16 @@ impl ProfileRegistry {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         }
-        let document: RegistryDocument = serde_json::from_slice(&bytes).map_err(|_| {
-            RegistryError::Untrustworthy(UntrustworthyRegistryReason::MalformedRegistry)
+        let document = parse_registry_document(&bytes).map_err(|refusal| {
+            RegistryError::Untrustworthy(match refusal {
+                RegistryDocumentRefusal::Malformed => {
+                    UntrustworthyRegistryReason::MalformedRegistry
+                }
+                RegistryDocumentRefusal::UnsupportedSchema => {
+                    UntrustworthyRegistryReason::UnsupportedRegistrySchema
+                }
+            })
         })?;
-        if document.schema != REGISTRY_SCHEMA {
-            return Err(RegistryError::Untrustworthy(
-                UntrustworthyRegistryReason::UnsupportedRegistrySchema,
-            ));
-        }
         let current = self.current_root_identity()?;
         verify_root_identity(&document.managed_root_identity, &current)
             .map_err(RegistryError::Untrustworthy)?;
@@ -2023,6 +2070,12 @@ impl ProfileRegistry {
 
     fn write_document(&self, mut document: RegistryDocument) -> Result<(), RegistryError> {
         self.root.revalidate()?;
+        // Before anything is written: a registry in this format on disk with
+        // no floor naming it would let staging pass a build that cannot read
+        // it. Reported as storage I/O, the outcome a failed write already has.
+        self.format_floor
+            .raise(REGISTRY_FORMAT)
+            .map_err(|error| RegistryError::Io(io::Error::other(error)))?;
         document.integrity = hex(&Sha256::digest(canonical_json(&document_payload(
             &document,
         ))));
@@ -2665,6 +2718,12 @@ impl ProfileLifecycle {
             abort_signals: Vec::new(),
             deletion_excluded: BTreeSet::new(),
         })
+    }
+    /// Raise `floor` for registry writes instead of the one chosen from the
+    /// root's location.
+    pub fn with_format_floor(mut self, floor: cerebellum_core::format_floor::FormatFloor) -> Self {
+        self.registry = self.registry.with_format_floor(floor);
+        self
     }
     pub fn disabled(root: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let registry = ProfileRegistry::disabled(root, RegistryConfig::default())?;
