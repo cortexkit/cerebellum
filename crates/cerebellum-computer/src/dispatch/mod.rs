@@ -69,26 +69,45 @@ pub struct FrozenDispatchRow {
 }
 
 impl FrozenDispatchRow {
+    /// The dispatch row of a current capability; `None` for any other id,
+    /// including every retired one, so nothing can build a dispatch for a
+    /// capability the vocabulary no longer carries.
     pub fn for_capability(capability_id: &str) -> Option<Self> {
-        let action_kind = match capability_id {
-            "computer.drag" => ActionKind::MutateDurable,
-            "computer.screenshot" | "computer.wait" => ActionKind::Observe,
-            "computer.click" | "computer.type" | "computer.keys" | "computer.scroll"
-            | "computer.move" => ActionKind::Compose,
-            _ => return None,
-        };
-        let semantic_supported = matches!(
-            capability_id,
-            "computer.click" | "computer.type" | "computer.scroll"
-        );
+        let capability = ComputerCapability::parse(capability_id)?;
+        let action_kind = capability.action_kind();
+        // Which delivery each row may use, as its frozen row declares: the
+        // press and write rows act through accessibility and post nothing, the
+        // keystroke rows post per process or globally, and the pointer rows
+        // post only globally because the per-process path does not carry
+        // pointer events.
+        let (semantic_supported, synthetic_background_supported, synthetic_observed_supported) =
+            match capability {
+                ComputerCapability::PressElement
+                | ComputerCapability::PressPoint
+                | ComputerCapability::WriteText => (true, false, false),
+                ComputerCapability::Type => (true, true, true),
+                ComputerCapability::Keys => (false, true, true),
+                ComputerCapability::TakeoverMove
+                | ComputerCapability::TakeoverDrag
+                | ComputerCapability::TakeoverScroll => (false, false, true),
+                ComputerCapability::ReadState | ComputerCapability::Wait => (false, false, false),
+                ComputerCapability::Click
+                | ComputerCapability::Scroll
+                | ComputerCapability::Move
+                | ComputerCapability::Drag
+                | ComputerCapability::Screenshot => return None,
+            };
         let input = action_kind != ActionKind::Observe;
         Some(Self {
             capability_id: capability_id.to_string(),
             action_kind,
             semantic_supported,
-            synthetic_background_supported: input && capability_id != "computer.move",
-            synthetic_observed_supported: input,
-            pixel_fallback_eligible: matches!(capability_id, "computer.click" | "computer.scroll"),
+            synthetic_background_supported,
+            synthetic_observed_supported,
+            // No current row falls back to pixels: the element rows name
+            // elements by id and the pointer rows name points, never a
+            // pixel match standing in for an element.
+            pixel_fallback_eligible: false,
             coordinate_addressed: false,
             global_none_authorized: input,
             private_envelope_recognized: true,
@@ -922,9 +941,9 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         // target by coordinate at all. That is either pixel-fallback
         // eligibility -- the row may ground an element by pixels -- or the
         // frozen grounding policy declaring the capability coordinate-
-        // addressable in its own right, which is how computer.move and
-        // computer.drag are frozen. Without one of those, a coordinate is an
-        // assertion nothing has grounded.
+        // addressable in its own right, which is how computer.takeover_move
+        // and computer.takeover_drag are frozen. Without one of those, a
+        // coordinate is an assertion nothing has grounded.
         if request.row.coordinate_addressed
             && !request.row.pixel_fallback_eligible
             && crate::grounding::GroundingPolicy::coordinate_addressable_for_capability(

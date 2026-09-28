@@ -47,6 +47,7 @@ pub use vocabulary::{
     validate_vocabulary, validate_vocabulary_digests, VocabularyDigestInputs,
     VocabularyValidationError, COMPUTER_ACTION_VOCABULARY_REVISION,
     COMPUTER_ACTION_VOCABULARY_SCHEMA_ID, COMPUTER_ACTION_VOCABULARY_SHA256,
+    COMPUTER_CAPABILITY_ROW_IDS,
 };
 
 /// The only capability support states permitted by the platform contract.
@@ -66,7 +67,10 @@ pub enum DispatchMode {
     Observed,
 }
 
-/// Closed action-kind taxonomy owned by the vocabulary artifact.
+/// Closed action-kind taxonomy that consent leases are keyed by.
+///
+/// The vocabulary artifact no longer carries it: each capability's kind is
+/// stated once, by `ComputerCapability::action_kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
@@ -249,29 +253,6 @@ impl ImmutableReleaseInputs {
         self.global_dispatch_review_revision.is_some()
             && self.release_signing_topology_revision.is_some()
     }
-
-    fn capture_ready(&self) -> bool {
-        self.capture_review_revision.is_some() && self.release_signing_topology_revision.is_some()
-    }
-
-    fn semantic_actuation_ready(&self) -> bool {
-        self.semantic_actuation_review_revision.is_some()
-            && self.release_signing_topology_revision.is_some()
-    }
-}
-
-/// Whether a row's synthetic path moves the pointer rather than the keyboard.
-///
-/// The distinction is not cosmetic: per-process delivery carries keyboard events
-/// and not pointer events, so this decides whether a row can be served in
-/// background mode at all. `computer.click` is included because its SYNTHETIC
-/// fallback is a pointer click -- its semantic path is unaffected and remains
-/// the route it actually takes.
-fn synthetic_path_is_pointer(id: &str) -> bool {
-    matches!(
-        id,
-        "computer.click" | "computer.move" | "computer.scroll" | "computer.drag"
-    )
 }
 
 /// Builds the fixed declaration set from release inputs and startup evidence.
@@ -280,23 +261,18 @@ fn synthetic_path_is_pointer(id: &str) -> bool {
 /// from one that can only report the frozen vocabulary. The latter keeps all
 /// rows visible for release evidence and may still advertise `computer.wait`,
 /// because waiting has no platform operation to perform.
+///
+/// One declaration per current capability, in artifact order. Retired
+/// capabilities are not declared at all: they are not something this module
+/// offers, even as a withheld row.
 pub fn capability_declarations(
     context: &CapabilityAdvertisementContext,
     platform_available: bool,
 ) -> Vec<CapabilityDeclaration> {
-    [
-        "computer.click",
-        "computer.type",
-        "computer.keys",
-        "computer.scroll",
-        "computer.move",
-        "computer.drag",
-        "computer.screenshot",
-        "computer.wait",
-    ]
-    .into_iter()
-    .map(|id| capability_declaration(id, context, platform_available))
-    .collect()
+    crate::audit::ComputerCapability::ALL
+        .into_iter()
+        .map(|capability| capability_declaration(capability, context, platform_available))
+        .collect()
 }
 
 /// One row's declaration.
@@ -306,20 +282,15 @@ pub fn capability_declarations(
 /// symbols, which no path uses. The flag still exists on the startup probe as a
 /// reported fact; it decides nothing.
 fn capability_declaration(
-    id: &str,
+    capability: crate::audit::ComputerCapability,
     context: &CapabilityAdvertisementContext,
     platform_available: bool,
 ) -> CapabilityDeclaration {
-    let action_kind = if id == "computer.drag" {
-        ActionKind::MutateDurable
-    } else if id == "computer.screenshot" || id == "computer.wait" {
-        ActionKind::Observe
-    } else {
-        ActionKind::Compose
-    };
-    let retry_class = match id {
-        "computer.scroll" => RetryClass::ReconcileBeforeRetry,
-        "computer.move" | "computer.screenshot" | "computer.wait" => RetryClass::Idempotent,
+    use crate::audit::ComputerCapability;
+    let id = capability.capability_id();
+    let action_kind = capability.action_kind();
+    let retry_class = match capability {
+        ComputerCapability::ReadState | ComputerCapability::Wait => RetryClass::Idempotent,
         _ => RetryClass::NeverAutomaticRetry,
     };
     // Use the shared capability-vocabulary lookup instead of duplicating its
@@ -337,14 +308,13 @@ fn capability_declaration(
         };
     let mut advertised = false;
     // A suppression reason is an operator-facing diagnosis, so it must
-    // identify the missing layer. The application can already request a
-    // closed-vocabulary AxAction, but no handler serves those requests over the
-    // wire. Advertising this capability also requires the serving path to be
-    // explicitly approved and enabled; the platform layer itself is present.
+    // identify the missing layer. Rows that reach neither branch below are in
+    // the vocabulary with no handler serving them over the wire yet, and no
+    // release input can change that.
     let mut suppression_reason = permission_lookup_failure.clone().or_else(|| {
         Some(
-            "no wire serving handler: the semantic mechanism is built, and serving it \
-             awaits review and activation"
+            "no wire serving handler: the capability is in the vocabulary and is not \
+             served yet"
                 .to_string(),
         )
     });
@@ -356,69 +326,8 @@ fn capability_declaration(
         advertised = context.inputs.vocabulary_ready();
         suppression_reason =
             (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
-    } else if id == "computer.click" {
-        suppression_reason = if !context.inputs.vocabulary_ready() {
-            Some("computer action vocabulary input unresolved".to_string())
-        } else if !context.inputs.semantic_actuation_ready() {
-            if context.inputs.semantic_actuation_review_revision.is_none() {
-                Some("semantic actuation review revision is not bound".to_string())
-            } else {
-                Some("release signing topology revision is not bound".to_string())
-            }
-        } else {
-            None
-        };
-        advertised = suppression_reason.is_none();
-    } else if id == "computer.screenshot" {
-        // Named separately rather than as one combined reason. The
-        // conditions fail for unrelated causes -- a missing release input is
-        // a build-time omission, an unresolved permission is a property of
-        // the machine -- and a reader given one message for both has to
-        // rule out the other by hand.
-        let liveness = context
-            .startup
-            .permissions
-            .state(PermissionService::ScreenRecording);
-        suppression_reason = if !context.inputs.vocabulary_ready() {
-            Some("computer action vocabulary input unresolved".to_string())
-        } else if !context.inputs.capture_ready() {
-            Some("capture release input unresolved".to_string())
-        } else {
-            // Matching on the state rather than testing it against Live
-            // keeps the accepting case an ordinary arm. A branch that can
-            // "never" be reached is a crash waiting for the day the
-            // surrounding condition changes.
-            match liveness {
-                PermissionLiveness::Live => None,
-                PermissionLiveness::Unavailable => {
-                    Some("screen recording permission is not granted".to_string())
-                }
-                PermissionLiveness::GrantedPendingRelaunch => Some(
-                    "screen recording permission is granted but not usable until this \
-                     process restarts"
-                        .to_string(),
-                ),
-                // Nothing denied the permission; no usable reading was
-                // recorded for it. A reading is discarded when it comes from
-                // the process main thread, or when the system attributes the
-                // grant to a process other than the one expected here.
-                PermissionLiveness::Unresolved => {
-                    Some("screen recording permission is not established".to_string())
-                }
-                PermissionLiveness::ProbeFailed => Some(
-                    "the permission probe did not complete (module fault, not a settings \
-                     state); check the module log rather than System Settings"
-                        .to_string(),
-                ),
-            }
-        };
-        advertised = suppression_reason.is_none();
-    } else if matches!(
-        id,
-        "computer.type" | "computer.keys" | "computer.scroll" | "computer.move" | "computer.drag"
-    ) {
-        // The synthetic rows. Their wire handlers exist now, so the gate that
-        // was computed and discarded here is the one that decides them.
+    } else if matches!(id, "computer.type" | "computer.keys") {
+        // The keystroke rows, the only actuating rows served over the wire.
         //
         // Each condition names itself rather than collapsing into one reason:
         // an unbound review is a build-time omission an operator cannot fix on
@@ -434,30 +343,13 @@ fn capability_declaration(
             Some("attendance contract inputs are not bound".to_string())
         } else if !context.inputs.input_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
-        } else if synthetic_path_is_pointer(id) && !context.inputs.global_dispatch_ready() {
-            Some("global dispatch review revision is not bound".to_string())
         } else {
-            // Every permission the frozen vocabulary names for THIS row, PLUS
-            // accessibility for all five.
-            //
-            // The extra requirement is deliberate and conservative. Per-process
-            // delivery is CGEventPostToPid, and whether that call needs the
-            // accessibility grant is not established: CGEvent.h documents the
-            // requirement for event taps and says nothing about posting, and the
-            // deciding experiment needs a machine whose grant can be revoked.
-            // Four rows name accessibility anyway; computer.move names only
-            // input monitoring, so without this it could advertise on a machine
-            // that denies accessibility and then fail at dispatch.
-            //
-            // Requiring MORE than the vocabulary declares is the safe direction
-            // of disagreement: a capability withheld from a machine that could
-            // have served it is a smaller fault than one offered to a machine
-            // that cannot. Requiring less would be the hazard. When the
-            // experiment settles it, either this extra requirement comes out or
-            // the vocabulary row gains what it always needed.
+            // Every permission the frozen vocabulary names for this row. Both
+            // keystroke rows name accessibility: whether per-process posting
+            // needs that grant is not established, and each row reads the
+            // target's focused element before posting, which does.
             permissions
                 .iter()
-                .chain(std::iter::once(&PermissionService::Accessibility))
                 .find_map(|service| match context.startup.permissions.state(*service) {
                     PermissionLiveness::Live => None,
                     PermissionLiveness::Unavailable => {
@@ -480,31 +372,29 @@ fn capability_declaration(
     }
 
     // Which modes could carry this row at all, before asking whether any of them
-    // is available in this build. move is observed-only: the frozen vocabulary
-    // gives it synthetic_paths ["global"] and no per_pid, which is the same
-    // conclusion tonight's measurement reached from the other direction.
-    let dispatch_modes = if id == "computer.move" {
-        vec![DispatchMode::Observed]
-    } else if id == "computer.screenshot" || id == "computer.wait" {
-        vec![]
-    } else {
-        vec![DispatchMode::Background, DispatchMode::Observed]
+    // is available in this build. The pointer rows are observed-only: the
+    // frozen vocabulary gives them synthetic_paths ["global"] and no per_pid,
+    // because the per-process path was measured not to carry pointer events.
+    // The element rows act through accessibility, which reaches a backgrounded
+    // application; wait dispatches nothing.
+    let dispatch_modes = match capability {
+        ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverDrag
+        | ComputerCapability::TakeoverScroll => vec![DispatchMode::Observed],
+        ComputerCapability::ReadState
+        | ComputerCapability::PressElement
+        | ComputerCapability::PressPoint
+        | ComputerCapability::WriteText => vec![DispatchMode::Background],
+        ComputerCapability::Type | ComputerCapability::Keys => {
+            vec![DispatchMode::Background, DispatchMode::Observed]
+        }
+        _ => vec![],
     };
 
-    // Claimed only where an AxAction actually implements the path the frozen row
-    // names, rather than wherever the row names one.
-    //
-    // The vocabulary declares three: click -> ax_press, type -> ax_value,
-    // scroll -> ax_scroll_position. AxAction has eight members -- Press,
-    // Increment, Decrement, Confirm, Cancel, ShowMenu, ShowAlternateUi,
-    // ShowDefaultUi -- so only ax_press exists. Nothing here sets a value or
-    // scrolls through the accessibility API, and dispatch has no semantic route
-    // for either capability.
-    let semantic_support = if id == "computer.click" {
-        SupportState::Supported
-    } else {
-        SupportState::Unsupported
-    };
+    // Claimed only where something serves the path the frozen row names,
+    // rather than wherever the row names one. The press and write rows name
+    // ax_press and ax_value, and nothing serves either over the wire yet.
+    let semantic_support = SupportState::Unsupported;
 
     // Background delivery is claimed per SYNTHETIC EVENT CLASS, because the
     // per-process path carries one and not the other. Measured on macOS 26
@@ -514,9 +404,13 @@ fn capability_declaration(
     // constructed events posted globally do select. The events are right and the
     // per-process path does not carry pointer events.
     //
-    // Two independent reasons, one answer: no platform driver to post with, or a
-    // row whose events that path does not carry.
-    let background_support = if platform_available && !synthetic_path_is_pointer(id) {
+    // Only the keystroke rows post synthetic keyboard events; the element rows
+    // post no events at all, so they claim no synthetic delivery either.
+    let background_support = if platform_available
+        && matches!(
+            capability,
+            ComputerCapability::Type | ComputerCapability::Keys
+        ) {
         SupportState::Supported
     } else {
         SupportState::Unsupported
@@ -524,21 +418,10 @@ fn capability_declaration(
     let observed_support = platform_available
         && dispatch_modes.contains(&DispatchMode::Observed)
         && context.inputs.global_dispatch_ready();
-
     CapabilityDeclaration {
         capability_id: id.to_string(),
         action_kind,
         dispatch_modes: dispatch_modes.clone(),
-        // Claimed only where an AxAction actually implements the path the
-        // frozen row names, rather than wherever the row names one.
-        //
-        // The vocabulary declares three: click -> ax_press, type -> ax_value,
-        // scroll -> ax_scroll_position. AxAction has eight members -- Press,
-        // Increment, Decrement, Confirm, Cancel, ShowMenu, ShowAlternateUi,
-        // ShowDefaultUi -- so only ax_press exists. Nothing in this workspace
-        // sets a value or scrolls through the accessibility API, and dispatch
-        // has no semantic route for either capability.
-        //
         // Mirroring the artifact made this declaration restate what the row
         // WANTS instead of what the driver can do, which is the same shape as a
         // frozen column nothing verifies: the claim and its subject never meet.
@@ -573,11 +456,10 @@ fn capability_declaration(
         // Derived from the dispatch modes rather than asserted beside them, so
         // the two cannot disagree about whether a row has an observed path.
         //
-        // They did: screenshot and wait carry no dispatch modes because they
-        // read rather than actuate, and this field claimed ConsentGated for them
-        // anyway -- an observed synthetic path, pending consent, for capabilities
-        // that dispatch nothing. Third claim in this struct that described the
-        // design rather than the driver.
+        // They did: the observing rows carry no observed dispatch mode because
+        // they read rather than actuate, and this field once claimed
+        // ConsentGated for them anyway -- an observed synthetic path, pending
+        // consent, for capabilities that dispatch nothing.
         synthetic_observed: if dispatch_modes.contains(&DispatchMode::Observed) {
             SupportState::ConsentGated
         } else {
@@ -592,23 +474,19 @@ fn capability_declaration(
         // An ACTUATING row must additionally have a delivery path that works.
         //
         // Every gate above answers whether we are ALLOWED to serve the row. None
-        // of them asks whether anything can carry it. Those came apart tonight:
-        // the per-process path does not deliver pointer events, so scroll, move
-        // and drag have no semantic action, no working background path, and an
-        // observed path whose driver refuses unconditionally because global
-        // posting was never approved. Binding the input review key would have
-        // advertised three capabilities that cannot deliver -- which is the
+        // of them asks whether anything can carry it. The two came apart once
+        // already: the per-process path does not deliver pointer events, so the
+        // pointer rows have no working background path, and binding a review
+        // key would have advertised capabilities that cannot deliver -- the
         // defect this module already refuses one field over, where a permission
         // that cannot be read withholds its capability.
         //
         // ConsentGated deliberately does not count. It describes what the design
         // intends to offer once observed mode exists, and intent is not a path.
         //
-        // The two observing rows declare no delivery paths in the frozen
-        // vocabulary at all -- they read rather than actuate -- so the
-        // requirement does not apply to them. Keyed on action_kind rather than a
-        // list of names, because the vocabulary already draws that line and a
-        // second copy of it would be one more thing to keep in step.
+        // Observing rows actuate nothing, so the requirement does not apply to
+        // them. Keyed on action_kind rather than a list of names, so the line
+        // between observing and actuating is drawn in one place.
         advertised: (platform_available || id == "computer.wait")
             && advertised
             && permission_lookup_failure.is_none()
@@ -620,7 +498,7 @@ fn capability_declaration(
     }
 }
 
-/// Platform-neutral semantic action intents admitted by `computer.click`.
+/// Platform-neutral semantic action intents a semantic dispatch may carry.
 pub const SEMANTIC_PRESS_ACTION: &str = "press";
 pub const SEMANTIC_CANCEL_ACTION: &str = "cancel";
 

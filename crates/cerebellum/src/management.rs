@@ -1416,7 +1416,48 @@ impl ManagementPlane {
                 ),
             }));
         };
+        self.resolve_leased(key)
+    }
 
+    /// Find the lease an action on a NAMED application runs under.
+    ///
+    /// For a request that says which application it means. The lease must be
+    /// held for exactly that application: one held for another application,
+    /// or the one most recently opened, admits nothing here, because acting on
+    /// an application the request did not name is the hidden selection a named
+    /// request exists to avoid.
+    pub async fn authority_for_bundle<C: MonotonicClock>(
+        &self,
+        grantee: &str,
+        bundle_identity: &str,
+        action_kind: ActionKind,
+        clock: &C,
+    ) -> ActionAuthority {
+        let key = LeaseKey {
+            grantee: grantee.to_string(),
+            bundle_identity: bundle_identity.to_string(),
+            action_kind,
+        };
+        let admitted = {
+            let mut leases = self.leases.lock().await;
+            leases.admits(&key, clock).is_admitted()
+        };
+        if !admitted {
+            return ActionAuthority::Refused(json!({
+                "outcome": "no_lease",
+                "bundle_identity": bundle_identity,
+                "remedy": format!(
+                    "call {OPEN_TARGET} with bundle_identity '{bundle_identity}' and \
+                     action_kind '{}', then retry",
+                    action_kind_to_wire(action_kind)
+                ),
+            }));
+        }
+        self.resolve_leased(key)
+    }
+
+    /// Resolve the application a held lease names to its one running process.
+    fn resolve_leased(&self, key: LeaseKey) -> ActionAuthority {
         match self.resolver.resolve(&key.bundle_identity) {
             TargetResolution::Resolved(grant) => ActionAuthority::Admitted(grant),
             // The lease is held and the thing it was granted over is gone. Not

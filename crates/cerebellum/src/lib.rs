@@ -181,22 +181,14 @@ pub struct ComputerReleaseEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerAdvertisementScope {
-    FrozenEightRows,
+    AllFrozenRows,
     PartialRuntimeAdvertisement,
     EmptyRuntimeAdvertisement,
 }
 
-const COMPUTER_FROZEN_ROW_COUNT: usize = 8;
-const COMPUTER_CAPABILITY_IDS: [&str; COMPUTER_FROZEN_ROW_COUNT] = [
-    "computer.click",
-    "computer.type",
-    "computer.keys",
-    "computer.scroll",
-    "computer.move",
-    "computer.drag",
-    "computer.screenshot",
-    "computer.wait",
-];
+const COMPUTER_FROZEN_ROW_COUNT: usize = computer::platform::COMPUTER_CAPABILITY_ROW_IDS.len();
+const COMPUTER_CAPABILITY_IDS: [&str; COMPUTER_FROZEN_ROW_COUNT] =
+    computer::platform::COMPUTER_CAPABILITY_ROW_IDS;
 
 type ComputerGateOutcomes = BTreeMap<&'static str, ComputerGateOutcome>;
 
@@ -404,7 +396,6 @@ fn gate_passes(outcomes: &ComputerGateOutcomes, gate: &str) -> bool {
 
 fn declaration_gate_passes(
     declaration: &ComputerCapabilityDeclaration,
-    context: &ComputerCapabilityAdvertisementContext,
     outcomes: &ComputerGateOutcomes,
 ) -> bool {
     let common = [
@@ -416,28 +407,7 @@ fn declaration_gate_passes(
         return false;
     }
     let id = declaration.capability_id.as_str();
-    if id == "computer.screenshot" {
-        context
-            .startup
-            .permissions
-            .state(PermissionService::ScreenRecording)
-            == PermissionLiveness::Live
-            && [
-                "capture_review_revision",
-                "release_signing_topology_revision",
-            ]
-            .iter()
-            .all(|gate| gate_passes(outcomes, gate))
-    } else if id == "computer.click" {
-        let platform_review = if cfg!(target_os = "windows") {
-            "windows_actuation_review_revision"
-        } else {
-            "semantic_actuation_review_revision"
-        };
-        [platform_review, "release_signing_topology_revision"]
-            .iter()
-            .all(|gate| gate_passes(outcomes, gate))
-    } else if matches!(id, "computer.type" | "computer.keys") {
+    if matches!(id, "computer.type" | "computer.keys") {
         [
             "attendance_contract_owner",
             "attendance_contract_revision",
@@ -446,29 +416,10 @@ fn declaration_gate_passes(
         ]
         .iter()
         .all(|gate| gate_passes(outcomes, gate))
-    } else if matches!(id, "computer.scroll" | "computer.move" | "computer.drag") {
-        [
-            "attendance_contract_owner",
-            "attendance_contract_revision",
-            "input_review_revision",
-            "global_dispatch_review_revision",
-            "release_signing_topology_revision",
-        ]
-        .iter()
-        .all(|gate| gate_passes(outcomes, gate))
-        // Deliberately NOT gated on private_envelope_recognized. That flag
-        // asks whether this build resolved private SkyLight symbols, which
-        // is evidence for a design this module does not use: per-process
-        // delivery goes through the PUBLIC CGEventPostToPid, measured on
-        // macOS 26 to reach an unfocused application with no focus change
-        // and no private symbol involved.
-        //
-        // Requiring it would withhold every synthetic row forever, since
-        // production supplies no envelope revision and no resolved symbols
-        // by construction. The permissions the vocabulary names are what
-        // actually gate these rows, and they are checked where every
-        // declaration's permissions are checked.
     } else {
+        // Only wait passes with no review of its own. Every other row either
+        // has its gate above or has no wire handler yet, and a row nothing
+        // serves has no release gate to pass.
         declaration.capability_id == "computer.wait"
     }
 }
@@ -496,10 +447,9 @@ fn canonical_declaration_is_complete(declarations: &[ComputerCapabilityDeclarati
 /// detectable.
 fn advertised_computer_declarations<'a>(
     declarations: &'a [ComputerCapabilityDeclaration],
-    context: &ComputerCapabilityAdvertisementContext,
     outcomes: &ComputerGateOutcomes,
 ) -> Vec<&'a ComputerCapabilityDeclaration> {
-    gate_admitted_computer_declarations(declarations, context, outcomes)
+    gate_admitted_computer_declarations(declarations, outcomes)
         .into_iter()
         .filter(|declaration| dispatchable_tool(&declaration.capability_id).is_some())
         .collect()
@@ -515,7 +465,6 @@ fn advertised_computer_declarations<'a>(
 /// closed gate, and every gate would then look equally closed.
 fn gate_admitted_computer_declarations<'a>(
     declarations: &'a [ComputerCapabilityDeclaration],
-    context: &ComputerCapabilityAdvertisementContext,
     outcomes: &ComputerGateOutcomes,
 ) -> Vec<&'a ComputerCapabilityDeclaration> {
     if !canonical_declaration_is_complete(declarations) {
@@ -524,7 +473,7 @@ fn gate_admitted_computer_declarations<'a>(
     declarations
         .iter()
         .filter(|declaration| {
-            declaration.advertised && declaration_gate_passes(declaration, context, outcomes)
+            declaration.advertised && declaration_gate_passes(declaration, outcomes)
         })
         .collect()
 }
@@ -542,17 +491,20 @@ fn canonical_computer_declarations(
 }
 
 fn computer_tool(id: &str) -> Option<subc_protocol::manifest::Tool> {
-    let artifact: Value = serde_json::from_slice(include_bytes!(
-        "../../cerebellum-computer/resources/computer_action_vocabulary-v12.json"
-    ))
-    .ok()?;
+    let artifact: Value =
+        serde_json::from_slice(computer::platform::vocabulary::COMPUTER_ACTION_VOCABULARY_ARTIFACT)
+            .ok()?;
     let row = artifact
         .get("rows")?
         .as_array()?
         .iter()
         .find(|row| row.get("capability_id").and_then(Value::as_str) == Some(id))?;
-    let action_kind = row.get("action_kind").and_then(Value::as_str)?;
-    let execution_mode = if action_kind == "observe" {
+    // The vocabulary no longer carries an action kind per row; the capability
+    // states its own, once. An observing capability changes nothing and so
+    // is pure; everything else may have effects nothing can fence.
+    let observes = computer::audit::ComputerCapability::parse(id)?.action_kind()
+        == computer::platform::ActionKind::Observe;
+    let execution_mode = if observes {
         subc_protocol::manifest::ExecutionMode::Pure
     } else {
         subc_protocol::manifest::ExecutionMode::Unfenceable
@@ -578,7 +530,7 @@ pub fn build_manifest_with_computer_plane(
     else {
         return manifest;
     };
-    let advertised = advertised_computer_declarations(&declarations, context, &outcomes);
+    let advertised = advertised_computer_declarations(&declarations, &outcomes);
     let admitted_names = advertised
         .iter()
         .map(|declaration| declaration.capability_id.clone())
@@ -609,19 +561,19 @@ pub fn computer_release_evidence_with_exercised_rows(
 ) -> ComputerReleaseEvidence {
     let (declarations, gate_outcomes) = canonical_computer_declarations(context);
     let gate_admitted_capabilities: Vec<String> =
-        gate_admitted_computer_declarations(&declarations, context, &gate_outcomes)
+        gate_admitted_computer_declarations(&declarations, &gate_outcomes)
             .into_iter()
             .map(|declaration| declaration.capability_id.clone())
             .collect();
     let advertised_capabilities: Vec<String> =
-        advertised_computer_declarations(&declarations, context, &gate_outcomes)
+        advertised_computer_declarations(&declarations, &gate_outcomes)
             .into_iter()
             .map(|declaration| declaration.capability_id.clone())
             .collect();
     let canonical_row_count = declarations.len();
     let advertised_row_count = advertised_capabilities.len();
     let scope = if advertised_row_count == COMPUTER_FROZEN_ROW_COUNT {
-        ComputerAdvertisementScope::FrozenEightRows
+        ComputerAdvertisementScope::AllFrozenRows
     } else if advertised_row_count == 0 {
         ComputerAdvertisementScope::EmptyRuntimeAdvertisement
     } else {
@@ -862,6 +814,12 @@ pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<Capab
         || name == flat_tools::BROWSER_USE
         || name == crate::browser_type::BROWSER_TYPE_TOOL;
     if !known_browser_name {
+        // A current vocabulary row this build does not serve is withheld on
+        // purpose; a retired computer capability, like any invented name, is
+        // not something this module has at all.
+        if computer::audit::ComputerCapability::parse(name).is_some() {
+            return Some(CapabilityWithheld::NotAdmitted);
+        }
         return Some(CapabilityWithheld::Unknown);
     }
     // A known browser name that would be dispatchable with a browser configured
@@ -2235,13 +2193,12 @@ impl Planes {
 /// gates would exercise release binding rather than the behaviour under test,
 /// and would go silently green the day an identifier came unbound: every
 /// request refused, and every assertion about a refusal still passing.
+///
+/// Only wait: it is the one served capability that needs no release review of
+/// its own, so admitting it here stands in for nothing production withholds.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn test_admitted_computer_capabilities() -> Arc<std::collections::BTreeSet<String>> {
-    #[cfg(target_os = "macos")]
-    let capabilities = ["computer.click", "computer.screenshot", "computer.wait"].as_slice();
-    #[cfg(target_os = "windows")]
-    let capabilities = ["computer.click", "computer.wait"].as_slice();
-    Arc::new(capabilities.iter().copied().map(str::to_string).collect())
+    Arc::new(std::iter::once("computer.wait".to_string()).collect())
 }
 
 impl Clone for Planes {
@@ -4668,8 +4625,9 @@ mod tests {
         let request = json!({
             "name": flat_tools::COMPUTER_USE,
             "arguments": {
-                "action": "click",
-                "target": {"by": "identifier", "identifier": "save"}
+                "action": "keys",
+                "keys": ["s"],
+                "target": "com.example.Editor"
             }
         });
         let frame = Frame::build_with_version(
@@ -4697,12 +4655,6 @@ mod tests {
     #[tokio::test]
     async fn folded_management_actions_match_the_management_route_on_the_same_bind() {
         let cases = [
-            (
-                flat_tools::COMPUTER_USE,
-                "open_target",
-                management::OPEN_TARGET,
-                json!({"bundle_identity":"com.example.App","action_kind":"compose"}),
-            ),
             (
                 flat_tools::BROWSER_USE,
                 "open_grant",
@@ -6097,7 +6049,7 @@ mod tests {
             })
             .map(|gate| (gate.name, ComputerGateOutcome::Pass))
             .collect::<ComputerGateOutcomes>();
-        assert!(advertised_computer_declarations(&declarations, &context, &outcomes).is_empty());
+        assert!(advertised_computer_declarations(&declarations, &outcomes).is_empty());
     }
 
     #[test]

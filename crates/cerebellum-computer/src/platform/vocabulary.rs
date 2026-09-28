@@ -1,8 +1,6 @@
 //! Digest-pinned, canonical computer action vocabulary validation.
 
-use super::{
-    delivered_semantic_action, PermissionService, SemanticActionIntent, SemanticActionPlatform,
-};
+use super::PermissionService;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -18,15 +16,18 @@ use std::sync::OnceLock;
 //   revision  — the vocabulary CONTENT version: which capabilities exist and
 //               what each one accepts.
 //
-// Changing what a capability accepts bumps the REVISION only, which is why
-// these currently read /v1 and -v9: the v2-v9 cutovers changed nested request
-// and result schemas or action annotations inside rows whose shape was unchanged.
-// A reviewer read the mismatch as a mistake before finding both fields in the
-// artifact, so it is stated here rather than left to be re-derived.
-pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v1";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v12";
+// Changing what a capability accepts bumps the REVISION only, which is why the
+// two numbers differ: revisions 2 through 12 changed nested request and result
+// schemas or action annotations inside rows whose shape was unchanged, and
+// kept format /v1. Revision 13 is the first to change which keys a row has --
+// rows no longer carry action_kind or action_kind_overrides, because consent
+// is granted per application rather than per class of action -- so it moved
+// the format to /v2. A reviewer read the mismatch as a mistake before finding
+// both fields in the artifact, so it is stated here rather than re-derived.
+pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v13";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v12.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v13.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -34,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "a820c3519c72bdedf0c7604f8f30531411d4538345e63fc160835aabcb422bfa";
+    "1589f0451e576147b7e6c5b2437f255432f9b5d1fedc4c864de311084f7f0e4e";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -109,32 +110,42 @@ pub struct ValidatedVocabulary {
     pub sha256: String,
 }
 
-const ROW_IDS: [&str; 8] = [
-    "computer.click",
+/// Every capability row the frozen artifact carries, in artifact order.
+///
+/// The one list other closed per-id tables are checked against: the
+/// declaration set, the dispatch rows and the grounding policy each name these
+/// ids and no others.
+pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 10] = [
+    "computer.read_state",
+    "computer.press_element",
+    "computer.press_point",
+    "computer.write_text",
     "computer.type",
     "computer.keys",
-    "computer.scroll",
-    "computer.move",
-    "computer.drag",
-    "computer.screenshot",
+    "computer.takeover_move",
+    "computer.takeover_drag",
+    "computer.takeover_scroll",
     "computer.wait",
 ];
 
-const ACTION_DEMOTION_RULE: &str = "An unserved conservative default MUST be measured in the same migration that first serves it. There is no serve-at-4-and-measure-later path: without this, the laundering risk returns as schedule pressure — a shipped action sitting at a conservative level with the measurement owed and nothing forcing it.";
+/// Rows whose target is an element named through the accessibility tree.
+/// Pressing and writing through accessibility posts no event, so these rows
+/// may require no post-event or input-monitoring grant and declare no
+/// synthetic path; a row that did would be withheld on machines that can
+/// serve it, and would carry a path nothing takes.
+const ELEMENT_ADDRESSED_ROW_IDS: [&str; 4] = [
+    "computer.read_state",
+    "computer.press_element",
+    "computer.press_point",
+    "computer.write_text",
+];
 
-const MACOS_ACTION_ROWS: [(&str, u64, &str, bool); 12] = [
-    ("AXPress", 2, "measured", true),
-    ("AXCancel", 2, "doc_derived", true),
-    ("AXConfirm", 4, "conservative_default", false),
-    ("AXPick", 4, "conservative_default", false),
-    ("AXShowMenu", 4, "conservative_default", false),
-    ("AXShowAlternateUI", 4, "conservative_default", false),
-    ("AXShowDefaultUI", 4, "conservative_default", false),
-    ("AXRaise", 4, "doc_derived", false),
-    ("AXIncrement", 4, "conservative_default", false),
-    ("AXDecrement", 4, "conservative_default", false),
-    ("AXDelete", 4, "conservative_default", false),
-    ("AXScrollToVisible", 4, "conservative_default", false),
+/// Rows that drive the one real system pointer, which only the global event
+/// stream carries.
+const TAKEOVER_ROW_IDS: [&str; 3] = [
+    "computer.takeover_move",
+    "computer.takeover_drag",
+    "computer.takeover_scroll",
 ];
 
 /// RFC 8785 canonical bytes for the artifact. The artifact intentionally uses
@@ -285,14 +296,14 @@ fn validate_value(value: &Value) -> Result<(), VocabularyValidationError> {
     let rows = object["rows"]
         .as_array()
         .ok_or(VocabularyValidationError::WrongRowSet)?;
-    if rows.len() != 8 {
+    if rows.len() != COMPUTER_CAPABILITY_ROW_IDS.len() {
         return Err(VocabularyValidationError::WrongRowCount(rows.len()));
     }
     let ids: Vec<_> = rows
         .iter()
         .filter_map(|row| row.get("capability_id").and_then(Value::as_str))
         .collect();
-    if ids != ROW_IDS {
+    if ids != COMPUTER_CAPABILITY_ROW_IDS {
         return Err(VocabularyValidationError::WrongRowSet);
     }
     for row in rows {
@@ -306,8 +317,6 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
         .as_object()
         .ok_or_else(|| VocabularyValidationError::WrongRowKeys("row is not an object".into()))?;
     let expected = [
-        "action_kind",
-        "action_kind_overrides",
         "attendance_requirement",
         "audit_obligation",
         "capability_id",
@@ -345,33 +354,24 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
         ));
     }
     let id = object["capability_id"].as_str().unwrap_or("");
-    let action = object["action_kind"].as_str().unwrap_or("");
     let retry = object["retry_class"].as_str().unwrap_or("");
-    let expected_action = if id == "computer.drag" {
-        "mutate_durable"
-    } else if id == "computer.screenshot" || id == "computer.wait" {
-        "observe"
-    } else {
-        "compose"
-    };
-    if action != expected_action
-        || object["action_kind_overrides"]
-            != if id == "computer.keys" {
-                serde_json::json!({"durable_chord":"mutate_durable"})
-            } else {
-                serde_json::json!({})
-            }
-    {
-        return Err(VocabularyValidationError::RowBinding(format!(
-            "action kind for {id}"
-        )));
-    }
+    // Named per id with no default, so a row added to the artifact without a
+    // decision here fails validation instead of inheriting a retry class.
     let expected_retry = match id {
-        "computer.click" | "computer.type" | "computer.keys" | "computer.drag" => {
-            "never_automatic_retry"
+        "computer.read_state" | "computer.wait" => "idempotent",
+        "computer.press_element"
+        | "computer.press_point"
+        | "computer.write_text"
+        | "computer.type"
+        | "computer.keys"
+        | "computer.takeover_move"
+        | "computer.takeover_drag"
+        | "computer.takeover_scroll" => "never_automatic_retry",
+        _ => {
+            return Err(VocabularyValidationError::RowBinding(format!(
+                "no retry class is bound for {id}"
+            )))
         }
-        "computer.scroll" => "reconcile_before_retry",
-        _ => "idempotent",
     };
     if retry != expected_retry {
         return Err(VocabularyValidationError::RowBinding(format!(
@@ -402,98 +402,45 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
             "effect statuses for {id}"
         )));
     }
-    if id == "computer.move" && object["dispatch_modes"] != serde_json::json!(["observed"]) {
-        return Err(VocabularyValidationError::RowBinding(
-            "computer.move dispatch mode".into(),
-        ));
-    }
-    if id == "computer.drag" && object["pixel_fallback_eligible"] != false {
-        return Err(VocabularyValidationError::RowBinding(
-            "computer.drag pixel fallback".into(),
-        ));
-    }
-    if id == "computer.type" && object["pixel_fallback_eligible"] != false {
-        return Err(VocabularyValidationError::RowBinding(
-            "computer.type pixel fallback".into(),
-        ));
-    }
-    if id == "computer.click" {
-        validate_click_action_catalog(row)?;
-    }
-    validate_numeric_invariants(id, object)
-}
-
-fn validate_click_action_catalog(row: &Value) -> Result<(), VocabularyValidationError> {
-    let action_schema = row
-        .get("request_schema")
-        .and_then(|schema| schema.get("properties"))
-        .and_then(|properties| properties.get("action"))
-        .ok_or_else(|| VocabularyValidationError::RowBinding("computer.click action".into()))?;
-    let catalog = action_schema
-        .get("catalog")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            VocabularyValidationError::RowBinding("computer.click action catalog".into())
-        })?;
-    if catalog.keys().map(String::as_str).collect::<Vec<_>>() != ["demotion_rule", "entries"]
-        || catalog.get("demotion_rule").and_then(Value::as_str) != Some(ACTION_DEMOTION_RULE)
+    // The pointer rows reach an application only through the global event
+    // stream, so observed mode is the only mode they have.
+    if TAKEOVER_ROW_IDS.contains(&id)
+        && (object["dispatch_modes"] != serde_json::json!(["observed"])
+            || object["synthetic_paths"] != serde_json::json!(["global"]))
     {
-        return Err(VocabularyValidationError::RowBinding(
-            "computer.click action catalog policy".into(),
-        ));
+        return Err(VocabularyValidationError::RowBinding(format!(
+            "{id} delivery must be global and observed only"
+        )));
     }
-    let entries = catalog
-        .get("entries")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            VocabularyValidationError::RowBinding("computer.click action catalog entries".into())
-        })?;
-    if entries.len() != MACOS_ACTION_ROWS.len() {
-        return Err(VocabularyValidationError::RowBinding(
-            "computer.click action catalog row count".into(),
-        ));
-    }
-    for (entry, (action, disruption_level, level_evidence, served)) in
-        entries.iter().zip(MACOS_ACTION_ROWS)
-    {
-        if entry
-            != &serde_json::json!({
-                "action": action,
-                "disruption_level": disruption_level,
-                "level_evidence": level_evidence,
-                "served": served,
+    if ELEMENT_ADDRESSED_ROW_IDS.contains(&id) {
+        let services = object["required_permission_services"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if object["dispatch_modes"] != serde_json::json!(["background"])
+            || object["synthetic_paths"] != serde_json::json!([])
+            || services.iter().any(|service| {
+                matches!(service.as_str(), Some("post_event" | "input_monitoring"))
             })
         {
             return Err(VocabularyValidationError::RowBinding(format!(
-                "computer.click action catalog row {action}"
+                "{id} posts no event and needs no event grant"
             )));
         }
     }
-
-    let admitted = action_schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            VocabularyValidationError::RowBinding("computer.click admitted set".into())
-        })?;
-    let served = entries
-        .iter()
-        .filter(|entry| entry.get("served").and_then(Value::as_bool) == Some(true))
-        .filter_map(|entry| entry.get("action").and_then(Value::as_str))
-        .filter_map(|platform_action| {
-            SemanticActionIntent::ALL.into_iter().find(|intent| {
-                delivered_semantic_action(SemanticActionPlatform::MacOs, *intent)
-                    .is_ok_and(|delivered| delivered == platform_action)
-            })
-        })
-        .map(|intent| Value::String(intent.wire_name().to_owned()))
-        .collect::<Vec<_>>();
-    if admitted != &served {
-        return Err(VocabularyValidationError::RowBinding(
-            "computer.click admitted actions disagree with served rows".into(),
-        ));
+    // Typing into a field identified by pixels rather than by identity is how
+    // a credential field gets typed into without being classified as one, and
+    // no row added with the accessibility-first actions falls back to pixels.
+    if (id == "computer.type"
+        || ELEMENT_ADDRESSED_ROW_IDS.contains(&id)
+        || TAKEOVER_ROW_IDS.contains(&id))
+        && object["pixel_fallback_eligible"] != false
+    {
+        return Err(VocabularyValidationError::RowBinding(format!(
+            "{id} pixel fallback"
+        )));
     }
-    Ok(())
+    validate_numeric_invariants(id, object)
 }
 
 fn validate_closed_schema(value: &Value, path: &str) -> Result<(), VocabularyValidationError> {
@@ -1049,69 +996,71 @@ mod tests {
     }
 
     #[test]
-    fn computer_click_unreadable_subtrees_conforms_to_the_v5_result_schema() {
+    fn a_keystroke_refusal_naming_its_application_conforms_to_the_v13_result_schema() {
         let reply = serde_json::json!({
-            "outcome": "completed",
-            "containment_rung": "semantic_element",
+            "outcome": "ambiguous",
+            "containment_rung": "pid_structural",
             "effect_status": "effect_indeterminate",
-            "unreadable_subtrees": 1,
+            "target_fronted": false,
+            "bundle_identity": "com.example.App",
+            "instances": [{"pid": 1, "window_count": 2}, {"pid": 3, "window_count": 1}],
+            "remedy": "quit all but one instance, then retry",
         });
 
-        assert_eq!(validate_capability_result("computer.click", &reply), Ok(()));
+        assert_eq!(validate_capability_result("computer.type", &reply), Ok(()));
     }
 
     #[test]
     fn frozen_rows_require_exactly_the_services_the_vocabulary_lists() {
-        assert_eq!(
-            required_permission_services("computer.click").expect("click"),
-            vec![
-                PermissionService::Accessibility,
-                PermissionService::PostEvent,
-                PermissionService::InputMonitoring,
-            ]
-        );
-        assert_eq!(
-            required_permission_services("computer.type").expect("type"),
-            vec![
-                PermissionService::Accessibility,
-                PermissionService::PostEvent,
-                PermissionService::InputMonitoring,
-            ]
-        );
-        assert_eq!(
-            required_permission_services("computer.keys").expect("keys"),
-            vec![
-                PermissionService::PostEvent,
-                PermissionService::InputMonitoring,
-            ]
-        );
-        assert_eq!(
-            required_permission_services("computer.scroll").expect("scroll"),
-            vec![
-                PermissionService::Accessibility,
-                PermissionService::PostEvent,
-                PermissionService::InputMonitoring,
-            ]
-        );
-        assert_eq!(
-            required_permission_services("computer.move").expect("move"),
-            vec![PermissionService::InputMonitoring]
-        );
-        assert_eq!(
-            required_permission_services("computer.drag").expect("drag"),
-            vec![
-                PermissionService::PostEvent,
-                PermissionService::InputMonitoring,
-            ]
-        );
-        assert_eq!(
-            required_permission_services("computer.screenshot").expect("screenshot"),
-            vec![PermissionService::ScreenRecording]
-        );
-        assert_eq!(
-            required_permission_services("computer.wait").expect("wait"),
-            Vec::<PermissionService>::new()
-        );
+        let accessibility_only = vec![PermissionService::Accessibility];
+        let keystroke = vec![
+            PermissionService::Accessibility,
+            PermissionService::PostEvent,
+            PermissionService::InputMonitoring,
+        ];
+        for (id, expected) in [
+            ("computer.read_state", accessibility_only.clone()),
+            ("computer.press_element", accessibility_only.clone()),
+            ("computer.press_point", accessibility_only.clone()),
+            ("computer.write_text", accessibility_only),
+            ("computer.type", keystroke.clone()),
+            ("computer.keys", keystroke.clone()),
+            (
+                "computer.takeover_move",
+                vec![PermissionService::InputMonitoring],
+            ),
+            (
+                "computer.takeover_drag",
+                vec![
+                    PermissionService::PostEvent,
+                    PermissionService::InputMonitoring,
+                ],
+            ),
+            ("computer.takeover_scroll", keystroke),
+            ("computer.wait", Vec::new()),
+        ] {
+            assert_eq!(
+                required_permission_services(id).expect("a frozen row"),
+                expected,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_capability_has_no_permission_list() {
+        for id in [
+            "computer.click",
+            "computer.screenshot",
+            "computer.move",
+            "computer.drag",
+            "computer.scroll",
+        ] {
+            assert_eq!(
+                required_permission_services(id),
+                Err(VocabularyPermissionError::UnknownCapability(id.into()))
+            );
+        }
     }
 
     #[test]

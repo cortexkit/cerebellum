@@ -156,11 +156,25 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
 
 #[test]
 fn capability_and_containment_maps_are_closed() {
-    assert_eq!(ComputerCapability::ALL.len(), 8);
+    assert_eq!(ComputerCapability::ALL.len(), 10);
+    assert_eq!(ComputerCapability::RETIRED.len(), 5);
     assert_eq!(
-        ComputerCapability::Screenshot.action_kind(),
+        ComputerCapability::ReadState.action_kind(),
         cerebellum_computer::platform::ActionKind::Observe
     );
+    // A retired capability is readable from the journal and nothing else: no
+    // capability id names it any more.
+    for retired in ComputerCapability::RETIRED {
+        assert!(retired.is_retired());
+        assert_eq!(ComputerCapability::parse(retired.capability_id()), None);
+    }
+    for current in ComputerCapability::ALL {
+        assert!(!current.is_retired());
+        assert_eq!(
+            ComputerCapability::parse(current.capability_id()),
+            Some(current)
+        );
+    }
     assert_eq!(
         cerebellum_computer::audit::containment_isolation_class(ContainmentRung::SemanticElement),
         IsolationClass::ResourceScoped

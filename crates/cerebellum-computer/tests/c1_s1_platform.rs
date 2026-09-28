@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
+mod vocabulary_mint;
+
 use cerebellum_computer::platform::{
     attributed_permission_liveness, canonical_json_bytes, capability_declarations,
-    computed_vocabulary_sha256, delivered_semantic_action, implementation_source_lock_digest,
-    validate_vocabulary, validate_vocabulary_digests, CapabilityAdvertisementContext,
-    ImmutableReleaseInputs, PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport,
-    PermissionProbeResult, PermissionService, SemanticActionIntent, SemanticActionPlatform,
-    StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION,
+    computed_vocabulary_sha256, implementation_source_lock_digest, validate_vocabulary,
+    validate_vocabulary_digests, CapabilityAdvertisementContext, ImmutableReleaseInputs,
+    PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport, PermissionProbeResult,
+    PermissionService, StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION,
     COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 #[cfg(target_os = "macos")]
@@ -14,9 +15,18 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v12.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v13.json");
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
-const SYNTHETIC_CAPABILITIES: [&str; 5] = [
+/// The digest of the v12 artifact, measured before v13 was minted.
+const V12_ARTIFACT_SHA256: &str = "a820c3519c72bdedf0c7604f8f30531411d4538345e63fc160835aabcb422bfa";
+/// The five rows v12 carried and v13 removed, exactly as v12 wrote them. The
+/// delta chain needs them to rebuild v12, and they exist nowhere else now.
+const RETIRED_V12_ROWS: &str = include_str!("fixtures/v12_retired_rows.json");
+/// The keystroke rows the current vocabulary serves.
+const SYNTHETIC_CAPABILITIES: [&str; 2] = ["computer.type", "computer.keys"];
+/// The five synthetic rows of revisions 8 through 12, which the historical
+/// digest chain below subtracts from.
+const HISTORICAL_SYNTHETIC_CAPABILITIES: [&str; 5] = [
     "computer.type",
     "computer.keys",
     "computer.scroll",
@@ -33,11 +43,11 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn vocabulary_has_exactly_eight_rows_and_locked_digest() {
+fn vocabulary_has_exactly_ten_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
-    assert_eq!(validated.revision, "computer_action_vocabulary-v12");
-    assert_eq!(validated.row_count, 8);
-    assert_eq!(validated.row_count, 8, "absolute row-count invariant");
+    assert_eq!(validated.revision, COMPUTER_ACTION_VOCABULARY_REVISION);
+    assert_eq!(validated.schema_id, "ck-computer-action-vocabulary/v2");
+    assert_eq!(validated.row_count, 10, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
     assert_eq!(
         computed_vocabulary_sha256(),
@@ -152,7 +162,7 @@ fn vocabulary_requires_all_three_digest_sources() {
 }
 
 #[test]
-fn implementation_source_lock_digest_matches_the_v8_artifact() {
+fn implementation_source_lock_digest_matches_the_artifact() {
     assert_eq!(
         implementation_source_lock_digest().as_deref(),
         Some(COMPUTER_ACTION_VOCABULARY_SHA256)
@@ -199,7 +209,7 @@ fn every_synthetic_row_declares_all_refusal_fields_without_requiring_them() {
             if field == "chord" {
                 assert!(
                     description.contains("hard-blocklist"),
-                    "{capability}.chord does not mention the upcoming hard-blocklist slice"
+                    "{capability}.chord does not mention the hard-blocklist check"
                 );
             }
         }
@@ -207,7 +217,7 @@ fn every_synthetic_row_declares_all_refusal_fields_without_requiring_them() {
     assert_eq!(
         checked,
         SYNTHETIC_CAPABILITIES.len(),
-        "the five synthetic rows were not all checked"
+        "the keystroke rows were not all checked"
     );
 }
 
@@ -220,7 +230,7 @@ fn v8_only_adds_refusal_fields_to_the_five_synthetic_rows() {
             .as_str()
             .expect("every row has a capability id")
             .to_owned();
-        if SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
+        if HISTORICAL_SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
             let properties = row["result_schema"]["properties"]
                 .as_object_mut()
                 .unwrap_or_else(|| panic!("{capability} has result properties"));
@@ -238,172 +248,24 @@ fn v8_only_adds_refusal_fields_to_the_five_synthetic_rows() {
 }
 
 #[test]
-fn computer_click_action_is_optional_and_closed_to_press_and_cancel() {
+fn wait_settle_markers_are_closed_to_their_values() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
-    let click = vocabulary["rows"]
+    let wait = vocabulary["rows"]
         .as_array()
-        .expect("the vocabulary has rows")
-        .iter()
-        .find(|row| row["capability_id"] == "computer.click")
-        .expect("the vocabulary contains computer.click");
-    let request = &click["request_schema"];
-
-    assert_eq!(
-        request["properties"]["action"]["enum"],
-        json!(["press", "cancel"])
-    );
-    assert!(
-        !request["required"]
-            .as_array()
-            .expect("the request schema names required fields")
-            .contains(&json!("action")),
-        "omitting action must preserve the historical press default"
-    );
-}
-
-#[test]
-fn macos_action_catalog_matches_the_authored_table() {
-    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
-    let click = vocabulary["rows"]
-        .as_array()
-        .expect("the vocabulary has rows")
-        .iter()
-        .find(|row| row["capability_id"] == "computer.click")
-        .expect("the vocabulary contains computer.click");
-    let catalog = &click["request_schema"]["properties"]["action"]["catalog"];
-
-    assert_eq!(
-        catalog["entries"],
-        json!([
-            {"action":"AXPress","disruption_level":2,"level_evidence":"measured","served":true},
-            {"action":"AXCancel","disruption_level":2,"level_evidence":"doc_derived","served":true},
-            {"action":"AXConfirm","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXPick","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXShowMenu","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXShowAlternateUI","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXShowDefaultUI","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXRaise","disruption_level":4,"level_evidence":"doc_derived","served":false},
-            {"action":"AXIncrement","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXDecrement","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXDelete","disruption_level":4,"level_evidence":"conservative_default","served":false},
-            {"action":"AXScrollToVisible","disruption_level":4,"level_evidence":"conservative_default","served":false},
-        ])
-    );
-    assert_eq!(
-        catalog["demotion_rule"],
-        "An unserved conservative default MUST be measured in the same migration that first serves it. There is no serve-at-4-and-measure-later path: without this, the laundering risk returns as schedule pressure — a shipped action sitting at a conservative level with the measurement owed and nothing forcing it."
-    );
-}
-
-#[test]
-fn every_unserved_macos_action_is_absent_from_the_admitted_set() {
-    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
-    let click = vocabulary["rows"]
-        .as_array()
-        .expect("the vocabulary has rows")
-        .iter()
-        .find(|row| row["capability_id"] == "computer.click")
-        .expect("the vocabulary contains computer.click");
-    let action = &click["request_schema"]["properties"]["action"];
-    let admitted_platform_actions = action["enum"]
-        .as_array()
-        .expect("the admitted actions are an enum")
-        .iter()
-        .map(|name| {
-            let intent = SemanticActionIntent::from_wire_name(
-                name.as_str().expect("an admitted intent is a string"),
-            )
-            .expect("the wire enum contains only known intents");
-            json!(
-                delivered_semantic_action(SemanticActionPlatform::MacOs, intent)
-                    .expect("macOS serves every admitted click intent")
-            )
-        })
-        .collect::<Vec<_>>();
-    let entries = action["catalog"]["entries"]
-        .as_array()
-        .expect("the action catalog has entries");
-
-    for entry in entries {
-        if entry["served"] == false {
-            let name = entry["action"].as_str().expect("an action name");
-            assert!(
-                !admitted_platform_actions.contains(&json!(name)),
-                "unserved action {name} is present in the admitted set"
-            );
-        }
-    }
-}
-
-#[test]
-fn click_query_and_wait_settle_markers_are_closed_to_v10_values() {
-    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
-    let rows = vocabulary["rows"].as_array().expect("rows");
-    let click = rows
-        .iter()
-        .find(|row| row["capability_id"] == "computer.click")
-        .expect("click");
-    let wait = rows
+        .expect("rows")
         .iter()
         .find(|row| row["capability_id"] == "computer.wait")
         .expect("wait");
-    let screenshot = rows
-        .iter()
-        .find(|row| row["capability_id"] == "computer.screenshot")
-        .expect("screenshot");
-    let click_request = &click["request_schema"];
-    let click_result = &click["result_schema"];
-    let post_action_query = &click_request["properties"]["post_action_query"];
-    let post_action_state = &click_result["properties"]["post_action_state"];
-
-    assert!(!click_request["required"]
-        .as_array()
-        .expect("click required fields")
-        .contains(&json!("post_action_query")));
-    assert_eq!(post_action_query["properties"]["elements"]["maxItems"], 8);
-    assert_eq!(
-        post_action_query["properties"]["attributes"]["items"]["enum"],
-        json!(["presence", "focused", "enabled", "value"])
-    );
-    assert_eq!(
-        post_action_state["required"],
-        json!([
-            "status",
-            "elements",
-            "read_after_action_ms",
-            "unreadable_subtrees"
-        ])
-    );
-    assert_eq!(
-        post_action_state["properties"]["status"]["enum"],
-        json!([
-            "read",
-            "target_gone",
-            "tree_unreadable",
-            "deadline_exceeded"
-        ])
-    );
-    assert!(click_result["required"]
-        .as_array()
-        .expect("click result required fields")
-        .contains(&json!("unreadable_subtrees")));
-    assert_eq!(
-        wait["result_schema"]["properties"]["outcome"]["enum"],
-        json!([
-            "predicate_satisfied",
-            "timeout",
-            "indeterminate",
-            "cancelled"
-        ])
-    );
     assert_eq!(
         wait["result_schema"]["properties"]["settle_path"]["enum"],
         json!(["poll_with_deadline"])
     );
-    assert_eq!(
-        screenshot["request_schema"]["properties"]["region"]["description"],
-        "Rectangle cropped from the target window in the window's own pixels, with a top-left origin; single-window capture honors this rectangle."
-    );
+    let outcomes = wait["result_schema"]["properties"]["outcome"]["enum"]
+        .as_array()
+        .expect("wait outcomes are closed");
+    for outcome in ["predicate_satisfied", "timeout", "indeterminate", "cancelled"] {
+        assert!(outcomes.contains(&json!(outcome)), "{outcome}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -447,7 +309,7 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
         permissions: PermissionLivenessReport::default(),
         startup: driver.startup_probe().clone(),
     });
-    assert_eq!(declarations.len(), 8);
+    assert_eq!(declarations.len(), 10);
     assert_eq!(
         declarations
             .iter()
@@ -527,27 +389,33 @@ fn an_unestablished_attribution_counts_no_grant_at_all() {
 }
 
 #[test]
-fn observed_move_is_the_only_global_cursor_capability_in_the_skeleton() {
+fn the_takeover_rows_are_the_only_observed_only_capabilities() {
     let context = CapabilityAdvertisementContext {
         inputs: ImmutableReleaseInputs::default(),
         permissions: PermissionLivenessReport::default(),
         startup: StartupCapabilityProbe::default(),
     };
     let declarations = capability_declarations(&context, true);
-    let move_declaration = declarations
+    let observed_only: Vec<_> = declarations
         .iter()
-        .find(|item| item.capability_id == "computer.move")
-        .unwrap();
-    assert_eq!(move_declaration.dispatch_modes.len(), 1);
+        .filter(|item| {
+            item.dispatch_modes == [cerebellum_computer::platform::DispatchMode::Observed]
+        })
+        .map(|item| item.capability_id.as_str())
+        .collect();
     assert_eq!(
-        move_declaration.dispatch_modes[0],
-        cerebellum_computer::platform::DispatchMode::Observed
+        observed_only,
+        [
+            "computer.takeover_move",
+            "computer.takeover_drag",
+            "computer.takeover_scroll"
+        ]
     );
     let ids: BTreeSet<_> = declarations
         .iter()
         .map(|item| item.capability_id.as_str())
         .collect();
-    assert_eq!(ids.len(), 8);
+    assert_eq!(ids.len(), 10);
 }
 
 fn recreated_v9() -> Value {
@@ -578,7 +446,7 @@ fn recreated_v9() -> Value {
 
 /// v12 without its one addition: the element shape of the `windows` array.
 fn recreated_v11() -> Value {
-    let mut before: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let mut before: Value = recreated_v12();
     before["revision"] = historical_revision(11);
     let screenshot = before["rows"]
         .as_array_mut()
@@ -657,7 +525,7 @@ fn recreated_v8() -> Value {
     before["revision"] = historical_revision(8);
     for row in before["rows"].as_array_mut().expect("rows") {
         let capability = row["capability_id"].as_str().unwrap().to_owned();
-        if SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
+        if HISTORICAL_SYNTHETIC_CAPABILITIES.contains(&capability.as_str()) {
             row["result_schema"]["properties"]
                 .as_object_mut()
                 .unwrap()
@@ -680,4 +548,308 @@ fn v9_only_adds_sequence_counts_and_missing_containment_rungs() {
         hex_digest(&bytes),
         "39061e07424d404695e0da6b06e6ce732a60136361267d77562ad276c9b95906"
     );
+}
+
+fn row<'a>(vocabulary: &'a Value, id: &str) -> &'a Value {
+    vocabulary["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["capability_id"] == id)
+        .unwrap_or_else(|| panic!("the vocabulary carries {id}"))
+}
+
+fn row_mut<'a>(vocabulary: &'a mut Value, id: &str) -> &'a mut Value {
+    vocabulary["rows"]
+        .as_array_mut()
+        .expect("rows")
+        .iter_mut()
+        .find(|row| row["capability_id"] == id)
+        .unwrap_or_else(|| panic!("the vocabulary carries {id}"))
+}
+
+fn remove_properties(row: &mut Value, schema: &str, names: &[&str]) {
+    let properties = row[schema]["properties"].as_object_mut().unwrap();
+    for name in names {
+        assert!(
+            properties.remove(*name).is_some(),
+            "{schema}.{name} is a v13 addition"
+        );
+    }
+}
+
+/// v13 without its changes: the v12 artifact, rebuilt from the shipped one.
+///
+/// Every change v13 makes is undone here by name. The five rows v13 removed
+/// come back from a fixture holding them as v12 wrote them, since they exist
+/// nowhere else now.
+fn recreated_v12() -> Value {
+    let mut v13: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+
+    // The keystroke rows gained the consent envelope, the bundle-resolution
+    // fields, the diff and the focused element, and their outcome a
+    // description of the v13 refusals.
+    for id in ["computer.type", "computer.keys"] {
+        let keystroke = row_mut(&mut v13, id);
+        remove_properties(
+            keystroke,
+            "result_schema",
+            &[
+                "ask_id",
+                "bundle_identity",
+                "instances",
+                "unreadable",
+                "changed",
+                "added",
+                "removed",
+                "focused_element_id",
+            ],
+        );
+        keystroke["result_schema"]["properties"]["outcome"] = json!({"type": "string"});
+    }
+    // type lost its parsed-and-unused replace_selection flag.
+    let typing = row_mut(&mut v13, "computer.type");
+    typing["request_schema"]["properties"]["replace_selection"] = json!({"type": "boolean"});
+    typing["request_schema"]["required"] = json!(["target", "text", "replace_selection"]);
+    // keys gained the fronting bound and the accessibility grant.
+    let keys = row_mut(&mut v13, "computer.keys");
+    keys["maximum_fronting_bracket_interval_ms"] = Value::Null;
+    keys["required_permission_services"] = json!(["post_event", "input_monitoring"]);
+    // wait gained the app field, the refusal fields and their outcomes.
+    let wait = row_mut(&mut v13, "computer.wait");
+    remove_properties(wait, "request_schema", &["app"]);
+    wait["request_schema"]["required"] = json!(["predicate", "timeout_ms"]);
+    remove_properties(
+        wait,
+        "result_schema",
+        &[
+            "field",
+            "reason",
+            "remedy",
+            "ask_id",
+            "bundle_identity",
+            "instances",
+            "unreadable",
+        ],
+    );
+    wait["result_schema"]["properties"]["outcome"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(4);
+    wait["result_schema"]["required"] = json!(["outcome", "evidence", "settle_path"]);
+
+    // Every v12 row carried its consent lease kind.
+    for (id, kind, overrides) in [
+        ("computer.type", "compose", json!({})),
+        (
+            "computer.keys",
+            "compose",
+            json!({"durable_chord": "mutate_durable"}),
+        ),
+        ("computer.wait", "observe", json!({})),
+    ] {
+        let retained = row_mut(&mut v13, id).as_object_mut().unwrap();
+        retained.insert("action_kind".into(), json!(kind));
+        retained.insert("action_kind_overrides".into(), overrides);
+    }
+
+    let retired: Vec<Value> = serde_json::from_str(RETIRED_V12_ROWS).expect("the fixture parses");
+    let v12_rows: Vec<Value> = [
+        "computer.click",
+        "computer.type",
+        "computer.keys",
+        "computer.scroll",
+        "computer.move",
+        "computer.drag",
+        "computer.screenshot",
+        "computer.wait",
+    ]
+    .iter()
+    .map(|id| {
+        retired
+            .iter()
+            .find(|row| row["capability_id"] == *id)
+            .unwrap_or_else(|| row(&v13, id))
+            .clone()
+    })
+    .collect();
+    json!({
+        "schema_id": "ck-computer-action-vocabulary/v1",
+        "revision": historical_revision(12),
+        "rows": v12_rows,
+    })
+}
+
+/// v13 makes exactly the changes `recreated_v12` undoes, and nothing else.
+///
+/// The digest on the right is v12's, measured before the mint. If anything
+/// else moved -- a description reworded, a row reordered, a number
+/// reformatted -- the rebuilt v12 would not reproduce it.
+#[test]
+fn v13_only_makes_the_changes_recreated_v12_undoes() {
+    let bytes = canonical_json_bytes(&recreated_v12()).unwrap();
+    assert_eq!(hex_digest(&bytes), V12_ARTIFACT_SHA256);
+}
+
+/// The shipped artifact is exactly what the generator produces from v12.
+///
+/// Together with the test above, which proves `recreated_v12` IS v12, this
+/// pins the artifact to the generator input and its comments: nothing in
+/// the artifact was edited by hand.
+#[test]
+fn the_minted_artifact_is_the_generator_output_from_v12() {
+    let generated = vocabulary_mint::v13_from_v12(
+        &recreated_v12(),
+        COMPUTER_ACTION_VOCABULARY_REVISION,
+    );
+    let bytes = canonical_json_bytes(&generated).unwrap();
+    assert!(
+        bytes == VOCABULARY.as_bytes(),
+        "the shipped vocabulary differs from the generator output; regenerate it"
+    );
+    assert_eq!(
+        generated["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["capability_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vocabulary_mint::V13_ROW_IDS
+    );
+}
+
+/// Each new row is written for what it does, not copied from the row it
+/// replaces.
+///
+/// The removed click row required post_event and input monitoring and
+/// declared per-process and global synthetic paths. Copied onto read_state,
+/// those would withhold a pure accessibility read on any machine with input
+/// monitoring off, and stamp a pointer path onto a row that posts nothing.
+/// Checked on the generator's own output, so a copied row fails here by name
+/// before it can reach an artifact.
+#[test]
+fn read_state_and_write_text_are_authored_for_what_they_do() {
+    let generated = vocabulary_mint::v13_from_v12(
+        &recreated_v12(),
+        COMPUTER_ACTION_VOCABULARY_REVISION,
+    );
+    let read_state = row(&generated, "computer.read_state");
+    assert_eq!(read_state["required_permission_services"], json!(["accessibility"]));
+    assert_eq!(read_state["synthetic_paths"], json!([]));
+    assert_eq!(read_state["semantic_path"], "none");
+    assert_eq!(read_state["dispatch_modes"], json!(["background"]));
+    assert_eq!(read_state["retry_class"], "idempotent");
+
+    let write_text = row(&generated, "computer.write_text");
+    assert_eq!(write_text["semantic_path"], "ax_value");
+    assert_eq!(write_text["synthetic_paths"], json!([]));
+    assert_eq!(write_text["required_permission_services"], json!(["accessibility"]));
+
+    for id in ["computer.press_element", "computer.press_point"] {
+        let press = row(&generated, id);
+        assert_eq!(press["semantic_path"], "ax_press", "{id}");
+        assert_eq!(press["synthetic_paths"], json!([]), "{id}");
+        assert_eq!(press["required_permission_services"], json!(["accessibility"]), "{id}");
+    }
+    for id in [
+        "computer.takeover_move",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
+    ] {
+        let takeover = row(&generated, id);
+        assert_eq!(takeover["synthetic_paths"], json!(["global"]), "{id}");
+        assert_eq!(takeover["dispatch_modes"], json!(["observed"]), "{id}");
+        assert_eq!(takeover["semantic_path"], "none", "{id}");
+        assert_eq!(
+            takeover["review_requirement"], "takeover_dispatch_review_revision",
+            "{id}"
+        );
+    }
+}
+
+/// No row of the vocabulary equals another row, current or removed, once
+/// its capability id is set aside.
+#[test]
+fn no_row_is_a_copy_of_another_row() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let retired: Vec<Value> = serde_json::from_str(RETIRED_V12_ROWS).expect("the fixture parses");
+    let without_id_or_kind = |row: &Value| {
+        let mut row = row.clone();
+        let object = row.as_object_mut().unwrap();
+        object.remove("capability_id");
+        object.remove("action_kind");
+        object.remove("action_kind_overrides");
+        row
+    };
+    let rows: Vec<&Value> = vocabulary["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(retired.iter())
+        .collect();
+    for (index, left) in rows.iter().enumerate() {
+        for right in &rows[index + 1..] {
+            assert_ne!(
+                without_id_or_kind(left),
+                without_id_or_kind(right),
+                "{} is a copy of {}",
+                left["capability_id"],
+                right["capability_id"]
+            );
+        }
+    }
+}
+
+/// wait names its application; keys fronts under the same bound as type and
+/// reads the focused element through accessibility first.
+#[test]
+fn the_retained_rows_carry_their_v13_changes() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    let wait = row(&vocabulary, "computer.wait");
+    assert_eq!(
+        wait["request_schema"]["required"],
+        json!(["app", "predicate", "timeout_ms"])
+    );
+    let keys = row(&vocabulary, "computer.keys");
+    assert_eq!(keys["maximum_fronting_bracket_interval_ms"], 100);
+    assert!(keys["required_permission_services"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("accessibility")));
+    assert!(
+        row(&vocabulary, "computer.type")["request_schema"]["properties"]
+            .get("replace_selection")
+            .is_none()
+    );
+}
+
+/// Every row that can need consent declares the whole consent envelope, and
+/// every row that parses input declares how it refuses bad input.
+#[test]
+fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    for row in vocabulary["rows"].as_array().unwrap() {
+        let id = row["capability_id"].as_str().unwrap();
+        let properties = row["result_schema"]["properties"].as_object().unwrap();
+        for field in ["ask_id", "remedy", "field", "reason"] {
+            assert!(properties.contains_key(field), "{id} lacks {field}");
+        }
+        if let Some(outcomes) = properties["outcome"]["enum"].as_array() {
+            for outcome in [
+                "consent_pending",
+                "consent_denied",
+                "consent_granted_not_executed",
+                "consent_unavailable",
+                "module_draining",
+                "route_closed",
+                "invalid_request",
+            ] {
+                assert!(outcomes.contains(&json!(outcome)), "{id} lacks {outcome}");
+            }
+            assert!(
+                !outcomes.contains(&json!("capability_not_admitted")),
+                "{id}: capability_not_admitted is a route error, not a capability result"
+            );
+        }
+    }
 }

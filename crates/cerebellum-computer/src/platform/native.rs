@@ -90,8 +90,9 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
         PermissionProbeResult {
             service: PermissionService::PostEvent,
             // The posting half of the same IOKit TCC pair, read separately
-            // because the vocabulary requires them separately: computer.move
-            // names only monitoring while typing names posting too.
+            // because the vocabulary requires them separately:
+            // computer.takeover_move names only monitoring while typing names
+            // posting too.
             //
             // KNOWN GAP, and worth reading before trusting this pair. IOHIDLib.h
             // says kIOHIDRequestTypePostEvent governs "IOHIDPostEvent" and
@@ -101,11 +102,11 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
             // two readings are true facts about grants for APIs we do not
             // invoke.
             //
-            // Four of the five synthetic rows are protected anyway, because
-            // their vocabulary rows also name `accessibility` -- but by luck
-            // rather than design. computer.move names ONLY input monitoring, so
-            // on a machine granting that and denying accessibility it would
-            // advertise and then fail at dispatch.
+            // The keystroke rows are protected anyway, because their
+            // vocabulary rows also name `accessibility`. The pointer move row
+            // names ONLY input monitoring, so on a machine granting that and
+            // denying accessibility it could advertise and then fail at
+            // dispatch once it is served.
             //
             // Not fixed here because every fix touches the frozen vocabulary or
             // makes code and vocabulary disagree about what a row requires, and
@@ -117,7 +118,7 @@ pub fn probe_permissions() -> Vec<PermissionProbeResult> {
             // them again. CGEvent.h documents an accessibility requirement for
             // event TAPS ("may only receive key up and down events if access for
             // assistive devices is enabled") and says nothing at all about
-            // posting. And computer.move cannot be argued into needing
+            // posting. And a pointer move cannot be argued into needing
             // accessibility by its own dispatch path: it carries a placeholder
             // element name and a coordinate, resolving no accessibility element.
             //

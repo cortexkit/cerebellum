@@ -910,7 +910,7 @@ impl MacOs26PlatformDriver {
         &self.startup
     }
 
-    /// Describe all eight actions, advertising only the ones that can be served.
+    /// Describe every current action, advertising only the ones that can be served.
     ///
     /// The platform-neutral policy owns the declaration data. This driver only
     /// reports that macOS is available and supplies its startup probe result.
@@ -927,7 +927,9 @@ impl MacOs26PlatformDriver {
         id: &str,
         context: &CapabilityAdvertisementContext,
     ) -> CapabilityDeclaration {
-        capability_declaration(id, context, true)
+        let capability = crate::audit::ComputerCapability::parse(id)
+            .unwrap_or_else(|| panic!("{id} is not a current capability"));
+        capability_declaration(capability, context, true)
     }
 }
 
@@ -1383,7 +1385,13 @@ mod tests {
             startup: driver.startup_probe().clone(),
         };
 
-        let declaration = driver.declaration("computer.not-in-the-vocabulary", &context);
+        // A retired capability is one the vocabulary no longer lists, so its
+        // permission lookup fails the way any unlisted capability's would.
+        let declaration = capability_declaration(
+            crate::audit::ComputerCapability::Click,
+            &context,
+            true,
+        );
 
         assert!(
             !declaration.advertised,
@@ -1405,15 +1413,8 @@ mod tests {
         );
     }
 
-    /// Semantic click is offered only under its own review binding.
-    ///
-    /// The synthetic-input review is deliberately present in the unbound case:
-    /// substituting that unrelated gate for the semantic review must still leave
-    /// the capability suppressed.
-    #[test]
-    fn computer_click_advertisement_requires_the_semantic_actuation_review() {
-        let driver = MacOs26PlatformDriver::default();
-        let mut bound = ImmutableReleaseInputs {
+    fn fully_bound_inputs() -> ImmutableReleaseInputs {
+        ImmutableReleaseInputs {
             attendance_contract_owner: Some("fixture-owner".to_string()),
             attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
             input_review_revision: Some("fixture-input-review-v1".to_string()),
@@ -1427,151 +1428,118 @@ mod tests {
                 source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
                 computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
             },
-        };
-        assert!(
-            bound.semantic_actuation_ready(),
-            "the accepting fixture must satisfy the semantic actuation gate"
-        );
-        let context = |inputs| CapabilityAdvertisementContext {
-            inputs,
-            permissions: PermissionLivenessReport::default(),
-            startup: driver.startup_probe().clone(),
-        };
-
-        let advertised = driver.declaration("computer.click", &context(bound.clone()));
-        assert!(
-            advertised.advertised,
-            "reviewed semantic click was suppressed: {:?}",
-            advertised.suppression_reason
-        );
-
-        bound.semantic_actuation_review_revision = None;
-        assert!(
-            bound.input_review_revision.is_some(),
-            "the synthetic-input review must remain present for this tripwire"
-        );
-        let suppressed = driver.declaration("computer.click", &context(bound));
-        assert!(
-            !suppressed.advertised,
-            "unreviewed semantic click was advertised"
-        );
-        assert_eq!(
-            suppressed.suppression_reason.as_deref(),
-            Some("semantic actuation review revision is not bound")
-        );
+        }
     }
 
-    /// computer.move is withheld when accessibility is denied.
-    ///
-    /// Its frozen vocabulary row names only input monitoring, so on a machine
-    /// granting that and denying accessibility it would advertise and then fail
-    /// at dispatch -- a capability offered that cannot work, which is the defect
-    /// the permission gate exists to prevent.
-    ///
-    /// This asserts the CONSERVATIVE direction of a deliberate disagreement with
-    /// the vocabulary: the code requires more than the row declares, because
-    /// whether CGEventPostToPid needs the accessibility grant is unestablished.
-    /// If a future measurement shows posting does not need it, this test is the
-    /// thing that should fail and be deleted, rather than the requirement being
-    /// dropped quietly.
-    #[test]
-    fn computer_move_is_withheld_without_accessibility_despite_its_row() {
-        let driver = MacOs26PlatformDriver::default();
-        let vocabulary_row =
-            crate::platform::vocabulary::required_permission_services("computer.move")
-                .expect("the vocabulary lists computer.move");
-        assert!(
-            !vocabulary_row.contains(&PermissionService::Accessibility),
-            "this test is about a row that does NOT name accessibility; if the vocabulary \
-             gained it, the extra requirement in the gate is now redundant and should go"
-        );
+    fn live(services: &[PermissionService]) -> PermissionLivenessReport {
+        PermissionLivenessReport::from_results(services.iter().map(|service| {
+            PermissionProbeResult {
+                service: *service,
+                liveness: PermissionLiveness::Live,
+                responsible_process: String::new(),
+                off_main: true,
+            }
+        }))
+    }
 
-        let inputs = ImmutableReleaseInputs {
-            attendance_contract_owner: Some("fixture-owner".to_string()),
-            attendance_contract_revision: Some("fixture-attendance-v1".to_string()),
-            input_review_revision: Some("fixture-input-review-v1".to_string()),
-            global_dispatch_review_revision: Some("fixture-global-review-v1".to_string()),
-            capture_review_revision: Some("fixture-capture-review-v1".to_string()),
-            semantic_actuation_review_revision: Some("fixture-semantic-review-v1".to_string()),
-            windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
-            release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
-            vocabulary_digests: VocabularyDigestInputs {
-                manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
-                source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
-                computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
+    /// A row the vocabulary carries but nothing serves over the wire is
+    /// withheld whatever is bound and granted, and says that is why.
+    ///
+    /// Every release input is bound and every permission is live, so the only
+    /// thing left to withhold these rows is that no handler serves them.
+    #[test]
+    fn unserved_rows_are_withheld_with_every_input_bound_and_every_permission_live() {
+        let driver = MacOs26PlatformDriver::default();
+        let everything = live(&[
+            PermissionService::Accessibility,
+            PermissionService::PostEvent,
+            PermissionService::InputMonitoring,
+            PermissionService::ScreenRecording,
+        ]);
+        let context = CapabilityAdvertisementContext {
+            inputs: fully_bound_inputs(),
+            permissions: everything.clone(),
+            startup: StartupCapabilityProbe {
+                permissions: everything,
+                ..driver.startup_probe().clone()
+            },
+        };
+        for id in [
+            "computer.read_state",
+            "computer.press_element",
+            "computer.press_point",
+            "computer.write_text",
+            "computer.takeover_move",
+            "computer.takeover_drag",
+            "computer.takeover_scroll",
+        ] {
+            let declaration = driver.declaration(id, &context);
+            assert!(!declaration.advertised, "{id} was advertised");
+            assert!(
+                declaration
+                    .suppression_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("no wire serving handler")),
+                "{id} is withheld for an unexpected reason: {:?}",
+                declaration.suppression_reason
+            );
+        }
+        // The accepting case, so a gate that withheld everything would fail.
+        assert!(driver.declaration("computer.type", &context).advertised);
+    }
+
+    /// computer.keys is withheld when accessibility is denied.
+    ///
+    /// Its row names accessibility because keys reads the target's focused
+    /// element before posting, to refuse a secure field; on a machine that
+    /// grants posting and input monitoring but denies accessibility, keys
+    /// would advertise and then be unable to make that check.
+    #[test]
+    fn computer_keys_is_withheld_without_accessibility() {
+        let driver = MacOs26PlatformDriver::default();
+        assert!(
+            crate::platform::vocabulary::required_permission_services("computer.keys")
+                .expect("the vocabulary lists computer.keys")
+                .contains(&PermissionService::Accessibility)
+        );
+        let context = |permissions: PermissionLivenessReport| CapabilityAdvertisementContext {
+            inputs: fully_bound_inputs(),
+            permissions: permissions.clone(),
+            // The gate reads startup.permissions, so the readings must be
+            // installed THERE. Setting the sibling field alone produced a
+            // fixture that granted nothing while appearing to grant a lot.
+            startup: StartupCapabilityProbe {
+                permissions,
+                ..driver.startup_probe().clone()
             },
         };
 
-        // Granted exactly what the row asks for, and nothing else.
-        let row_only = PermissionLivenessReport::from_results(vec![PermissionProbeResult {
-            service: PermissionService::InputMonitoring,
-            liveness: PermissionLiveness::Live,
-            responsible_process: String::new(),
-            off_main: true,
-        }]);
-        let declaration = driver.declaration(
-            "computer.move",
-            &CapabilityAdvertisementContext {
-                inputs: inputs.clone(),
-                permissions: row_only.clone(),
-                // The gate reads startup.permissions, so the readings must be
-                // installed THERE. Setting the sibling field alone produced a
-                // fixture that granted nothing while appearing to grant a lot.
-                startup: StartupCapabilityProbe {
-                    permissions: row_only,
-                    ..driver.startup_probe().clone()
-                },
-            },
+        let without = driver.declaration(
+            "computer.keys",
+            &context(live(&[
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ])),
         );
         assert!(
-            !declaration.advertised,
-            "computer.move advertised with accessibility denied: {:?}",
-            declaration.suppression_reason
+            !without.advertised,
+            "computer.keys advertised with accessibility denied"
         );
 
-        // The same context plus accessibility clears the PERMISSION refusal, so
-        // the one above is the accessibility check and not some unrelated gate.
-        //
-        // The same context plus accessibility clears the permission refusal.
-        // This fixture also supplies the external authorization required for
-        // session-global posting, so the observed route is permitted to deliver.
-        let with_accessibility = PermissionLivenessReport::from_results(vec![
-            PermissionProbeResult {
-                service: PermissionService::InputMonitoring,
-                liveness: PermissionLiveness::Live,
-                responsible_process: String::new(),
-                off_main: true,
-            },
-            PermissionProbeResult {
-                service: PermissionService::Accessibility,
-                liveness: PermissionLiveness::Live,
-                responsible_process: String::new(),
-                off_main: true,
-            },
-        ]);
-        let declaration = driver.declaration(
-            "computer.move",
-            &CapabilityAdvertisementContext {
-                inputs,
-                permissions: with_accessibility.clone(),
-                startup: StartupCapabilityProbe {
-                    permissions: with_accessibility,
-                    ..driver.startup_probe().clone()
-                },
-            },
+        // The same context plus accessibility clears the refusal, so the one
+        // above is the accessibility check and not some unrelated gate.
+        let with = driver.declaration(
+            "computer.keys",
+            &context(live(&[
+                PermissionService::Accessibility,
+                PermissionService::PostEvent,
+                PermissionService::InputMonitoring,
+            ])),
         );
         assert!(
-            !declaration
-                .suppression_reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("permission"),
-            "granting accessibility must clear the permission refusal, but the reason is {:?}",
-            declaration.suppression_reason
-        );
-        assert!(
-            declaration.advertised,
-            "reviewed observed move was suppressed after every permission became live"
+            with.advertised,
+            "computer.keys was suppressed after every permission became live: {:?}",
+            with.suppression_reason
         );
     }
 
@@ -1610,13 +1578,7 @@ mod tests {
             startup: driver.startup_probe().clone(),
         };
 
-        for id in [
-            "computer.type",
-            "computer.keys",
-            "computer.scroll",
-            "computer.move",
-            "computer.drag",
-        ] {
+        for id in ["computer.type", "computer.keys"] {
             let declaration = driver.declaration(id, &context);
             assert!(!declaration.advertised, "{id} was advertised");
             let reason = declaration
@@ -1660,14 +1622,7 @@ mod tests {
             startup,
         };
 
-        for id in [
-            "computer.screenshot",
-            "computer.type",
-            "computer.keys",
-            "computer.scroll",
-            "computer.move",
-            "computer.drag",
-        ] {
+        for id in ["computer.type", "computer.keys"] {
             let declaration = driver.declaration(id, &context);
             assert!(!declaration.advertised, "{id} was advertised");
             let reason = declaration
@@ -1736,7 +1691,7 @@ mod tests {
 
         for (intent, action) in actions {
             let delivered = delivered_semantic_action(SemanticActionPlatform::MacOs, intent)
-                .expect("macOS serves every admitted click intent");
+                .expect("macOS serves every semantic intent");
             assert_eq!(
                 delivered,
                 action.name(),
@@ -1763,7 +1718,7 @@ mod tests {
             startup: driver.startup_probe().clone(),
         };
 
-        let declaration = driver.declaration("computer.click", &context);
+        let declaration = driver.declaration("computer.type", &context);
         assert_eq!(
             declaration.required_permissions,
             vec![

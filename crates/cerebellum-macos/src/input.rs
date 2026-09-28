@@ -279,7 +279,7 @@ mod framework {
     ///
     /// `kIOHIDRequestTypePostEvent` (0) is the posting side of the same TCC
     /// pair. Read separately from the listening grant because the frozen
-    /// vocabulary names them as separate requirements: `computer.move` needs
+    /// vocabulary names them as separate requirements: `computer.takeover_move` needs
     /// only monitoring, while typing needs posting too, and one reading
     /// substituted for the other would answer a question nobody asked.
     pub fn event_post_access() -> InputMonitoringAccess {

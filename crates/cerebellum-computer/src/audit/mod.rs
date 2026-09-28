@@ -26,67 +26,127 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// The complete computer capability set frozen by the C1 vocabulary artifact.
+/// Every computer capability the journal can name.
+///
+/// Two groups. [`ComputerCapability::ALL`] is the set the frozen vocabulary
+/// artifact carries now. [`ComputerCapability::RETIRED`] are capabilities an
+/// earlier vocabulary served and the current one does not: they are never
+/// parsed from a capability id and never dispatched, and they stay variants
+/// only so the journal can still read them. A journal entry names its
+/// capability by this enum's serialized name, and startup reconciliation
+/// decodes every entry it settles, so removing a variant would make any
+/// journal written while that capability was served unreadable, and the
+/// module would refuse to start on that machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerCapability {
-    Click,
+    ReadState,
+    PressElement,
+    PressPoint,
+    WriteText,
     Type,
     Keys,
-    Scroll,
-    Move,
-    Drag,
-    Screenshot,
+    TakeoverMove,
+    TakeoverDrag,
+    TakeoverScroll,
     Wait,
+    /// Retired; readable from the journal only.
+    Click,
+    /// Retired; readable from the journal only.
+    Scroll,
+    /// Retired; readable from the journal only.
+    Move,
+    /// Retired; readable from the journal only.
+    Drag,
+    /// Retired; readable from the journal only.
+    Screenshot,
 }
 
 impl ComputerCapability {
-    pub const ALL: [Self; 8] = [
-        Self::Click,
+    /// The capabilities the current vocabulary carries, in artifact order.
+    pub const ALL: [Self; 10] = [
+        Self::ReadState,
+        Self::PressElement,
+        Self::PressPoint,
+        Self::WriteText,
         Self::Type,
         Self::Keys,
+        Self::TakeoverMove,
+        Self::TakeoverDrag,
+        Self::TakeoverScroll,
+        Self::Wait,
+    ];
+
+    /// Capabilities an earlier vocabulary served, kept only so journal
+    /// entries that name them still decode.
+    pub const RETIRED: [Self; 5] = [
+        Self::Click,
         Self::Scroll,
         Self::Move,
         Self::Drag,
         Self::Screenshot,
-        Self::Wait,
     ];
 
     pub const fn capability_id(self) -> &'static str {
         match self {
-            Self::Click => "computer.click",
+            Self::ReadState => "computer.read_state",
+            Self::PressElement => "computer.press_element",
+            Self::PressPoint => "computer.press_point",
+            Self::WriteText => "computer.write_text",
             Self::Type => "computer.type",
             Self::Keys => "computer.keys",
+            Self::TakeoverMove => "computer.takeover_move",
+            Self::TakeoverDrag => "computer.takeover_drag",
+            Self::TakeoverScroll => "computer.takeover_scroll",
+            Self::Wait => "computer.wait",
+            Self::Click => "computer.click",
             Self::Scroll => "computer.scroll",
             Self::Move => "computer.move",
             Self::Drag => "computer.drag",
             Self::Screenshot => "computer.screenshot",
-            Self::Wait => "computer.wait",
         }
     }
 
+    pub const fn is_retired(self) -> bool {
+        matches!(
+            self,
+            Self::Click | Self::Scroll | Self::Move | Self::Drag | Self::Screenshot
+        )
+    }
+
+    /// The consent lease kind an action of this capability is admitted under,
+    /// and the effect class its journal entry is scored with.
+    ///
+    /// The rows added with the accessibility-first actions take the kind of
+    /// the row they replace: reading is an observation like the screenshot it
+    /// replaces, pressing and writing compose like the click and typing they
+    /// replace, and each pointer row keeps the kind of the pointer row it
+    /// re-homes, so a drag stays the one durable-change pointer action.
     pub const fn action_kind(self) -> ActionKind {
         match self {
-            Self::Drag => ActionKind::MutateDurable,
-            Self::Screenshot | Self::Wait => ActionKind::Observe,
-            Self::Click | Self::Type | Self::Keys | Self::Scroll | Self::Move => {
-                ActionKind::Compose
-            }
+            Self::Drag | Self::TakeoverDrag => ActionKind::MutateDurable,
+            Self::Screenshot | Self::Wait | Self::ReadState => ActionKind::Observe,
+            Self::Click
+            | Self::Type
+            | Self::Keys
+            | Self::Scroll
+            | Self::Move
+            | Self::PressElement
+            | Self::PressPoint
+            | Self::WriteText
+            | Self::TakeoverMove
+            | Self::TakeoverScroll => ActionKind::Compose,
         }
     }
 
+    /// The capability a current capability id names.
+    ///
+    /// A retired id parses to nothing: it is not a capability anyone can ask
+    /// for any more, only a name old journal entries carry.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "computer.click" => Some(Self::Click),
-            "computer.type" => Some(Self::Type),
-            "computer.keys" => Some(Self::Keys),
-            "computer.scroll" => Some(Self::Scroll),
-            "computer.move" => Some(Self::Move),
-            "computer.drag" => Some(Self::Drag),
-            "computer.screenshot" => Some(Self::Screenshot),
-            "computer.wait" => Some(Self::Wait),
-            _ => None,
-        }
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.capability_id() == value)
     }
 }
 
@@ -755,13 +815,26 @@ impl AuditCapabilityGate {
             // Wait has no capture or redaction obligation, but it still needs a
             // durable journal obligation under the C2 fail-closed rule.
             ComputerCapability::Wait => self.journal_available && self.severity_available,
-            ComputerCapability::Screenshot => self.ready(),
-            ComputerCapability::Click
+            // Reading state can return an image, which passes through capture
+            // custody and redaction exactly as a screenshot did.
+            ComputerCapability::ReadState => self.ready(),
+            ComputerCapability::PressElement
+            | ComputerCapability::PressPoint
+            | ComputerCapability::WriteText
             | ComputerCapability::Type
             | ComputerCapability::Keys
+            | ComputerCapability::TakeoverMove
+            | ComputerCapability::TakeoverDrag
+            | ComputerCapability::TakeoverScroll => {
+                self.journal_available && self.severity_available
+            }
+            // Never advertised, whatever the audit can do: these exist only
+            // so old journal entries decode.
+            ComputerCapability::Click
             | ComputerCapability::Scroll
             | ComputerCapability::Move
-            | ComputerCapability::Drag => self.journal_available && self.severity_available,
+            | ComputerCapability::Drag
+            | ComputerCapability::Screenshot => false,
         }
     }
 }
@@ -822,7 +895,7 @@ mod gate_tests {
 
         assert!(!gate.redactor_available);
         assert!(
-            !gate.advertised(ComputerCapability::Screenshot),
+            !gate.advertised(ComputerCapability::ReadState),
             "capture was offered with no redaction policy bound"
         );
         assert!(
@@ -891,7 +964,7 @@ mod gate_tests {
 
         assert!(gate.redactor_available);
         assert!(
-            gate.advertised(ComputerCapability::Screenshot),
+            gate.advertised(ComputerCapability::ReadState),
             "capture is still withheld with a redaction policy bound"
         );
         assert!(gate.advertised(ComputerCapability::Wait));
@@ -905,7 +978,7 @@ mod gate_tests {
 
         let gate = audit.capability_gate();
         assert!(!gate.custody_available);
-        assert!(!gate.advertised(ComputerCapability::Screenshot));
+        assert!(!gate.advertised(ComputerCapability::ReadState));
         assert!(gate.advertised(ComputerCapability::Wait));
     }
 
@@ -948,7 +1021,7 @@ mod gate_tests {
             .reserve(
                 journal_identity("principal", "conversation", "project", SessionKind::Primary),
                 ComputerPlaneDescriptor::new(
-                    ComputerCapability::Screenshot,
+                    ComputerCapability::ReadState,
                     ContainmentRung::SemanticElement,
                     ObservationState::HumanObserved,
                 ),
@@ -1008,15 +1081,21 @@ pub enum ComputerRecoveryAction {
 /// or leaves the platform effect uncertain.
 pub const fn recovery_entry_class(capability: ComputerCapability) -> ComputerRecoveryEntryClass {
     match capability {
-        ComputerCapability::Screenshot | ComputerCapability::Wait => {
-            ComputerRecoveryEntryClass::Capture
-        }
+        ComputerCapability::Screenshot
+        | ComputerCapability::Wait
+        | ComputerCapability::ReadState => ComputerRecoveryEntryClass::Capture,
         ComputerCapability::Click
         | ComputerCapability::Type
         | ComputerCapability::Keys
         | ComputerCapability::Scroll
         | ComputerCapability::Move
-        | ComputerCapability::Drag => ComputerRecoveryEntryClass::Actuation,
+        | ComputerCapability::Drag
+        | ComputerCapability::PressElement
+        | ComputerCapability::PressPoint
+        | ComputerCapability::WriteText
+        | ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverDrag
+        | ComputerCapability::TakeoverScroll => ComputerRecoveryEntryClass::Actuation,
     }
 }
 

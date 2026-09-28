@@ -541,7 +541,7 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
         .dispatch(
             &mut audit(),
             audit_identity(),
-            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+            semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap()),
         )
         .unwrap();
     assert_eq!(
@@ -575,7 +575,7 @@ fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs(
 fn press_and_cancel_reach_the_same_audited_semantic_platform_path() {
     for action in [SEMANTIC_PRESS_ACTION, SEMANTIC_CANCEL_ACTION] {
         let request = semantic_request_for_action(
-            FrozenDispatchRow::for_capability("computer.click").unwrap(),
+            FrozenDispatchRow::for_capability("computer.type").unwrap(),
             action,
         );
         let mut dispatcher = Dispatcher::new(
@@ -616,7 +616,7 @@ fn press_and_cancel_reach_the_same_audited_semantic_platform_path() {
 #[test]
 fn semantic_delivery_cannot_report_a_non_semantic_rung() {
     let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+        semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     request.identity = None;
     let report = Dispatcher::new(
         RecordingDriver::default(),
@@ -639,7 +639,7 @@ fn semantic_delivery_cannot_report_a_non_semantic_rung() {
 #[test]
 fn semantic_reply_and_journal_use_the_same_containment_rung() {
     let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+        semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     request.identity = None;
     let mut audit = audit();
     let report = Dispatcher::new(
@@ -682,7 +682,7 @@ fn semantic_reply_and_journal_use_the_same_containment_rung() {
 #[test]
 fn mode_and_delivery_primitive_are_not_substituted() {
     let mut driver = RecordingDriver::default();
-    let row = FrozenDispatchRow::for_capability("computer.click")
+    let row = FrozenDispatchRow::for_capability("computer.type")
         .unwrap()
         .with_private_envelope(false);
     let request = DispatchRequest::new(
@@ -712,7 +712,7 @@ fn mode_and_delivery_primitive_are_not_substituted() {
     assert_eq!(dispatcher.driver().global_calls, 0);
 
     driver = RecordingDriver::default();
-    let row = FrozenDispatchRow::for_capability("computer.click")
+    let row = FrozenDispatchRow::for_capability("computer.type")
         .unwrap()
         .with_global_cursor_movement(PermissionLiveness::Unavailable);
     let request = DispatchRequest::new(
@@ -752,7 +752,7 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         }),
         ..RecordingDriver::default()
     };
-    let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
+    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
     let request = DispatchRequest::new(
         row,
         DispatchMode::Observed,
@@ -844,7 +844,7 @@ fn an_observed_abort_journals_its_numbers_while_the_wire_reply_carries_none() {
         ..RecordingDriver::default()
     };
     let request = DispatchRequest::new(
-        FrozenDispatchRow::for_capability("computer.move").unwrap(),
+        FrozenDispatchRow::for_capability("computer.takeover_move").unwrap(),
         DispatchMode::Observed,
         target(),
         ExpectedPostCondition::new(
@@ -909,7 +909,11 @@ fn an_observed_abort_journals_its_numbers_while_the_wire_reply_carries_none() {
 
 #[test]
 fn coordinate_per_pid_delivery_succeeds_only_with_the_global_none_rung() {
-    let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
+    // No current row may name a per-process target by coordinate, so the row
+    // is widened to one that may ground by pixels: the rung rule under test
+    // belongs to the dispatcher, whichever row first needs it.
+    let mut row = FrozenDispatchRow::for_capability("computer.type").unwrap();
+    row.pixel_fallback_eligible = true;
     let request = DispatchRequest::new(
         row,
         DispatchMode::Background,
@@ -998,7 +1002,7 @@ fn a_delivery_that_posted_nothing_cannot_earn_an_atomic_binding() {
 
 #[test]
 fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one() {
-    let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
+    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
     let request = DispatchRequest::new(
         row,
         DispatchMode::Background,
@@ -1129,7 +1133,7 @@ fn background_lease_is_renewable_but_expiry_before_post_stops_delivery() {
         "monotonic-v1",
     )
     .unwrap();
-    let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
+    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
     let valid_request = DispatchRequest::new(
         row.clone(),
         DispatchMode::Background,
@@ -1350,7 +1354,7 @@ fn permitted_escalation_requests_consent_and_records_a_distinct_attempt() {
 
 #[test]
 fn seize_latency_must_fit_between_observed_posts() {
-    let row = FrozenDispatchRow::for_capability("computer.click").unwrap();
+    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
     let first = DispatchRequest::new(
         row.clone(),
         DispatchMode::Observed,
@@ -1406,7 +1410,7 @@ fn unsupported_semantic_path_reaches_the_caller_without_a_synthetic_retry() {
         semantic_result: Err(DriverError::Unsupported("semantic")),
         ..RecordingDriver::default()
     };
-    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap())
         .with_synthetic(SyntheticAction::type_text("x"));
     let mut dispatcher = Dispatcher::new(
         driver,
@@ -1449,7 +1453,7 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         ..RecordingDriver::default()
     };
     let request = DispatchRequest::new(
-        FrozenDispatchRow::for_capability("computer.click").unwrap(),
+        FrozenDispatchRow::for_capability("computer.type").unwrap(),
         DispatchMode::Observed,
         target(),
         ExpectedPostCondition::new(
@@ -1490,7 +1494,7 @@ fn unavailable_effect_observer_is_one_indeterminate_status() {
         .dispatch(
             &mut audit(),
             audit_identity(),
-            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+            semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap()),
         )
         .unwrap();
     assert_eq!(report.effect.status, EffectStatus::EffectIndeterminate);
@@ -1506,7 +1510,7 @@ fn fronting_downgrade_does_not_forfeit_semantic_delivery_containment() {
         fronting: VecDeque::from([fronting(0), post]),
         ..RecordingDriver::default()
     };
-    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     let mut dispatcher = Dispatcher::new(
         driver,
         &cerebellum_computer::platform::process_event::never_cancelled,
@@ -1538,7 +1542,7 @@ fn fronting_downgrade_does_not_forfeit_semantic_delivery_containment() {
 #[test]
 fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
     let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap());
+        semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     let foreign = ProcessGrant {
         pid: 99,
         bundle_identity: "com.example.other".into(),
@@ -1584,7 +1588,7 @@ fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
 /// A gate refusal is a finalized audit event even though no handler ran.
 #[test]
 fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
-    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap())
         .with_semantic(
             ElementResolutionResult {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
@@ -1655,7 +1659,7 @@ fn the_effect_is_observed_in_the_authorised_application() {
         .dispatch(
             &mut audit(),
             audit_identity(),
-            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+            semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap()),
         )
         .unwrap();
 
@@ -1809,7 +1813,7 @@ fn every_semantic_refusal_reaches_the_caller_with_its_remedy_payload() {
             .dispatch(
                 &mut audit,
                 audit_identity(),
-                semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+                semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap()),
             )
             .expect_err("the semantic driver refusal reaches its caller");
 
@@ -1831,7 +1835,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
         dispatch_probe: Some(probe.clone()),
         ..RecordingDriver::default()
     };
-    let request = semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap())
+    let request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap())
         .with_semantic(
             ElementResolutionResult {
                 element_name: AccessibilityElementName::Identifier("element-1".into()),
@@ -1888,7 +1892,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
     let record = audit.read_computer_audit_record(1).unwrap();
     assert_eq!(
         record.descriptor.capability,
-        cerebellum_computer::audit::ComputerCapability::Click
+        cerebellum_computer::audit::ComputerCapability::Type
     );
     assert_eq!(
         record.terminal_kind,
@@ -1918,7 +1922,7 @@ fn partial_action_tree_disclosure_reaches_caller_and_decoded_audit_entry() {
         .dispatch(
             &mut audit,
             audit_identity(),
-            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+            semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap()),
         )
         .expect("a unique match in the readable tree reaches its handler");
 
@@ -1952,7 +1956,7 @@ fn a_crash_between_intent_and_outcome_remains_indeterminate_and_is_not_retried()
         let _ = dispatcher.dispatch(
             &mut audit,
             audit_identity(),
-            semantic_request(FrozenDispatchRow::for_capability("computer.click").unwrap()),
+            semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap()),
         );
     }));
     assert!(crash.is_err(), "the fixture did not interrupt dispatch");

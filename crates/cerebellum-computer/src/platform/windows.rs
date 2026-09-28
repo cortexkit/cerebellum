@@ -12,7 +12,6 @@ use crate::capture::{
 use std::collections::BTreeMap;
 
 pub const WINDOWS_ACTUATION_UNREVIEWED: &str = "windows_actuation_unreviewed";
-const WINDOWS_CAPTURE_UNSUPPORTED: &str = "windows_capture_unsupported";
 const UIA_ROLE_PREFIX: &str = "uia_control_type:";
 
 /// A capture backend whose type makes Windows capture absence explicit.
@@ -735,8 +734,6 @@ impl WindowsPlatformDriver {
         let mut declarations = super::capability_declarations(context, true);
         let windows_review_bound = context.inputs.windows_actuation_review_revision.is_some();
         let vocabulary_ready = context.inputs.vocabulary_ready();
-        let signing_ready = context.inputs.release_signing_topology_revision.is_some();
-        let capture_supported = WindowsUnsupportedCaptureBackend.platform_support().is_ok();
 
         for declaration in &mut declarations {
             declaration.synthetic_background = SupportState::Unsupported;
@@ -748,20 +745,6 @@ impl WindowsPlatformDriver {
                 };
 
             match declaration.capability_id.as_str() {
-                "computer.click" => {
-                    declaration.semantic_path = SupportState::Supported;
-                    declaration.advertised =
-                        windows_review_bound && vocabulary_ready && signing_ready;
-                    declaration.suppression_reason = if !windows_review_bound {
-                        Some(WINDOWS_ACTUATION_UNREVIEWED.to_owned())
-                    } else if !vocabulary_ready {
-                        Some("computer action vocabulary input unresolved".to_owned())
-                    } else if !signing_ready {
-                        Some("release signing topology revision is not bound".to_owned())
-                    } else {
-                        None
-                    };
-                }
                 "computer.wait" => {
                     declaration.advertised = windows_review_bound && vocabulary_ready;
                     declaration.suppression_reason = if !windows_review_bound {
@@ -772,16 +755,13 @@ impl WindowsPlatformDriver {
                         None
                     };
                 }
-                "computer.screenshot" => {
-                    declaration.advertised = capture_supported;
-                    declaration.suppression_reason =
-                        (!capture_supported).then(|| WINDOWS_CAPTURE_UNSUPPORTED.to_owned());
-                }
                 _ => {
                     // Consent-gated observed delivery cannot be used here, and
                     // Windows has no background synthetic path. Recompute
                     // `advertised` so only observations, supported semantic
                     // actions, or supported background synthetic actions remain.
+                    // The accessibility-first rows are macOS-only, and the
+                    // Windows review never covered them, so it admits none.
                     declaration.advertised = declaration.advertised
                         && (declaration.action_kind == ActionKind::Observe
                             || declaration.semantic_path == SupportState::Supported
@@ -1164,10 +1144,10 @@ mod tests {
     }
 
     #[test]
-    fn fully_reviewed_windows_advertises_only_click_and_wait() {
+    fn fully_reviewed_windows_advertises_only_wait() {
         assert_eq!(
             advertised(&context(fully_bound_inputs())),
-            vec!["computer.click", "computer.wait"]
+            vec!["computer.wait"]
         );
     }
 
@@ -1179,7 +1159,7 @@ mod tests {
         assert!(declarations
             .iter()
             .all(|declaration| !declaration.advertised));
-        for id in ["computer.click", "computer.wait"] {
+        for id in ["computer.wait"] {
             let declaration = declarations
                 .iter()
                 .find(|declaration| declaration.capability_id == id)
@@ -1480,21 +1460,18 @@ mod tests {
     }
 
     #[test]
-    fn refusing_capture_backend_is_the_source_of_screenshot_suppression() {
+    fn windows_declares_no_capture_capability() {
         let backend = WindowsUnsupportedCaptureBackend;
         assert_eq!(
             backend.platform_support(),
             Err(BackendError::UnsupportedOnPlatform)
         );
-        let screenshot = WindowsPlatformDriver::default()
+        // The only capture surface is the image a state read returns, and no
+        // row that can return one is advertised on Windows.
+        assert!(WindowsPlatformDriver::default()
             .declarations(&context(fully_bound_inputs()))
-            .into_iter()
-            .find(|declaration| declaration.capability_id == "computer.screenshot")
-            .expect("the canonical declaration exists");
-        assert!(!screenshot.advertised);
-        assert_eq!(
-            screenshot.suppression_reason.as_deref(),
-            Some(WINDOWS_CAPTURE_UNSUPPORTED)
-        );
+            .iter()
+            .all(|declaration| declaration.capability_id != "computer.screenshot"
+                && !(declaration.capability_id == "computer.read_state" && declaration.advertised)));
     }
 }

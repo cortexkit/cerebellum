@@ -1,6 +1,6 @@
 //! The frozen vocabulary and the code that decides the same things must agree.
 //!
-//! Several fields in `computer_action_vocabulary-v12.json` state a rule that a
+//! Several fields in the frozen computer action vocabulary state a rule that a
 //! hand-written function also states. Validation checks those fields are
 //! PRESENT and never reads them, so the two statements can drift apart with
 //! nothing failing: the file is the contract and the function is what runs.
@@ -26,7 +26,7 @@ use cerebellum_computer::{
 };
 use serde_json::Value;
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v12.json");
+const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v13.json");
 
 /// These frozen fields have no per-capability code counterpart to compare.
 ///
@@ -172,7 +172,7 @@ fn code_permission_services(capability: &str) -> Vec<PermissionService> {
 fn grounding_rules_agree_with_the_frozen_vocabulary() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows");
-    assert_eq!(rows.len(), 8, "the vocabulary is frozen at eight rows");
+    assert_eq!(rows.len(), 10, "the vocabulary is frozen at ten rows");
 
     let mut disagreements = Vec::new();
     for row in rows {
@@ -219,24 +219,22 @@ fn grounding_rules_agree_with_the_frozen_vocabulary() {
     );
 }
 
-/// A drag records whether it used an element or a coordinate, because only the
-/// element path can be revalidated by what moved while coordinate addressing is
-/// necessarily recorded at the weakest containment rung.
+/// A pointer drag names points, never an element, so nothing grounds it and it
+/// is addressed by coordinate: its containment is recorded at the weakest rung
+/// rather than at an element rung a pixel match could only pretend to.
 #[test]
-fn drag_preserves_the_actual_grounding_path_for_containment() {
-    let requirement = GroundingPolicy::for_capability("computer.drag");
-    let element_policy = GroundingPolicy {
-        eligible_paths: [GroundingPath::AccessibilityElement].into_iter().collect(),
-        pixel_fallback_eligible: false,
-        ..GroundingPolicy::default()
-    };
-
+fn a_takeover_drag_is_coordinate_addressed_and_grounds_nothing() {
     assert_eq!(
-        requirement.resolution_path(true),
-        Some(GroundingResolutionPath::Element(element_policy))
+        GroundingPolicy::for_capability("computer.takeover_drag"),
+        GroundingRequirement::NotGrounded
     );
     assert_eq!(
-        requirement.resolution_path(false),
+        GroundingPolicy::coordinate_addressable_for_capability("computer.takeover_drag"),
+        Some(true)
+    );
+    assert_eq!(
+        GroundingRequirement::ElementOrCoordinateAddressed(GroundingPolicy::default())
+            .resolution_path(false),
         Some(GroundingResolutionPath::CoordinateAddressed {
             containment_rung: ContainmentRung::GlobalNone,
         })
@@ -319,7 +317,7 @@ fn the_code_serves_every_capability_the_vocabulary_names() {
 
 /// The two required audit obligations stay distinct from one another.
 ///
-/// Six rows require a record BEFORE DISPATCH and one requires it before the
+/// Eight rows require a record BEFORE DISPATCH and one requires it before the
 /// RESULT, and those are different guarantees: the first says the intent was
 /// written down before the machine changed, so an action that dies mid-flight
 /// still left a statement it was about to happen; the second only says an
@@ -354,27 +352,22 @@ fn the_two_required_audit_obligations_are_not_interchangeable() {
     // Absolute counts rather than "at least one of each": a mapping that sent
     // every row to the same variant would satisfy a presence check.
     assert_eq!(
-        before_dispatch, 6,
-        "six actuating rows must record intent before the machine changes"
+        before_dispatch, 8,
+        "eight actuating rows must record intent before the machine changes"
     );
     assert_eq!(
         before_result, 1,
-        "only the observing row may account for its record after the fact"
+        "only the state read, whose image passes through capture custody, may \
+         account for its record after the fact"
     );
 }
 
-/// computer.scroll declares a semantic path that nothing implements.
+/// No row declares a semantic scroll path, because nothing implements one.
 ///
-/// The frozen row says `semantic_path: ax_scroll_position`, and `AxAction` has
-/// eight members with no scroll among them. So scroll can be GROUNDED on an
-/// accessibility element but never DISPATCHED semantically: it always goes out
-/// as synthetic input and can never claim the strongest containment rung.
-///
-/// Asserted rather than fixed, and asserted rather than left silent. The
-/// vocabulary is a published artifact, so a caller reading that column would
-/// conclude scroll can be actuated semantically -- and the honest place to
-/// correct that is here, where the divergence is stated and the reason is next
-/// to it.
+/// `AxAction` has eight members with no scroll among them, so a row naming
+/// `ax_scroll_position` would tell a caller reading the published artifact that
+/// scrolling can be actuated semantically when it always goes out as synthetic
+/// input. The pointer scroll row is global synthetic only and says so.
 ///
 /// WHY NOT JUST ADD THE ACTION. Real applications do advertise
 /// AXScrollUpByPage and friends, so the member could exist. Two arguments
@@ -384,28 +377,16 @@ fn the_two_required_audit_obligations_are_not_interchangeable() {
 /// amount the APPLICATION chooses, so the post-condition cannot be stated the
 /// way a press's can. Deciding that is a vocabulary revision with a review
 /// behind it, not a patch.
-///
-/// If a future revision adds scroll to AxAction, this test fails and should be
-/// deleted rather than adjusted -- its whole purpose is to mark a gap that is
-/// currently deliberate.
 #[test]
-fn scroll_declares_a_semantic_path_that_no_action_implements() {
-    let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/computer_action_vocabulary-v12.json"
-    ))
-    .expect("the frozen vocabulary parses");
-    let scroll = vocabulary["rows"]
-        .as_array()
-        .expect("rows is an array")
-        .iter()
-        .find(|row| row["capability_id"] == "computer.scroll")
-        .expect("computer.scroll is a frozen row");
-    assert_eq!(
-        scroll["semantic_path"], "ax_scroll_position",
-        "this test exists because the row CLAIMS a semantic path; if that claim \
-         changed, the divergence it documents is gone"
-    );
-
+fn no_row_declares_a_semantic_scroll_path() {
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
+    for row in vocabulary["rows"].as_array().expect("rows is an array") {
+        assert_ne!(
+            row["semantic_path"], "ax_scroll_position",
+            "{} claims a semantic scroll path that no action implements",
+            row["capability_id"]
+        );
+    }
     // The claim's counterpart. Named as literals rather than read from the enum,
     // so removing a member cannot quietly satisfy this by shrinking the set it
     // is compared against.
@@ -421,8 +402,8 @@ fn scroll_declares_a_semantic_path_that_no_action_implements() {
     ];
     assert!(
         !implemented.iter().any(|name| name.contains("Scroll")),
-        "an AxAction now implements scrolling, so the declared semantic path is \
-         no longer a gap: delete this test rather than adjusting it"
+        "an AxAction now implements scrolling, so a semantic scroll path is no \
+         longer a gap: revisit this test"
     );
 }
 
@@ -459,7 +440,7 @@ fn only_keyboard_rows_claim_background_synthetic_support() {
         let id = declaration.capability_id.as_str();
         let pointer = matches!(
             id,
-            "computer.click" | "computer.move" | "computer.scroll" | "computer.drag"
+            "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
         );
         let keyboard = matches!(id, "computer.type" | "computer.keys");
         if pointer {
@@ -485,7 +466,7 @@ fn only_keyboard_rows_claim_background_synthetic_support() {
         .filter(|d| {
             matches!(
                 d.capability_id.as_str(),
-                "computer.click" | "computer.move" | "computer.scroll" | "computer.drag"
+                "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
             )
         })
         .count();
@@ -493,70 +474,39 @@ fn only_keyboard_rows_claim_background_synthetic_support() {
         .iter()
         .filter(|d| matches!(d.capability_id.as_str(), "computer.type" | "computer.keys"))
         .count();
-    assert_eq!(pointer_rows, 4, "the pointer rows are not all present");
+    assert_eq!(pointer_rows, 3, "the pointer rows are not all present");
     assert_eq!(keyboard_rows, 2, "the keyboard rows are not all present");
 }
 
-/// A row claims semantic support only where an AxAction implements its path.
+/// No row claims semantic support while nothing serves a semantic path.
 ///
-/// The frozen vocabulary names three semantic paths: click -> ax_press,
-/// type -> ax_value, scroll -> ax_scroll_position. Only the first exists.
-/// AxAction has eight members and none of them sets a value or scrolls, and
-/// dispatch has no semantic route for either capability, so those two rows
-/// were claiming a delivery path that cannot be taken.
+/// The press rows name ax_press and write_text names ax_value, and neither is
+/// reachable yet: pressing a retained element and writing an element's value
+/// need a retained-handle store and an attribute-write call the platform layer
+/// does not have. A declaration that mirrored the artifact -- Supported
+/// wherever the row named anything other than none -- would restate what the
+/// row WANTS rather than what the driver can do, which is the same shape as a
+/// frozen column nothing verifies: the claim and its subject never meet.
 ///
-/// The declaration used to mirror the artifact -- Supported wherever the row
-/// named anything other than none -- which made it restate what the row WANTS
-/// rather than what the driver can do. That is the same shape as a frozen
-/// column nothing verifies: the claim and its subject never meet.
-///
-/// The implemented set is a literal here rather than read from AxAction,
-/// because deriving it from the enum would let a member's removal satisfy this
-/// test by shrinking what it compares against.
+/// Every row is checked against the literal answer, so a row that starts
+/// claiming support fails here by name.
 #[test]
-fn semantic_support_is_claimed_only_where_an_action_implements_it() {
-    const IMPLEMENTED_SEMANTIC_PATHS: [&str; 1] = ["ax_press"];
-
-    let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/computer_action_vocabulary-v12.json"
-    ))
-    .expect("the frozen vocabulary parses");
-    let rows = vocabulary["rows"].as_array().expect("rows is an array");
-
+fn semantic_support_is_claimed_only_where_something_serves_it() {
     let context = CapabilityAdvertisementContext {
         inputs: ImmutableReleaseInputs::default(),
         permissions: PermissionLivenessReport::default(),
         startup: StartupCapabilityProbe::default(),
     };
     let declarations = capability_declarations(&context, true);
-
-    let mut claimed = 0;
+    assert_eq!(declarations.len(), 10, "every row was checked");
     for declaration in &declarations {
-        let row = rows
-            .iter()
-            .find(|row| row["capability_id"] == declaration.capability_id.as_str())
-            .expect("every declaration has a frozen row");
-        let declared_path = row["semantic_path"].as_str().unwrap_or("none");
-        let implemented = IMPLEMENTED_SEMANTIC_PATHS.contains(&declared_path);
-        if implemented {
-            claimed += 1;
-        }
         assert_eq!(
-            declaration.semantic_path == SupportState::Supported,
-            implemented,
-            "{} declares semantic path {declared_path:?}, which is {}implemented, but claims {:?}",
-            declaration.capability_id,
-            if implemented { "" } else { "NOT " },
-            declaration.semantic_path
+            declaration.semantic_path,
+            SupportState::Unsupported,
+            "{} claims a semantic path nothing serves",
+            declaration.capability_id
         );
     }
-
-    // At least one row must genuinely claim it, or the assertion above is
-    // satisfied by everything being Unsupported and proves nothing.
-    assert_eq!(
-        claimed, 1,
-        "exactly one row should claim an implemented semantic path"
-    );
 }
 
 /// Every release input bound and every permission live.
@@ -610,10 +560,10 @@ fn fully_bound_context() -> CapabilityAdvertisementContext {
 ///
 /// Every other gate answers whether we are ALLOWED to serve a row. None asks
 /// whether anything can carry it, and those came apart when the per-process
-/// path turned out not to deliver pointer events: scroll, move and drag have no
+/// path turned out not to deliver pointer events: the pointer rows have no
 /// semantic action, no working background path, and an observed path whose
 /// driver refuses because global posting was never approved. Binding the input
-/// review key would have advertised three capabilities that cannot deliver.
+/// review key would have advertised capabilities that cannot deliver.
 ///
 /// The two observing rows declare no delivery paths in the frozen vocabulary --
 /// they read rather than actuate -- so the requirement does not apply to them,
@@ -623,7 +573,7 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
     // EVERY release input bound and every permission live, so the delivery-path
     // rule is the ONLY thing that can withhold a row.
     //
-    // A default context withholds scroll, move and drag anyway -- the input
+    // A default context withholds the actuating rows anyway -- the input
     // review key is unbound -- so the assertions below would hold whether or not
     // the rule existed. Measured: with a default context, deleting the rule from
     // production leaves this test green. The fixture has to make the refusal come
@@ -639,10 +589,7 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
          one is withheld for the reason under test"
     );
 
-    let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-        "../resources/computer_action_vocabulary-v12.json"
-    ))
-    .expect("the frozen vocabulary parses");
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows is an array");
 
     let mut actuating = 0;
@@ -677,16 +624,16 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
     }
 
     // Both populations must be non-empty, or the loop above asserts nothing.
-    assert_eq!(actuating, 6, "the actuating rows are not all present");
+    assert_eq!(actuating, 8, "the actuating rows are not all present");
     assert_eq!(observing, 2, "the observing rows are not all present");
 }
 
 /// A row's observed-path claim agrees with the dispatch modes beside it.
 ///
 /// These are two statements about the same question -- can this row be carried
-/// in observed mode -- sitting in one struct, and they disagreed: screenshot and
-/// wait carry no dispatch modes because they read rather than actuate, and the
-/// observed field claimed ConsentGated for them anyway. A consent-gated path for
+/// in observed mode -- sitting in one struct, and they once disagreed: the
+/// observing rows carry no observed dispatch mode because they read rather than
+/// actuate, and the observed field claimed ConsentGated for them anyway. A consent-gated path for
 /// a capability that dispatches nothing.
 ///
 /// Fixed by deriving one from the other rather than by correcting the value, so
@@ -717,19 +664,19 @@ fn the_observed_claim_and_the_dispatch_modes_agree() {
 
     // Both sides must occur, or the equality above is satisfied by one uniform
     // answer and proves nothing about the agreement.
-    assert_eq!(with_observed, 6, "the rows with an observed mode changed");
-    assert_eq!(without, 2, "the rows without one changed");
+    assert_eq!(with_observed, 5, "the rows with an observed mode changed");
+    assert_eq!(without, 5, "the rows without one changed");
 }
 
 #[test]
-fn posts_returned_is_declared_on_all_five_synthetic_rows() {
+fn posts_returned_is_declared_on_every_synthetic_row() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
     for id in [
         "computer.type",
         "computer.keys",
-        "computer.scroll",
-        "computer.move",
-        "computer.drag",
+        "computer.takeover_move",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
     ] {
         let row = vocabulary["rows"]
             .as_array()

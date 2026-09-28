@@ -531,30 +531,31 @@ impl GroundingPolicy {
     pub fn for_capability(capability_id: &str) -> GroundingRequirement {
         let mut policy = Self::default();
         match capability_id {
-            "computer.click" | "computer.scroll" => GroundingRequirement::Grounded(policy),
-            "computer.type" => {
-                // Typing resolves through the accessibility tree only. A pixel
-                // fallback would let text reach a field identified by position
-                // rather than by identity, which is how a credential field gets
-                // typed into without ever being classified as one.
+            "computer.type"
+            | "computer.press_element"
+            | "computer.press_point"
+            | "computer.write_text" => {
+                // Resolved through the accessibility tree only. A pixel
+                // fallback would let text or a press reach an element
+                // identified by position rather than by identity, which is how
+                // a credential field gets typed into without ever being
+                // classified as one. A point handed to press_point is only a
+                // way to find an element; what is pressed is the element.
                 policy.eligible_paths = [GroundingPath::AccessibilityElement].into_iter().collect();
                 policy.pixel_fallback_eligible = false;
                 GroundingRequirement::Grounded(policy)
             }
-            "computer.drag" => {
-                // Element aiming lets a drag be revalidated before dispatch and
-                // recorded by what it moved. Without an element it remains
-                // coordinate-addressed, so it can only be recorded by where it
-                // acted at the weakest containment rung. Drag is the only action
-                // in this vocabulary that makes durable changes, so it must not
-                // let a pixel match pretend to be an element target.
-                policy.eligible_paths = [GroundingPath::AccessibilityElement].into_iter().collect();
-                policy.pixel_fallback_eligible = false;
-                GroundingRequirement::ElementOrCoordinateAddressed(policy)
-            }
-            "computer.keys" | "computer.move" | "computer.screenshot" | "computer.wait" => {
-                GroundingRequirement::NotGrounded
-            }
+            // The pointer rows name points in a returned image and never an
+            // element, and a scroll names no location at all; reading state,
+            // waiting and key chords aim at nothing.
+            "computer.read_state"
+            | "computer.keys"
+            | "computer.takeover_move"
+            | "computer.takeover_drag"
+            | "computer.takeover_scroll"
+            | "computer.wait" => GroundingRequirement::NotGrounded,
+            // Retired ids land here too: nothing may be grounded for a
+            // capability the vocabulary no longer carries.
             _ => GroundingRequirement::UnknownCapability,
         }
     }
@@ -565,12 +566,14 @@ impl GroundingPolicy {
     /// and therefore remains on the weakest containment rung.
     pub fn coordinate_addressable_for_capability(capability_id: &str) -> Option<bool> {
         match capability_id {
-            "computer.move" | "computer.drag" => Some(true),
-            "computer.click"
+            "computer.takeover_move" | "computer.takeover_drag" => Some(true),
+            "computer.read_state"
+            | "computer.press_element"
+            | "computer.press_point"
+            | "computer.write_text"
             | "computer.type"
             | "computer.keys"
-            | "computer.scroll"
-            | "computer.screenshot"
+            | "computer.takeover_scroll"
             | "computer.wait" => Some(false),
             _ => None,
         }
@@ -1475,53 +1478,63 @@ mod tests {
     /// change rather than a consequence of another one.
     #[test]
     fn every_grounding_outcome_is_reachable_and_distinct() {
-        assert!(matches!(
-            GroundingPolicy::for_capability("computer.click"),
-            GroundingRequirement::Grounded(_)
-        ));
+        // Pressing and typing resolve by identity only. A pixel fallback here
+        // would let a press or text reach an element picked out by position.
+        for capability in [
+            "computer.type",
+            "computer.press_element",
+            "computer.press_point",
+            "computer.write_text",
+        ] {
+            let GroundingRequirement::Grounded(policy) = GroundingPolicy::for_capability(capability)
+            else {
+                panic!("{capability} is grounded");
+            };
+            assert!(!policy.pixel_fallback_eligible, "{capability}");
+            assert_eq!(
+                policy.eligible_paths,
+                [GroundingPath::AccessibilityElement].into_iter().collect(),
+                "{capability}"
+            );
+        }
 
-        // Typing resolves by identity only. A pixel fallback here would let
-        // text reach a field picked out by position.
-        let GroundingRequirement::Grounded(typing) =
-            GroundingPolicy::for_capability("computer.type")
-        else {
-            panic!("typing is grounded");
-        };
-        assert!(!typing.pixel_fallback_eligible);
+        // An element-or-coordinate requirement still resolves to the weakest
+        // rung when no element is available, whichever row comes to use it.
         assert_eq!(
-            typing.eligible_paths,
-            [GroundingPath::AccessibilityElement].into_iter().collect()
-        );
-
-        // Drag is the one durable action that can preserve an element target
-        // when available but must remain coordinate-addressed otherwise.
-        let GroundingRequirement::ElementOrCoordinateAddressed(drag) =
-            GroundingPolicy::for_capability("computer.drag")
-        else {
-            panic!("drag resolves an element or addresses a coordinate");
-        };
-        assert_eq!(
-            drag.eligible_paths,
-            [GroundingPath::AccessibilityElement].into_iter().collect()
-        );
-        assert!(!drag.pixel_fallback_eligible);
-        assert_eq!(
-            GroundingPolicy::for_capability("computer.drag").resolution_path(false),
+            GroundingRequirement::ElementOrCoordinateAddressed(GroundingPolicy::default())
+                .resolution_path(false),
             Some(GroundingResolutionPath::CoordinateAddressed {
                 containment_rung: ContainmentRung::GlobalNone,
             })
         );
 
         for capability in [
+            "computer.read_state",
             "computer.keys",
-            "computer.move",
-            "computer.screenshot",
+            "computer.takeover_move",
+            "computer.takeover_drag",
+            "computer.takeover_scroll",
             "computer.wait",
         ] {
             assert_eq!(
                 GroundingPolicy::for_capability(capability),
                 GroundingRequirement::NotGrounded,
                 "{capability} addresses no element, so it has nothing to ground"
+            );
+        }
+
+        // A retired capability is outside the vocabulary like any other name.
+        for capability in [
+            "computer.click",
+            "computer.screenshot",
+            "computer.move",
+            "computer.drag",
+            "computer.scroll",
+        ] {
+            assert_eq!(
+                GroundingPolicy::for_capability(capability),
+                GroundingRequirement::UnknownCapability,
+                "{capability}"
             );
         }
 
