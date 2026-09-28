@@ -741,6 +741,11 @@ fn write_text() -> Value {
 /// The reply fields every takeover row shares. A pointer post may change
 /// anything anywhere and has no element session to diff against, so these
 /// rows answer `completed` with no diff and the caller reads state afterwards.
+///
+/// `dispatch_failed` is the module's own failure to carry the action out,
+/// with the dispatch error's code in `reason`. It is kept apart from
+/// `invalid_request`, which says the request was wrong: a caller told that
+/// would change a request that was correct.
 fn takeover_result(extra_outcomes: &[&str], description: &str) -> Map<String, Value> {
     let mut result = Map::new();
     result.insert(
@@ -752,6 +757,7 @@ fn takeover_result(extra_outcomes: &[&str], description: &str) -> Map<String, Va
                     "target_not_frontmost",
                     "invalid_request",
                     "audit_unavailable",
+                    "dispatch_failed",
                 ],
                 extra_outcomes,
                 &GLOBAL_DISPATCH_OUTCOMES,

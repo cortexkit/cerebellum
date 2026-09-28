@@ -956,8 +956,12 @@ mod probe {
         )
     }
 
+    /// A wait in Finder, the application whose app grant the probe settles
+    /// before the wait arms run; a wait must name the application its
+    /// predicate's element lives in.
     fn wait_arguments(identifier: &str, timeout_ms: u64) -> Value {
         json!({
+            "app": FINDER_BUNDLE,
             "predicate": {
                 "kind": "element_present",
                 "element": {"Identifier": identifier},

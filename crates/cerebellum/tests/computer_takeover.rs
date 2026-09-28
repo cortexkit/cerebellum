@@ -96,6 +96,10 @@ struct Pointer {
     /// Signalled after the first post; the sequence then waits for the
     /// caller's cancel before going on.
     pause_after_first_post: Option<Arc<tokio::sync::Notify>>,
+    /// The heartbeat that proves the input watch live is never seen.
+    heartbeat_missed: bool,
+    /// The platform refuses the dispatch outright with this error.
+    fail_with: Option<DriverError>,
 }
 
 struct PointerDriver {
@@ -160,13 +164,17 @@ impl PlatformDriver for PointerDriver {
         request: GlobalDispatchRequest,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
-        let (idle_ms, seize_before_post, pause) = {
+        let (idle_ms, seize_before_post, pause, heartbeat_missed) = {
             let mut pointer = self.pointer.lock().unwrap();
             pointer.dispatched.push(request.synthetic.clone());
+            if let Some(error) = pointer.fail_with.clone() {
+                return Err(error);
+            }
             (
                 pointer.idle_ms,
                 pointer.seize_before_post,
                 pointer.pause_after_first_post.clone(),
+                pointer.heartbeat_missed,
             )
         };
         let target_pid = request.synthetic.target.pid;
@@ -229,10 +237,15 @@ impl PlatformDriver for PointerDriver {
                 &mut watcher,
                 index,
                 probe,
-                |posted: &HeartbeatProbe| HeartbeatObservation::Seen {
-                    marker: posted.marker,
-                    source_unix_process_id: posted.our_pid,
-                    observed_at_ms: posted.posted_at_ms,
+                |posted: &HeartbeatProbe| {
+                    if heartbeat_missed {
+                        return HeartbeatObservation::Missed;
+                    }
+                    HeartbeatObservation::Seen {
+                        marker: posted.marker,
+                        source_unix_process_id: posted.our_pid,
+                        observed_at_ms: posted.posted_at_ms,
+                    }
                 },
                 || desk.state().frontmost == Some(target_pid),
                 || pointer.lock().unwrap().posts.push((event, false)),
@@ -707,6 +720,41 @@ async fn a_stale_image_and_a_point_outside_it_are_refused_by_name() {
     assert_eq!(reply["outcome"], "point_out_of_bounds", "{reply}");
     assert!(rig.desk.state().hit_scopes.is_empty());
     assert!(rig.dispatched().is_empty());
+}
+
+/// A dispatch the module could not carry out answers `dispatch_failed` with
+/// the dispatch error's code, never `invalid_request`: the request was
+/// correct, and a caller told otherwise would change it. Both replies pass
+/// the rows' result schemas in withholding mode.
+#[tokio::test]
+async fn a_failed_dispatch_is_the_module_s_failure_not_the_request_s() {
+    let rig = granted_rig().await;
+    rig.pointer.lock().unwrap().fail_with =
+        Some(DriverError::Unsupported("global target generation changed"));
+    let reply = serve(
+        &rig,
+        "computer.takeover_move",
+        json!({"image_id": rig.image_id, "to": {"x": 10, "y": 20}}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+    assert_eq!(reply["reason"], "synthetic_unavailable");
+    assert!(reply["remedy"].is_string());
+    assert!(rig.posts().is_empty());
+
+    // An input watch whose heartbeat is never seen is a module failure too,
+    // not an unreadable idle time.
+    let rig = granted_rig().await;
+    rig.pointer.lock().unwrap().heartbeat_missed = true;
+    let reply = serve(
+        &rig,
+        "computer.takeover_scroll",
+        json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": 1}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+    assert_eq!(reply["reason"], "observer_unavailable");
+    assert!(rig.posts().is_empty());
 }
 
 /// A person who used the machine a moment ago keeps the pointer: the idle

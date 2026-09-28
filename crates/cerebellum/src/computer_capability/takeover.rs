@@ -300,9 +300,12 @@ fn require_app_grant(
 
 /// A dispatch refusal in the reply vocabulary the takeover rows declare.
 ///
-/// The rows declare only the global dispatch refusals a caller can act on,
-/// so the others are folded into the nearest declared outcome and keep their
-/// own code in `reason`.
+/// The rows name the refusals a caller acts on differently: the person is
+/// using the machine, the person took the pointer back, the target is not in
+/// front, the call was cancelled. Every other dispatch error is the module
+/// failing to carry out a correct request, and answers `dispatch_failed` with
+/// the error's own code in `reason`, never `invalid_request`, which would send
+/// the caller to change a request that was right.
 fn refusal_reply(refusal: &DispatchError) -> Value {
     match refusal {
         DispatchError::Cancelled { .. } => super::synthetic_dispatch_refusal(refusal),
@@ -323,14 +326,16 @@ fn refusal_reply(refusal: &DispatchError) -> Value {
             "remedy": "how long the machine has been idle could not be read, so whether the \
                        person is using it is unknown and nothing was posted",
         }),
-        // The watch for the person's own input could not be shown to be live.
-        // Without it nothing would stop the action if they reached for the
-        // mouse, which leaves the same unknown as an unreadable idle time.
+        // Not an idle reading: the error means the watch for the person's own
+        // input was not shown to be live (its heartbeat was missed), or the
+        // row's posts could not be paced inside the seize bound. Either way
+        // the module could not carry the action out safely.
         DispatchError::ObserverUnavailable => json!({
-            "outcome": "idle_unreadable",
+            "outcome": "dispatch_failed",
             "reason": "observer_unavailable",
-            "remedy": "the watch for the person's own input could not be established, so the \
-                       pointer was not taken and nothing more was posted",
+            "remedy": "the watch for the person's own input could not be shown to be live, so \
+                       the pointer was not taken and nothing more was posted; the request was \
+                       not at fault, so retry it unchanged, and report it if it persists",
         }),
         DispatchError::UserSeizedControl { .. } => json!({
             "outcome": "user_seized_control",
@@ -353,10 +358,11 @@ fn refusal_reply(refusal: &DispatchError) -> Value {
                        see whether anything happened before acting again",
         }),
         other => json!({
-            "outcome": "invalid_request",
+            "outcome": "dispatch_failed",
             "reason": other.reason_code(),
-            "remedy": "the pointer action could not be carried out on this machine; read the \
-                       state before trying anything else",
+            "remedy": "the module could not carry out the pointer action; the request was not \
+                       at fault, so do not change it. Read the state to see whether anything \
+                       happened before retrying, and report it if it persists",
         }),
     }
 }
@@ -564,7 +570,7 @@ where
     ) -> Value {
         let Some(row) = FrozenDispatchRow::for_capability(capability.capability_id()) else {
             return json!({
-                "outcome": "invalid_request",
+                "outcome": "dispatch_failed",
                 "reason": "no_dispatch_row",
                 "remedy": "this build has no dispatch row for the action; report it",
             });
@@ -654,6 +660,64 @@ mod tests {
             scroll(json!("vertical"), json!(1.5)).unwrap_err()["reason"],
             "wrong_type"
         );
+    }
+
+    /// Every dispatch error answers an outcome the takeover rows declare, and
+    /// none answers `invalid_request`: a dispatch error is never the request's
+    /// fault. Listed by hand so a new error variant has to be placed here.
+    #[test]
+    fn every_dispatch_error_reaches_a_declared_outcome_and_none_blames_the_request() {
+        use cerebellum_computer::platform::vocabulary::validate_capability_result;
+        use cerebellum_computer::platform::IdleUnreadable;
+        let errors = [
+            DispatchError::InvalidRequest,
+            DispatchError::SyntheticUnavailable,
+            DispatchError::Cancelled {
+                posts_returned: 1,
+                held_state: HeldStateDisposition::Released { posts_returned: 1 },
+            },
+            DispatchError::EnvelopeUnrecognized,
+            DispatchError::UnsupportedMode,
+            DispatchError::ObserverUnavailable,
+            DispatchError::SeizeLatencyBoundExceeded,
+            DispatchError::IdleGateRefused(IdleGateRefusal::BelowThreshold {
+                threshold_ms: 1_000,
+                hid_idle_ms: 10,
+                user_idle_ms: 10,
+            }),
+            DispatchError::IdleGateRefused(IdleGateRefusal::Unreadable(
+                IdleUnreadable::TableUnavailable,
+            )),
+            DispatchError::UserSeizedControl {
+                sourced_input_kind: None,
+            },
+            DispatchError::AttendanceUnavailable,
+            DispatchError::TargetFocusMismatch,
+            DispatchError::GroundingUntrusted,
+            DispatchError::GrantIdentityMismatch,
+            DispatchError::IdentityVerificationUnavailable,
+            DispatchError::EffectObservationUnavailable,
+            DispatchError::Platform,
+            DispatchError::AuditUnavailable,
+        ];
+        for error in &errors {
+            let reply = refusal_reply(error);
+            assert_ne!(reply["outcome"], "invalid_request", "{error:?}: {reply}");
+            for row in [
+                "computer.takeover_move",
+                "computer.takeover_drag",
+                "computer.takeover_scroll",
+            ] {
+                validate_capability_result(row, &reply)
+                    .unwrap_or_else(|violation| panic!("{error:?} on {row}: {violation:?}"));
+            }
+        }
+        let observer = refusal_reply(&DispatchError::ObserverUnavailable);
+        assert_eq!(observer["outcome"], "dispatch_failed");
+        assert_eq!(observer["reason"], "observer_unavailable");
+        let platform = refusal_reply(&DispatchError::Platform);
+        assert_eq!(platform["outcome"], "dispatch_failed");
+        assert_eq!(platform["reason"], "platform_error");
     }
 
     #[test]
