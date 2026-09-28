@@ -17,10 +17,14 @@
 //! delivery, so the frontmost app is sampled throughout and a route's result is
 //! discarded if the target ever becomes frontmost while it runs.
 //!
-//! It reads back both the focused element's value and its descendant static
-//! texts, because a web-content app puts typed text in child nodes rather than
-//! on the field itself. It clears the field afterward with whichever route
-//! delivered, and exits non-zero if the authentication route did not deliver.
+//! It reads back both the message box's value and its descendant static texts,
+//! because a web-content app puts typed text in child nodes rather than on the
+//! field itself. After each route that delivered, it sends select-all plus one
+//! Backspace through that same route, to measure whether a Command chord
+//! survives per-process delivery, then empties the box with plain Backspaces.
+//! A route this system does not provide is reported as not tested. It exits
+//! non-zero only if the box is left non-empty, so a leftover draft is never
+//! missed.
 //!
 //! Not run in CI: it needs a desk with the target focused. The pure decision
 //! rules below carry host-neutral tests so they are checked everywhere.
@@ -111,25 +115,74 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "com.hnc.Discord".to_string());
 
+    // `<bundle> backspace <n>`: remove leftover probe text one key at a time
+    // through the public route, which needs no modifier chord. A select-all
+    // chord posted per process may lose its modifier on the way in, so this is
+    // the cleanup that does not depend on it.
+    if std::env::args().nth(2).as_deref() == Some("labels") {
+        let Some(pid) = pid_for_bundle(&bundle_id) else {
+            println!("UNMEASURABLE: no running application with bundle id {bundle_id}");
+            std::process::exit(2);
+        };
+        for label in text_area_labels(pid as u32) {
+            println!("text area: {label:?}");
+        }
+        return;
+    }
+
+    if std::env::args().nth(2).as_deref() == Some("explicit") {
+        let Some(pid) = pid_for_bundle(&bundle_id) else {
+            println!("UNMEASURABLE: no running application with bundle id {bundle_id}");
+            std::process::exit(2);
+        };
+        if composer_texts(pid as u32).is_none() {
+            println!(
+                "UNMEASURABLE: no message box labelled {:?}",
+                expected_box_label()
+            );
+            std::process::exit(2);
+        }
+        println!(
+            "public, Command as its own key: Cmd+A {}",
+            explicit_modifier_chord(pid)
+        );
+        let left = composer_text_len(pid as u32);
+        println!("message box left with {left} character(s)");
+        std::process::exit(if left == 0 { 0 } else { 1 });
+    }
+
+    if std::env::args().nth(2).as_deref() == Some("backspace") {
+        let count: usize = std::env::args()
+            .nth(3)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let Some(pid) = pid_for_bundle(&bundle_id) else {
+            println!("UNMEASURABLE: no running application with bundle id {bundle_id}");
+            std::process::exit(2);
+        };
+        backspaces(pid, count);
+        thread::sleep(Duration::from_millis(600));
+        println!("after {count} backspaces: {:?}", composer_texts(pid as u32));
+        return;
+    }
+
     let Some(pid) = pid_for_bundle(&bundle_id) else {
         println!("UNMEASURABLE: no running application with bundle id {bundle_id}");
         std::process::exit(2);
     };
     println!("target {bundle_id} pid: {pid}");
 
-    // The operator must have focused the text box. If the app reports no
-    // focused element, there is nowhere to measure delivery.
-    match cerebellum_macos::focused_element(pid as u32) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            println!("UNMEASURABLE: {bundle_id} reports no focused element; focus its text box");
-            std::process::exit(2);
-        }
-        Err(error) => {
-            println!("UNMEASURABLE: could not read {bundle_id}'s focused element: {error:?}");
-            std::process::exit(2);
-        }
-    }
+    // Delivery is read back from the message box itself, found by role and
+    // label. A web-content app reports NO focused element while it is in the
+    // background (it keeps keyboard focus internally and exposes it only when
+    // frontmost), so asking for the focused element here would refuse every
+    // background run. The operator still clicks into the box beforehand, since
+    // that internal focus is where the posted keys go.
+    let Some((initial_value, initial_texts)) = composer_texts(pid as u32) else {
+        println!("UNMEASURABLE: {bundle_id} shows no text area labelled as a message box");
+        std::process::exit(2);
+    };
+    println!("message box before: value {initial_value:?}, texts {initial_texts:?}");
 
     println!("private posting available:      {}", skylight_available());
     println!(
@@ -143,10 +196,24 @@ fn main() {
         Method::PrivatePlain,
         Method::PrivateAuth,
     ];
-    let mut delivering_method: Option<Method> = None;
-    let mut auth_delivered = false;
+    let mut rows: Vec<(Method, &'static str, &'static str)> = Vec::new();
 
     for (index, method) in methods.into_iter().enumerate() {
+        // A route this system does not provide is reported as not tested. It
+        // posts nothing, so reading "not delivered" from it would be false.
+        let available = match method {
+            Method::PublicPost => true,
+            Method::PrivatePlain => skylight_available(),
+            Method::PrivateAuth => skylight_available() && keyboard_auth_available(),
+        };
+        if !available {
+            println!(
+                "route: {}\n  NOT TESTED: this system does not provide it\n",
+                method.label()
+            );
+            rows.push((method, "not tested", "not tested"));
+            continue;
+        }
         let marker = marker(index as u64);
 
         // Sample the frontmost app for the whole window this route runs in, so
@@ -165,69 +232,211 @@ fn main() {
         post_marker(method, pid, &marker);
         // Let the target's editor settle before reading it back.
         thread::sleep(Duration::from_millis(600));
+        let (value, child_texts) = composer_texts(pid as u32).unwrap_or_default();
+        let in_value = value.as_deref().is_some_and(|text| text.contains(&marker));
+        let in_children = child_texts.iter().any(|text| text.contains(&marker));
+
+        // The chord test: select-all then one Backspace through this same route.
+        // An honoured Command key empties the box; a dropped one removes only
+        // the last letter. Run only when the marker landed, or there is
+        // nothing to tell the two apart by.
+        let mut chord = "not tested (marker did not land)";
+        if in_value || in_children {
+            clear_field(method, pid);
+            thread::sleep(Duration::from_millis(600));
+            let after = composer_text_len(pid as u32);
+            chord = if after == 0 {
+                "honoured (box emptied)"
+            } else {
+                "DROPPED (Command lost; only Backspace landed)"
+            };
+        }
 
         stop.store(true, Ordering::Relaxed);
         let samples = watcher.join().unwrap_or_default();
         let timeline = summarize_frontmost(&samples);
         let discarded = target_became_frontmost(pid, &samples);
-
-        let value = cerebellum_macos::focused_element(pid as u32)
-            .ok()
-            .flatten()
-            .and_then(|element| {
-                cerebellum_macos::element_text_value(&element)
-                    .ok()
-                    .flatten()
-            });
-        let child_texts = focused_subtree_texts(pid as u32);
-
-        let in_value = value.as_deref().is_some_and(|text| text.contains(&marker));
-        let in_children = child_texts.iter().any(|text| text.contains(&marker));
         let delivered = !discarded && (in_value || in_children);
 
         println!("route: {}", method.label());
         println!("  marker posted:            {marker}");
         println!("  frontmost timeline:       {timeline:?}");
         println!("  discarded (target fronted): {discarded}");
-        println!("  focused value:            {value:?}");
-        println!("  marker in value:          {in_value}");
-        println!("  marker in child texts:    {in_children}");
+        println!("  box value after typing:   {value:?}");
         println!("  DELIVERED:                {delivered}");
+        println!("  Cmd+A chord:              {chord}");
         println!();
+        rows.push((
+            method,
+            if discarded {
+                "discarded"
+            } else if delivered {
+                "delivered"
+            } else {
+                "NOT delivered"
+            },
+            if discarded { "discarded" } else { chord },
+        ));
 
-        if delivered && delivering_method.is_none() {
-            delivering_method = Some(method);
-        }
-        if method == Method::PrivateAuth {
-            auth_delivered = delivered;
+        // Leave the box empty before the next route, with plain Backspaces
+        // through the public route (no chord needed).
+        let remaining = composer_text_len(pid as u32);
+        if remaining > 0 {
+            backspaces(pid, remaining + 3);
+            thread::sleep(Duration::from_millis(600));
         }
     }
 
-    // Do not leave a draft behind: clear the field with whatever delivered.
-    if let Some(method) = delivering_method {
-        clear_field(method, pid);
-        thread::sleep(Duration::from_millis(400));
-        let final_value = cerebellum_macos::focused_element(pid as u32)
-            .ok()
-            .flatten()
-            .and_then(|element| {
-                cerebellum_macos::element_text_value(&element)
-                    .ok()
-                    .flatten()
-            });
+    println!("SUMMARY");
+    for (method, typing, chord) in &rows {
         println!(
-            "cleared with {}; final value: {final_value:?}",
-            method.label()
+            "  {:34} typing: {:14} Cmd+A: {}",
+            method.label(),
+            typing,
+            chord
         );
-    } else {
-        println!("no route delivered; nothing to clear");
     }
-
-    if !auth_delivered {
-        eprintln!("VERDICT: the authentication route did NOT deliver in the background");
+    println!(
+        "  {:34} Cmd+A: {}",
+        "public, Command as its own key",
+        explicit_modifier_chord(pid)
+    );
+    let final_len = composer_text_len(pid as u32);
+    println!("message box left with {final_len} character(s)");
+    if final_len > 0 {
+        eprintln!("WARNING: the message box is not empty; clear it before sending anything");
         std::process::exit(1);
     }
-    println!("VERDICT: the authentication route delivered in the background");
+}
+
+/// The exact accessibility label of the message box to type into.
+#[cfg(target_os = "macos")]
+fn expected_box_label() -> String {
+    std::env::var("CEREBELLUM_PROBE_BOX_LABEL").unwrap_or_else(|_| "Message @IceTea".to_string())
+}
+
+/// Type a marker, then send select-all the way a physical keyboard does:
+/// Command down, A down, A up, Command up, each as its own event, then one
+/// plain Backspace. The chord test above only marks the A events as
+/// Command-held, and an app that tracks modifiers from separate modifier
+/// events sees no Command at all. An emptied box means this form is honoured.
+#[cfg(target_os = "macos")]
+fn explicit_modifier_chord(pid: i32) -> &'static str {
+    use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID};
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    const COMMAND_KEY: u16 = 55;
+    const A_KEY: u16 = 0;
+
+    post_marker(Method::PublicPost, pid, &marker(7));
+    // Poll rather than read once: the editor updates its accessibility value
+    // some time after the keys land, and a single early read reports nothing.
+    if !wait_for_len(pid, |len| len > 0) {
+        return "not tested (marker did not land)";
+    }
+    let Some(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return "not tested (no event source)";
+    };
+    let steps = [
+        (COMMAND_KEY, true, CGEventFlags::MaskCommand),
+        (A_KEY, true, CGEventFlags::MaskCommand),
+        (A_KEY, false, CGEventFlags::MaskCommand),
+        (COMMAND_KEY, false, CGEventFlags::empty()),
+    ];
+    for (key, down, flags) in steps {
+        let Some(event) = CGEvent::new_keyboard_event(Some(&source), key, down) else {
+            return "not tested (event build failed)";
+        };
+        CGEvent::set_flags(Some(&event), flags);
+        CGEvent::post_to_pid(pid, Some(&event));
+        sleep(Duration::from_millis(30));
+    }
+    backspaces(pid, 1);
+    // An honoured chord empties the box; a dropped one leaves all but one
+    // letter. Wait for the box to settle either way before judging.
+    let before = marker(7).len();
+    let _ = wait_for_len(pid, |len| len == 0 || len < before);
+    sleep(Duration::from_millis(300));
+    let verdict = if composer_text_len(pid as u32) == 0 {
+        "honoured (box emptied)"
+    } else {
+        "DROPPED (Command lost; only Backspace landed)"
+    };
+    let remaining = composer_text_len(pid as u32);
+    if remaining > 0 {
+        backspaces(pid, remaining + 3);
+        sleep(Duration::from_millis(600));
+    }
+    verdict
+}
+
+/// The title and description of every text area in the app, for diagnosing
+/// why the exact-label match found nothing.
+#[cfg(target_os = "macos")]
+fn text_area_labels(pid: u32) -> Vec<(Option<String>, Option<String>)> {
+    use cerebellum_macos::{read_app_state, AxAppStateBounds, AxStateElement};
+
+    fn walk(node: &AxStateElement, out: &mut Vec<(Option<String>, Option<String>)>) {
+        if node.role.as_deref() == Some("AXTextArea") {
+            out.push((node.title.clone(), node.description.clone()));
+        }
+        for child in &node.children {
+            walk(child, out);
+        }
+    }
+
+    let bounds = AxAppStateBounds {
+        max_elements: 4_000,
+        max_depth: 40,
+        timeout: std::time::Duration::from_secs(3),
+    };
+    let mut out = Vec::new();
+    if let Ok(state) = read_app_state(pid, bounds) {
+        for root in &state.roots {
+            walk(root, &mut out);
+        }
+    }
+    out
+}
+
+/// Poll the box's visible length until `done` holds, for up to three seconds.
+#[cfg(target_os = "macos")]
+fn wait_for_len(pid: i32, done: impl Fn(usize) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if done(composer_text_len(pid as u32)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    false
+}
+
+/// How many visible characters the message box holds, ignoring the invisible
+/// placeholder characters a web editor keeps in an empty field.
+#[cfg(target_os = "macos")]
+fn composer_text_len(pid: u32) -> usize {
+    let (value, _) = composer_texts(pid).unwrap_or_default();
+    value
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{feff}')
+        .count()
+}
+
+/// Post `count` plain Backspaces through the public per-process route.
+#[cfg(target_os = "macos")]
+fn backspaces(pid: i32, count: usize) {
+    use cerebellum_macos::{key_combination_events, post_event_to_pid, KeyModifiers, VirtualKey};
+    for _ in 0..count {
+        if let Ok(events) = key_combination_events(VirtualKey::Backspace, KeyModifiers::NONE) {
+            for event in events {
+                let _ = post_event_to_pid(pid, &event);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
 }
 
 /// Post the marker string through one route.
@@ -292,22 +501,34 @@ fn clear_field(method: Method, pid: i32) {
     }
 }
 
-/// Every text value under the focused element's subtree.
+/// The message box's own value and every text value in its subtree, or `None`
+/// when no message box is found.
 ///
-/// A web-content app places typed text in child nodes rather than on the
-/// focused field itself, so the read gathers the focused node's own text and
-/// its descendants' text together.
+/// The box is the first text area whose title or description names it a
+/// message box (Discord labels it "Message @<name>"). A web-content app places
+/// typed text in child nodes rather than on the field itself, so the read
+/// gathers the box's own value and its descendants' text separately.
 #[cfg(target_os = "macos")]
-fn focused_subtree_texts(pid: u32) -> Vec<String> {
+fn composer_texts(pid: u32) -> Option<(Option<String>, Vec<String>)> {
     use std::time::Duration;
 
     use cerebellum_macos::{read_app_state, AxAppStateBounds, AxStateElement, AxStateValue};
 
-    fn find_focused(node: &AxStateElement) -> Option<&AxStateElement> {
-        if node.focused {
+    fn is_message_box(node: &AxStateElement) -> bool {
+        // Match the box's label exactly, so the probe types only into the
+        // conversation the operator named and never into whichever channel
+        // happens to be open.
+        let expected = expected_box_label();
+        let labelled = |text: &Option<String>| text.as_deref() == Some(expected.as_str());
+        node.role.as_deref() == Some("AXTextArea")
+            && (labelled(&node.title) || labelled(&node.description))
+    }
+
+    fn find_box(node: &AxStateElement) -> Option<&AxStateElement> {
+        if is_message_box(node) {
             return Some(node);
         }
-        node.children.iter().find_map(find_focused)
+        node.children.iter().find_map(find_box)
     }
 
     fn collect(node: &AxStateElement, out: &mut Vec<String>) {
@@ -324,17 +545,17 @@ fn focused_subtree_texts(pid: u32) -> Vec<String> {
         max_depth: 40,
         timeout: Duration::from_secs(3),
     };
-    let Ok(state) = read_app_state(pid, bounds) else {
-        return Vec::new();
+    let state = read_app_state(pid, bounds).ok()?;
+    let found = state.roots.iter().find_map(find_box)?;
+    let own = match &found.value {
+        AxStateValue::Text(text) => Some(text.clone()),
+        _ => None,
     };
-    let mut out = Vec::new();
-    for root in &state.roots {
-        if let Some(focused) = find_focused(root) {
-            collect(focused, &mut out);
-            return out;
-        }
+    let mut texts = Vec::new();
+    for child in &found.children {
+        collect(child, &mut texts);
     }
-    out
+    Some((own, texts))
 }
 
 /// The unix pid of the running application with `bundle_id`, or `None`.
