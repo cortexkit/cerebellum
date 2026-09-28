@@ -20,7 +20,7 @@ use crate::audit::{
 };
 use crate::capture_custody::{CaptureScope, CustodyUnavailable, PixelArtifact};
 use crate::grounding::ContainmentRung;
-use image::{ImageCustody, ImageUnavailable, RetainFailure, WindowImageCapture};
+use image::{CustodyStepFailed, ImageCustody, ImageUnavailable, RetainFailure, WindowImageCapture};
 
 /// The computer audit as the custody a state read's image passes through.
 ///
@@ -58,16 +58,19 @@ where
     type Reservation = cerebellum_core::journal::ReservationHandle;
     type Admission = crate::capture_custody::CaptureAdmissionToken;
 
-    fn reserve(&mut self) -> Result<Self::Reservation, ()> {
+    fn reserve(&mut self) -> Result<Self::Reservation, CustodyStepFailed> {
         self.audit
             .reserve(self.identity.clone(), descriptor())
-            .map_err(|_| ())
+            .map_err(|_| CustodyStepFailed)
     }
 
-    fn prepare(&mut self, reservation: &Self::Reservation) -> Result<Self::Admission, ()> {
+    fn prepare(
+        &mut self,
+        reservation: &Self::Reservation,
+    ) -> Result<Self::Admission, CustodyStepFailed> {
         self.audit
             .prepare_capture(*reservation, CaptureScope::PerWindow, None, self.now_ms)
-            .map_err(|_| ())
+            .map_err(|_| CustodyStepFailed)
     }
 
     fn retain(
@@ -99,7 +102,7 @@ where
         }
     }
 
-    fn finalize(&mut self, reservation: Self::Reservation) -> Result<(), ()> {
+    fn finalize(&mut self, reservation: Self::Reservation) -> Result<(), CustodyStepFailed> {
         let dispatch = TypedCaptureDispatch::new(
             ComputerCapability::ReadState,
             ContainmentRung::PidStructural,
@@ -109,7 +112,7 @@ where
         let token = self
             .audit
             .commit_dispatched(reservation, &dispatch, b"app_grant".to_vec(), None)
-            .map_err(|_| ())?;
+            .map_err(|_| CustodyStepFailed)?;
         self.audit
             .finalize_dispatched(
                 token,
@@ -117,7 +120,7 @@ where
                 self.bundle_identity.clone().into_bytes(),
             )
             .map(|_| ())
-            .map_err(|_| ())
+            .map_err(|_| CustodyStepFailed)
     }
 
     fn reject(&mut self, reservation: Self::Reservation, reason: ImageUnavailable) {

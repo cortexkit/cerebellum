@@ -252,7 +252,7 @@ impl Reader {
 
     fn remaining_seconds(&self) -> Option<f32> {
         let remaining = self.deadline.checked_duration_since(Instant::now())?;
-        (!remaining.is_zero()).then(|| remaining.as_secs_f32())
+        (!remaining.is_zero()).then_some(remaining.as_secs_f32())
     }
 
     fn read(&mut self, element: AxRetainedElement, depth: usize) -> ElementRead {

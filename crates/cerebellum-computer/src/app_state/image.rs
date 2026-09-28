@@ -182,6 +182,11 @@ pub enum RetainFailure {
     CustodyUnavailable,
 }
 
+/// A custody or journal step refused; which step says why the image is
+/// missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustodyStepFailed;
+
 /// The custody and journal steps an image passes through, in order.
 ///
 /// A trait so every failure between capture and release can be driven by a
@@ -192,9 +197,12 @@ pub trait ImageCustody {
     type Admission;
 
     /// Reserve the journal record the capture will be accounted to.
-    fn reserve(&mut self) -> Result<Self::Reservation, ()>;
+    fn reserve(&mut self) -> Result<Self::Reservation, CustodyStepFailed>;
     /// Ask custody to accept a capture for that record.
-    fn prepare(&mut self, reservation: &Self::Reservation) -> Result<Self::Admission, ()>;
+    fn prepare(
+        &mut self,
+        reservation: &Self::Reservation,
+    ) -> Result<Self::Admission, CustodyStepFailed>;
     /// Hand the image to custody and confirm custody holds it.
     fn retain(
         &mut self,
@@ -204,7 +212,7 @@ pub trait ImageCustody {
         height_px: u32,
     ) -> Result<(), RetainFailure>;
     /// Commit and finalize the record.
-    fn finalize(&mut self, reservation: Self::Reservation) -> Result<(), ()>;
+    fn finalize(&mut self, reservation: Self::Reservation) -> Result<(), CustodyStepFailed>;
     /// Close the record as rejected, naming why.
     fn reject(&mut self, reservation: Self::Reservation, reason: ImageUnavailable);
 }
@@ -221,10 +229,10 @@ pub fn release_through_custody<C: ImageCustody>(
 ) -> Result<ReleasedImage, ImageUnavailable> {
     let reservation = custody
         .reserve()
-        .map_err(|()| ImageUnavailable::AuditUnavailable)?;
+        .map_err(|CustodyStepFailed| ImageUnavailable::AuditUnavailable)?;
     let admission = match custody.prepare(&reservation) {
         Ok(admission) => admission,
-        Err(()) => {
+        Err(CustodyStepFailed) => {
             custody.reject(reservation, ImageUnavailable::CaptureNotAdmitted);
             return Err(ImageUnavailable::CaptureNotAdmitted);
         }
@@ -263,7 +271,7 @@ pub fn release_through_custody<C: ImageCustody>(
     }
     custody
         .finalize(reservation)
-        .map_err(|()| ImageUnavailable::AuditUnavailable)?;
+        .map_err(|CustodyStepFailed| ImageUnavailable::AuditUnavailable)?;
     Ok(ReleasedImage {
         jpeg: captured.jpeg,
         width_px,

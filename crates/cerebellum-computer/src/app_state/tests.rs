@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use super::image::{
-    jpeg_dimensions, release_through_custody, ImageCustody, ImageMapping, ImageUnavailable,
-    RetainFailure, WindowImageCapture,
+    jpeg_dimensions, release_through_custody, CustodyStepFailed, ImageCustody, ImageMapping,
+    ImageUnavailable, RetainFailure, WindowImageCapture,
 };
 use super::render::{
     escape_label, is_session_ending_title, render, ObservedNode, RenderFilter, TruncationReason,
@@ -679,18 +679,18 @@ impl ImageCustody for ScriptedCustody {
     type Reservation = ();
     type Admission = ();
 
-    fn reserve(&mut self) -> Result<(), ()> {
+    fn reserve(&mut self) -> Result<(), CustodyStepFailed> {
         self.calls.push("reserve".into());
         if self.fail == Some("reserve") {
-            Err(())
+            Err(CustodyStepFailed)
         } else {
             Ok(())
         }
     }
-    fn prepare(&mut self, _: &()) -> Result<(), ()> {
+    fn prepare(&mut self, _: &()) -> Result<(), CustodyStepFailed> {
         self.calls.push("prepare".into());
         if self.fail == Some("prepare") {
-            Err(())
+            Err(CustodyStepFailed)
         } else {
             Ok(())
         }
@@ -708,10 +708,10 @@ impl ImageCustody for ScriptedCustody {
             None => Ok(()),
         }
     }
-    fn finalize(&mut self, _: ()) -> Result<(), ()> {
+    fn finalize(&mut self, _: ()) -> Result<(), CustodyStepFailed> {
         self.calls.push("finalize".into());
         if self.fail == Some("finalize") {
-            Err(())
+            Err(CustodyStepFailed)
         } else {
             Ok(())
         }
