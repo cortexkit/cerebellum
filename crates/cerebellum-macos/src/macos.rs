@@ -682,6 +682,52 @@ pub fn process_start_time_micros(pid: u32) -> Option<u64> {
     }
 }
 
+/// C `struct timespec` on Apple platforms, for the one call below that takes a
+/// wait bound.
+#[repr(C)]
+struct Timespec {
+    tv_sec: std::ffi::c_long,
+    tv_nsec: std::ffi::c_long,
+}
+
+extern "C" {
+    /// Copies this machine's platform UUID (the IOPlatformUUID) into `id`,
+    /// waiting at most `wait` for it; returns 0 on success.
+    fn gethostuuid(id: *mut u8, wait: *const Timespec) -> c_int;
+}
+
+/// This machine's hardware UUID (IOPlatformUUID), uppercase and hyphenated as
+/// `ioreg` prints it, or `None` if it could not be read within `timeout`.
+///
+/// Read through the kernel with an explicit wait bound rather than by running
+/// a command: a subprocess can hang with nothing to stop it, and this is read
+/// on the path that decides whether a person is offered a durable grant.
+pub fn hardware_uuid(timeout: Duration) -> Option<String> {
+    let mut id = [0u8; 16];
+    let wait = Timespec {
+        tv_sec: timeout
+            .as_secs()
+            .try_into()
+            .unwrap_or(std::ffi::c_long::MAX),
+        tv_nsec: timeout.subsec_nanos().into(),
+    };
+    // SAFETY: `id` is a 16-byte buffer, the size of `uuid_t`, owned here; the
+    // wait bound is a live value passed by pointer for the duration of the call.
+    let status = unsafe { gethostuuid(id.as_mut_ptr(), &wait) };
+    if status != 0 || id == [0u8; 16] {
+        return None;
+    }
+    let hex: String = id.iter().map(|byte| format!("{byte:02X}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
 /// One window as the system reports it.
 ///
 /// Deliberately without the window title. A title is readable only with a
@@ -1120,6 +1166,57 @@ fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize)
 
 #[cfg(test)]
 mod tests {
+
+    /// The kernel read of the hardware UUID agrees with `ioreg`'s
+    /// IOPlatformUUID, the value an operator would look up by hand.
+    ///
+    /// `ioreg` runs once here, under a deadline, and is killed if it does not
+    /// finish: a hung system tool must fail this test, not hold the suite.
+    #[test]
+    fn the_hardware_uuid_matches_ioreg() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let read = super::hardware_uuid(Duration::from_secs(5))
+            .expect("this machine reports a hardware UUID");
+
+        let mut child = Command::new("/usr/sbin/ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ioreg starts");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if child.try_wait().expect("ioreg can be waited on").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("ioreg did not finish within its deadline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .expect("ioreg's output is piped")
+            .read_to_string(&mut output)
+            .expect("ioreg's output is text");
+        let listed = output
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "\"IOPlatformUUID\"")
+                    .then(|| value.trim().trim_matches('"').to_string())
+            })
+            .expect("ioreg lists IOPlatformUUID");
+
+        assert_eq!(read, listed);
+    }
 
     /// A locked screen is classified separately from other capture failures.
     ///

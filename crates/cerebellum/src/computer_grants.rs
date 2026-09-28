@@ -320,38 +320,21 @@ impl GrantStorage for FilesystemGrantStorage {
 
 /// This machine's hardware identity, or `None` where none can be read.
 ///
-/// On macOS this is the IOPlatformUUID, which survives a reinstall of the
-/// operating system and differs between machines, so a record bound to it
-/// does not travel with a backup. Elsewhere there is no source yet, and a host
-/// without one is never offered "always".
+/// On macOS this is the IOPlatformUUID, read from the kernel with a bounded
+/// wait. It survives a reinstall of the operating system and differs between
+/// machines, so a record bound to it does not travel with a backup. Elsewhere
+/// there is no source yet. A host without one, or one whose read fails, is
+/// never offered "always", and the listing reports every stored record as
+/// belonging to another machine.
 pub fn this_machine_uuid() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/usr/sbin/ioreg")
-            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_platform_uuid(&String::from_utf8_lossy(&output.stdout))
+        cerebellum_macos::hardware_uuid(Duration::from_secs(2))
     }
     #[cfg(not(target_os = "macos"))]
     {
         None
     }
-}
-
-/// Read the `"IOPlatformUUID" = "<uuid>"` line from `ioreg` output.
-pub fn parse_platform_uuid(ioreg_output: &str) -> Option<String> {
-    ioreg_output.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != "\"IOPlatformUUID\"" {
-            return None;
-        }
-        let value = value.trim().trim_matches('"');
-        (!value.is_empty()).then(|| value.to_string())
-    })
 }
 
 /// The last load result of the operator's durable store, for the health reply.
@@ -1477,21 +1460,4 @@ enum Ending {
     TimedOut,
     Draining,
     Cancelled,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_platform_uuid_is_read_from_ioreg_output() {
-        let output = "+-o J314sAP  <class IOPlatformExpertDevice>\n    {\n      \
-                      \"IOPlatformSerialNumber\" = \"ABC\"\n      \
-                      \"IOPlatformUUID\" = \"1B2C3D4E-0000-1111-2222-333344445555\"\n    }\n";
-        assert_eq!(
-            parse_platform_uuid(output).as_deref(),
-            Some("1B2C3D4E-0000-1111-2222-333344445555")
-        );
-        assert_eq!(parse_platform_uuid("nothing here"), None);
-    }
 }
