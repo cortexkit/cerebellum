@@ -275,8 +275,8 @@ pub struct ComputerJournalCodec {
 /// startup reconciliation reads it back.
 pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v1";
 
-/// The computer journal's entry format, as the format floor and staging name
-/// it.
+/// The computer journal's entry format. Its floor is raised before entries are
+/// written, and staging refuses a build whose readers stop short of it.
 pub const COMPUTER_ENTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
     cerebellum_core::format_floor::DurableFormat::new(
         "computer-journal-entry",
@@ -433,8 +433,9 @@ impl PlaneJournalCodec for ComputerJournalCodec {
     }
 
     /// Floored only when writing the version startup reconciliation reads
-    /// back; a codec built with another version string (fixtures) writes a
-    /// family no reader here decodes.
+    /// back. A codec built with another version string (test fixtures) writes
+    /// entries that no reader in this module decodes, so there is no floor to
+    /// raise for them.
     fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
         (self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION).then_some(COMPUTER_ENTRY_FORMAT)
     }

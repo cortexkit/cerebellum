@@ -1406,8 +1406,9 @@ where
     }
 
     fn commit_state(&mut self, candidate: DurableState) -> Result<(), JournalError> {
-        // Before the save: an entry a reader decodes, on disk in a version no
-        // floor names, is what lets staging pass a build that cannot read it.
+        // Raise the entry format's floor before saving. Otherwise an entry
+        // could reach disk in a version the floor does not record, and staging
+        // would accept a build that cannot read it.
         if let Some(format) = self.codec.entry_format() {
             self.raise_format_floor(format)?;
         }
@@ -1713,8 +1714,8 @@ mod tests {
         assert_eq!(journal.export_bytes(), b"c:1");
     }
 
-    /// The fixture codec, declaring an entry format as a codec whose entries
-    /// are decoded again would.
+    /// The fixture codec with an entry format declared, standing in for a
+    /// plane codec whose entries a reader decodes again.
     #[derive(Debug, Clone, Copy)]
     struct DecodedEntryCodec;
 
