@@ -1,0 +1,139 @@
+{
+  "schema_version": 2,
+  "state": {
+    "next_sequence": 5,
+    "next_cursor": 3,
+    "entries": {
+      "1": {
+        "identity": {
+          "principal": "prefrontal",
+          "conversation_key": "conversation-1",
+          "agent_project_id": "project-1",
+          "session_kind": "primary"
+        },
+        "invocation_descriptor": "eyJjYXBhYmlsaXR5IjoiY2xpY2siLCJjb250YWlubWVudF9ydW5nIjoic2VtYW50aWNfZWxlbWVudCIsIm9ic2VydmF0aW9uIjoiaHVtYW5fdW5vYnNlcnZlZCJ9",
+        "bytes": "eyJhdHRhY2htZW50cyI6W10sImNvZGVjX3ZlcnNpb24iOiJjay1jb21wdXRlci1qb3VybmFsL3YxIiwiY29tcGxldGVkX3Jlc3VsdCI6WzEyMywzNCwxMTEsMTE3LDExNiw5OSwxMTEsMTA5LDEwMSwzNCw1OCwzNCwxMDQsOTcsMTEwLDEwMCwxMDgsMTAxLDExNCw5NSwxMTQsMTAxLDExNiwxMTcsMTE0LDExMCwxMDEsMTAwLDM0LDQ0LDM0LDExNywxMTAsMTE0LDEwMSw5NywxMDAsOTcsOTgsMTA4LDEwMSw5NSwxMTUsMTE3LDk4LDExNiwxMTQsMTAxLDEwMSwxMTUsMzQsNTgsNDgsMTI1XSwiZGlzcGF0Y2hfbWF0ZXJpYWwiOlsxMjMsMzQsMTAxLDEwOCwxMDEsMTA5LDEwMSwxMTAsMTE2LDM0LDU4LDEyMywzNCwxMDksOTcsMTE2LDk5LDEwNCwxMDEsMTAwLDk1LDk4LDEyMSwzNCw1OCwxMjMsMzQsNzMsMTAwLDEwMSwxMTAsMTE2LDEwNSwxMDIsMTA1LDEwMSwxMTQsMzQsNTgsMzQsMTE2LDExMSwxMTEsMTA4LDk4LDk3LDExNCw0NSwxMTUsMTE3LDk4LDEwOSwxMDUsMTE2LDM0LDEyNSw0NCwzNCw5NywxMDgsMTE2LDEwMSwxMTQsMTEwLDk3LDExNiwxMDEsOTUsMTEwLDk3LDEwOSwxMDEsMzQsNTgsMTEwLDExNywxMDgsMTA4LDEyNSw0NCwzNCw5Nyw5OSwxMTYsMTA1LDExMSwxMTAsMzQsNTgsMzQsMTEyLDExNCwxMDEsMTE1LDExNSwzNCw0NCwzNCwxMDMsMTE0LDk3LDExMCwxMTYsOTUsMTA1LDEwMCwxMDEsMTEwLDExNiwxMDUsMTE2LDEyMSwzNCw1OCwxMjMsMzQsMTEyLDEwNSwxMDAsMzQsNTgsNTIsNTAsNDQsMzQsOTgsMTE3LDExMCwxMDAsMTA4LDEwMSw5NSwxMDUsMTAwLDEwMSwxMTAsMTE2LDEwNSwxMTYsMTIxLDM0LDU4LDM0LDk5LDExMSwxMDksNDYsMTAxLDEyMCw5NywxMDksMTEyLDEwOCwxMDEsNDYsMTE2LDk3LDExNCwxMDMsMTAxLDExNiwzNCw0NCwzNCwxMTIsMTE0LDExMSw5OSwxMDEsMTE1LDExNSw5NSwxMDMsMTAxLDExMCwxMDEsMTE0LDk3LDExNiwxMDUsMTExLDExMCw5NSwxMDEsMTE4LDEwNSwxMDAsMTAxLDExMCw5OSwxMDEsMzQsNTgsMzQsMTAzLDEwMSwxMTAsMTAxLDExNCw5NywxMTYsMTA1LDExMSwxMTAsNDUsNDksMzQsMTI1LDEyNV0sImZpbmFsX2NvbnRleHQiOltdLCJpZGVudGl0eSI6eyJhZ2VudF9wcm9qZWN0X2lkIjoicHJvamVjdC0xIiwiY29udmVyc2F0aW9uX2tleSI6ImNvbnZlcnNhdGlvbi0xIiwicHJpbmNpcGFsIjoicHJlZnJvbnRhbCIsInNlc3Npb25fa2luZCI6InByaW1hcnkifSwicGhhc2UiOiJmaW5hbGl6ZWQiLCJzZXF1ZW5jZSI6MSwic2V2ZXJpdHlfaW5wdXRzIjp7ImVmZmVjdF9jbGFzcyI6Im11dGF0ZSIsImlzb2xhdGlvbl9jbGFzcyI6InJlc291cmNlX3Njb3BlZCIsIm9ic2VydmFiaWxpdHlfY2xhc3MiOiJodW1hbl91bm9ic2VydmVkIn19",
+        "accounted_size": 2429,
+        "codec_id": "ck-computer-journal/v1",
+        "kind": "finalized_committed",
+        "reason": null,
+        "severity_inputs": {
+          "effect_class": "mutate",
+          "isolation_class": "resource_scoped",
+          "observability_class": "human_unobserved"
+        },
+        "severity": {
+          "tier": 2,
+          "credential": false,
+          "financial": false
+        },
+        "attachments": {},
+        "recovered": false
+      },
+      "2": {
+        "identity": {
+          "principal": "prefrontal",
+          "conversation_key": "conversation-1",
+          "agent_project_id": "project-1",
+          "session_kind": "primary"
+        },
+        "invocation_descriptor": "eyJjYXBhYmlsaXR5Ijoic2NyZWVuc2hvdCIsImNvbnRhaW5tZW50X3J1bmciOiJwaWRfc3RydWN0dXJhbCIsIm9ic2VydmF0aW9uIjoiaHVtYW5fdW5vYnNlcnZlZCJ9",
+        "bytes": "eyJhdHRhY2htZW50cyI6W1sxMjMsMzQsOTcsMTE0LDExNiwxMDUsMTAyLDk3LDk5LDExNiw5NSwxMDUsMTAwLDM0LDU4LDM0LDk5LDk3LDExMiwxMTYsMTE3LDExNCwxMDEsNDUsOTcsMTE0LDExNiwxMDUsMTAyLDk3LDk5LDExNiw0NSw0OSwzNCw0NCwzNCwxMDAsMTAxLDExNSw5OSwxMTQsMTA1LDExMiwxMTYsMTExLDExNCwzNCw1OCwxMjMsMzQsOTcsMTE0LDExNiwxMDUsMTAyLDk3LDk5LDExNiw5NSwxMTUsMTA0LDk3LDUwLDUzLDU0LDM0LDU4LDM0LDU1LDU2LDU1LDk5LDU1LDU3LDU2LDEwMSw1MSw1Nyw5Nyw1Myw5OCw5OSw0OSw1Nyw0OSw0OCw1MSw1Myw1Myw5OCw5NywxMDEsNTQsMTAwLDQ4LDk5LDEwMCw1Niw1NSw5Nyw1MSw1NCw5OCw1MCwxMDEsNDksNDgsMTAyLDEwMCw0OCw1MCw0OCw1MCw5Nyw1Niw1MSwxMDEsNTEsOTgsOTgsNTQsOTgsNDgsNDgsNTMsMTAwLDk3LDU2LDUxLDUyLDU1LDUwLDM0LDQ0LDM0LDk5LDk3LDExMiwxMTYsMTE3LDExNCwxMDEsOTUsMTE1LDk5LDExMSwxMTIsMTAxLDM0LDU4LDM0LDExMiwxMDEsMTE0LDk1LDExOSwxMDUsMTEwLDEwMCwxMTEsMTE5LDM0LDQ0LDM0LDk5LDk3LDExMiwxMTYsMTE3LDExNCwxMDEsMTAwLDk1LDk3LDExNiwzNCw1OCw0OSw0OCw0NCwzNCwxMDMsMTE0LDk3LDExMCwxMTYsOTUsMTA1LDEwMCwzNCw1OCwxMTAsMTE3LDEwOCwxMDgsNDQsMzQsMTA0LDEwMSwxMDUsMTAzLDEwNCwxMTYsOTUsMTEyLDEyMCwzNCw1OCw0OSw0NCwzNCwxMTEsMTE5LDExMCwxMDUsMTEwLDEwMyw5NSwxMTIsMTE0LDExMSw5OSwxMDEsMTE1LDExNSw5NSwxMDUsMTAwLDM0LDU4LDUyLDUwLDQ0LDM0LDExNiw5NywxMTQsMTAzLDEwMSwxMTYsOTUsMTE5LDEwNSwxMTAsMTAwLDExMSwxMTksOTUsMTA1LDEwMCwzNCw1OCwzNCwxMTksMTA1LDExMCwxMDAsMTExLDExOSw0NSw0OSwzNCw0NCwzNCwxMTksMTA1LDEwMCwxMTYsMTA0LDk1LDExMiwxMjAsMzQsNTgsNTEsMTI1LDQ0LDM0LDExNCwxMDEsMTE2LDEwMSwxMTAsMTE2LDEwNSwxMTEsMTEwLDk1LDExMiwxMDUsMTEwLDk1LDEwNSwxMDAsMzQsNTgsMTEwLDExNywxMDgsMTA4LDEyNV1dLCJjb2RlY192ZXJzaW9uIjoiY2stY29tcHV0ZXItam91cm5hbC92MSIsImNvbXBsZXRlZF9yZXN1bHQiOls5OSw5NywxMTIsMTE2LDExNywxMTQsMTAxLDEwMF0sImRpc3BhdGNoX21hdGVyaWFsIjpbOTksMTExLDEwOSwxMTIsMTE3LDExNiwxMDEsMTE0LDQ2LDExNSw5OSwxMTQsMTAxLDEwMSwxMTAsMTE1LDEwNCwxMTEsMTE2XSwiZmluYWxfY29udGV4dCI6W10sImlkZW50aXR5Ijp7ImFnZW50X3Byb2plY3RfaWQiOiJwcm9qZWN0LTEiLCJjb252ZXJzYXRpb25fa2V5IjoiY29udmVyc2F0aW9uLTEiLCJwcmluY2lwYWwiOiJwcmVmcm9udGFsIiwic2Vzc2lvbl9raW5kIjoicHJpbWFyeSJ9LCJwaGFzZSI6ImZpbmFsaXplZCIsInNlcXVlbmNlIjoyLCJzZXZlcml0eV9pbnB1dHMiOnsiZWZmZWN0X2NsYXNzIjoicmVhZCIsImlzb2xhdGlvbl9jbGFzcyI6Im93bmVyX3Njb3BlZCIsIm9ic2VydmFiaWxpdHlfY2xhc3MiOiJodW1hbl91bm9ic2VydmVkIn19",
+        "accounted_size": 3139,
+        "codec_id": "ck-computer-journal/v1",
+        "kind": "finalized_committed",
+        "reason": null,
+        "severity_inputs": {
+          "effect_class": "read",
+          "isolation_class": "owner_scoped",
+          "observability_class": "human_unobserved"
+        },
+        "severity": {
+          "tier": 1,
+          "credential": false,
+          "financial": false
+        },
+        "attachments": {
+          "computer.capture": {
+            "revision": 1,
+            "opaque_bytes": "eyJhcnRpZmFjdF9pZCI6ImNhcHR1cmUtYXJ0aWZhY3QtMSIsImRlc2NyaXB0b3IiOnsiYXJ0aWZhY3Rfc2hhMjU2IjoiNzg3Yzc5OGUzOWE1YmMxOTEwMzU1YmFlNmQwY2Q4N2EzNmIyZTEwZmQwMjAyYTgzZTNiYjZiMDA1ZGE4MzQ3MiIsImNhcHR1cmVfc2NvcGUiOiJwZXJfd2luZG93IiwiY2FwdHVyZWRfYXQiOjEwLCJncmFudF9pZCI6bnVsbCwiaGVpZ2h0X3B4IjoxLCJvd25pbmdfcHJvY2Vzc19pZCI6NDIsInRhcmdldF93aW5kb3dfaWQiOiJ3aW5kb3ctMSIsIndpZHRoX3B4IjozfSwicmV0ZW50aW9uX3Bpbl9pZCI6bnVsbH0="
+          }
+        },
+        "recovered": false
+      }
+    },
+    "reservations": {
+      "3": {
+        "identity": {
+          "principal": "prefrontal",
+          "conversation_key": "conversation-1",
+          "agent_project_id": "project-1",
+          "session_kind": "primary"
+        },
+        "invocation_descriptor": "eyJjYXBhYmlsaXR5IjoiY2xpY2siLCJjb250YWlubWVudF9ydW5nIjoic2VtYW50aWNfZWxlbWVudCIsIm9ic2VydmF0aW9uIjoiaHVtYW5fdW5vYnNlcnZlZCJ9",
+        "provisional": {
+          "durable_bytes": "eyJjb2RlY192ZXJzaW9uIjoiY2stY29tcHV0ZXItam91cm5hbC92MSIsImRpc3BhdGNoX21hdGVyaWFsIjpbMTIzLDM0LDEwMSwxMDgsMTAxLDEwOSwxMDEsMTEwLDExNiwzNCw1OCwxMjMsMzQsMTA5LDk3LDExNiw5OSwxMDQsMTAxLDEwMCw5NSw5OCwxMjEsMzQsNTgsMTIzLDM0LDczLDEwMCwxMDEsMTEwLDExNiwxMDUsMTAyLDEwNSwxMDEsMTE0LDM0LDU4LDM0LDExNiwxMTEsMTExLDEwOCw5OCw5NywxMTQsNDUsMTE1LDExNyw5OCwxMDksMTA1LDExNiwzNCwxMjUsNDQsMzQsOTcsMTA4LDExNiwxMDEsMTE0LDExMCw5NywxMTYsMTAxLDk1LDExMCw5NywxMDksMTAxLDM0LDU4LDExMCwxMTcsMTA4LDEwOCwxMjUsNDQsMzQsOTcsOTksMTE2LDEwNSwxMTEsMTEwLDM0LDU4LDM0LDExMiwxMTQsMTAxLDExNSwxMTUsMzQsNDQsMzQsMTAzLDExNCw5NywxMTAsMTE2LDk1LDEwNSwxMDAsMTAxLDExMCwxMTYsMTA1LDExNiwxMjEsMzQsNTgsMTIzLDM0LDExMiwxMDUsMTAwLDM0LDU4LDUyLDUwLDQ0LDM0LDk4LDExNywxMTAsMTAwLDEwOCwxMDEsOTUsMTA1LDEwMCwxMDEsMTEwLDExNiwxMDUsMTE2LDEyMSwzNCw1OCwzNCw5OSwxMTEsMTA5LDQ2LDEwMSwxMjAsOTcsMTA5LDExMiwxMDgsMTAxLDQ2LDExNiw5NywxMTQsMTAzLDEwMSwxMTYsMzQsNDQsMzQsMTEyLDExNCwxMTEsOTksMTAxLDExNSwxMTUsOTUsMTAzLDEwMSwxMTAsMTAxLDExNCw5NywxMTYsMTA1LDExMSwxMTAsOTUsMTAxLDExOCwxMDUsMTAwLDEwMSwxMTAsOTksMTAxLDM0LDU4LDM0LDEwMywxMDEsMTEwLDEwMSwxMTQsOTcsMTE2LDEwNSwxMTEsMTEwLDQ1LDQ5LDM0LDEyNSwxMjVdLCJnb3Zlcm5pbmdfb2JzZXJ2YXRpb24iOm51bGwsImdyYW50X2RlY2lzaW9uIjpbMTIzLDM0LDExMiwxMDUsMTAwLDM0LDU4LDUyLDUwLDQ0LDM0LDk4LDExNywxMTAsMTAwLDEwOCwxMDEsOTUsMTA1LDEwMCwxMDEsMTEwLDExNiwxMDUsMTE2LDEyMSwzNCw1OCwzNCw5OSwxMTEsMTA5LDQ2LDEwMSwxMjAsOTcsMTA5LDExMiwxMDgsMTAxLDQ2LDExNiw5NywxMTQsMTAzLDEwMSwxMTYsMzQsNDQsMzQsMTEyLDExNCwxMTEsOTksMTAxLDExNSwxMTUsOTUsMTAzLDEwMSwxMTAsMTAxLDExNCw5NywxMTYsMTA1LDExMSwxMTAsOTUsMTAxLDExOCwxMDUsMTAwLDEwMSwxMTAsOTksMTAxLDM0LDU4LDM0LDEwMywxMDEsMTEwLDEwMSwxMTQsOTcsMTE2LDEwNSwxMTEsMTEwLDQ1LDQ5LDM0LDEyNV0sImlkZW50aXR5Ijp7ImFnZW50X3Byb2plY3RfaWQiOiJwcm9qZWN0LTEiLCJjb252ZXJzYXRpb25fa2V5IjoiY29udmVyc2F0aW9uLTEiLCJwcmluY2lwYWwiOiJwcmVmcm9udGFsIiwic2Vzc2lvbl9raW5kIjoicHJpbWFyeSJ9LCJpbnZvY2F0aW9uX2Rlc2NyaXB0b3IiOlsxMjMsMzQsOTksOTcsMTEyLDk3LDk4LDEwNSwxMDgsMTA1LDExNiwxMjEsMzQsNTgsMzQsOTksMTA4LDEwNSw5OSwxMDcsMzQsNDQsMzQsOTksMTExLDExMCwxMTYsOTcsMTA1LDExMCwxMDksMTAxLDExMCwxMTYsOTUsMTE0LDExNywxMTAsMTAzLDM0LDU4LDM0LDExNSwxMDEsMTA5LDk3LDExMCwxMTYsMTA1LDk5LDk1LDEwMSwxMDgsMTAxLDEwOSwxMDEsMTEwLDExNiwzNCw0NCwzNCwxMTEsOTgsMTE1LDEwMSwxMTQsMTE4LDk3LDExNiwxMDUsMTExLDExMCwzNCw1OCwzNCwxMDQsMTE3LDEwOSw5NywxMTAsOTUsMTE3LDExMCwxMTEsOTgsMTE1LDEwMSwxMTQsMTE4LDEwMSwxMDAsMzQsMTI1XSwicGhhc2UiOiJkaXNwYXRjaGVkIiwic2VxdWVuY2UiOjMsInNldmVyaXR5X2lucHV0cyI6eyJlZmZlY3RfY2xhc3MiOiJtdXRhdGUiLCJpc29sYXRpb25fY2xhc3MiOiJyZXNvdXJjZV9zY29wZWQiLCJvYnNlcnZhYmlsaXR5X2NsYXNzIjoiaHVtYW5fdW5vYnNlcnZlZCJ9fQ==",
+          "accounted_serialized_size": 1867,
+          "codec_version": "ck-computer-journal/v1"
+        },
+        "codec_id": "ck-computer-journal/v1",
+        "charge": 3599,
+        "state": "dispatched",
+        "marker": null,
+        "dispatch": {
+          "dispatch_material": "eyJlbGVtZW50Ijp7Im1hdGNoZWRfYnkiOnsiSWRlbnRpZmllciI6InRvb2xiYXItc3VibWl0In0sImFsdGVybmF0ZV9uYW1lIjpudWxsfSwiYWN0aW9uIjoicHJlc3MiLCJncmFudF9pZGVudGl0eSI6eyJwaWQiOjQyLCJidW5kbGVfaWRlbnRpdHkiOiJjb20uZXhhbXBsZS50YXJnZXQiLCJwcm9jZXNzX2dlbmVyYXRpb25fZXZpZGVuY2UiOiJnZW5lcmF0aW9uLTEifX0=",
+          "severity_inputs": {
+            "effect_class": "mutate",
+            "isolation_class": "resource_scoped",
+            "observability_class": "human_unobserved"
+          },
+          "grant_decision": "eyJwaWQiOjQyLCJidW5kbGVfaWRlbnRpdHkiOiJjb20uZXhhbXBsZS50YXJnZXQiLCJwcm9jZXNzX2dlbmVyYXRpb25fZXZpZGVuY2UiOiJnZW5lcmF0aW9uLTEifQ==",
+          "governing_observation": null
+        },
+        "attachments": {}
+      },
+      "4": {
+        "identity": {
+          "principal": "prefrontal",
+          "conversation_key": "conversation-1",
+          "agent_project_id": "project-1",
+          "session_kind": "primary"
+        },
+        "invocation_descriptor": "eyJjYXBhYmlsaXR5Ijoic2NyZWVuc2hvdCIsImNvbnRhaW5tZW50X3J1bmciOiJwaWRfc3RydWN0dXJhbCIsIm9ic2VydmF0aW9uIjoiaHVtYW5fdW5vYnNlcnZlZCJ9",
+        "provisional": {
+          "durable_bytes": "eyJjb2RlY192ZXJzaW9uIjoiY2stY29tcHV0ZXItam91cm5hbC92MSIsImRpc3BhdGNoX21hdGVyaWFsIjpbOTksMTExLDEwOSwxMTIsMTE3LDExNiwxMDEsMTE0LDQ2LDExNSw5OSwxMTQsMTAxLDEwMSwxMTAsMTE1LDEwNCwxMTEsMTE2XSwiZ292ZXJuaW5nX29ic2VydmF0aW9uIjpudWxsLCJncmFudF9kZWNpc2lvbiI6WzEwOCwxMDEsOTcsMTE1LDEwMV0sImlkZW50aXR5Ijp7ImFnZW50X3Byb2plY3RfaWQiOiJwcm9qZWN0LTEiLCJjb252ZXJzYXRpb25fa2V5IjoiY29udmVyc2F0aW9uLTEiLCJwcmluY2lwYWwiOiJwcmVmcm9udGFsIiwic2Vzc2lvbl9raW5kIjoicHJpbWFyeSJ9LCJpbnZvY2F0aW9uX2Rlc2NyaXB0b3IiOlsxMjMsMzQsOTksOTcsMTEyLDk3LDk4LDEwNSwxMDgsMTA1LDExNiwxMjEsMzQsNTgsMzQsMTE1LDk5LDExNCwxMDEsMTAxLDExMCwxMTUsMTA0LDExMSwxMTYsMzQsNDQsMzQsOTksMTExLDExMCwxMTYsOTcsMTA1LDExMCwxMDksMTAxLDExMCwxMTYsOTUsMTE0LDExNywxMTAsMTAzLDM0LDU4LDM0LDExMiwxMDUsMTAwLDk1LDExNSwxMTYsMTE0LDExNyw5OSwxMTYsMTE3LDExNCw5NywxMDgsMzQsNDQsMzQsMTExLDk4LDExNSwxMDEsMTE0LDExOCw5NywxMTYsMTA1LDExMSwxMTAsMzQsNTgsMzQsMTA0LDExNywxMDksOTcsMTEwLDk1LDExNywxMTAsMTExLDk4LDExNSwxMDEsMTE0LDExOCwxMDEsMTAwLDM0LDEyNV0sInBoYXNlIjoiZGlzcGF0Y2hlZCIsInNlcXVlbmNlIjo0LCJzZXZlcml0eV9pbnB1dHMiOnsiZWZmZWN0X2NsYXNzIjoicmVhZCIsImlzb2xhdGlvbl9jbGFzcyI6Im93bmVyX3Njb3BlZCIsIm9ic2VydmFiaWxpdHlfY2xhc3MiOiJodW1hbl91bm9ic2VydmVkIn19",
+          "accounted_serialized_size": 861,
+          "codec_version": "ck-computer-journal/v1"
+        },
+        "codec_id": "ck-computer-journal/v1",
+        "charge": 1881,
+        "state": "dispatched",
+        "marker": null,
+        "dispatch": {
+          "dispatch_material": "Y29tcHV0ZXIuc2NyZWVuc2hvdA==",
+          "severity_inputs": {
+            "effect_class": "read",
+            "isolation_class": "owner_scoped",
+            "observability_class": "human_unobserved"
+          },
+          "grant_decision": "bGVhc2U=",
+          "governing_observation": null
+        },
+        "attachments": {}
+      }
+    },
+    "transitions": [
+      {
+        "cursor": 1,
+        "action_obligation_id": 1,
+        "kind": "finalized_committed"
+      },
+      {
+        "cursor": 2,
+        "action_obligation_id": 2,
+        "kind": "finalized_committed"
+      }
+    ],
+    "oversize_flag": false
+  }
+}

@@ -1075,3 +1075,83 @@ fn crash_orphaned_capture_is_finalized_by_startup_reconciliation() {
         Some(ComputerTerminalKind::RecoveryDispatchFinalized)
     );
 }
+
+/// A journal written before `click` and `screenshot` were retired still loads.
+///
+/// The fixture is a real `computer.json`, written by the journal code as it
+/// stood when both capabilities were served: a completed click, a completed
+/// screenshot, and one of each that was mid-flight when the process died. The
+/// descriptor inside each entry names its capability by its serialized name, so
+/// deleting a retired variant would make these entries undecodable, and the
+/// module would refuse to start on any machine that had ever clicked. The
+/// orphaned entries matter most: startup reconciliation must decode their
+/// descriptors to settle them, which is the path that fails first.
+#[test]
+fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup() {
+    const FIXTURE: &[u8] = include_bytes!("fixtures/v12_computer_journal.json");
+    // A private copy per run, because reconciliation rewrites the file it
+    // loaded and the checked-in fixture must stay as it was written.
+    let path = std::env::temp_dir().join(format!(
+        "cerebellum-retired-journal-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, FIXTURE).unwrap();
+    let custody = CaptureCustody::new(
+        bounds(),
+        InMemoryGrantAuthority::default(),
+        InMemoryCustodyStorage::new(),
+    )
+    .unwrap();
+    let mut audit = ComputerAudit::new(
+        ExcludeApplicationText,
+        cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+        JournalConfig {
+            journal_retention_bytes: 8 * 1024 * 1024,
+            journal_max_entry_bytes: 64 * 1024,
+        },
+        cerebellum_core::journal::FilesystemJournalStorage::new(path.clone()),
+        custody,
+    )
+    .expect("a journal holding retired capabilities binds");
+
+    let reconciled = audit.startup_reconcile(10);
+    let records: Vec<_> = (1..=4)
+        .map(|sequence| audit.read_computer_audit_record(sequence))
+        .collect();
+    let _ = std::fs::remove_file(&path);
+
+    reconciled.expect("startup reconciliation settles the retired entries");
+    let records: Vec<_> = records
+        .into_iter()
+        .map(|record| record.expect("every retired entry decodes"))
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.descriptor.capability)
+            .collect::<Vec<_>>(),
+        vec![
+            ComputerCapability::Click,
+            ComputerCapability::Screenshot,
+            ComputerCapability::Click,
+            ComputerCapability::Screenshot,
+        ]
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.terminal_kind)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(ComputerTerminalKind::FinalizedCommitted),
+            Some(ComputerTerminalKind::FinalizedCommitted),
+            Some(ComputerTerminalKind::DispatchOutcomeUnknown),
+            Some(ComputerTerminalKind::RecoveryDispatchFinalized),
+        ],
+        "the two orphaned entries were settled by reconciliation"
+    );
+}
