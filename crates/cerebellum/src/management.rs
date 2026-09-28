@@ -1,20 +1,16 @@
-//! Management operations: asking for permission to reach an application.
+//! Management operations: asking for permission, and the operator's own tools.
 //!
 //! Separate from tool calls because the two surfaces take different request
 //! envelopes and because what they do differs in kind. A tool call acts; a
 //! management operation arranges the authority under which acting is possible.
 //!
-//! WHY OPENING A LEASE IS ITS OWN CALL rather than something the first action
-//! does implicitly: an implicit prompt would ask the user to approve reaching an
-//! application the agent is ALREADY MID-ACTION AGAINST, which turns consent into
-//! ratification — the thing being consented to arrives pre-committed. Keeping
-//! the ask ahead of the action costs a round trip and buys an approval the user
-//! can refuse before anything has happened.
-//!
-//! The cost of an explicit step is that it can be forgotten. That is paid for at
-//! the other end: an action against an unleased target refuses with the name of
-//! this operation and the application it needs, so forgetting costs one round
-//! trip and teaches.
+//! For the computer plane the authority is the app grant and the takeover
+//! grant (see [`crate::computer_grants`]). A computer action asks for the grant
+//! it needs itself and waits for the answer, so no separate opening call is
+//! required before acting; `computer.open_target` remains for an operator who
+//! wants to settle an application's grant ahead of time, and the grant
+//! listing and revoking operations live here because they are the operator's,
+//! never a model's.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -22,10 +18,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerebellum_computer::platform::{ProcessGrant, TargetCandidate, TargetResolution};
-use cerebellum_core::clock::MonotonicClock;
-use cerebellum_core::consent::{
-    ActionKind, ConsentLeases, GrantKind, LeaseKey, OnceDispatchToken, Opening,
-};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -34,11 +26,17 @@ use crate::authorization::{
     OBSERVE,
 };
 use crate::classification::canonical_grant_origin;
+use crate::computer_grants::{ComputerGrants, ConsentContext, GrantNeed};
 use crate::launch_recovery::{ClearFailure, ClearPreview, LaunchRecoveryRegistry};
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
+use crate::CancelHandle;
 
-/// The computer-target operation this surface serves.
+/// Settle an application's app grant ahead of any action on it.
 pub const OPEN_TARGET: &str = "computer.open_target";
+/// List the durable "always allow" app grants. Operator-only.
+pub const LIST_APP_GRANTS: &str = "computer.list_app_grants";
+/// Remove a durable "always allow" app grant. Operator-only.
+pub const REVOKE_APP_GRANT: &str = "computer.revoke_app_grant";
 /// Ask a person to issue a hazard-scoped browser action grant.
 pub const OPEN_GRANT: &str = "browser.open_grant";
 /// Copy persistent encrypted login rows from the person's matching browser.
@@ -55,8 +53,10 @@ pub const CAPTURE_LOGIN: &str = "browser.capture_login";
 /// browser from before a restart gone. Operator-only: it is a management
 /// operation, never a tool, so no model sees it in a tool catalog.
 pub const CLEAR_LAUNCH_RECOVERY: &str = "browser.clear_launch_recovery";
-pub const OPERATIONS: [&str; 8] = [
+pub const OPERATIONS: [&str; 10] = [
     OPEN_TARGET,
+    LIST_APP_GRANTS,
+    REVOKE_APP_GRANT,
     OPEN_GRANT,
     IMPORT_LOGIN,
     PRESENT,
@@ -65,45 +65,6 @@ pub const OPERATIONS: [&str; 8] = [
     CAPTURE_LOGIN,
     CLEAR_LAUNCH_RECOVERY,
 ];
-
-/// Read an action kind from its wire spelling.
-///
-/// `None` for anything unrecognised, so a kind this module does not know is
-/// refused rather than resolved to a default. Defaulting would put a request
-/// under whichever gate the default names, and the plausible default is the
-/// permissive one.
-pub fn action_kind_from_wire(kind: &str) -> Option<ActionKind> {
-    match kind {
-        "observe" => Some(ActionKind::Observe),
-        "compose" => Some(ActionKind::Compose),
-        "mutate_durable" => Some(ActionKind::MutateDurable),
-        _ => None,
-    }
-}
-
-/// How an action kind is spelled on the wire.
-///
-/// The inverse of [`action_kind_from_wire`], so a refusal can name the value a
-/// caller should send back. A refusal that describes the remedy in different
-/// words than the request accepts is a remedy the caller cannot follow.
-pub fn action_kind_to_wire(kind: ActionKind) -> &'static str {
-    match kind {
-        ActionKind::Observe => "observe",
-        ActionKind::Compose => "compose",
-        ActionKind::MutateDurable => "mutate_durable",
-    }
-}
-
-/// How long a consent question for control of an application may stay
-/// unanswered before it stops being one.
-///
-/// Kept short on purpose: this lease hands the agent the screen, and its
-/// window starts when the person answers. A person answering a stale question
-/// long after the agent asked may not be watching when the agent acts. Its
-/// expiry is a definite not-granted rather than an unfinished wait; the caller
-/// has long since been told the request is pending, so nothing is blocked on
-/// it.
-const CONSENT_DEADLINE: Duration = Duration::from_secs(300);
 
 /// How long a question the person usually answers from a phone may stay open:
 /// a browser grant, or re-identifying the profile root.
@@ -115,13 +76,6 @@ const CONSENT_DEADLINE: Duration = Duration::from_secs(300);
 /// already expired it.
 const PHONE_CONSENT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-/// How long a granted lease lasts when the user allows one.
-///
-/// The prompt offers a bounded grant rather than an open-ended one, so this is
-/// the bound. It is not configurable here: a duration that can be raised toward
-/// indefinite reintroduces the grant nobody could later say they issued.
-const GRANT_DURATION: Duration = Duration::from_secs(600);
-
 /// Resolving an application name to the process that answers to it.
 ///
 /// Behind a trait because the resolution reads the window server, which exists
@@ -131,6 +85,12 @@ const GRANT_DURATION: Duration = Duration::from_secs(600);
 /// compiles.
 pub trait TargetResolver: Send + Sync {
     fn resolve(&self, bundle_identity: &str) -> TargetResolution;
+
+    /// The name the resolved process runs under, for showing to a person.
+    /// `None` where it cannot be read; the bundle identity is shown instead.
+    fn display_name(&self, _grant: &ProcessGrant) -> Option<String> {
+        None
+    }
 }
 
 /// Resolves application names against this machine.
@@ -194,6 +154,11 @@ impl TargetResolver for PlatformResolver {
         cerebellum_computer::platform::native::resolve_target(bundle_identity, self.timeout)
     }
 
+    #[cfg(target_os = "macos")]
+    fn display_name(&self, grant: &ProcessGrant) -> Option<String> {
+        cerebellum_computer::platform::native::application_name(grant.pid, self.timeout)
+    }
+
     /// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
     /// Windows the same caller names an executable basename (`notepad.exe`).
     /// Windows has no bundle identifier; the two identities are deliberately
@@ -239,7 +204,9 @@ impl TargetResolver for PlatformResolver {
 
 /// The state a management route needs.
 pub struct ManagementPlane {
-    leases: Mutex<ConsentLeases>,
+    /// The computer plane's app and takeover grants, and the questions out
+    /// for them.
+    computer_grants: Arc<ComputerGrants>,
     resolver: Arc<dyn TargetResolver>,
     browser_grants: Arc<Mutex<GrantStore>>,
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
@@ -252,15 +219,6 @@ pub struct ManagementPlane {
     /// request for that project. The answer arrives on a task nobody waits
     /// on, so this is where an answer that did nothing says so.
     launch_recovery_settlements: Mutex<BTreeMap<String, Value>>,
-    /// Targets whose last consent question reached no person, by the ask that
-    /// was never put.
-    ///
-    /// Kept so the NEXT request for the same target can say what became of the
-    /// previous one. Without it every attempt looks identical to the first and
-    /// the caller is told to await an answer that was never solicited. Not a
-    /// refusal and not a cache of one: the question is still put each time,
-    /// because a person who becomes reachable should simply be asked.
-    unreached: Mutex<BTreeMap<LeaseKey, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,9 +295,20 @@ impl ClearSettlement {
 }
 
 impl ManagementPlane {
+    /// A plane whose computer grants live in memory and are never offered
+    /// "always". For tests and isolated callers.
     pub fn new(resolver: Arc<dyn TargetResolver>) -> Self {
+        Self::with_computer_grants(resolver, Arc::new(ComputerGrants::in_memory()))
+    }
+
+    /// A plane over computer grants the caller opened, which is how a running
+    /// module attaches the operator's durable store.
+    pub fn with_computer_grants(
+        resolver: Arc<dyn TargetResolver>,
+        computer_grants: Arc<ComputerGrants>,
+    ) -> Self {
         Self {
-            leases: Mutex::new(ConsentLeases::new()),
+            computer_grants,
             resolver,
             browser_grants: Arc::new(Mutex::new(GrantStore::default())),
             pending_browser_grants: Mutex::new(BTreeMap::new()),
@@ -348,7 +317,114 @@ impl ManagementPlane {
             launch_recovery: Arc::new(LaunchRecoveryRegistry::new()),
             pending_launch_recovery_clears: Mutex::new(BTreeMap::new()),
             launch_recovery_settlements: Mutex::new(BTreeMap::new()),
-            unreached: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The computer plane's grants.
+    pub fn computer_grants(&self) -> &Arc<ComputerGrants> {
+        &self.computer_grants
+    }
+
+    /// Resolve an application name to the one process answering to it now,
+    /// or the refusal that says why there is not exactly one.
+    ///
+    /// Called for every action, and again after a call waited for consent:
+    /// a grant says the person agreed, and resolving says the process they
+    /// agreed about is still the one answering to that name. A process that
+    /// exited and had its identifier reused would otherwise inherit a grant
+    /// made for something else.
+    pub fn resolve_process(&self, bundle_identity: &str) -> Result<ProcessGrant, Value> {
+        match self.resolver.resolve(bundle_identity) {
+            TargetResolution::Resolved(grant) => Ok(grant),
+            TargetResolution::NotRunning => Err(json!({
+                "outcome": "not_running",
+                "bundle_identity": bundle_identity,
+                "remedy": "start the application, then retry",
+            })),
+            TargetResolution::Ambiguous(candidates) => Err(json!({
+                "outcome": "ambiguous",
+                "bundle_identity": bundle_identity,
+                "instances": describe(&candidates),
+                // Named rather than chosen between: picking one would act on a
+                // process the person never selected.
+                "remedy": "quit all but one instance, then retry",
+            })),
+            // Separate from `not_running` because that answer is a claim about
+            // the world and this one is only about our own sight. Telling
+            // someone their running application is not running sends them to
+            // start a second copy.
+            TargetResolution::Unreadable(reason) => Err(json!({
+                "outcome": "targets_unreadable",
+                "bundle_identity": bundle_identity,
+                "unreadable": reason,
+                "remedy": unreadable_remedy(&reason),
+            })),
+        }
+    }
+
+    /// What the person sees an application called, for the consent question:
+    /// its running name, or its bundle identity when no name can be read.
+    pub fn application_name(&self, grant: &ProcessGrant) -> String {
+        self.resolver
+            .display_name(grant)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| grant.bundle_identity.clone())
+    }
+
+    /// Resolve an application and hold its app grant, asking the person and
+    /// waiting for the answer when it is not held.
+    ///
+    /// The process is resolved before asking, so nobody is asked about an
+    /// application that is not running, and again after a wait, so the call
+    /// acts on the process that answers to the name now.
+    pub async fn admit_app(
+        &self,
+        bundle_identity: &str,
+        consent: &ConsentContext,
+        cancel: &CancelHandle,
+    ) -> Result<(ProcessGrant, crate::computer_grants::GrantAdmission), AppRefusal> {
+        let grant = self
+            .resolve_process(bundle_identity)
+            .map_err(AppRefusal::Resolution)?;
+        let need = GrantNeed::App {
+            bundle_identity: bundle_identity.to_string(),
+            display_name: self.application_name(&grant),
+        };
+        let admission = self
+            .computer_grants
+            .require(&need, consent, cancel)
+            .await
+            .map_err(AppRefusal::Consent)?;
+        let grant = if admission.waited {
+            self.resolve_process(bundle_identity)
+                .map_err(AppRefusal::Resolution)?
+        } else {
+            grant
+        };
+        Ok((grant, admission))
+    }
+
+    /// `computer.open_target`: settle an application's app grant now.
+    ///
+    /// Blocks exactly as an action does, and replies `granted` once the grant
+    /// is held; nothing is done in the application.
+    pub async fn open_target(
+        &self,
+        bundle_identity: &str,
+        consent: &ConsentContext,
+        cancel: &CancelHandle,
+    ) -> Value {
+        match self.admit_app(bundle_identity, consent, cancel).await {
+            Ok((grant, admission)) => {
+                let mut reply = json!({
+                    "outcome": "granted",
+                    "bundle_identity": bundle_identity,
+                    "pid": grant.pid,
+                });
+                admission.decorate(&mut reply);
+                reply
+            }
+            Err(refusal) => refusal.reply(bundle_identity),
         }
     }
 
@@ -826,238 +902,6 @@ impl ManagementPlane {
     pub async fn launch_recovery_clear_pending_count(&self) -> usize {
         self.pending_launch_recovery_clears.lock().await.len()
     }
-
-    /// Resolve an application name and report what authority exists over it.
-    ///
-    /// Returns without waiting for the user. The operation's own deadline is
-    /// seconds and a person's is minutes, so waiting would time out on almost
-    /// every genuine ask and report a decision nobody made. The caller is told
-    /// the request is pending and asks again later; the answer, when it comes,
-    /// is applied by the task this spawns.
-    pub async fn open_target<C: MonotonicClock>(
-        &self,
-        grantee: &str,
-        bundle_identity: &str,
-        action_kind: ActionKind,
-        can_relay_to_a_person: bool,
-        clock: &C,
-    ) -> (Value, Option<Question>) {
-        // Resolved BEFORE any lease is consulted, because a lease over an
-        // application that is not running, or that names two processes, is not
-        // something to act on even when it is held. The lease says the user
-        // agreed; resolution says what they agreed about still exists.
-        let resolution = self.resolver.resolve(bundle_identity);
-        let grant = match resolution {
-            TargetResolution::Resolved(grant) => grant,
-            TargetResolution::NotRunning => {
-                return (
-                    json!({
-                        "outcome": "not_running",
-                        "bundle_identity": bundle_identity,
-                        "remedy": "start the application, then ask again",
-                    }),
-                    None,
-                );
-            }
-            TargetResolution::Ambiguous(candidates) => {
-                return (
-                    json!({
-                        "outcome": "ambiguous",
-                        "bundle_identity": bundle_identity,
-                        "instances": describe(&candidates),
-                        // Named rather than chosen between: picking one would
-                        // grant access to a process the user never selected.
-                        "remedy": "quit all but one instance, then ask again",
-                    }),
-                    None,
-                );
-            }
-            // Separate from `not_running` because that answer is a claim about
-            // the world and this one is only about our own sight. Telling
-            // someone their running application is not running sends them to
-            // start a second copy.
-            TargetResolution::Unreadable(reason) => {
-                return (
-                    json!({
-                        "outcome": "targets_unreadable",
-                        "bundle_identity": bundle_identity,
-                        "unreadable": reason,
-                        "remedy": unreadable_remedy(&reason),
-                    }),
-                    None,
-                );
-            }
-        };
-
-        let key = LeaseKey {
-            grantee: grantee.to_string(),
-            bundle_identity: bundle_identity.to_string(),
-            action_kind,
-        };
-
-        let opening = {
-            let mut leases = self.leases.lock().await;
-            leases.open(key.clone(), clock, new_ask_id)
-        };
-        // What became of the last question about this target, when the carrier
-        // told us nobody was shown it. Carried into the pending replies below so
-        // a caller can tell "the person has not answered yet" from "no person
-        // was ever asked", which have opposite remedies and, without this, look
-        // identical on the wire.
-        let unreached = self.unreached.lock().await.get(&key).cloned();
-        let previous_request = |reply: &mut Value| {
-            if let (Some(ask_id), Some(object)) = (unreached.as_ref(), reply.as_object_mut()) {
-                object.insert(
-                    "previous_request".into(),
-                    json!({
-                        "ask_id": ask_id,
-                        "disposition": "not_put_to_anyone",
-                    }),
-                );
-            }
-        };
-
-        match opening {
-            Opening::AlreadyHeld(lease) => {
-                let remaining = {
-                    let leases = self.leases.lock().await;
-                    let _ = &*leases;
-                    ConsentLeases::remaining(&lease, clock)
-                };
-                (
-                    json!({
-                        "outcome": "already_held",
-                        "bundle_identity": bundle_identity,
-                        "pid": grant.pid,
-                        // A duration rather than the expiry instant, which is
-                        // comparable only against this module's clock. Stale by
-                        // however long it takes to arrive, so it is worth planning
-                        // against and not worth relying on: the check made when the
-                        // lease is used stays the authority.
-                        "remaining_ms": remaining.map(|left| left.as_millis() as u64),
-                    }),
-                    None,
-                )
-            }
-            // Already being asked: the caller waits for that answer. Putting the
-            // question again would show the user a second prompt for something
-            // already on their screen.
-            Opening::AlreadyAsking(pending) => {
-                let mut reply = json!({
-                    "outcome": "consent_pending",
-                    "bundle_identity": bundle_identity,
-                    "ask_id": pending.ask_id,
-                    "remedy": "ask again once the request has been answered",
-                });
-                previous_request(&mut reply);
-                (reply, None)
-            }
-            Opening::AskNeeded(pending) => {
-                if !can_relay_to_a_person {
-                    // Nobody can be asked, so nothing can be granted. Reported
-                    // as its own outcome rather than as a pending question:
-                    // waiting for an answer that cannot be requested would
-                    // report the user as unresponsive for a fault on this side.
-                    let mut leases = self.leases.lock().await;
-                    leases.settle(&pending.ask_id, None, clock);
-                    return (
-                        json!({
-                            "outcome": "consent_unavailable",
-                            "bundle_identity": bundle_identity,
-                            "remedy":
-                                "reconnect declaring the ability to relay a question to a person",
-                        }),
-                        None,
-                    );
-                }
-
-                // The question travels back to the caller rather than being sent
-                // here, so this type decides WHAT to ask without needing a wire
-                // to ask on -- which is what lets the whole flow be exercised
-                // where no window server and no route exist.
-                let question = Question {
-                    ask_id: pending.ask_id.clone(),
-                    body: consent_question(&pending.ask_id, bundle_identity, action_kind),
-                    deadline: CONSENT_DEADLINE,
-                };
-                let mut reply = json!({
-                    "outcome": "consent_pending",
-                    "bundle_identity": bundle_identity,
-                    "ask_id": pending.ask_id,
-                    "remedy": "ask again once the request has been answered",
-                });
-                previous_request(&mut reply);
-                (reply, Some(question))
-            }
-        }
-    }
-
-    /// Apply a user's answer to the question it answers.
-    ///
-    /// An answer to a question this module is not holding grants nothing: it is
-    /// either a reply to one already settled or an answer to something never
-    /// asked, and neither may create authority.
-    pub async fn settle<C: MonotonicClock>(
-        &self,
-        ask_id: &str,
-        answer: Option<&Value>,
-        clock: &C,
-    ) -> bool {
-        self.settle_target(ask_id, answer, true, clock).await
-    }
-
-    /// Settle a consent question, recording whether a person ever saw it.
-    ///
-    /// `put_to_a_person` false means the carrier reported that it could reach
-    /// nobody. That grants nothing either way, so it does not change this
-    /// answer -- it changes what the NEXT request for the same target is told,
-    /// which is the difference between waiting for a person and waiting for one
-    /// who was never asked.
-    pub async fn settle_target<C: MonotonicClock>(
-        &self,
-        ask_id: &str,
-        answer: Option<&Value>,
-        put_to_a_person: bool,
-        clock: &C,
-    ) -> bool {
-        let granted = answer.and_then(|answer| grant_from_answer(answer, clock));
-        let mut leases = self.leases.lock().await;
-        // Read before settling, because settling removes the pending ask and
-        // with it the only link from this ask to the target it was about.
-        let key = leases.pending_key(ask_id);
-        let settled = leases.settle(ask_id, granted, clock).is_some();
-        drop(leases);
-        if let Some(key) = key {
-            let mut unreached = self.unreached.lock().await;
-            if put_to_a_person {
-                // Someone was asked, whatever they said or did not say, so any
-                // earlier report that nobody could be reached is now stale.
-                unreached.remove(&key);
-            } else {
-                unreached.insert(key, ask_id.to_string());
-            }
-        }
-        settled
-    }
-
-    /// Whether a lease currently admits an action, without spending one.
-    pub async fn admits<C: MonotonicClock>(&self, key: &LeaseKey, clock: &C) -> bool {
-        let mut leases = self.leases.lock().await;
-        leases.admits(key, clock).is_admitted()
-    }
-
-    /// Consume an exact Once lease into the token required by global dispatch.
-    ///
-    /// The same write lock guards both lease minting and consumption, so a
-    /// concurrent opening and dispatch cannot both observe one single-use grant.
-    pub async fn admit_once_dispatch<C: MonotonicClock>(
-        &self,
-        key: &LeaseKey,
-        clock: &C,
-    ) -> Option<OnceDispatchToken> {
-        let mut leases = self.leases.lock().await;
-        leases.admit_once_dispatch(key, clock)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1370,178 +1214,22 @@ pub struct Question {
     pub deadline: Duration,
 }
 
-/// What authority an action has over an application, at the moment it asks.
-///
-/// The refusal carries the way out rather than only the diagnosis. An explicit
-/// opening step can be forgotten, and an agent that forgot it learns from this
-/// refusal in one round trip instead of needing to have read the manual first,
-/// which is what makes requiring the explicit step affordable.
+/// Why an action on a named application did not proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActionAuthority {
-    /// A lease admits this action against the named process.
-    Admitted(ProcessGrant),
-    /// Nothing admits it. Carries the operation to call and what to name.
-    Refused(Value),
+pub enum AppRefusal {
+    /// The name did not resolve to exactly one running process.
+    Resolution(Value),
+    /// The app grant was not held and the question did not grant it.
+    Consent(crate::computer_grants::ConsentRefusal),
 }
 
-impl ManagementPlane {
-    /// Find the lease an action runs under, or refuse with the way to get one.
-    ///
-    /// Requests that carry no target of their own resolve to the application
-    /// most recently opened for this action kind, which is the agent's own last
-    /// deliberate act rather than a property of the machine.
-    ///
-    /// The target is resolved again here rather than carried from the opening: a
-    /// lease records that the user agreed, and resolving says the process they
-    /// agreed about is still the one answering to that name. A process that
-    /// exited and had its identifier reused would otherwise inherit a grant made
-    /// for something else.
-    pub async fn authority_for<C: MonotonicClock>(
-        &self,
-        grantee: &str,
-        action_kind: ActionKind,
-        clock: &C,
-    ) -> ActionAuthority {
-        let focused = {
-            let mut leases = self.leases.lock().await;
-            leases.focused(grantee, action_kind, clock)
-        };
-        let Some(key) = focused else {
-            return ActionAuthority::Refused(json!({
-                "outcome": "no_lease",
-                "remedy": format!(
-                    "call {OPEN_TARGET} with the bundle_identity of the application and \
-                     action_kind '{}', then retry",
-                    action_kind_to_wire(action_kind)
-                ),
-            }));
-        };
-        self.resolve_leased(key)
-    }
-
-    /// Find the lease an action on a NAMED application runs under.
-    ///
-    /// For a request that says which application it means. The lease must be
-    /// held for exactly that application: one held for another application,
-    /// or the one most recently opened, admits nothing here, because acting on
-    /// an application the request did not name is the hidden selection a named
-    /// request exists to avoid.
-    pub async fn authority_for_bundle<C: MonotonicClock>(
-        &self,
-        grantee: &str,
-        bundle_identity: &str,
-        action_kind: ActionKind,
-        clock: &C,
-    ) -> ActionAuthority {
-        let key = LeaseKey {
-            grantee: grantee.to_string(),
-            bundle_identity: bundle_identity.to_string(),
-            action_kind,
-        };
-        let admitted = {
-            let mut leases = self.leases.lock().await;
-            leases.admits(&key, clock).is_admitted()
-        };
-        if !admitted {
-            return ActionAuthority::Refused(json!({
-                "outcome": "no_lease",
-                "bundle_identity": bundle_identity,
-                "remedy": format!(
-                    "call {OPEN_TARGET} with bundle_identity '{bundle_identity}' and \
-                     action_kind '{}', then retry",
-                    action_kind_to_wire(action_kind)
-                ),
-            }));
+impl AppRefusal {
+    /// The reply for this refusal in the shared consent envelope.
+    pub fn reply(&self, bundle_identity: &str) -> Value {
+        match self {
+            Self::Resolution(reply) => reply.clone(),
+            Self::Consent(refusal) => refusal.reply(Some(bundle_identity)),
         }
-        self.resolve_leased(key)
-    }
-
-    /// Resolve the application a held lease names to its one running process.
-    fn resolve_leased(&self, key: LeaseKey) -> ActionAuthority {
-        match self.resolver.resolve(&key.bundle_identity) {
-            TargetResolution::Resolved(grant) => ActionAuthority::Admitted(grant),
-            // The lease is held and the thing it was granted over is gone. Not
-            // reported as a missing lease: the remedy is to start the
-            // application, and telling the agent to ask again for permission it
-            // already holds would send it to the user for nothing.
-            TargetResolution::NotRunning => ActionAuthority::Refused(json!({
-                "outcome": "target_not_running",
-                "bundle_identity": key.bundle_identity,
-                "remedy": "start the application, then retry",
-            })),
-            TargetResolution::Ambiguous(candidates) => ActionAuthority::Refused(json!({
-                "outcome": "ambiguous",
-                "bundle_identity": key.bundle_identity,
-                "instances": describe(&candidates),
-                "remedy": "quit all but one instance, then retry",
-            })),
-            // Refused rather than admitted, because an action needs a target
-            // this process can currently see: the grant identifies a process by
-            // its generation, and that cannot be re-established from a window
-            // list that did not answer. Distinct from `target_not_running` so a
-            // caller is not sent to start an application that is already there.
-            TargetResolution::Unreadable(reason) => ActionAuthority::Refused(json!({
-                "outcome": "targets_unreadable",
-                "bundle_identity": key.bundle_identity,
-                "unreadable": reason,
-                "remedy": unreadable_remedy(&reason),
-            })),
-        }
-    }
-}
-
-/// The question put to the user.
-///
-/// The wording carries the scope in words because the prompt's attachment cannot:
-/// a preview shows one window at one moment while the grant covers the whole
-/// application for its duration, so a user deciding from the picture would be
-/// deciding on something the grant does not preserve.
-fn consent_question(ask_id: &str, bundle_identity: &str, action_kind: ActionKind) -> Value {
-    let verb = match action_kind {
-        ActionKind::Observe => "see",
-        ActionKind::Compose => "control",
-        ActionKind::MutateDurable => "make lasting changes in",
-    };
-    json!({
-        "jsonrpc": "2.0",
-        "id": ask_id,
-        "method": "elicitation/create",
-        "params": {
-            "message": format!(
-                "Allow this agent to {verb} {bundle_identity}? \
-                 It will apply to that application's windows for the next 10 minutes, \
-                 including windows and pages you open during that time."
-            ),
-            "requestedSchema": {
-                "type": "object",
-                "properties": {
-                    "decision": {
-                        "type": "string",
-                        // No indefinite option. An open-ended grant to reach an
-                        // application is one nobody could later say they issued;
-                        // durable permission is a configuration act instead.
-                        "enum": ["allow_once", "allow_10_minutes", "deny"],
-                    }
-                },
-                "required": ["decision"],
-            },
-        },
-    })
-}
-
-/// Turn a user's answer into the grant it authorises, if any.
-///
-/// An answer this does not recognise is a refusal rather than a default: a reply
-/// that cannot be read is not evidence that anyone agreed to anything.
-pub fn grant_from_answer<C: MonotonicClock>(answer: &Value, clock: &C) -> Option<GrantKind> {
-    match answer.get("decision").and_then(Value::as_str) {
-        Some("allow_once") => Some(GrantKind::Once),
-        // Computed against this module's clock, which is the only clock the
-        // expiry will ever be compared to.
-        Some("allow_10_minutes") => {
-            Some(GrantKind::Until(clock.now().saturating_add(GRANT_DURATION)))
-        }
-        _ => None,
     }
 }
 
@@ -1589,18 +1277,9 @@ fn new_launch_recovery_clear_ask_id(incarnation: &str) -> String {
     )
 }
 
-fn new_ask_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!("consent-{}", NEXT.fetch_add(1, Ordering::Relaxed) + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use cerebellum_computer::platform::ProcessGrant;
-    use cerebellum_core::clock::FakeClock;
 
     struct Fixed(TargetResolution);
 
@@ -1612,26 +1291,6 @@ mod tests {
 
     fn plane(resolution: TargetResolution) -> ManagementPlane {
         ManagementPlane::new(Arc::new(Fixed(resolution)))
-    }
-
-    fn one_instance() -> TargetResolution {
-        TargetResolution::Resolved(ProcessGrant {
-            pid: 4242,
-            bundle_identity: "com.apple.Safari".to_string(),
-            process_generation_evidence: "1700000000000000".to_string(),
-        })
-    }
-
-    async fn open(plane: &ManagementPlane, clock: &FakeClock) -> (Value, Option<Question>) {
-        plane
-            .open_target(
-                "pj-example",
-                "com.apple.Safari",
-                ActionKind::Observe,
-                true,
-                clock,
-            )
-            .await
     }
 
     #[tokio::test]
@@ -1856,452 +1515,5 @@ mod tests {
         assert_eq!(unavailable["outcome"], "consent_unavailable");
         assert!(question.is_none());
         assert_eq!(plane.browser_grant_count().await, 0);
-    }
-
-    /// An unleased application asks, and hands back the question to put.
-    #[tokio::test]
-    async fn an_unleased_application_produces_a_question() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (reply, question) = open(&plane, &clock).await;
-        assert_eq!(reply["outcome"], "consent_pending");
-        let question = question.expect("an unleased application must produce a question");
-        assert_eq!(question.ask_id, reply["ask_id"].as_str().unwrap());
-
-        // The wording carries the scope, because the grant outlives the moment
-        // and covers more than whatever the user can see when they answer.
-        let message = question.body["params"]["message"].as_str().unwrap();
-        assert!(message.contains("com.apple.Safari"), "{message}");
-        assert!(message.contains("10 minutes"), "{message}");
-        assert!(message.contains("open during that time"), "{message}");
-
-        // No indefinite option is offered.
-        let options = question.body["params"]["requestedSchema"]["properties"]["decision"]["enum"]
-            .as_array()
-            .unwrap();
-        assert_eq!(options.len(), 3);
-        assert!(!options.iter().any(|option| {
-            let option = option.as_str().unwrap_or_default();
-            option.contains("always") || option.contains("forever")
-        }));
-    }
-
-    /// A repeat request joins the question in flight rather than asking again.
-    ///
-    /// The reply is the same, and the ABSENCE of a second question is the
-    /// property: a caller handed one puts it, and the user would then see two
-    /// prompts for a single request.
-    #[tokio::test]
-    async fn a_repeat_request_does_not_produce_a_second_question() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (first, first_question) = open(&plane, &clock).await;
-        let (second, second_question) = open(&plane, &clock).await;
-
-        assert_eq!(first["ask_id"], second["ask_id"]);
-        assert!(first_question.is_some());
-        assert!(
-            second_question.is_none(),
-            "a repeat request would have prompted the user twice"
-        );
-    }
-
-    /// Two instances refuse, name both, and ask nothing.
-    ///
-    /// Asking would be asking about a target that does not exist: the user
-    /// cannot grant access to "Safari" when the name does not identify one.
-    #[tokio::test]
-    async fn two_instances_refuse_without_asking() {
-        let plane = plane(TargetResolution::Ambiguous(vec![
-            TargetCandidate {
-                pid: 100,
-                window_count: 2,
-            },
-            TargetCandidate {
-                pid: 101,
-                window_count: 1,
-            },
-        ]));
-        let clock = FakeClock::new();
-
-        let (reply, question) = open(&plane, &clock).await;
-        assert_eq!(reply["outcome"], "ambiguous");
-        assert!(question.is_none(), "an ambiguous target was asked about");
-
-        let instances = reply["instances"].as_array().unwrap();
-        assert_eq!(instances.len(), 2);
-        assert_eq!(instances[0]["pid"], 100);
-        assert_eq!(instances[0]["window_count"], 2);
-        assert_eq!(instances[1]["pid"], 101);
-    }
-
-    /// An application that is not running refuses without asking.
-    #[tokio::test]
-    async fn a_missing_application_refuses_without_asking() {
-        let plane = plane(TargetResolution::NotRunning);
-        let clock = FakeClock::new();
-
-        let (reply, question) = open(&plane, &clock).await;
-        assert_eq!(reply["outcome"], "not_running");
-        assert!(question.is_none());
-    }
-
-    /// With nobody to ask, the request fails rather than waiting.
-    ///
-    /// Reported as its own outcome: leaving a question outstanding for a
-    /// consumer that cannot relay it would report the user as unresponsive for
-    /// a fault on this side.
-    #[tokio::test]
-    async fn a_consumer_that_cannot_relay_gets_no_pending_question() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (reply, question) = plane
-            .open_target(
-                "pj-example",
-                "com.apple.Safari",
-                ActionKind::Observe,
-                false,
-                &clock,
-            )
-            .await;
-
-        assert_eq!(reply["outcome"], "consent_unavailable");
-        assert!(question.is_none());
-
-        // And nothing is left pending, so a later request asks afresh rather
-        // than joining a question that was never put.
-        let (again, question) = open(&plane, &clock).await;
-        assert_eq!(again["outcome"], "consent_pending");
-        // Control of an application stays on the short deadline: its lease
-        // starts when the person answers, and a stale answer should not hand
-        // over the screen when they may no longer be watching.
-        assert_eq!(
-            question.expect("a question is put").deadline,
-            Duration::from_secs(300)
-        );
-    }
-
-    /// An allowed answer mints the lease, and a later request is already held.
-    #[tokio::test]
-    async fn an_allowed_answer_grants_a_bounded_lease() {
-        let plane = plane(one_instance());
-        let mut clock = FakeClock::new();
-
-        let (reply, _) = open(&plane, &clock).await;
-        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
-
-        assert!(
-            plane
-                .settle(
-                    &ask_id,
-                    Some(&json!({"decision": "allow_10_minutes"})),
-                    &clock
-                )
-                .await
-        );
-
-        let (held, question) = open(&plane, &clock).await;
-        assert_eq!(held["outcome"], "already_held");
-        assert!(question.is_none(), "a held lease asked again");
-        assert_eq!(held["remaining_ms"], 600_000);
-
-        // The bound is real: the lease stops admitting once it passes.
-        clock.advance(Duration::from_secs(600));
-        let (expired, question) = open(&plane, &clock).await;
-        assert_eq!(expired["outcome"], "consent_pending");
-        assert!(question.is_some(), "an expired lease did not ask again");
-    }
-
-    /// A question nobody was shown is reported as such on the next request.
-    ///
-    /// The two ways a consent goes unanswered look identical on the wire
-    /// otherwise, and their remedies are opposite: a person who ignored a
-    /// prompt may answer the next one, while a question that reached nobody
-    /// will not be answered however many times it is asked. A caller told to
-    /// "ask again once the request has been answered" about a question no one
-    /// was ever offered is in a loop -- which is exactly what a live consumer
-    /// hit, its carrier reporting that no head session existed to consent.
-    #[tokio::test]
-    async fn a_question_that_reached_nobody_is_named_on_the_next_request() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (first, question) = open(&plane, &clock).await;
-        assert_eq!(first["outcome"], "consent_pending");
-        assert!(question.is_some());
-        assert!(
-            first.get("previous_request").is_none(),
-            "a first request has no previous one to report"
-        );
-        let unreached_ask = first["ask_id"].as_str().unwrap().to_string();
-
-        // The carrier reports it could put the question to no one.
-        plane
-            .settle_target(&unreached_ask, None, false, &clock)
-            .await;
-
-        // The question is still put -- a person who becomes reachable should
-        // simply be asked -- but the caller is told about the one that was not.
-        let (again, question) = open(&plane, &clock).await;
-        assert_eq!(again["outcome"], "consent_pending");
-        assert!(question.is_some(), "a reachable person would not be asked");
-        assert_eq!(again["previous_request"]["ask_id"], unreached_ask);
-        assert_eq!(
-            again["previous_request"]["disposition"],
-            "not_put_to_anyone"
-        );
-    }
-
-    /// Silence from a person who WAS asked is not reported as unreached.
-    ///
-    /// The distinction is the whole point: if every unanswered question were
-    /// reported this way, the field would mean "not answered yet" and the
-    /// caller would be no better off than with the timing.
-    #[tokio::test]
-    async fn silence_from_someone_who_was_asked_is_not_reported_as_unreached() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (first, _) = open(&plane, &clock).await;
-        let ask_id = first["ask_id"].as_str().unwrap().to_string();
-
-        // Asked, and nobody replied inside the deadline.
-        plane.settle_target(&ask_id, None, true, &clock).await;
-
-        let (again, _) = open(&plane, &clock).await;
-        assert_eq!(again["outcome"], "consent_pending");
-        assert!(
-            again.get("previous_request").is_none(),
-            "silence from a person who was asked was reported as nobody asked"
-        );
-    }
-
-    /// Reaching someone clears an earlier report that nobody was reachable.
-    #[tokio::test]
-    async fn reaching_a_person_clears_the_earlier_unreached_report() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (first, _) = open(&plane, &clock).await;
-        let unreached_ask = first["ask_id"].as_str().unwrap().to_string();
-        plane
-            .settle_target(&unreached_ask, None, false, &clock)
-            .await;
-
-        let (second, _) = open(&plane, &clock).await;
-        assert_eq!(second["previous_request"]["ask_id"], unreached_ask);
-        let answered_ask = second["ask_id"].as_str().unwrap().to_string();
-
-        // This one reached a person, who refused. Nothing is granted, but the
-        // earlier report is now stale and must not keep being made.
-        plane
-            .settle_target(
-                &answered_ask,
-                Some(&json!({"decision": "deny"})),
-                true,
-                &clock,
-            )
-            .await;
-
-        let (third, _) = open(&plane, &clock).await;
-        assert!(
-            third.get("previous_request").is_none(),
-            "a stale unreached report survived reaching a person"
-        );
-    }
-
-    /// A refusal grants nothing, and the next request asks afresh.
-    #[tokio::test]
-    async fn a_refusal_grants_nothing() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (reply, _) = open(&plane, &clock).await;
-        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
-
-        assert!(
-            !plane
-                .settle(&ask_id, Some(&json!({"decision": "deny"})), &clock)
-                .await
-        );
-
-        let (again, question) = open(&plane, &clock).await;
-        assert_eq!(again["outcome"], "consent_pending");
-        assert!(question.is_some(), "a refused request did not ask again");
-    }
-
-    /// An answer that cannot be read grants nothing.
-    ///
-    /// A reply this does not understand is not evidence that anyone agreed, so
-    /// it is a refusal rather than a value to fall back from.
-    #[tokio::test]
-    async fn an_unreadable_answer_grants_nothing() {
-        let clock = FakeClock::new();
-        assert!(grant_from_answer(&json!({}), &clock).is_none());
-        assert!(grant_from_answer(&json!({"decision": "yes"}), &clock).is_none());
-        assert!(grant_from_answer(&json!({"decision": "allow_forever"}), &clock).is_none());
-        assert!(grant_from_answer(&json!({"decision": "allow_once"}), &clock).is_some());
-    }
-
-    /// An action with no lease is refused with the way to get one.
-    ///
-    /// The remedy names the operation AND the exact value to send: a refusal
-    /// that describes the remedy in different words than the request accepts is
-    /// one the caller cannot follow.
-    #[tokio::test]
-    async fn an_unleased_action_is_refused_with_the_recipe() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let ActionAuthority::Refused(refusal) = plane
-            .authority_for("pj-example", ActionKind::Observe, &clock)
-            .await
-        else {
-            panic!("an action with no lease must be refused");
-        };
-
-        assert_eq!(refusal["outcome"], "no_lease");
-        let remedy = refusal["remedy"].as_str().unwrap();
-        assert!(remedy.contains(OPEN_TARGET), "{remedy}");
-        assert!(remedy.contains("bundle_identity"), "{remedy}");
-        // The wire spelling, so following the remedy produces a valid request.
-        assert!(remedy.contains("'observe'"), "{remedy}");
-        assert!(action_kind_from_wire("observe").is_some());
-    }
-
-    /// Once consent is given, the action runs against the process named by it.
-    #[tokio::test]
-    async fn a_granted_action_names_the_process_it_runs_against() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (reply, _) = open(&plane, &clock).await;
-        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
-        plane
-            .settle(
-                &ask_id,
-                Some(&json!({"decision": "allow_10_minutes"})),
-                &clock,
-            )
-            .await;
-
-        let ActionAuthority::Admitted(grant) = plane
-            .authority_for("pj-example", ActionKind::Observe, &clock)
-            .await
-        else {
-            panic!("a granted action must be admitted");
-        };
-        assert_eq!(grant.pid, 4242);
-        assert_eq!(grant.bundle_identity, "com.apple.Safari");
-    }
-
-    /// A grant to look does not admit an action that touches.
-    #[tokio::test]
-    async fn looking_consent_does_not_admit_composing() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (reply, _) = open(&plane, &clock).await;
-        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
-        plane
-            .settle(
-                &ask_id,
-                Some(&json!({"decision": "allow_10_minutes"})),
-                &clock,
-            )
-            .await;
-
-        let ActionAuthority::Refused(refusal) = plane
-            .authority_for("pj-example", ActionKind::Compose, &clock)
-            .await
-        else {
-            panic!("permission to look admitted an action that touches");
-        };
-        assert_eq!(refusal["outcome"], "no_lease");
-        assert!(refusal["remedy"].as_str().unwrap().contains("'compose'"));
-    }
-
-    /// A lease whose application has since quit is not reported as unleased.
-    ///
-    /// The remedy differs: this one is answered by starting the application, and
-    /// sending the agent back to the user for permission it already holds would
-    /// prompt for nothing.
-    #[tokio::test]
-    async fn a_lease_over_a_departed_application_says_so() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        let (reply, _) = open(&plane, &clock).await;
-        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
-        plane
-            .settle(
-                &ask_id,
-                Some(&json!({"decision": "allow_10_minutes"})),
-                &clock,
-            )
-            .await;
-
-        // The lease survives; the application does not.
-        let departed = ManagementPlane::new(Arc::new(Fixed(TargetResolution::NotRunning)));
-        {
-            let mut from = plane.leases.lock().await;
-            let mut into = departed.leases.lock().await;
-            std::mem::swap(&mut *from, &mut *into);
-        }
-
-        let ActionAuthority::Refused(refusal) = departed
-            .authority_for("pj-example", ActionKind::Observe, &clock)
-            .await
-        else {
-            panic!("an action over a departed application must be refused");
-        };
-        assert_eq!(refusal["outcome"], "target_not_running");
-        assert!(refusal["remedy"].as_str().unwrap().contains("start"));
-    }
-
-    /// An expired lease refuses, rather than admitting on a stale focus.
-    #[tokio::test]
-    async fn an_expired_lease_admits_nothing() {
-        let plane = plane(one_instance());
-        let mut clock = FakeClock::new();
-
-        let (reply, _) = open(&plane, &clock).await;
-        let ask_id = reply["ask_id"].as_str().unwrap().to_string();
-        plane
-            .settle(
-                &ask_id,
-                Some(&json!({"decision": "allow_10_minutes"})),
-                &clock,
-            )
-            .await;
-
-        clock.advance(Duration::from_secs(600));
-        let ActionAuthority::Refused(refusal) = plane
-            .authority_for("pj-example", ActionKind::Observe, &clock)
-            .await
-        else {
-            panic!("an expired lease admitted an action");
-        };
-        assert_eq!(refusal["outcome"], "no_lease");
-    }
-
-    /// An answer to a question nobody asked grants nothing.
-    #[tokio::test]
-    async fn an_answer_to_an_unknown_question_grants_nothing() {
-        let plane = plane(one_instance());
-        let clock = FakeClock::new();
-
-        assert!(
-            !plane
-                .settle(
-                    "never-asked",
-                    Some(&json!({"decision": "allow_once"})),
-                    &clock
-                )
-                .await
-        );
     }
 }

@@ -959,7 +959,8 @@ pub struct SyntheticDispatchRequest {
     pub action: SyntheticAction,
 }
 
-/// A global request that cannot be constructed without consuming a Once lease.
+/// A global request that cannot be constructed without the token minted when
+/// the takeover grant admits one dispatch.
 ///
 /// The token is held by value and is neither cloneable nor defaultable. Timing
 /// bounds travel with the request because the platform driver applies them

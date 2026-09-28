@@ -118,9 +118,19 @@ fn management_surface() -> ProviderRole {
         operations: [
             (
                 crate::management::OPEN_TARGET,
-                "Ask the person for access to an application, so computer actions \
-                 can name it as a target. Returns once the request is pending; \
-                 access begins only if they agree.",
+                "Settle an application's app grant ahead of any computer action: \
+                 asks the person if the grant is not held and waits for the \
+                 answer, replying granted once it is.",
+            ),
+            (
+                crate::management::LIST_APP_GRANTS,
+                "List the durable always-allow app grants, and any record naming \
+                 another machine, which grants nothing here. Operator-only.",
+            ),
+            (
+                crate::management::REVOKE_APP_GRANT,
+                "Remove a durable always-allow app grant for one agent and \
+                 application; dry_run reports what would be removed. Operator-only.",
             ),
             (
                 crate::management::OPEN_GRANT,
@@ -172,6 +182,9 @@ fn management_surface() -> ProviderRole {
                 ManagementOperationKind::Mutate
             } else if name == crate::management::CAPTURE_LOGIN {
                 // A capture writes a file holding a login onto this machine.
+                ManagementOperationKind::Mutate
+            } else if name == crate::management::REVOKE_APP_GRANT {
+                // A revoke rewrites the durable grant store.
                 ManagementOperationKind::Mutate
             } else {
                 // The remaining operations report state or arrange authority;
@@ -290,7 +303,7 @@ fn self_signals() -> Vec<SelfSignalDeclaration> {
             anchored_to: SignalAnchor::HealthGauges { gauges: vec!["inFlightActions".to_string()] },
             cadence: None,
             domain: None,
-            note: Some("A non-zero reading holds back shutdown while a synthetic input sequence or browser action is mid-flight. Requests parked on a consent prompt are not counted. computer.open_target and browser.open_grant reply pending and finish consent on a detached task; browser.import_login holds its request and parks while awaiting consent.".to_string()),
+            note: Some("A non-zero reading holds back shutdown while a synthetic input sequence or browser action is mid-flight. Requests parked on a consent prompt are not counted. browser.open_grant replies pending and finishes consent on a detached task; computer actions, computer.open_target and browser.import_login hold their request and park while awaiting consent.".to_string()),
         },
         SelfSignalDeclaration {
             name: "dispatch_heartbeat_restamp".to_string(),
@@ -922,6 +935,8 @@ mod tests {
             advertised,
             vec![
                 crate::management::OPEN_TARGET,
+                crate::management::LIST_APP_GRANTS,
+                crate::management::REVOKE_APP_GRANT,
                 crate::management::OPEN_GRANT,
                 crate::management::IMPORT_LOGIN,
                 crate::management::PRESENT,

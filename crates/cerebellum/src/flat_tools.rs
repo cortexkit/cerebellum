@@ -925,4 +925,61 @@ mod tests {
             assert!(application.contains("com.apple.TextEdit"), "{field}");
         }
     }
+
+    /// Listing and revoking durable app grants are the operator's operations,
+    /// on the management surface alone. No model-visible tool offers them: not
+    /// as a flat action, not as a tool of their own, and not in any tool
+    /// definition a catalog is built from. A model that could revoke or list
+    /// grants could read or undo the person's decisions about it.
+    #[test]
+    fn grant_listing_and_revoking_are_never_model_visible() {
+        let operations = [
+            crate::management::LIST_APP_GRANTS,
+            crate::management::REVOKE_APP_GRANT,
+        ];
+        let manifest = crate::manifest::build_with_browser_config("cerebellum", true);
+        let computer = computer_tool(&computer_names()).expect("the computer tool is built");
+        let browser_names: Vec<String> = crate::browser::tool_definitions()
+            .into_iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect();
+        let browser = browser_tool(&browser_names).expect("the browser tool is built");
+        for operation in operations {
+            let action = operation.trim_start_matches("computer.");
+            for tool in [&computer, &browser] {
+                let schema = tool.schema.to_string();
+                assert!(
+                    !schema.contains(action),
+                    "{} names {operation}: {schema}",
+                    tool.name
+                );
+            }
+            let refused = translate_computer(&json!({"action": action})).unwrap_err();
+            assert_eq!(refused.field, "action", "{operation}");
+            assert!(
+                crate::browser::tool_definitions()
+                    .iter()
+                    .all(|(name, description, schema)| *name != operation
+                        && !description.contains(action)
+                        && !schema.to_string().contains(action)),
+                "a browser tool definition names {operation}"
+            );
+            assert!(
+                crate::dispatchable_tool_for_test(operation, true).is_none(),
+                "{operation} is dispatchable as a tool"
+            );
+            for role in &manifest.provides {
+                if let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = role {
+                    for tool in tools {
+                        assert_ne!(tool.name, operation);
+                        assert!(
+                            !serde_json::to_string(tool).unwrap().contains(action),
+                            "the advertised tool {} names {operation}",
+                            tool.name
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

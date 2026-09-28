@@ -64,7 +64,7 @@ mod macos_probe {
     use std::time::{Duration, Instant};
 
     use cerebellum::browser_config::BrowserConfig;
-    use cerebellum::management::{self, ActionAuthority};
+    use cerebellum::management;
     use cerebellum::Planes;
     use cerebellum_computer::dispatch::post_condition::PostCondition;
     use cerebellum_computer::dispatch::{
@@ -636,15 +636,10 @@ mod macos_probe {
     ) -> Result<Value, String> {
         let current = match planes
             .management
-            .authority_for(
-                GRANTEE,
-                cerebellum_core::consent::ActionKind::Compose,
-                planes.lease_clock.as_ref(),
-            )
-            .await
+            .resolve_process(&target.bundle_identity)
         {
-            ActionAuthority::Admitted(grant) => grant,
-            ActionAuthority::Refused(refusal) => {
+            Ok(grant) => grant,
+            Err(refusal) => {
                 return Err(format!(
                     "target authority refused before dispatch: {refusal}"
                 ))
@@ -817,37 +812,22 @@ mod macos_probe {
                 json!({
                     "method": management::OPEN_TARGET,
                     "params": {
-                        "bundle_identity": bundle_identity,
-                        "action_kind": "compose"
+                        "bundle_identity": bundle_identity
                     }
                 }),
             ),
-            json!({"decision": "allow_10_minutes"}),
+            json!({"decision": "allow_conversation"}),
             "target lease",
         )
         .await?;
-        if pending["outcome"] != "consent_pending" {
-            return Err(format!("target lease did not enter consent: {pending}"));
+        if pending["outcome"] != "granted" {
+            return Err(format!("target grant refused: {pending}"));
         }
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match planes
-                    .management
-                    .authority_for(
-                        GRANTEE,
-                        cerebellum_core::consent::ActionKind::Compose,
-                        planes.lease_clock.as_ref(),
-                    )
-                    .await
-                {
-                    ActionAuthority::Admitted(grant) => return Ok(grant),
-                    ActionAuthority::Refused(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await
-        .map_err(|_| "target consent answer did not mint authority".to_string())?
+        planes
+            .management
+            .resolve_process(bundle_identity)
+            .map_err(|refusal| format!("the granted target did not resolve: {refusal}"))
     }
 
     async fn teardown_browser(

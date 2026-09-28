@@ -693,6 +693,9 @@ pub struct RawWindow {
     pub window_id: u32,
     pub owner_pid: u32,
     pub owner_bundle_identifier: String,
+    /// The owning application's display name. For showing to a person only:
+    /// an application picks its own name, so it is not identity evidence.
+    pub owner_application_name: String,
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -782,6 +785,7 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
                                 window_id: window.windowID(),
                                 owner_pid: u32::try_from(owner.processID()).ok()?,
                                 owner_bundle_identifier: owner.bundleIdentifier().to_string(),
+                                owner_application_name: owner.applicationName().to_string(),
                                 x: frame.origin.x,
                                 y: frame.origin.y,
                                 width: frame.size.width,

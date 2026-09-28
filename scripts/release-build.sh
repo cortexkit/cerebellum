@@ -32,9 +32,11 @@ cd "$(dirname "$0")/.."
 # review and a new revision.
 export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
 
-# The semantic click path, reviewed at c8e7d2f and amended at 928cf90. This
-# binds only identifier-addressed computer.click; synthetic input and the other
-# actuating rows remain unreviewed.
+# The semantic click path, reviewed at c8e7d2f and amended at 928cf90. It
+# reviewed identifier-addressed computer.click, which vocabulary v13 retired, so
+# this key admits no row in the current vocabulary. It stays bound as the record
+# of that review; the element-addressed rows that replace click are a new
+# semantic surface with their own, still unminted, review.
 #
 # The amendment scoped element uniqueness to the tree actually read: a partial
 # tree no longer refuses outright, and the count of unreadable subtrees is
@@ -49,10 +51,12 @@ export CEREBELLUM_CAPTURE_REVIEW_REVISION="cerebellum-capture-review/v1@cb1f669"
 export CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION="semantic-actuation-review/v2@928cf90"
 
 # Windows semantic actuation, reviewed under the v2 shape at 9b59170 with the
-# differences from macOS recorded here as the Windows appendix. This binds only
-# UIA Invoke on a uniquely resolved element (computer.click) and computer.wait;
-# Windows has no per-process input path and no capture backend, so every other
-# row is withheld by the advertisement rule rather than by this key.
+# differences from macOS recorded here as the Windows appendix. It reviewed UIA
+# Invoke on a uniquely resolved element (computer.click, retired in vocabulary
+# v13) and computer.wait. With click gone it admits no row of its own: wait
+# needs no review key, and Windows has no per-process input path and no capture
+# backend, so every other row is withheld by the advertisement rule rather than
+# by this key.
 #
 # Measured on ARM64 Windows 11 from the console session, through the production
 # driver: attendance verified, tree read, Close resolved uniquely with its
@@ -107,11 +111,12 @@ export CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION="windows-actuation-review/v1
 # the review required a live end-to-end run on the served wire path as a
 # prerequisite, and that run corrected the claim twice before it was granted.
 #
-# What it admits is type and keys. Scroll, move and drag stay withheld and this
-# key is not what withholds them: per-process posting carries keyboard events
-# and not pointer events, measured with a control arm, so advertisement refuses
-# them for want of a delivery path. Pointer capabilities need a v2 when a path
-# exists, because a new mechanism is a new containment story.
+# What it admits is type and keys. It never covered pointer rows: per-process
+# posting carries keyboard events and not pointer events, measured with a
+# control arm. Vocabulary v13 retired the old scroll, move and drag rows; their
+# pointer work returns as the takeover rows, which will need the global-dispatch
+# key below AND their own takeover review, because a new mechanism is a new
+# containment story.
 #
 # The rung those rows serve is pid_structural, backed by kernel start-time
 # re-verification before every post and atomically bound to each delivery. That
@@ -150,7 +155,12 @@ export CEREBELLUM_ATTENDANCE_CONTRACT_REVISION="v1"
 # requirement names that identifier and a certificate rather than a cdhash.
 export CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION="signing-topology/v2"
 
-# Global observed dispatch: computer.move, computer.scroll, computer.drag.
+# Global observed dispatch: the macOS session-global pointer stream. It was
+# reviewed on computer.move, computer.scroll and computer.drag, which vocabulary
+# v13 retired, so it admits no row today. Its successors are the three takeover
+# rows (computer.takeover_move, computer.takeover_drag,
+# computer.takeover_scroll), which have no wire handler yet; when they do, they
+# need this key AND their own takeover review before they are admitted.
 # Session-global pointer posting at the session tap, the top containment rung
 # (global_none, tier 4), reviewed at subconscious 5a89716c
 # (docs/reviews/global-dispatch-review-v1.md) against cerebellum 1e675685,

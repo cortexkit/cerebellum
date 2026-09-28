@@ -22,11 +22,11 @@ use tokio::sync::mpsc;
 
 /// Drive one request that may open an elicitation, answer it, return the reply.
 ///
-/// Reads frames until the reply is in hand AND, if that reply is
-/// `consent_pending`, the question has arrived -- the two can land in either
-/// order on the same route, so waiting for the reply alone would answer a
-/// question that has not been asked yet, and waiting for the question alone
-/// would hang on the capabilities that never open one.
+/// Reads frames until the reply is in hand, answering any question that
+/// arrives on the way. Both orders happen on one route: a computer grant is
+/// asked while the request waits, so its question comes BEFORE the reply,
+/// while a browser grant replies `consent_pending` first and asks after. So a
+/// `consent_pending` reply is final only once its question has been answered.
 pub async fn elicit_and_answer(
     planes: &Planes,
     opening: Frame,
@@ -34,57 +34,51 @@ pub async fn elicit_and_answer(
     label: &str,
 ) -> Result<Value, String> {
     let (writer, mut frames) = mpsc::channel(8);
+    // Returns once the request is spawned, so a request that waits for its
+    // answer is still running when the question is read below.
     cerebellum::handle_frame_for_test(opening, &writer, planes)
         .await
         .map_err(|error| format!("{label} request failed: {error}"))?;
 
     let mut reply = None;
-    let mut question = None;
+    let mut answered = false;
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(10), frames.recv())
             .await
             .map_err(|_| format!("{label} reply or question timed out"))?
             .ok_or_else(|| format!("{label} relay closed"))?;
         let body: Value = serde_json::from_slice(&frame.body)
             .map_err(|error| format!("{label} frame was not JSON: {error}"))?;
         if frame.header.ty == FrameType::Request {
-            question = Some((frame, body));
+            println!("{label} question: {body}");
+            println!("{label} answer: {answer_body}");
+            // Addressed to the QUESTION's channel, epoch and corr rather than
+            // the request's: the answer is correlated to the ask, and a reply
+            // built from the opening frame's header is silently never matched.
+            let answer = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                serde_json::to_vec(&answer_body).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            cerebellum::handle_frame_for_test(answer, &writer, planes)
+                .await
+                .map_err(|error| format!("{label} answer failed: {error}"))?;
+            answered = true;
         } else {
             reply = Some(body);
         }
         if let Some(reply) = reply.as_ref() {
-            if reply["outcome"] != "consent_pending" || question.is_some() {
+            if reply["outcome"] != "consent_pending" || answered {
                 break;
             }
         }
     }
     let reply = reply.ok_or_else(|| format!("{label} returned no reply"))?;
-    println!("{label} open: {reply}");
-    if reply["outcome"] != "consent_pending" {
-        println!("{label} elicitation: not opened for this typed outcome");
-        return Ok(reply);
-    }
-
-    let (question_frame, question) =
-        question.ok_or_else(|| format!("{label} returned no elicitation question"))?;
-    println!("{label} question: {question}");
-    println!("{label} answer: {answer_body}");
-
-    // Addressed to the QUESTION's channel, epoch and corr rather than the
-    // request's: the answer is correlated to the ask, and a reply built from
-    // the opening frame's header is silently never matched.
-    let answer = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        FrameType::Response,
-        Flags::new(false, Priority::Interactive, false),
-        question_frame.header.channel,
-        question_frame.header.epoch,
-        question_frame.header.corr,
-        serde_json::to_vec(&answer_body).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    cerebellum::handle_frame_for_test(answer, &writer, planes)
-        .await
-        .map_err(|error| format!("{label} answer failed: {error}"))?;
+    println!("{label} reply: {reply}");
     Ok(reply)
 }

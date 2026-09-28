@@ -17,7 +17,9 @@ use cerebellum_computer::platform::{TargetResolution, UnreadableReason};
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{IoDiagnostic, StorageError};
 use serde_json::{json, Value};
-use support::computer::{audit, identity, leased_management, management, Fixed};
+use support::computer::{
+    audit, granted_management, identity, management, no_relay, relayed, Fixed, ScriptedCarrier,
+};
 
 #[test]
 fn journal_boot_failure_message_names_its_path_and_typed_cause() {
@@ -102,6 +104,7 @@ async fn serve_wait(
                 grantee: "pj-example",
                 identity: identity(),
                 management,
+                consent: no_relay(),
                 clock,
                 now_ms: 10,
             },
@@ -111,10 +114,10 @@ async fn serve_wait(
         .expect("every wait reply conforms to its row")
 }
 
-/// With no lease for the application a wait names, the wait is indeterminate
-/// and says which application needs one.
+/// With no app grant for the application a wait names, and no way to ask a
+/// person, the wait says nobody could be asked rather than pretending to poll.
 #[tokio::test]
-async fn a_wait_without_a_lease_for_its_app_is_indeterminate() {
+async fn a_wait_without_its_app_grant_and_nobody_to_ask_is_consent_unavailable() {
     let clock = FakeClock::new();
     let reply = serve_wait(
         &management(),
@@ -123,35 +126,21 @@ async fn a_wait_without_a_lease_for_its_app_is_indeterminate() {
     )
     .await;
 
-    assert_eq!(reply["outcome"], "indeterminate");
-    assert_eq!(reply["settle_path"], "poll_with_deadline");
-    let evidence: Value = serde_json::from_str(
-        reply["evidence"]
-            .as_str()
-            .expect("wait evidence is a JSON string"),
-    )
-    .expect("wait evidence contains a typed value");
-    assert_eq!(evidence["status"], "indeterminate");
-    assert_eq!(evidence["predicate"]["kind"], "element_present");
-    assert!(
-        evidence["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("no_lease")),
-        "{evidence}"
-    );
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["reason"], "cannot_relay", "{reply}");
 }
 
-/// A wait is admitted by the lease for the application it NAMES, never by the
-/// one some earlier call selected.
+/// A wait is admitted by the app grant for the application it NAMES, never by
+/// one some earlier call obtained.
 ///
-/// The conversation holds an observing lease for Safari, which is also the
-/// application most recently opened. A wait naming another application must
-/// not borrow it: resolving the predicate there would read an application the
-/// request did not name. A wait naming Safari gets past admission.
+/// The conversation holds Safari's app grant. A wait naming another
+/// application must not borrow it: resolving the predicate there would read an
+/// application the request did not name. A wait naming Safari gets past
+/// admission.
 #[tokio::test]
-async fn a_wait_is_admitted_only_by_the_lease_for_the_app_it_names() {
+async fn a_wait_is_admitted_only_by_the_app_grant_for_the_app_it_names() {
     let clock = FakeClock::new();
-    let management = leased_management(&clock).await;
+    let management = granted_management().await;
 
     let elsewhere = serve_wait(
         &management,
@@ -159,10 +148,9 @@ async fn a_wait_is_admitted_only_by_the_lease_for_the_app_it_names() {
         json!({"app": "com.example.Other", "predicate": predicate(), "timeout_ms": 0}),
     )
     .await;
-    let evidence = elsewhere["evidence"].as_str().expect("evidence");
-    assert!(
-        evidence.contains("no_lease") && evidence.contains("com.example.Other"),
-        "a wait naming another application was admitted by Safari's lease: {elsewhere}"
+    assert_eq!(
+        elsewhere["outcome"], "consent_unavailable",
+        "a wait naming another application was admitted by Safari's grant: {elsewhere}"
     );
 
     let named = serve_wait(
@@ -172,20 +160,20 @@ async fn a_wait_is_admitted_only_by_the_lease_for_the_app_it_names() {
     )
     .await;
     assert!(
-        !named["evidence"]
+        !named["outcome"]
             .as_str()
             .unwrap_or_default()
-            .contains("no_lease"),
-        "the lease for the named application did not admit the wait: {named}"
+            .starts_with("consent_"),
+        "the app grant for the named application did not admit the wait: {named}"
     );
 }
 
 /// A wait that names no application is refused by name at the wire.
 #[tokio::test]
-async fn a_wait_without_app_is_refused_before_any_lease_is_consulted() {
+async fn a_wait_without_app_is_refused_before_any_grant_is_consulted() {
     let clock = FakeClock::new();
     let reply = serve_wait(
-        &leased_management(&clock).await,
+        &granted_management().await,
         &clock,
         json!({"predicate": predicate(), "timeout_ms": 250}),
     )
@@ -212,15 +200,13 @@ async fn an_unreadable_window_list_is_not_reported_as_the_application_being_abse
     let plane = Arc::new(ManagementPlane::new(Arc::new(Fixed(
         TargetResolution::Unreadable(UnreadableReason::WindowListUnavailable),
     ))));
-    let clock = FakeClock::new();
+    let carrier = ScriptedCarrier::default();
 
-    let (body, question) = plane
+    let body = plane
         .open_target(
-            "agent-under-test",
             "com.example.App",
-            cerebellum_core::consent::ActionKind::Observe,
-            true,
-            &clock,
+            &relayed(&carrier),
+            &cerebellum::CancelHandle::pending(),
         )
         .await;
 
@@ -229,7 +215,7 @@ async fn an_unreadable_window_list_is_not_reported_as_the_application_being_abse
         "an unreadable window list produced: {body}"
     );
     assert!(
-        question.is_none(),
+        carrier.questions().is_empty(),
         "a person was asked to approve a target nothing could see: {body}"
     );
 }
@@ -245,7 +231,6 @@ async fn an_unreadable_window_list_is_not_reported_as_the_application_being_abse
 /// wire kept saying the same thing.
 #[tokio::test]
 async fn an_unreadable_reason_reaches_the_wire_with_its_own_remedy() {
-    let clock = FakeClock::new();
     let mut seen = std::collections::BTreeSet::new();
 
     for (reason, remedy_names) in [
@@ -278,13 +263,11 @@ async fn an_unreadable_reason_reaches_the_wire_with_its_own_remedy() {
         let plane = Arc::new(ManagementPlane::new(Arc::new(Fixed(
             TargetResolution::Unreadable(reason.clone()),
         ))));
-        let (body, _) = plane
+        let body = plane
             .open_target(
-                "agent-under-test",
                 "com.example.App",
-                cerebellum_core::consent::ActionKind::Observe,
-                true,
-                &clock,
+                &no_relay(),
+                &cerebellum::CancelHandle::pending(),
             )
             .await;
 

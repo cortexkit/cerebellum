@@ -26,12 +26,14 @@ use cerebellum_computer::platform::{
     SyntheticKey, SyntheticKeyModifiers, BLOCKED_CHORDS,
 };
 use cerebellum_core::clock::FakeClock;
-use cerebellum_core::consent::ActionKind;
 use cerebellum_core::journal::{
     InMemoryJournalStorage, JournalStorage, LifecycleState, ValidatedSeverityTaxonomy,
 };
 use serde_json::{json, Value};
-use support::computer::{audit, grant, grant_lease, identity, management, TestRedactor, GRANTEE};
+use support::computer::{
+    audit, grant, granted_management, identity, management, no_relay, TestRedactor, GRANTEE,
+    TARGET_BUNDLE_ID,
+};
 
 /// One synthetic dispatch the platform driver was asked to perform.
 #[derive(Debug, Clone, PartialEq)]
@@ -254,6 +256,7 @@ async fn serve(
                 grantee: GRANTEE,
                 identity: identity(),
                 management,
+                consent: no_relay(),
                 clock,
                 now_ms: 10,
             },
@@ -263,28 +266,22 @@ async fn serve(
         .expect("detect-only validation preserves the reply")
 }
 
-async fn management_leased(kind: ActionKind, clock: &FakeClock) -> Arc<ManagementPlane> {
-    let management = management();
-    grant_lease(&management, kind, clock).await;
-    management
-}
-
 fn type_request() -> Value {
-    json!({"target": "editor", "text": "hi"})
+    json!({"target": TARGET_BUNDLE_ID, "text": "hi"})
 }
 
 fn keys_request(keys: &[&str]) -> Value {
-    json!({"keys": keys, "target": "editor"})
+    json!({"keys": keys, "target": TARGET_BUNDLE_ID})
 }
 
-/// Typing reaches the target's leased process generation and reports structural
+/// Typing reaches the named application's process generation and reports structural
 /// containment even when the target process is not frontmost.
 #[tokio::test]
 async fn computer_type_reports_pid_structural_for_an_unfocused_target() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = granted_management().await;
     let before = plane.journal_entry_count().await;
 
     let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
@@ -321,7 +318,7 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = granted_management().await;
 
     let reply = serve(
         &plane,
@@ -355,8 +352,8 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
     );
 }
 
-/// Every session-ending chord remains refused even with the widest lease this
-/// fixture can mint; the floor runs before authority and records the attempt.
+/// Every session-ending chord remains refused even with the application's app
+/// grant held; the floor runs before authority and records the attempt.
 ///
 /// Gated to the platforms that HAVE a chord set. The fixture is neutral, but
 /// the floor is consulted through `current_blocked_chord_platform()`, which is
@@ -368,11 +365,11 @@ async fn computer_keys_dispatches_a_plain_chord_as_compose() {
 /// wire can reach the floor.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[tokio::test]
-async fn every_listed_session_ending_chord_is_refused_above_a_full_lease() {
+async fn every_listed_session_ending_chord_is_refused_above_an_app_grant() {
     let platform = cerebellum_computer::platform::current_blocked_chord_platform()
         .expect("this test is compiled only where a chord set exists");
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+    let management = granted_management().await;
     let shared = Shared::handle();
     let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
         audit(),
@@ -518,7 +515,7 @@ async fn session_floor_leaves_command_near_misses_grantable() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::MutateDurable, &clock).await;
+    let management = granted_management().await;
 
     for keys in [&["command", "q"][..], &["command", "shift", "s"][..]] {
         let reply = serve(
@@ -556,6 +553,7 @@ async fn withholding_mode_preserves_keys_invalid_request_diagnostics() {
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
+                consent: no_relay(),
                 clock: &clock,
                 now_ms: 10,
             },
@@ -574,16 +572,15 @@ async fn withholding_mode_preserves_keys_invalid_request_diagnostics() {
     );
 }
 
-/// A lease that authorised observing an application authorises no input into
-/// it. Asserted for each keystroke row, and by the ABSENCE of a dispatched
-/// event and of a journal entry: a handler that asked the wrong action kind
-/// would pass the lease check and post.
+/// Without the application's app grant, no keystroke reaches it. Asserted for
+/// each keystroke row, and by the ABSENCE of a dispatched event and of a
+/// journal entry: a handler that skipped the grant check would post.
 #[tokio::test]
-async fn an_observe_only_lease_is_refused_for_each_keystroke_row() {
+async fn a_keystroke_row_without_its_app_grant_posts_nothing() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Observe, &clock).await;
+    let management = management();
 
     let cases = [
         ("computer.type", type_request()),
@@ -593,8 +590,8 @@ async fn an_observe_only_lease_is_refused_for_each_keystroke_row() {
         let before = plane.journal_entry_count().await;
         let reply = serve(&plane, name, request, &management, &clock).await;
         assert_eq!(
-            reply["outcome"], "no_lease",
-            "{name} ran under an observe-only lease"
+            reply["outcome"], "consent_unavailable",
+            "{name} ran without its app grant: {reply}"
         );
         assert_eq!(
             plane.journal_entry_count().await,
@@ -613,34 +610,16 @@ async fn an_observe_only_lease_is_refused_for_each_keystroke_row() {
     );
 }
 
-/// The vocabulary's durable_chord override: a Command chord escalates to
-/// mutate_durable, so a compose lease does not cover it and a durable one
-/// does. If every chord were treated as compose, the first half of this test
-/// would dispatch under the compose lease and fail by name.
+/// A Command chord is admitted by the application's app grant like any other
+/// key press: the grant covers everything done inside the application, and
+/// the chord is still recorded as a durable action in the dispatch evidence.
 #[tokio::test]
-async fn a_command_chord_demands_a_mutate_durable_lease() {
+async fn a_command_chord_is_admitted_by_the_app_grant() {
     let shared = Shared::handle();
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
 
-    let compose_only = management_leased(ActionKind::Compose, &clock).await;
-    let before = plane.journal_entry_count().await;
-    let reply = serve(
-        &plane,
-        "computer.keys",
-        keys_request(&["command", "s"]),
-        &compose_only,
-        &clock,
-    )
-    .await;
-    assert_eq!(
-        reply["outcome"], "no_lease",
-        "a durable chord ran under a compose-only lease"
-    );
-    assert_eq!(plane.journal_entry_count().await, before);
-    assert!(dispatched_calls(&shared).is_empty());
-
-    let durable = management_leased(ActionKind::MutateDurable, &clock).await;
+    let durable = granted_management().await;
     let reply = serve(
         &plane,
         "computer.keys",
@@ -682,7 +661,7 @@ async fn an_unknown_held_state_reaches_the_caller_unflattened() {
         }));
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = granted_management().await;
 
     let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
 
@@ -738,7 +717,7 @@ async fn a_failing_dispatch_still_finalises_its_audit_entry() {
         }));
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = granted_management().await;
 
     let before = plane.journal_entry_count().await;
     let reply = serve(&plane, "computer.type", type_request(), &management, &clock).await;
@@ -786,12 +765,12 @@ async fn typed_text_never_reaches_the_journal() {
         SyntheticDriver::factory(Arc::clone(&shared)),
     );
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = granted_management().await;
 
     let reply = serve(
         &plane,
         "computer.type",
-        json!({"target": "field", "text": SECRET}),
+        json!({"target": TARGET_BUNDLE_ID, "text": SECRET}),
         &management,
         &clock,
     )
@@ -897,9 +876,9 @@ async fn a_single_thread_runtime_can_interrupt_a_posting_computer_action() {
     shared.lock().unwrap().interrupt_after_two = Some(posted.clone());
     let plane = plane_with(&shared);
     let clock = FakeClock::new();
-    let management = management_leased(ActionKind::Compose, &clock).await;
+    let management = granted_management().await;
     let cancel = cerebellum::CancelHandle::pending();
-    let arguments = json!({"target":"editor", "text":"abcde"});
+    let arguments = json!({"target": TARGET_BUNDLE_ID, "text":"abcde"});
     let serving = plane.serve(
         servable("computer.type").unwrap(),
         &arguments,
@@ -908,6 +887,7 @@ async fn a_single_thread_runtime_can_interrupt_a_posting_computer_action() {
             grantee: GRANTEE,
             identity: identity(),
             management: &management,
+            consent: no_relay(),
             clock: &clock,
             now_ms: 10,
         },

@@ -12,8 +12,8 @@ use cerebellum_computer::capture_custody::{
     InMemoryGrantAuthority,
 };
 use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
-use cerebellum_core::clock::MonotonicClock;
-use cerebellum_core::consent::ActionKind;
+use cerebellum::computer_grants::{ConsentContext, GrantCaller, QuestionCarrier};
+use cerebellum::elicit::AskOutcome;
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
     DurableState, EffectClass, InMemoryJournalStorage, IoDiagnostic, IsolationClass, JournalConfig,
@@ -459,34 +459,119 @@ pub fn request() -> Value {
     json!({ "scope": "target_windows", "include_cursor": false })
 }
 
-pub async fn grant_lease<C: MonotonicClock>(
-    management: &ManagementPlane,
-    action_kind: ActionKind,
-    clock: &C,
-) {
-    let (reply, _question) = management
-        .open_target(GRANTEE, TARGET_BUNDLE_ID, action_kind, true, clock)
-        .await;
-    let ask_id = reply["ask_id"]
-        .as_str()
-        .expect("an ask is minted")
-        .to_string();
-    assert!(
-        management
-            .settle(
-                &ask_id,
-                Some(&json!({"decision": "allow_10_minutes"})),
-                clock
-            )
-            .await,
-        "the fixture lease settles"
-    );
+/// The caller every fixture acts as: the conversation and agent of
+/// [`identity`], with an identity the daemon did not attest.
+#[allow(dead_code)]
+pub fn caller() -> GrantCaller {
+    GrantCaller {
+        conversation_key: identity().conversation_key,
+        agent_project_id: GRANTEE.to_string(),
+        durable_identity_attested: false,
+    }
 }
 
-/// A management plane holding a live observing lease for the fixture target.
+/// A consent context that can ask nobody. Enough for a caller that already
+/// holds its grant, or that expects to be refused before any question.
 #[allow(dead_code)]
-pub async fn leased_management<C: MonotonicClock>(clock: &C) -> Arc<ManagementPlane> {
+pub fn no_relay() -> ConsentContext {
+    ConsentContext::without_carrier(caller())
+}
+
+/// A consent context that asks through `carrier`.
+#[allow(dead_code)]
+pub fn relayed(carrier: &ScriptedCarrier) -> ConsentContext {
+    let (_drain, drain) = tokio::sync::watch::channel(false);
+    // The sender is leaked on purpose: a dropped sender would read as a closed
+    // drain signal, which a fixture has no reason to model.
+    std::mem::forget(_drain);
+    ConsentContext::new(
+        caller(),
+        Some(Arc::new(carrier.clone()) as Arc<dyn QuestionCarrier>),
+        Arc::new(cerebellum::computer_grants::AlwaysOpenRoute),
+        drain,
+        None,
+    )
+}
+
+/// A carrier whose answers the test scripts.
+///
+/// Each question put through it is recorded. It is answered by the next queued
+/// answer, if one was queued, or else waits until the test answers it with
+/// [`ScriptedCarrier::answer_next`].
+#[derive(Clone, Default)]
+pub struct ScriptedCarrier {
+    state: Arc<Mutex<ScriptState>>,
+}
+
+#[derive(Default)]
+struct ScriptState {
+    queued: std::collections::VecDeque<AskOutcome>,
+    waiting: std::collections::VecDeque<tokio::sync::oneshot::Sender<AskOutcome>>,
+    questions: Vec<Value>,
+}
+
+#[allow(dead_code)]
+impl ScriptedCarrier {
+    /// A carrier that answers each question, in order, with these decisions.
+    pub fn answering(decisions: &[&str]) -> Self {
+        let carrier = Self::default();
+        for decision in decisions {
+            carrier.queue(AskOutcome::Answered(json!({"decision": decision})));
+        }
+        carrier
+    }
+
+    pub fn queue(&self, outcome: AskOutcome) {
+        self.state.lock().unwrap().queued.push_back(outcome);
+    }
+
+    /// Answer the oldest question still waiting. False when none is.
+    pub fn answer_next(&self, outcome: AskOutcome) -> bool {
+        let waiting = self.state.lock().unwrap().waiting.pop_front();
+        waiting.is_some_and(|sender| sender.send(outcome).is_ok())
+    }
+
+    /// Every question put so far, in order.
+    pub fn questions(&self) -> Vec<Value> {
+        self.state.lock().unwrap().questions.clone()
+    }
+}
+
+impl QuestionCarrier for ScriptedCarrier {
+    fn put(
+        &self,
+        question: Value,
+        _deadline: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AskOutcome> + Send>> {
+        let mut state = self.state.lock().unwrap();
+        state.questions.push(question);
+        if let Some(answer) = state.queued.pop_front() {
+            return Box::pin(async move { answer });
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        state.waiting.push_back(sender);
+        Box::pin(async move { receiver.await.unwrap_or(AskOutcome::NoAnswer) })
+    }
+}
+
+/// Hold the fixture application's app grant for the fixture conversation, by
+/// answering its question "allow for this conversation".
+pub async fn grant_app(management: &ManagementPlane) {
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    management
+        .admit_app(
+            TARGET_BUNDLE_ID,
+            &relayed(&carrier),
+            &cerebellum::CancelHandle::pending(),
+        )
+        .await
+        .expect("the fixture grant is answered allow_conversation");
+}
+
+/// A management plane holding the fixture application's app grant.
+#[allow(dead_code)]
+pub async fn granted_management() -> Arc<ManagementPlane> {
     let management = management();
-    grant_lease(&management, ActionKind::Observe, clock).await;
+    grant_app(&management).await;
     management
 }

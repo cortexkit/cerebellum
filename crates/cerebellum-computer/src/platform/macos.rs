@@ -2405,23 +2405,10 @@ mod cached_element_tests {
         }
 
         fn global_request(action: SyntheticAction) -> GlobalDispatchRequest {
-            let clock = cerebellum_core::clock::FakeClock::new();
-            let key = cerebellum_core::consent::LeaseKey {
-                grantee: "test-agent".to_string(),
-                bundle_identity: grant().bundle_identity,
-                action_kind: cerebellum_core::consent::ActionKind::MutateDurable,
-            };
-            let mut leases = cerebellum_core::consent::ConsentLeases::new();
-            leases.grant(
-                key.clone(),
-                cerebellum_core::consent::GrantKind::Once,
-                &clock,
-            );
             GlobalDispatchRequest {
                 synthetic: request(action),
-                once_dispatch_token: leases
-                    .admit_once_dispatch(&key, &clock)
-                    .expect("the fixture consumes its Once lease"),
+                once_dispatch_token:
+                    cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(),
                 maximum_seize_detection_latency_ms: 50,
                 minimum_inter_post_interval_ms: 50,
             }

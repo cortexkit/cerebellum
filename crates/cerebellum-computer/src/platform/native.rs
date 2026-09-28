@@ -188,6 +188,18 @@ pub fn grant_for_pid(pid: u32, timeout: Duration) -> Option<ProcessGrant> {
     })
 }
 
+/// The name a process runs under, as the window server reports it for the
+/// application owning its windows. Shown to a person in a consent question;
+/// never used as identity evidence, since an application chooses its own name.
+pub fn application_name(pid: u32, timeout: Duration) -> Option<String> {
+    cerebellum_macos::enumerate_windows(timeout)
+        .ok()?
+        .into_iter()
+        .find(|window| window.owner_pid == pid)
+        .map(|window| window.owner_application_name)
+        .filter(|name| !name.is_empty())
+}
+
 /// Resolve a bundle identity against the windows this system currently reports.
 ///
 /// Thin on purpose: the decision lives in [`TargetResolution::decide`], which is

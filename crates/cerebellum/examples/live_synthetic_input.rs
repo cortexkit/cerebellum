@@ -53,10 +53,9 @@ mod macos_probe {
     use std::time::{Duration, Instant};
 
     use cerebellum::browser_config::BrowserConfig;
-    use cerebellum::management::{self, ActionAuthority};
+    use cerebellum::management;
     use cerebellum::Planes;
     use cerebellum_computer::platform::ProcessGrant;
-    use cerebellum_core::consent::ActionKind;
     use cerebellum_core::health::HealthState;
     use serde::Deserialize;
     use serde_json::{json, Value};
@@ -319,7 +318,6 @@ mod macos_probe {
         let compose_target = mint_target_lease(
             planes,
             bundle_identity,
-            ActionKind::Compose,
             20,
             "compose target lease",
         )
@@ -506,13 +504,11 @@ mod macos_probe {
             println!("MOVE VERDICT: {}", move_verdict.label());
             verdicts.push(("move", move_verdict));
 
-            // Drag is classified mutate_durable because the same gesture could drag a file to the
-            // trash. This fixture only records press/move/release and has no durable effect, so this
-            // stronger lease is exceptional probe authority rather than a routine way to mint one.
+            // One app grant covers every action in the application, so this second request
+            // answers `granted` at once; it is kept to re-resolve the target before the drag.
             let durable_target = mint_target_lease(
                 planes,
                 bundle_identity,
-                ActionKind::MutateDurable,
                 21,
                 "drag mutate_durable target lease",
             )
@@ -860,12 +856,10 @@ mod macos_probe {
     async fn mint_target_lease(
         planes: &Planes,
         bundle_identity: &str,
-        action_kind: ActionKind,
         corr: u64,
         label: &str,
     ) -> Result<ProcessGrant, String> {
-        let action_kind_wire = management::action_kind_to_wire(action_kind);
-        let pending = elicit_and_answer(
+        let granted = elicit_and_answer(
             planes,
             route_request(
                 MANAGEMENT_CHANNEL,
@@ -874,33 +868,21 @@ mod macos_probe {
                 json!({
                     "method": management::OPEN_TARGET,
                     "params": {
-                        "bundle_identity": bundle_identity,
-                        "action_kind": action_kind_wire
+                        "bundle_identity": bundle_identity
                     }
                 }),
             ),
-            json!({"decision": "allow_10_minutes"}),
+            json!({"decision": "allow_conversation"}),
             label,
         )
         .await?;
-        if pending["outcome"] != "consent_pending" {
-            return Err(format!("{label} did not enter consent: {pending}"));
+        if granted["outcome"] != "granted" {
+            return Err(format!("{label} was not granted: {granted}"));
         }
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match planes
-                    .management
-                    .authority_for(GRANTEE, action_kind, planes.lease_clock.as_ref())
-                    .await
-                {
-                    ActionAuthority::Admitted(grant) => return Ok(grant),
-                    ActionAuthority::Refused(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await
-        .map_err(|_| format!("{label} answer did not mint authority"))?
+        planes
+            .management
+            .resolve_process(bundle_identity)
+            .map_err(|refusal| format!("{label}: the granted target did not resolve: {refusal}"))
     }
 
     async fn teardown_browser(

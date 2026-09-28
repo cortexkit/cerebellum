@@ -325,40 +325,34 @@ mod probe {
         async fn take_target(
             &mut self,
             bundle_identity: &str,
-            action_kind: &str,
             decision: &'static str,
         ) -> Result<(), String> {
             self.elicitation_decision = decision;
-            let result = self.take_target_inner(bundle_identity, action_kind).await;
+            let result = self.take_target_inner(bundle_identity).await;
             self.elicitation_decision = "deny";
             result
         }
 
-        async fn take_target_inner(
-            &mut self,
-            bundle_identity: &str,
-            action_kind: &str,
-        ) -> Result<(), String> {
-            let params = json!({
-                "bundle_identity": bundle_identity,
-                "action_kind": action_kind,
-            });
+        /// Settle the application's app grant. The operation waits for the
+        /// answer, which this probe's own relay gives, and replies `granted`.
+        async fn take_target_inner(&mut self, bundle_identity: &str) -> Result<(), String> {
+            let params = json!({"bundle_identity": bundle_identity});
             for _ in 0..=TARGET_POLL_ATTEMPTS {
                 let reply = self
                     .management_call("computer.open_target", params.clone())
                     .await?;
                 match reply["outcome"].as_str() {
-                    Some("already_held") => return Ok(()),
+                    Some("granted") => return Ok(()),
                     Some("consent_pending") => sleep(TARGET_POLL_INTERVAL).await,
                     _ => {
                         return Err(format!(
-                            "computer.open_target for {bundle_identity} ({action_kind}) answered {reply}"
+                            "computer.open_target for {bundle_identity} answered {reply}"
                         ))
                     }
                 }
             }
             Err(format!(
-                "computer.open_target for {bundle_identity} ({action_kind}) did not become live within {}ms",
+                "computer.open_target for {bundle_identity} was not granted within {}ms",
                 TARGET_POLL_ATTEMPTS as u128 * TARGET_POLL_INTERVAL.as_millis()
             ))
         }
@@ -560,7 +554,7 @@ mod probe {
             ]
         } else {
             match wire
-                .take_target(FINDER_BUNDLE, "observe", "allow_10_minutes")
+                .take_target(FINDER_BUNDLE, "allow_conversation")
                 .await
             {
                 Ok(()) => vec![
@@ -821,7 +815,7 @@ mod probe {
             }
         };
         if let Err(reason) = wire
-            .take_target(&bundle_identity, "mutate_durable", "allow_once")
+            .take_target(&bundle_identity, "allow_conversation")
             .await
         {
             return Arm::unmeasurable(NUMBER, NAME, reason);

@@ -22,6 +22,7 @@ pub mod capability;
 pub mod cdp;
 pub mod classification;
 pub mod computer_capability;
+pub mod computer_grants;
 pub mod connector_evidence;
 #[cfg(test)]
 mod content_named_fixture;
@@ -715,6 +716,8 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
     matches!(
         name,
         management::OPEN_TARGET
+            | management::LIST_APP_GRANTS
+            | management::REVOKE_APP_GRANT
             | management::OPEN_GRANT
             | management::IMPORT_LOGIN
             | management::REBIND_PROFILE_ROOT
@@ -1046,6 +1049,98 @@ impl RouteBindings {
             .ok()
             .and_then(|mut routes| routes.remove(&(channel, epoch)))
     }
+
+    /// Whether any bound route carries this conversation. Two routes may carry
+    /// one conversation, so a conversation ends only when its last route does.
+    fn carries_conversation(&self, conversation_key: &str) -> bool {
+        self.inner.read().ok().is_some_and(|routes| {
+            routes
+                .values()
+                .any(|facts| facts.identity.conversation_key == conversation_key)
+        })
+    }
+}
+
+/// The route one computer call arrived on, as the call's consent wait sees it.
+struct BoundRoute {
+    routes: Arc<RouteBindings>,
+    channel: u16,
+    epoch: u32,
+    conversation_key: String,
+}
+
+impl computer_grants::RouteLiveness for BoundRoute {
+    fn route_open(&self) -> bool {
+        self.routes.get(self.channel, self.epoch).is_some()
+    }
+    fn conversation_open(&self) -> bool {
+        self.routes.carries_conversation(&self.conversation_key)
+    }
+}
+
+/// Puts a consent question to the person on the other end of one route.
+struct RouteCarrier {
+    elicitor: SharedElicitor,
+    writer: mpsc::Sender<Frame>,
+    channel: u16,
+    epoch: u32,
+}
+
+impl computer_grants::QuestionCarrier for RouteCarrier {
+    fn put(
+        &self,
+        question: Value,
+        deadline: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = elicit::AskOutcome> + Send>> {
+        let elicitor = Arc::clone(&self.elicitor);
+        let writer = self.writer.clone();
+        let (channel, epoch) = (self.channel, self.epoch);
+        Box::pin(async move {
+            elicitor
+                .ask(&writer, channel, epoch, question, deadline)
+                .await
+        })
+    }
+}
+
+/// Everything a computer call on this route needs to ask for a grant and wait.
+///
+/// The identity is the route's accepted bind, never the request body. The
+/// request's in-flight guard is taken from the task scope the frame loop
+/// spawned it under, so the wait is parked out of the busy gauge.
+fn consent_context(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    writer: &mpsc::Sender<Frame>,
+    channel: u16,
+    epoch: u32,
+) -> computer_grants::ConsentContext {
+    let carrier: Option<Arc<dyn computer_grants::QuestionCarrier>> =
+        facts.declares_elicitation().then(|| {
+            Arc::new(RouteCarrier {
+                elicitor: Arc::clone(&planes.elicitor),
+                writer: writer.clone(),
+                channel,
+                epoch,
+            }) as Arc<dyn computer_grants::QuestionCarrier>
+        });
+    computer_grants::ConsentContext::new(
+        computer_grants::GrantCaller {
+            conversation_key: facts.identity.conversation_key.clone(),
+            agent_project_id: facts.identity.agent_project_id.clone(),
+            durable_identity_attested: facts.agent_project_id_attested
+                && facts.session_kind_attested,
+        },
+        carrier,
+        Arc::new(BoundRoute {
+            routes: Arc::clone(&planes.routes),
+            channel,
+            epoch,
+            conversation_key: facts.identity.conversation_key.clone(),
+        }),
+        planes.drain_signal.subscribe(),
+        elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
+    )
 }
 
 /// The binary entry point: read config from env, load the health config
@@ -1825,20 +1920,45 @@ type RouteTestHandler =
 /// A caller-owned interrupt signal; firing it never aborts the task that must
 /// release held input and finalize the journal.
 #[derive(Clone, Debug)]
-pub struct CancelHandle(Arc<std::sync::atomic::AtomicBool>);
+pub struct CancelHandle(Arc<CancelSignal>);
+
+/// The flag a polling loop reads, and a notifier for a call that waits on
+/// something else (a person's answer) and must stop at once when cancelled.
+#[derive(Debug, Default)]
+pub struct CancelSignal {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
 
 impl CancelHandle {
     pub fn pending() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        Self(Arc::new(CancelSignal::default()))
     }
     pub fn for_uninterruptible_probe() -> Self {
         Self::pending()
     }
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
+        self.0
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.notify.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.0.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Resolve once the handle is cancelled, immediately if it already is.
+    pub async fn cancelled(&self) {
+        loop {
+            // Registered before the flag is read, so a cancel landing between
+            // the read and the wait still wakes this.
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -1901,6 +2021,10 @@ pub struct Planes {
     pub health: Arc<HealthState>,
     cancellations: RequestCancellations,
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The same drain, as a signal a waiting task can await: a call parked on
+    /// a person's answer must stop at once when the module drains, not at the
+    /// end of its wait.
+    drain_signal: Arc<tokio::sync::watch::Sender<bool>>,
     drain_notice: Arc<std::sync::OnceLock<(subc_protocol::RouteCloseReason, u64)>>,
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
@@ -2059,9 +2183,19 @@ impl Planes {
         ));
         // Built before the launch service, which publishes what its startup
         // recovery kept into this plane's registry.
-        let management = Arc::new(ManagementPlane::new(Arc::new(
-            management::PlatformResolver::new(),
-        )));
+        // The operator's "always" grants are read from their store only for a
+        // durable plane; an isolated plane keeps grants in memory and, with no
+        // machine identity, never offers "always".
+        let computer_grants = match journal {
+            JournalPersistence::Durable => Arc::new(computer_grants::ComputerGrants::open_durable(
+                computer_grants::this_machine_uuid(),
+            )),
+            JournalPersistence::Isolated => Arc::new(computer_grants::ComputerGrants::in_memory()),
+        };
+        let management = Arc::new(ManagementPlane::with_computer_grants(
+            Arc::new(management::PlatformResolver::new()),
+            computer_grants,
+        ));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
             browser_config
@@ -2179,6 +2313,7 @@ impl Planes {
             #[cfg(test)]
             route_test_handler: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             cancellations: RequestCancellations::default(),
             elicitor: Arc::new(Elicitor::new()),
@@ -2209,6 +2344,7 @@ impl Clone for Planes {
             health: Arc::clone(&self.health),
             cancellations: self.cancellations.clone(),
             draining: self.draining.clone(),
+            drain_signal: Arc::clone(&self.drain_signal),
             drain_notice: self.drain_notice.clone(),
             routes: Arc::clone(&self.routes),
             browser: Arc::clone(&self.browser),
@@ -2280,6 +2416,7 @@ async fn handle_frame(
                     planes
                         .draining
                         .store(true, std::sync::atomic::Ordering::Release);
+                    planes.drain_signal.send_replace(true);
                     // Spend the drain window flushing profiles, not waiting for the
                     // deadline. It is only an upper bound, never a scheduled start.
                     if let Some(config) = planes.browser_config.clone() {
@@ -2292,13 +2429,27 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            // Unbound before its requests are cancelled, so a call waiting on a
+            // person sees the route gone when it wakes and answers
+            // `route_closed` rather than a caller-requested cancel.
+            let removed = planes
+                .routes
+                .remove(frame.header.channel, frame.header.epoch);
             planes
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
-            if let Some(facts) = planes
-                .routes
-                .remove(frame.header.channel, frame.header.epoch)
-            {
+            if let Some(facts) = removed {
+                // A conversation's computer grants end with its last route:
+                // another route may still carry the same conversation.
+                if !planes
+                    .routes
+                    .carries_conversation(&facts.identity.conversation_key)
+                {
+                    planes
+                        .management
+                        .computer_grants()
+                        .end_conversation(&facts.identity.conversation_key);
+                }
                 if let Some(config) = planes.browser_config.as_ref() {
                     planes.sessions.teardown_route(
                         &facts.identity.conversation_key,
@@ -2637,17 +2788,27 @@ async fn handle_management_request(
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
     }
 
-    enum Settlement {
-        ComputerTarget,
-        BrowserGrant,
-        ProfileRootRebind,
-        LaunchRecoveryClear,
-    }
-
-    let (reply, question, settlement) = if method == management::OPEN_TARGET {
+    if method == management::OPEN_TARGET {
+        if let Some(field) = params_object
+            .keys()
+            .filter(|field| field.as_str() != "bundle_identity")
+            .min()
+        {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
         let Some(bundle_identity) = params_object
             .get("bundle_identity")
             .and_then(serde_json::Value::as_str)
+            .filter(|bundle| !bundle.is_empty())
         else {
             return send_invalid_request_response(
                 writer,
@@ -2660,39 +2821,127 @@ async fn handle_management_request(
             )
             .await;
         };
-        let Some(action_kind) = params_object
-            .get("action_kind")
-            .and_then(serde_json::Value::as_str)
-            .and_then(management::action_kind_from_wire)
-        else {
+        // Waits for the person exactly as a computer action does, so it is
+        // interruptible in the same ways.
+        let cancel = planes
+            .cancellations
+            .get((channel, epoch, corr))
+            .unwrap_or_else(CancelHandle::pending);
+        let consent = consent_context(planes, facts, writer, channel, epoch);
+        let reply = planes
+            .management
+            .open_target(bundle_identity, &consent, &cancel)
+            .await;
+        // The caller is gone when its route unbound mid-wait; nothing is sent.
+        if planes.routes.get(channel, epoch).is_none() {
+            return Ok(());
+        }
+        return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
+    if method == management::LIST_APP_GRANTS {
+        if let Some(field) = params_object.keys().min() {
             return send_invalid_request_response(
                 writer,
                 ver,
                 channel,
                 epoch,
                 corr,
-                "action_kind",
-                "missing_field",
+                field,
+                "unknown_field",
             )
             .await;
+        }
+        let reply = planes.management.computer_grants().list();
+        return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
+    if method == management::REVOKE_APP_GRANT {
+        if let Some(field) = params_object
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "grantee" | "bundle_identity" | "dry_run"))
+            .min()
+        {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                field,
+                "unknown_field",
+            )
+            .await;
+        }
+        let mut named = [None, None];
+        for (slot, field) in named.iter_mut().zip(["grantee", "bundle_identity"]) {
+            match params_object.get(field) {
+                Some(serde_json::Value::String(value)) if !value.is_empty() => {
+                    *slot = Some(value.clone())
+                }
+                Some(serde_json::Value::String(_)) => {
+                    return send_invalid_request_response(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        "empty_value",
+                    )
+                    .await
+                }
+                other => {
+                    return send_invalid_request_response(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        if other.is_some() {
+                            "wrong_type"
+                        } else {
+                            "missing_field"
+                        },
+                    )
+                    .await
+                }
+            }
+        }
+        let dry_run = match params_object.get("dry_run") {
+            None => false,
+            Some(serde_json::Value::Bool(dry_run)) => *dry_run,
+            Some(_) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "dry_run",
+                    "wrong_type",
+                )
+                .await
+            }
         };
-        let grantee = facts.identity.agent_project_id.clone();
-        // The module's one lease clock. A fresh SystemClock here would carry a
-        // different epoch from every later check, so this answer and the
-        // authority check would disagree about the same lease.
-        let clock = planes.lease_clock.as_ref();
-        let (reply, question) = planes
+        let [Some(grantee), Some(bundle_identity)] = named else {
+            unreachable!("both fields were checked above");
+        };
+        let reply = planes
             .management
-            .open_target(
-                &grantee,
-                bundle_identity,
-                action_kind,
-                facts.declares_elicitation(),
-                clock,
-            )
-            .await;
-        (reply, question, Settlement::ComputerTarget)
-    } else if method == management::OPEN_GRANT {
+            .computer_grants()
+            .revoke(&grantee, &bundle_identity, dry_run);
+        return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
+    enum Settlement {
+        BrowserGrant,
+        ProfileRootRebind,
+        LaunchRecoveryClear,
+    }
+
+    let (reply, question, settlement) = if method == management::OPEN_GRANT {
         if let Some(field) = params_object
             .keys()
             .filter(|field| !matches!(field.as_str(), "origins" | "hazards" | "severity_tier"))
@@ -2952,22 +3201,11 @@ async fn handle_management_request(
         // pending, so nothing is waiting on the question here.
         let elicitor = Arc::clone(&planes.elicitor);
         let management_plane = Arc::clone(&planes.management);
-        // The module's one lease clock, carried into the task rather than made
-        // there. SystemClock's epoch is per INSTANCE, so a clock constructed
-        // here would stamp the lease's expiry on an epoch nothing else shares:
-        // the grant would read as live to whoever used that same throwaway and
-        // as long expired to every checker on the shared clock.
-        let lease_clock = Arc::clone(&planes.lease_clock);
         let writer = writer.clone();
         tokio::spawn(async move {
             let outcome = elicitor
                 .ask(&writer, channel, epoch, question.body, question.deadline)
                 .await;
-            // Whether a person was ever shown this question. A carrier that
-            // could not reach anyone leaves the caller's remedy unsatisfiable,
-            // so the fact is carried into settlement rather than flattened into
-            // "no answer arrived" with the two other ways that happens.
-            let put_to_a_person = !matches!(outcome, elicit::AskOutcome::NotPutToAnyone);
             let answer = match outcome {
                 elicit::AskOutcome::Answered(body) => Some(body),
                 elicit::AskOutcome::NoAnswer
@@ -2975,16 +3213,6 @@ async fn handle_management_request(
                 | elicit::AskOutcome::Undeliverable => None,
             };
             match settlement {
-                Settlement::ComputerTarget => {
-                    management_plane
-                        .settle_target(
-                            &question.ask_id,
-                            answer.as_ref(),
-                            put_to_a_person,
-                            lease_clock.as_ref(),
-                        )
-                        .await;
-                }
                 Settlement::BrowserGrant => {
                     management_plane
                         .settle_browser_grant(&question.ask_id, answer.as_ref())
@@ -3800,6 +4028,7 @@ async fn handle_tool_request(
                         session_kind: accepted_facts.identity.session_kind,
                     },
                     management: &planes.management,
+                    consent: consent_context(planes, &accepted_facts, writer, channel, epoch),
                     clock,
                     // Wall-clock rather than the lease clock: this stamps a
                     // journal entry a person may later read against other
@@ -3813,6 +4042,11 @@ async fn handle_tool_request(
                 |_grant| computer_capability::native_capture_backend(),
             )
             .await;
+        // A call whose route unbound while it waited on a person has nobody
+        // to answer; its reply is dropped rather than sent to a closed route.
+        if planes.routes.get(channel, epoch).is_none() {
+            return Ok(());
+        }
         return match result {
             Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
             Err(error) => {
@@ -4233,10 +4467,12 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
 ///   agent's signed-in sessions, could not be deleted where no session was
 ///   there to report it;
 /// - `sigtermListener`, whether SIGTERM will run the module's teardown or
-///   just end the process (see [`sigterm_listener_state`]).
+///   just end the process (see [`sigterm_listener_state`]);
+/// - `computerGrantStore`, whether the operator's "always allow" app grants are
+///   in force, or withheld because their store could not be read.
 ///
-/// Both are atomics, so reading them keeps the health lane insulated, and
-/// neither changes the status.
+/// All are atomics, so reading them keeps the health lane insulated, and
+/// none changes the status.
 fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlResponse {
     if let ModuleControlResponse::HealthCheck {
         metrics: Some(serde_json::Value::Object(metrics)),
@@ -4251,6 +4487,10 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         metrics.insert(
             "sigtermListener".to_string(),
             serde_json::Value::from(sigterm_listener_state()),
+        );
+        metrics.insert(
+            "computerGrantStore".to_string(),
+            serde_json::Value::from(computer_grants::durable_grant_store_health()),
         );
     }
     report
@@ -5281,6 +5521,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
             elicitor: Arc::clone(&elicitor),
@@ -5333,6 +5574,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
             elicitor: Arc::clone(&elicitor),
@@ -5362,7 +5604,6 @@ mod tests {
             "method": management::OPEN_TARGET,
             "params": {
                 "bundle_identity": "com.example.Nothing",
-                "action_kind": "observe",
             },
         });
         let frame = Frame::build_with_version(
@@ -5871,6 +6112,7 @@ mod tests {
             #[cfg(test)]
             route_test_handler: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
@@ -5937,6 +6179,7 @@ mod tests {
             #[cfg(test)]
             route_test_handler: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
@@ -7047,7 +7290,7 @@ mod drain_tests {
         let mut planes = super::tests::management_bound_planes(1, 1);
         let (tx, mut rx) = mpsc::channel(8);
         let release = hold(&mut planes);
-        handle_frame(frame(FrameType::Request, 1, json!({"method": management::OPEN_TARGET, "params": {"bundle_identity":"com.example.Nothing", "action_kind":"observe"}})), &tx, &planes)
+        handle_frame(frame(FrameType::Request, 1, json!({"method": management::OPEN_TARGET, "params": {"bundle_identity":"com.example.Nothing"}})), &tx, &planes)
             .await
             .unwrap();
         handle_frame(draining(), &tx, &planes).await.unwrap();

@@ -56,12 +56,11 @@ pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
     cerebellum_computer::platform::WindowsUnsupportedCaptureBackend
 }
 use cerebellum_computer::platform::{
-    blocked_chord, current_blocked_chord_platform, DispatchMode, EffectStatus,
+    blocked_chord, current_blocked_chord_platform, ActionKind, DispatchMode, EffectStatus,
     HeldStateDisposition, PlatformDriver, SyntheticAction, SyntheticKey, SyntheticKeyModifiers,
     UnsupportedPlatformDriver,
 };
 use cerebellum_core::clock::MonotonicClock;
-use cerebellum_core::consent::ActionKind;
 use cerebellum_core::journal::JournalIdentity;
 use cerebellum_core::journal::{
     CallerRefusalHistory, JournalStorage, Redactor, RefusalRing, RefusalRingConfig,
@@ -70,7 +69,8 @@ use cerebellum_core::journal::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::management::{ActionAuthority, ManagementPlane};
+use crate::computer_grants::{ConsentContext, ConsentRefusal};
+use crate::management::{AppRefusal, ManagementPlane};
 
 /// The computer plane as a running module holds it.
 ///
@@ -340,16 +340,20 @@ pub fn servable(name: &str) -> Option<Servable> {
 /// that appears in its journal entry, and separating them invites a handler
 /// that authorises against one identity and records another.
 pub struct ServeContext<'a, C: MonotonicClock> {
-    /// The durable agent identity a lease is held by.
+    /// The durable agent identity the action is attributed to.
     ///
-    /// Whatever the caller passes here decides which leases apply, so it must
-    /// come from the route's accepted bind rather than from the request body: an
-    /// identity a request can choose is a permission granted to whoever asks for
-    /// it. This type cannot check that, which is why it is said here.
+    /// It must come from the route's accepted bind rather than from the
+    /// request body: an identity a request can choose is a permission granted
+    /// to whoever asks for it. This type cannot check that, which is why it is
+    /// said here. The same holds for the identity inside `consent`, which
+    /// decides which grants apply.
     pub grantee: &'a str,
     pub cancel: crate::CancelHandle,
     pub identity: JournalIdentity,
     pub management: &'a Arc<ManagementPlane>,
+    /// Who is asking for which grant, how to ask the person, and what ends a
+    /// wait for their answer.
+    pub consent: ConsentContext,
     pub clock: &'a C,
     pub now_ms: u64,
 }
@@ -602,7 +606,7 @@ where
     /// Poll one accessibility predicate until it settles, expires, or is cancelled.
     ///
     /// The request names the application its predicate's elements live in, and
-    /// the lease that admits the wait must be held for that application: a
+    /// the app grant that admits the wait is the grant for that application: a
     /// wait never borrows whichever application some earlier call selected.
     async fn serve_wait<C: MonotonicClock>(
         &self,
@@ -615,20 +619,19 @@ where
         };
         let ServeContext {
             cancel,
-            grantee,
+            grantee: _,
             identity: _,
             management,
-            clock,
+            consent,
+            clock: _,
             now_ms: _,
         } = context;
-        let grant = match management
-            .authority_for_bundle(grantee, &parsed.app, ActionKind::Observe, clock)
-            .await
-        {
-            ActionAuthority::Admitted(grant) => grant,
-            ActionAuthority::Refused(refusal) => {
-                return wait_indeterminate_reply(Some(parsed.predicate), refusal)
+        let (grant, admission) = match management.admit_app(&parsed.app, &consent, &cancel).await {
+            Ok(admitted) => admitted,
+            Err(AppRefusal::Consent(ConsentRefusal::Cancelled)) => {
+                return cancelled_before_polling_reply(parsed.predicate)
             }
+            Err(refusal) => return refusal.reply(&parsed.app),
         };
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -644,7 +647,11 @@ where
             })
             .await
             {
-                Ok(result) => wait_wire_reply(result),
+                Ok(result) => {
+                    let mut reply = wait_wire_reply(result);
+                    admission.decorate(&mut reply);
+                    reply
+                }
                 Err(_) => {
                     wait_indeterminate_reply(None, json!({"reason": "polling_task_unavailable"}))
                 }
@@ -654,19 +661,20 @@ where
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = (grant, cancel);
-            wait_indeterminate_reply(
+            let mut reply = wait_indeterminate_reply(
                 Some(parsed.predicate),
                 json!({"reason": "scoped_accessibility_read_unsupported"}),
-            )
+            );
+            admission.decorate(&mut reply);
+            reply
         }
     }
 
-    /// Post one keystroke action into the application this conversation may
-    /// act on.
+    /// Post one keystroke action into the application the request names.
     ///
-    /// Shared by the two keystroke capabilities, which differ in the request
-    /// they parse and the action kind their lease must cover, and nowhere
-    /// else. Both deliver to the leased process in background mode.
+    /// Shared by the two keystroke capabilities, which differ only in the
+    /// request they parse. Both deliver to the named application's process in
+    /// background mode, under that application's app grant.
     ///
     /// The ordering is not stylistic: authority is established before
     /// anything is journaled, the dispatcher reserves and commits the intent
@@ -689,6 +697,7 @@ where
             grantee,
             identity,
             management,
+            consent,
             clock,
             now_ms: _,
         } = context;
@@ -709,18 +718,26 @@ where
                     .await;
                 return chord_blocked_refusal(&chord, blocked.reason);
             }
-            // The session floor is checked before a Command chord escalates to
-            // mutate_durable, so no lease can make a session-ending action valid.
+            // The session floor is checked before anything is asked or
+            // escalated, so no grant can make a session-ending chord valid.
             parsed.action_kind = chord_action_kind(*modifiers);
         }
-        // Keystrokes stay bound to the leased process generation.
+        // Keystrokes stay bound to the named application's process generation.
         let mode = DispatchMode::Background;
-        let grant = match management
-            .authority_for(grantee, parsed.action_kind, clock)
+        let (grant, admission) = match management
+            .admit_app(&parsed.target, &consent, &cancel)
             .await
         {
-            ActionAuthority::Admitted(grant) => grant,
-            ActionAuthority::Refused(refusal) => return refusal,
+            Ok(admitted) => admitted,
+            // A cancel while waiting on the person is answered the way a cancel
+            // during posting is: nothing was posted and nothing is held.
+            Err(AppRefusal::Consent(ConsentRefusal::Cancelled)) => {
+                return synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                    posts_returned: 0,
+                    held_state: HeldStateDisposition::NoneHeld,
+                })
+            }
+            Err(refusal) => return refusal.reply(&parsed.target),
         };
 
         let capability_id = capability.capability_id();
@@ -791,7 +808,7 @@ where
         })
         .await
         .unwrap_or(Err(DispatchError::Platform));
-        match dispatched {
+        let mut reply = match dispatched {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
                     return synthetic_dispatch_refusal(&DispatchError::AuditUnavailable);
@@ -827,7 +844,9 @@ where
                 )
             }
             Err(refusal) => synthetic_dispatch_refusal(&refusal),
-        }
+        };
+        admission.decorate(&mut reply);
+        reply
     }
 
     async fn record_blocked_chord(&self, caller: &str, chord: &str, reason: &str) {
@@ -986,6 +1005,19 @@ fn wait_indeterminate_reply(predicate: Option<PostCondition>, reason: Value) -> 
     })
 }
 
+/// The reply to a wait cancelled while it waited on the person, before any
+/// poll: the same `cancelled` outcome a wait cancelled mid-poll returns, with
+/// no reads attempted.
+fn cancelled_before_polling_reply(predicate: PostCondition) -> Value {
+    let mut reply = wait_indeterminate_reply(
+        Some(predicate),
+        json!({"reason": "cancelled_while_awaiting_consent"}),
+    );
+    reply["outcome"] = json!("cancelled");
+    reply["attempts"] = json!(0);
+    reply
+}
+
 fn effect_status_name(status: EffectStatus) -> &'static str {
     match status {
         EffectStatus::EffectObserved => "effect_observed",
@@ -998,11 +1030,13 @@ fn effect_status_name(status: EffectStatus) -> &'static str {
 #[derive(Debug)]
 struct ParsedSynthetic {
     action: SyntheticAction,
+    /// The bundle identity of the application the keystrokes are for, whose
+    /// app grant admits them.
+    target: String,
     /// The wire spelling of a parsed key chord, retained for a floor refusal.
     chord: Option<String>,
-    /// The consent action kind the lease must cover. Usually the row's own
-    /// kind; a durable chord takes the escalated kind the vocabulary assigns
-    /// to it.
+    /// What the dispatch's audit and containment evidence record the action
+    /// as: typing is a compose action, and a Command chord a durable one.
     action_kind: ActionKind,
     /// The element the placeholder post-condition names. It is never
     /// evaluated -- the keystroke schemas declare no post-condition -- so it
@@ -1114,6 +1148,7 @@ fn parse_type_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     // between replacing and inserting is what write_text's write_mode is for.
     Ok(ParsedSynthetic {
         action: SyntheticAction::type_text(text),
+        target: target.clone(),
         chord: None,
         action_kind: ActionKind::Compose,
         placeholder_element: AccessibilityElementName::Identifier(target),
@@ -1172,6 +1207,7 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     };
     Ok(ParsedSynthetic {
         action: SyntheticAction::key_combination(key, modifiers),
+        target: target.clone(),
         chord: Some(chord_names.join("+")),
         // The session floor must run before durable-chord escalation; serve
         // classifies this only after the floor declines the exact chord.
@@ -1180,16 +1216,6 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
     })
 }
 
-/// The action kind a key combination runs under: the vocabulary's
-/// `durable_chord` override applied to the chord just parsed.
-///
-/// A Command chord asks the target application to run one of the
-/// application's OWN commands, and what those do is not enumerable from here:
-/// Command-S saves, Command-Q quits, Command-W closes -- state that outlives
-/// the session -- while Command-C copies. Because the plane cannot show any Command chord to be
-/// session-scoped, every Command chord takes the durable side and requires a
-/// `mutate_durable` lease. A chord without Command is an editing or
-/// navigation keystroke, which is what `compose` covers.
 /// The chord in the wire's own spelling, rebuilt from the parsed parts.
 ///
 /// Used only when the parser's retained text is absent, which it is not
@@ -1217,6 +1243,15 @@ fn describe_chord(modifiers: SyntheticKeyModifiers, key: SyntheticKey) -> String
     parts.join("+")
 }
 
+/// What a key combination is recorded as in the dispatch's evidence.
+///
+/// A Command chord asks the target application to run one of the
+/// application's OWN commands, and what those do is not enumerable from here:
+/// Command-S saves, Command-Q quits, Command-W closes -- state that outlives
+/// the session -- while Command-C copies. Because the plane cannot show any
+/// Command chord to be session-scoped, every Command chord is recorded as
+/// durable. A chord without Command is an editing or navigation keystroke.
+/// This classifies the evidence only; the app grant is what admits either.
 fn chord_action_kind(modifiers: SyntheticKeyModifiers) -> ActionKind {
     if modifiers.command {
         ActionKind::MutateDurable

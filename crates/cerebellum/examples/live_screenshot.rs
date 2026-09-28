@@ -2,8 +2,8 @@
 //!
 //! Every automated test of this path uses a fixture capture backend, which
 //! proves the plumbing and cannot prove that a real capture survives it. This
-//! runs the actual sequence against a real window: resolve a target, mint a
-//! lease through consent, check authority, reserve the journal, capture, encode,
+//! runs the actual sequence against a real window: resolve a target, ask for
+//! the app grant, check authority, reserve the journal, capture, encode,
 //! admit to custody, finalize, and read the reply.
 //!
 //! It calls the plane directly rather than going through the wire, so it does
@@ -41,7 +41,6 @@ fn main() {
     use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
     use cerebellum::management::{ManagementPlane, PlatformResolver};
     use cerebellum_core::clock::SystemClock;
-    use cerebellum_core::consent::ActionKind;
     use cerebellum_core::identity::SessionKind;
     use cerebellum_core::journal::JournalIdentity;
     use serde_json::json;
@@ -68,30 +67,17 @@ fn main() {
         let clock = SystemClock::new();
         let grantee = "pj-live-probe";
 
-        // Open a lease the way an agent would, then answer it the way a person
-        // would. Both halves are exercised: a probe that injected a lease
-        // directly would skip the consent path this feature exists to gate.
-        let (reply, question) = management
-            .open_target(grantee, &bundle, ActionKind::Observe, true, &clock)
-            .await;
-        println!("open_target -> {}", reply["outcome"]);
-        if reply["outcome"] != "consent_pending" && reply["outcome"] != "already_held" {
-            println!("FAILED: {reply}");
-            return;
-        }
-        if let Some(question) = question {
-            println!("  question: {}", question.body);
-        }
-        if let Some(ask_id) = reply["ask_id"].as_str() {
-            management
-                .settle(
-                    ask_id,
-                    Some(&json!({"decision": "allow_10_minutes"})),
-                    &clock,
-                )
-                .await;
-            println!("  answered: allow_10_minutes");
-        }
+        println!("target application: {bundle}");
+        // No separate opening step: the action asks for its app grant itself.
+        // This probe has no person to relay a question to, so a call without
+        // the grant is refused `consent_unavailable` rather than asked.
+        let consent = cerebellum::computer_grants::ConsentContext::without_carrier(
+            cerebellum::computer_grants::GrantCaller {
+                conversation_key: "live-probe".to_string(),
+                agent_project_id: grantee.to_string(),
+                durable_identity_attested: false,
+            },
+        );
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -113,6 +99,7 @@ fn main() {
                         session_kind: SessionKind::Primary,
                     },
                     management: &management,
+                    consent,
                     clock: &clock,
                     now_ms,
                 },

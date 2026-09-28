@@ -28,10 +28,9 @@ use cerebellum_computer::platform::vocabulary::{
 };
 use cerebellum_computer::platform::{TargetResolution, UnreadableReason};
 use cerebellum_core::clock::FakeClock;
-use cerebellum_core::consent::ActionKind;
 use serde_json::{json, Value};
 use support::computer::{
-    audit, grant, grant_lease, identity, management as unleased_management, management_with,
+    audit, grant, grant_app, identity, no_relay, management as unleased_management, management_with,
     MutableTargetResolver, GRANTEE, TARGET_BUNDLE_ID,
 };
 
@@ -153,6 +152,7 @@ async fn served_synthetic_replies() -> Vec<(&'static str, Value)> {
                     grantee: GRANTEE,
                     identity: identity(),
                     management: &management,
+                    consent: no_relay(),
                     clock: &clock,
                     now_ms: 10,
                 },
@@ -180,6 +180,7 @@ async fn served_wait_replies() -> Vec<Value> {
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
+                consent: no_relay(),
                 clock: &clock,
                 now_ms: 10,
             },
@@ -192,7 +193,7 @@ async fn served_wait_replies() -> Vec<Value> {
     let clock = FakeClock::new();
     let resolver = MutableTargetResolver::new(TargetResolution::Resolved(grant()));
     let management = management_with(Arc::new(resolver.clone()));
-    grant_lease(&management, ActionKind::Observe, &clock).await;
+    grant_app(&management).await;
     resolver.replace(TargetResolution::Unreadable(
         UnreadableReason::WindowListUnavailable,
     ));
@@ -213,6 +214,7 @@ async fn served_wait_replies() -> Vec<Value> {
                 grantee: GRANTEE,
                 identity: identity(),
                 management: &management,
+                consent: no_relay(),
                 clock: &clock,
                 now_ms: 10,
             },
@@ -221,7 +223,7 @@ async fn served_wait_replies() -> Vec<Value> {
         .await
         .expect("the target-unreadable wait reply conforms");
 
-    replies.push(named_reply(reply, "indeterminate"));
+    replies.push(named_reply(reply, "targets_unreadable"));
     replies
 }
 

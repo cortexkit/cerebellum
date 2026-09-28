@@ -436,21 +436,7 @@ impl cerebellum_computer::dispatch::EscalationConsent for RecordingConsent {
 }
 
 fn once_dispatch_token() -> cerebellum_core::consent::OnceDispatchToken {
-    let clock = cerebellum_core::clock::FakeClock::new();
-    let key = cerebellum_core::consent::LeaseKey {
-        grantee: "process-1".to_string(),
-        bundle_identity: target().bundle_identity,
-        action_kind: cerebellum_core::consent::ActionKind::MutateDurable,
-    };
-    let mut leases = cerebellum_core::consent::ConsentLeases::new();
-    leases.grant(
-        key.clone(),
-        cerebellum_core::consent::GrantKind::Once,
-        &clock,
-    );
-    leases
-        .admit_once_dispatch(&key, &clock)
-        .expect("the fixture consumes its Once lease")
+    cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant()
 }
 
 fn background_attendance() -> AttendanceContext {
