@@ -618,11 +618,38 @@ fn with_classification_unavailable(
     detail
 }
 
+// A loaded document is usable even if background traffic outlasts the single
+// navigation deadline. Keep the quiet verdict separate from load success.
+fn navigate_reply(tracker: &Tracker, should_settle: bool) -> Value {
+    let loaded = tracker.url_final.is_some()
+        && tracker.load_observed
+        && tracker.main_frame_failure().is_none();
+    let mut response = navigation_reply(tracker, false);
+    response["lifecycle"] = json!({
+        "events": tracker.lifecycle,
+        "loaded": loaded,
+        "settled": loaded && tracker.settled,
+    });
+    if should_settle && !loaded {
+        response["outcome"] = json!("not_settled");
+        let pending = if tracker.url_final.is_none() {
+            "main document has not committed"
+        } else {
+            tracker
+                .main_frame_failure()
+                .unwrap_or("main document load event is still pending")
+        };
+        response["remedy"] = json!(format!(
+            "navigation deadline expired: {pending}; take a snapshot to inspect the page before retrying"
+        ));
+    }
+    response
+}
+
 /// The reply fields a navigation reports from its tracker.
 ///
-/// `browser.navigate` and a click that navigated both reply through here, so
-/// `url_final`, `lifecycle`, `http_status`, `challenge` and the `not_settled`
-/// outcome mean the same thing from either capability.
+/// Both navigation and clicks share landing URL and HTTP metadata here.
+/// Navigate wraps the lifecycle to distinguish document load from network quiet.
 fn navigation_reply(tracker: &Tracker, should_settle: bool) -> Value {
     let mut response = if should_settle && !tracker.settled {
         json!({
@@ -718,6 +745,7 @@ pub struct Tracker {
     pub inflight_count: u64,
     pub settled: bool,
     pub load_observed: bool,
+    pending_requests: HashMap<String, (Instant, bool)>,
     main_frame_id: Option<String>,
     pending_document_responses: HashMap<String, MainFrameResponse>,
     quiet_since: Option<Instant>,
@@ -757,6 +785,50 @@ impl Tracker {
         self.inflight_count = self.inflight_count.saturating_sub(1);
         if self.inflight_count == 0 {
             self.quiet_since = Some(now);
+        }
+    }
+    // Request identity prevents redirects and late completions from corrupting
+    // the count; persistent transports must not hold a loaded page hostage.
+    fn network_request_started(&mut self, id: &str, kind: &str, now: Instant) {
+        if !self.pending_requests.contains_key(id) {
+            self.pending_requests.insert(
+                id.to_string(),
+                (now, matches!(kind, "WebSocket" | "EventSource")),
+            );
+            self.inflight_count = self.inflight_count.saturating_add(1);
+        }
+        self.refresh_network_quiet(now);
+    }
+    fn network_request_finished(&mut self, id: &str, now: Instant) {
+        if self.pending_requests.remove(id).is_some() {
+            self.inflight_count = self.inflight_count.saturating_sub(1);
+        }
+        self.refresh_network_quiet(now);
+    }
+    fn network_request_type(&mut self, id: &str, kind: &str, now: Instant) {
+        if let Some((_, persistent)) = self.pending_requests.get_mut(id) {
+            *persistent |= matches!(kind, "WebSocket" | "EventSource");
+        }
+        self.refresh_network_quiet(now);
+    }
+    fn refresh_network_quiet(&mut self, now: Instant) {
+        let active = self
+            .pending_requests
+            .values()
+            .filter(|(started, persistent)| {
+                !persistent && now.saturating_duration_since(*started) < Duration::from_secs(3)
+            })
+            .count() as u64;
+        // One outstanding short request is normal for a rendered page. Two or
+        // more reset the window; requests older than three seconds are long polls.
+        let anonymous = self
+            .inflight_count
+            .saturating_sub(self.pending_requests.len() as u64);
+        if active + anonymous > 1 {
+            self.quiet_since = None;
+            self.settled = false;
+        } else {
+            self.quiet_since.get_or_insert(now);
         }
     }
     pub fn observe_main_frame_response(
@@ -874,8 +946,8 @@ impl Tracker {
         }
     }
     pub fn poll_settlement(&mut self, now: Instant) -> bool {
+        self.refresh_network_quiet(now);
         if self.load_observed
-            && self.inflight_count == 0
             && self
                 .quiet_since
                 .is_some_and(|since| now.duration_since(since) >= Duration::from_millis(QUIET_MS))
@@ -2241,12 +2313,12 @@ impl BrowserPlane {
         drive_result.map_err(map_navigation_drive_error)?;
 
         let should_settle = wait == crate::browser_session::NavigationWait::Settle;
-        let outcome = if should_settle && !tracker.settled {
-            Outcome::InternalError
-        } else {
+        let mut response = navigate_reply(&tracker, should_settle);
+        let outcome = if response["outcome"] == "ok" {
             Outcome::Success
+        } else {
+            Outcome::InternalError
         };
-        let mut response = navigation_reply(&tracker, should_settle);
         self.finalize(
             identity,
             BrowserCapability::Navigate,
@@ -4028,7 +4100,11 @@ fn navigate_result_schema() -> Value {
     reply_schema(
         json!({
             "url_final":nullable_string_schema(),
-            "lifecycle":string_array_schema(),
+            "lifecycle":closed_object(json!({
+                "events":string_array_schema(),
+                "loaded":{"type":"boolean"},
+                "settled":{"type":"boolean"}
+            }), &["events", "loaded", "settled"]),
             "http_status":integer_schema(),
             "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
             "read_page":embedded_read_page_schema(),

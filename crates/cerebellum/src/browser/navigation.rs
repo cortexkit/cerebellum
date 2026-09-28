@@ -1889,8 +1889,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .as_ref()
                     .and_then(|params| params.get("redirectResponse"))
                     .is_some();
-                if !is_redirect_continuation {
-                    tracker.request_started();
+                if let Some(params) = event.params.as_ref() {
+                    if let Some(id) = params.get("requestId").and_then(Value::as_str) {
+                        tracker.network_request_started(
+                            id,
+                            params.get("type").and_then(Value::as_str).unwrap_or(""),
+                            observed_at,
+                        );
+                    } else if !is_redirect_continuation {
+                        tracker.request_started();
+                    }
                 }
                 if let Some(params) = event
                     .params
@@ -1905,9 +1913,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     }
                 }
             }
-            "Network.loadingFinished" => tracker.request_finished(observed_at),
-            "Network.loadingFailed" => {
-                tracker.request_finished(observed_at);
+            "Network.loadingFinished" | "Network.loadingFailed" => {
+                if let Some(id) = event
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("requestId"))
+                    .and_then(Value::as_str)
+                {
+                    tracker.network_request_finished(id, observed_at);
+                } else {
+                    tracker.request_finished(observed_at);
+                }
                 if let Some(params) = event.params.as_ref() {
                     if let (Some(request_id), Some(error_text)) = (
                         params.get("requestId").and_then(Value::as_str),
@@ -2007,6 +2023,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 let Some(params) = event.params.as_ref() else {
                     return;
                 };
+                if let Some(id) = params.get("requestId").and_then(Value::as_str) {
+                    tracker.network_request_type(
+                        id,
+                        params.get("type").and_then(Value::as_str).unwrap_or(""),
+                        observed_at,
+                    );
+                }
                 if params.get("type").and_then(Value::as_str) != Some("Document") {
                     return;
                 }
@@ -4598,6 +4621,7 @@ mod tests {
     fn an_ordinary_concurrent_request_is_still_counted() {
         let driver = attached_driver([]);
         let mut tracker = Tracker::default();
+        tracker.request_started();
         let now = Instant::now();
 
         driver.apply_event(
@@ -4627,7 +4651,7 @@ mod tests {
 
         assert!(
             !tracker.poll_settlement(now + Duration::from_millis(QUIET_MS + 1)),
-            "settled while a request was still in flight"
+            "settled while more than one request was still in flight"
         );
     }
 
@@ -4661,6 +4685,131 @@ mod tests {
     }
 
     #[test]
+    fn loaded_websocket_and_long_poll_settle_within_quiet_window() {
+        let driver = attached_driver([]);
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+        for (id, kind) in [("socket", "WebSocket"), ("poll", "Fetch")] {
+            driver.apply_event(
+                "route-own",
+                &mut tracker,
+                &event(
+                    "Network.requestWillBeSent",
+                    json!({"requestId":id,"type":kind}),
+                ),
+                now,
+            );
+        }
+        driver.apply_event(
+            "route-own",
+            &mut tracker,
+            &event("Page.loadEventFired", json!({})),
+            now,
+        );
+        assert!(tracker.poll_settlement(now + Duration::from_millis(QUIET_MS)));
+    }
+
+    #[test]
+    fn old_requests_and_event_streams_do_not_prevent_quiet() {
+        let driver = attached_driver([]);
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+        for id in ["poll1", "poll2", "stream1", "stream2"] {
+            driver.apply_event(
+                "route-own",
+                &mut tracker,
+                &event(
+                    "Network.requestWillBeSent",
+                    json!({"requestId":id,"type":"Fetch"}),
+                ),
+                now,
+            );
+        }
+        for id in ["stream1", "stream2"] {
+            driver.apply_event(
+                "route-own",
+                &mut tracker,
+                &event(
+                    "Network.responseReceived",
+                    json!({"requestId":id,"type":"EventSource"}),
+                ),
+                now,
+            );
+        }
+        tracker.load(now);
+        assert!(!tracker.poll_settlement(now + Duration::from_millis(QUIET_MS)));
+        let mut streams_only = tracker.clone();
+        for id in ["poll1", "poll2"] {
+            streams_only.network_request_finished(id, now);
+        }
+        assert!(streams_only.poll_settlement(now + Duration::from_millis(QUIET_MS)));
+        let aged = now + Duration::from_secs(3);
+        assert!(!tracker.poll_settlement(aged));
+        assert!(tracker.poll_settlement(aged + Duration::from_millis(QUIET_MS)));
+    }
+
+    #[test]
+    fn loaded_but_busy_deadline_is_ok_not_settled() {
+        let mut driver = attached_driver([]);
+        let mut tracker = Tracker::default();
+        let mut clock = FakeClock::new();
+        tracker.main_frame_navigated(Some("target-own".into()), "https://example.com".into());
+        tracker.load(clock.now());
+        // Overlapping short requests keep the count above the quiet threshold
+        // through the deadline without any request becoming a long poll.
+        for turn in 0..4 {
+            for id in ["short1", "short2"] {
+                driver.apply_event(
+                    "route-own",
+                    &mut tracker,
+                    &event(
+                        "Network.requestWillBeSent",
+                        json!({"requestId":id,"type":"Fetch"}),
+                    ),
+                    clock.now(),
+                );
+            }
+            let deadline = clock.now() + Duration::from_millis(200);
+            driver
+                .settle_navigation("route-own", &mut tracker, deadline, |_| false, &mut clock)
+                .unwrap();
+            if turn < 3 {
+                for id in ["short1", "short2"] {
+                    driver.apply_event(
+                        "route-own",
+                        &mut tracker,
+                        &event("Network.loadingFinished", json!({"requestId":id})),
+                        clock.now(),
+                    );
+                }
+            }
+        }
+        let reply = super::super::navigate_reply(&tracker, true);
+        assert_eq!(reply["outcome"], "ok");
+        assert_eq!(reply["lifecycle"]["loaded"], true);
+        assert_eq!(reply["lifecycle"]["settled"], false);
+        assert!(reply.get("remedy").is_none());
+    }
+
+    #[test]
+    fn uncommitted_document_deadline_reports_what_is_pending() {
+        let mut driver = attached_driver([]);
+        let mut tracker = Tracker::default();
+        let mut clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_millis(QUIET_MS + 1);
+        driver
+            .settle_navigation("route-own", &mut tracker, deadline, |_| false, &mut clock)
+            .unwrap();
+        let reply = super::super::navigate_reply(&tracker, true);
+        assert_eq!(reply["outcome"], "not_settled");
+        assert_eq!(reply["lifecycle"]["loaded"], false);
+        assert!(reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("main document has not committed"));
+    }
+
+    #[test]
     fn every_settlement_condition_is_required() {
         let now = Instant::now();
 
@@ -4673,7 +4822,7 @@ mod tests {
         in_flight.load(now);
         // Assign the public count directly so the quiet timestamp remains
         // satisfied and this assertion isolates the in-flight predicate.
-        in_flight.inflight_count = 1;
+        in_flight.inflight_count = 2;
         assert!(!in_flight.poll_settlement(now + Duration::from_millis(QUIET_MS)));
 
         let mut not_quiet = Tracker::default();

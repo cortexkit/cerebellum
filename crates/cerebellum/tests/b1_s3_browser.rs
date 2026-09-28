@@ -2222,7 +2222,7 @@ async fn navigation_reports_the_browser_landing_url_instead_of_the_request() {
     assert_eq!(result["outcome"], "ok");
     assert_eq!(result["url_final"], "https://landed.example/final");
     assert_eq!(
-        result["lifecycle"],
+        result["lifecycle"]["events"],
         json!(["navigation_started", "load", "network_quiet"])
     );
     let operations = plane.operation_log().await;
@@ -2258,7 +2258,12 @@ async fn unsettled_navigation_returns_the_observed_tokens() {
 
     assert_eq!(result["outcome"], "not_settled");
     assert_eq!(result["url_final"], Value::Null);
-    assert_eq!(result["lifecycle"], json!(["navigation_started", "load"]));
+    assert_eq!(
+        result["lifecycle"]["events"],
+        json!(["navigation_started", "load"])
+    );
+    assert_eq!(result["lifecycle"]["loaded"], false);
+    assert_eq!(result["lifecycle"]["settled"], false);
 }
 
 #[tokio::test]
@@ -2341,7 +2346,7 @@ async fn main_frame_cloudflare_challenge_header_is_reported_as_evidence() {
         json!({
             "outcome": "ok",
             "url_final": "https://requested.example/",
-            "lifecycle": ["navigation_started"],
+            "lifecycle": {"events": ["navigation_started"], "loaded": false, "settled": false},
             "http_status": 403,
             "challenge": {"vendor": "cloudflare", "evidence": "cf-mitigated: challenge"},
             "context": {
@@ -2390,7 +2395,7 @@ async fn subframe_document_response_cannot_replace_main_frame_status_or_claim_a_
         json!({
             "outcome": "ok",
             "url_final": "https://requested.example/",
-            "lifecycle": ["navigation_started"],
+            "lifecycle": {"events": ["navigation_started"], "loaded": false, "settled": false},
             "http_status": 403,
             "context": {
                 "profile_uuid": null,
