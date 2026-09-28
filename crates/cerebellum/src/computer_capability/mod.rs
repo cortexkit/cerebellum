@@ -80,6 +80,7 @@ use tokio::sync::Mutex;
 
 mod element_actions;
 mod keystrokes;
+mod takeover;
 
 use crate::computer_grants::{ConsentContext, ConsentRefusal};
 use crate::management::{AppRefusal, ManagementPlane};
@@ -301,6 +302,9 @@ enum Served {
     WriteText,
     Type,
     Keys,
+    TakeoverMove,
+    TakeoverDrag,
+    TakeoverScroll,
     Wait,
 }
 
@@ -313,6 +317,9 @@ impl Servable {
             Served::WriteText => ComputerCapability::WriteText,
             Served::Type => ComputerCapability::Type,
             Served::Keys => ComputerCapability::Keys,
+            Served::TakeoverMove => ComputerCapability::TakeoverMove,
+            Served::TakeoverDrag => ComputerCapability::TakeoverDrag,
+            Served::TakeoverScroll => ComputerCapability::TakeoverScroll,
             Served::Wait => ComputerCapability::Wait,
         }
     }
@@ -339,10 +346,9 @@ pub fn servable(name: &str) -> Option<Servable> {
         ComputerCapability::PressElement => Served::PressElement,
         ComputerCapability::PressPoint => Served::PressPoint,
         ComputerCapability::WriteText => Served::WriteText,
-        // In the vocabulary, with no wire handler yet.
-        ComputerCapability::TakeoverMove
-        | ComputerCapability::TakeoverDrag
-        | ComputerCapability::TakeoverScroll => return None,
+        ComputerCapability::TakeoverMove => Served::TakeoverMove,
+        ComputerCapability::TakeoverDrag => Served::TakeoverDrag,
+        ComputerCapability::TakeoverScroll => Served::TakeoverScroll,
         // Readable from the journal only; never served.
         ComputerCapability::Click
         | ComputerCapability::Scroll
@@ -650,6 +656,18 @@ where
                 self.serve_synthetic(ComputerCapability::Keys, arguments, context)
                     .await,
             ),
+            Served::TakeoverMove => {
+                self.serve_takeover(ComputerCapability::TakeoverMove, arguments, context)
+                    .await
+            }
+            Served::TakeoverDrag => {
+                self.serve_takeover(ComputerCapability::TakeoverDrag, arguments, context)
+                    .await
+            }
+            Served::TakeoverScroll => {
+                self.serve_takeover(ComputerCapability::TakeoverScroll, arguments, context)
+                    .await
+            }
         };
         self.finish_reply(capability.capability(), reply)
     }
@@ -1462,6 +1480,12 @@ pub(crate) fn served_request_fields(
             let fields = synthetic_request_fields(capability)?;
             Some((fields, fields))
         }
+        ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverDrag
+        | ComputerCapability::TakeoverScroll => {
+            let fields = takeover::request_fields(capability)?;
+            Some((fields, fields))
+        }
         _ => None,
     }
 }
@@ -1482,6 +1506,11 @@ pub(crate) fn parse_served_request(
         }
         ComputerCapability::PressPoint => element_actions::parse_press_point(arguments).map(|_| ()),
         ComputerCapability::WriteText => element_actions::parse_write_text(arguments).map(|_| ()),
+        ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverDrag
+        | ComputerCapability::TakeoverScroll => {
+            takeover::parse_request(capability, arguments).map(|_| ())
+        }
         _ => parse_synthetic_request(capability, arguments).map(|_| ()),
     }
 }
@@ -2136,6 +2165,18 @@ mod wait_tests {
             (
                 ComputerCapability::Wait,
                 json!({"app": "com.example.Editor", "predicate": predicate(), "timeout_ms": 250}),
+            ),
+            (
+                ComputerCapability::TakeoverMove,
+                json!({"image_id": "image-1", "to": {"x": 3, "y": 4}}),
+            ),
+            (
+                ComputerCapability::TakeoverDrag,
+                json!({"from": {"x": 1, "y": 2}, "image_id": "image-1", "to": {"x": 3, "y": 4}}),
+            ),
+            (
+                ComputerCapability::TakeoverScroll,
+                json!({"amount_lines": -3, "axis": "vertical", "target": "com.example.Editor"}),
             ),
         ];
         for (capability, sample) in samples {

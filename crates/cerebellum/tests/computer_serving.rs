@@ -47,8 +47,7 @@ fn journal_boot_failure_message_names_its_path_and_typed_cause() {
 /// Listed by name rather than matched by a wildcard, so a capability cannot
 /// become servable by default: the match in `servable` stops compiling until a
 /// new capability is admitted or refused by name, and this list forces the
-/// same decision in the test. A retired capability id is not servable, and
-/// neither is a current row nothing serves yet.
+/// same decision in the test. A retired capability id is not servable.
 #[test]
 fn only_the_capabilities_with_a_wire_handler_are_servable() {
     for (name, capability) in [
@@ -58,6 +57,12 @@ fn only_the_capabilities_with_a_wire_handler_are_servable() {
         ("computer.write_text", ComputerCapability::WriteText),
         ("computer.type", ComputerCapability::Type),
         ("computer.keys", ComputerCapability::Keys),
+        ("computer.takeover_move", ComputerCapability::TakeoverMove),
+        ("computer.takeover_drag", ComputerCapability::TakeoverDrag),
+        (
+            "computer.takeover_scroll",
+            ComputerCapability::TakeoverScroll,
+        ),
         ("computer.wait", ComputerCapability::Wait),
     ] {
         assert_eq!(
@@ -72,9 +77,6 @@ fn only_the_capabilities_with_a_wire_handler_are_servable() {
         "computer.move",
         "computer.drag",
         "computer.scroll",
-        "computer.takeover_move",
-        "computer.takeover_drag",
-        "computer.takeover_scroll",
         "computer.not-a-capability",
     ] {
         assert!(servable(name).is_none(), "{name} must not be servable");

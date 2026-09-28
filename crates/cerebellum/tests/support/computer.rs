@@ -623,6 +623,10 @@ pub struct DeskState {
     /// finds: an element token and the pid that owns it.
     pub application_hit: Option<(u64, Option<u32>)>,
     pub system_wide_hit: Option<(u64, Option<u32>)>,
+    /// System-wide hits at particular desktop points, which take the place
+    /// of `system_wide_hit` there. How a test puts two applications under
+    /// the two ends of one drag.
+    pub system_wide_hits_at: Vec<((f64, f64), (u64, Option<u32>))>,
     pub presses: Vec<u64>,
     pub writes: Vec<(u64, TextAttribute)>,
     pub hit_scopes: Vec<HitScope>,
@@ -647,6 +651,7 @@ impl Desk {
             frontmost: Some(grant().pid),
             application_hit: None,
             system_wide_hit: None,
+            system_wide_hits_at: Vec::new(),
             presses: Vec::new(),
             writes: Vec::new(),
             hit_scopes: Vec::new(),
@@ -784,13 +789,18 @@ impl AppStateSource for Desk {
     fn element_at(
         &self,
         scope: HitScope,
-        _point: (f64, f64),
+        point: (f64, f64),
     ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
         let mut state = self.state();
         state.hit_scopes.push(scope);
         let hit = match scope {
             HitScope::Application { .. } => state.application_hit,
-            HitScope::SystemWide => state.system_wide_hit,
+            HitScope::SystemWide => state
+                .system_wide_hits_at
+                .iter()
+                .find(|(at, _)| (at.0 - point.0).abs() < 0.5 && (at.1 - point.1).abs() < 0.5)
+                .map(|(_, hit)| *hit)
+                .or(state.system_wide_hit),
         };
         Ok(hit.map(|(token, pid)| (fixture_handle(token), pid)))
     }

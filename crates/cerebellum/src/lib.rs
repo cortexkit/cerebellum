@@ -456,10 +456,24 @@ fn declaration_gate_passes(
         ]
         .iter()
         .all(|gate| gate_passes(outcomes, gate))
+    } else if matches!(
+        id,
+        "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
+    ) {
+        // The real-pointer rows need two reviews, and each is checked here
+        // rather than trusted to the row's artifact: the row names only the
+        // takeover review, while the global pointer stream they post through
+        // stays under its own review of record.
+        [
+            "global_dispatch_review_revision",
+            "takeover_dispatch_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
     } else {
-        // Only wait passes with no review of its own. Every other row either
-        // has its gate above or has no wire handler yet, and a row nothing
-        // serves has no release gate to pass.
+        // Only wait passes with no review of its own. Every other current row
+        // has its gate above.
         declaration.capability_id == "computer.wait"
     }
 }
@@ -549,9 +563,19 @@ fn computer_tool(id: &str) -> Option<subc_protocol::manifest::Tool> {
     } else {
         subc_protocol::manifest::ExecutionMode::Unfenceable
     };
+    // The scroll is the one takeover action a model could not work out the
+    // grant of from its fields, so its description says so.
+    let description = if id == "computer.takeover_scroll" {
+        format!(
+            "Computer-plane capability {id}. {}",
+            flat_tools::TAKEOVER_SCROLL_NOTE
+        )
+    } else {
+        format!("Computer-plane capability {id}.")
+    };
     Some(subc_protocol::manifest::Tool {
         name: id.to_string(),
-        description: Some(format!("Computer-plane capability {id}.")),
+        description: Some(description),
         execution_mode,
         schema: row.get("request_schema")?.clone(),
     })
@@ -6468,6 +6492,79 @@ mod tests {
             outcomes.into_values().collect::<Vec<_>>(),
             vec![ComputerGateOutcome::Pass; 14]
         );
+    }
+
+    /// The release gate itself holds the takeover rows to both reviews,
+    /// whatever the declaration says. Each review is left unbound in turn
+    /// through the attestation path while the declarations are taken as
+    /// advertised, so only the gate stands between the rows and the manifest.
+    #[test]
+    fn the_release_gate_holds_the_takeover_rows_to_both_reviews() {
+        let bindings = |global: Option<&'static str>, takeover: Option<&'static str>| {
+            ComputerCapabilityAdvertisementContext {
+                inputs: release_inputs_from_build_bindings(BuildReleaseBindings {
+                    attendance_contract_owner: Some("fixture-attendance-owner"),
+                    attendance_contract_revision: Some("fixture-attendance-revision"),
+                    input_review_revision: Some("fixture-input-review"),
+                    global_dispatch_review_revision: global,
+                    capture_review_revision: Some("fixture-capture-review"),
+                    semantic_actuation_review_revision: Some("fixture-semantic-actuation-review"),
+                    windows_actuation_review_revision: Some("fixture-windows-actuation-review"),
+                    app_state_review_revision: Some("fixture-app-state-review"),
+                    element_addressed_review_revision: Some("fixture-element-addressed-review"),
+                    takeover_dispatch_review_revision: takeover,
+                    release_signing_topology_revision: Some("fixture-signing-topology"),
+                }),
+                permissions: Default::default(),
+                startup: StartupCapabilityProbe::default(),
+            }
+        };
+        let takeover_rows = [
+            "computer.takeover_move",
+            "computer.takeover_drag",
+            "computer.takeover_scroll",
+        ];
+        let admitted = |context: &ComputerCapabilityAdvertisementContext| {
+            let mut declarations = computer::platform::capability_declarations(context, true);
+            for declaration in &mut declarations {
+                declaration.advertised = true;
+            }
+            let outcomes = computer_gate_outcomes(context);
+            gate_admitted_computer_declarations(&declarations, &outcomes)
+                .into_iter()
+                .map(|declaration| declaration.capability_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let both = admitted(&bindings(Some("fixture-global"), Some("fixture-takeover")));
+        for row in takeover_rows {
+            assert!(both.iter().any(|id| id == row), "{row}: {both:?}");
+        }
+        for (gate, context) in [
+            (
+                "global_dispatch_review_revision",
+                bindings(None, Some("fixture-takeover")),
+            ),
+            (
+                "takeover_dispatch_review_revision",
+                bindings(Some("fixture-global"), None),
+            ),
+        ] {
+            assert_eq!(
+                computer_gate_outcomes(&context).get(gate),
+                Some(&ComputerGateOutcome::MissingExternalInput {
+                    gate: gate.to_string()
+                })
+            );
+            let admitted = admitted(&context);
+            for row in takeover_rows {
+                assert!(!admitted.iter().any(|id| id == row), "{gate}: {row}");
+            }
+            assert!(
+                admitted.iter().any(|id| id == "computer.type"),
+                "{gate} withheld a row it does not govern: {admitted:?}"
+            );
+        }
     }
 }
 

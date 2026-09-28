@@ -7,9 +7,10 @@
 //!   (reading its state, pressing, writing text, typing, key presses, waiting
 //!   on it). It is asked once per application per conversation, with the
 //!   answers `allow_conversation`, `allow_always` and `deny`.
-//! * A **takeover grant** covers driving the one real system pointer. It is
-//!   keyed by the conversation alone, because a pointer stroke can cross
-//!   applications, and it is never offered "always": a stale approval must not
+//! * A **takeover grant** covers driving the one real system pointer and
+//!   bringing an application forward to type into it. It is keyed by the
+//!   conversation alone, because either can reach any application, and it is
+//!   never offered "always": a stale approval must not
 //!   be able to take the screen from someone who is not watching.
 //!
 //! A call that needs a grant it does not hold asks the question itself and
@@ -33,6 +34,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cerebellum_core::consent::OnceDispatchToken;
 use cerebellum_core::dispatch::InFlightGuard;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -550,6 +552,30 @@ impl GrantAdmission {
     }
 }
 
+/// One real-pointer dispatch the takeover grant admitted.
+///
+/// Its fields are private so nothing outside this module can build one: the
+/// token inside is the dispatch path's proof that the person agreed, and it
+/// is reachable only through [`ComputerGrants::require_takeover_dispatch`].
+#[derive(Debug)]
+pub struct TakeoverDispatch {
+    admission: GrantAdmission,
+    token: OnceDispatchToken,
+}
+
+impl TakeoverDispatch {
+    /// Whether the call waited for the person, and what became of an
+    /// "always" answer, as for any other grant.
+    pub fn admission(&self) -> &GrantAdmission {
+        &self.admission
+    }
+
+    /// Hand the token to the one dispatch it was minted for.
+    pub fn into_token(self) -> OnceDispatchToken {
+        self.token
+    }
+}
+
 /// Why a call is not admitted, each with the reply the caller acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentRefusal {
@@ -977,6 +1003,25 @@ impl ComputerGrants {
                 }
             }
         }
+    }
+
+    /// Admit one real-pointer dispatch under the conversation's takeover
+    /// grant, asking the person and waiting for the answer when it is not held.
+    ///
+    /// This is the only place a [`OnceDispatchToken`] is made: the global
+    /// dispatch path refuses to post without one, so a token is the proof
+    /// that the person agreed to hand over the pointer. Only a takeover
+    /// answer admits it; an app grant never does.
+    pub async fn require_takeover_dispatch(
+        self: &Arc<Self>,
+        context: &ConsentContext,
+        cancel: &CancelHandle,
+    ) -> Result<TakeoverDispatch, ConsentRefusal> {
+        let admission = self.require(&GrantNeed::Takeover, context, cancel).await?;
+        Ok(TakeoverDispatch {
+            admission,
+            token: OnceDispatchToken::admitted_by_takeover_grant(),
+        })
     }
 
     /// Park the caller on the open question for this grant, or open one.
@@ -1416,8 +1461,9 @@ fn question_body(ask_id: &str, need: &GrantNeed, offered: &[&'static str]) -> Va
         }
         GrantNeed::Takeover => {
             params["message"] = json!(
-                "Takeover moves your real mouse pointer. It is machine-wide for this \
-                 conversation and can reach every application on the screen."
+                "Takeover lets the agent bring apps to the front, type into them, and move \
+                 your real mouse pointer. It is machine-wide for this conversation and can \
+                 reach every application on the screen."
             );
         }
     }

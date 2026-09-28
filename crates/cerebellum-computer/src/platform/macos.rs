@@ -1659,13 +1659,12 @@ mod tests {
         }))
     }
 
-    /// A row the vocabulary carries but nothing serves over the wire is
-    /// withheld whatever is bound and granted, and says that is why.
-    ///
-    /// Every release input is bound and every permission is live, so the only
-    /// thing left to withhold these rows is that no handler serves them.
+    /// The takeover rows are advertised only when both of their reviews are
+    /// bound, and each review is proved by isolation: with every other input
+    /// bound and every permission live, leaving that one review unbound
+    /// withholds all three rows and names that review.
     #[test]
-    fn unserved_rows_are_withheld_with_every_input_bound_and_every_permission_live() {
+    fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
         let driver = MacOs26PlatformDriver::default();
         let everything = live(&[
             PermissionService::Accessibility,
@@ -1673,37 +1672,49 @@ mod tests {
             PermissionService::InputMonitoring,
             PermissionService::ScreenRecording,
         ]);
-        let context = CapabilityAdvertisementContext {
-            inputs: fully_bound_inputs(),
+        let context = |inputs: ImmutableReleaseInputs| CapabilityAdvertisementContext {
+            inputs,
             permissions: everything.clone(),
             startup: StartupCapabilityProbe {
-                permissions: everything,
+                permissions: everything.clone(),
                 ..driver.startup_probe().clone()
             },
         };
-        for id in [
+        let rows = [
             "computer.takeover_move",
             "computer.takeover_drag",
             "computer.takeover_scroll",
-        ] {
-            let declaration = driver.declaration(id, &context);
-            assert!(!declaration.advertised, "{id} was advertised");
+        ];
+        // The accepting case first, so a gate that withheld everything fails.
+        for id in rows {
+            let declaration = driver.declaration(id, &context(fully_bound_inputs()));
             assert!(
-                declaration
-                    .suppression_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("no wire serving handler")),
-                "{id} is withheld for an unexpected reason: {:?}",
+                declaration.advertised,
+                "{id} was withheld with everything bound: {:?}",
                 declaration.suppression_reason
             );
         }
-        // The accepting cases, so a gate that withheld everything would fail.
-        assert!(driver.declaration("computer.type", &context).advertised);
-        assert!(
-            driver
-                .declaration("computer.read_state", &context)
-                .advertised
-        );
+        let unbind: [(&str, fn(&mut ImmutableReleaseInputs)); 2] = [
+            ("global dispatch review revision is not bound", |inputs| {
+                inputs.global_dispatch_review_revision = None
+            }),
+            ("takeover dispatch review revision is not bound", |inputs| {
+                inputs.takeover_dispatch_review_revision = None
+            }),
+        ];
+        for (reason, spoil) in unbind {
+            let mut inputs = fully_bound_inputs();
+            spoil(&mut inputs);
+            for id in rows {
+                let declaration = driver.declaration(id, &context(inputs.clone()));
+                assert!(!declaration.advertised, "{id} was advertised: {reason}");
+                assert_eq!(
+                    declaration.suppression_reason.as_deref(),
+                    Some(reason),
+                    "{id}"
+                );
+            }
+        }
     }
 
     /// computer.read_state is advertised on its own review and accessibility

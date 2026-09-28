@@ -494,6 +494,27 @@ mod framework {
         Ok(event)
     }
 
+    /// Build one horizontal scroll-wheel event.
+    ///
+    /// A two-wheel event whose first (vertical) wheel is still and whose
+    /// second carries the delta: CoreGraphics numbers the horizontal wheel
+    /// second. The delta's sign follows the same convention as the vertical
+    /// event's.
+    pub fn horizontal_scroll_wheel_event(
+        unit: ScrollUnit,
+        delta: i32,
+    ) -> Result<OwnedCgEvent, InputEventConstructionError> {
+        let source = event_source()?;
+        let unit = match unit {
+            ScrollUnit::Line => CGScrollEventUnit::Line,
+            ScrollUnit::Pixel => CGScrollEventUnit::Pixel,
+        };
+        let event = CGEvent::new_scroll_wheel_event2(Some(&source), unit, 2, 0, delta, 0)
+            .ok_or(InputEventConstructionError::ScrollUnavailable)?;
+        CGEvent::set_flags(Some(&event), CGEventFlags::empty());
+        Ok(event)
+    }
+
     /// Build one mouse-move event at `point` without posting it.
     pub fn mouse_move_event(
         point: EventPoint,
@@ -546,9 +567,10 @@ mod framework {
 
 #[cfg(target_os = "macos")]
 pub use framework::{
-    event_post_access, heartbeat_marker_event, input_monitoring_access, key_combination_events,
-    mouse_drag_events, mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
-    seconds_since_last_input, text_input_events,
+    event_post_access, heartbeat_marker_event, horizontal_scroll_wheel_event,
+    input_monitoring_access, key_combination_events, mouse_drag_events, mouse_move_event,
+    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_input,
+    text_input_events,
 };
 
 #[cfg(test)]
@@ -726,6 +748,24 @@ mod framework_tests {
             );
             assert_eq!(CGEvent::flags(Some(&event)), CGEventFlags::empty());
         }
+    }
+
+    /// The horizontal event puts its delta on the second wheel and leaves the
+    /// vertical one still, so it scrolls sideways and never up or down.
+    #[test]
+    fn horizontal_scroll_moves_only_the_second_wheel() {
+        let event = super::horizontal_scroll_wheel_event(ScrollUnit::Line, -4)
+            .expect("construct horizontal scroll event");
+        assert_eq!(CGEvent::r#type(Some(&event)), CGEventType::ScrollWheel);
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField::ScrollWheelEventDeltaAxis2),
+            -4
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField::ScrollWheelEventDeltaAxis1),
+            0
+        );
+        assert_eq!(CGEvent::flags(Some(&event)), CGEventFlags::empty());
     }
 
     #[test]

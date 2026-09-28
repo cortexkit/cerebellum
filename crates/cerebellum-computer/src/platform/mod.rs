@@ -264,6 +264,13 @@ impl ImmutableReleaseInputs {
         self.global_dispatch_review_revision.is_some()
             && self.release_signing_topology_revision.is_some()
     }
+
+    /// Both reviews the takeover rows need: the review of the global pointer
+    /// stream and its per-post checks, and the review of handing that pointer
+    /// to the agent under a takeover grant. Neither covers the other.
+    fn takeover_dispatch_ready(&self) -> bool {
+        self.global_dispatch_ready() && self.takeover_dispatch_review_revision.is_some()
+    }
 }
 
 /// Builds the fixed declaration set from release inputs and startup evidence.
@@ -440,6 +447,52 @@ fn capability_declaration(
                 })
         };
         advertised = suppression_reason.is_none();
+    } else if matches!(
+        capability,
+        ComputerCapability::TakeoverMove
+            | ComputerCapability::TakeoverDrag
+            | ComputerCapability::TakeoverScroll
+    ) {
+        // The real-pointer rows. Each unbound review names itself, for the
+        // same reason the keystroke rows do: a build-time omission and a
+        // permission the person can grant have different remedies.
+        suppression_reason = if !platform_available {
+            Some("no global pointer dispatch on this platform".to_string())
+        } else if !context.inputs.vocabulary_ready() {
+            Some("computer action vocabulary input unresolved".to_string())
+        } else if context.inputs.global_dispatch_review_revision.is_none() {
+            Some("global dispatch review revision is not bound".to_string())
+        } else if context.inputs.takeover_dispatch_review_revision.is_none() {
+            Some("takeover dispatch review revision is not bound".to_string())
+        } else if !context.inputs.takeover_dispatch_ready() {
+            Some("release signing topology revision is not bound".to_string())
+        } else {
+            // Every permission the frozen row names, plus accessibility: the
+            // move and drag find the application under a point by an
+            // accessibility hit test, and none of the three can check which
+            // application is in front without it.
+            permissions
+                .iter()
+                .chain(std::iter::once(&PermissionService::Accessibility))
+                .find_map(|service| match context.startup.permissions.state(*service) {
+                    PermissionLiveness::Live => None,
+                    PermissionLiveness::Unavailable => {
+                        Some(format!("{service:?} permission is not granted"))
+                    }
+                    PermissionLiveness::GrantedPendingRelaunch => Some(format!(
+                        "{service:?} permission is granted but not usable until this process restarts"
+                    )),
+                    PermissionLiveness::Unresolved => {
+                        Some(format!("{service:?} permission is not established"))
+                    }
+                    PermissionLiveness::ProbeFailed => Some(
+                        "the permission probe did not complete (module fault, not a \
+                         settings state); check the module log rather than System Settings"
+                            .to_string(),
+                    ),
+                })
+        };
+        advertised = suppression_reason.is_none();
     }
 
     // Which modes could carry this row at all, before asking whether any of them
@@ -497,9 +550,12 @@ fn capability_declaration(
     } else {
         SupportState::Unsupported
     };
+    // Observed delivery is the global pointer stream. For the keystroke rows
+    // it is never used over the wire, so only the takeover rows count it as
+    // a working path, and only under both of their reviews.
     let observed_support = platform_available
         && dispatch_modes.contains(&DispatchMode::Observed)
-        && context.inputs.global_dispatch_ready();
+        && context.inputs.takeover_dispatch_ready();
     CapabilityDeclaration {
         capability_id: id.to_string(),
         action_kind,

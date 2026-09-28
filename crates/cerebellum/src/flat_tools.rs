@@ -43,6 +43,10 @@ fn computer_vocabulary() -> Value {
     .expect("the digest-pinned computer vocabulary is valid JSON")
 }
 
+/// What a model must be told about `takeover_scroll` that its fields do not
+/// show: where it scrolls, and which grant it needs.
+pub(crate) const TAKEOVER_SCROLL_NOTE: &str = "takeover_scroll carries no location: it turns the real scroll wheel wherever the pointer already is, in the application target names, which must be frontmost. It is the one takeover action that needs only the conversation's takeover grant and no app grant.";
+
 /// A description the flat tool gives a field, where the vocabulary row's own
 /// is absent or written for the row rather than for a model choosing among
 /// actions. Descriptions change nothing a request is held to.
@@ -64,8 +68,21 @@ fn describe_computer_field(name: &str, schema: &mut Value) {
              be read at all, which is not evidence that the condition is false."
         }
         "timeout_ms" => "Maximum wait in milliseconds.",
+        "axis" => "Scroll direction for takeover_scroll.",
+        // Only takeover_scroll has this field, so its whole note rides here,
+        // where a model choosing between actions reads it.
+        "amount_lines" => {
+            return set_description(
+                schema,
+                &format!("Lines to scroll; the sign picks the direction. {TAKEOVER_SCROLL_NOTE}"),
+            )
+        }
         _ => return,
     };
+    set_description(schema, description);
+}
+
+fn set_description(schema: &mut Value, description: &str) {
     if let Some(object) = schema.as_object_mut() {
         object.insert("description".into(), Value::String(description.into()));
     }
@@ -198,7 +215,16 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
             match properties.get_mut(&name) {
                 Some(existing) if existing != &schema => {
                     if existing.get("oneOf").is_none() {
+                        // A description both shapes share stays where a host
+                        // that shows only top-level descriptions finds it.
+                        let shared = existing
+                            .get("description")
+                            .filter(|description| schema.get("description") == Some(*description))
+                            .cloned();
                         *existing = json!({"oneOf":[existing.clone(), schema]});
+                        if let Some(description) = shared {
+                            existing["description"] = description;
+                        }
                     }
                 }
                 Some(_) => {}
@@ -554,6 +580,9 @@ mod tests {
                 "write_text",
                 "type",
                 "keys",
+                "takeover_move",
+                "takeover_drag",
+                "takeover_scroll",
                 "wait"
             ])
         );
@@ -657,6 +686,9 @@ mod tests {
             ("write_text", vec!["element_id", "text", "write_mode"]),
             ("type", vec!["target", "text"]),
             ("keys", vec!["keys", "target"]),
+            ("takeover_move", vec!["image_id", "to"]),
+            ("takeover_drag", vec!["image_id", "from", "to"]),
+            ("takeover_scroll", vec!["target", "axis", "amount_lines"]),
             ("wait", vec!["app", "predicate", "timeout_ms"]),
         ] {
             assert_eq!(required_for(action), required, "{action}");
@@ -689,20 +721,11 @@ mod tests {
         assert_eq!(error.reason, "unsupported_value");
     }
 
-    /// No retired or unserved action reaches a dispatch through the flat tool;
-    /// each is refused as an unsupported action before anything is served.
+    /// No retired action reaches a dispatch through the flat tool; each is
+    /// refused as an unsupported action before anything is served.
     #[test]
-    fn retired_and_unserved_actions_are_refused_before_dispatch() {
-        for action in [
-            "click",
-            "screenshot",
-            "move",
-            "drag",
-            "scroll",
-            "takeover_move",
-            "takeover_drag",
-            "takeover_scroll",
-        ] {
+    fn retired_actions_are_refused_before_dispatch() {
+        for action in ["click", "screenshot", "move", "drag", "scroll"] {
             let error = translate_computer(&json!({"action": action})).unwrap_err();
             assert_eq!(error.field, "action", "{action}");
             assert_eq!(error.reason, "unsupported_value", "{action}");
@@ -907,6 +930,22 @@ mod tests {
         ] {
             assert!(crate::dispatchable_management_operation(method));
         }
+    }
+
+    /// The scroll's grant cannot be read off its fields, so the model is told
+    /// in the one field only the scroll has.
+    #[test]
+    fn the_scroll_says_it_needs_only_the_takeover_grant() {
+        let tool = computer_tool(&computer_names()).unwrap();
+        let note = tool.schema["properties"]["amount_lines"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            note.contains("only the conversation's takeover grant"),
+            "{note}"
+        );
+        assert!(note.contains("no app grant"), "{note}");
+        assert!(note.contains("wherever the pointer already is"), "{note}");
     }
 
     #[test]

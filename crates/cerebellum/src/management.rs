@@ -92,6 +92,13 @@ pub trait TargetResolver: Send + Sync {
     fn display_name(&self, _grant: &ProcessGrant) -> Option<String> {
         None
     }
+
+    /// The application a process belongs to, with the start time that tells
+    /// it apart from a later process given the same pid. `None` where the
+    /// process cannot be identified; nothing may act on it then.
+    fn process_for_pid(&self, _pid: u32) -> Option<ProcessGrant> {
+        None
+    }
 }
 
 /// Resolves application names against this machine.
@@ -158,6 +165,11 @@ impl TargetResolver for PlatformResolver {
     #[cfg(target_os = "macos")]
     fn display_name(&self, grant: &ProcessGrant) -> Option<String> {
         cerebellum_computer::platform::native::application_name(grant.pid, self.timeout)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_for_pid(&self, pid: u32) -> Option<ProcessGrant> {
+        cerebellum_computer::platform::native::grant_for_pid(pid, self.timeout)
     }
 
     /// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
@@ -390,6 +402,13 @@ impl ManagementPlane {
             .display_name(grant)
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| grant.bundle_identity.clone())
+    }
+
+    /// The application a process belongs to, identified by its start time,
+    /// or `None` when it cannot be identified. Used where an action learns a
+    /// pid rather than a name, such as the application under a point.
+    pub fn process_for_pid(&self, pid: u32) -> Option<ProcessGrant> {
+        self.resolver.process_for_pid(pid)
     }
 
     /// Resolve an application and hold its app grant, asking the person and

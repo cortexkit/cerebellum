@@ -25,9 +25,26 @@ pub struct OnceDispatchToken {
 impl OnceDispatchToken {
     /// Mint the token for one dispatch the takeover grant has just admitted.
     ///
-    /// Call this only at the point of admission, immediately before building
-    /// the dispatch it is for: a token minted earlier and held is a standing
-    /// permission, which is what the type exists to prevent.
+    /// WHY THIS IS PUBLIC, AND WHAT KEEPS IT SEALED. The token is the proof
+    /// that a person agreed to hand over their pointer, so it may be made in
+    /// exactly one place: the takeover grant check in the serving crate
+    /// (`ComputerGrants::require_takeover_dispatch`), which returns it only
+    /// after the grant is held. The type has to live here, below both the
+    /// dispatch crate that demands it and the serving crate that checks the
+    /// grant, and Rust has no visibility that admits one named downstream
+    /// crate and no other. So the seal is split in two:
+    ///
+    /// * the grant check wraps the token in a value only that check can
+    ///   build, so nothing else in the serving crate can obtain one; and
+    /// * a structural test (`once_dispatch_token_site.rs` in the serving
+    ///   crate) scans every production source of the workspace and fails if
+    ///   this constructor is called anywhere but in that check.
+    ///
+    /// Tests build tokens of their own; that is outside the production paths
+    /// the scan covers. Call this only at the point of admission, immediately
+    /// before building the dispatch it is for: a token minted earlier and held
+    /// is a standing permission, which is what the type exists to prevent.
+    #[doc(hidden)]
     pub fn admitted_by_takeover_grant() -> Self {
         Self { _private: () }
     }

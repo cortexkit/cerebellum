@@ -764,11 +764,15 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
     assert_eq!(takeover["params"]["grant_kind"], "takeover");
     assert_eq!(decisions(takeover), ["allow_conversation", "deny"]);
     assert!(takeover["params"].get("app").is_none());
-    assert!(takeover["params"]["message"]
-        .as_str()
-        .is_some_and(
-            |message| message.contains("machine-wide") && message.contains("this conversation")
-        ));
+    // Pinned byte for byte: the host shows this line unchanged, and it has to
+    // cover both uses of the grant, fronting an application for keystrokes
+    // and driving the real pointer.
+    assert_eq!(
+        takeover["params"]["message"],
+        "Takeover lets the agent bring apps to the front, type into them, and move your real \
+         mouse pointer. It is machine-wide for this conversation and can reach every \
+         application on the screen."
+    );
     assert!(grants.holds(&attested, &GrantNeed::Takeover));
     assert!(!grants.holds(&caller("conversation-2", true), &GrantNeed::Takeover));
 }

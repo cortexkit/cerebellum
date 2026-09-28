@@ -7,7 +7,8 @@
 //! the constructed events with the neutral plan's roles.
 
 use super::synthetic::{
-    SyntheticAction, SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollUnit,
+    SyntheticAction, SyntheticKey, SyntheticKeyModifiers, SyntheticPoint, SyntheticScrollAxis,
+    SyntheticScrollUnit,
 };
 use super::{DriverError, SyntheticStep};
 use cerebellum_macos::{EventPoint, KeyModifiers, OwnedCgEvent, ScrollUnit, VirtualKey};
@@ -212,13 +213,18 @@ pub fn synthetic_event_steps(
             .map_err(map_event_construction_error)?;
             vec![down, up]
         }
-        SyntheticAction::Scroll { unit, delta } => {
+        SyntheticAction::Scroll { unit, delta, axis } => {
             let unit = match unit {
                 SyntheticScrollUnit::Line => ScrollUnit::Line,
                 SyntheticScrollUnit::Pixel => ScrollUnit::Pixel,
             };
-            vec![cerebellum_macos::scroll_wheel_event(unit, *delta)
-                .map_err(map_event_construction_error)?]
+            let event = match axis {
+                SyntheticScrollAxis::Vertical => cerebellum_macos::scroll_wheel_event(unit, *delta),
+                SyntheticScrollAxis::Horizontal => {
+                    cerebellum_macos::horizontal_scroll_wheel_event(unit, *delta)
+                }
+            };
+            vec![event.map_err(map_event_construction_error)?]
         }
         SyntheticAction::MovePointer { point } => {
             vec![cerebellum_macos::mouse_move_event(macos_point(*point))

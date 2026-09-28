@@ -73,6 +73,36 @@ fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> V
         .collect()
 }
 
+/// Every current row, in artifact order: each has a wire handler.
+fn every_served_row() -> Vec<&'static str> {
+    vec![
+        "computer.read_state",
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+        "computer.type",
+        "computer.keys",
+        "computer.takeover_move",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
+        "computer.wait",
+    ]
+}
+
+/// Every current row but the named ones, in artifact order.
+fn every_served_row_but(withheld: &[&str]) -> Vec<&'static str> {
+    every_served_row()
+        .into_iter()
+        .filter(|row| !withheld.contains(row))
+        .collect()
+}
+
+const TAKEOVER_ROWS: [&str; 3] = [
+    "computer.takeover_move",
+    "computer.takeover_drag",
+    "computer.takeover_scroll",
+];
+
 fn tools(manifest: &subc_protocol::manifest::ModuleManifest) -> Vec<&Tool> {
     let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
         panic!("computer integration must retain the tool provider role")
@@ -111,37 +141,18 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
 
     // Complete release identifiers with every permission live admit every row
     // with a wire handler: the state read, the element presses and write, the
-    // two keystroke rows and wait. This was
+    // two keystroke rows, the three takeover rows and wait. This was
     // originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
     // Advertisement is now the conjunction of gate admission and
     // dispatchability, so the identifier half is asserted here and the manifest
     // half below.
-    assert_eq!(
-        available_capabilities(&context),
-        vec![
-            "computer.read_state",
-            "computer.press_element",
-            "computer.press_point",
-            "computer.write_text",
-            "computer.type",
-            "computer.keys",
-            "computer.wait"
-        ]
-    );
+    assert_eq!(available_capabilities(&context), every_served_row());
     assert_eq!(
         evidence.gate_admitted_capabilities,
         if cfg!(target_os = "macos") {
-            vec![
-                "computer.read_state",
-                "computer.press_element",
-                "computer.press_point",
-                "computer.write_text",
-                "computer.type",
-                "computer.keys",
-                "computer.wait",
-            ]
+            every_served_row()
         } else {
             vec!["computer.wait"]
         }
@@ -164,35 +175,31 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. It is PARTIAL: the state read, the element actions, the keystroke
-    // rows and wait are served, while the takeover pointer rows have no wire
-    // handler yet.
+    // admit. With every row now served, a macOS build carrying every review
+    // advertises ALL of the frozen rows; elsewhere only wait is served, which
+    // is PARTIAL.
     //
-    // PARTIAL rather than EMPTY is a release-visible claim: it says a caller can
-    // act on the computer plane rather than only read its declarations. Changing
-    // this expectation means changing what the module tells the fleet it can do,
+    // This is a release-visible claim: it says what a caller can do on the
+    // computer plane rather than only what it declares. Changing this
+    // expectation means changing what the module tells the fleet it can do,
     // which is why the scope is asserted exactly rather than as "not empty".
     assert_eq!(
         evidence.scope,
-        ComputerAdvertisementScope::PartialRuntimeAdvertisement
+        if cfg!(target_os = "macos") {
+            ComputerAdvertisementScope::AllFrozenRows
+        } else {
+            ComputerAdvertisementScope::PartialRuntimeAdvertisement
+        }
     );
     assert_eq!(
         computer_tools,
         if cfg!(target_os = "macos") {
-            vec![
-                "computer.read_state",
-                "computer.press_element",
-                "computer.press_point",
-                "computer.write_text",
-                "computer.type",
-                "computer.keys",
-                "computer.wait",
-            ]
+            every_served_row()
         } else {
             vec!["computer.wait"]
         },
         "the advertised set is no longer exactly the state read, the element actions, the \
-         keystroke rows and wait"
+         keystroke rows, the takeover rows and wait"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -248,6 +255,9 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         "computer.press_element",
         "computer.press_point",
         "computer.write_text",
+        "computer.takeover_move",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
     ] {
         assert!(
             offered.contains(served),
@@ -260,9 +270,6 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         "computer.move",
         "computer.drag",
         "computer.scroll",
-        "computer.takeover_move",
-        "computer.takeover_drag",
-        "computer.takeover_scroll",
     ] {
         assert!(!offered.contains(never), "{never} was offered");
     }
@@ -481,13 +488,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             | "input_review_revision" => {
                 assert_eq!(
                     admitted,
-                    vec![
-                        "computer.read_state",
-                        "computer.press_element",
-                        "computer.press_point",
-                        "computer.write_text",
-                        "computer.wait"
-                    ],
+                    every_served_row_but(&["computer.type", "computer.keys"]),
                     "{gate} governs the keystroke rows"
                 )
             }
@@ -498,38 +499,32 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             ),
             "app_state_review_revision" => assert_eq!(
                 admitted,
-                vec![
-                    "computer.press_element",
-                    "computer.press_point",
-                    "computer.write_text",
-                    "computer.type",
-                    "computer.keys",
-                    "computer.wait"
-                ],
+                every_served_row_but(&["computer.read_state"]),
                 "{gate} governs the state read alone"
             ),
             "element_addressed_review_revision" => assert_eq!(
                 admitted,
-                vec![
-                    "computer.read_state",
-                    "computer.type",
-                    "computer.keys",
-                    "computer.wait"
-                ],
+                every_served_row_but(&[
+                    "computer.press_element",
+                    "computer.press_point",
+                    "computer.write_text"
+                ]),
                 "{gate} governs the element presses and writes alone"
             ),
-            // The fronting bracket is gated where it is served, not where the
+            // Both reviews govern the takeover rows and nothing else. The
+            // fronting bracket is gated where it is served, not where the
             // keystroke rows are advertised: without it they still serve a
             // frontmost target.
-            "takeover_dispatch_review_revision" => assert_eq!(
-                admitted,
-                available_capabilities(&complete),
-                "{gate} withholds no advertised row"
-            ),
+            "takeover_dispatch_review_revision" | "global_dispatch_review_revision" => {
+                assert_eq!(
+                    admitted,
+                    every_served_row_but(&TAKEOVER_ROWS),
+                    "{gate} governs the takeover rows alone"
+                )
+            }
             // No served row is reviewed under these any more, so withholding
             // one withholds nothing.
-            "global_dispatch_review_revision"
-            | "capture_review_revision"
+            "capture_review_revision"
             | "semantic_actuation_review_revision"
             | "windows_actuation_review_revision" => assert_eq!(
                 admitted,
@@ -581,39 +576,84 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
     }
 }
 
-/// With every other release input and permission live, the missing
-/// global-dispatch review withholds nothing: no served row posts globally.
-/// The pointer rows it used to govern are gone, and the takeover rows that
-/// replace them have no wire handler, so they are withheld whether it is bound
-/// or not.
+/// The takeover rows need both the global-dispatch review and the takeover
+/// review, each proved by isolation: with every other release input bound
+/// and every permission live, leaving exactly one of the two unbound
+/// withholds all three rows, from the declaration, the release gate and the
+/// manifest, and each withheld row names that review as the reason.
 #[test]
-fn global_dispatch_review_gate_governs_no_served_row() {
-    let mut inputs = valid_inputs();
-    inputs.global_dispatch_review_revision = None;
-    let context = ComputerCapabilityAdvertisementContext {
-        inputs,
-        permissions: valid_context().permissions,
-        startup: valid_context().startup,
-    };
+fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
+    // Everything bound admits them, so the refusals below are the gates'.
+    let bound = valid_context();
+    let admitted = computer_release_evidence(&bound).gate_admitted_capabilities;
+    for row in TAKEOVER_ROWS {
+        assert!(available_capabilities(&bound).contains(&row.to_string()));
+        if cfg!(target_os = "macos") {
+            assert!(admitted.contains(&row.to_string()), "{row}: {admitted:?}");
+        }
+    }
 
-    assert_eq!(
-        available_capabilities(&context),
-        vec![
-            "computer.read_state",
-            "computer.press_element",
-            "computer.press_point",
-            "computer.write_text",
-            "computer.type",
-            "computer.keys",
-            "computer.wait"
-        ],
-    );
-    assert!(
-        computer_release_evidence(&context).gate_outcomes.contains(
-            &ComputerGateOutcome::MissingExternalInput {
-                gate: "global_dispatch_review_revision".to_string(),
-            }
+    for (gate, reason) in [
+        (
+            "global_dispatch_review_revision",
+            "global dispatch review revision is not bound",
         ),
-        "the missing gate is still reported as an unresolved input"
-    );
+        (
+            "takeover_dispatch_review_revision",
+            "takeover dispatch review revision is not bound",
+        ),
+    ] {
+        let mut inputs = valid_inputs();
+        match gate {
+            "global_dispatch_review_revision" => inputs.global_dispatch_review_revision = None,
+            _ => inputs.takeover_dispatch_review_revision = None,
+        }
+        let context = ComputerCapabilityAdvertisementContext {
+            inputs,
+            permissions: bound.permissions.clone(),
+            startup: bound.startup.clone(),
+        };
+
+        for declaration in capability_declarations(&context, true)
+            .into_iter()
+            .filter(|declaration| TAKEOVER_ROWS.contains(&declaration.capability_id.as_str()))
+        {
+            assert!(!declaration.advertised, "{gate}: {declaration:?}");
+            assert_eq!(
+                declaration.suppression_reason.as_deref(),
+                Some(reason),
+                "{gate}: {}",
+                declaration.capability_id
+            );
+        }
+        let evidence = computer_release_evidence(&context);
+        assert!(
+            evidence
+                .gate_outcomes
+                .contains(&ComputerGateOutcome::MissingExternalInput {
+                    gate: gate.to_string(),
+                }),
+            "{gate} is not reported as an unresolved input"
+        );
+        for row in TAKEOVER_ROWS {
+            assert!(
+                !evidence
+                    .gate_admitted_capabilities
+                    .contains(&row.to_string()),
+                "{gate}: {row} was admitted"
+            );
+            assert!(
+                tools(&build_manifest_with_computer_plane("cerebellum", &context))
+                    .iter()
+                    .all(|tool| tool.name != row),
+                "{gate}: {row} was in the manifest"
+            );
+        }
+        // The rest of the served surface is untouched by either review.
+        assert_eq!(
+            available_capabilities(&context),
+            every_served_row_but(&TAKEOVER_ROWS),
+            "{gate}"
+        );
+    }
 }

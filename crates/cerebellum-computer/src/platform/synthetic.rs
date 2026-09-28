@@ -155,6 +155,19 @@ pub enum SyntheticScrollUnit {
     Pixel,
 }
 
+/// Which way a scroll-wheel event turns the content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticScrollAxis {
+    /// Up and down, the wheel every mouse has. The default, so a recorded
+    /// scroll from before the axis existed reads back as the vertical one it
+    /// was.
+    #[default]
+    Vertical,
+    /// Left and right.
+    Horizontal,
+}
+
 /// A point in global display coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SyntheticPoint {
@@ -178,10 +191,12 @@ pub enum SyntheticAction {
         key: SyntheticKey,
         modifiers: SyntheticKeyModifiers,
     },
-    /// Turn the scroll wheel by `delta` units, vertical axis.
+    /// Turn the scroll wheel by `delta` units along `axis`.
     Scroll {
         unit: SyntheticScrollUnit,
         delta: i32,
+        #[serde(default)]
+        axis: SyntheticScrollAxis,
     },
     /// Move the pointer to a point without pressing any button.
     MovePointer { point: SyntheticPoint },
@@ -201,8 +216,13 @@ impl SyntheticAction {
         Self::KeyCombination { key, modifiers }
     }
 
+    /// A vertical scroll.
     pub fn scroll(unit: SyntheticScrollUnit, delta: i32) -> Self {
-        Self::Scroll { unit, delta }
+        Self::scroll_along(SyntheticScrollAxis::Vertical, unit, delta)
+    }
+
+    pub fn scroll_along(axis: SyntheticScrollAxis, unit: SyntheticScrollUnit, delta: i32) -> Self {
+        Self::Scroll { unit, delta, axis }
     }
 
     pub fn move_pointer(point: SyntheticPoint) -> Self {
