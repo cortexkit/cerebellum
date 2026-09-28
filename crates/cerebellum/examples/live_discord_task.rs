@@ -313,12 +313,14 @@ mod task {
     }
 
     /// Labels Discord has given the button beside the composer that opens
-    /// its upload menu.
+    /// its upload menu. Discord exposes "More message options" as a pop-up
+    /// button (AXPopUpButton), not a plain button.
     const UPLOAD_CONTROL_LABELS: [&str; 3] = ["More message options", "Upload a File", "Upload"];
+    pub const UPLOAD_CONTROL_ROLES: [&str; 2] = ["button", "pop up button"];
 
     pub fn find_upload_control(lines: &[TreeLine]) -> Result<TreeLine, FindFailure> {
         unique(lines, |line| {
-            line.role == "button"
+            UPLOAD_CONTROL_ROLES.contains(&line.role.as_str())
                 && UPLOAD_CONTROL_LABELS
                     .iter()
                     .any(|label| line.head().eq_ignore_ascii_case(label))
@@ -1571,7 +1573,7 @@ mod macos_probe {
             .find(
                 "upload control",
                 Read {
-                    roles: &["button"],
+                    roles: &task::UPLOAD_CONTROL_ROLES,
                     ..Read::default()
                 },
                 task::find_upload_control,
@@ -1581,7 +1583,7 @@ mod macos_probe {
         desk.act(Planned::Press(&control)).await;
         tokio::time::sleep(SETTLE).await;
 
-        let item = desk
+        let item = match desk
             .find(
                 "Upload a File menu item",
                 Read {
@@ -1591,7 +1593,18 @@ mod macos_probe {
                 task::find_upload_menu_item,
             )
             .await
-            .map_err(|failure| format!("the Upload a File menu item: {failure}"))?;
+        {
+            Ok(item) => item,
+            Err(failure) => {
+                // Like a missing panel, a missing menu is a reach finding: the
+                // rest of the task does not depend on the attachment.
+                println!(
+                    "  REACH: the upload menu did not appear in Discord's accessibility tree \
+                     after pressing the upload control ({failure}); the attach is skipped"
+                );
+                return Ok(());
+            }
+        };
         desk.act(Planned::Press(&item)).await;
         tokio::time::sleep(SETTLE * 2).await;
 

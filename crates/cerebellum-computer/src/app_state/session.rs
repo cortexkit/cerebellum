@@ -26,7 +26,13 @@ use crate::platform::ProcessGrant;
 /// The most elements one session numbers. Past it, new elements go
 /// unnumbered and the reply says so; a live element is never evicted to make
 /// room, so nothing the agent can see turns stale because the map filled.
-pub const MAX_SESSION_ELEMENTS: usize = 2048;
+///
+/// Twice the read bound, so one complete read always fits and a view change
+/// still finds room while the previous view's ids wait out their eviction.
+/// Discord's tree measured about 2,260 elements, and at a cap below that its
+/// last-read elements (the direct-message list among them) had no ids and
+/// could not be pressed.
+pub const MAX_SESSION_ELEMENTS: usize = 2 * super::source::READ_BOUND_ELEMENTS;
 
 /// How many consecutive complete reads an element may be missing from before
 /// its id is retired. More than one, so an element that flickers out for a

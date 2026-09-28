@@ -113,13 +113,14 @@ pub struct ReadBounds {
     pub timeout: Duration,
 }
 
+/// The most elements one read visits. The element map holds twice this, so a
+/// whole read can always be numbered.
+pub const READ_BOUND_ELEMENTS: usize = 4_000;
+
 impl Default for ReadBounds {
     fn default() -> Self {
         Self {
-            // Past the element map's own cap, so a large application reaches
-            // that cap and says so rather than stopping silently at a smaller
-            // read bound.
-            max_elements: 4_000,
+            max_elements: READ_BOUND_ELEMENTS,
             max_depth: 48,
             timeout: Duration::from_secs(4),
         }
