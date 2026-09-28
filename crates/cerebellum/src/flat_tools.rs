@@ -37,8 +37,10 @@ fn action_name(capability: &str) -> Option<&str> {
 }
 
 fn computer_vocabulary() -> Value {
-    serde_json::from_slice(cerebellum_computer::platform::vocabulary::COMPUTER_ACTION_VOCABULARY_ARTIFACT)
-        .expect("the digest-pinned computer vocabulary is valid JSON")
+    serde_json::from_slice(
+        cerebellum_computer::platform::vocabulary::COMPUTER_ACTION_VOCABULARY_ARTIFACT,
+    )
+    .expect("the digest-pinned computer vocabulary is valid JSON")
 }
 
 /// A description the flat tool gives a field, where the vocabulary row's own
@@ -142,7 +144,9 @@ pub(crate) const COMPUTER_FLAT_NARROWINGS: [FlatNarrowing; 0] = [];
 /// an action is advertised exactly as its frozen row declares it. The flat
 /// schema is built from this and the parity test reads this, so the schema and
 /// the check cannot describe two different tools.
-pub(crate) fn computer_action_fields(admitted: &[String]) -> Vec<(String, Map<String, Value>, Vec<String>)> {
+pub(crate) fn computer_action_fields(
+    admitted: &[String],
+) -> Vec<(String, Map<String, Value>, Vec<String>)> {
     let vocabulary = computer_vocabulary();
     let Some(rows) = vocabulary["rows"].as_array() else {
         return Vec::new();
@@ -723,13 +727,18 @@ mod tests {
         let admitted = computer_names();
         let tool = computer_tool(&admitted).unwrap();
         let fields = computer_action_fields(&admitted);
-        assert_eq!(fields.len(), admitted.len(), "every admitted action is advertised");
+        assert_eq!(
+            fields.len(),
+            admitted.len(),
+            "every admitted action is advertised"
+        );
 
         let mut advertised_union: BTreeSet<String> = BTreeSet::from(["action".to_string()]);
         for (action, properties, required) in &fields {
-            let capability =
-                cerebellum_computer::audit::ComputerCapability::parse(&format!("computer.{action}"))
-                    .expect("a served action names a current capability");
+            let capability = cerebellum_computer::audit::ComputerCapability::parse(&format!(
+                "computer.{action}"
+            ))
+            .expect("a served action names a current capability");
             let (accepted, parser_required) =
                 crate::computer_capability::served_request_fields(capability)
                     .expect("a served capability declares its parser fields");
@@ -749,7 +758,10 @@ mod tests {
                 .copied()
                 .filter(|field| !narrowed.contains(field))
                 .collect();
-            assert_eq!(advertised, accepted, "{action}: advertised versus accepted fields");
+            assert_eq!(
+                advertised, accepted,
+                "{action}: advertised versus accepted fields"
+            );
 
             let advertised_required: BTreeSet<&str> = required
                 .iter()
@@ -790,7 +802,10 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        assert_eq!(schema_properties, advertised_union, "the flat schema's properties");
+        assert_eq!(
+            schema_properties, advertised_union,
+            "the flat schema's properties"
+        );
     }
 
     #[test]

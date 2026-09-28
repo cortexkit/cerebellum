@@ -1259,23 +1259,16 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
 /// Give every synthetic-input outcome the result envelope its vocabulary row
 /// declares.
 ///
-/// The three focus-delivered rows declare `outcome`, `containment_rung` and
-/// `effect_status`. Move and drag also permit an optional containment rung;
-/// preserve it when dispatch measured one without inventing it on refusals.
-/// `detail` is an implementation diagnostic and is stripped here rather than
-/// shipped. The five rows declare `field`, `reason`, `remedy`, and `chord` so
-/// a refusal tells callers what failed and how to continue.
 /// Build the reply for a synthetic action that completed.
 ///
 /// Extracted from its one production call site so a test can assert the exact
 /// shape this surface emits against the frozen result schema. The two had no
-/// common point before, and that gap shipped: `computer.move` and
-/// `computer.drag` emit `containment_rung` like every other synthetic row, but
-/// the v8 schema declared it only on the other three, and withholding mode
-/// REJECTS an undeclared property rather than dropping it -- so a move that
-/// really moved the cursor came back to the caller as a schema violation. v9
-/// declares it on all five; `every_synthetic_success_reply_survives_withholding`
-/// is what keeps the builder and the schema from parting again.
+/// common point once, and that gap shipped: a pointer row emitted
+/// `containment_rung` that its schema did not declare, and withholding mode
+/// REJECTS an undeclared property rather than dropping it -- so an action that
+/// really happened came back to the caller as a schema violation.
+/// `every_synthetic_success_reply_survives_withholding` is what keeps the
+/// builder and the schema from parting again.
 fn synthetic_success_reply(
     containment_rung: &str,
     target_fronted: bool,
@@ -1499,7 +1492,10 @@ mod wait_tests {
         assert_eq!(refusal["outcome"], "invalid_request");
         assert_eq!(refusal["field"], "duration_ms");
         assert_eq!(refusal["reason"], "unknown_field");
-        assert_eq!(validate_capability_result("computer.wait", &refusal), Ok(()));
+        assert_eq!(
+            validate_capability_result("computer.wait", &refusal),
+            Ok(())
+        );
     }
 
     /// Every served parser holds a request to exactly the fields it declares.
@@ -1536,7 +1532,10 @@ mod wait_tests {
                 .collect();
             let mut declared: Vec<&str> = accepted.to_vec();
             declared.sort_unstable();
-            assert_eq!(sample_fields, declared, "{capability:?} sample covers every field");
+            assert_eq!(
+                sample_fields, declared,
+                "{capability:?} sample covers every field"
+            );
             parse_served_request(capability, &sample)
                 .unwrap_or_else(|refusal| panic!("{capability:?} sample refused: {refusal}"));
             for field in accepted {
@@ -1548,7 +1547,10 @@ mod wait_tests {
                     assert_eq!(refusal["field"], *field, "{capability:?}");
                     assert_eq!(refusal["reason"], "missing_field", "{capability:?}.{field}");
                 } else {
-                    assert!(verdict.is_ok(), "{capability:?}.{field} is declared optional");
+                    assert!(
+                        verdict.is_ok(),
+                        "{capability:?}.{field} is declared optional"
+                    );
                 }
             }
             let mut extra = sample.clone();
@@ -1567,7 +1569,10 @@ mod wait_tests {
     #[test]
     fn a_wait_without_app_is_refused_as_a_missing_field() {
         for (request, reason) in [
-            (json!({"predicate": predicate(), "timeout_ms": 250}), "missing_field"),
+            (
+                json!({"predicate": predicate(), "timeout_ms": 250}),
+                "missing_field",
+            ),
             (
                 json!({"app": "  ", "predicate": predicate(), "timeout_ms": 250}),
                 "empty_value",
@@ -1581,7 +1586,10 @@ mod wait_tests {
             assert_eq!(refusal["outcome"], "invalid_request");
             assert_eq!(refusal["field"], "app");
             assert_eq!(refusal["reason"], reason);
-            assert_eq!(validate_capability_result("computer.wait", &refusal), Ok(()));
+            assert_eq!(
+                validate_capability_result("computer.wait", &refusal),
+                Ok(())
+            );
         }
     }
 
@@ -2136,10 +2144,10 @@ mod startup_reconciliation_tests {
     use cerebellum_computer::audit::{
         ComputerAuditError, ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
     };
-    use cerebellum_computer::grounding::ContainmentRung;
     use cerebellum_computer::capture_custody::{
         CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
     };
+    use cerebellum_computer::grounding::ContainmentRung;
     use cerebellum_core::identity::SessionKind;
     use cerebellum_core::journal::{
         DurableState, JournalConfig, JournalError, JournalIdentity, JournalStorage, StorageError,
@@ -2442,12 +2450,11 @@ mod cancel_wire_tests {
             ComputerPlane::with_result_schema_enforcement(audit, ResultSchemaEnforcement::Withhold);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         for capability in [ComputerCapability::Type, ComputerCapability::Keys] {
-            let reply = synthetic_wire_envelope(synthetic_dispatch_refusal(
-                &DispatchError::Cancelled {
+            let reply =
+                synthetic_wire_envelope(synthetic_dispatch_refusal(&DispatchError::Cancelled {
                     posts_returned: 2,
                     held_state: HeldStateDisposition::Released { posts_returned: 1 },
-                },
-            ));
+                }));
             match plane.finish_reply(capability, reply) {
                 Ok(reply) => crate::send_tool_response(&tx, 1, 7, 1, 42, reply)
                     .await

@@ -92,10 +92,17 @@ const IMAGE_UNAVAILABLE_REASONS: [&str; 9] = [
     "image_not_scalable",
 ];
 
-const EFFECT_STATUSES: [&str; 3] = ["effect_observed", "no_effect_observed", "effect_indeterminate"];
+const EFFECT_STATUSES: [&str; 3] = [
+    "effect_observed",
+    "no_effect_observed",
+    "effect_indeterminate",
+];
 
 fn outcome(tokens: &[&[&str]], description: &str) -> Value {
-    let values: Vec<&str> = tokens.iter().flat_map(|group| group.iter().copied()).collect();
+    let values: Vec<&str> = tokens
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect();
     json!({"type": "string", "enum": values, "description": description})
 }
 
@@ -673,7 +680,12 @@ fn takeover_result(extra_outcomes: &[&str], description: &str) -> Map<String, Va
         "outcome".into(),
         outcome(
             &[
-                &["completed", "target_not_frontmost", "invalid_request", "audit_unavailable"],
+                &[
+                    "completed",
+                    "target_not_frontmost",
+                    "invalid_request",
+                    "audit_unavailable",
+                ],
                 extra_outcomes,
                 &GLOBAL_DISPATCH_OUTCOMES,
                 &CONSENT_OUTCOMES,
@@ -693,7 +705,11 @@ fn takeover_result(extra_outcomes: &[&str], description: &str) -> Map<String, Va
 /// `computer.takeover_move`: moves the real pointer, under a takeover grant.
 fn takeover_move() -> Value {
     let result = takeover_result(
-        &["app_grant_required", "image_reference_unknown", "point_out_of_bounds"],
+        &[
+            "app_grant_required",
+            "image_reference_unknown",
+            "point_out_of_bounds",
+        ],
         "completed carries no diff; read the state again to see what changed. The application \
          hit-tested at `to` is the containment target and must be frontmost.",
     );
@@ -755,7 +771,11 @@ fn takeover_move() -> Value {
 /// `computer.takeover_drag`: a real-pointer drag within one application.
 fn takeover_drag() -> Value {
     let result = takeover_result(
-        &["app_grant_required", "image_reference_unknown", "point_out_of_bounds"],
+        &[
+            "app_grant_required",
+            "image_reference_unknown",
+            "point_out_of_bounds",
+        ],
         "completed carries no diff. The application hit-tested at `from` is the containment \
          target; a `to` in a different application refuses target_not_frontmost with no post.",
     );

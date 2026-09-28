@@ -1486,7 +1486,8 @@ mod tests {
             "computer.press_point",
             "computer.write_text",
         ] {
-            let GroundingRequirement::Grounded(policy) = GroundingPolicy::for_capability(capability)
+            let GroundingRequirement::Grounded(policy) =
+                GroundingPolicy::for_capability(capability)
             else {
                 panic!("{capability} is grounded");
             };

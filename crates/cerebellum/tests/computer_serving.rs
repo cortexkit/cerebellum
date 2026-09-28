@@ -86,7 +86,11 @@ fn predicate() -> Value {
     })
 }
 
-async fn serve_wait(management: &Arc<ManagementPlane>, clock: &FakeClock, arguments: Value) -> Value {
+async fn serve_wait(
+    management: &Arc<ManagementPlane>,
+    clock: &FakeClock,
+    arguments: Value,
+) -> Value {
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
         ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
     plane

@@ -615,8 +615,7 @@ fn press_and_cancel_reach_the_same_audited_semantic_platform_path() {
 
 #[test]
 fn semantic_delivery_cannot_report_a_non_semantic_rung() {
-    let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
+    let mut request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     request.identity = None;
     let report = Dispatcher::new(
         RecordingDriver::default(),
@@ -638,8 +637,7 @@ fn semantic_delivery_cannot_report_a_non_semantic_rung() {
 
 #[test]
 fn semantic_reply_and_journal_use_the_same_containment_rung() {
-    let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
+    let mut request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     request.identity = None;
     let mut audit = audit();
     let report = Dispatcher::new(
@@ -1541,8 +1539,7 @@ fn fronting_downgrade_does_not_forfeit_semantic_delivery_containment() {
 /// the boundary and merely loses the containment dividend it could not earn.
 #[test]
 fn an_element_owned_by_another_process_does_not_take_the_semantic_path() {
-    let mut request =
-        semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
+    let mut request = semantic_request(FrozenDispatchRow::for_capability("computer.type").unwrap());
     let foreign = ProcessGrant {
         pid: 99,
         bundle_identity: "com.example.other".into(),

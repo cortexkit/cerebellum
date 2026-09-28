@@ -1159,16 +1159,14 @@ mod tests {
         assert!(declarations
             .iter()
             .all(|declaration| !declaration.advertised));
-        for id in ["computer.wait"] {
-            let declaration = declarations
-                .iter()
-                .find(|declaration| declaration.capability_id == id)
-                .expect("the canonical declaration exists");
-            assert_eq!(
-                declaration.suppression_reason.as_deref(),
-                Some(WINDOWS_ACTUATION_UNREVIEWED)
-            );
-        }
+        let wait = declarations
+            .iter()
+            .find(|declaration| declaration.capability_id == "computer.wait")
+            .expect("the canonical declaration exists");
+        assert_eq!(
+            wait.suppression_reason.as_deref(),
+            Some(WINDOWS_ACTUATION_UNREVIEWED)
+        );
     }
 
     fn grant() -> ProcessGrant {
@@ -1471,7 +1469,10 @@ mod tests {
         assert!(WindowsPlatformDriver::default()
             .declarations(&context(fully_bound_inputs()))
             .iter()
-            .all(|declaration| declaration.capability_id != "computer.screenshot"
-                && !(declaration.capability_id == "computer.read_state" && declaration.advertised)));
+            .all(
+                |declaration| declaration.capability_id != "computer.screenshot"
+                    && !(declaration.capability_id == "computer.read_state"
+                        && declaration.advertised)
+            ));
     }
 }

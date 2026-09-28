@@ -7,8 +7,8 @@ use cerebellum_computer::platform::{
     computed_vocabulary_sha256, implementation_source_lock_digest, validate_vocabulary,
     validate_vocabulary_digests, CapabilityAdvertisementContext, ImmutableReleaseInputs,
     PermissionLiveness, PermissionLivenessProbe, PermissionLivenessReport, PermissionProbeResult,
-    PermissionService, StartupCapabilityProbe, VocabularyDigestInputs, COMPUTER_ACTION_VOCABULARY_REVISION,
-    COMPUTER_ACTION_VOCABULARY_SHA256,
+    PermissionService, StartupCapabilityProbe, VocabularyDigestInputs,
+    COMPUTER_ACTION_VOCABULARY_REVISION, COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 #[cfg(target_os = "macos")]
 use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v13.json");
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 /// The digest of the v12 artifact, measured before v13 was minted.
-const V12_ARTIFACT_SHA256: &str = "a820c3519c72bdedf0c7604f8f30531411d4538345e63fc160835aabcb422bfa";
+const V12_ARTIFACT_SHA256: &str =
+    "a820c3519c72bdedf0c7604f8f30531411d4538345e63fc160835aabcb422bfa";
 /// The five rows v12 carried and v13 removed, exactly as v12 wrote them. The
 /// delta chain needs them to rebuild v12, and they exist nowhere else now.
 const RETIRED_V12_ROWS: &str = include_str!("fixtures/v12_retired_rows.json");
@@ -263,7 +264,12 @@ fn wait_settle_markers_are_closed_to_their_values() {
     let outcomes = wait["result_schema"]["properties"]["outcome"]["enum"]
         .as_array()
         .expect("wait outcomes are closed");
-    for outcome in ["predicate_satisfied", "timeout", "indeterminate", "cancelled"] {
+    for outcome in [
+        "predicate_satisfied",
+        "timeout",
+        "indeterminate",
+        "cancelled",
+    ] {
         assert!(outcomes.contains(&json!(outcome)), "{outcome}");
     }
 }
@@ -698,10 +704,8 @@ fn v13_only_makes_the_changes_recreated_v12_undoes() {
 /// the artifact was edited by hand.
 #[test]
 fn the_minted_artifact_is_the_generator_output_from_v12() {
-    let generated = vocabulary_mint::v13_from_v12(
-        &recreated_v12(),
-        COMPUTER_ACTION_VOCABULARY_REVISION,
-    );
+    let generated =
+        vocabulary_mint::v13_from_v12(&recreated_v12(), COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -729,12 +733,13 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
 /// before it can reach an artifact.
 #[test]
 fn read_state_and_write_text_are_authored_for_what_they_do() {
-    let generated = vocabulary_mint::v13_from_v12(
-        &recreated_v12(),
-        COMPUTER_ACTION_VOCABULARY_REVISION,
-    );
+    let generated =
+        vocabulary_mint::v13_from_v12(&recreated_v12(), COMPUTER_ACTION_VOCABULARY_REVISION);
     let read_state = row(&generated, "computer.read_state");
-    assert_eq!(read_state["required_permission_services"], json!(["accessibility"]));
+    assert_eq!(
+        read_state["required_permission_services"],
+        json!(["accessibility"])
+    );
     assert_eq!(read_state["synthetic_paths"], json!([]));
     assert_eq!(read_state["semantic_path"], "none");
     assert_eq!(read_state["dispatch_modes"], json!(["background"]));
@@ -743,13 +748,20 @@ fn read_state_and_write_text_are_authored_for_what_they_do() {
     let write_text = row(&generated, "computer.write_text");
     assert_eq!(write_text["semantic_path"], "ax_value");
     assert_eq!(write_text["synthetic_paths"], json!([]));
-    assert_eq!(write_text["required_permission_services"], json!(["accessibility"]));
+    assert_eq!(
+        write_text["required_permission_services"],
+        json!(["accessibility"])
+    );
 
     for id in ["computer.press_element", "computer.press_point"] {
         let press = row(&generated, id);
         assert_eq!(press["semantic_path"], "ax_press", "{id}");
         assert_eq!(press["synthetic_paths"], json!([]), "{id}");
-        assert_eq!(press["required_permission_services"], json!(["accessibility"]), "{id}");
+        assert_eq!(
+            press["required_permission_services"],
+            json!(["accessibility"]),
+            "{id}"
+        );
     }
     for id in [
         "computer.takeover_move",

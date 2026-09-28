@@ -419,9 +419,9 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
             .unwrap_or_default();
         if object["dispatch_modes"] != serde_json::json!(["background"])
             || object["synthetic_paths"] != serde_json::json!([])
-            || services.iter().any(|service| {
-                matches!(service.as_str(), Some("post_event" | "input_monitoring"))
-            })
+            || services
+                .iter()
+                .any(|service| matches!(service.as_str(), Some("post_event" | "input_monitoring")))
         {
             return Err(VocabularyValidationError::RowBinding(format!(
                 "{id} posts no event and needs no event grant"

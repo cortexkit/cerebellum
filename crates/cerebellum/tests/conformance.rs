@@ -1397,7 +1397,14 @@ async fn every_retired_or_unserved_computer_name_gets_a_typed_refusal() {
         assert_eq!(body["code"], code, "{name}: {body}");
     }
     // Through the flat tool the retired names are not actions at all.
-    for action in ["click", "screenshot", "move", "drag", "scroll", "open_target"] {
+    for action in [
+        "click",
+        "screenshot",
+        "move",
+        "drag",
+        "scroll",
+        "open_target",
+    ] {
         let reply = one_reply(
             json!({"name": "computer_use", "arguments": {"action": action}}),
             None,

@@ -1387,11 +1387,8 @@ mod tests {
 
         // A retired capability is one the vocabulary no longer lists, so its
         // permission lookup fails the way any unlisted capability's would.
-        let declaration = capability_declaration(
-            crate::audit::ComputerCapability::Click,
-            &context,
-            true,
-        );
+        let declaration =
+            capability_declaration(crate::audit::ComputerCapability::Click, &context, true);
 
         assert!(
             !declaration.advertised,
