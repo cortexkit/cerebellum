@@ -44,7 +44,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod process_table;
 // The record-offset selection is pure and compiled for unit tests on every
-// host; the framework calls it guards are macOS-only.
+// host; the calls into the private framework are macOS-only.
 #[cfg(any(target_os = "macos", test))]
 mod skylight;
 #[cfg(target_os = "macos")]

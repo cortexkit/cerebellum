@@ -28,6 +28,10 @@
 /// A short delivery marker built from a seed: letters only, no spaces, so the
 /// editor cannot transform it into punctuation and nothing can split it on
 /// whitespace during read-back.
+///
+/// The pure rules are compiled where the probe runs and wherever tests build,
+/// so they are checked on every host without being dead code elsewhere.
+#[cfg(any(target_os = "macos", test))]
 fn marker(seed: u64) -> String {
     let mut value = seed;
     let mut text = String::from("ckprobe");
@@ -40,6 +44,7 @@ fn marker(seed: u64) -> String {
 
 /// The distinct frontmost pids seen during a sample window, in the order they
 /// first appeared. `None` samples (no readable frontmost app) are dropped.
+#[cfg(any(target_os = "macos", test))]
 fn summarize_frontmost(samples: &[Option<i32>]) -> Vec<i32> {
     let mut seen = Vec::new();
     for pid in samples.iter().flatten() {
@@ -55,6 +60,7 @@ fn summarize_frontmost(samples: &[Option<i32>]) -> Vec<i32> {
 /// A route's result is only meaningful while the target stays in the
 /// background: if it was ever frontmost, the keystroke may have reached a
 /// FOCUSED app, so the result must be discarded rather than counted.
+#[cfg(any(target_os = "macos", test))]
 fn target_became_frontmost(target: i32, samples: &[Option<i32>]) -> bool {
     samples.contains(&Some(target))
 }
