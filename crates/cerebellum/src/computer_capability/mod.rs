@@ -674,7 +674,9 @@ where
         let lock_state = self.session_locked();
         if lock_state == Some(true) {
             let reply = match capability.0 {
-                Served::Type | Served::Keys => synthetic_wire_envelope(screen_locked_reply()),
+                Served::Type | Served::Keys => synthetic_wire_envelope(
+                    keystrokes::refused_before_posting(screen_locked_reply()),
+                ),
                 _ => screen_locked_reply(),
             };
             return self.finish_reply(capability.capability(), reply);
@@ -1133,9 +1135,14 @@ where
         arguments: &Value,
         context: ServeContext<'_, C>,
     ) -> Value {
+        // Every refusal returned before the dispatch below is marked as having
+        // posted nothing, so a caller knows it can retry it. A refusal left
+        // unmarked reads as effect_indeterminate, which is the safe default
+        // for any path added later without thought.
+        use keystrokes::refused_before_posting as unposted;
         let mut parsed = match parse_synthetic_request(capability, arguments) {
             Ok(parsed) => parsed,
-            Err(refusal) => return refusal,
+            Err(refusal) => return unposted(refusal),
         };
 
         let ServeContext {
@@ -1162,7 +1169,7 @@ where
                     .unwrap_or_else(|| describe_chord(*modifiers, *key));
                 self.record_blocked_chord(grantee, &chord, blocked.reason)
                     .await;
-                return chord_blocked_refusal(&chord, blocked.reason);
+                return unposted(chord_blocked_refusal(&chord, blocked.reason));
             }
             // The session floor is checked before anything is asked or
             // escalated, so no grant can make a session-ending chord valid.
@@ -1178,15 +1185,15 @@ where
             // A cancel while waiting on the person is answered the way a cancel
             // during posting is: nothing was posted and nothing is held.
             Err(AppRefusal::Consent(ConsentRefusal::Cancelled)) => {
-                return synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                return unposted(synthetic_dispatch_refusal(&DispatchError::Cancelled {
                     posts_returned: 0,
                     held_state: HeldStateDisposition::NoneHeld,
-                })
+                }))
             }
-            Err(refusal) => return refusal.reply(&parsed.target),
+            Err(refusal) => return unposted(refusal.reply(&parsed.target)),
         };
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
-            return locked;
+            return unposted(locked);
         }
 
         // Before anything is posted or fronted: the target's own focused
@@ -1205,7 +1212,7 @@ where
             Err(refusal) => {
                 let mut reply = refusal.reply();
                 admission.decorate(&mut reply);
-                return reply;
+                return unposted(reply);
             }
         };
 
@@ -1225,13 +1232,13 @@ where
         if delivery == keystrokes::KeyDelivery::Refuse {
             let mut reply = keystrokes::modifier_chord_refusal();
             admission.decorate(&mut reply);
-            return reply;
+            return unposted(reply);
         }
         if delivery == keystrokes::KeyDelivery::BringForward {
             if !self.fronting_bracket_admitted {
                 let mut reply = keystrokes::needs_foreground_reply();
                 admission.decorate(&mut reply);
-                return reply;
+                return unposted(reply);
             }
             match management
                 .computer_grants()
@@ -1256,17 +1263,19 @@ where
                                 grant = current;
                             }
                             Ok(_) | Err(_) => {
-                                return management
-                                    .resolve_process(&parsed.target)
-                                    .err()
-                                    .unwrap_or_else(|| {
-                                        json!({
-                                            "outcome": "not_running",
-                                            "bundle_identity": parsed.target,
-                                            "remedy": "the application restarted while the \
-                                                       person was asked; retry",
-                                        })
-                                    })
+                                return unposted(
+                                    management
+                                        .resolve_process(&parsed.target)
+                                        .err()
+                                        .unwrap_or_else(|| {
+                                            json!({
+                                                "outcome": "not_running",
+                                                "bundle_identity": parsed.target,
+                                                "remedy": "the application restarted while the \
+                                                           person was asked; retry",
+                                            })
+                                        }),
+                                )
                             }
                         }
                     }
@@ -1274,19 +1283,19 @@ where
                         admission.persisted = takeover.persisted;
                     }
                     if let Some(locked) = self.locked_after_wait(takeover.waited, &admission) {
-                        return locked;
+                        return unposted(locked);
                     }
                 }
                 Err(ConsentRefusal::Cancelled) => {
-                    return synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                    return unposted(synthetic_dispatch_refusal(&DispatchError::Cancelled {
                         posts_returned: 0,
                         held_state: HeldStateDisposition::NoneHeld,
-                    })
+                    }))
                 }
                 Err(refusal) => {
                     let mut reply = refusal.reply(None);
                     admission.decorate(&mut reply);
-                    return reply;
+                    return unposted(reply);
                 }
             }
             bracket_bound = Some(
@@ -1301,10 +1310,10 @@ where
         // Every served capability has a dispatch row; a missing one is a table
         // disagreement to report, not a reason to take the module down.
         let Some(mut row) = FrozenDispatchRow::for_capability(capability_id) else {
-            return json!({
+            return unposted(json!({
                 "outcome": "not_servable",
                 "remedy": "this capability has no dispatch row; report it",
-            });
+            }));
         };
         if parsed.action_kind == ActionKind::MutateDurable {
             // The vocabulary's durable escalation is a property of the request,
@@ -1325,7 +1334,11 @@ where
             "cerebellum-serve-context-v1",
         ) {
             Ok(lease) => lease,
-            Err(_) => return synthetic_dispatch_refusal(&DispatchError::AttendanceUnavailable),
+            Err(_) => {
+                return unposted(synthetic_dispatch_refusal(
+                    &DispatchError::AttendanceUnavailable,
+                ))
+            }
         };
         let attendance = AttendanceContext::background(
             identity.conversation_key.clone(),
@@ -1374,6 +1387,7 @@ where
         let audit = self.audit.clone();
         let make_driver = self.make_synthetic_driver.clone();
         let conversation_key = identity.conversation_key.clone();
+        let mut unposted_refusal = false;
         let (dispatched, bracket) = tokio::task::spawn_blocking(move || {
             let mut audit = audit.blocking_lock();
             let cancelled = || cancel.is_cancelled();
@@ -1425,6 +1439,10 @@ where
                 )
             }
             Err(refusal) => {
+                // Decided from whether a post call was made, not from a zero
+                // posts_returned: see `post_call_made` for why the two differ.
+                unposted_refusal =
+                    keystrokes::post_call_made(&refusal, bracket.as_ref()) == Some(false);
                 let mut refused = keystrokes::dispatch_refusal_reply(&refusal);
                 // A bracket that stopped part-way may already have posted
                 // earlier chunks. Saying how many keeps a caller from retrying
@@ -1441,6 +1459,12 @@ where
         // else happened, because the person's next keystrokes go to it.
         if let Some(bracket) = &bracket {
             keystrokes::disclose_failed_restore(&mut reply, bracket, &grant);
+        }
+        // Applied after the restore disclosure, which rewrites the reply: a
+        // bracket can fail to put the previous application back without ever
+        // posting, and that reply must still say nothing was posted.
+        if unposted_refusal {
+            reply = unposted(reply);
         }
 
         let posted = matches!(
@@ -2174,6 +2198,13 @@ fn synthetic_success_reply(
 
 /// Give every keystroke reply the envelope its row requires: an outcome, an
 /// effect status, whether the target was fronted, and a containment rung.
+///
+/// A reply that set no effect status gets `effect_indeterminate`: the keys
+/// may have landed. Only a refusal known to have made no post call says
+/// `not_dispatched` (see `keystrokes::refused_before_posting`). The row
+/// states the reader's side of this: a value a reader does not know is read
+/// as `effect_indeterminate`, never as "did not run", so a status added
+/// later can never make an older caller retry keys that landed.
 fn synthetic_wire_envelope(mut reply: Value) -> Value {
     let object = reply
         .as_object_mut()

@@ -6,9 +6,78 @@
 use cerebellum_computer::app_state::source::{
     AppStateSource, ElementHandle, RawElement, ReadBounds,
 };
-use cerebellum_computer::dispatch::{BracketReport, DispatchError, RestoreStatus};
-use cerebellum_computer::platform::ProcessGrant;
+use cerebellum_computer::dispatch::{BracketReport, BracketStop, DispatchError, RestoreStatus};
+use cerebellum_computer::platform::{HeldStateDisposition, ProcessEventRefusal, ProcessGrant};
 use serde_json::{json, Value};
+
+/// Mark a keystroke refusal as one that made no post call at all.
+///
+/// A refusal otherwise reads `effect_indeterminate`, which tells a caller
+/// the keys may have landed, so it will not retry. When no post call was
+/// made nothing can have reached the application, and saying
+/// `not_dispatched` is what lets a caller retry instead of stopping. This
+/// is deliberately a different word from `no_effect_observed`, which claims
+/// the effect was looked for and not seen -- that does not make a retry
+/// safe, since the keys may still arrive.
+///
+/// Call this only where it is certain no post call was made: before the
+/// dispatch, or where [`post_call_made`] answers `Some(false)`.
+///
+/// The remedy is left as the refusal wrote it: the effect status is the
+/// signal, and the computer tool's description tells the model what
+/// `not_dispatched` means.
+pub(crate) fn refused_before_posting(mut reply: Value) -> Value {
+    reply["effect_status"] = json!("not_dispatched");
+    reply["posts_returned"] = json!(0);
+    reply
+}
+
+/// Whether a keystroke dispatch that ended in `refusal` made any post call,
+/// or `None` when that is not known.
+///
+/// `posts_returned` alone is NOT the answer, although it looks like it: it
+/// counts post calls that returned, so a sequence whose very first post
+/// call failed reports 0 even though a call was made -- and a failed post
+/// call is uncertain, the event may have gone out. Only refusals that stop
+/// before the call (a routing check such as the process having gone, or a
+/// cancel seen before posting) leave 0 meaning "no call was made". Releases
+/// posted to undo held keys are post calls too.
+///
+/// The count comes from the fronting bracket's report when there was one,
+/// and otherwise from the sequence report the refusal carries. Any other
+/// refusal carries no count, so whether it posted is unknown and it must
+/// stay `effect_indeterminate`.
+pub(crate) fn post_call_made(
+    refusal: &DispatchError,
+    bracket: Option<&BracketReport>,
+) -> Option<bool> {
+    let failed_call =
+        |refusal: &ProcessEventRefusal| matches!(refusal, ProcessEventRefusal::PostCallFailed(_));
+    let released = |held: &HeldStateDisposition| matches!(held, HeldStateDisposition::Released { posts_returned } if *posts_returned > 0);
+    let from_refusal = match refusal {
+        DispatchError::Cancelled {
+            posts_returned,
+            held_state,
+        } => Some(*posts_returned > 0 || released(held_state)),
+        DispatchError::SyntheticSequenceFailed {
+            posts_returned,
+            refusal,
+            held_state,
+        } => Some(*posts_returned > 0 || failed_call(refusal) || released(held_state)),
+        _ => None,
+    };
+    match bracket {
+        Some(bracket) => {
+            let failed = matches!(
+                &bracket.stop,
+                Some(BracketStop::PostFailed(failure))
+                    if failed_call(&failure.refusal) || released(&failure.held_state)
+            );
+            Some(bracket.posts_returned > 0 || failed || from_refusal == Some(true))
+        }
+        None => from_refusal,
+    }
+}
 
 /// The target's focused element as it was before anything was posted, kept
 /// so typed text can be looked for in what changed.

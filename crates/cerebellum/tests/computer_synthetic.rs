@@ -197,6 +197,9 @@ impl PlatformDriver for SyntheticDriver {
             pending: None,
             refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
             front_latency_ms: script.front_latency_ms.unwrap_or(2),
+            unit_failure: script.unit_failure.clone(),
+            seize_after_first_unit: script.seize_after_first_unit,
+            units_posted: 0,
         };
         let chunks_started = std::cell::Cell::new(0);
         let scripted_cancel = || {
@@ -288,6 +291,11 @@ struct FrontingScript {
     cancel_after_first_chunk: bool,
     /// How long a fronting request takes to take effect; 2 ms when unset.
     front_latency_ms: Option<u64>,
+    /// When set, every unit post fails this way instead of succeeding.
+    unit_failure: Option<SequencePostFailure>,
+    /// When set, input from another process shows up once a unit has been
+    /// posted, so the bracket stops after posting.
+    seize_after_first_unit: bool,
 }
 
 type FrontedScript = FrontingScript;
@@ -303,6 +311,9 @@ struct FrontingDesk {
     pending: Option<(u32, u64)>,
     refuse_front_of: Option<u32>,
     front_latency_ms: u64,
+    unit_failure: Option<SequencePostFailure>,
+    seize_after_first_unit: bool,
+    units_posted: usize,
 }
 
 impl FrontingDesk {
@@ -344,6 +355,13 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
         cerebellum_computer::platform::IdleReading::Milliseconds(60_000)
     }
     fn drain(&mut self, _tap: &()) -> Vec<cerebellum_computer::dispatch::SourcedInputEvent> {
+        if self.seize_after_first_unit && self.units_posted > 0 {
+            return vec![cerebellum_computer::dispatch::SourcedInputEvent {
+                source_unix_process_id: 999,
+                detection_latency_ms: 1,
+                platform_delivery_latency_ms: None,
+            }];
+        }
         Vec::new()
     }
     fn post_heartbeat(&mut self) -> cerebellum_computer::dispatch::HeartbeatProbe {
@@ -370,6 +388,10 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
         _index: usize,
     ) -> Result<cerebellum_computer::dispatch::UnitPosted, SequencePostFailure> {
         self.advance(3);
+        if let Some(failure) = self.unit_failure.clone() {
+            return Err(failure);
+        }
+        self.units_posted += 1;
         Ok(cerebellum_computer::dispatch::UnitPosted {
             posts_returned: 2,
             generation_verifications: 4,
@@ -1576,4 +1598,252 @@ async fn route_summaries_reach_the_journal_not_the_wire_on_success_and_auth_fail
             serde_json::from_slice(&bytes).unwrap();
         assert_eq!(outcome.routes, evidence);
     }
+}
+
+// ---------------------------------------------------------------------------
+// not_dispatched: a keystroke refusal that made no post call says so
+// ---------------------------------------------------------------------------
+
+/// Assert that `reply` says it made no post call: the effect status and a
+/// zero count.
+fn assert_not_dispatched(reply: &Value) {
+    assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
+    assert_eq!(reply["posts_returned"], 0, "{reply}");
+}
+
+/// A target that comes forward too slowly for even one keystroke to fit the
+/// fronting bound posts nothing, and says so: retrying it is safe, and a
+/// caller told "indeterminate" would stop instead.
+#[tokio::test]
+async fn a_bracket_whose_front_is_slower_than_the_bound_reports_not_dispatched() {
+    let shared = Shared::handle();
+    // Coming forward takes 60 ms, and the restore is predicted to take as
+    // long, so no unit fits inside the 100 ms bound.
+    shared.lock().unwrap().fronted.front_latency_ms = Some(60);
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    grant_takeover(&management).await;
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&ScriptedCarrier::default()),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "fronting_bound_exceeded", "{reply}");
+    assert_not_dispatched(&reply);
+    assert!(matches!(
+        &dispatched_calls(&shared)[..],
+        [DispatchedCall::Fronted(_)]
+    ));
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// Refusals decided before anything is dispatched report not_dispatched and
+/// keep their own reason.
+#[tokio::test]
+async fn refusals_made_before_dispatch_report_not_dispatched() {
+    let shared = Shared::handle();
+    let secure = focused_text_desk();
+    secure.state().elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+    let plane = plane_on(&shared, &secure, true);
+    let management = granted_management().await;
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve(&plane, name, request, &management, &FakeClock::new()).await;
+        assert_eq!(reply["outcome"], "secure_field_refused", "{name}: {reply}");
+        assert_eq!(reply["reason"], "secure_field_focused");
+        assert_not_dispatched(&reply);
+    }
+
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&ScriptedCarrier::default()),
+    )
+    .await;
+    assert_eq!(
+        reply["outcome"], "modifier_chord_needs_foreground",
+        "{reply}"
+    );
+    assert_eq!(reply["reason"], "modifier_chord_needs_foreground");
+    assert_not_dispatched(&reply);
+
+    let reply = serve(
+        &plane,
+        "computer.keys",
+        keys_request(&["a", "b"]),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+    assert_not_dispatched(&reply);
+
+    assert!(dispatched_calls(&shared).is_empty());
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A sequence stopped by a routing check before its first post call made no
+/// call, and reports not_dispatched.
+#[tokio::test]
+async fn a_sequence_stopped_before_its_first_post_call_reports_not_dispatched() {
+    let shared = Shared::handle();
+    shared.lock().unwrap().per_pid =
+        Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: 0,
+            refusal: ProcessEventRefusal::ProcessGone,
+            held_state: HeldStateDisposition::NoneHeld,
+        }));
+    let desk = focused_text_desk();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+    assert_not_dispatched(&reply);
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A first post call that FAILED still made a call, and a failed call is
+/// uncertain: the event may have gone out. Its posts_returned is 0 because
+/// it counts calls that returned, so reading 0 as "never posted" would tell
+/// a caller to retry keys that may have landed.
+#[tokio::test]
+async fn a_first_post_call_that_failed_stays_indeterminate_at_zero_posts() {
+    let shared = Shared::handle();
+    shared.lock().unwrap().per_pid =
+        Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: 0,
+            refusal: ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
+                "framework call failed",
+            )),
+            held_state: HeldStateDisposition::NoneHeld,
+        }));
+    let desk = focused_text_desk();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+    assert_eq!(reply["posts_returned"], 0, "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A stop after posting stays effect_indeterminate and carries its count,
+/// through a per-process sequence and through the fronting bracket. This is
+/// what fails if every refusal were called not_dispatched.
+#[tokio::test]
+async fn a_stop_after_posting_stays_indeterminate_with_its_count() {
+    let management = granted_management().await;
+
+    let shared = Shared::handle();
+    shared.lock().unwrap().per_pid =
+        Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: 2,
+            refusal: ProcessEventRefusal::ProcessGone,
+            held_state: HeldStateDisposition::NoneHeld,
+        }));
+    let desk = focused_text_desk();
+    let plane = plane_on(&shared, &desk, false);
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+    assert_eq!(reply["posts_returned"], 2, "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+
+    // Through the bracket: the unit's key press was posted, then the process
+    // went away before the rest of the unit.
+    let shared = Shared::handle();
+    shared.lock().unwrap().fronted.unit_failure = Some(SequencePostFailure {
+        posts_returned: 1,
+        refusal: ProcessEventRefusal::ProcessGone,
+        held_state: HeldStateDisposition::NoneHeld,
+    });
+    grant_takeover(&management).await;
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&ScriptedCarrier::default()),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+    assert_eq!(reply["posts_returned"], 1, "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+
+    // Through the bracket, stopped after the unit went out by input from
+    // another process. Only the bracket's own count shows that it posted:
+    // the refusal it ends in carries none.
+    let shared = Shared::handle();
+    shared.lock().unwrap().fronted.seize_after_first_unit = true;
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&ScriptedCarrier::default()),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "user_seized_control", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+    assert_eq!(reply["posts_returned"], 2, "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A dispatch that posted everything is reported as before: unconfirmed
+/// delivery with an indeterminate effect, and no count or retry claim.
+#[tokio::test]
+async fn a_successful_keystroke_reply_is_unchanged() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.keys",
+        keys_request(&["a"]),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+    assert!(reply.get("posts_returned").is_none(), "{reply}");
+    assert!(reply.get("remedy").is_none(), "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
 }

@@ -910,10 +910,29 @@ fn recreated_v13() -> Value {
     let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
     vocabulary["revision"] = historical_revision(13);
     for id in ["computer.keys", "computer.type"] {
-        row_mut(&mut vocabulary, id)["result_schema"]["properties"]["outcome"]
+        let properties = &mut row_mut(&mut vocabulary, id)["result_schema"]["properties"];
+        properties["outcome"]
             .as_object_mut()
             .unwrap()
             .remove("enum");
+        // Undo the not_dispatched effect status: its word, its description,
+        // and the sentence it added to posts_returned.
+        let status = properties["effect_status"].as_object_mut().unwrap();
+        assert_eq!(
+            status.remove("description"),
+            Some(json!(vocabulary_mint::KEYSTROKE_EFFECT_STATUS_DESCRIPTION))
+        );
+        assert_eq!(
+            status["enum"].as_array_mut().unwrap().pop(),
+            Some(json!("not_dispatched"))
+        );
+        let posts = properties["posts_returned"]["description"]
+            .as_str()
+            .unwrap()
+            .strip_suffix(vocabulary_mint::KEYSTROKE_POSTS_RETURNED_ADDITION)
+            .expect("posts_returned carries the not_dispatched sentence")
+            .to_owned();
+        properties["posts_returned"]["description"] = json!(posts);
     }
     for (id, pointer, word) in [
         (
@@ -948,6 +967,48 @@ fn v14_only_makes_the_changes_recreated_v13_undoes() {
         hex_digest(&canonical_json_bytes(&recreated_v13()).unwrap()),
         V13_ARTIFACT_SHA256
     );
+}
+
+/// A reader meeting an effect_status it does not know reads it as
+/// effect_indeterminate, and the computer.type and computer.keys rows say so
+/// in their effect_status description.
+///
+/// Nothing in this repository parses effect_status back out of a reply --
+/// the model reading computer_use replies is the reader -- so the vector is a
+/// fixture, and this pins it to the rule text the rows carry. The unknown
+/// value must really be unknown to the rows, or the vector tests nothing.
+#[test]
+fn an_unknown_effect_status_is_read_as_indeterminate_by_rule() {
+    let vector: Value =
+        serde_json::from_str(include_str!("fixtures/effect_status_unknown_value.json")).unwrap();
+    assert_eq!(
+        vector["reader_must_read_effect_status_as"],
+        "effect_indeterminate"
+    );
+    let unknown = &vector["reply"]["effect_status"];
+    let vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    for id in vector["capabilities"].as_array().unwrap() {
+        let status =
+            &row(&vocabulary, id.as_str().unwrap())["result_schema"]["properties"]["effect_status"];
+        let statuses = status["enum"].as_array().unwrap();
+        assert!(statuses.contains(&json!("not_dispatched")), "{id}");
+        assert!(!statuses.contains(unknown), "{id} knows the vector's value");
+        assert!(
+            status["description"].as_str().unwrap().contains(
+                "A reader that meets an effect_status value it does not know treats it as \
+                 effect_indeterminate, never as not-run."
+            ),
+            "{id} does not state the reader rule"
+        );
+    }
+    // write_text sets a value through accessibility rather than posting
+    // keystrokes, so its effect_status enum does not gain not_dispatched.
+    let write_text = &row(&vocabulary, "computer.write_text")["result_schema"]["properties"]
+        ["effect_status"]["enum"];
+    assert!(!write_text
+        .as_array()
+        .unwrap()
+        .contains(&json!("not_dispatched")));
 }
 
 #[test]

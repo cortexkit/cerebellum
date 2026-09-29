@@ -1174,7 +1174,62 @@ pub fn v13_from_v12(v12: &Value, revision: &str) -> Value {
     })
 }
 
-/// Add the image and web-content refusals, and publish the closed keystroke outcomes.
+/// The keystroke rows' `effect_status` description, added in revision 14.
+///
+/// It carries the reader's obligation because the artifact is the contract
+/// callers read, and this is where the vocabulary says what a value means to
+/// its reader. The reader rule is what keeps a status added later safe: a
+/// caller that took an unknown word for "did not run" would retry keys that
+/// may have landed.
+pub const KEYSTROKE_EFFECT_STATUS_DESCRIPTION: &str =
+    "not_dispatched means the call made no post call, so nothing reached the application and \
+     the call can be retried safely; any call that made even one post call, including one \
+     that stopped part-way, says effect_indeterminate and carries posts_returned. \
+     no_effect_observed is a different claim: the effect was looked for and not seen. \
+     A reader that meets an effect_status value it does not know treats it as \
+     effect_indeterminate, never as not-run.";
+
+/// What revision 14 appends to the keystroke rows' `posts_returned`
+/// description, which otherwise says it appears only on a sequence that
+/// stopped mid-flight.
+pub const KEYSTROKE_POSTS_RETURNED_ADDITION: &str =
+    " Also present, as 0, on a refusal whose effect_status is not_dispatched.";
+
+/// Say, on a keystroke row, that a refusal made before any post call is
+/// `not_dispatched`.
+///
+/// A refusal used to read `effect_indeterminate` even when it had posted
+/// nothing, which tells a caller the keys may have landed, so it would not
+/// retry a call that was perfectly safe to retry. `no_effect_observed` is
+/// not reused for this: it means the effect was looked for and not seen,
+/// and keys that were posted may still arrive after the look.
+fn keystroke_not_dispatched(row: &mut Value) {
+    let properties = object_mut(row, "/result_schema/properties");
+    let mut statuses: Vec<&str> = EFFECT_STATUSES.to_vec();
+    statuses.push("not_dispatched");
+    properties.insert(
+        "effect_status".into(),
+        json!({
+            "type": "string",
+            "enum": statuses,
+            "description": KEYSTROKE_EFFECT_STATUS_DESCRIPTION,
+        }),
+    );
+    let posts = properties
+        .get_mut("posts_returned")
+        .and_then(Value::as_object_mut)
+        .expect("the keystroke rows declare posts_returned");
+    let description = format!(
+        "{}{KEYSTROKE_POSTS_RETURNED_ADDITION}",
+        posts["description"]
+            .as_str()
+            .expect("posts_returned is described")
+    );
+    posts.insert("description".into(), json!(description));
+}
+
+/// Add the image and web-content refusals, publish the closed keystroke
+/// outcomes, and give the keystroke rows the `not_dispatched` effect status.
 pub fn v14_from_v13(v13: &Value, revision: &str) -> Value {
     let mut v14 = v13.clone();
     v14["revision"] = json!(revision);
@@ -1245,6 +1300,7 @@ pub fn v14_from_v13(v13: &Value, revision: &str) -> Value {
             }
             outcomes.sort_unstable();
             row["result_schema"]["properties"]["outcome"]["enum"] = json!(outcomes);
+            keystroke_not_dispatched(row);
         }
         if row["capability_id"] == "computer.read_state" {
             row["result_schema"]["properties"]["outcome"]["enum"]
