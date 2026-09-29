@@ -1,51 +1,11 @@
 //! Window-server visibility facts, separate from the caller's image policy.
 
-use std::path::Path;
-
-/// Chromium may stop painting any window that is not fully visible.
+/// How much of the window the window server can establish is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowVisibility {
     FullyVisible,
     Covered,
     Unknown,
-}
-
-/// Recognize Chromium without launching the application or loading its frameworks.
-pub fn bundle_uses_chromium(bundle: &Path, bundle_id: &str) -> bool {
-    matches!(
-        bundle_id,
-        "com.google.Chrome"
-            | "com.google.Chrome.beta"
-            | "com.google.Chrome.dev"
-            | "com.google.Chrome.canary"
-            | "org.chromium.Chromium"
-            | "com.microsoft.edgemac"
-            | "com.microsoft.edgemac.Beta"
-            | "com.microsoft.edgemac.Dev"
-            | "com.microsoft.edgemac.Canary"
-            | "com.brave.Browser"
-            | "com.brave.Browser.beta"
-            | "com.brave.Browser.nightly"
-            | "com.vivaldi.Vivaldi"
-            | "com.operasoftware.Opera"
-    ) || [
-        "Chromium Embedded Framework.framework",
-        "Electron Framework.framework",
-        "Google Chrome Framework.framework",
-    ]
-    .iter()
-    .any(|name| bundle.join("Contents/Frameworks").join(name).is_dir())
-}
-
-/// Read the running image's enclosing app bundle, not an unrelated installed copy.
-#[cfg(target_os = "macos")]
-pub fn process_uses_chromium(pid: u32, bundle_id: &str) -> bool {
-    let executable = crate::process_executable_path(pid).ok().flatten();
-    let bundle = executable.as_deref().and_then(|path| {
-        path.ancestors()
-            .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
-    });
-    bundle_uses_chromium(bundle.unwrap_or_else(|| Path::new("")), bundle_id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,31 +139,6 @@ pub(crate) fn visibility_from_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chromium_framework_bundle_fixtures() {
-        let root = std::env::temp_dir().join(format!("chromium-bundles-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(!bundle_uses_chromium(&root, "com.example.Native"));
-        for name in [
-            "Chromium Embedded Framework",
-            "Electron Framework",
-            "Google Chrome Framework",
-        ] {
-            let bundle = root.join(format!("{name}.app"));
-            let framework = bundle
-                .join("Contents/Frameworks")
-                .join(format!("{name}.framework"));
-            std::fs::create_dir_all(&framework).unwrap();
-            assert!(bundle_uses_chromium(&bundle, "com.example.Custom"));
-            std::fs::remove_dir_all(&framework).unwrap();
-            assert!(!bundle_uses_chromium(&bundle, "com.example.Custom"));
-        }
-        assert!(bundle_uses_chromium(&root, "com.google.Chrome"));
-        assert!(bundle_uses_chromium(&root, "org.chromium.Chromium"));
-        assert!(!bundle_uses_chromium(&root, "com.google.Chrome.unrelated"));
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
     fn rect(x: f64, width: f64) -> Rect {
         Rect {

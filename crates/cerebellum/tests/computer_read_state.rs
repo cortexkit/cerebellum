@@ -90,6 +90,13 @@ type Plane<S = cerebellum_core::journal::InMemoryJournalStorage> = ComputerPlane
 fn plane(source: Arc<FixtureSource>) -> Plane {
     ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
         .with_app_state_source(source)
+        .with_image_freshness_source(Arc::new(FixtureFreshness {
+            repaints: false,
+            before:
+                cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+            after: cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+            seen: Mutex::new(vec![]),
+        }))
 }
 
 fn identity_for(conversation_key: &str) -> JournalIdentity {
@@ -418,7 +425,13 @@ async fn a_missing_image_is_declared_and_the_tree_still_returns() {
         support::computer::failing_audit(),
         ResultSchemaEnforcement::Withhold,
     )
-    .with_app_state_source(FixtureSource::new(vec![chat_window()]));
+    .with_app_state_source(FixtureSource::new(vec![chat_window()]))
+    .with_image_freshness_source(Arc::new(FixtureFreshness {
+        repaints: false,
+        before: cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+        after: cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+        seen: Mutex::new(vec![]),
+    }));
     let reply = serve(
         &failing,
         &management,
@@ -509,7 +522,7 @@ async fn an_ungranted_read_is_refused_before_anything_is_read() {
 }
 
 struct FixtureFreshness {
-    chromium: bool,
+    repaints: bool,
     before: cerebellum::computer_capability::image_freshness::WindowVisibility,
     after: cerebellum::computer_capability::image_freshness::WindowVisibility,
     seen: Mutex<Vec<Option<String>>>,
@@ -527,7 +540,7 @@ impl cerebellum::computer_capability::image_freshness::ImageFreshnessSource for 
         assert_eq!(target.bundle_identity, TARGET_BUNDLE_ID);
         self.seen.lock().unwrap().push(window_id.map(str::to_owned));
         (
-            self.chromium,
+            self.repaints,
             if window_id.is_some() {
                 self.after
             } else {
@@ -538,12 +551,12 @@ impl cerebellum::computer_capability::image_freshness::ImageFreshnessSource for 
 }
 
 #[tokio::test]
-async fn covered_chromium_image_refusal_passes_withholding_and_keeps_tree() {
+async fn covered_unmeasured_app_image_refusal_passes_withholding_and_keeps_tree() {
     use cerebellum::computer_capability::image_freshness::WindowVisibility;
     let management = granted_management().await;
     for visibility in [WindowVisibility::Covered, WindowVisibility::Unknown] {
         let facts = Arc::new(FixtureFreshness {
-            chromium: true,
+            repaints: false,
             before: visibility,
             after: visibility,
             seen: Mutex::new(vec![]),
@@ -578,18 +591,16 @@ async fn covered_chromium_image_refusal_passes_withholding_and_keeps_tree() {
 }
 
 #[tokio::test]
-async fn capture_rechecks_exact_window_and_native_images_remain_available() {
+async fn capture_rechecks_exact_window_and_only_visible_unmeasured_images_remain_available() {
     use cerebellum::computer_capability::image_freshness::WindowVisibility::*;
     let management = granted_management().await;
-    for (chromium, before, after, allowed) in [
-        (true, FullyVisible, FullyVisible, true),
-        (true, FullyVisible, Covered, false),
-        (true, FullyVisible, Unknown, false),
-        (false, Covered, Covered, true),
-        (false, Unknown, Unknown, true),
+    for (repaints, before, after, allowed) in [
+        (false, FullyVisible, FullyVisible, true),
+        (false, FullyVisible, Covered, false),
+        (false, FullyVisible, Unknown, false),
     ] {
         let facts = Arc::new(FixtureFreshness {
-            chromium,
+            repaints,
             before,
             after,
             seen: Mutex::new(vec![]),
@@ -622,7 +633,7 @@ async fn capture_rechecks_exact_window_and_native_images_remain_available() {
 async fn tree_only_reads_do_not_probe_image_freshness() {
     use cerebellum::computer_capability::image_freshness::WindowVisibility::Covered;
     let facts = Arc::new(FixtureFreshness {
-        chromium: true,
+        repaints: false,
         before: Covered,
         after: Covered,
         seen: Mutex::new(vec![]),

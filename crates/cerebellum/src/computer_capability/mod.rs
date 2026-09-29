@@ -921,8 +921,8 @@ where
         let grant = grant.clone();
         let freshness = self.image_freshness_source.clone();
         tokio::task::spawn_blocking(move || {
-            let (chromium, visibility) = freshness.inspect(&grant, None);
-            image_freshness_decision(chromium, visibility)?;
+            let (repaints, visibility) = freshness.inspect(&grant, None);
+            image_freshness_decision(repaints, visibility)?;
             let mut audit = audit.blocking_lock();
             let mut custody = AuditImageCustody {
                 audit: &mut audit,
@@ -949,9 +949,9 @@ where
                     })?;
                 // Selection and capture may race a window move or cover, so recheck
                 // visibility for the captured window before returning its pixels.
-                let (chromium, visibility) =
+                let (repaints, visibility) =
                     freshness.inspect(&grant, Some(&captured.window.window_id));
-                image_freshness_decision(chromium, visibility)?;
+                image_freshness_decision(repaints, visibility)?;
                 Ok(WindowImageCapture {
                     window_id: captured.window.window_id.clone(),
                     owning_pid: grant.pid,
@@ -3295,3 +3295,6 @@ mod cancel_wire_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod outcome_tests;
