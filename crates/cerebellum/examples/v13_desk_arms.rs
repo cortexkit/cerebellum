@@ -350,11 +350,14 @@ fn route_count(value: &Value, route: &str) -> Option<u64> {
     }
 }
 fn rendered_element_id(line: &str) -> Option<&str> {
+    // The id shape `read_state` renders and `AppStateSessions` parses: `s`, a
+    // session token of letters and digits, `-`, and an element number
+    // (`shbll1-11`).
     let id = line.split_whitespace().next()?;
-    let (session, number) = id.strip_prefix('s')?.split_once('-')?;
+    let (session, number) = id.strip_prefix('s')?.rsplit_once('-')?;
     (!session.is_empty()
         && !number.is_empty()
-        && session.chars().all(|c| c.is_ascii_digit())
+        && session.chars().all(|c| c.is_ascii_alphanumeric())
         && number.chars().all(|c| c.is_ascii_digit()))
     .then_some(id)
 }
@@ -415,9 +418,15 @@ fn desktop_to_image(
     Ok((x.round() as u64, y.round() as u64))
 }
 fn zero_post_evidence(rows: &BTreeMap<String, Value>, before: &Value, after: &Value) -> bool {
-    // Refusals must not enter the authorized-dispatch journal.
-    // Even an unresolved reservation prevents a claim that nothing proceeded.
-    rows.is_empty() && !before.is_null() && before == after
+    // Nothing may have been dispatched. The computer journal reserves space
+    // before a dispatch and finalizes it after, so any open reservation or
+    // finalized entry means an action ran or may have run. A request refused
+    // after its app grant was checked is written as a `rejected` entry
+    // holding the refusal reason and no dispatch, so only those may appear.
+    rows.iter()
+        .all(|(key, row)| key.starts_with("entries/") && row["bytes"]["phase"] == "rejected")
+        && !before.is_null()
+        && before == after
 }
 
 #[cfg(target_os = "macos")]
@@ -565,13 +574,26 @@ mod desk {
     fn snapshot(app: &str) -> Result<Value, String> {
         use cerebellum_macos::{AxStateElement, AxStateValue};
         fn elements(nodes: &[AxStateElement]) -> Value {
-            json!(nodes.iter().map(|n| {
+            // An unlabelled group with nothing inside it carries no state,
+            // and macOS adds and removes such groups inside a window's
+            // full-screen button on its own (its hover popover). They are
+            // left out, judged after their own children are filtered, so a
+            // group holding only such groups goes too.
+            json!(nodes.iter().filter_map(|n| {
+                let children = elements(&n.children);
+                let hollow = n.role.as_deref() == Some("AXGroup")
+                    && children.as_array().is_some_and(Vec::is_empty)
+                    && n.title.as_deref().unwrap_or_default().is_empty()
+                    && n.description.as_deref().unwrap_or_default().is_empty()
+                    && matches!(n.value, AxStateValue::Absent);
+                (!hollow).then_some((n, children))
+            }).map(|(n, children)| {
                 let value = match &n.value {
                     AxStateValue::Text(s) => json!(s), AxStateValue::Boolean(b) => json!(b),
                     AxStateValue::Number(n) => json!(n), AxStateValue::Absent => Value::Null,
                     AxStateValue::Other => json!("<unreadable value>"),
                 };
-                json!({"role":n.role,"title":n.title,"description":n.description,"value":value,"selected":n.selected,"focused":n.focused,"children":elements(&n.children)})
+                json!({"role":n.role,"title":n.title,"description":n.description,"value":value,"selected":n.selected,"focused":n.focused,"children":children})
             }).collect::<Vec<_>>())
         }
         let grant = resolve(app)?;
@@ -589,7 +611,15 @@ mod desk {
                 "UNMEASURABLE: incomplete independent AX snapshot of {app}"
             ));
         }
-        Ok(elements(&raw.roots))
+        // The application's windows only, without its menu bar. The menu bar
+        // changes on its own (TextEdit adds to Open Recent as documents open
+        // and close), so comparing it would report a change no action made.
+        let windows: Vec<_> = raw
+            .roots
+            .into_iter()
+            .filter(|root| root.role.as_deref() != Some("AXMenuBar"))
+            .collect();
+        Ok(elements(&windows))
     }
     fn selected_text() -> Result<String, String> {
         script("tell application \"System Events\" to tell process \"TextEdit\" to get value of attribute \"AXSelectedText\" of text area 1 of scroll area 1 of window 1")
@@ -610,7 +640,26 @@ mod desk {
     fn editor_focus() -> Result<(), String> {
         script("tell application \"TextEdit\" to activate")?;
         script("tell application \"System Events\" to tell process \"TextEdit\" to set value of attribute \"AXFocused\" of text area 1 of scroll area 1 of window 1 to true")?;
-        Ok(())
+        await_front(TEXT)
+    }
+    /// Wait up to three seconds for `app` to be frontmost. A window behind
+    /// another is covered, and cerebellum rightly withholds its picture, so
+    /// an arm that needs one cannot be measured unless this holds. Another
+    /// application taking the front meanwhile (the one the run was started
+    /// from, say) makes the arm unmeasurable rather than failed.
+    fn await_front(app: &str) -> Result<(), String> {
+        let pid = resolve(app)?.pid as i32;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if cerebellum_macos::frontmost_process_id() == Some(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(format!(
+            "UNMEASURABLE: {app} did not stay in front (frontmost pid {:?})",
+            cerebellum_macos::frontmost_process_id()
+        ))
     }
     fn front(app: &str) -> Result<(), String> {
         script(&format!("tell application id {} to activate", quote(app)))?;
@@ -933,12 +982,30 @@ mod desk {
         /// the end of it, so an unfiltered read omits the one element these
         /// arms need; an agent would filter the same way.
         async fn read_text(&mut self, app: &str, text: &str) -> Result<Call, String> {
-            self.call(
-                "computer.read_state",
-                json!({"target":app,"include_image":false,"text_filter":text}),
-                "allow_conversation",
-            )
-            .await
+            // A backgrounded Electron app sometimes answers a whole read with
+            // every subtree unreadable: `read_state` then returns an empty
+            // tree with a nonzero `unreadable_subtrees`, and a moment later
+            // reads normally. An agent seeing that count would read again, so
+            // the probe does the same, and reports the arm unmeasurable if
+            // the app never answers.
+            for attempt in 0..3 {
+                let call = self
+                    .call(
+                        "computer.read_state",
+                        json!({"target":app,"include_image":false,"text_filter":text}),
+                        "allow_conversation",
+                    )
+                    .await?;
+                let unreadable = call.reply["unreadable_subtrees"].as_u64().unwrap_or(0);
+                if call.reply["tree"] != "" || unreadable == 0 {
+                    return Ok(call);
+                }
+                println!("UNREADABLE READ attempt={attempt} unreadable_subtrees={unreadable}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(format!(
+                "UNMEASURABLE: every read of {app} came back unreadable"
+            ))
         }
         async fn takeover(&mut self) -> Result<(), String> {
             // Moving the pointer raises the takeover consent question; the relay
@@ -1093,7 +1160,9 @@ mod desk {
             check(close_lines.len()==1,"covered read must show one Close button")?;
             let shown_line = close_lines[0];
             let shown_id = element(&json!({"tree":shown_line}),"")?;
-            let shown_label = tree_labels(shown_line)?.into_iter().next().ok_or("Close label unavailable")?;
+            // The close button has no label of its own, so an empty one is
+            // expected; it is printed as evidence, not checked.
+            let shown_label = tree_labels(shown_line)?.into_iter().next().unwrap_or_default();
             let ElementResolution::Live { handle: shown_handle, pid: shown_pid, .. } = p.planes.management.app_state_sessions().resolve(&p.conversation,&shown_id) else { return Err("shown Close id is not live".into()); };
             check(close_frame(grant.pid)? == bounds, "Close button frame changed while covered")?;
             let desktop = image.mapping.pixel_to_desktop(x as f64,y as f64);
@@ -1278,8 +1347,19 @@ mod desk {
         }
         Ok(found[0])
     }
+    /// Discord's editor keeps a zero-width no-break space (U+FEFF) and a
+    /// newline in an empty message box (read on the desk as "\u{feff}\n"),
+    /// so those are dropped before comparing.
+    fn composer_text(composer: &Value) -> String {
+        composer["value"]
+            .as_str()
+            .unwrap_or_default()
+            .replace('\u{feff}', "")
+            .trim_end_matches('\n')
+            .to_string()
+    }
     fn composer_empty(snapshot: &Value) -> bool {
-        composer(snapshot).is_ok_and(|c| c["value"] == "")
+        composer(snapshot).is_ok_and(|c| composer_text(c).is_empty())
     }
 
     async fn arm(name: &str, p: &mut Probe, f: &mut Fixture) -> Result<(), String> {
@@ -1393,7 +1473,15 @@ mod desk {
                 if !composer_empty(&after) {
                     clear_discord(p).await?;
                 }
-                refused(&result, "web_content_needs_type", &before, &after)
+                // Only the message box is compared: the rest of Discord changes
+                // on its own (a friend going idle rewrote two labels in the
+                // desk run), which says nothing about this refusal.
+                refused(
+                    &result,
+                    "web_content_needs_type",
+                    composer(&before)?,
+                    composer(&after)?,
+                )
             }
             // element_addressed: a changed signature must ask again, never reuse
             // the original grant. Denying that new question must dispatch nothing.
@@ -1415,7 +1503,7 @@ mod desk {
                         .await?;
                     check(
                         c.questions.iter().any(|q| {
-                            q["params"]["message"]
+                            q["params"]["prompt"]
                                 .as_str()
                                 .is_some_and(|s| s.contains("signature has changed"))
                         }),
@@ -1506,7 +1594,7 @@ mod desk {
                 let scroll = p
                     .call(
                         "computer.takeover_scroll",
-                        json!({"target":TEXT,"axis":"vertical","amount_lines":30}),
+                        json!({"target":TEXT,"axis":"vertical","amount_lines":-30}),
                         "allow_conversation",
                     )
                     .await?;
@@ -1552,6 +1640,7 @@ mod desk {
                     cerebellum_macos::frontmost_process_id() != Some(resolve(DISCORD)?.pid as i32),
                     "Discord is not background",
                 )?;
+                let typed_at = Instant::now();
                 let result = p
                     .call(
                         "computer.type",
@@ -1559,14 +1648,34 @@ mod desk {
                         "allow_conversation",
                     )
                     .await;
-                let after = snapshot(DISCORD);
+                // How long Discord takes to show the text, measured from the
+                // call and from its reply by the probe's own reads. `type`
+                // confirms delivery by reading the field back for up to its
+                // effect deadline; this says whether that is long enough for a
+                // backgrounded Discord.
+                let replied_ms = typed_at.elapsed().as_millis();
+                let mut after = snapshot(DISCORD);
+                while typed_at.elapsed() < Duration::from_secs(5)
+                    && !after
+                        .as_ref()
+                        .ok()
+                        .and_then(|s| composer(s).ok())
+                        .is_some_and(|c| composer_text(c) == "ck-v13-unsent")
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    after = snapshot(DISCORD);
+                }
+                println!(
+                    "LANDING {}",
+                    json!({"reply_after_ms":replied_ms,"seen_after_ms":typed_at.elapsed().as_millis()})
+                );
                 let cleanup = clear_discord(p).await;
                 let c = result?;
                 let after = after?;
                 cleanup?;
                 println!("DISCORD READBACK {after}");
                 check(
-                    composer(&after)?["value"] == "ck-v13-unsent",
+                    composer_text(composer(&after)?) == "ck-v13-unsent",
                     "typed text not observed in composer",
                 )?;
                 authorized(&c, "completed", None)?;
@@ -1584,9 +1693,8 @@ mod desk {
         // This function is called only after observing an empty composer before
         // typing. It never sends Return and never clears a pre-existing draft.
         let initial = snapshot(DISCORD)?;
-        let value = composer(&initial)?["value"]
-            .as_str()
-            .ok_or("Discord composer value unavailable")?;
+        let value = composer_text(composer(&initial)?);
+        let value = value.as_str();
         if value.is_empty() {
             return Ok(());
         }
@@ -1607,7 +1715,7 @@ mod desk {
         }
         let focused = snapshot(DISCORD)?;
         check(
-            composer(&focused)?["focused"] == true && composer(&focused)?["value"] == value,
+            composer(&focused)?["focused"] == true && composer_text(composer(&focused)?) == value,
             "refusing cleanup: composer focus or value changed",
         )?;
         for keys in [json!(["command", "a"]), json!(["backspace"])] {
@@ -2110,6 +2218,20 @@ mod tests {
             json!({"routes":{"skylight":0,"public":0}}),
         )]);
         assert!(!zero_post_evidence(&rows, &target, &target));
+        // A rejected entry records a refusal with nothing dispatched. A
+        // finalized entry is a completed dispatch, and an open reservation is
+        // one that started, so either means something ran.
+        let rejected =
+            BTreeMap::from([("entries/2".into(), json!({"bytes":{"phase":"rejected"}}))]);
+        assert!(zero_post_evidence(&rejected, &target, &target));
+        let finalized =
+            BTreeMap::from([("entries/2".into(), json!({"bytes":{"phase":"finalized"}}))]);
+        assert!(!zero_post_evidence(&finalized, &target, &target));
+        let reserved = BTreeMap::from([(
+            "reservations/3".into(),
+            json!({"bytes":{"phase":"rejected"}}),
+        )]);
+        assert!(!zero_post_evidence(&reserved, &target, &target));
     }
     #[test]
     fn read_facts_require_unique_observed_values() {
