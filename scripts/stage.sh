@@ -23,6 +23,44 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# THE HARDENING GATE, as a function so it can be exercised on its own (see
+# the dry path just below). A binary signed without hardened runtime, or
+# carrying com.apple.security.get-task-allow, can have a debugger attached by
+# any other program running as the same user, which can then read the
+# module's memory and the launch secret in it. The checks themselves live in
+# scripts/check-placed-hardening.sh, the same script the placement gate runs
+# on the placed copy, so staging and placement cannot disagree about what
+# "hardened" means.
+refuse_unless_hardened() {
+  local binary="$1" findings
+  if findings="$(./scripts/check-placed-hardening.sh "$binary" 2>&1)"; then
+    return 0
+  fi
+  echo >&2
+  echo "REFUSING TO STAGE: the signed binary is not hardened." >&2
+  printf '%s\n' "$findings" | sed 's/^/  /' >&2
+  echo "Without hardened runtime, or with get-task-allow, any same-user program" >&2
+  echo "can attach a debugger and read the module's memory. Sign with" >&2
+  echo "--options runtime and no entitlements file." >&2
+  return 1
+}
+
+# A dry path that runs only the hardening gate on a given file, and does
+# nothing else: no build, no signing, nothing written under ~/ck-stage or the
+# fleet staging directory. It exists so the gate's refusal can be proven
+# (scripts/check-placed-hardening.test.sh) without staging anything. It comes
+# before the dirty-tree refusal on purpose: it stages nothing, so the tree's
+# state is irrelevant to it.
+if [ "${1:-}" = "--check-hardening-only" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "usage: $0 --check-hardening-only <path to binary>" >&2
+    exit 2
+  fi
+  refuse_unless_hardened "$2" || exit 1
+  echo "hardening gate passed: $2"
+  exit 0
+fi
+
 HEAD_REV="$(git rev-parse HEAD)"
 STAGE="$HOME/ck-stage/cerebellum-$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -79,8 +117,23 @@ cp "$FORMAT_VERSIONS" "$STAGE/format-versions.json"
 # looks the same as an oversight.
 cp engram-catalog.json "$STAGE/"
 
-codesign --force --sign "$IDENTITY" --identifier "$DEPLOYED_NAME" "$STAGE/$DEPLOYED_NAME"
+# --options runtime turns on hardened runtime, so no other same-user process
+# can attach a debugger to the module. No entitlements file, on purpose: the
+# module needs none under hardened runtime (every live computer-control check
+# in the crates/cerebellum/examples/v13_desk_arms.rs probe passed on a hardened
+# copy, including the private SkyLight symbols it loads with dlsym), and every
+# entitlement is an exemption from the protection. The identity and identifier
+# are unchanged by the flag, and so is the designated requirement TCC grants
+# bind to.
+codesign --force --sign "$IDENTITY" --identifier "$DEPLOYED_NAME" --options runtime "$STAGE/$DEPLOYED_NAME"
 codesign --verify --strict "$STAGE/$DEPLOYED_NAME"
+
+# Read back from the signed bytes rather than trusted from the flag above, so
+# a signing step that silently dropped the option cannot publish.
+refuse_unless_hardened "$STAGE/$DEPLOYED_NAME" || {
+  rm -rf "$STAGE"
+  exit 1
+}
 
 # THE ARTIFACT GATE. Ask the signed bytes what they are, after signing, on the
 # exact file that will be placed.
@@ -192,7 +245,10 @@ echo "(~/.local/share/cortexkit/cerebellum/) alongside the binary placement, or"
 echo "the browser profile is neither captured nor deliberately excluded."
 echo
 echo "Placement is a PLAIN COPY -- never re-sign at placement, because a"
-echo "re-sign replaces the pin and invalidates the sha above. Gatekeeper"
+echo "re-sign replaces the pin and invalidates the sha above. After the copy,"
+echo "run scripts/check-placed-hardening.sh <placed path> on the PLACED file and"
+echo "refuse the placement if it fails: it must still carry hardened runtime"
+echo "and no get-task-allow, or a same-user debugger can read it. Gatekeeper"
 echo "assesses each file on its own first exec, so warm the PLACED copy on the"
 echo "deploy path: a multi-second first exec inside a supervisor health window"
 echo "reads as a failed start."
