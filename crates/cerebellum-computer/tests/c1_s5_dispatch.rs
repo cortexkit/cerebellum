@@ -784,6 +784,9 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         decode_embedded_json(&entry["completed_result"]),
         json!({
             "outcome": "refused",
+            "routes": {"skylight": 0, "public": 0},
+            "release_routes": {"skylight": 0, "public": 0},
+            "auth": "not_applicable",
             "refusal": {
                 "reason": "user_seized_control",
                 "sourced_input_kind": {"source": "other_process", "pid": 36_680},
@@ -1430,6 +1433,9 @@ fn unsupported_semantic_path_reaches_the_caller_without_a_synthetic_retry() {
         decode_embedded_json(&entry["completed_result"]),
         json!({
             "outcome": "refused",
+            "routes": {"skylight": 0, "public": 0},
+            "release_routes": {"skylight": 0, "public": 0},
+            "auth": "not_applicable",
             "refusal": {"reason": "semantic_path_unavailable"},
         })
     );
@@ -1619,6 +1625,9 @@ fn an_unadvertised_cancel_is_refused_by_name_and_lists_advertised_actions() {
         decode_embedded_json(&entry["rejection_material"]),
         json!({
             "outcome": "no_action",
+            "routes": {"skylight": 0, "public": 0},
+            "release_routes": {"skylight": 0, "public": 0},
+            "auth": "not_applicable",
             "refusal": {
                 "reason": "action_not_advertised",
                 "action": "cancel",
@@ -1877,7 +1886,7 @@ fn intent_is_durable_before_dispatch_and_outcome_is_visible_before_return() {
     );
     assert_eq!(
         decode_embedded_json(&entry["completed_result"]),
-        json!({"outcome": "handler_returned", "unreadable_subtrees": 0})
+        json!({"outcome": "handler_returned", "unreadable_subtrees": 0, "routes": {"skylight": 0, "public": 0}, "release_routes": {"skylight": 0, "public": 0}, "auth": "not_applicable"})
     );
     let record = audit.read_computer_audit_record(1).unwrap();
     assert_eq!(
@@ -1923,7 +1932,7 @@ fn partial_action_tree_disclosure_reaches_caller_and_decoded_audit_entry() {
     .unwrap();
     assert_eq!(
         decode_embedded_json(&entry["completed_result"]),
-        json!({"outcome": "handler_returned", "unreadable_subtrees": 2})
+        json!({"outcome": "handler_returned", "unreadable_subtrees": 2, "routes": {"skylight": 0, "public": 0}, "release_routes": {"skylight": 0, "public": 0}, "auth": "not_applicable"})
     );
 }
 

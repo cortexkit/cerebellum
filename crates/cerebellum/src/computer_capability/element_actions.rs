@@ -541,7 +541,7 @@ where
                 return audit_unavailable_reply(false);
             }
             return json!({
-                "outcome": "element_not_settable",
+                "outcome": "web_content_needs_type",
                 "reason": "web_content_needs_type",
                 "remedy": "web editors must be typed into; press_element the field to place the caret, then use type, which appends at the caret and confirms by readback. To replace existing text, clear it first",
             });

@@ -2025,6 +2025,9 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
     } = refusal
     {
         if failure.reason == cerebellum_computer::platform::input_route::PRIVATE_INPUT_AUTH_FAILED {
+            if outcome != "held_state_unknown" {
+                reply["outcome"] = json!("private_input_auth_failed");
+            }
             reply["reason"] = json!("private_input_auth_failed");
             reply["remedy"] = json!("private keyboard authentication failed; no public retry was made. Read the state before retrying");
         }

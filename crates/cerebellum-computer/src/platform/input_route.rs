@@ -72,9 +72,7 @@ impl KeyboardRoute {
         let route = self.selected();
         match route {
             PerProcessTransport::PrivateSkyLight => {
-                if let Err(error) = private(self.factory_available) {
-                    return Err(error);
-                }
+                private(self.factory_available)?;
                 evidence.auth = if self.factory_available {
                     AuthEvidence::Attached
                 } else {

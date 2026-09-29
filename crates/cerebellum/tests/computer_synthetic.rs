@@ -1206,7 +1206,7 @@ async fn background_modifier_chords_refuse_without_takeover_and_post_nothing() {
             "a background shortcut was posted"
         );
         assert_eq!(
-            reply["reason"], "modifier_chord_needs_foreground",
+            reply["outcome"], "modifier_chord_needs_foreground",
             "{reply}"
         );
     }
@@ -1441,6 +1441,7 @@ async fn route_summaries_reach_the_journal_not_the_wire_on_success_and_auth_fail
         .await;
         if fail {
             assert_eq!(reply["reason"], "private_input_auth_failed", "{reply}");
+            assert_eq!(reply["outcome"], "private_input_auth_failed", "{reply}");
         }
         for name in ["routes", "release_routes", "auth", "fallback_reason"] {
             assert!(

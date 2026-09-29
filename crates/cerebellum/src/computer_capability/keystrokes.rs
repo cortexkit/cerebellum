@@ -96,7 +96,7 @@ pub(crate) fn key_delivery(
 
 pub(crate) fn modifier_chord_refusal() -> Value {
     json!({
-        "outcome": "keystrokes_need_foreground",
+        "outcome": "modifier_chord_needs_foreground",
         "reason": "modifier_chord_needs_foreground",
         "remedy": "background applications do not reliably receive shortcut modifiers; use the equivalent accessibility action or ask for takeover",
     })

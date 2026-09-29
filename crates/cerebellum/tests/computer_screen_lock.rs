@@ -499,31 +499,34 @@ async fn a_lock_during_the_wait_of_an_element_or_point_action_refuses_before_act
     }
 }
 
-/// Keystrokes for a background target wait a second time, on the question
-/// that lets the target be brought forward. A lock during that wait refuses
-/// before anything is fronted or posted.
+/// Shortcut delivery requires a takeover already held by the conversation.
+/// A grant answered while the screen locks does not authorize posting through
+/// the lock when the next shortcut arrives.
 #[tokio::test]
-async fn a_lock_during_the_fronting_question_refuses_before_posting() {
+async fn a_lock_after_takeover_is_granted_refuses_background_chords_before_posting() {
     let rig = rig(Some(false));
     support::computer::grant_app(&rig.management).await;
-    // Some other application is in front, so the target must be fronted.
     rig.desk.state().frontmost = Some(grant().pid + 1);
     let carrier = ScriptedCarrier::default();
-    let arguments = json!({"target": TARGET_BUNDLE_ID, "text": "hi"});
-    let (reply, ()) = tokio::join!(
-        serve(&rig, "computer.type", &arguments, relayed(&carrier)),
+    let consent = relayed(&carrier);
+    let cancel = cerebellum::CancelHandle::pending();
+    let (admitted, ()) = tokio::join!(
+        rig.management
+            .computer_grants()
+            .require(&GrantNeed::Takeover, &consent, &cancel),
         lock_then_allow(&carrier, &rig.lock, 1)
     );
-    assert_screen_locked("computer.type", &reply);
-    assert_eq!(
-        carrier.questions()[0]["params"]["grant_kind"],
-        "takeover",
-        "the question answered was the fronting one"
-    );
-    assert!(
-        rig.posted.lock().unwrap().is_empty(),
-        "the keystrokes posted"
-    );
+    admitted.unwrap();
+    let reply = serve(
+        &rig,
+        "computer.keys",
+        &json!({"target": TARGET_BUNDLE_ID, "keys": ["command", "a"]}),
+        relayed(&carrier),
+    )
+    .await;
+    assert_screen_locked("computer.keys", &reply);
+    assert_eq!(carrier.questions().len(), 1);
+    assert!(rig.posted.lock().unwrap().is_empty(), "the shortcut posted");
 }
 
 /// The takeover grant's wait is re-checked the same way: a pointer row whose

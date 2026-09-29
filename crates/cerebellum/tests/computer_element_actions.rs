@@ -584,6 +584,7 @@ async fn web_content_refuses_without_calling_value_or_selection_setter() {
             "web editor setter was called"
         );
         assert_eq!(reply["reason"], "web_content_needs_type", "{reply}");
+        assert_eq!(reply["outcome"], "web_content_needs_type", "{reply}");
         assert!(reply["remedy"].as_str().unwrap().contains("press_element"));
     }
 }
