@@ -141,8 +141,9 @@ pub(crate) fn dispatch_refusal_reply(refusal: &DispatchError) -> Value {
              use write_text on a settable element, or retry",
         ),
         DispatchError::FrontingBoundExceeded => Some(
-            "the keystrokes could not be posted inside the time the application may stay in \
-             front; use write_text on a settable element, or send shorter text",
+            "the application would have stayed in front longer than allowed, so posting stopped; \
+             posts_returned says how many keystrokes were already sent. Read the field before \
+             retrying, and use write_text on a settable element or send shorter text",
         ),
         DispatchError::FrontingRestoreFailed => {
             Some("the previous application could not be brought back, so nothing more was posted")
@@ -235,6 +236,31 @@ pub(crate) fn changed_part<'a>(before: &str, after: &'a str) -> Option<&'a str> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bracket that posted every unit but held the target in front past the
+    /// bound reports the keystrokes as delivered with the overrun named, never
+    /// as fronted and never as a refusal. One inside the bound is fronted with
+    /// no forfeiture.
+    #[test]
+    fn a_bracket_that_overran_the_bound_is_disclosed_on_a_delivered_reply() {
+        let report = |longest_fronted_interval_ms| BracketReport {
+            previous_frontmost: Some(100),
+            chunks: 1,
+            units_posted: 1,
+            posts_returned: 2,
+            generation_verifications: 4,
+            longest_fronted_interval_ms,
+            slowest_unit_ms: 4,
+            slowest_restore_ms: 50,
+            restore: RestoreStatus::Restored,
+            stop: None,
+        };
+        assert_eq!(
+            bracket_fronting(&report(104), 100),
+            (false, Some("fronting_bound_exceeded"))
+        );
+        assert_eq!(bracket_fronting(&report(90), 100), (true, None));
+    }
 
     #[test]
     fn key_delivery_decision_covers_foreground_takeover_and_plain_typing() {

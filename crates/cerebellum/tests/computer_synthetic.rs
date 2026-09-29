@@ -196,6 +196,7 @@ impl PlatformDriver for SyntheticDriver {
             frontmost: Some(OTHER_APPLICATION_PID),
             pending: None,
             refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
+            front_latency_ms: script.front_latency_ms.unwrap_or(2),
         };
         let chunks_started = std::cell::Cell::new(0);
         let scripted_cancel = || {
@@ -285,6 +286,8 @@ impl PlatformDriver for SyntheticDriver {
 struct FrontingScript {
     refuse_restore: bool,
     cancel_after_first_chunk: bool,
+    /// How long a fronting request takes to take effect; 2 ms when unset.
+    front_latency_ms: Option<u64>,
 }
 
 type FrontedScript = FrontingScript;
@@ -292,13 +295,14 @@ type FrontedScript = FrontingScript;
 /// The application in front when a bracket starts.
 const OTHER_APPLICATION_PID: u32 = 100;
 
-/// A desk on a fake clock: a fronting request takes effect 2 ms later, and
-/// each unit takes 3 ms to post.
+/// A desk on a fake clock: a fronting request takes effect `front_latency_ms`
+/// later, and each unit takes 3 ms to post.
 struct FrontingDesk {
     now: u64,
     frontmost: Option<u32>,
     pending: Option<(u32, u64)>,
     refuse_front_of: Option<u32>,
+    front_latency_ms: u64,
 }
 
 impl FrontingDesk {
@@ -326,7 +330,7 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
     }
     fn request_front(&mut self, pid: u32) -> bool {
         if self.refuse_front_of != Some(pid) {
-            self.pending = Some((pid, self.now + 2));
+            self.pending = Some((pid, self.now + self.front_latency_ms));
         }
         true
     }
@@ -1278,6 +1282,37 @@ async fn a_frontmost_target_is_posted_per_process_without_a_takeover_question() 
         &dispatched_calls(&shared)[..],
         [DispatchedCall::PerPid(_)]
     ));
+}
+
+/// A chord that was posted, where only putting the previous application
+/// back ran past the bound, is reported as delivered with the overrun named.
+/// Reporting it as a refusal would tell the caller keystrokes that landed
+/// did not, and a retry would send them twice.
+#[tokio::test]
+async fn a_chord_whose_restore_overran_the_bound_is_reported_delivered_not_refused() {
+    let shared = Shared::handle();
+    // Front and restore each take 49 ms: the chord fits the prediction, and
+    // the whole interval (49 + 3 + 49) runs past the 100 ms bound.
+    shared.lock().unwrap().fronted.front_latency_ms = Some(49);
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    grant_takeover(&management).await;
+    let carrier = ScriptedCarrier::default();
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&carrier),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(reply["target_fronted"], false, "{reply}");
+    assert_eq!(
+        reply["containment_forfeited_because"], "fronting_bound_exceeded",
+        "{reply}"
+    );
 }
 
 /// A previous application that cannot be put back is reported by name,

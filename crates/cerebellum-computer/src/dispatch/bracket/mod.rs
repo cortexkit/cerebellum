@@ -376,7 +376,13 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
             break;
         }
         if interval > bound {
-            report.stop = Some(BracketStop::BoundExceeded);
+            // Past the bound with units still to post: stop, so the target is
+            // not fronted again. Once every unit is posted the keystrokes have
+            // landed, and the overrun is reported through the interval rather
+            // than as a stop, which would refuse an action that took effect.
+            if next_unit < plan.units {
+                report.stop = Some(BracketStop::BoundExceeded);
+            }
             break;
         }
     }

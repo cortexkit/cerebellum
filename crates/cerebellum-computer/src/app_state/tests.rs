@@ -53,6 +53,34 @@ fn read(sessions: &AppStateSessions, raw: &RawAppState) -> super::session::Sessi
     sessions.observe(CONVERSATION, &grant(), raw)
 }
 
+/// A window's own controls have no title or description, so the subrole is
+/// the only thing that tells close from minimize and zoom. Each must be named,
+/// or an agent reading the tree sees three identical bare buttons.
+#[test]
+fn window_controls_are_named_by_their_subrole() {
+    let control = |id, subrole: &str| {
+        let mut button = RawElement::fixture(id, "AXButton");
+        button.subrole = Some(subrole.into());
+        button
+    };
+    let raw = state(vec![RawElement::fixture(1, "AXWindow")
+        .titled("desk.txt")
+        .with_children(vec![
+            control(2, "AXCloseButton"),
+            control(3, "AXMinimizeButton"),
+            control(4, "AXZoomButton"),
+        ])]);
+    let sessions = AppStateSessions::default();
+    let tree = tree_of(&read(&sessions, &raw));
+    for words in ["close button", "minimize button", "zoom button"] {
+        assert_eq!(
+            tree.matches(words).count(),
+            1,
+            "{words} is not named once in:\n{tree}"
+        );
+    }
+}
+
 fn tree_of(read: &super::session::SessionRead) -> String {
     render(&read.roots, &RenderFilter::default()).tree
 }

@@ -178,6 +178,13 @@ fn role_words(element: &RawElement) -> String {
         Some("AXSecureTextField") => Some("AXSecureTextField"),
         Some("AXSearchField") => Some("AXSearchField"),
         Some("AXDialog" | "AXSystemDialog") => Some("AXDialog"),
+        // A window's own controls carry no title or description; only the
+        // subrole tells the close button from minimize and zoom, so without
+        // it all three read as a bare `button` and none can be chosen.
+        Some(
+            subrole
+            @ ("AXCloseButton" | "AXMinimizeButton" | "AXZoomButton" | "AXFullScreenButton"),
+        ) => Some(subrole),
         _ => None,
     };
     let Some(role) = named.or(element.role.as_deref()) else {

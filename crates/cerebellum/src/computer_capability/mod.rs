@@ -1424,7 +1424,18 @@ where
                     forfeiture,
                 )
             }
-            Err(refusal) => keystrokes::dispatch_refusal_reply(&refusal),
+            Err(refusal) => {
+                let mut refused = keystrokes::dispatch_refusal_reply(&refusal);
+                // A bracket that stopped part-way may already have posted
+                // earlier chunks. Saying how many keeps a caller from retrying
+                // text that partly landed as though none of it had.
+                if let Some(bracket) = &bracket {
+                    if refused.get("posts_returned").is_none() {
+                        refused["posts_returned"] = json!(bracket.posts_returned);
+                    }
+                }
+                refused
+            }
         };
         // A previous application left behind the target is reported whatever
         // else happened, because the person's next keystrokes go to it.

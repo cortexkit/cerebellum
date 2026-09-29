@@ -299,6 +299,27 @@ fn a_front_slower_than_the_bound_posts_nothing() {
     assert_eq!(desk.frontmost, Some(PREVIOUS));
 }
 
+/// Every unit posted, and only putting the previous application back ran
+/// past the bound. The keystrokes were delivered, so this is not a stop: a
+/// stop becomes a refusal on the wire, and a refusal for keystrokes that
+/// landed would make a caller send them again. The overrun stays visible in
+/// the report, which is what the reply discloses.
+#[test]
+fn a_restore_that_overruns_after_the_last_unit_is_disclosed_not_a_stop() {
+    let mut desk = FakeDesk::new();
+    // Front and restore each take 49 ms: the one unit fits the prediction
+    // (49 + 49 <= 100), and the real interval is 49 + 4 + 49 > 100.
+    desk.front_latency_ms = 49;
+    let report = run(&mut desk, 1);
+    assert_eq!(report.stop, None, "{report:?}");
+    assert_eq!(report.units_posted, 1);
+    assert_eq!(desk.posted, vec![0]);
+    assert!(report.longest_fronted_interval_ms > 100, "{report:?}");
+    assert!(!report.held(100));
+    assert_eq!(report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.frontmost, Some(PREVIOUS));
+}
+
 /// A post failure stops the bracket with the failure's own report.
 #[test]
 fn a_post_failure_is_reported_with_what_it_left_held() {
