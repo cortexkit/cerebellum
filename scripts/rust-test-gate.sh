@@ -501,6 +501,20 @@ run_phase "cargo test -p cerebellum --features test-observer --test conformance 
 run_phase "scripts/lib/format-floor-gate.test.sh" \
   scripts/lib/format-floor-gate.test.sh
 
+# Phase 5c: staging and placement refuse a binary without hardened runtime or
+# with get-task-allow, since either lets a same-user debugger read the module.
+# Like the floor gate, the check is a script a test run never reaches, so its
+# proofs run here against ad hoc signed scratch binaries under /tmp. codesign
+# and lipo exist only on macOS, so elsewhere the phase is named as not run
+# rather than passed.
+if [ "$(uname -s)" = Darwin ]; then
+  run_phase "scripts/check-placed-hardening.test.sh" \
+    scripts/check-placed-hardening.test.sh
+else
+  printf '==> SKIPPED: the hardening check needs macOS codesign, so it did not run\n'
+  not_verified="$not_verified; hardening check (macOS only)"
+fi
+
 # Phase 6: a generated file must be committed in the form its generator emits.
 # An entry that is semantically right but textually different -- a hand-written
 # Cargo.lock line with the wrong indent, say -- is rewritten by the next build,
