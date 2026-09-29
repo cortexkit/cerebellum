@@ -1,0 +1,11 @@
+{
+  "description": "Reader vector for the keystroke rows' effect_status. A reply carrying an effect_status value the reader does not know must be read as effect_indeterminate (the keys may have landed), never as not-run, so a status added in a later revision can never make an older caller retry keystrokes that landed. Nothing in this repository parses effect_status back out of a reply; the model reading computer_use replies is the reader, so this vector pins the rule the vocabulary states for it.",
+  "capabilities": ["computer.type", "computer.keys"],
+  "reply": {
+    "outcome": "delivery_unconfirmed",
+    "containment_rung": "pid_structural",
+    "target_fronted": false,
+    "effect_status": "future_value"
+  },
+  "reader_must_read_effect_status_as": "effect_indeterminate"
+}
