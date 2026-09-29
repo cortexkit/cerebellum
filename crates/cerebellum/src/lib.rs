@@ -803,8 +803,9 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
 /// conversation.
 ///
 /// Each works on state that belongs to the machine or the operator rather than
-/// to a conversation: the browser profile root, a launch record startup
-/// recovery kept, and the durable "always allow" app grants. None of them
+/// to a conversation: the browser profile root, a browser launch record that
+/// module startup kept because it could not prove that browser gone, and the
+/// durable "always allow" app grants. None of them
 /// needs a conversation's grants, so running them with no conversation costs
 /// the operator nothing. Every other operation asks for, reads or acts under a
 /// conversation's permissions, and is a session-bound call.

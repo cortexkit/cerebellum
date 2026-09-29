@@ -245,8 +245,8 @@ async fn the_session_caller_acts_on_its_conversations_grant() {
     let body: Value = serde_json::from_slice(&granted[0].body).unwrap();
     assert_eq!(body["outcome"], "no_session", "{body}");
 
-    // The contrast that makes the line above evidence of the grant: without
-    // one, the same caller is asked about the site rather than let through.
+    // The contrast that makes `no_session` evidence of the grant: for a site
+    // with no grant, the same caller is asked about it rather than let through.
     let ungranted = frames_for(&planes, navigate(2, UNGRANTED_ORIGIN)).await;
     assert!(
         ungranted
@@ -269,9 +269,10 @@ async fn other_first_party_callers_are_refused_before_their_conversations_grant(
     }
 }
 
-/// A refused caller is refused before anything asks the person: a site it
-/// holds no grant for produces the refusal and no question. A check placed
-/// after the grant lookup would ask first.
+/// A refused caller is refused before anything asks the person: a site its
+/// conversation holds no grant for produces the refusal and no question. Had
+/// the refusal come after the site grant was looked up, the missing grant
+/// would have put a question to the person first.
 #[tokio::test]
 async fn a_refused_caller_is_never_asked_about_a_site() {
     for (principal, label) in other_first_party_principals() {
@@ -282,9 +283,9 @@ async fn a_refused_caller_is_never_asked_about_a_site() {
     }
 }
 
-/// The management surface holds the same line: asking the person for a new
-/// site grant is a call in the conversation's name, refused to every other
-/// caller without a question being put.
+/// The management surface refuses the same callers: asking the person for a
+/// new site grant is a call in the conversation's name, so it is refused to
+/// every caller but Prefrontal's core module, without a question being put.
 #[tokio::test]
 async fn a_refused_caller_cannot_open_a_grant_on_the_management_surface() {
     for (principal, label) in other_first_party_principals() {
@@ -330,8 +331,11 @@ async fn principals_resembling_the_session_caller_are_refused() {
     }
 }
 
-/// The operator's own operations are served to a `direct` desk route that
-/// names a conversation, and served outside it.
+/// The operator's own operations (listing and revoking app grants, clearing a
+/// kept launch record, rebinding the profile root) are served to a `direct`
+/// desk route, even though that route names a conversation. That they run
+/// outside the conversation is shown in `profile_root_rebind.rs`, where the
+/// rebind records which conversation it was made in.
 #[tokio::test]
 async fn operator_operations_are_served_to_a_direct_route() {
     let planes = planes_with_a_grant().await;
