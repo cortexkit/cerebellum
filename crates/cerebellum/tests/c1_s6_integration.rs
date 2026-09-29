@@ -384,33 +384,33 @@ fn the_advertisement_context_reflects_this_system() {
 /// Every tool the module offers in its manifest can actually be served.
 ///
 /// The manifest and the dispatcher are built from separate lists, so a tool can
-/// be added to one and not the other. The gap is not hypothetical here: the
-/// computer-plane rows are added to the manifest once the release identifiers in
-/// `default_computer_context` are filled in, while dispatch routes browser names
-/// only -- so filling those in would advertise a capability that every call to
-/// it rejects as an unknown method. Offering a caller something it cannot use is
-/// worse than not offering it, because the caller has no way to tell the
+/// be added to one and not the other. Offering a caller something it cannot use
+/// is worse than not offering it, because the caller has no way to tell the
 /// difference until it tries.
 ///
-/// The check runs against the context the module really ships rather than a
-/// fully populated one, so it fails at the moment those identifiers are
-/// supplied, which is the change that would create the mismatch.
+/// The check runs against the context the module really ships, and also against
+/// a context with every release identifier supplied, because that is the change
+/// that would create a mismatch. A development build binds no review, so it may
+/// advertise nothing at all; the fully bound context is what keeps the check
+/// from passing on an empty list.
 #[test]
 fn every_shipped_advertisement_can_be_dispatched() {
-    let manifest =
+    let shipped =
         build_manifest_with_computer_plane("cerebellum", &cerebellum::default_computer_context());
-    let advertised = tools(&manifest);
+    let bound = build_manifest_with_computer_plane("cerebellum", &valid_context());
     assert!(
-        !advertised.is_empty(),
+        !tools(&bound).is_empty(),
         "an empty manifest would satisfy this vacuously"
     );
-    for tool in advertised {
-        assert_eq!(
-            cerebellum::dispatchable_tool(&tool.name),
-            Some(tool.name.as_str()),
-            "{} is advertised but dispatch would reject it as an unknown method",
-            tool.name
-        );
+    for manifest in [&shipped, &bound] {
+        for tool in tools(manifest) {
+            assert_eq!(
+                cerebellum::dispatchable_tool(&tool.name),
+                Some(tool.name.as_str()),
+                "{} is advertised but dispatch would reject it as an unknown method",
+                tool.name
+            );
+        }
     }
 }
 
@@ -656,5 +656,52 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
             every_served_row_but(&TAKEOVER_ROWS),
             "{gate}"
         );
+    }
+}
+
+/// Every read of an application's accessibility tree is withdrawn by one key.
+///
+/// The wait polls the same tree read_state reads, under the same app grant, so
+/// it must not stay advertised when that review is unbound: otherwise a build
+/// placed with the key unbound would still read trees, with no key left that
+/// withdraws it.
+#[test]
+fn every_tree_read_is_withdrawn_by_the_app_state_key() {
+    const TREE_READS: [&str; 2] = ["computer.read_state", "computer.wait"];
+    let bound = valid_context();
+    let mut inputs = valid_inputs();
+    inputs.app_state_review_revision = None;
+    let unbound = ComputerCapabilityAdvertisementContext {
+        inputs,
+        permissions: bound.permissions.clone(),
+        startup: bound.startup.clone(),
+    };
+
+    let with_key = computer_release_evidence(&bound).gate_admitted_capabilities;
+    let without_key = computer_release_evidence(&unbound).gate_admitted_capabilities;
+    let manifest_without_key = build_manifest_with_computer_plane("cerebellum", &unbound);
+    for row in TREE_READS {
+        if cfg!(target_os = "macos") {
+            assert!(with_key.contains(&row.to_string()), "{row}: {with_key:?}");
+        }
+        assert!(
+            !without_key.contains(&row.to_string()),
+            "{row} was admitted with the app_state review unbound: {without_key:?}"
+        );
+        assert!(
+            tools(&manifest_without_key)
+                .iter()
+                .all(|tool| tool.name != row),
+            "{row} was in the manifest with the app_state review unbound"
+        );
+    }
+    // Unbinding the key withdraws exactly the tree reads and nothing else.
+    if cfg!(target_os = "macos") {
+        let expected: Vec<String> = with_key
+            .iter()
+            .filter(|row| !TREE_READS.contains(&row.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(without_key, expected);
     }
 }
