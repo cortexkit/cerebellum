@@ -1289,3 +1289,79 @@ fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
     assert_eq!(recorded.outcome, old_outcome.outcome);
     assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
 }
+
+#[test]
+fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
+    let entry = ComputerJournalCodec::decode_entry(include_bytes!(
+        "fixtures/v2_manual_accessibility_entry.json"
+    ))
+    .unwrap();
+    assert_eq!(entry["codec_version"], "ck-computer-journal/v2");
+    assert_eq!(entry["manual_accessibility"], "newly_enabled");
+    let bytes: Vec<u8> = serde_json::from_value(entry["dispatch_material"].clone()).unwrap();
+    let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(dispatch["grant_identity"]["pid"], 42);
+    assert_eq!(
+        dispatch["grant_identity"]["bundle_identity"],
+        "com.example.target"
+    );
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn accessibility_read_evidence_is_on_each_actions_own_row_and_not_its_result() {
+    use cerebellum_computer::audit::AccessibilityReadScope;
+    for capability in [
+        ComputerCapability::ReadState,
+        ComputerCapability::PressElement,
+        ComputerCapability::WriteText,
+        ComputerCapability::Wait,
+        ComputerCapability::PressPoint,
+    ] {
+        for status in [
+            "newly_enabled",
+            "already_enabled",
+            "not_supported",
+            "failed",
+        ] {
+            let mut audit = audit();
+            let result;
+            {
+                let _scope = AccessibilityReadScope::new(42, Some(status));
+                result = audit
+                    .record_accessibility_read(
+                        identity(),
+                        capability,
+                        &target_grant(),
+                        || serde_json::json!({"outcome": "completed"}),
+                    )
+                    .unwrap();
+            }
+            assert!(result.get("manual_accessibility").is_none());
+            let entry =
+                ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+            assert_eq!(entry["manual_accessibility"], status);
+            assert_eq!(entry["codec_version"], "ck-computer-journal/v2");
+            let bytes: Vec<u8> =
+                serde_json::from_value(entry["dispatch_material"].clone()).unwrap();
+            let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(dispatch["grant_identity"]["pid"], 42);
+            assert_eq!(dispatch["action"], capability.capability_id());
+        }
+    }
+    let mut audit = audit();
+    audit
+        .record_accessibility_read(
+            identity(),
+            ComputerCapability::ReadState,
+            &target_grant(),
+            || (),
+        )
+        .unwrap();
+    let entry = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+    assert!(
+        entry.get("manual_accessibility").is_none(),
+        "evidence must not leak to another action on the worker thread"
+    );
+}

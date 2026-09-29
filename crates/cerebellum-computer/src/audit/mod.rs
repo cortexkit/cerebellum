@@ -300,7 +300,12 @@ impl ComputerJournalCodec {
         Ok(Self { codec_version })
     }
 
-    fn encoded(&self, value: Value) -> Result<EncodedJournalState, JournalCodecError> {
+    fn encoded(&self, mut value: Value) -> Result<EncodedJournalState, JournalCodecError> {
+        if self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION {
+            if let Some(status) = AccessibilityReadScope::current() {
+                value["manual_accessibility"] = json!(status);
+            }
+        }
         let durable_bytes = serde_json::to_vec(&value).map_err(|_| JournalCodecError::Failed)?;
         if durable_bytes.is_empty() {
             return Err(JournalCodecError::Failed);
@@ -1406,6 +1411,39 @@ where
         )?)
     }
 
+    /// Keep read-side application changes on the read's own obligation, including
+    /// unsuccessful reads: opting into accessibility can succeed before reading fails.
+    pub fn record_accessibility_read<U>(
+        &mut self,
+        identity: JournalIdentity,
+        capability: ComputerCapability,
+        grant: &ProcessGrant,
+        read: impl FnOnce() -> U,
+    ) -> Result<U, ComputerAuditError> {
+        let descriptor = ComputerPlaneDescriptor::new(
+            capability,
+            ContainmentRung::SemanticElement,
+            ObservationState::HumanUnobserved,
+        );
+        let handle = self.reserve(identity, descriptor.clone())?;
+        let token = self.commit_actuation_intent(
+            handle,
+            &descriptor,
+            &ActuationIntent {
+                element: None,
+                action: capability.capability_id().to_string(),
+                grant_identity: grant.clone(),
+            },
+        )?;
+        let result = read();
+        self.finalize_dispatched(
+            token,
+            br#"{"outcome":"read_attempted"}"#.to_vec(),
+            Vec::new(),
+        )?;
+        Ok(result)
+    }
+
     /// Persist one complete actuation intent before the platform can receive it.
     ///
     /// THE JOURNAL RECORDS THE CALLER'S WORDS, NEVER THE SCREEN'S. `matched_by`
@@ -1948,5 +1986,47 @@ where
 
     pub fn journal_purge(&mut self) -> cerebellum_core::journal::PurgeReport {
         self.journal.purge()
+    }
+}
+
+/// Keeps enable evidence on the action's journal row, never in its wire result.
+/// Construct and drop on the same blocking thread as the reads and journal writes.
+pub struct AccessibilityReadScope {
+    #[cfg(target_os = "macos")]
+    _guard: cerebellum_macos::ManualAccessibilityScope,
+}
+
+impl AccessibilityReadScope {
+    pub fn new(pid: u32, initial: Option<&'static str>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            use cerebellum_macos::ManualAccessibility as M;
+            let initial = initial.and_then(|s| match s {
+                "newly_enabled" => Some(M::NewlyEnabled),
+                "already_enabled" => Some(M::AlreadyEnabled),
+                "not_supported" => Some(M::NotSupported),
+                "failed" => Some(M::Failed(-1)),
+                _ => None,
+            });
+            Self {
+                _guard: cerebellum_macos::ManualAccessibilityScope::new(pid, initial),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (pid, initial);
+            Self {}
+        }
+    }
+
+    pub fn current() -> Option<&'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            cerebellum_macos::ManualAccessibilityScope::current().map(|status| status.as_str())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 }

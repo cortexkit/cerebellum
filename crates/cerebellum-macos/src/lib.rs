@@ -83,6 +83,8 @@ pub use ax_actions::{
     focused_element, press_element, request_frontmost, write_element_text, AxElementActionError,
     AxElementFacts, AxHitScope, AxTextAttribute,
 };
+#[cfg(target_os = "macos")]
+pub use manual_accessibility::prepare_manual_accessibility;
 #[cfg(any(target_os = "macos", test))]
 mod manual_accessibility;
 #[cfg(target_os = "macos")]
@@ -127,7 +129,7 @@ pub use macos::{
     RawCapture, RawWindow,
 };
 #[cfg(any(target_os = "macos", test))]
-pub use manual_accessibility::ManualAccessibility;
+pub use manual_accessibility::{ManualAccessibility, ManualAccessibilityScope};
 #[cfg(target_os = "macos")]
 pub use process_table::{
     all_process_ids, host_name, process_arguments, process_executable_path, ProcessArguments,

@@ -1194,6 +1194,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
                     ))
                 }
             }
+            cerebellum_macos::prepare_manual_accessibility(request.target.pid);
             let attribute = match request.attribute {
                 AccessibilityReadbackAttribute::Presence => {
                     cerebellum_macos::AxReadbackAttribute::Presence

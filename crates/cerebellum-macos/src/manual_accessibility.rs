@@ -4,7 +4,8 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualAccessibility {
-    Enabled,
+    NewlyEnabled,
+    AlreadyEnabled,
     NotSupported,
     Failed(i32),
 }
@@ -20,54 +21,168 @@ pub(crate) fn read_with_manual_accessibility<T, E>(
     requested_bound: Duration,
 ) -> Result<T, E> {
     let (status, fresh) = enable(false);
-    let bound = if status == ManualAccessibility::Enabled {
+    let bound = if status.enabled() {
         requested_bound.min(Duration::from_millis(400))
     } else {
         requested_bound
     };
     let first = read(bound)?;
-    if status != ManualAccessibility::Enabled || populated_web(&first) {
+    if !status.enabled() || populated_web(&first) {
         return Ok(first);
     }
     // A fresh enable is already in flight. Otherwise a reload may have cleared
     // the flag, so set it again before spending the one retry.
-    if !fresh && enable(true).0 != ManualAccessibility::Enabled {
+    if !fresh && !enable(true).0.enabled() {
         return Ok(first);
     }
     pause(Duration::from_millis(100));
     read(bound)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn prepare(pid: u32, force: bool) -> (ManualAccessibility, bool) {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static ENABLED: OnceLock<Mutex<HashMap<u32, (u64, ManualAccessibility)>>> = OnceLock::new();
-    let crate::ProcessStartTime::Started(generation) = crate::process_start_time(pid) else {
-        return (ManualAccessibility::Failed(-1), false);
-    };
-    let mut cache = ENABLED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if !force {
-        if let Some((previous, status)) = cache.get(&pid) {
-            if *previous == generation {
-                return (*status, false);
+#[derive(Default)]
+struct EnableCache(std::collections::HashMap<u32, (u64, ManualAccessibility)>);
+
+impl EnableCache {
+    fn prepare(
+        &mut self,
+        pid: u32,
+        generation: u64,
+        force: bool,
+        enable: impl FnOnce() -> ManualAccessibility,
+    ) -> (ManualAccessibility, bool) {
+        if !force {
+            if let Some((previous, status)) = self.0.get(&pid) {
+                if *previous == generation {
+                    return (
+                        match status {
+                            ManualAccessibility::NewlyEnabled => {
+                                ManualAccessibility::AlreadyEnabled
+                            }
+                            status => *status,
+                        },
+                        false,
+                    );
+                }
             }
         }
+        let status = enable();
+        if !matches!(status, ManualAccessibility::Failed(_)) {
+            self.0.insert(pid, (generation, status));
+        }
+        (status, status == ManualAccessibility::NewlyEnabled)
     }
-    let status = crate::ax_actions::enable_manual_accessibility(pid);
-    if !matches!(status, ManualAccessibility::Failed(_)) {
-        cache.insert(pid, (generation, status));
-    }
-    (status, status == ManualAccessibility::Enabled)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare(pid: u32, force: bool) -> (ManualAccessibility, bool) {
+    use std::sync::{Mutex, OnceLock};
+    static ENABLED: OnceLock<Mutex<EnableCache>> = OnceLock::new();
+    let result =
+        if let crate::ProcessStartTime::Started(generation) = crate::process_start_time(pid) {
+            ENABLED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prepare(pid, generation, force, || {
+                    crate::ax_actions::enable_manual_accessibility(pid)
+                })
+        } else {
+            (ManualAccessibility::Failed(-1), false)
+        };
+    record(pid, result.0);
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn manual_accessibility_audit_records_process_generation_outcomes() {
+        let mut cache = EnableCache::default();
+        let calls = Cell::new(0);
+        let mut action = |pid, generation, result| {
+            let _scope = ManualAccessibilityScope::new(pid, None);
+            let tree = read_with_manual_accessibility(
+                |force| {
+                    let enabled = cache.prepare(pid, generation, force, || {
+                        calls.set(calls.get() + 1);
+                        result
+                    });
+                    record(pid, enabled.0);
+                    enabled
+                },
+                |_| Ok::<_, ()>(true),
+                |populated| *populated,
+                |_| panic!("populated tree must not retry"),
+                Duration::from_secs(1),
+            );
+            assert_eq!(tree, Ok(true));
+            ManualAccessibilityScope::current().unwrap().as_str()
+        };
+        assert_eq!(
+            action(42, 7, ManualAccessibility::NewlyEnabled),
+            "newly_enabled"
+        );
+        assert_eq!(
+            action(42, 7, ManualAccessibility::NewlyEnabled),
+            "already_enabled"
+        );
+        assert_eq!(
+            action(43, 8, ManualAccessibility::NotSupported),
+            "not_supported"
+        );
+        assert_eq!(
+            action(43, 8, ManualAccessibility::NotSupported),
+            "not_supported"
+        );
+        assert_eq!(
+            action(42, 9, ManualAccessibility::NewlyEnabled),
+            "newly_enabled"
+        );
+        assert_eq!(action(44, 10, ManualAccessibility::Failed(-42)), "failed");
+        assert_eq!(
+            action(44, 10, ManualAccessibility::NewlyEnabled),
+            "newly_enabled"
+        );
+        assert_eq!(
+            calls.get(),
+            5,
+            "only successful generation results are cached"
+        );
+        assert_eq!(ManualAccessibilityScope::current(), None);
+    }
+
+    #[test]
+    fn action_scope_preserves_new_enable_and_isolates_threads_and_targets() {
+        let _scope = ManualAccessibilityScope::new(42, None);
+        record(43, ManualAccessibility::NotSupported);
+        assert_eq!(ManualAccessibilityScope::current(), None);
+        record(42, ManualAccessibility::NewlyEnabled);
+        record(42, ManualAccessibility::AlreadyEnabled);
+        assert_eq!(
+            ManualAccessibilityScope::current(),
+            Some(ManualAccessibility::NewlyEnabled)
+        );
+        std::thread::spawn(|| {
+            assert_eq!(ManualAccessibilityScope::current(), None);
+        })
+        .join()
+        .unwrap();
+        {
+            let _nested = ManualAccessibilityScope::new(43, None);
+            record(43, ManualAccessibility::NotSupported);
+            assert_eq!(
+                ManualAccessibilityScope::current(),
+                Some(ManualAccessibility::NotSupported)
+            );
+        }
+        assert_eq!(
+            ManualAccessibilityScope::current(),
+            Some(ManualAccessibility::NewlyEnabled)
+        );
+    }
 
     #[test]
     fn native_not_supported_reads_once_successfully() {
@@ -95,7 +210,7 @@ mod tests {
             let result = read_with_manual_accessibility(
                 |_| {
                     enables.set(enables.get() + 1);
-                    (ManualAccessibility::Enabled, fresh)
+                    (ManualAccessibility::NewlyEnabled, fresh)
                 },
                 |bound| {
                     reads.set(reads.get() + 1);
@@ -116,7 +231,7 @@ mod tests {
     #[test]
     fn populated_web_or_failed_enable_never_retries() {
         for status in [
-            ManualAccessibility::Enabled,
+            ManualAccessibility::NewlyEnabled,
             ManualAccessibility::Failed(-42),
         ] {
             let reads = Cell::new(0);
@@ -136,4 +251,70 @@ mod tests {
             assert_eq!(reads.get(), 1);
         }
     }
+}
+
+impl ManualAccessibility {
+    fn enabled(self) -> bool {
+        matches!(self, Self::NewlyEnabled | Self::AlreadyEnabled)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NewlyEnabled => "newly_enabled",
+            Self::AlreadyEnabled => "already_enabled",
+            Self::NotSupported => "not_supported",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+thread_local! {
+    static ACTION: std::cell::Cell<Option<(u32, Option<ManualAccessibility>)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Binds synchronous AX reads to one action, not to a reusable worker thread.
+/// The guard is deliberately not Send: async callers keep it inside a blocking task.
+pub struct ManualAccessibilityScope {
+    previous: Option<(u32, Option<ManualAccessibility>)>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl ManualAccessibilityScope {
+    pub fn new(pid: u32, initial: Option<ManualAccessibility>) -> Self {
+        Self {
+            previous: ACTION.replace(Some((pid, initial))),
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    pub fn current() -> Option<ManualAccessibility> {
+        ACTION.get().and_then(|(_, status)| status)
+    }
+}
+
+impl Drop for ManualAccessibilityScope {
+    fn drop(&mut self) {
+        ACTION.set(self.previous);
+    }
+}
+
+fn record(pid: u32, status: ManualAccessibility) {
+    ACTION.with(|action| {
+        if let Some((target, previous)) = action.get() {
+            if target == pid {
+                // Later cache hits must not hide a flag set earlier in this action.
+                let status = match previous {
+                    Some(ManualAccessibility::NewlyEnabled) => ManualAccessibility::NewlyEnabled,
+                    _ => status,
+                };
+                action.set(Some((target, Some(status))));
+            }
+        }
+    });
+}
+
+/// Opt in once for a process generation before a scoped accessibility read.
+#[cfg(target_os = "macos")]
+pub fn prepare_manual_accessibility(pid: u32) -> ManualAccessibility {
+    prepare(pid, false).0
 }

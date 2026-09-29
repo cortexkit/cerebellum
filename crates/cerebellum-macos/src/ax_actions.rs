@@ -188,7 +188,7 @@ pub fn enable_manual_accessibility(pid: u32) -> crate::ManualAccessibility {
         )
     };
     match code {
-        AX_ERROR_SUCCESS => ManualAccessibility::Enabled,
+        AX_ERROR_SUCCESS => ManualAccessibility::NewlyEnabled,
         AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NOT_IMPLEMENTED => {
             ManualAccessibility::NotSupported
         }

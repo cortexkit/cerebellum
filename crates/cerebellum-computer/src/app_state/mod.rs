@@ -22,11 +22,8 @@ use crate::capture_custody::{CaptureScope, CustodyUnavailable, PixelArtifact};
 use crate::grounding::ContainmentRung;
 use image::{CustodyStepFailed, ImageCustody, ImageUnavailable, RetainFailure, WindowImageCapture};
 
-/// The computer audit as the custody a state read's image passes through.
-///
-/// The image is recorded as a `computer.read_state` capture: reading pixels
-/// reaches no element and moves nothing, so it claims only process-level
-/// containment, and nobody is assumed to be watching.
+/// One successful state read's journal row, with optional image custody.
+/// Tree-only reads use the same finalization path without preparing a capture.
 pub struct AuditImageCustody<'a, R, T, S>
 where
     R: Redactor,
@@ -36,9 +33,16 @@ where
     pub audit: &'a mut ComputerAudit<R, T, S>,
     pub identity: JournalIdentity,
     pub now_ms: u64,
-    /// The application the image is of, recorded as the capture's final
-    /// context. A bundle identity, never application text.
-    pub bundle_identity: String,
+    pub summary: ReadStateSummary,
+    pub finalized: bool,
+}
+
+/// Only counts and process identity cross the journal boundary; tree strings
+/// are deliberately absent so labels and values cannot become durable text.
+pub struct ReadStateSummary {
+    pub grant_identity: crate::platform::ProcessGrant,
+    pub element_count: usize,
+    pub unreadable_count: usize,
 }
 
 fn descriptor() -> ComputerPlaneDescriptor {
@@ -103,30 +107,52 @@ where
     }
 
     fn finalize(&mut self, reservation: Self::Reservation) -> Result<(), CustodyStepFailed> {
+        self.finalize_read(reservation, true)
+    }
+
+    fn reject(&mut self, reservation: Self::Reservation, _reason: ImageUnavailable) {
+        // The image failed, not the tree read. Its successful tree still needs
+        // the same completed row, explicitly saying that no image was released.
+        let _ = self.finalize_read(reservation, false);
+    }
+}
+
+impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, R, T, S> {
+    pub fn finalize_read(
+        &mut self,
+        reservation: cerebellum_core::journal::ReservationHandle,
+        image_returned: bool,
+    ) -> Result<(), CustodyStepFailed> {
         let dispatch = TypedCaptureDispatch::new(
             ComputerCapability::ReadState,
             ContainmentRung::PidStructural,
             ObservationState::HumanUnobserved,
         )
-        .dispatch_material(b"computer.read_state".to_vec());
+        .dispatch_material(
+            serde_json::to_vec(&self.summary.grant_identity).map_err(|_| CustodyStepFailed)?,
+        );
         let token = self
             .audit
             .commit_dispatched(reservation, &dispatch, b"app_grant".to_vec(), None)
             .map_err(|_| CustodyStepFailed)?;
+        let result = serde_json::json!({
+            "element_count": self.summary.element_count,
+            "unreadable_count": self.summary.unreadable_count,
+            "image_returned": image_returned,
+        });
         self.audit
             .finalize_dispatched(
                 token,
-                b"captured".to_vec(),
-                self.bundle_identity.clone().into_bytes(),
+                serde_json::to_vec(&result).map_err(|_| CustodyStepFailed)?,
+                self.summary
+                    .grant_identity
+                    .bundle_identity
+                    .clone()
+                    .into_bytes(),
             )
-            .map(|_| ())
-            .map_err(|_| CustodyStepFailed)
-    }
-
-    fn reject(&mut self, reservation: Self::Reservation, reason: ImageUnavailable) {
-        let _ = self
-            .audit
-            .finalize_rejected(reservation, reason.as_str().as_bytes().to_vec());
+            .map_err(|_| CustodyStepFailed)?;
+        self.finalized = true;
+        Ok(())
     }
 }
 

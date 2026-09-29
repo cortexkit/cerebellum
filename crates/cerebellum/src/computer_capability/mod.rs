@@ -815,11 +815,17 @@ where
 
         let source = self.app_state_source.clone();
         let read_grant = grant.clone();
-        let raw = tokio::task::spawn_blocking(move || {
-            source.read_app_state(&read_grant, ReadBounds::default())
+        let (raw, manual_accessibility) = tokio::task::spawn_blocking(move || {
+            let _scope =
+                cerebellum_computer::audit::AccessibilityReadScope::new(read_grant.pid, None);
+            let raw = source.read_app_state(&read_grant, ReadBounds::default());
+            (
+                raw,
+                cerebellum_computer::audit::AccessibilityReadScope::current(),
+            )
         })
         .await
-        .unwrap_or(Err(AppStateReadError::Unreadable));
+        .unwrap_or((Err(AppStateReadError::Unreadable), None));
         let raw = match raw {
             Ok(raw) => raw,
             Err(AppStateReadError::TargetGone) => {
@@ -832,7 +838,20 @@ where
                 return reply;
             }
             Err(error) => {
-                let mut reply = unreadable_application_reply(error);
+                let summary = cerebellum_computer::app_state::ReadStateSummary {
+                    grant_identity: grant.clone(),
+                    element_count: 0,
+                    unreadable_count: 1,
+                };
+                let mut reply = if self
+                    .journal_state_read(identity, summary, manual_accessibility, now_ms, None)
+                    .await
+                    .is_ok()
+                {
+                    unreadable_application_reply(error)
+                } else {
+                    read_audit_unavailable_reply()
+                };
                 admission.decorate(&mut reply);
                 return reply;
             }
@@ -867,70 +886,103 @@ where
                 "omitted_elements": truncation.omitted_elements,
             });
         }
-        if parsed.include_image {
-            match self
-                .window_image(identity, &grant, now_ms, make_backend(&grant))
-                .await
-            {
-                Ok(image) => {
-                    let image_id = sessions.register_image(
-                        &conversation_key,
-                        RegisteredImage {
-                            bundle_identity: grant.bundle_identity.clone(),
-                            pid: grant.pid,
-                            process_generation: grant.process_generation_evidence.clone(),
-                            width_px: image.width_px,
-                            height_px: image.height_px,
-                            mapping: image.mapping,
-                        },
-                    );
-                    reply["image"] = json!({
-                        "image_id": image_id,
-                        "mime": "image/jpeg",
-                        "data_b64": cerebellum_core::serde_base64::encode(&image.jpeg),
-                        "width_px": image.width_px,
-                        "height_px": image.height_px,
-                    });
-                }
-                Err(reason) => {
-                    reply["image_unavailable"] = json!({"reason": reason.as_str()});
-                }
+        fn count_elements(nodes: &[cerebellum_computer::app_state::source::RawElement]) -> usize {
+            nodes
+                .iter()
+                .map(|node| 1 + count_elements(&node.children))
+                .sum()
+        }
+        let summary = cerebellum_computer::app_state::ReadStateSummary {
+            grant_identity: grant.clone(),
+            element_count: count_elements(&raw.roots),
+            unreadable_count: raw.unreadable_subtrees,
+        };
+        match self
+            .journal_state_read(
+                identity,
+                summary,
+                manual_accessibility,
+                now_ms,
+                parsed.include_image.then(|| make_backend(&grant)),
+            )
+            .await
+        {
+            Ok((Some(image), _)) => {
+                let image_id = sessions.register_image(
+                    &conversation_key,
+                    RegisteredImage {
+                        bundle_identity: grant.bundle_identity.clone(),
+                        pid: grant.pid,
+                        process_generation: grant.process_generation_evidence.clone(),
+                        width_px: image.width_px,
+                        height_px: image.height_px,
+                        mapping: image.mapping,
+                    },
+                );
+                reply["image"] = json!({
+                    "image_id": image_id,
+                    "mime": "image/jpeg",
+                    "data_b64": cerebellum_core::serde_base64::encode(&image.jpeg),
+                    "width_px": image.width_px,
+                    "height_px": image.height_px,
+                });
+            }
+            Ok((None, Some(reason))) => {
+                reply["image_unavailable"] = json!({"reason": reason.as_str()});
+            }
+            Ok((None, None)) => {}
+            Err(_) => {
+                let mut refusal = read_audit_unavailable_reply();
+                admission.decorate(&mut refusal);
+                return refusal;
             }
         }
         admission.decorate(&mut reply);
         reply
     }
 
-    /// Capture the target's frontmost window through custody.
-    ///
-    /// Screen Recording is checked first, so a machine without it answers
-    /// with that reason and journals nothing. Past that, the capture runs
-    /// inside the custody sequence: nothing is returned unless custody holds
-    /// the image and its journal record is final.
-    async fn window_image(
+    /// Finalize one text-free state-read row, with or without an image.
+    /// Pixels are released only through custody, after this same row is final.
+    async fn journal_state_read(
         &self,
         identity: JournalIdentity,
-        grant: &cerebellum_computer::platform::ProcessGrant,
+        summary: cerebellum_computer::app_state::ReadStateSummary,
+        manual_accessibility: Option<&'static str>,
         now_ms: u64,
-        backend: B,
-    ) -> Result<ReleasedImage, ImageUnavailable> {
-        if backend.screen_recording_liveness() != PermissionLiveness::Live {
-            return Err(ImageUnavailable::ScreenRecordingNotLive);
-        }
+        backend: Option<B>,
+    ) -> Result<(Option<ReleasedImage>, Option<ImageUnavailable>), ImageUnavailable> {
+        use cerebellum_computer::app_state::image::ImageCustody;
         let audit = self.audit.clone();
-        let grant = grant.clone();
+        let grant = summary.grant_identity.clone();
         let freshness = self.image_freshness_source.clone();
         tokio::task::spawn_blocking(move || {
-            let (repaints, visibility) = freshness.inspect(&grant, None);
-            image_freshness_decision(repaints, visibility)?;
+            let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(
+                grant.pid,
+                manual_accessibility,
+            );
             let mut audit = audit.blocking_lock();
             let mut custody = AuditImageCustody {
                 audit: &mut audit,
                 identity,
                 now_ms,
-                bundle_identity: grant.bundle_identity.clone(),
+                summary,
+                finalized: false,
             };
-            release_through_custody(&mut custody, || {
+            let Some(backend) = backend else {
+                let reservation = custody
+                    .reserve()
+                    .map_err(|_| ImageUnavailable::AuditUnavailable)?;
+                custody
+                    .finalize_read(reservation, false)
+                    .map_err(|_| ImageUnavailable::AuditUnavailable)?;
+                return Ok((None, None));
+            };
+            let image = release_through_custody(&mut custody, || {
+                if backend.screen_recording_liveness() != PermissionLiveness::Live {
+                    return Err(ImageUnavailable::ScreenRecordingNotLive);
+                }
+                let (repaints, visibility) = freshness.inspect(&grant, None);
+                image_freshness_decision(repaints, visibility)?;
                 let mut controller =
                     ScopedCaptureController::with_v1_bounds(backend, grant.clone())
                         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
@@ -969,6 +1021,13 @@ where
                     ),
                     jpeg: captured.frame.jpeg,
                 })
+            });
+            if !custody.finalized {
+                return Err(ImageUnavailable::AuditUnavailable);
+            }
+            Ok(match image {
+                Ok(image) => (Some(image), None),
+                Err(reason) => (None, Some(reason)),
             })
         })
         .await
@@ -992,7 +1051,7 @@ where
         let ServeContext {
             cancel,
             grantee: _,
-            identity: _,
+            identity,
             management,
             consent,
             clock: _,
@@ -1013,21 +1072,33 @@ where
         {
             let predicate = parsed.predicate;
             let timeout_ms = parsed.timeout_ms;
+            let audit = self.audit.clone();
             match tokio::task::spawn_blocking(move || {
-                let mut poller =
-                    PlatformPredicatePoller::new(NativeComputerPlatformDriver::default(), grant);
-                wait_until_predicate(&mut poller, predicate, timeout_ms, &|| {
-                    cancel.is_cancelled()
-                })
+                let _scope =
+                    cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
+                audit.blocking_lock().record_accessibility_read(
+                    identity,
+                    ComputerCapability::Wait,
+                    &grant,
+                    || {
+                        let mut poller = PlatformPredicatePoller::new(
+                            NativeComputerPlatformDriver::default(),
+                            grant.clone(),
+                        );
+                        wait_until_predicate(&mut poller, predicate, timeout_ms, &|| {
+                            cancel.is_cancelled()
+                        })
+                    },
+                )
             })
             .await
             {
-                Ok(result) => {
+                Ok(Ok(result)) => {
                     let mut reply = wait_wire_reply(result);
                     admission.decorate(&mut reply);
                     reply
                 }
-                Err(_) => {
+                Ok(Err(_)) | Err(_) => {
                     wait_indeterminate_reply(None, json!({"reason": "polling_task_unavailable"}))
                 }
             }
@@ -1035,7 +1106,7 @@ where
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = (grant, cancel);
+            let _ = (grant, cancel, identity);
             let mut reply = wait_indeterminate_reply(
                 Some(parsed.predicate),
                 json!({"reason": "scoped_accessibility_read_unsupported"}),
@@ -1559,6 +1630,13 @@ fn unreadable_application_reply(error: AppStateReadError) -> Value {
         "unreadable_subtrees": 1,
         "reason": error.as_str(),
         "remedy": remedy,
+    })
+}
+
+fn read_audit_unavailable_reply() -> Value {
+    json!({
+        "outcome": "audit_unavailable",
+        "remedy": "the module could not record the read, so it withheld the result; retry shortly",
     })
 }
 

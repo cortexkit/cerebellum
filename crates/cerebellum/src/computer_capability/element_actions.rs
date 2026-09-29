@@ -297,6 +297,9 @@ where
     pub audit: &'a mut ComputerAudit<R, T, S>,
     pub identity: JournalIdentity,
     pub capability: ComputerCapability,
+    grant: &'a ProcessGrant,
+    pending: Option<(DispatchCommitmentToken, String)>,
+    recorded: bool,
 }
 
 impl<R, T, S> ElementJournal<'_, R, T, S>
@@ -308,6 +311,7 @@ where
     /// Record a refusal decided after the element was found, before anything
     /// was sent to it.
     fn refused(&mut self, role: &str, outcome: &str) -> Result<(), ()> {
+        self.recorded = true;
         let handle = self
             .audit
             .reserve(self.identity.clone(), descriptor(self.capability))
@@ -315,7 +319,7 @@ where
         self.audit
             .finalize_rejected(
                 handle,
-                json!({"outcome": outcome, "role": role})
+                json!({"outcome": outcome, "role": role, "grant_identity": self.grant})
                     .to_string()
                     .into_bytes(),
             )
@@ -353,14 +357,36 @@ where
     }
 
     fn outcome(&mut self, token: DispatchCommitmentToken, outcome: &str) -> Result<(), ()> {
-        self.audit
-            .finalize_dispatched(
-                token,
-                json!({"outcome": outcome}).to_string().into_bytes(),
-                Vec::new(),
-            )
-            .map(|_| ())
-            .map_err(|_| ())
+        // The post-action diff also reads the tree and may re-enable a renderer.
+        // Finalize after that read so its state change stays on this action's row.
+        self.pending = Some((token, outcome.to_string()));
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), ()> {
+        if let Some((token, outcome)) = self.pending.take() {
+            self.audit
+                .finalize_dispatched(
+                    token,
+                    json!({"outcome": outcome}).to_string().into_bytes(),
+                    Vec::new(),
+                )
+                .map(|_| ())
+                .map_err(|_| ())
+        } else if !self.recorded
+            && cerebellum_computer::audit::AccessibilityReadScope::current().is_some()
+        {
+            self.audit
+                .record_accessibility_read(
+                    self.identity.clone(),
+                    self.capability,
+                    self.grant,
+                    || (),
+                )
+                .map_err(|_| ())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -764,6 +790,14 @@ pub(crate) fn add_diff(
     reply["unreadable_subtrees"] = json!(unreadable_subtrees);
 }
 
+enum PressTarget {
+    Element {
+        element_id: String,
+        handle: ElementHandle,
+    },
+    Point((f64, f64)),
+}
+
 impl<B, R, T, S, D> super::ComputerPlane<B, R, T, S, D>
 where
     B: cerebellum_computer::capture::CaptureBackend + Send + 'static,
@@ -830,8 +864,7 @@ where
                 sessions,
                 ComputerCapability::PressElement,
                 grant,
-                element_id,
-                handle,
+                PressTarget::Element { element_id, handle },
             )
             .await;
         admission.decorate(&mut reply);
@@ -898,35 +931,13 @@ where
         let point = image
             .mapping
             .pixel_to_desktop(parsed.x as f64, parsed.y as f64);
-        let source = self.app_state_source.clone();
-        let hit_grant = grant.clone();
-        let hit = tokio::task::spawn_blocking(move || hit_test(source.as_ref(), &hit_grant, point))
-            .await
-            .unwrap_or(PointHit::Nothing);
-        let PointHit::Element(handle) = hit else {
-            let mut reply = json!({
-                "outcome": "no_element_at_point",
-                "remedy": "nothing of this application is at that point; nothing was pressed and \
-                           the pointer was not used. Read the state again and choose an element",
-            });
-            admission.decorate(&mut reply);
-            return reply;
-        };
-        let element_id = match adopt(&sessions, &conversation_key, &grant, &handle) {
-            Ok(element_id) => element_id,
-            Err(mut refusal) => {
-                admission.decorate(&mut refusal);
-                return refusal;
-            }
-        };
         let mut reply = self
             .press_and_diff(
                 identity,
                 sessions,
                 ComputerCapability::PressPoint,
                 grant,
-                element_id,
-                handle,
+                PressTarget::Point(point),
             )
             .await;
         admission.decorate(&mut reply);
@@ -987,22 +998,24 @@ where
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
         let mut reply = tokio::task::spawn_blocking(move || {
-            let written = {
-                let mut audit = audit.blocking_lock();
-                let mut journal = ElementJournal {
-                    audit: &mut audit,
-                    identity,
-                    capability: ComputerCapability::WriteText,
-                };
-                write_blocking(
-                    source.as_ref(),
-                    &mut journal,
-                    &grant,
-                    &handle,
-                    &parsed,
-                    settle,
-                )
+            let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
+            let mut audit = audit.blocking_lock();
+            let mut journal = ElementJournal {
+                audit: &mut audit,
+                identity,
+                capability: ComputerCapability::WriteText,
+                grant: &grant,
+                pending: None,
+                recorded: false,
             };
+            let written = write_blocking(
+                source.as_ref(),
+                &mut journal,
+                &grant,
+                &handle,
+                &parsed,
+                settle,
+            );
             let mut reply = written;
             if matches!(
                 reply["outcome"].as_str(),
@@ -1016,6 +1029,9 @@ where
                     settle,
                 );
                 add_diff(&mut reply, diff, focused, unreadable);
+            }
+            if journal.finish().is_err() {
+                return audit_unavailable_reply(true);
             }
             reply
         })
@@ -1033,22 +1049,46 @@ where
         sessions: std::sync::Arc<AppStateSessions>,
         capability: ComputerCapability,
         grant: ProcessGrant,
-        element_id: String,
-        handle: ElementHandle,
+        target: PressTarget,
     ) -> Value {
         let audit = self.audit.clone();
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
         tokio::task::spawn_blocking(move || {
-            let mut reply = {
-                let mut audit = audit.blocking_lock();
-                let mut journal = ElementJournal {
-                    audit: &mut audit,
-                    identity: identity.clone(),
-                    capability,
-                };
-                press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle)
+            let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
+            let (element_id, handle) = match target {
+                PressTarget::Element { element_id, handle } => (element_id, handle),
+                PressTarget::Point(point) => {
+                    let hit = hit_test(source.as_ref(), &grant, point);
+                    let found = match hit {
+                        PointHit::Element(handle) => adopt(&sessions, &identity.conversation_key, &grant, &handle)
+                            .map(|id| (id, handle)),
+                        PointHit::Nothing => Err(json!({
+                            "outcome": "no_element_at_point",
+                            "remedy": "nothing of this application is at that point; nothing was pressed and the pointer was not used. Read the state again and choose an element",
+                        })),
+                    };
+                    match found {
+                        Ok(found) => found,
+                        Err(reply) => {
+                            if audit.blocking_lock().record_accessibility_read(identity.clone(), capability, &grant, || ()).is_err() {
+                                return audit_unavailable_reply(false);
+                            }
+                            return reply;
+                        }
+                    }
+                }
             };
+            let mut audit = audit.blocking_lock();
+            let mut journal = ElementJournal {
+                audit: &mut audit,
+                identity: identity.clone(),
+                capability,
+                grant: &grant,
+                pending: None,
+                recorded: false,
+            };
+            let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if reply["outcome"] == "completed" {
                 let (diff, focused, unreadable) = settle_and_observe(
                     source.as_ref(),
@@ -1058,6 +1098,9 @@ where
                     settle,
                 );
                 add_diff(&mut reply, diff, focused, unreadable);
+            }
+            if journal.finish().is_err() {
+                return audit_unavailable_reply(true);
             }
             reply
         })
