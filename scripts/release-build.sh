@@ -189,9 +189,9 @@ export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
 # sheets and menu bar as a text tree with element ids that persist across
 # reads, the diff between reads, and the optional image of its frontmost
 # window taken through capture custody. A new semantic surface, so it has its
-# own review; UNSET until that review is minted, and the row is withheld with
-# a named reason until then. Its identifier is
-# CEREBELLUM_APP_STATE_REVIEW_REVISION.
+# own review, minted in subconscious docs/reviews/app-state-review-v1.md on
+# b3f42392 against ck-cerebellum ca6b54d.
+export CEREBELLUM_APP_STATE_REVIEW_REVISION="app-state-review/v1@b3f42392"
 
 # Acting on an element through accessibility: computer.press_element (AXPress
 # on an element a state read numbered), computer.press_point (a point in a
@@ -199,9 +199,9 @@ export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
 # the same way; the pointer never moves), and computer.write_text (AXValue or
 # AXSelectedText written, then read back). Retained-handle actions are a new
 # semantic surface, apart from reading the tree, so they have their own
-# review; UNSET until it is minted, and the three rows are withheld with a
-# named reason until then. Its identifier is
-# CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION.
+# review, minted in subconscious docs/reviews/element-addressed-review-v1.md
+# on b3f42392 against ck-cerebellum ca6b54d.
+export CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION="element-addressed-review/v1@b3f42392"
 
 # Anything that can take the person's input focus: the takeover pointer rows,
 # and the fronting bracket computer.type and computer.keys use to reach an
@@ -216,8 +216,10 @@ export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
 # (SLEventPostToPid), which reaches a background Chromium or Electron app that
 # the public per-process post does not wake. Fails closed: no fallback to the
 # public route when the private one is missing or its authentication fails.
-# UNSET until its review is minted. Without it, type and keys use the public
-# route only. Its identifier is CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION.
+# Reviewed in subconscious docs/reviews/private-input-route-review-v1.md on
+# b3f42392 against ck-cerebellum ca6b54d; a change to this route's code paths
+# needs a new revision. Without it, type and keys use the public route only.
+export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-review/v1@b3f42392"
 
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
