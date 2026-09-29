@@ -74,7 +74,7 @@ fn describe_computer_field(name: &str, schema: &mut Value) {
         "amount_lines" => {
             return set_description(
                 schema,
-                &format!("Lines to scroll; the sign picks the direction. {TAKEOVER_SCROLL_NOTE}"),
+                &format!("Lines to scroll. Vertical: positive scrolls up toward the top, negative scrolls down. {TAKEOVER_SCROLL_NOTE}"),
             )
         }
         _ => return,
