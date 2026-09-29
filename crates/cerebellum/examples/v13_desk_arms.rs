@@ -3,6 +3,10 @@
 //! `all` or individual arm names select live checks. No Return key is sent.
 //! Missing evidence is not a PASS, including an absent refusal-ring entry.
 
+// Non-macOS executables only print a refusal; the pure helpers still compile
+// and run as unit tests on every platform.
+#![cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
+
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -68,6 +72,7 @@ const REQUIRED_CAPABILITIES: &[&str] = &[
     "computer.write_text",
     "computer.type",
     "computer.keys",
+    "computer.takeover_move",
     "computer.takeover_drag",
     "computer.takeover_scroll",
 ];
@@ -184,6 +189,7 @@ fn decode_journal(bytes: &[u8]) -> Result<BTreeMap<String, Value>, String> {
     }
     Ok(rows)
 }
+#[cfg(target_os = "macos")]
 fn contains_fact(value: &Value, expected: &str) -> bool {
     match value {
         Value::String(s) => s == expected,
@@ -216,34 +222,49 @@ fn fields_named<'a>(
         _ => (),
     }
 }
-fn read_state_facts(row: &Value) -> Result<(), String> {
+fn read_state_facts(entry: &Value) -> Result<(), String> {
     for name in [
         "manual_accessibility",
         "element_count",
         "unreadable_subtrees",
         "image_returned",
     ] {
-        let mut found = Vec::new();
-        fields_named(row, name, "", &mut found);
-        if found.len() != 1 {
-            return Err(format!(
-                "expected exactly one {name}, found {}",
-                found.len()
-            ));
-        }
-        let (path, value) = &found[0];
-        println!("READ FACT {path}={value}");
+        let canonical = entry
+            .get(name)
+            .ok_or_else(|| format!("missing canonical /bytes/{name}"))?;
+        println!("READ FACT /bytes/{name}={canonical}");
         let valid = match name {
-            "manual_accessibility" => {
-                matches!(value.as_str(), Some("newly_enabled" | "already_enabled"))
-            }
-            "element_count" => value.as_u64().is_some_and(|n| n > 0),
-            "unreadable_subtrees" => value.as_u64().is_some(),
-            "image_returned" => **value == false,
+            "manual_accessibility" => matches!(
+                canonical.as_str(),
+                Some("newly_enabled" | "already_enabled")
+            ),
+            "element_count" => canonical.as_u64().is_some_and(|n| n > 0),
+            "unreadable_subtrees" => canonical.as_u64().is_some(),
+            "image_returned" => *canonical == false,
             _ => false,
         };
         if !valid {
-            return Err(format!("invalid Discord read fact {path}={value}"));
+            return Err(format!(
+                "invalid Discord read fact /bytes/{name}={canonical}"
+            ));
+        }
+        let mut copies = Vec::new();
+        fields_named(entry, name, "/bytes", &mut copies);
+        if name == "manual_accessibility" && copies.len() != 1 {
+            return Err("manual_accessibility must occur exactly once".into());
+        }
+        for (path, copy) in copies {
+            if path == format!("/bytes/{name}") {
+                continue;
+            }
+            // The codec mirrors the summary in opaque completed_result bytes;
+            // decoding those bytes must reveal the same facts, not a second story.
+            println!("READ FACT COPY {path}={copy} canonical=/bytes/{name}={canonical}");
+            if !path.starts_with("/bytes/completed_result/") || copy != canonical {
+                return Err(format!(
+                    "unexpected or disagreeing read fact copy {path}={copy}"
+                ));
+            }
         }
     }
     Ok(())
@@ -785,13 +806,17 @@ mod desk {
             .await
         }
         async fn takeover(&mut self) -> Result<(), String> {
-            // A scroll inside scratch TextEdit obtains the real conversation grant.
+            // Moving the pointer raises the takeover consent question; the relay
+            // approves focus and pointer control for this conversation. Move into
+            // scratch TextEdit before scrolling, regardless of the initial pointer position.
             editor_focus()?;
+            let read = self.read(TEXT, true).await?;
+            let point = image_point(&read, 180, 150)?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             let c = self
                 .call(
-                    "computer.takeover_scroll",
-                    json!({"target":TEXT,"axis":"vertical","amount_lines":1}),
+                    "computer.takeover_move",
+                    json!({"image_id":point["image_id"],"to":{"x":180,"y":150}}),
                     "allow_conversation",
                 )
                 .await?;
@@ -976,7 +1001,7 @@ mod desk {
                     })
                     .collect();
                 check(rows.len() == 1, "expected one finalized read_state row")?;
-                read_state_facts(rows[0].1)?;
+                read_state_facts(&rows[0].1["bytes"])?;
                 no_screen_text(rows[0].1, &c.reply)
             }
             // app_state: a remembered deny must block a read before dispatch.
@@ -1665,20 +1690,20 @@ mod tests {
     }
     #[test]
     fn read_facts_require_unique_observed_values() {
-        let good = json!({"completed_result":{"manual_accessibility":"already_enabled","element_count":27,"unreadable_subtrees":0,"image_returned":false}});
+        let good = json!({"manual_accessibility":"already_enabled","element_count":27,"unreadable_subtrees":0,"image_returned":false,"completed_result":{"element_count":27,"unreadable_subtrees":0,"image_returned":false}});
         assert!(read_state_facts(&good).is_ok());
         let mut bad = good.clone();
-        bad["completed_result"]["manual_accessibility"] = json!("failed");
+        bad["manual_accessibility"] = json!("failed");
         assert!(read_state_facts(&bad).is_err());
         let mut missing = good.clone();
-        missing["completed_result"]
-            .as_object_mut()
-            .unwrap()
-            .remove("element_count");
+        missing.as_object_mut().unwrap().remove("element_count");
         assert!(read_state_facts(&missing).is_err());
-        let mut duplicate = good;
-        duplicate["element_count"] = json!(27);
+        let mut duplicate = good.clone();
+        duplicate["completed_result"]["manual_accessibility"] = json!("already_enabled");
         assert!(read_state_facts(&duplicate).is_err());
+        let mut mismatch = good;
+        mismatch["completed_result"]["element_count"] = json!(26);
+        assert!(read_state_facts(&mismatch).is_err());
     }
     #[test]
     fn privacy_scan_detects_screen_text_and_requires_a_reply_witness() {
