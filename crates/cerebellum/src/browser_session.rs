@@ -1179,6 +1179,13 @@ pub struct BrowserSessions {
     shutdown: Arc<Mutex<ShutdownSide>>,
 }
 
+#[derive(Debug)]
+pub enum IdleCloseRefusal {
+    Busy,
+    Presented,
+    Unavailable,
+}
+
 pub enum LaunchSlot {
     Acquired {
         browser_session_id: String,
@@ -2085,6 +2092,42 @@ impl BrowserSessions {
         for cell in self.active_cells_recovering() {
             self.expire_cell(&cell, clock, config);
         }
+    }
+
+    /// Reserve an idle durable session for import before reading its URL or closing it.
+    /// Admission and the terminal transition share the meta lock, so neither a
+    /// driver operation nor a human handoff can begin between them.
+    pub fn close_idle_for_import(
+        &self,
+        route_key: &str,
+        config: &BrowserConfig,
+    ) -> Result<(Value, Option<String>), IdleCloseRefusal> {
+        let cell = self
+            .active_cell(route_key)
+            .map_err(|_| IdleCloseRefusal::Unavailable)?
+            .ok_or(IdleCloseRefusal::Unavailable)?;
+        {
+            let mut meta = cell.meta().map_err(|_| IdleCloseRefusal::Unavailable)?;
+            if meta.handoff_opening || matches!(meta.handoff, Some(HandoffState::Open(_))) {
+                return Err(IdleCloseRefusal::Presented);
+            }
+            if meta.pending_operations != 0 {
+                return Err(IdleCloseRefusal::Busy);
+            }
+            if !meta.admits_calls() || meta.disposition != ProfileDisposition::Durable {
+                return Err(IdleCloseRefusal::Unavailable);
+            }
+            meta.terminal = Some(BrowserSessionTerminalOutcome::Closed);
+        }
+        cell.notify();
+        let url = cell.driver().ok().and_then(|mut driver| {
+            driver
+                .as_mut()?
+                .main_frame_url(route_key, config.navigation_settle_deadline_ms)
+                .ok()
+        });
+        let result = self.close(route_key, &cell.browser_session_id, config);
+        Ok((result, url))
     }
 
     pub fn close(
@@ -3532,6 +3575,82 @@ mod tests {
             "1970-01-01T00:00:10.100Z"
         );
         assert_eq!(lease.deadline(), deadline);
+    }
+
+    #[test]
+    fn import_idle_close_races_operation_admission() {
+        for _ in 0..50 {
+            let sessions = BrowserSessions::default();
+            let clock = FakeClock::new();
+            ready_session(&sessions, &clock, true);
+            let start = std::sync::Barrier::new(2);
+            let done = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let operation = scope.spawn(|| {
+                    start.wait();
+                    let admitted = sessions.accept_dispatch("route", &clock);
+                    done.wait();
+                    admitted
+                });
+                start.wait();
+                let closed = sessions.close_idle_for_import("route", &config());
+                done.wait();
+                match (operation.join().unwrap(), closed) {
+                    (DispatchAdmission::Accepted(guard), Err(IdleCloseRefusal::Busy)) => {
+                        guard.finish();
+                        assert_eq!(
+                            sessions.status("route", &clock, UNIX_EPOCH)["outcome"],
+                            "ready"
+                        );
+                    }
+                    (
+                        DispatchAdmission::NoSession | DispatchAdmission::LaunchPending,
+                        Ok((reply, _)),
+                    ) => {
+                        assert_eq!(reply["outcome"], "closed");
+                        assert_eq!(
+                            sessions.status("route", &clock, UNIX_EPOCH)["outcome"],
+                            "terminal"
+                        );
+                    }
+                    _ => panic!("admission and idle close must have exactly one winner"),
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn import_idle_close_races_present() {
+        for _ in 0..50 {
+            let sessions = BrowserSessions::default();
+            let clock = FakeClock::new();
+            handoff_session(&sessions, &clock);
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let presentation = scope.spawn(|| {
+                    start.wait();
+                    sessions.present("route", "https://login.example", 100, &clock)
+                });
+                start.wait();
+                let closed = sessions.close_idle_for_import("route", &config());
+                match (presentation.join().unwrap(), closed) {
+                    (Ok(_), Err(IdleCloseRefusal::Presented)) => {
+                        assert_eq!(
+                            sessions.status("route", &clock, UNIX_EPOCH)["outcome"],
+                            "ready"
+                        );
+                    }
+                    (Err(PresentRefusal::NoSession), Ok((reply, _))) => {
+                        assert_eq!(reply["outcome"], "closed");
+                        assert_eq!(
+                            sessions.status("route", &clock, UNIX_EPOCH)["outcome"],
+                            "terminal"
+                        );
+                    }
+                    _ => panic!("present and idle close must have exactly one winner"),
+                }
+            });
+        }
     }
 
     #[test]

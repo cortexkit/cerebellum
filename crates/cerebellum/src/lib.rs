@@ -2858,7 +2858,15 @@ async fn handle_management_request(
             .await;
         }
         let reply = if method == management::IMPORT_LOGIN {
-            import_browser_login(planes, facts, writer, channel, epoch, origin).await
+            let reply =
+                import_browser_login(planes, facts, writer, channel, epoch, corr, origin).await;
+            match planes.browser.finish_reply(method, reply) {
+                Ok(reply) => reply,
+                Err(error) => return send_route_error(writer, ver, channel, epoch, corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!("the import reply violated its declared result schema ({error}); the import may already have completed, so do not retry based on this response"),
+                ).await,
+            }
         } else {
             present_browser_handoff(planes, &facts.identity, origin).await
         };
@@ -3380,16 +3388,11 @@ async fn import_browser_login(
     writer: &mpsc::Sender<Frame>,
     channel: u16,
     epoch: u32,
+    corr: u64,
     origin: &str,
 ) -> Value {
-    let status = planes.sessions.status(
-        &facts.identity.conversation_key,
-        planes.lease_clock.as_ref(),
-        std::time::SystemTime::now(),
-    );
-    let session_open = status.get("outcome").and_then(Value::as_str) == Some("ready");
     let durable = facts.identity.profile_disposition == ProfileDisposition::Durable;
-    if let Err(result) = login_import::profile_precondition(origin, durable, session_open) {
+    if let Err(result) = login_import::profile_precondition(origin, durable) {
         return journal_login_import_result(planes, &facts.identity, *result).await;
     }
     if !facts.declares_elicitation() {
@@ -3455,7 +3458,16 @@ async fn import_browser_login(
         }
     };
 
-    complete_login_import(planes, facts, writer, channel, epoch, plan).await
+    complete_login_import(
+        planes,
+        facts,
+        writer,
+        channel,
+        epoch,
+        plan,
+        planes.cancellations.get((channel, epoch, corr)),
+    )
+    .await
 }
 
 async fn complete_login_import(
@@ -3465,19 +3477,19 @@ async fn complete_login_import(
     channel: u16,
     epoch: u32,
     plan: login_import::LoginImportPlan,
+    cancel: Option<CancelHandle>,
 ) -> Value {
     let ask_id = login_import::new_ask_id();
     let question = plan.question(&ask_id, &facts.identity.agent_project_id);
-    let answer = planes
-        .elicitor
-        .ask(
-            writer,
-            channel,
-            epoch,
-            question,
-            login_import::ELICITATION_DEADLINE,
-        )
-        .await;
+    let answer = tokio::select! {
+        answer = planes.elicitor.ask(writer, channel, epoch, question, login_import::ELICITATION_DEADLINE) => answer,
+        () = async {
+            match &cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => elicit::AskOutcome::NoAnswer,
+    };
     let decision = match &answer {
         elicit::AskOutcome::Answered(body) => body.get("decision").and_then(Value::as_str),
         // None of the three permits a transfer, and they are listed rather than
@@ -3486,19 +3498,87 @@ async fn complete_login_import(
         | elicit::AskOutcome::NotPutToAnyone
         | elicit::AskOutcome::Undeliverable => None,
     };
-    if decision.is_some_and(|value| value.starts_with("transfer:")) {
+    let decision = if cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
+        None
+    } else {
+        decision
+    };
+    let mut reopen = None;
+    if plan.permits_transfer(decision) {
         let status = planes.sessions.status(
             &facts.identity.conversation_key,
             planes.lease_clock.as_ref(),
             std::time::SystemTime::now(),
         );
         if status.get("outcome").and_then(Value::as_str) == Some("ready") {
-            let result = plan.refusal("session_open", "browser.close");
-            return journal_login_import_result(planes, &facts.identity, result).await;
+            let Some(config) = planes.browser_config.as_ref() else {
+                return journal_login_import_result(
+                    planes,
+                    &facts.identity,
+                    plan.refusal("session_open", "browser.close"),
+                )
+                .await;
+            };
+            match planes
+                .sessions
+                .close_idle_for_import(&facts.identity.conversation_key, config)
+            {
+                Ok((closed, url)) if closed["outcome"] == "closed" => {
+                    reopen = Some(url);
+                    planes.browser.end_context(&facts.identity, false).await;
+                }
+                _ => {
+                    return journal_login_import_result(
+                        planes,
+                        &facts.identity,
+                        plan.refusal("session_open", "browser.close"),
+                    )
+                    .await
+                }
+            }
         }
     }
     let result = plan.decide(decision);
-    journal_login_import_result(planes, &facts.identity, result).await
+    let mut reply = journal_login_import_result(planes, &facts.identity, result).await;
+    if let Some(url) = reopen {
+        // Even a failed copy must not leave a session we closed unnecessarily down.
+        let launched =
+            handle_browser_control(browser_session::BROWSER_LAUNCH, &json!({}), facts, planes)
+                .await;
+        if launched["outcome"] == "launched" {
+            let mut restored_url = None;
+            if let Some(url) = url {
+                if let Some(origin) = classification::canonical_origin_from_url(&url) {
+                    let granted = planes
+                        .management
+                        .browser_grants()
+                        .lock()
+                        .await
+                        .select_covering_grant(
+                            &facts.identity.conversation_key,
+                            authorization::Severity::new(1, false, false),
+                            &origin,
+                        )
+                        .is_ok();
+                    if granted {
+                        let navigation = planes.browser.serve(&facts.identity, browser::BrowserCapability::Navigate,
+                            &json!({"url":url,"intent":"Restore the page after importing login","severity":{"tier":1,"credential":false,"financial":false},"wait":"settle"})).await;
+                        if let Ok(navigation) = navigation {
+                            if matches!(navigation["outcome"].as_str(), Some("ok" | "not_settled"))
+                            {
+                                restored_url = navigation["url_final"].as_str().map(str::to_string);
+                            }
+                        }
+                    }
+                }
+            }
+            reply["relaunched"] = json!({"browser_session_id":launched["browser_session_id"],"restored_url":restored_url});
+        } else {
+            reply["relaunched"] = Value::Null;
+            reply["detail"] = launched;
+        }
+    }
+    reply
 }
 
 async fn journal_login_import_result(
@@ -7729,7 +7809,8 @@ mod drain_tests {
             let writer = writer.clone();
             Box::pin(async move {
                 let facts = planes.routes.get(1, 1).unwrap();
-                let result = complete_login_import(&planes, &facts, &writer, 1, 1, plan).await;
+                let result =
+                    complete_login_import(&planes, &facts, &writer, 1, 1, plan, None).await;
                 result_tx.send(result).unwrap();
             })
         }));
