@@ -4158,3 +4158,326 @@ async fn an_action_after_a_same_document_fragment_change_still_dispatches() {
         commands.lock().unwrap()
     );
 }
+
+async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, &launcher.page, "https://page.example").await;
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 9,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: Some(vec!["elicitation".into()]),
+        admission_facts: Some(
+            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
+        ),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        800,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame, &tx, &planes)
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+    (planes, launcher)
+}
+
+fn blocking_navigation(tier: u8) -> Frame {
+    request(
+        801,
+        "browser.navigate",
+        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":tier,"credential":false,"financial":false}}),
+    )
+}
+
+async fn consent_frame(rx: &mut mpsc::Receiver<Frame>) -> Frame {
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("prompt reply")
+        .unwrap()
+}
+
+async fn answer_browser(
+    planes: &Planes,
+    tx: &mpsc::Sender<Frame>,
+    question: &Frame,
+    decision: &str,
+) {
+    let answer = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        9,
+        3,
+        question.header.corr,
+        serde_json::to_vec(&json!({"decision":decision})).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(answer, tx, planes)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_allow_continues_same_navigation() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+        .await
+        .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let body: Value = serde_json::from_slice(&question.body).unwrap();
+    assert_eq!(
+        body["params"]["origins"],
+        json!(["https://requested.example"])
+    );
+    assert!(launcher.effects.lock().unwrap().is_empty());
+    answer_browser(&planes, &tx, &question, "allow").await;
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(reply.header.corr, 801);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "ok", "{body}");
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
+    assert!(rx.try_recv().is_err(), "only one question and one reply");
+    assert_eq!(planes.elicitor.outstanding(), 0);
+    assert!(planes.browser.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_deny_never_navigates() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+        .await
+        .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    answer_browser(&planes, &tx, &question, "deny").await;
+    let reply = consent_frame(&mut rx).await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "authorization_denied", "{body}");
+    assert_eq!(body["detail"]["decision"], "declined", "{body}");
+    assert!(
+        launcher.effects.lock().unwrap().is_empty(),
+        "no CDP navigation after deny"
+    );
+    assert!(rx.try_recv().is_err(), "no second question");
+    assert!(planes.browser.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_timeout_keeps_late_answer() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_browser_consent_deadline_for_test(
+        blocking_navigation(1),
+        &tx,
+        &planes,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let reply = consent_frame(&mut rx).await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "consent_pending", "{body}");
+    assert!(body["ask_id"].as_str().is_some());
+    assert!(launcher.effects.lock().unwrap().is_empty());
+    answer_browser(&planes, &tx, &question, "allow").await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while planes.management.browser_grant_count().await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+        .await
+        .unwrap();
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(reply.header.ty, FrameType::Response, "no second question");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap()["outcome"],
+        "ok"
+    );
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
+    assert!(rx.try_recv().is_err());
+    assert!(planes.browser.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_cancel_releases_registry() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let baseline = planes.elicitor.outstanding();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+        .await
+        .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    assert_eq!(planes.elicitor.outstanding(), baseline + 1);
+    let mut cancel = blocking_navigation(1);
+    cancel.header.ty = FrameType::Cancel;
+    cancel.body.clear();
+    cerebellum::handle_frame_for_test(cancel, &tx, &planes)
+        .await
+        .unwrap();
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap()["detail"]["decision"],
+        "cancelled"
+    );
+    assert_eq!(planes.elicitor.outstanding(), baseline);
+    answer_browser(&planes, &tx, &question, "allow").await;
+    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_wait_releases_session_locks() {
+    let (planes, _) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+        .await
+        .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let subc_protocol::session::ModuleControlResponse::HealthCheck {
+        metrics: Some(metrics),
+        ..
+    } = planes.health.report()
+    else {
+        panic!("health metrics");
+    };
+    assert_eq!(metrics["inFlightActions"], 0);
+    assert_eq!(metrics["awaitingConsent"], 1);
+    let status = tokio::time::timeout(
+        Duration::from_secs(1),
+        invoke_existing(&planes, 802, "browser.status", json!({})),
+    )
+    .await
+    .expect("status must not wait on consent");
+    assert_eq!(status.header.ty, FrameType::Response);
+    // Status reads the session table; also probe the CDP serialization lane so
+    // future calls on this conversation cannot be stalled behind the question.
+    let lane = tokio::time::timeout(
+        Duration::from_secs(1),
+        planes.browser.lane_for_test("test-session"),
+    )
+    .await
+    .expect("conversation lane must not wait on consent");
+    drop(lane);
+    answer_browser(&planes, &tx, &question, "deny").await;
+    consent_frame(&mut rx).await;
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_unfixable_refusals_never_ask() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(blocking_navigation(5), &tx, &planes)
+        .await
+        .unwrap();
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(reply.header.ty, FrameType::Response, "tier 5 must not ask");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap()["outcome"],
+        "authorization_denied"
+    );
+    launcher.page.commit("about:blank");
+    cerebellum::handle_frame_for_test(request(803, "browser.snapshot", json!({})), &tx, &planes)
+        .await
+        .unwrap();
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "null origin must not ask"
+    );
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["detail"]["attempted_origin"], "null", "{body}");
+    assert!(rx.try_recv().is_err());
+    assert_eq!(planes.elicitor.outstanding(), 0);
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn blocking_browser_grant_goodbye_and_drain_withdraw_even_after_timeout() {
+    for timed_out in [false, true] {
+        for draining in [false, true] {
+            let (planes, _) = blocking_grant_fixture().await;
+            let (tx, mut rx) = mpsc::channel(8);
+            if timed_out {
+                cerebellum::handle_browser_consent_deadline_for_test(
+                    blocking_navigation(1),
+                    &tx,
+                    &planes,
+                    Duration::from_millis(20),
+                )
+                .await
+                .unwrap();
+            } else {
+                cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+                    .await
+                    .unwrap();
+            }
+            let question = consent_frame(&mut rx).await;
+            assert_eq!(question.header.ty, FrameType::Request);
+            if timed_out {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&consent_frame(&mut rx).await.body).unwrap()
+                        ["outcome"],
+                    "consent_pending"
+                );
+            }
+            let ending = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                if draining {
+                    FrameType::Push
+                } else {
+                    FrameType::Goodbye
+                },
+                Flags::new(false, Priority::Interactive, false),
+                if draining { 0 } else { 9 },
+                if draining { 0 } else { 3 },
+                0,
+                serde_json::to_vec(
+                    &json!({"op":"module.draining", "reason":"restart", "deadline_ms":123}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            cerebellum::handle_frame_for_test(ending, &tx, &planes)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while planes.elicitor.outstanding() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ending must withdraw the question");
+            answer_browser(&planes, &tx, &question, "allow").await;
+            assert_eq!(planes.management.browser_grant_count().await, 0);
+        }
+    }
+}

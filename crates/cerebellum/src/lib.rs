@@ -1105,6 +1105,7 @@ pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
 #[derive(Clone, Default)]
 pub struct RouteBindings {
     inner: Arc<RwLock<HashMap<(u16, u32), AcceptedBindFacts>>>,
+    removed: Arc<tokio::sync::Notify>,
 }
 
 impl RouteBindings {
@@ -1126,10 +1127,27 @@ impl RouteBindings {
     }
 
     fn remove(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
-        self.inner
+        let facts = self
+            .inner
             .write()
             .ok()
-            .and_then(|mut routes| routes.remove(&(channel, epoch)))
+            .and_then(|mut routes| routes.remove(&(channel, epoch)));
+        self.removed.notify_waiters();
+        facts
+    }
+
+    async fn closed(&self, channel: u16, epoch: u32) {
+        loop {
+            let removed = self.removed.notified();
+            tokio::pin!(removed);
+            // Subscribe before checking so an unbind between the check and the
+            // wait cannot leave a detached grant question alive on a dead route.
+            removed.as_mut().enable();
+            if self.get(channel, epoch).is_none() {
+                return;
+            }
+            removed.await;
+        }
     }
 
     /// Whether any bound route carries this conversation. Two routes may carry
@@ -1631,9 +1649,20 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let consent_shutdown = ConsentShutdown(Arc::clone(&planes.drain_signal));
     let connection_result = run_connection(read_half, write_half, config, planes).await;
+    drop(consent_shutdown);
     teardown.run_or_join().await;
     connection_result
+}
+
+/// Release consent waits even when SIGTERM drops the connection future.
+struct ConsentShutdown(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Drop for ConsentShutdown {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
 }
 
 async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, ModuleError> {
@@ -3817,7 +3846,6 @@ async fn handle_tool_request(
     planes: &Planes,
 ) -> Result<(), ModuleError> {
     let route_bindings = &planes.routes;
-    let browser_plane = &planes.browser;
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
@@ -4202,9 +4230,21 @@ async fn handle_tool_request(
         )
         .await;
     };
-    let result = browser_plane
-        .serve(&accepted_facts.identity, capability, arguments)
-        .await;
+    let result = serve_browser_with_consent(
+        planes,
+        &accepted_facts,
+        writer,
+        (channel, epoch, corr),
+        capability,
+        arguments,
+        BROWSER_CONSENT_PARK_LIMIT
+            .try_with(|limit| *limit)
+            .unwrap_or(Duration::from_secs(120)),
+    )
+    .await;
+    if planes.routes.get(channel, epoch).is_none() {
+        return Ok(());
+    }
     match result {
         Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
         Err(error) => {
@@ -4222,6 +4262,141 @@ async fn handle_tool_request(
                 ),
             )
             .await
+        }
+    }
+}
+
+tokio::task_local! {
+    static BROWSER_CONSENT_PARK_LIMIT: Duration;
+}
+
+/// Exercise the production dispatch with a shorter inline wait, without changing
+/// the lifetime of the question that must still accept a late answer.
+#[doc(hidden)]
+pub async fn handle_browser_consent_deadline_for_test(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    deadline: Duration,
+) -> Result<(), ModuleError> {
+    BROWSER_CONSENT_PARK_LIMIT
+        .scope(
+            deadline,
+            handle_tool_request_for_test_with_existing_planes(frame, writer, planes),
+        )
+        .await
+}
+
+/// Ask only after dispatch has returned its refusal and released its conversation
+/// lane and session operation guard. A person reading a question must not block
+/// another request or the session's idle sweep.
+async fn serve_browser_with_consent(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    writer: &mpsc::Sender<Frame>,
+    request: (u16, u32, u64),
+    capability: browser::BrowserCapability,
+    arguments: &Value,
+    park_limit: Duration,
+) -> Result<Value, cerebellum_computer::platform::vocabulary::CapabilityResultValidationError> {
+    let mut reply = planes
+        .browser
+        .serve(&facts.identity, capability, arguments)
+        .await?;
+    let Some(scope) = reply.pointer("/detail/grant_request") else {
+        return Ok(reply);
+    };
+    if !facts.declares_elicitation() {
+        return Ok(reply);
+    }
+    let Some(cancel) = planes.cancellations.get(request) else {
+        return Ok(reply);
+    };
+    let origins = scope["origins"].as_array().and_then(|values| {
+        values
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+    });
+    let hazards = scope["hazards"].as_array().and_then(|values| {
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .and_then(authorization::HazardClass::from_wire)
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let tier = scope["severity_tier"]
+        .as_u64()
+        .and_then(|tier| u8::try_from(tier).ok());
+    let (Some(origins), Some(hazards), Some(tier)) = (origins, hazards, tier) else {
+        return Ok(reply);
+    };
+    let Ok((mut pending, Some(question))) = planes
+        .management
+        .open_browser_grant_at_tier(
+            &facts.identity.conversation_key,
+            origins,
+            hazards,
+            Some(tier),
+            true,
+        )
+        .await
+    else {
+        return Ok(reply);
+    };
+    let elicitor = Arc::clone(&planes.elicitor);
+    let management = Arc::clone(&planes.management);
+    let writer = writer.clone();
+    let mut drain = planes.drain_signal.subscribe();
+    let routes = Arc::clone(&planes.routes);
+    let (channel, epoch, _) = request;
+    // Keep the question alive after the call's wait expires so a late approval
+    // still creates the browser grant. Cancellation, route closure and shutdown
+    // instead remove the pending question from the answer registry.
+    let mut settlement = tokio::spawn(async move {
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => (None, "cancelled"),
+            _ = routes.closed(channel, epoch) => (None, "route_closed"),
+            _ = drain.wait_for(|draining| *draining) => (None, "draining"),
+            outcome = elicitor.ask(&writer, channel, epoch, question.body, question.deadline) => (Some(outcome), "unavailable"),
+        };
+        let answer = match &outcome.0 {
+            Some(elicit::AskOutcome::Answered(answer)) => Some(answer),
+            _ => None,
+        };
+        let settled = management
+            .settle_browser_grant(&question.ask_id, answer)
+            .await;
+        match answer.and_then(|answer| answer["decision"].as_str()) {
+            Some("allow") if settled => "allow",
+            Some("deny") => "declined",
+            _ => outcome.1,
+        }
+    });
+    let guard = elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
+    let parked = guard.as_ref().map(|guard| guard.park_on_consent());
+    let answer = tokio::time::timeout(park_limit, &mut settlement).await;
+    drop(parked);
+    match answer {
+        Ok(Ok("allow")) => {
+            // Re-enter normal authorization, rather than treating the answer as
+            // authority: the session or its origin may have changed meanwhile.
+            planes
+                .browser
+                .serve(&facts.identity, capability, arguments)
+                .await
+        }
+        Ok(decision) => {
+            reply["detail"]["decision"] = json!(decision.unwrap_or("unavailable"));
+            planes.browser.finish_reply(capability.name(), reply)
+        }
+        Err(_) => {
+            pending["context"] = reply["context"].clone();
+            planes.browser.finish_reply(capability.name(), pending)
         }
     }
 }

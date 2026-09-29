@@ -3961,6 +3961,7 @@ fn refusal_detail_schema() -> Value {
     closed_object(
         json!({
             "field":string_schema(),
+            "decision":string_schema(),
             "reason_code":string_schema(),
             "reason":string_schema(),
             "attempted_origin":string_schema(),
@@ -4053,6 +4054,7 @@ fn browser_result_outcome_schema() -> Value {
         "invalid_coordinates",
         "image_too_large",
         "authorization_denied",
+        "consent_pending",
         "hazard_not_disclosed",
         "navigation_policy_rejected",
         "navigation_failed",
@@ -4074,6 +4076,19 @@ fn reply_schema(mut properties: Value, required: &[&str]) -> Value {
     properties.insert("context".into(), context_result_schema());
     properties.insert("origin".into(), string_schema());
     properties.insert("expires_in_ms".into(), integer_schema());
+    properties.insert("ask_id".into(), string_schema());
+    properties.insert("origins".into(), string_array_schema());
+    properties.insert("hazards".into(), string_array_schema());
+    properties.insert(
+        "severity_ceiling".into(),
+        closed_object(
+            json!({
+                "tier":integer_schema(), "credential":boolean_schema(),
+                "financial":boolean_schema(), "name":string_schema(),
+            }),
+            &["tier", "credential", "financial", "name"],
+        ),
+    );
     properties.insert(
         "stage".into(),
         enum_schema(&[crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
