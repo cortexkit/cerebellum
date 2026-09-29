@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_protocol::manifest::{ExecutionMode, ProviderRole};
+use subc_protocol::manifest::ProviderRole;
 use subc_protocol::session::{
     ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -802,15 +802,19 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     }) else {
         panic!("cerebellum must register as a tool provider");
     };
-    // The vocabulary mirrors come from checked-in release artifacts, so their
-    // release gates can enable `computer.wait` without external attestations.
-    // Other computer rows remain suppressed because their required compile-time
-    // attestations are still unbound.
-    assert_eq!(tools.len(), 2);
-    assert_eq!(tools[0].name, "computer.wait");
-    assert_eq!(tools[0].execution_mode, ExecutionMode::Pure);
-    assert_eq!(tools[1].name, "computer_use");
-    assert_eq!(tools[1].execution_mode, ExecutionMode::Unfenceable);
+    // A build with no review keys bound admits no computer row: every tree
+    // read waits for the app_state review, and typing for the input review.
+    // So there is no computer tool, and no flat computer_use tool either,
+    // because that tool is derived from the admitted computer rows. The
+    // browser tools are absent too, because no browser is configured.
+    assert!(
+        tools.is_empty(),
+        "a build with no reviews bound must register no tools: {:?}",
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+    );
 
     let route = open_live_route(&mut client, 2).await;
 
@@ -911,13 +915,18 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "browser.screenshot",
         "browser.click_point",
         "browser_use",
-        "computer_use",
     ] {
         assert!(
             registered.contains(&expected),
             "the daemon's catalogue is missing {expected}: {registered:?}"
         );
     }
+    // This build binds no review keys, so it admits no computer row and has
+    // no flat computer_use tool to offer.
+    assert!(
+        registered.iter().all(|name| !name.starts_with("computer")),
+        "a build with no reviews bound offered a computer tool: {registered:?}"
+    );
 
     // These two are intentionally absent rather than accidentally omitted.
     // browser.type refuses any target it classifies as credential- or
@@ -935,13 +944,13 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "the daemon's catalogue offers {withheld}, which has no dispatch route: {registered:?}"
     );
 
-    // The sibling test asserts this catalogue carries exactly two tools when no
-    // browser is configured. Asserting the count here too is what makes the two
-    // tests measure a DIFFERENCE rather than each measuring its own world.
+    // The sibling test asserts this catalogue carries no tools when no browser
+    // is configured. Asserting the count here too is what makes the two tests
+    // measure a DIFFERENCE rather than each measuring its own world.
     assert_eq!(
         registered.len(),
-        11,
-        "expected eight browser tools, both flat adapters, and computer.wait: {registered:?}"
+        9,
+        "expected eight browser tools and the flat browser_use adapter: {registered:?}"
     );
 
     // Close the client before the daemon and module guards are dropped so the
