@@ -4297,9 +4297,33 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     assert_eq!(question.header.ty, FrameType::Request);
     let body: Value = serde_json::from_slice(&question.body).unwrap();
     assert_eq!(
-        body["params"]["origins"],
+        body["params"]["scope"]["origins"],
         json!(["https://requested.example"])
     );
+    let p = &body["params"];
+    assert_eq!(p["kind"], "consent");
+    assert_eq!(
+        p["target"],
+        json!({"kind": "site", "label": "requested.example"})
+    );
+    assert_eq!(p["default"], "deny");
+    assert_eq!(p["on_expiry"], "deny");
+    assert_eq!(p["expires_in_ms"], 1_800_000);
+    assert_eq!(
+        p["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["allow", "deny"]
+    );
+    assert_eq!(
+        p["requestedSchema"]["properties"]["decision"]["enum"],
+        json!(["allow", "deny"])
+    );
+    assert_eq!(p["options"][0]["effect"], "grant");
+    assert_eq!(p["options"][1]["effect"], "decline");
     assert!(launcher.effects.lock().unwrap().is_empty());
     answer_browser(&planes, &tx, &question, "allow").await;
     let reply = consent_frame(&mut rx).await;

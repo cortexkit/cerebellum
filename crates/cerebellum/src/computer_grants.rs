@@ -1766,7 +1766,11 @@ fn question_body(
     let (title, prompt, target, deadline) = match need {
         GrantNeed::App { display_name, .. } => (
             format!("Allow access to {display_name}?"),
-            "Covers reading and acting inside this application.".to_string(),
+            if signature_changed {
+                "This application's code signature has changed since it was approved. Covers reading and acting inside this application.".to_string()
+            } else {
+                "Covers reading and acting inside this application.".to_string()
+            },
             Target { kind: TargetKind::App, label: display_name.clone() }, APP_QUESTION_DEADLINE,
         ),
         GrantNeed::Takeover => (

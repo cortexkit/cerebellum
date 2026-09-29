@@ -1106,6 +1106,54 @@ async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
         "the changed requirement was not asked about"
     );
     assert!(question_message(&questions[3]).contains(SIGNATURE_CHANGED));
+    for (kind, question, ids) in [
+        (
+            "signature-changed conversation app",
+            &questions[1],
+            &["allow_conversation", "deny"][..],
+        ),
+        (
+            "signature-changed persistent app",
+            &questions[3],
+            &["allow_conversation", "allow_always", "deny"][..],
+        ),
+    ] {
+        let p = &question["params"];
+        assert_eq!(p["kind"], "consent", "{kind}");
+        assert_eq!(p["target"]["kind"], "app", "{kind}");
+        assert!(
+            p["prompt"].as_str().unwrap().contains(SIGNATURE_CHANGED),
+            "{kind}"
+        );
+        assert_eq!(p["default"], "deny", "{kind}");
+        assert_eq!(p["on_expiry"], "deny", "{kind}");
+        assert_eq!(p["expires_in_ms"], 1_800_000, "{kind}");
+        let options = p["options"].as_array().unwrap();
+        assert_eq!(
+            options
+                .iter()
+                .map(|o| o["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ids,
+            "{kind}"
+        );
+        assert_eq!(
+            p["requestedSchema"]["properties"]["decision"]["enum"],
+            json!(ids),
+            "{kind}"
+        );
+        for option in options {
+            assert_eq!(
+                option["effect"],
+                if option["id"] == "deny" {
+                    "decline"
+                } else {
+                    "grant"
+                },
+                "{kind}"
+            );
+        }
+    }
     assert!(!grants.holds(&attested, &need_for(&code)));
     assert_eq!(
         storage.load().unwrap().records.len(),
