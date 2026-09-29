@@ -714,7 +714,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
     /// Classify one click target. The outer error is a transport failure that
     /// ends the action; the inner one is a named reason the target could not be
-    /// classified, which authorization treats as the strongest hazard.
+    /// classified, so callers can refuse without claiming that credential or
+    /// payment fields were observed.
     fn classify_click_before<C: NavigationClock>(
         &mut self,
         context_key: &str,

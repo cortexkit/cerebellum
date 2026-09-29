@@ -3490,7 +3490,7 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
     );
     assert_eq!(
         clicked["lifecycle"],
-        json!(["navigation_started", "load", "network_quiet"]),
+        json!({"events":["navigation_started", "load", "network_quiet"],"loaded":true,"settled":true}),
         "{clicked}"
     );
     assert_eq!(clicked["http_status"], 200, "{clicked}");
@@ -3688,7 +3688,7 @@ async fn a_click_whose_dialog_is_dismissed_reports_the_dialog_and_no_navigation(
     );
     assert_eq!(
         clicked["lifecycle"],
-        json!(["javascript_dialog_opened", "javascript_dialog_dismissed"]),
+        json!({"events":[],"loaded":false,"settled":false}),
         "{clicked}"
     );
     assert_eq!(clicked["navigation"], "none_observed", "{clicked}");

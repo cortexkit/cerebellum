@@ -2900,7 +2900,7 @@ impl BrowserPlane {
                 json!({
                     "outcome":"ok",
                     "navigation":"not_committed",
-                    "lifecycle":tracker.lifecycle,
+                    "lifecycle":{"events":[],"loaded":false,"settled":false},
                 })
             }
             ClickNavigation::MainFrame(tracker) => {
@@ -2916,7 +2916,7 @@ impl BrowserPlane {
                         .replace(DocumentTransition::TopLevelDocumentReplaced);
                     context.tracker = (*tracker).clone();
                 }
-                let mut response = navigation_reply(&tracker, true);
+                let mut response = navigate_reply(&tracker, true);
                 let object = response
                     .as_object_mut()
                     .expect("navigation response is an object");
@@ -2960,14 +2960,11 @@ impl BrowserPlane {
             if object.get("outcome") == Some(&json!("ok")) {
                 object.insert("outcome".into(), json!("javascript_dialog_dismissed"));
             }
-            let mut lifecycle = vec![
-                json!("javascript_dialog_opened"),
-                json!("javascript_dialog_dismissed"),
-            ];
-            if let Some(Value::Array(navigation_lifecycle)) = object.remove("lifecycle") {
-                lifecycle.extend(navigation_lifecycle);
-            }
-            object.insert("lifecycle".into(), Value::Array(lifecycle));
+            // Dialog details have their own field. Lifecycle describes document
+            // navigation consistently, even when a dialog opened without one.
+            object
+                .entry("lifecycle")
+                .or_insert_with(|| json!({"events":[],"loaded":false,"settled":false}));
             object.insert(
                 "dialogs".into(),
                 dialogs
@@ -4205,15 +4202,22 @@ fn embedded_read_page_schema() -> Value {
     closed_object(properties.into(), &["outcome"])
 }
 
+fn navigation_lifecycle_schema() -> Value {
+    closed_object(
+        json!({
+            "events":string_array_schema(),
+            "loaded":boolean_schema(),
+            "settled":boolean_schema(),
+        }),
+        &["events", "loaded", "settled"],
+    )
+}
+
 fn navigate_result_schema() -> Value {
     reply_schema(
         json!({
             "url_final":nullable_string_schema(),
-            "lifecycle":closed_object(json!({
-                "events":string_array_schema(),
-                "loaded":{"type":"boolean"},
-                "settled":{"type":"boolean"}
-            }), &["events", "loaded", "settled"]),
+            "lifecycle":navigation_lifecycle_schema(),
             "http_status":integer_schema(),
             "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
             "read_page":embedded_read_page_schema(),
@@ -4233,7 +4237,7 @@ fn click_result_schema() -> Value {
             "navigation_window_ms":integer_schema(),
             "activated_element":closed_object(json!({"identity":string_schema(),"kind":string_schema()}), &["identity","kind"]),
             "url_final":nullable_string_schema(),
-            "lifecycle":string_array_schema(),
+            "lifecycle":navigation_lifecycle_schema(),
             "http_status":integer_schema(),
             "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
             "landing_origin":string_schema(),
@@ -5356,6 +5360,38 @@ mod tests {
     }
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn click_and_navigate_share_loaded_but_unsettled_lifecycle() {
+        let plane = BrowserPlane::new();
+        let route = identity();
+        plane.open_context(route.clone()).await.unwrap();
+        let mut tracker = Tracker {
+            url_final: Some("https://example.test/page".into()),
+            ..Tracker::default()
+        };
+        tracker.load(Instant::now());
+        let expected = json!({"events":["load"],"loaded":true,"settled":false});
+        assert_eq!(navigate_reply(&tracker, true)["lifecycle"], expected);
+        let reply = plane
+            .click_reply(
+                &route,
+                crate::browser_session::BrowserClickOutcome::Clicked {
+                    position: crate::browser_session::BrowserClickPosition {
+                        x_css: 1.0,
+                        y_css: 1.0,
+                    },
+                    navigation: crate::browser_session::ClickNavigation::MainFrame(Box::new(
+                        tracker,
+                    )),
+                },
+            )
+            .await;
+        assert_eq!(reply["outcome"], "ok");
+        assert_eq!(reply["lifecycle"], expected);
+        let reply = plane.result(&route, Ok(reply)).await;
+        assert!(validate_browser_result(CLICK, &reply).is_ok());
+    }
 
     fn identity() -> RouteIdentity {
         RouteIdentity::from_bind(
