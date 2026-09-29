@@ -175,6 +175,28 @@ impl ImportResult {
     }
 }
 
+pub fn reply_schema(launch_refusal: Value) -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "outcome":{"type":"string","enum":["transferred","denied","hand_off","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","transfer_failed","invalid_origin","internal_failure"]},
+            "domains_matched":{"type":"array","items":{"type":"string"}},
+            "browser":{"type":"string"},
+            "rows":{"type":"integer"},
+            "remedy":{"type":"string"},
+            "reason":{"type":"string"},
+            "relaunched":{
+                "type":["object","null"],"properties":{
+                    "browser_session_id":{"type":"string"},
+                    "restored_url":{"type":["string","null"]}
+                },"required":["browser_session_id","restored_url"],"additionalProperties":false
+            },
+            "detail":launch_refusal
+        },
+        "required":["outcome"],"additionalProperties":false
+    })
+}
+
 pub enum PreparedImport {
     Ready(LoginImportPlan),
     Refused(ImportResult),
@@ -271,6 +293,16 @@ impl LoginImportPlan {
 
     pub fn refusal(&self, code: &'static str, remedy: &'static str) -> ImportResult {
         self.result(code, None, 0, Some(remedy))
+    }
+
+    pub fn permits_transfer(&self, decision: Option<&str>) -> bool {
+        decision
+            .and_then(|value| value.strip_prefix("transfer:"))
+            .is_some_and(|id| {
+                self.presence
+                    .iter()
+                    .any(|browser| browser.browser == id && browser.transfer == "available")
+            })
     }
 
     pub fn decide(self, decision: Option<&str>) -> ImportResult {
@@ -439,23 +471,12 @@ pub fn prepare_import(
     })
 }
 
-pub fn profile_precondition(
-    origin: &str,
-    durable: bool,
-    session_open: bool,
-) -> Result<(), Box<ImportResult>> {
+pub fn profile_precondition(origin: &str, durable: bool) -> Result<(), Box<ImportResult>> {
     if !durable {
         return Err(Box::new(ImportResult::refusal(
             origin,
             "profile_not_durable",
             "bind a primary route with a durable browser profile",
-        )));
-    }
-    if session_open {
-        return Err(Box::new(ImportResult::refusal(
-            origin,
-            "session_open",
-            "browser.close",
         )));
     }
     Ok(())
@@ -984,6 +1005,303 @@ mod tests {
     use super::*;
 
     use std::sync::Mutex;
+
+    use crate::browser_session::*;
+
+    struct ImportProcess(Arc<Mutex<Vec<&'static str>>>);
+    impl OwnedBrowserProcess for ImportProcess {
+        fn navigate(
+            &mut self,
+            _: &str,
+            url: &str,
+            _: NavigationWait,
+            _: u64,
+            tracker: &mut crate::browser::Tracker,
+        ) -> Result<(), NavigationDriveError> {
+            self.0.lock().unwrap().push("navigate");
+            tracker.main_frame_navigated(None, url.to_string());
+            tracker.load(std::time::Instant::now());
+            Ok(())
+        }
+        fn generation_matches(&self) -> bool {
+            true
+        }
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.0.lock().unwrap().push("close");
+            Ok(())
+        }
+        fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+            Ok(true)
+        }
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+        fn main_frame_url(&mut self, _: &str, _: u64) -> Result<String, NavigationDriveError> {
+            Ok("https://x.com/page".into())
+        }
+        fn present(&mut self, _: &str, _: u64) -> Result<(), NavigationDriveError> {
+            Ok(())
+        }
+        fn cookie_names_for_origin(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<std::collections::BTreeSet<String>, NavigationDriveError> {
+            Ok(Default::default())
+        }
+    }
+    struct ImportCleanup;
+    impl SessionCleanup for ImportCleanup {
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            Ok(SessionCleanupOutcome::Complete)
+        }
+    }
+    struct ImportLauncher {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+    impl BrowserSessionLauncher for ImportLauncher {
+        fn launch(&self, _: &crate::AcceptedBindFacts, _: &str) -> Result<LaunchedBrowser, Value> {
+            self.events.lock().unwrap().push("launch");
+            if self.fail {
+                return Err(json!({"outcome":"executable_missing"}));
+            }
+            Ok(LaunchedBrowser {
+                process: Box::new(ImportProcess(self.events.clone())),
+                cleanup: Box::new(ImportCleanup),
+                executable_identity_checkpoints:
+                    crate::browser_launch::ExecutableIdentityCheckpoints::BeforeSpawnAndAfterExec,
+            })
+        }
+    }
+
+    async fn open_import_case(
+        decision: &str,
+        presented: bool,
+        fail: bool,
+        granted: bool,
+    ) -> (Value, Value, String, Vec<&'static str>) {
+        let root = TestRoot::new("open-session");
+        let chrome = source("chrome", "Chrome", root.path());
+        let data = root.path().join("data");
+        create_store(
+            &cookie_store(&data, &chrome),
+            &[Cookie {
+                host: ".x.com",
+                name: "session",
+                path: "/",
+                persistent: true,
+                encrypted: b"secret",
+            }],
+        );
+        let profile = root.path().join("managed/profile");
+        fs::create_dir_all(&profile).unwrap();
+        let mut planes = crate::tests::management_bound_planes(4, 1);
+        let mut facts = planes.routes.get(4, 1).unwrap();
+        facts.identity.profile_disposition = cerebellum_core::identity::ProfileDisposition::Durable;
+        let config = crate::browser_config::BrowserConfig {
+            executable_path: Some(chrome.executable.clone()),
+            expected_identity: None,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 100,
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+        };
+        planes.browser_config = Some(config.clone());
+        planes.browser = Arc::new(
+            crate::browser::BrowserPlane::with_session_gate(
+                planes.sessions.clone(),
+                planes.lease_clock.clone(),
+                100,
+            )
+            .with_shared_grants(planes.management.browser_grants()),
+        );
+        if granted {
+            planes
+                .management
+                .browser_grants()
+                .lock()
+                .await
+                .replace(crate::authorization::ActionGrant::new(
+                    "restore",
+                    1,
+                    &facts.identity.conversation_key,
+                    crate::authorization::Severity::new(1, false, false),
+                    ["https://x.com"],
+                ))
+                .unwrap();
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        planes.launch_service = Some(Arc::new(ImportLauncher {
+            events: events.clone(),
+            fail: false,
+        }));
+        let launched =
+            crate::handle_browser_control(BROWSER_LAUNCH, &json!({}), &facts, &planes).await;
+        assert_eq!(launched["outcome"], "launched", "{launched}");
+        let old_id = launched["browser_session_id"].as_str().unwrap().to_string();
+        events.lock().unwrap().clear();
+        planes.launch_service = Some(Arc::new(ImportLauncher {
+            events: events.clone(),
+            fail,
+        }));
+        if presented {
+            planes
+                .sessions
+                .present(
+                    &facts.identity.conversation_key,
+                    "https://x.com",
+                    100,
+                    planes.lease_clock.as_ref(),
+                )
+                .unwrap();
+        }
+        let PreparedImport::Ready(plan) = prepare_import(
+            "https://x.com",
+            &facts.identity.agent_project_id,
+            &chrome.executable,
+            DurableProfileLocation {
+                managed_root: root.path().join("managed"),
+                profile_directory: profile.clone(),
+            },
+            ImportSettings::for_test(
+                PathBuf::from(SQLITE_PROGRAM),
+                data,
+                root.path().join("safari"),
+                vec![chrome.clone()],
+            ),
+        ) else {
+            panic!("plan")
+        };
+        assert!(plan.permits_transfer(Some("transfer:chrome")));
+        let copy_events = events.clone();
+        let plan = plan.with_profile_write_observer_for_test(Arc::new(move |_: &Path| {
+            let mut events = copy_events.lock().unwrap();
+            assert_eq!(
+                *events,
+                ["close"],
+                "copy must follow graceful close and precede launch"
+            );
+            events.push("copy");
+            Ok(())
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let cancel = crate::CancelHandle::pending();
+        let request =
+            crate::complete_login_import(&planes, &facts, &tx, 4, 1, plan, Some(cancel.clone()));
+        let answer = async {
+            let question = rx.recv().await.unwrap();
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "browser closed before consent"
+            );
+            if decision == "cancel" {
+                cancel.cancel();
+                return;
+            }
+            assert!(planes
+                .elicitor
+                .deliver(4, question.header.corr, json!({"decision":decision})));
+        };
+        let (reply, ()) = tokio::join!(request, answer);
+        crate::browser::validate_browser_result(crate::management::IMPORT_LOGIN, &reply).unwrap();
+        let status = planes.sessions.status(
+            &facts.identity.conversation_key,
+            planes.lease_clock.as_ref(),
+            std::time::SystemTime::now(),
+        );
+        if reply["outcome"] == "transferred" {
+            assert_eq!(
+                encrypted_hex(&profile.join(COOKIES_RELATIVE_PATH), "session"),
+                "736563726574"
+            );
+        }
+        let recorded = events.lock().unwrap().clone();
+        (reply, status, old_id, recorded)
+    }
+
+    #[tokio::test]
+    async fn import_open_session_closes_copies_and_relaunches() {
+        let (reply, status, old, events) =
+            open_import_case("transfer:chrome", false, false, false).await;
+        assert_eq!(reply["outcome"], "transferred");
+        assert_eq!(events, ["close", "copy", "launch"]);
+        assert_eq!(status["outcome"], "ready");
+        assert_eq!(
+            reply["relaunched"]["browser_session_id"],
+            status["browser_session_id"]
+        );
+        assert_ne!(status["browser_session_id"], old);
+        assert!(reply["relaunched"]["restored_url"].is_null());
+        for malformed in [
+            json!({"browser_session_id": 7, "restored_url": null}),
+            json!({"browser_session_id":"id"}),
+            json!({"browser_session_id":"id","restored_url":null,"extra":true}),
+        ] {
+            let mut invalid = reply.clone();
+            invalid["relaunched"] = malformed;
+            assert!(crate::browser::validate_browser_result(
+                crate::management::IMPORT_LOGIN,
+                &invalid
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_restores_url_only_with_a_grant() {
+        let (reply, _, _, events) = open_import_case("transfer:chrome", false, false, true).await;
+        assert_eq!(
+            reply["relaunched"]["restored_url"], "https://x.com/page",
+            "{reply}"
+        );
+        assert_eq!(events, ["close", "copy", "launch", "navigate"]);
+    }
+
+    #[tokio::test]
+    async fn import_deny_and_hand_off_leave_open_session_untouched() {
+        for decision in ["deny", "hand_off", "transfer:unknown", "cancel"] {
+            let (reply, status, old, events) =
+                open_import_case(decision, false, false, false).await;
+            assert_eq!(
+                reply["outcome"],
+                if decision == "hand_off" {
+                    "hand_off"
+                } else {
+                    "denied"
+                }
+            );
+            assert_eq!(status["outcome"], "ready");
+            assert_eq!(status["browser_session_id"], old);
+            assert!(events.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn import_presented_session_is_not_closed() {
+        let (reply, status, old, events) =
+            open_import_case("transfer:chrome", true, false, false).await;
+        assert_eq!(reply["outcome"], "session_open");
+        assert_eq!(status["browser_session_id"], old);
+        assert_eq!(status["outcome"], "ready");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_relaunch_failure_preserves_transferred_outcome() {
+        let (reply, status, _, events) =
+            open_import_case("transfer:chrome", false, true, false).await;
+        assert_eq!(reply["outcome"], "transferred");
+        assert!(reply["relaunched"].is_null());
+        assert_eq!(reply["detail"]["outcome"], "executable_missing");
+        assert_ne!(status["outcome"], "ready");
+        assert_eq!(events, ["close", "copy", "launch"]);
+    }
 
     struct TestRoot(PathBuf);
 
@@ -1583,10 +1901,8 @@ mod tests {
     }
 
     #[test]
-    fn transfer_refused_while_the_session_is_open() {
-        let refusal = profile_precondition("https://x.com", true, true).unwrap_err();
-        assert_eq!(refusal.outcome, "session_open");
-        assert_eq!(refusal.remedy, Some("browser.close"));
+    fn durable_profile_can_reach_consent() {
+        assert!(profile_precondition("https://x.com", true).is_ok());
     }
 
     #[test]

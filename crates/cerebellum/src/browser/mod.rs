@@ -3870,6 +3870,12 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         // Served on the management surface, never advertised as a tool: it is
         // listed here only so its reply passes the same closed-schema boundary.
         BrowserToolDefinition {
+            name: crate::management::IMPORT_LOGIN,
+            description: "Import an existing login with consent, reopening an idle browser session.",
+            request_schema: json!({"type":"object","properties":{"origin":{"type":"string"}},"required":["origin"],"additionalProperties":false}),
+            result_schema: crate::login_import::reply_schema(browser_launch_result_schema()),
+        },
+        BrowserToolDefinition {
             name: crate::management::CAPTURE_LOGIN,
             description: "Capture a fresh login in a throwaway browser for the operator to store.",
             request_schema: crate::login_capture::request_schema(),
@@ -4389,6 +4395,9 @@ fn schema_types(
             .iter()
             .any(|value| value == "array" || value == "object")
             && values.len() != 1
+            && !(values.len() == 2
+                && values.iter().any(|value| value == "object")
+                && values.iter().any(|value| value == "null"))
     {
         return Err(CapabilityResultValidationError::MalformedArtifact(format!(
             "{path} has unsupported or incompatible result types"
@@ -4438,7 +4447,9 @@ fn validate_runtime_result_schema(
 
     let schema_types = schema_types(object, path)?;
     let schema_type = schema_types
-        .first()
+        .iter()
+        .find(|value| value.as_str() != "null")
+        .or_else(|| schema_types.first())
         .expect("a result schema with types is nonempty");
 
     // A KEYWORD THAT DOES NOT APPLY TO THE DECLARED TYPE IS A SILENT NO-OP, and
@@ -4448,11 +4459,8 @@ fn validate_runtime_result_schema(
     // schemas are built by `json!` in this file rather than loaded from a pinned
     // artifact, so nothing else would catch the typo.
     //
-    // The FIRST declared type decides, and that is exact rather than a
-    // shortcut: `schema_types` refuses `array` or `object` inside a list of
-    // more than one, so a multi-type schema is all scalars and every branch
-    // below would answer identically. A `.any()` over the list would imply a
-    // generality the loader does not permit.
+    // Nullable objects still require a closed object schema. Inspect the
+    // non-null type so the ordering of the type list cannot bypass that check.
     //
     // The computer plane has had this check since it was written; this side
     // did not, which is the mirror of the array-items hole that side had until
@@ -4629,7 +4637,14 @@ fn collect_result_violations(
         });
     }
 
-    match schema_types.first().map(String::as_str) {
+    if result.is_null() {
+        return;
+    }
+    match schema_types
+        .iter()
+        .find(|value| value.as_str() != "null")
+        .map(String::as_str)
+    {
         Some("object") => {
             let result = result
                 .as_object()
