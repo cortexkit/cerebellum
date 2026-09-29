@@ -33,6 +33,18 @@ pub async fn elicit_and_answer(
     answer_body: Value,
     label: &str,
 ) -> Result<Value, String> {
+    elicit_and_answer_observing(planes, opening, answer_body, label, |_| {}).await
+}
+
+/// Drive a consent-capable request, observing each question before answering it.
+/// The observer lets probes verify the choices the production relay offered.
+pub async fn elicit_and_answer_observing(
+    planes: &Planes,
+    opening: Frame,
+    answer_body: Value,
+    label: &str,
+    mut observe: impl FnMut(&Value),
+) -> Result<Value, String> {
     let (writer, mut frames) = mpsc::channel(8);
     // Returns once the request is spawned, so a request that waits for its
     // answer is still running when the question is read below.
@@ -50,6 +62,7 @@ pub async fn elicit_and_answer(
         let body: Value = serde_json::from_slice(&frame.body)
             .map_err(|error| format!("{label} frame was not JSON: {error}"))?;
         if frame.header.ty == FrameType::Request {
+            observe(&body);
             println!("{label} question: {body}");
             println!("{label} answer: {answer_body}");
             // Addressed to the QUESTION's channel, epoch and corr rather than
