@@ -128,7 +128,7 @@ async fn bind_management_route(planes: &Planes) {
             module_id: "cerebellum".to_string(),
         },
         identity: BindIdentity::new("/test/project", "test", "test-session".to_string()),
-        principal: Some(Principal::Direct),
+        principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({
             "agentProjectId": "pj-browser-session-wire",
@@ -1687,7 +1687,7 @@ async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame 
             module_id: "cerebellum".to_string(),
         },
         identity: BindIdentity::new("/caller/chosen/project", "test", "test-session".to_string()),
-        principal: Some(Principal::Direct),
+        principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(admission_facts),
     };
@@ -1906,9 +1906,11 @@ async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
 /// A route opened without the admission carrier is refused with the reason
 /// and remedy that say so, through the declared reply contract.
 ///
-/// A daemon opens a route with no admission facts whenever anything other
-/// than its configured carrier opens it, which makes this the refusal a
-/// misconfigured caller meets first. Driven through the real dispatch for all
+/// A daemon opens a route with no admission facts whenever it is not
+/// configured to stamp them for the caller that opened it, which makes this
+/// the refusal the session caller meets first on a misconfigured daemon. (Any
+/// other caller is refused earlier, as not admitted to act in a conversation.)
+/// Driven through the real dispatch for all
 /// three control operations, because the refusal sits in front of all of them
 /// and each has its own schema.
 ///
@@ -4226,7 +4228,7 @@ async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
             module_id: "cerebellum".into(),
         },
         identity: BindIdentity::new("/test/project", "test", "test-session"),
-        principal: Some(Principal::Direct),
+        principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),

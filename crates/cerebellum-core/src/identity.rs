@@ -396,6 +396,45 @@ impl AcceptedBindFacts {
         }
     }
 
+    /// Whether this route's opener may make calls in a conversation's name.
+    ///
+    /// Read from the daemon-stamped principal alone: the conversation key and
+    /// admission facts on the bind say which conversation a call would act in,
+    /// never whether this caller may act in one.
+    pub fn admits_session_calls(&self) -> bool {
+        crate::principal::admits_session_calls(&self.principal)
+    }
+
+    /// These facts as an operator's call outside any conversation sees them.
+    ///
+    /// Every standing permission is keyed on the conversation or the agent
+    /// project, so the view carries neither: an empty conversation key (which
+    /// no grant is ever recorded under), no project id, the ephemeral session
+    /// kind (which resolves no browser profile), no attested facts, no browser
+    /// controls and an explicitly empty capability scope. An operator whose
+    /// route happens to name a live conversation therefore still sees none of
+    /// that conversation's grants. The principal, the surface and the declared
+    /// ability to relay a question to a person are kept, because the
+    /// operator's operations ask the person directly on this route.
+    pub fn outside_session_scope(&self) -> Self {
+        Self {
+            identity: RouteIdentity {
+                conversation_key: String::new(),
+                agent_project_id: String::new(),
+                session_kind: SessionKind::Ephemeral,
+                profile_disposition: ProfileDisposition::None,
+                project_root: self.identity.project_root.clone(),
+            },
+            principal: self.principal.clone(),
+            agent_project_id_attested: false,
+            session_kind_attested: false,
+            control_operations: Vec::new(),
+            effective_capability_scope: Some(Vec::new()),
+            consumer_capabilities: self.consumer_capabilities.clone(),
+            surface: self.surface,
+        }
+    }
+
     /// Whether the accepted scope permits a capability. This uses only facts
     /// retained from `route.bind`; callers cannot widen it through a request.
     pub fn allows_capability(&self, capability: &str) -> bool {
@@ -1332,5 +1371,62 @@ mod tests {
             conversation_b.resolve_profile().logical_profile_key,
             "different subagent conversations must not share a disposable key"
         );
+    }
+
+    /// An operator's call outside any conversation keeps nothing that a
+    /// standing permission or a durable profile is keyed on, even when its
+    /// route named a conversation and carried fully attested facts.
+    #[test]
+    fn outside_session_scope_carries_no_session_identity() {
+        let accepted = AcceptedBindFacts::from_bind(
+            &bind_identity("/tmp/project", "conversation-live"),
+            Some(Principal::Direct),
+            Some(&serde_json::json!({
+                "agentProjectId": "pj-live",
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["*"],
+                "browserControlOperations": ["browser.launch"],
+            })),
+            Some(&[ELICITATION_CAPABILITY.to_string()]),
+            &RouteTarget::ManagementSurface {
+                module_id: "cerebellum".to_string(),
+            },
+        );
+        let operator = accepted.outside_session_scope();
+        assert_eq!(operator.identity.conversation_key, "");
+        assert_eq!(operator.identity.agent_project_id, "");
+        assert_eq!(operator.identity.session_kind, SessionKind::Ephemeral);
+        assert_eq!(operator.identity.logical_profile_key(), None);
+        assert!(!operator.agent_project_id_attested);
+        assert!(!operator.session_kind_attested);
+        assert!(!operator.allows_control_operation("browser.launch"));
+        assert!(!operator.allows_capability("browser.status"));
+        // Kept: who opened the route, which surface it reaches, and whether
+        // it can relay the operator's question to a person.
+        assert_eq!(operator.principal, Some(Principal::Direct));
+        assert_eq!(operator.surface, RouteSurface::Management);
+        assert!(operator.declares_elicitation());
+    }
+
+    #[test]
+    fn only_a_prefrontal_core_bind_admits_session_calls() {
+        let bind = |principal| {
+            AcceptedBindFacts::from_bind(
+                &bind_identity("/tmp/project", "conversation-live"),
+                principal,
+                Some(&facts("pj-live", "primary")),
+                None,
+                &tool_route(),
+            )
+        };
+        assert!(bind(Some(Principal::Reserved {
+            module_id: "prefrontal-core".to_string()
+        }))
+        .admits_session_calls());
+        assert!(!bind(Some(Principal::Direct)).admits_session_calls());
+        assert!(!bind(Some(Principal::Reserved {
+            module_id: "aft".to_string()
+        }))
+        .admits_session_calls());
     }
 }

@@ -27,7 +27,7 @@ use cerebellum_core::health::HealthState;
 use serde_json::{json, Value};
 use subc_protocol::session::ModuleControlRequest;
 use subc_protocol::{
-    BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -81,7 +81,7 @@ async fn management_planes() -> Planes {
             module_id: "cerebellum".to_string(),
         },
         identity: identity(),
-        principal: Some(Principal::Direct),
+        principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({
             "agentProjectId": "pj-consent-relay-test",

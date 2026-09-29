@@ -110,6 +110,9 @@ pub enum BrowserSurface {
     Refused(BrowserConfigError),
     Available(BrowserConfig),
 }
+use cerebellum_core::principal::{
+    principal_label, SESSION_CALLER_NOT_ADMITTED, SESSION_CALLER_NOT_ADMITTED_REMEDY,
+};
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
 pub use wire::{build_error_frame, control_flags};
 
@@ -793,6 +796,26 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
             | management::CLEAR_LAUNCH_RECOVERY
     ) || (matches!(name, management::PRESENT | management::RESUME)
         && browser::has_wire_dispatch_route(name))
+}
+
+/// The operator's own management operations: the ones served to a caller that
+/// is not admitted to act in a conversation, and served to it outside any
+/// conversation.
+///
+/// Each works on state that belongs to the machine or the operator rather than
+/// to a conversation: the browser profile root, a launch record startup
+/// recovery kept, and the durable "always allow" app grants. None of them
+/// needs a conversation's grants, so running them with no conversation costs
+/// the operator nothing. Every other operation asks for, reads or acts under a
+/// conversation's permissions, and is a session-bound call.
+fn is_operator_operation(name: &str) -> bool {
+    matches!(
+        name,
+        management::REBIND_PROFILE_ROOT
+            | management::CLEAR_LAUNCH_RECOVERY
+            | management::LIST_APP_GRANTS
+            | management::REVOKE_APP_GRANT
+    )
 }
 
 /// The dispatch predicate, exposed so a test can compare the surface reporter
@@ -2803,6 +2826,20 @@ async fn handle_management_request(
         )
         .await;
     }
+    // Session admission, before any operation below asks a person, opens or
+    // reads a grant, or writes the journal; see `send_session_caller_not_admitted`.
+    // A caller not admitted to act in a conversation reaches only the
+    // operator's operations, and those see these facts with every trace of
+    // the conversation removed.
+    let operator_facts;
+    let facts = if facts.admits_session_calls() {
+        facts
+    } else if is_operator_operation(method) {
+        operator_facts = facts.outside_session_scope();
+        &operator_facts
+    } else {
+        return send_session_caller_not_admitted(writer, ver, channel, epoch, corr, facts).await;
+    };
     let params = object
         .get("params")
         .cloned()
@@ -3834,7 +3871,9 @@ async fn handle_control_request(
             // (subc-mcp) is the primary exclusion of cerebellum capabilities
             // from `mcp:*` surfaces. This check is the defense-in-depth backstop
             // that rejects a forged direct dispatch under a non-first-party
-            // principal before any capability executes.
+            // principal before any capability executes. Whether a first-party
+            // principal may act in the conversation this bind names is decided
+            // per call, at dispatch: see `send_session_caller_not_admitted`.
             let trust = trust_for_principal(&principal);
             if !trust.is_first_party() {
                 return send_principal_denied(
@@ -3912,16 +3951,7 @@ async fn send_principal_denied(
     corr: u64,
     principal: &Option<subc_protocol::Principal>,
 ) -> Result<(), ModuleError> {
-    let label = principal
-        .as_ref()
-        .map(|p| match p {
-            subc_protocol::Principal::Reserved { module_id } => {
-                format!("reserved:{module_id}")
-            }
-            subc_protocol::Principal::Direct => "direct".to_string(),
-            subc_protocol::Principal::Unverified => "unverified".to_string(),
-        })
-        .unwrap_or_else(|| "absent".to_string());
+    let label = principal_label(principal);
     let frame = build_error_frame(
         ver,
         0,
@@ -3931,6 +3961,60 @@ async fn send_principal_denied(
         &format!(
             "cerebellum capabilities are first-party only; principal '{label}' is not eligible"
         ),
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
+/// Refuse a call that would act in a conversation, made by a caller not
+/// admitted to act in one.
+///
+/// Cerebellum's standing permissions (site grants, app grants, the takeover
+/// grant) are keyed on the conversation a person gave them in. A route names
+/// its conversation at bind, and every first-party module may open a route
+/// under any conversation, so the conversation key alone would let AFT, Broca,
+/// the routing module or a `direct` plugin reuse a permission the person gave
+/// someone else, without being asked. Only Prefrontal's core module carries
+/// sessions to cerebellum; everyone else is refused here.
+///
+/// Why at dispatch rather than at bind: a bind says who opened the route and
+/// under which conversation, not which call will follow, and the operator's
+/// own operations (see `is_operator_operation`) are legitimately served to
+/// `direct` desk tools on routes that name a conversation. Refusing the bind
+/// would refuse those too. So the bind is kept and every request is checked
+/// against the daemon-stamped principal, at the one point in each surface's
+/// handler where the request's name is known and nothing has yet read a grant,
+/// asked a person or reserved a journal entry. The check reads only the
+/// principal, so no fact a caller supplies can satisfy it.
+async fn send_session_caller_not_admitted(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    facts: &AcceptedBindFacts,
+) -> Result<(), ModuleError> {
+    let label = principal_label(&facts.principal);
+    let body = serde_json::to_vec(&ErrorBody {
+        code: SESSION_CALLER_NOT_ADMITTED.to_string(),
+        message: format!(
+            "principal '{label}' is not admitted to act in a conversation: {}",
+            SESSION_CALLER_NOT_ADMITTED_REMEDY
+        ),
+        detail: Some(json!({
+            "principal": label,
+            "remedy": SESSION_CALLER_NOT_ADMITTED_REMEDY,
+        })),
+    })
+    .map_err(ModuleError::Json)?;
+    let frame = Frame::build_with_version(
+        ver,
+        FrameType::Error,
+        control_flags(),
+        channel,
+        epoch,
+        corr,
+        body,
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
@@ -4046,6 +4130,21 @@ async fn handle_tool_request(
         )
         .await;
     };
+    // Session admission, before the capability scope and before anything
+    // below reads a grant, asks a person or reserves a journal entry; see
+    // `send_session_caller_not_admitted`. Every tool call acts in the route's
+    // conversation, so no tool is served outside one.
+    if !accepted_facts.admits_session_calls() {
+        return send_session_caller_not_admitted(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            &accepted_facts,
+        )
+        .await;
+    }
     if !accepted_facts.allows_capability(capability_name) {
         return send_route_error(
             writer,
@@ -4892,6 +4991,14 @@ pub async fn handle_control_request_for_test_with_bindings(
     handle_control_request(frame, writer, health_state, route_bindings).await
 }
 
+/// The principal a test bind carries when it stands for a session's calls:
+/// Prefrontal's core module, the only caller admitted to act in a conversation.
+pub fn session_caller_principal_for_test() -> Option<subc_protocol::Principal> {
+    Some(subc_protocol::Principal::Reserved {
+        module_id: cerebellum_core::principal::SESSION_CALLER_MODULE_ID.to_string(),
+    })
+}
+
 /// Install a synthetic accepted first-party bind for a test frame.
 ///
 /// Older fixtures invoke only the data-plane helper, so this lets them exercise
@@ -4904,7 +5011,7 @@ fn install_test_bind(route_bindings: &Arc<RouteBindings>, frame: &Frame) {
         frame.header.epoch,
         AcceptedBindFacts::from_bind(
             &identity,
-            Some(subc_protocol::Principal::Direct),
+            session_caller_principal_for_test(),
             Some(&json!({
                 "agentProjectId": "test-project",
                 "sessionKind": "primary",
@@ -4936,7 +5043,7 @@ pub fn install_browser_test_bind(
         epoch,
         AcceptedBindFacts::from_bind(
             &identity,
-            Some(subc_protocol::Principal::Direct),
+            session_caller_principal_for_test(),
             Some(&json!({
                 "agentProjectId": "test-project",
                 "sessionKind": "primary",
@@ -4966,7 +5073,7 @@ pub fn install_browser_compatibility_test_bind(
         epoch,
         AcceptedBindFacts::from_bind(
             &identity,
-            Some(subc_protocol::Principal::Direct),
+            session_caller_principal_for_test(),
             Some(&json!({
                 "sessionKind": "primary",
                 "effectiveCapabilityScope": ["*"],
@@ -4980,10 +5087,13 @@ pub fn install_browser_compatibility_test_bind(
     );
 }
 
-/// A route opened directly, with no admission facts at all.
+/// A route opened by the session caller with no admission facts at all.
 ///
-/// The shape a daemon produces when anything other than its configured
-/// admission carrier opens the route.
+/// The shape a daemon produces when it is not configured to stamp admission
+/// facts on the session caller's routes. The principal is the session caller
+/// because any other principal is refused before its facts are read (see
+/// `send_session_caller_not_admitted`), so only this one can reach the
+/// missing-facts refusal.
 #[doc(hidden)]
 pub fn install_browser_direct_test_bind(
     route_bindings: &Arc<RouteBindings>,
@@ -5000,7 +5110,7 @@ pub fn install_browser_direct_test_bind(
         epoch,
         AcceptedBindFacts::from_bind(
             &identity,
-            Some(subc_protocol::Principal::Direct),
+            session_caller_principal_for_test(),
             None,
             None,
             &subc_protocol::RouteTarget::ToolProvider {
@@ -5307,7 +5417,7 @@ mod tests {
             planes.management = Arc::new(ManagementPlane::new(Arc::new(OneRunning)));
             let facts = AcceptedBindFacts::from_bind(
                 &bind_identity_for_test(),
-                Some(Principal::Direct),
+                session_caller_principal_for_test(),
                 Some(&json!({
                     "agentProjectId": "test-project",
                     "sessionKind": "primary",
@@ -5551,7 +5661,7 @@ mod tests {
             1,
             AcceptedBindFacts::from_bind(
                 &identity,
-                Some(Principal::Direct),
+                session_caller_principal_for_test(),
                 Some(&admission),
                 Some(&["elicitation".to_string()]),
                 &subc_protocol::RouteTarget::ManagementSurface {
@@ -5564,7 +5674,7 @@ mod tests {
             3,
             AcceptedBindFacts::from_bind(
                 &identity,
-                Some(Principal::Direct),
+                session_caller_principal_for_test(),
                 Some(&admission),
                 None,
                 &subc_protocol::RouteTarget::ToolProvider {
@@ -6197,7 +6307,7 @@ mod tests {
             1,
             AcceptedBindFacts::from_bind(
                 &bind_identity_for_test(),
-                Some(Principal::Direct),
+                session_caller_principal_for_test(),
                 Some(&admission),
                 Some(&["elicitation".to_string()]),
                 &subc_protocol::RouteTarget::ManagementSurface {
@@ -6622,7 +6732,7 @@ mod tests {
             epoch,
             AcceptedBindFacts::from_bind(
                 &bind_identity_for_test(),
-                Some(Principal::Direct),
+                session_caller_principal_for_test(),
                 None,
                 None,
                 &subc_protocol::RouteTarget::ManagementSurface {
@@ -8179,7 +8289,7 @@ mod computer_consent_wire_tests {
                     "test",
                     "test-session".to_string(),
                 ),
-                Some(subc_protocol::Principal::Direct),
+                session_caller_principal_for_test(),
                 Some(&json!({
                     "agentProjectId": "test-project",
                     "sessionKind": "primary",
