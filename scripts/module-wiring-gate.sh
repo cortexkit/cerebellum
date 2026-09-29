@@ -156,3 +156,34 @@ if [ "$example_failed" -ne 0 ]; then
 fi
 
 echo "example tests: $examples_scanned examples, every one carrying tests declares a target that runs them"
+
+# Assert every release identifier the shipped code reads is one the release
+# build exports.
+#
+# A capability is advertised only when the build carries its review revision,
+# read at compile time through option_env!. If release-build.sh's ATTESTATIONS
+# list leaves an identifier out, the release build never exports it, so the
+# capability ships switched off with nothing failing: the build succeeds and
+# ships less than intended. The private input route's identifier was missing
+# from the list exactly this way. Only the crates' src/ trees count: examples
+# read probe-only switches the release never sets.
+read_names="$(grep -rhoE 'option_env!\("CEREBELLUM_[A-Z_]+"\)' crates/*/src \
+  | sed -E 's/.*"(CEREBELLUM_[A-Z_]+)".*/\1/' | sort -u)"
+listed_names="$(awk '/^readonly ATTESTATIONS=\(/ { in_list = 1; next }
+    in_list && /^\)/ { exit }
+    in_list { gsub(/[[:space:]]/, ""); if ($0 != "") print }' scripts/release-build.sh | sort -u)"
+read_count="$(printf '%s\n' "$read_names" | grep -c . || true)"
+listed_count="$(printf '%s\n' "$listed_names" | grep -c . || true)"
+if [ "$read_count" -eq 0 ] || [ "$listed_count" -eq 0 ]; then
+  echo "this check could not look: identifiers read=$read_count listed=$listed_count"
+  echo "A zero means a broken path or pattern, not a healthy tree."
+  exit 1
+fi
+unlisted="$(comm -23 <(printf '%s\n' "$read_names") <(printf '%s\n' "$listed_names"))"
+if [ -n "$unlisted" ]; then
+  echo "release identifiers the code reads but release-build.sh never exports:"
+  printf '  %s\n' $unlisted
+  echo "Add each to ATTESTATIONS in scripts/release-build.sh, or its capability ships switched off."
+  exit 1
+fi
+echo "release identifiers: $read_count read by the code, every one exported by release-build.sh"

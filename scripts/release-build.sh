@@ -212,6 +212,13 @@ export CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION="global-dispatch/v1@5a89716c"
 # refuse a background one with keystrokes_need_foreground. Its identifier is
 # CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION.
 
+# Keystrokes posted to one process through the private SkyLight route
+# (SLEventPostToPid), which reaches a background Chromium or Electron app that
+# the public per-process post does not wake. Fails closed: no fallback to the
+# public route when the private one is missing or its authentication fails.
+# UNSET until its review is minted. Without it, type and keys use the public
+# route only. Its identifier is CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION.
+
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
 # "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
@@ -230,6 +237,7 @@ readonly ATTESTATIONS=(
   CEREBELLUM_APP_STATE_REVIEW_REVISION
   CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION
   CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION
+  CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION
   CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION
