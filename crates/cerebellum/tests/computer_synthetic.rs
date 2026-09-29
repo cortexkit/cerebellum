@@ -1165,6 +1165,59 @@ async fn an_unreadable_focus_refuses_keystrokes() {
     assert!(dispatched_calls(&shared).is_empty());
 }
 
+/// An application that reports no focused element, but whose field carries
+/// its own focused flag (a backgrounded Electron app), still has that field
+/// checked for a secure one before anything is posted.
+#[tokio::test]
+async fn a_secure_field_flagged_focused_refuses_when_the_app_reports_no_focus() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    {
+        let mut state = desk.state();
+        state.focus = DeskFocus::Nothing;
+        state.roots[0].children[0].focused = true;
+        state.elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+    }
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve(&plane, name, request, &management, &FakeClock::new()).await;
+        assert_eq!(reply["outcome"], "secure_field_refused", "{name}: {reply}");
+        assert_eq!(reply["reason"], "secure_field_focused");
+    }
+    assert!(dispatched_calls(&shared).is_empty());
+}
+
+/// Typing into a field the application marks focused only on the field
+/// itself is confirmed by reading that field back.
+#[tokio::test]
+async fn typing_into_a_field_flagged_focused_is_confirmed_when_the_app_reports_no_focus() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    {
+        let mut state = desk.state();
+        state.focus = DeskFocus::Nothing;
+        state.roots[0].children[0].focused = true;
+        state.elements.get_mut(&2).unwrap().readbacks =
+            [Some("ab".to_string()), Some("ahib".to_string())].into();
+    }
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_observed");
+}
+
 /// Plain typing needs no takeover, even in a build without a fronting bracket.
 #[tokio::test]
 async fn background_plain_and_shift_typing_use_per_process_without_takeover() {
@@ -1373,6 +1426,34 @@ async fn typed_text_found_in_what_changed_is_completed() {
     let desk = focused_text_desk();
     desk.state().elements.get_mut(&2).unwrap().readbacks =
         [Some("ab".to_string()), Some("ahib".to_string())].into();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_observed");
+}
+
+/// Text the application shows only a few reads after the posts return is
+/// still confirmed: the check is polled up to the row's effect deadline, not
+/// taken once. A backgrounded Discord showed typed text over a second late.
+#[tokio::test]
+async fn typed_text_that_lands_a_few_reads_late_is_completed() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().readbacks = [
+        Some("ab".to_string()),
+        Some("ab".to_string()),
+        Some("ab".to_string()),
+        Some("ahib".to_string()),
+    ]
+    .into();
     let plane = plane_on(&shared, &desk, false);
     let management = granted_management().await;
     let reply = serve(

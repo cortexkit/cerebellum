@@ -1451,11 +1451,20 @@ where
             let source = self.app_state_source.clone();
             let sessions = management.app_state_sessions().clone();
             let settle = element_actions::settle_bound(capability);
+            let effect_deadline = element_actions::effect_deadline(capability);
             let mut finished = reply;
             reply = tokio::task::spawn_blocking(move || {
+                // Polled up to the row's effect deadline rather than read once:
+                // an application renders typed text some time after the posts
+                // return, and a backgrounded Electron app takes the longest.
                 if let (Some(text), Some(focused)) = (typed_text.as_deref(), focus.as_ref()) {
                     if finished["outcome"] == "delivery_unconfirmed"
-                        && keystrokes::typed_text_arrived(source.as_ref(), focused, text)
+                        && keystrokes::await_typed_text(
+                            source.as_ref(),
+                            focused,
+                            text,
+                            effect_deadline,
+                        )
                     {
                         finished["outcome"] = json!("completed");
                         finished["effect_status"] = json!("effect_observed");

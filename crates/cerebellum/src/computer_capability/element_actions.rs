@@ -24,7 +24,9 @@ use cerebellum_computer::audit::{
     ComputerPlaneDescriptor, ObservationState,
 };
 use cerebellum_computer::grounding::ContainmentRung;
-use cerebellum_computer::platform::vocabulary::frozen_row_bound_ms;
+use cerebellum_computer::platform::vocabulary::{
+    frozen_row_bound_ms, frozen_row_effect_deadline_ms,
+};
 use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
 use cerebellum_core::journal::{
     DispatchCommitmentToken, JournalIdentity, JournalStorage, Redactor, SeverityTaxonomy,
@@ -55,6 +57,12 @@ pub(crate) fn settle_bound(capability: ComputerCapability) -> Duration {
         )
         .unwrap_or(500),
     )
+}
+
+/// The longest an action waits to see its own effect, from the row's
+/// effect-observation deadline. A row that declares none waits one second.
+pub(crate) fn effect_deadline(capability: ComputerCapability) -> Duration {
+    Duration::from_millis(frozen_row_effect_deadline_ms(capability.capability_id()).unwrap_or(1000))
 }
 
 fn invalid(field: &str, reason: &str) -> Value {

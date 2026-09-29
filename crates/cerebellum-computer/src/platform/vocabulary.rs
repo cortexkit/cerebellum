@@ -745,6 +745,23 @@ pub fn frozen_row_bound_ms(capability_id: &str, field: &str) -> Option<u64> {
         .as_u64()
 }
 
+/// A frozen row's effect-observation deadline: how long the vocabulary allows
+/// for an action's effect to be observed. Read from the artifact itself, so a
+/// served path is held to the number the vocabulary publishes rather than to a
+/// copy of it. `None` when absent or null.
+pub fn frozen_row_effect_deadline_ms(capability_id: &str) -> Option<u64> {
+    static ROWS: OnceLock<Option<Value>> = OnceLock::new();
+    ROWS.get_or_init(|| serde_json::from_slice(COMPUTER_ACTION_VOCABULARY_ARTIFACT).ok())
+        .as_ref()?
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("capability_id").and_then(Value::as_str) == Some(capability_id))?
+        .get("effect_observation")?
+        .get("deadline_ms")?
+        .as_u64()
+}
+
 fn collect_result_violations(
     schema: &Value,
     result: &Value,

@@ -3,7 +3,9 @@
 //! how a fronting bracket's result reads on the wire, and whether typed text
 //! can be shown to have arrived.
 
-use cerebellum_computer::app_state::source::{AppStateSource, ElementHandle};
+use cerebellum_computer::app_state::source::{
+    AppStateSource, ElementHandle, RawElement, ReadBounds,
+};
 use cerebellum_computer::dispatch::{BracketReport, DispatchError, RestoreStatus};
 use cerebellum_computer::platform::ProcessGrant;
 use serde_json::{json, Value};
@@ -46,17 +48,28 @@ impl FocusRefusal {
 }
 
 /// Read the target application's own focused element and refuse a secure
-/// one. `Ok(None)` when the application reports nothing focused: there is no
-/// field to protect, and nothing to confirm typing against either.
+/// one. `Ok(None)` when no focused element can be found: there is no field to
+/// protect, and nothing to confirm typing against either.
+///
+/// Some applications report no focused element at the application level
+/// while one of their elements carries its own focused flag: a backgrounded
+/// Electron app does (Discord's message box, measured on the desk). For
+/// those the application is read once and the element marked focused is
+/// used, because otherwise both the secure-field check and the readback that
+/// confirms typing would silently have nothing to look at.
 pub(crate) fn read_target_focus(
     source: &dyn AppStateSource,
     grant: &ProcessGrant,
 ) -> Result<Option<TargetFocus>, FocusRefusal> {
-    let Some(handle) = source
+    let handle = match source
         .focused_element(grant)
         .map_err(|_| FocusRefusal::Unreadable)?
-    else {
-        return Ok(None);
+    {
+        Some(handle) => handle,
+        None => match flagged_focus(source, grant)? {
+            Some(handle) => handle,
+            None => return Ok(None),
+        },
     };
     let facts = source
         .element_facts(&handle)
@@ -66,6 +79,45 @@ pub(crate) fn read_target_focus(
     }
     let before = source.text_value(&handle).ok().flatten();
     Ok(Some(TargetFocus { handle, before }))
+}
+
+/// The one element below the windows that carries its own focused flag, when
+/// the application reports none. A secure field among several flagged
+/// elements refuses, since which one receives the keystrokes cannot be
+/// told; several without a secure one leave nothing to confirm against.
+fn flagged_focus(
+    source: &dyn AppStateSource,
+    grant: &ProcessGrant,
+) -> Result<Option<ElementHandle>, FocusRefusal> {
+    fn collect(nodes: &[RawElement], out: &mut Vec<ElementHandle>) {
+        for node in nodes {
+            let container = matches!(
+                node.role.as_deref(),
+                Some("AXWindow" | "AXApplication" | "AXMenuBar")
+            );
+            if node.focused && !container {
+                out.push(node.handle.clone());
+            }
+            collect(&node.children, out);
+        }
+    }
+    let Ok(read) = source.read_app_state(grant, ReadBounds::default()) else {
+        return Ok(None);
+    };
+    let mut flagged = Vec::new();
+    collect(&read.roots, &mut flagged);
+    for handle in &flagged {
+        let facts = source
+            .element_facts(handle)
+            .map_err(|_| FocusRefusal::Unreadable)?;
+        if facts.is_secure() {
+            return Err(FocusRefusal::Secure);
+        }
+    }
+    Ok(match flagged.len() {
+        1 => flagged.pop(),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +258,30 @@ pub(crate) fn typed_text_arrived(
         return false;
     };
     changed_part(before, &after).is_some_and(|inserted| inserted.contains(text))
+}
+
+/// Poll [`typed_text_arrived`] until it holds or `deadline` passes, checking
+/// at least once. The posts returning says nothing about when the application
+/// renders them, so a single read taken at once reports text that is about to
+/// appear as unconfirmed.
+pub(crate) fn await_typed_text(
+    source: &dyn AppStateSource,
+    focus: &TargetFocus,
+    text: &str,
+    deadline: std::time::Duration,
+) -> bool {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        if typed_text_arrived(source, focus, text) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= until {
+            return false;
+        }
+        std::thread::sleep(POLL.min(until - now));
+    }
 }
 
 /// The part of `after` that is not shared with `before` at either end, or

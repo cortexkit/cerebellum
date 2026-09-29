@@ -13,6 +13,14 @@ pub enum ManualAccessibility {
 /// One retry only: an accepted opt-in does not mean the renderer has finished
 /// building the tree. Native applications that reject the optional attribute
 /// are read once, without waiting for a web tree they will never build.
+///
+/// The two reads share the caller's bound: the first may use all of it, and
+/// the retry gets what is left after the first read and the pause. The first
+/// read is never cut shorter than the caller asked. An empty, still-building
+/// web tree reads in milliseconds whatever its bound, so a short bound saves
+/// nothing there, while a populated one (a Discord window is some two
+/// thousand elements) cut short loses the elements past the cut, reported only
+/// as unreadable subtrees.
 pub(crate) fn read_with_manual_accessibility<T, E>(
     mut enable: impl FnMut(bool) -> (ManualAccessibility, bool),
     mut read: impl FnMut(Duration) -> Result<T, E>,
@@ -20,13 +28,10 @@ pub(crate) fn read_with_manual_accessibility<T, E>(
     pause: impl FnOnce(Duration),
     requested_bound: Duration,
 ) -> Result<T, E> {
+    const RETRY_PAUSE: Duration = Duration::from_millis(100);
+    let started = std::time::Instant::now();
     let (status, fresh) = enable(false);
-    let bound = if status.enabled() {
-        requested_bound.min(Duration::from_millis(400))
-    } else {
-        requested_bound
-    };
-    let first = read(bound)?;
+    let first = read(requested_bound)?;
     if !status.enabled() || populated_web(&first) {
         return Ok(first);
     }
@@ -35,8 +40,15 @@ pub(crate) fn read_with_manual_accessibility<T, E>(
     if !fresh && !enable(true).0.enabled() {
         return Ok(first);
     }
-    pause(Duration::from_millis(100));
-    read(bound)
+    let Some(remaining) = requested_bound
+        .checked_sub(started.elapsed())
+        .and_then(|left| left.checked_sub(RETRY_PAUSE))
+        .filter(|left| !left.is_zero())
+    else {
+        return Ok(first);
+    };
+    pause(RETRY_PAUSE);
+    read(remaining)
 }
 
 #[derive(Default)]
@@ -206,7 +218,8 @@ mod tests {
         for fresh in [true, false] {
             let reads = Cell::new(0);
             let enables = Cell::new(0);
-            let budget = Cell::new(Duration::ZERO);
+            let bounds = std::cell::RefCell::new(Vec::new());
+            let paused = Cell::new(Duration::ZERO);
             let result = read_with_manual_accessibility(
                 |_| {
                     enables.set(enables.get() + 1);
@@ -214,18 +227,65 @@ mod tests {
                 },
                 |bound| {
                     reads.set(reads.get() + 1);
-                    budget.set(budget.get() + bound);
+                    bounds.borrow_mut().push(bound);
                     Ok::<_, ()>(false)
                 },
                 |tree| *tree,
-                |wait| budget.set(budget.get() + wait),
+                |wait| paused.set(wait),
                 Duration::from_secs(4),
             );
             assert_eq!(result, Ok(false), "an empty retry is reported honestly");
             assert_eq!(reads.get(), 2);
             assert_eq!(enables.get(), if fresh { 1 } else { 2 });
-            assert!(budget.get() <= Duration::from_secs(1));
+            // The two reads and the pause together stay inside the caller's
+            // bound: the retry gets only what the first read left.
+            let bounds = bounds.borrow();
+            assert_eq!(bounds[0], Duration::from_secs(4));
+            assert!(
+                bounds[1] + paused.get() <= Duration::from_secs(4),
+                "{bounds:?}"
+            );
         }
+    }
+
+    /// A web app whose accessibility is already on gets the caller's whole
+    /// bound for its read. Cutting it to a fixed fraction truncated a slow
+    /// Discord window partway, so its message box never appeared.
+    #[test]
+    fn an_enabled_web_app_is_read_with_the_whole_requested_bound() {
+        let bound = Cell::new(Duration::ZERO);
+        let result = read_with_manual_accessibility(
+            |_| (ManualAccessibility::AlreadyEnabled, false),
+            |given| {
+                bound.set(given);
+                Ok::<_, ()>(true)
+            },
+            |tree| *tree,
+            |_| panic!("a populated tree is not read again"),
+            Duration::from_secs(4),
+        );
+        assert_eq!(result, Ok(true));
+        assert_eq!(bound.get(), Duration::from_secs(4));
+    }
+
+    /// No time left after the first read means no retry: the first read's
+    /// result is returned rather than a second read with a zero bound.
+    #[test]
+    fn no_retry_when_the_first_read_used_the_whole_bound() {
+        let reads = Cell::new(0);
+        let result = read_with_manual_accessibility(
+            |_| (ManualAccessibility::NewlyEnabled, true),
+            |_| {
+                reads.set(reads.get() + 1);
+                std::thread::sleep(Duration::from_millis(30));
+                Ok::<_, ()>(false)
+            },
+            |tree| *tree,
+            |_| panic!("no time left to retry"),
+            Duration::from_millis(20),
+        );
+        assert_eq!(result, Ok(false));
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
