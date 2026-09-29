@@ -207,10 +207,11 @@ export CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION="element-addressed-review/v1
 # and the fronting bracket computer.type and computer.keys use to reach an
 # application that is not frontmost (bring it forward for at most 100 ms at a
 # time, post, put the previous application back, under the idle gate and the
-# seize watcher). UNSET until that review is minted. Without it, type and
-# keys still serve a frontmost target under the input review above, and
-# refuse a background one with keystrokes_need_foreground. Its identifier is
-# CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION.
+# seize watcher). Minted in subconscious docs/reviews/
+# takeover-dispatch-review-v1.md on ada9eb93 against ck-cerebellum abe8e3a.
+# Without it, type and keys still serve a frontmost target under the input
+# review above, and refuse a background one with keystrokes_need_foreground.
+export CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION="takeover-dispatch-review/v1@ada9eb93"
 
 # Keystrokes posted to one process through the private SkyLight route
 # (SLEventPostToPid), which reaches a background Chromium or Electron app that
