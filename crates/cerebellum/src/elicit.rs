@@ -92,9 +92,16 @@ pub const NO_ANSWER_DECISION: &str = "no_answer";
 /// anything on this side.
 pub const NOT_PUT_TO_ANYONE_DECISION: &str = "not_put_to_anyone";
 
+/// What came back for a question: an answer to read, or an error frame in
+/// place of one.
+enum Reply {
+    Answer(Value),
+    Refused,
+}
+
 /// The questions this module has outstanding.
 pub struct Elicitor {
-    lane: AskLane<oneshot::Sender<Value>>,
+    lane: AskLane<oneshot::Sender<Reply>>,
 }
 
 impl Default for Elicitor {
@@ -184,11 +191,17 @@ impl Elicitor {
         }
 
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(answer)) => match answer.get("decision").and_then(Value::as_str) {
+            Ok(Ok(Reply::Answer(answer))) => match answer.get("decision").and_then(Value::as_str) {
                 Some(NO_ANSWER_DECISION) => AskOutcome::NoAnswer,
                 Some(NOT_PUT_TO_ANYONE_DECISION) => AskOutcome::NotPutToAnyone,
                 _ => AskOutcome::Answered(answer),
             },
+            // The consumer answered the question with an error frame, so it
+            // refused the request itself rather than relaying it: a consumer
+            // with no handler for questions answers that way at once. Nobody was
+            // shown it, and waiting out the deadline would report silence from a
+            // person who never saw a prompt.
+            Ok(Ok(Reply::Refused)) => AskOutcome::NotPutToAnyone,
             // The sender was dropped, which happens when the question is
             // forgotten without an answer. Nobody replied.
             Ok(Err(_)) | Err(_) => AskOutcome::NoAnswer,
@@ -202,12 +215,23 @@ impl Elicitor {
     /// correlation this module never sent — and the caller should treat it as
     /// unsolicited rather than assume it was consumed.
     pub fn deliver(&self, channel: u16, correlation: u64, body: Value) -> bool {
+        self.settle(channel, correlation, Reply::Answer(body))
+    }
+
+    /// End the question the consumer answered with an error frame.
+    ///
+    /// Returns whether anyone was waiting, as [`Self::deliver`] does.
+    pub fn refuse(&self, channel: u16, correlation: u64) -> bool {
+        self.settle(channel, correlation, Reply::Refused)
+    }
+
+    fn settle(&self, channel: u16, correlation: u64, reply: Reply) -> bool {
         let Some(waiter) = self.lane.claim(channel, correlation) else {
             return false;
         };
         // A closed receiver means the asker stopped waiting between the claim
         // and now, which is the same as nobody waiting.
-        waiter.send(body).is_ok()
+        waiter.send(reply).is_ok()
     }
 
     /// How many questions are outstanding.
@@ -219,7 +243,7 @@ impl Elicitor {
 /// One registered question, removed from the lane when dropped. Correlations
 /// are never reused, so removing an entry an answer already claimed is a no-op.
 struct Registration<'a> {
-    lane: &'a AskLane<oneshot::Sender<Value>>,
+    lane: &'a AskLane<oneshot::Sender<Reply>>,
     channel: u16,
     correlation: u64,
 }

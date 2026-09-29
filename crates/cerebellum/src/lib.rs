@@ -2547,6 +2547,18 @@ async fn handle_frame(
             }
             Ok(true)
         }
+        // An error frame in place of an answer: the consumer refused the
+        // question instead of relaying it. The frame type settles direction,
+        // as for a response: an error can only answer a request this module
+        // sent, and on a route channel the only requests it sends are
+        // questions. Ending it here keeps the question from waiting out its
+        // whole deadline, up to half an hour, for an answer that cannot come.
+        FrameType::Error if frame.header.channel != 0 => {
+            planes
+                .elicitor
+                .refuse(frame.header.channel, frame.header.corr);
+            Ok(true)
+        }
         FrameType::Push if frame.header.channel == 0 => {
             if let Ok(subc_protocol::session::ModuleControlCommand::Draining {
                 reason,
@@ -6395,6 +6407,54 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    /// A consumer that answers the question with an error frame (a client with
+    /// no handler for questions does, at once) ends it immediately as a
+    /// question nobody was shown. Before the error arm, the frame was dropped
+    /// and the question waited out its five-minute deadline, then reported
+    /// silence from a person who never saw a prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_error_frame_answering_a_question_ends_it_as_not_put_to_anyone() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        handle_frame(
+            capture_request_frame(304, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let question = next_frame(&mut writer_rx).await;
+        assert_eq!(question.header.ty, FrameType::Request);
+        let refusal = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false),
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr,
+            serde_json::to_vec(&ErrorBody {
+                code: "REVERSE_REQUEST_UNHANDLED".to_string(),
+                message: "no reverse-request handler is registered for elicitation".to_string(),
+                detail: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        handle_frame(refusal, &writer_tx, &planes).await.unwrap();
+        // `next_frame` gives up after ten seconds; the question's own deadline
+        // is five minutes, so a reply inside that window is the error ending it.
+        let reply = next_frame(&mut writer_rx).await;
+        assert_eq!(reply.header.corr, 304);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "capture_consent_not_given", "{body}");
+        assert_eq!(body["reason"], "not_put_to_anyone", "{body}");
+        assert_eq!(planes.elicitor.outstanding(), 0);
+        assert!(fixture.fs.contents().is_empty());
     }
 
     #[tokio::test]
