@@ -1298,13 +1298,13 @@ fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
     .unwrap();
     assert_eq!(entry["codec_version"], "ck-computer-journal/v2");
     assert_eq!(entry["manual_accessibility"], "newly_enabled");
+    assert_eq!(entry["element_count"].as_u64(), Some(2));
+    assert_eq!(entry["unreadable_subtrees"].as_u64(), Some(0));
+    assert_eq!(entry["image_returned"].as_bool(), Some(false));
     let bytes: Vec<u8> = serde_json::from_value(entry["dispatch_material"].clone()).unwrap();
     let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(dispatch["grant_identity"]["pid"], 42);
-    assert_eq!(
-        dispatch["grant_identity"]["bundle_identity"],
-        "com.example.target"
-    );
+    assert_eq!(dispatch["pid"], 42);
+    assert_eq!(dispatch["bundle_identity"], "com.example.target");
     assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
 }
 

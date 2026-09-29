@@ -42,7 +42,7 @@ where
 pub struct ReadStateSummary {
     pub grant_identity: crate::platform::ProcessGrant,
     pub element_count: usize,
-    pub unreadable_count: usize,
+    pub unreadable_subtrees: usize,
 }
 
 fn descriptor() -> ComputerPlaneDescriptor {
@@ -137,7 +137,7 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
             .map_err(|_| CustodyStepFailed)?;
         let result = serde_json::json!({
             "element_count": self.summary.element_count,
-            "unreadable_count": self.summary.unreadable_count,
+            "unreadable_subtrees": self.summary.unreadable_subtrees,
             "image_returned": image_returned,
         });
         self.audit

@@ -905,7 +905,7 @@ fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
     }
 }
 
-/// Restore the open keystroke outcomes and remove the two other enum additions.
+/// Restore the open keystroke outcomes and remove the read, image and web refusals.
 fn recreated_v13() -> Value {
     let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
     vocabulary["revision"] = historical_revision(13);
@@ -916,6 +916,11 @@ fn recreated_v13() -> Value {
             .remove("enum");
     }
     for (id, pointer, word) in [
+        (
+            "computer.read_state",
+            "/result_schema/properties/outcome/enum",
+            "audit_unavailable",
+        ),
         (
             "computer.read_state",
             "/result_schema/properties/image_unavailable/properties/reason/enum",
@@ -952,6 +957,7 @@ fn v14_refusal_words_are_in_closed_enums_and_validate() {
         ("computer.keys", "modifier_chord_needs_foreground"),
         ("computer.keys", "private_input_auth_failed"),
         ("computer.type", "private_input_auth_failed"),
+        ("computer.read_state", "audit_unavailable"),
         ("computer.write_text", "web_content_needs_type"),
     ] {
         let vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();

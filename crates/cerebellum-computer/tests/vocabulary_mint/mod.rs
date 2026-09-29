@@ -1246,6 +1246,12 @@ pub fn v14_from_v13(v13: &Value, revision: &str) -> Value {
             outcomes.sort_unstable();
             row["result_schema"]["properties"]["outcome"]["enum"] = json!(outcomes);
         }
+        if row["capability_id"] == "computer.read_state" {
+            row["result_schema"]["properties"]["outcome"]["enum"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("audit_unavailable"));
+        }
         let pointer = match row["capability_id"].as_str().unwrap() {
             "computer.read_state" => Some((
                 "/result_schema/properties/image_unavailable/properties/reason/enum",

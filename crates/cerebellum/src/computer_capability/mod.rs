@@ -841,7 +841,7 @@ where
                 let summary = cerebellum_computer::app_state::ReadStateSummary {
                     grant_identity: grant.clone(),
                     element_count: 0,
-                    unreadable_count: 1,
+                    unreadable_subtrees: 1,
                 };
                 let mut reply = if self
                     .journal_state_read(identity, summary, manual_accessibility, now_ms, None)
@@ -895,7 +895,7 @@ where
         let summary = cerebellum_computer::app_state::ReadStateSummary {
             grant_identity: grant.clone(),
             element_count: count_elements(&raw.roots),
-            unreadable_count: raw.unreadable_subtrees,
+            unreadable_subtrees: raw.unreadable_subtrees,
         };
         match self
             .journal_state_read(

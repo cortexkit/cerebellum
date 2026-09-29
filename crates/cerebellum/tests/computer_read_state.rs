@@ -420,7 +420,7 @@ async fn a_missing_image_is_declared_and_the_tree_still_returns() {
     }
     assert!(plane.result_schema_findings().is_empty());
 
-    // A journal that cannot record the capture releases no image.
+    // A successful tree also needs a durable row, not just a captured image.
     let failing: Plane<_> = ComputerPlane::with_result_schema_enforcement(
         support::computer::failing_audit(),
         ResultSchemaEnforcement::Withhold,
@@ -442,11 +442,8 @@ async fn a_missing_image_is_declared_and_the_tree_still_returns() {
     )
     .await;
     assert!(reply.get("image").is_none(), "{reply}");
-    assert_eq!(
-        reply["image_unavailable"]["reason"], "audit_unavailable",
-        "{reply}"
-    );
-    assert!(reply["tree"].as_str().unwrap().contains("GoToWindow"));
+    assert_eq!(reply["outcome"], "audit_unavailable", "{reply}");
+    assert!(reply.get("tree").is_none(), "{reply}");
 }
 
 trait ZeroCapture {
@@ -484,6 +481,7 @@ async fn an_unreadable_application_is_disclosed_rather_than_shown_empty() {
     assert_eq!(reply["unreadable_subtrees"], 1);
     assert_eq!(reply["reason"], "application_unreadable");
 
+    let before_refusal = plane.journal_entry_count().await;
     *source.0.lock().unwrap() = Err(AppStateReadError::TargetGone);
     let gone = serve(
         &plane,
@@ -496,6 +494,7 @@ async fn an_unreadable_application_is_disclosed_rather_than_shown_empty() {
     .await;
     assert_eq!(gone["outcome"], "not_running");
     assert_eq!(gone["bundle_identity"], TARGET_BUNDLE_ID);
+    assert_eq!(plane.journal_entry_count().await, before_refusal);
 
     source.replace(vec![chat_window()]);
     assert!(plane.result_schema_findings().is_empty());
@@ -507,6 +506,7 @@ async fn an_unreadable_application_is_disclosed_rather_than_shown_empty() {
 async fn an_ungranted_read_is_refused_before_anything_is_read() {
     let management = support::computer::management();
     let plane = plane(FixtureSource::new(vec![chat_window()]));
+    let before = plane.journal_entry_count().await;
     let reply = serve(
         &plane,
         &management,
@@ -519,6 +519,7 @@ async fn an_ungranted_read_is_refused_before_anything_is_read() {
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     assert!(reply.get("tree").is_none());
     assert_eq!(management.app_state_sessions().session_count(), 0);
+    assert_eq!(plane.journal_entry_count().await, before);
 }
 
 struct FixtureFreshness {
@@ -584,8 +585,8 @@ async fn covered_unmeasured_app_image_refusal_passes_withholding_and_keeps_tree(
         assert_eq!(*facts.seen.lock().unwrap(), vec![None]);
         assert_eq!(
             plane.journal_entry_count().await,
-            journal_before,
-            "no capture was admitted"
+            journal_before + 1,
+            "the successful tree read is recorded even though its image was withheld"
         );
     }
 }
@@ -652,4 +653,226 @@ async fn tree_only_reads_do_not_probe_image_freshness() {
     .await;
     assert_eq!(reply["outcome"], "completed");
     assert!(facts.seen.lock().unwrap().is_empty());
+}
+
+fn recorded_read(storage: &cerebellum_core::journal::InMemoryJournalStorage) -> Value {
+    let state = serde_json::to_value(storage.load().unwrap()).unwrap();
+    let entries = state["entries"].as_object().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one read must have exactly one terminal row"
+    );
+    let row = entries.values().next().unwrap();
+    let bytes = cerebellum_core::serde_base64::decode(row["bytes"].as_str().unwrap()).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn assert_no_screen_text(value: &Value, sentinel: &str) {
+    assert!(!value.to_string().contains(sentinel));
+    match value {
+        Value::Object(fields) => {
+            for value in fields.values() {
+                assert_no_screen_text(value, sentinel);
+            }
+        }
+        Value::Array(items) => {
+            // Opaque journal material is JSON encoded as byte arrays; inspect
+            // those bytes too, rather than mistaking their decimal form for redaction.
+            if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(value.clone()) {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains(sentinel),
+                    "screen text in opaque journal material"
+                );
+            }
+            for value in items {
+                assert_no_screen_text(value, sentinel);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn no_image_read_writes_one_text_free_row() {
+    const LABEL: &str = "PrivateDiscordMessage_f74ba901";
+    let management = granted_management().await;
+    let source = FixtureSource::new(vec![RawElement::fixture(1, "AXWindow")
+        .titled(LABEL)
+        .with_children(vec![RawElement::fixture(2, "AXButton").titled(LABEL)])]);
+    source
+        .0
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .unreadable_subtrees = 2;
+    let storage = cerebellum_core::journal::InMemoryJournalStorage::new();
+    let plane: Plane = ComputerPlane::with_result_schema_enforcement(
+        support::computer::audit_with_storage(storage.clone()),
+        ResultSchemaEnforcement::Withhold,
+    )
+    .with_app_state_source(source);
+    let before = plane.journal_entry_count().await;
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "include_image": false}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(reply["tree"].as_str().unwrap().contains(LABEL));
+    assert_eq!(plane.journal_entry_count().await, before + 1);
+    let row = recorded_read(&storage);
+    assert_eq!(row["phase"], "finalized");
+    let material: Vec<u8> = serde_json::from_value(row["dispatch_material"].clone()).unwrap();
+    let target: Value = serde_json::from_slice(&material).unwrap();
+    assert_eq!(target, serde_json::to_value(grant()).unwrap());
+    let result: Vec<u8> = serde_json::from_value(row["completed_result"].clone()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result).unwrap(),
+        json!({
+            "element_count": 2, "unreadable_subtrees": 2, "image_returned": false,
+            "routes": {"public": 0, "skylight": 0},
+            "release_routes": {"public": 0, "skylight": 0},
+            "auth": "not_applicable",
+        })
+    );
+    assert_no_screen_text(&row, LABEL);
+    assert!(reply.get("manual_accessibility").is_none());
+}
+
+#[tokio::test]
+async fn failed_read_journal_withholds_tree_and_image() {
+    const LABEL: &str = "DoNotReleaseUnjournaledMessage_f92a";
+    let management = granted_management().await;
+    for include_image in [false, true] {
+        let plane: Plane<_> = ComputerPlane::with_result_schema_enforcement(
+            support::computer::failing_audit(),
+            ResultSchemaEnforcement::Withhold,
+        )
+        .with_app_state_source(FixtureSource::new(vec![
+            RawElement::fixture(1, "AXWindow").titled(LABEL)
+        ]));
+        let reply = serve(
+            &plane,
+            &management,
+            "conversation-1",
+            no_relay(),
+            json!({"target": TARGET_BUNDLE_ID, "include_image": include_image}),
+            capturing(jpeg(1250, 750, 0)),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "audit_unavailable", "{reply}");
+        assert!(reply.get("tree").is_none());
+        assert!(reply.get("image").is_none());
+        assert!(!reply.to_string().contains(LABEL));
+        assert!(plane.result_schema_findings().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn image_and_empty_reads_use_the_same_single_summary_row() {
+    let management = granted_management().await;
+    for (include_image, unreadable) in [(true, false), (false, true)] {
+        let source = FixtureSource::new(vec![RawElement::fixture(1, "AXWindow")]);
+        if unreadable {
+            *source.0.lock().unwrap() = Err(AppStateReadError::Unreadable);
+        }
+        let storage = cerebellum_core::journal::InMemoryJournalStorage::new();
+        let plane: Plane = ComputerPlane::with_result_schema_enforcement(
+            support::computer::audit_with_storage(storage.clone()),
+            ResultSchemaEnforcement::Withhold,
+        )
+        .with_app_state_source(source)
+        .with_image_freshness_source(Arc::new(FixtureFreshness {
+            repaints: false,
+            before:
+                cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+            after: cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+            seen: Mutex::new(vec![]),
+        }));
+        let before = plane.journal_entry_count().await;
+        let reply = serve(
+            &plane,
+            &management,
+            "conversation-1",
+            no_relay(),
+            json!({"target": TARGET_BUNDLE_ID, "include_image": include_image}),
+            capturing(jpeg(1250, 750, 0)),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(reply.get("image").is_some(), include_image);
+        assert_eq!(plane.journal_entry_count().await, before + 1);
+        let row = recorded_read(&storage);
+        assert_eq!(row["phase"], "finalized");
+        let result: Vec<u8> = serde_json::from_value(row["completed_result"].clone()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result).unwrap(),
+            json!({
+                "element_count": if unreadable {0} else {1},
+                "unreadable_subtrees": if unreadable {1} else {0},
+                "image_returned": include_image,
+                "routes": {"public": 0, "skylight": 0},
+                "release_routes": {"public": 0, "skylight": 0},
+                "auth": "not_applicable",
+            })
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn serialized_read_row_has_all_four_desk_check_fields() {
+    struct ReportingSource(Arc<FixtureSource>);
+    impl AppStateSource for ReportingSource {
+        fn read_app_state(
+            &self,
+            target: &ProcessGrant,
+            bounds: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            cerebellum_macos::ManualAccessibilityScope::record(
+                target.pid,
+                cerebellum_macos::ManualAccessibility::NewlyEnabled,
+            );
+            self.0.read_app_state(target, bounds)
+        }
+    }
+    let management = granted_management().await;
+    let storage = cerebellum_core::journal::InMemoryJournalStorage::new();
+    let source = FixtureSource::new(vec![RawElement::fixture(1, "AXWindow")]);
+    source
+        .0
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .unreadable_subtrees = 3;
+    let plane: Plane = ComputerPlane::with_result_schema_enforcement(
+        support::computer::audit_with_storage(storage.clone()),
+        ResultSchemaEnforcement::Withhold,
+    )
+    .with_app_state_source(Arc::new(ReportingSource(source)));
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed");
+    assert!(reply.get("manual_accessibility").is_none());
+    let row = recorded_read(&storage);
+    assert_eq!(row["element_count"].as_u64(), Some(1));
+    assert_eq!(row["unreadable_subtrees"].as_u64(), Some(3));
+    assert_eq!(row["image_returned"].as_bool(), Some(false));
+    assert_eq!(row["manual_accessibility"].as_str(), Some("newly_enabled"));
+    assert!(row.get("unreadable_count").is_none());
 }

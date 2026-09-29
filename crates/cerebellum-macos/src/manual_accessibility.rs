@@ -89,7 +89,7 @@ pub(crate) fn prepare(pid: u32, force: bool) -> (ManualAccessibility, bool) {
         } else {
             (ManualAccessibility::Failed(-1), false)
         };
-    record(pid, result.0);
+    ManualAccessibilityScope::record(pid, result.0);
     result
 }
 
@@ -285,6 +285,12 @@ impl ManualAccessibilityScope {
             previous: ACTION.replace(Some((pid, initial))),
             _thread: std::marker::PhantomData,
         }
+    }
+
+    /// Record an enable result only when `pid` matches the current scope's
+    /// target, so reading another process cannot change this action's evidence.
+    pub fn record(pid: u32, status: ManualAccessibility) {
+        record(pid, status);
     }
 
     pub fn current() -> Option<ManualAccessibility> {

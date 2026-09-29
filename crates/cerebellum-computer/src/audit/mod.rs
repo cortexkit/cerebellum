@@ -384,7 +384,7 @@ impl PlaneJournalCodec for ComputerJournalCodec {
         &self,
         input: &CompletionInput,
     ) -> Result<EncodedJournalState, JournalCodecError> {
-        self.encoded(json!({
+        let mut entry = json!({
             "attachments": input.attachments,
             "codec_version": self.codec_version,
             "completed_result": input.completed_result,
@@ -394,7 +394,22 @@ impl PlaneJournalCodec for ComputerJournalCodec {
             "phase": "finalized",
             "sequence": input.action_obligation_id,
             "severity_inputs": Self::severity(input.severity_inputs),
-        }))
+        });
+        // Read summaries stay directly queryable without decoding opaque result
+        // bytes. Copy only the closed numeric/Boolean fields, never tree text.
+        if self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION {
+            if let Ok(summary) = serde_json::from_slice::<Value>(&input.completed_result) {
+                if summary["element_count"].is_u64()
+                    && summary["unreadable_subtrees"].is_u64()
+                    && summary["image_returned"].is_boolean()
+                {
+                    for key in ["element_count", "unreadable_subtrees", "image_returned"] {
+                        entry[key] = summary[key].clone();
+                    }
+                }
+            }
+        }
+        self.encoded(entry)
     }
 
     fn encode_reduced_terminal(
