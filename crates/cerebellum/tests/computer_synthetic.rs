@@ -198,6 +198,8 @@ impl PlatformDriver for SyntheticDriver {
             refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
             front_latency_ms: script.front_latency_ms.unwrap_or(2),
             unit_failure: script.unit_failure.clone(),
+            seize_after_first_unit: script.seize_after_first_unit,
+            units_posted: 0,
         };
         let chunks_started = std::cell::Cell::new(0);
         let scripted_cancel = || {
@@ -291,6 +293,9 @@ struct FrontingScript {
     front_latency_ms: Option<u64>,
     /// When set, every unit post fails this way instead of succeeding.
     unit_failure: Option<SequencePostFailure>,
+    /// When set, input from another process shows up once a unit has been
+    /// posted, so the bracket stops after posting.
+    seize_after_first_unit: bool,
 }
 
 type FrontedScript = FrontingScript;
@@ -307,6 +312,8 @@ struct FrontingDesk {
     refuse_front_of: Option<u32>,
     front_latency_ms: u64,
     unit_failure: Option<SequencePostFailure>,
+    seize_after_first_unit: bool,
+    units_posted: usize,
 }
 
 impl FrontingDesk {
@@ -348,6 +355,13 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
         cerebellum_computer::platform::IdleReading::Milliseconds(60_000)
     }
     fn drain(&mut self, _tap: &()) -> Vec<cerebellum_computer::dispatch::SourcedInputEvent> {
+        if self.seize_after_first_unit && self.units_posted > 0 {
+            return vec![cerebellum_computer::dispatch::SourcedInputEvent {
+                source_unix_process_id: 999,
+                detection_latency_ms: 1,
+                platform_delivery_latency_ms: None,
+            }];
+        }
         Vec::new()
     }
     fn post_heartbeat(&mut self) -> cerebellum_computer::dispatch::HeartbeatProbe {
@@ -377,6 +391,7 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
         if let Some(failure) = self.unit_failure.clone() {
             return Err(failure);
         }
+        self.units_posted += 1;
         Ok(cerebellum_computer::dispatch::UnitPosted {
             posts_returned: 2,
             generation_verifications: 4,
@@ -1787,6 +1802,26 @@ async fn a_stop_after_posting_stays_indeterminate_with_its_count() {
     assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
     assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
     assert_eq!(reply["posts_returned"], 1, "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+
+    // Through the bracket, stopped after the unit went out by input from
+    // another process. Only the bracket's own count shows that it posted:
+    // the refusal it ends in carries none.
+    let shared = Shared::handle();
+    shared.lock().unwrap().fronted.seize_after_first_unit = true;
+    let desk = background(focused_text_desk());
+    let plane = plane_on(&shared, &desk, true);
+    let reply = serve_asking(
+        &plane,
+        "computer.keys",
+        keys_request(&["command", "a"]),
+        &management,
+        relayed(&ScriptedCarrier::default()),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "user_seized_control", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+    assert_eq!(reply["posts_returned"], 2, "{reply}");
     assert!(plane.result_schema_findings().is_empty());
 }
 
