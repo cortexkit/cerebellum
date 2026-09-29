@@ -970,7 +970,8 @@ fn v14_only_makes_the_changes_recreated_v13_undoes() {
 }
 
 /// A reader meeting an effect_status it does not know reads it as
-/// effect_indeterminate, and the keystroke rows say so.
+/// effect_indeterminate, and the computer.type and computer.keys rows say so
+/// in their effect_status description.
 ///
 /// Nothing in this repository parses effect_status back out of a reply --
 /// the model reading computer_use replies is the reader -- so the vector is a
@@ -1001,7 +1002,7 @@ fn an_unknown_effect_status_is_read_as_indeterminate_by_rule() {
         );
     }
     // write_text sets a value through accessibility rather than posting
-    // keystrokes, so it is left without the new word.
+    // keystrokes, so its effect_status enum does not gain not_dispatched.
     let write_text = &row(&vocabulary, "computer.write_text")["result_schema"]["properties"]
         ["effect_status"]["enum"];
     assert!(!write_text
