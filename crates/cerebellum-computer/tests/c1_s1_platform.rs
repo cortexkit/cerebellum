@@ -905,10 +905,16 @@ fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
     }
 }
 
-/// Undo only the two closed-enum additions; open keystroke outcomes need no artifact change.
+/// Restore the open keystroke outcomes and remove the two other enum additions.
 fn recreated_v13() -> Value {
     let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
     vocabulary["revision"] = historical_revision(13);
+    for id in ["computer.keys", "computer.type"] {
+        row_mut(&mut vocabulary, id)["result_schema"]["properties"]["outcome"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enum");
+    }
     for (id, pointer, word) in [
         (
             "computer.read_state",
@@ -940,7 +946,7 @@ fn v14_only_makes_the_changes_recreated_v13_undoes() {
 }
 
 #[test]
-fn v14_refusal_words_validate_in_their_declared_fields() {
+fn v14_refusal_words_are_in_closed_enums_and_validate() {
     use cerebellum_computer::platform::vocabulary::validate_capability_result;
     for (id, outcome) in [
         ("computer.keys", "modifier_chord_needs_foreground"),
@@ -948,6 +954,17 @@ fn v14_refusal_words_validate_in_their_declared_fields() {
         ("computer.type", "private_input_auth_failed"),
         ("computer.write_text", "web_content_needs_type"),
     ] {
+        let vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+        let row = vocabulary["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["capability_id"] == id)
+            .unwrap();
+        assert!(row["result_schema"]["properties"]["outcome"]["enum"]
+            .as_array()
+            .expect("outcome must be closed")
+            .contains(&json!(outcome)));
         let mut reply = json!({"outcome": outcome});
         if id == "computer.keys" || id == "computer.type" {
             reply["containment_rung"] = json!("pid_structural");

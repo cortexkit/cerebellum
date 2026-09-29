@@ -1174,12 +1174,78 @@ pub fn v13_from_v12(v12: &Value, revision: &str) -> Value {
     })
 }
 
-/// Add the stale-image refusal and the semantic web-content refusal.
-/// Keystroke outcomes remain open strings, so their new words require no schema change.
+/// Add the image and web-content refusals, and publish the closed keystroke outcomes.
 pub fn v14_from_v13(v13: &Value, revision: &str) -> Value {
     let mut v14 = v13.clone();
     v14["revision"] = json!(revision);
     for row in v14["rows"].as_array_mut().unwrap() {
+        let id = row["capability_id"].as_str().unwrap();
+        if matches!(id, "computer.type" | "computer.keys") {
+            // The shared dispatch-refusal builder can render every dispatch error,
+            // including errors normally associated with semantic actions.
+            let mut outcomes = vec![
+                "invalid_request",
+                "semantic_action_unsupported",
+                "element_name_ambiguous",
+                "element_not_found",
+                "action_not_advertised",
+                "application_refused",
+                "accessibility_permission_unavailable",
+                "target_no_longer_current",
+                "semantic_dispatch_transient",
+                "semantic_path_unavailable",
+                "session_not_console",
+                "window_visibility_unknown",
+                "synthetic_unavailable",
+                "cancelled",
+                "held_state_unknown",
+                "dispatch_failed",
+                "envelope_unrecognized",
+                "unsupported_mode",
+                "observer_unavailable",
+                "seize_latency_bound_exceeded",
+                "idle_unreadable",
+                "not_idle",
+                "user_seized_control",
+                "attendance_unavailable",
+                "fronting_failed",
+                "fronting_bound_exceeded",
+                "restore_failed",
+                "target_focus_mismatch",
+                "grounding_untrusted",
+                "stale_element",
+                "stale_grounding",
+                "grant_identity_mismatch",
+                "identity_verification_unavailable",
+                "observation_primitive_unavailable",
+                "background_unsupported_target",
+                "platform_error",
+                "audit_unavailable",
+                "consent_pending",
+                "consent_denied",
+                "consent_granted_not_executed",
+                "consent_unavailable",
+                "module_draining",
+                "route_closed",
+                "not_running",
+                "ambiguous",
+                "targets_unreadable",
+                "secure_field_refused",
+                "keystrokes_need_foreground",
+                "screen_locked",
+                "not_servable",
+                "delivery_unconfirmed",
+                "refused",
+                "private_input_auth_failed",
+            ];
+            if id == "computer.type" {
+                outcomes.push("completed");
+            } else {
+                outcomes.extend(["chord_blocked", "modifier_chord_needs_foreground"]);
+            }
+            outcomes.sort_unstable();
+            row["result_schema"]["properties"]["outcome"]["enum"] = json!(outcomes);
+        }
         let pointer = match row["capability_id"].as_str().unwrap() {
             "computer.read_state" => Some((
                 "/result_schema/properties/image_unavailable/properties/reason/enum",

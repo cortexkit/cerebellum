@@ -31,9 +31,29 @@ type Plane<S = InMemoryJournalStorage> = ComputerPlane<
     S,
 >;
 
+// Point-action fixtures capture fake windows, whose visibility cannot be read
+// from the real desktop. Certify only the fixture's fully visible window.
+struct VisibleFixture;
+impl cerebellum::computer_capability::image_freshness::ImageFreshnessSource for VisibleFixture {
+    fn inspect(
+        &self,
+        _: &ProcessGrant,
+        _: Option<&str>,
+    ) -> (
+        bool,
+        cerebellum::computer_capability::image_freshness::WindowVisibility,
+    ) {
+        (
+            false,
+            cerebellum::computer_capability::image_freshness::WindowVisibility::FullyVisible,
+        )
+    }
+}
+
 fn plane(desk: &Desk) -> Plane {
     ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
         .with_app_state_source(desk.source())
+        .with_image_freshness_source(Arc::new(VisibleFixture))
 }
 
 async fn serve_as<S: JournalStorage + Send + 'static>(

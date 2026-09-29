@@ -51,10 +51,8 @@ mod skylight;
 mod window_image;
 #[cfg(any(target_os = "macos", test))]
 mod window_visibility;
-#[cfg(target_os = "macos")]
-pub use window_visibility::process_uses_chromium;
 #[cfg(any(target_os = "macos", test))]
-pub use window_visibility::{bundle_uses_chromium, WindowVisibility};
+pub use window_visibility::WindowVisibility;
 
 // The export gate MATCHES the module gate above. `accessibility` compiles off
 // macOS under `test` on purpose, so its platform-neutral logic -- cycle
