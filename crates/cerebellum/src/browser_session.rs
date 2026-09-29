@@ -420,6 +420,7 @@ pub struct ViewportRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClickDriveError {
     NoPosition,
+    Intercepted(serde_json::Value),
     ClassificationChanged,
     OutsideViewportAfterScroll(ViewportRefusal),
     Navigation(NavigationDriveError),
@@ -557,6 +558,37 @@ pub trait OwnedBrowserProcess: Send {
         Err(ClickDriveError::Navigation(
             NavigationDriveError::Unavailable,
         ))
+    }
+
+    fn classify_point(
+        &mut self,
+        _context_key: &str,
+        _position: BrowserClickPosition,
+        _document_epoch: u64,
+        _document_url: &str,
+        _deadline_ms: u64,
+    ) -> Result<
+        Result<
+            crate::classification::NonTypeClassificationRecord,
+            crate::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn click_point_classified(
+        &mut self,
+        _context_key: &str,
+        _position: BrowserClickPosition,
+        _document_epoch: u64,
+        _document_url: &str,
+        _expected: &crate::classification::NonTypeClassificationRecord,
+        _deadline_ms: u64,
+        _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        Err(ClickDriveError::ClassificationChanged)
     }
 
     /// Dispatch a screenshot-backed coordinate through the process-owned CDP driver.
@@ -1337,15 +1369,55 @@ impl OperationGuard {
         )
     }
 
-    pub(crate) fn click_point(
+    pub(crate) fn classify_point(
         &mut self,
         context_key: &str,
         position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        deadline_ms: u64,
+    ) -> Result<
+        Result<
+            crate::classification::NonTypeClassificationRecord,
+            crate::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        self.drive(
+            |error| error,
+            |process| {
+                process.classify_point(
+                    context_key,
+                    position,
+                    document_epoch,
+                    document_url,
+                    deadline_ms,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn click_point_classified(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        expected: &crate::classification::NonTypeClassificationRecord,
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-    ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
-        self.drive(ClickPointDriveError::Navigation, |process| {
-            process.click_point(context_key, position, deadline_ms, input_dispatched)
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.drive(ClickDriveError::Navigation, |process| {
+            process.click_point_classified(
+                context_key,
+                position,
+                document_epoch,
+                document_url,
+                expected,
+                deadline_ms,
+                input_dispatched,
+            )
         })
     }
 

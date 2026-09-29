@@ -698,7 +698,11 @@ impl GrantStore {
         let (computed, fingerprint) =
             computed_required_severity(request.action, request.classification)?;
         let required_hazards = target_hazards(request.action, request.classification)?;
-        let floor = request.action.floor();
+        let floor = if computed.tier == OBSERVE {
+            computed
+        } else {
+            request.action.floor()
+        };
         request.requested_severity.validate()?;
         if request.requested_severity.tier < floor.tier {
             return Err(AuthorizationError::SeverityBelowFloor { required: computed });
@@ -710,6 +714,17 @@ impl GrantStore {
             attempted_origin,
             &required_hazards,
         )?;
+        if let Some(destination) = request
+            .classification
+            .and_then(|record| record.activation_destination_origin.as_deref())
+        {
+            self.select_covering_grant_for_hazards(
+                request.conversation_key,
+                effective,
+                destination,
+                &required_hazards,
+            )?;
+        }
         make_decision(&grant, request, effective, fingerprint)
     }
 
@@ -869,7 +884,11 @@ pub fn effective_severity(
 ) -> Result<Severity, AuthorizationError> {
     requested.validate()?;
     let (computed, _) = computed_required_severity(action, classification)?;
-    let floor = action.floor();
+    let floor = if computed.tier == OBSERVE {
+        computed
+    } else {
+        action.floor()
+    };
     if requested.tier < floor.tier {
         return Err(AuthorizationError::SeverityBelowFloor { required: computed });
     }

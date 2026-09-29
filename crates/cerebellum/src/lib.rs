@@ -5810,21 +5810,20 @@ mod tests {
                 }),
             )
             .await;
-        assert_eq!(unknown["outcome"], "hazard_not_disclosed", "{unknown}");
         assert_eq!(
-            unknown["detail"]["missing_hazard"], "unverified_form_contents",
+            unknown["outcome"], "classification_unavailable",
             "{unknown}"
         );
         assert_eq!(
-            unknown["remedy"],
-            "call browser.open_grant with the arguments in detail.grant_request, then retry",
-            "{unknown}"
+            unknown["detail"]["classification_unavailable"],
+            "not_captured"
         );
-        assert_eq!(
-            unknown["detail"]["grant_request"]["hazards"],
-            json!(["unverified_form_contents"]),
-            "{unknown}"
-        );
+        assert!(unknown["detail"].get("required").is_none());
+        assert!(unknown["detail"].get("grant_request").is_none());
+        assert!(unknown["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("enclosing element"));
     }
 
     /// An answer arriving on a route reaches the question that asked it.

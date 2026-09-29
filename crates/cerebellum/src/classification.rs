@@ -385,12 +385,19 @@ impl NonTypeClassificationRecord {
             return Err(ClassificationError::DerivedFieldMismatch);
         }
         let expected_tier = if self.activation_invokes_form_submit
+            || self.credential
+            || self.financial
             || self
                 .activation_destination_origin
                 .as_deref()
                 .is_some_and(|origin| origin != self.current_top_level_origin)
         {
             4
+        } else if self.target_kind.is_navigation_target()
+            && self.activation_destination_origin.as_deref()
+                == Some(self.current_top_level_origin.as_str())
+        {
+            1
         } else {
             2
         };
@@ -744,10 +751,20 @@ pub fn classify_non_type(
         &associated_form_controls,
     );
     let elevated = activation_invokes_form_submit
+        || credential
+        || financial
         || activation_destination_origin
             .as_deref()
             .is_some_and(|origin| origin != current_origin);
-    let required_tier = if elevated { 4 } else { 2 };
+    let required_tier = if elevated {
+        4
+    } else if activation_target.target_kind.is_navigation_target()
+        && activation_destination_origin.as_deref() == Some(current_origin.as_str())
+    {
+        1
+    } else {
+        2
+    };
 
     let record = NonTypeClassificationRecord {
         schema: NON_TYPE_CLASSIFICATION_SCHEMA.to_string(),
@@ -822,36 +839,19 @@ fn derive_activation_target<'a>(
     target: &'a ElementClassificationInput,
     ancestors: &'a [ElementClassificationInput],
 ) -> Result<&'a ElementClassificationInput, ClassificationError> {
-    if target.is_label {
-        if let Some(control) = target.label_control.as_deref() {
-            if !control.disabled {
+    // The nearest activation boundary wins: a nested button must not inherit
+    // the behavior of a more distant link or label.
+    for element in std::iter::once(target).chain(ancestors.iter()) {
+        if element.is_label {
+            if let Some(control) = element.label_control.as_deref() {
                 return Ok(control);
             }
-            // Chromium's label forwarding still identifies the disabled control,
-            // but the disabled control cannot produce submit elevation.  It is
-            // therefore returned as the activation target rather than skipped.
-            return Ok(control);
+        }
+        if element.built_in_activation {
+            return Ok(element);
         }
     }
-    Ok(ancestors
-        .iter()
-        .find_map(|ancestor| {
-            if ancestor.is_label {
-                ancestor.label_control.as_deref()
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            ancestors
-                .iter()
-                .find(|ancestor| ancestor.built_in_activation)
-        })
-        .or_else(|| target.built_in_activation.then_some(target))
-        // A custom element or inert wrapper has no standardized activation
-        // behavior, so the classified node itself remains the target.
-        .or(Some(target))
-        .expect("the classified node is always an activation fallback"))
+    Ok(target)
 }
 
 fn validate_element(element: &ElementClassificationInput) -> Result<(), ClassificationError> {

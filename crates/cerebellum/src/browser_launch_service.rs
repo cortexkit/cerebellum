@@ -2000,6 +2000,58 @@ impl OwnedBrowserProcess for ProductionProcess {
             .screenshot(context_key, document_epoch, deadline_ms, full)
     }
 
+    fn classify_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        deadline_ms: u64,
+    ) -> Result<
+        Result<
+            crate::classification::NonTypeClassificationRecord,
+            crate::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .classify_point(
+                context_key,
+                position,
+                document_epoch,
+                document_url,
+                deadline_ms,
+            )
+    }
+
+    fn click_point_classified(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        expected: &crate::classification::NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(ClickDriveError::Navigation(
+                NavigationDriveError::Unavailable,
+            ))?
+            .click_point_classified(
+                context_key,
+                position,
+                document_epoch,
+                document_url,
+                expected,
+                deadline_ms,
+                input_dispatched,
+            )
+    }
+
     fn click_point(
         &mut self,
         context_key: &str,

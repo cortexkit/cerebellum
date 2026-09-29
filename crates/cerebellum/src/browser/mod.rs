@@ -157,6 +157,8 @@ pub enum BrowserError {
         candidate_count: usize,
     },
     ElementIntercepted,
+    Intercepted(Value),
+    ClassificationUnavailable(ClassificationUnavailable),
     OutsideViewportAfterScroll {
         refusal: crate::browser_session::ViewportRefusal,
     },
@@ -250,7 +252,8 @@ impl BrowserError {
             Self::StaleSnapshot { .. } | Self::PageChangedSinceSnapshot { .. } => "stale_snapshot",
             Self::RefNotFound { .. } => "ref_not_found",
             Self::RefAmbiguous { .. } => "ref_ambiguous",
-            Self::ElementIntercepted => "element_intercepted",
+            Self::ClassificationUnavailable(_) => "classification_unavailable",
+            Self::ElementIntercepted | Self::Intercepted(_) => "element_intercepted",
             Self::OutsideViewportAfterScroll { .. } => "outside_viewport_after_scroll",
             Self::PointOutsideViewport { .. } => "point_outside_viewport",
             Self::InvalidCoordinates { .. } => "invalid_coordinates",
@@ -298,7 +301,8 @@ impl BrowserError {
             Self::RefAmbiguous { .. } => {
                 "take a fresh browser.snapshot and choose a ref that identifies exactly one current element"
             }
-            Self::ElementIntercepted => {
+            Self::ClassificationUnavailable(_) => "take a fresh snapshot and click the enclosing element's ref instead",
+            Self::ElementIntercepted | Self::Intercepted(_) => {
                 "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position"
             }
             Self::OutsideViewportAfterScroll { .. } => {
@@ -492,7 +496,13 @@ impl BrowserError {
             }
             Self::BrowserLaunchPending => json!({"reason_code":"browser_launch_pending"}),
             Self::HumanInControl { .. } | Self::SessionStateUnavailable => return None,
-            Self::ElementIntercepted => json!({}),
+            Self::ClassificationUnavailable(reason) => {
+                json!({"classification_unavailable":reason.reason_code(), "classification_unavailable_facts":reason.facts()})
+            }
+            Self::Intercepted(detail) => detail.clone(),
+            Self::ElementIntercepted => {
+                json!({"hit_role":null,"hit_name":null,"hit_inside_target":null,"reason_code":"click_position_unavailable"})
+            }
             Self::OutsideViewportAfterScroll { refusal } => {
                 viewport_refusal_detail("outside_viewport_after_scroll", *refusal)
             }
@@ -3033,15 +3043,20 @@ impl BrowserPlane {
             )
         };
 
+        if let Err(reason) = &classification {
+            self.unpin_snapshot(identity, snapshot_id).await;
+            return Err(BrowserError::ClassificationUnavailable(reason.clone()));
+        }
+        let activated_element = classification
+            .as_ref()
+            .ok()
+            .map(|record| json!({"identity":record.activation_target_identity,"kind":record.target_kind}));
         let deadline_ms = self
             .session_gate
             .as_ref()
             .map(|(_, _, deadline_ms)| *deadline_ms);
-        // Snapshot capture stores either validated form facts or the named
-        // reason the DOM could not be classified. Authorization treats any such
-        // reason as the distinct unverified-form hazard, and the refusal names
-        // it. Before mouse input, `click_classified` recomputes the record and
-        // refuses if it differs from this snapshot-time value.
+        // Before mouse input, recompute the snapshot classification so a changed
+        // target cannot inherit authorization from the earlier observation.
 
         let authorization = {
             let grants = self.grants.lock().await;
@@ -3172,8 +3187,11 @@ impl BrowserPlane {
             .refuse_moved_page(identity, BrowserCapability::Click, drive_result)
             .await?;
 
-        let response = match drive_result {
+        let mut response = match drive_result {
             Ok(outcome) => self.click_reply(identity, outcome).await,
+            Err(crate::browser_session::ClickDriveError::Intercepted(detail)) => {
+                return Err(BrowserError::Intercepted(detail));
+            }
             Err(crate::browser_session::ClickDriveError::NoPosition) => {
                 self.finalize(
                     identity,
@@ -3211,6 +3229,7 @@ impl BrowserPlane {
                 return Err(map_navigation_drive_error(error));
             }
         };
+        response["activated_element"] = activated_element.unwrap_or(Value::Null);
         self.finalize(
             identity,
             BrowserCapability::Click,
@@ -3381,7 +3400,7 @@ impl BrowserPlane {
         // As in `click`: authorization enforces the floor and reports the
         // severity it computed for this action.
         let requested_severity = parse_severity(object)?;
-        let (position, source_origin, source_document) = {
+        let (position, source_origin, source_document, document_epoch) = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
@@ -3440,31 +3459,9 @@ impl BrowserPlane {
                 crate::browser_session::BrowserClickPosition { x_css, y_css },
                 screenshot.source_origin,
                 screenshot.source_document,
+                screenshot.document_epoch,
             )
         };
-
-        // A screenshot does not identify or classify the DOM element under the
-        // point, so its grant must cover unverified form targets on that page.
-        let authorization = {
-            let grants = self.grants.lock().await;
-            let request = AuthorizationRequest::click_point_unverified(
-                &identity.conversation_key,
-                requested_severity,
-                snapshot_id,
-                &identity.agent_project_id,
-            );
-            let origin = origin_from_url(&source_origin);
-            grants.authorize(request, &origin).and_then(|decision| {
-                grants
-                    .commit(&decision)
-                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
-                Ok(decision)
-            })
-        };
-        if let Err(error) = authorization {
-            self.unpin_snapshot(identity, snapshot_id).await;
-            return Err(map_authorization_error(error));
-        }
 
         let reservation = self.reserve(identity, BrowserCapability::ClickPoint).await;
         let mut session_operation = match reservation {
@@ -3501,6 +3498,61 @@ impl BrowserPlane {
             self.unpin_snapshot(identity, snapshot_id).await;
             return Err(BrowserError::NoSession);
         };
+        let route_key = identity.conversation_key.clone();
+        let origin = source_origin.clone();
+        let observed = tokio::task::spawn_blocking(move || {
+            let live = session_operation.committed_document(&route_key, deadline_ms);
+            let result = check_snapshot_document(source_document.as_ref(), live).and_then(|_| {
+                session_operation
+                    .classify_point(&route_key, position, document_epoch, &origin, deadline_ms)
+                    .map_err(map_navigation_drive_error)?
+                    .map_err(BrowserError::ClassificationUnavailable)
+            });
+            (session_operation, result, source_document)
+        })
+        .await;
+        let (operation, classification, source_document) = match observed {
+            Ok(value) => value,
+            Err(_) => {
+                self.unpin_snapshot(identity, snapshot_id).await;
+                return Err(BrowserError::Internal {
+                    reason_code: JournalReasonCode::InternalFailure,
+                });
+            }
+        };
+        session_operation = operation;
+        let classification = match classification {
+            Ok(record) => record,
+            Err(error) => {
+                session_operation.finish();
+                self.unpin_snapshot(identity, snapshot_id).await;
+                return Err(error);
+            }
+        };
+        let authorization = {
+            let grants = self.grants.lock().await;
+            let request = AuthorizationRequest::click_point(
+                &identity.conversation_key,
+                requested_severity,
+                snapshot_id,
+                &identity.agent_project_id,
+                &classification,
+            );
+            grants
+                .authorize(request, &origin_from_url(&source_origin))
+                .and_then(|decision| {
+                    grants
+                        .commit(&decision)
+                        .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+                    Ok(decision)
+                })
+        };
+        if let Err(error) = authorization {
+            session_operation.finish();
+            self.unpin_snapshot(identity, snapshot_id).await;
+            return Err(map_authorization_error(error));
+        }
+        let activated_element = json!({"identity":classification.activation_target_identity,"kind":classification.target_kind});
         let state = Arc::clone(&self.state);
         let route_key = identity.conversation_key.clone();
         let driven = tokio::task::spawn_blocking(move || {
@@ -3521,9 +3573,12 @@ impl BrowserPlane {
             if let Err(error) = check_snapshot_document(source_document.as_ref(), live) {
                 return (session_operation, Err(error));
             }
-            let result = session_operation.click_point(
+            let result = session_operation.click_point_classified(
                 &route_key,
                 position,
+                document_epoch,
+                &source_origin,
+                &classification,
                 deadline_ms,
                 &mut input_dispatched,
             );
@@ -3544,9 +3599,9 @@ impl BrowserPlane {
         let drive_result = self
             .refuse_moved_page(identity, BrowserCapability::ClickPoint, drive_result)
             .await?;
-        let response = match drive_result {
+        let mut response = match drive_result {
             Ok(outcome) => self.click_reply(identity, outcome).await,
-            Err(crate::browser_session::ClickPointDriveError::OutsideViewport(refusal)) => {
+            Err(crate::browser_session::ClickDriveError::OutsideViewportAfterScroll(refusal)) => {
                 let detail = viewport_refusal_detail("point_outside_viewport", refusal);
                 self.finalize(
                     identity,
@@ -3557,11 +3612,23 @@ impl BrowserPlane {
                 .await?;
                 return Err(BrowserError::PointOutsideViewport { refusal });
             }
-            Err(crate::browser_session::ClickPointDriveError::Navigation(error)) => {
+            Err(crate::browser_session::ClickDriveError::Intercepted(detail)) => {
+                return Err(BrowserError::Intercepted(detail));
+            }
+            Err(
+                crate::browser_session::ClickDriveError::NoPosition
+                | crate::browser_session::ClickDriveError::ClassificationChanged,
+            ) => {
+                return Err(BrowserError::StaleSnapshot {
+                    reason_code: "classification_changed",
+                });
+            }
+            Err(crate::browser_session::ClickDriveError::Navigation(error)) => {
                 return Err(map_navigation_drive_error(error));
             }
         };
 
+        response["activated_element"] = activated_element;
         self.finalize(
             identity,
             BrowserCapability::ClickPoint,
@@ -4002,6 +4069,10 @@ fn refusal_detail_schema() -> Value {
                 "severity_tier":integer_schema(),
                 "hazards":string_array_schema(),
             }), &["origins", "severity_tier", "hazards"]),
+            "hit_backend_node_id":integer_schema(),
+            "hit_role":nullable_string_schema(),
+            "hit_name":nullable_string_schema(),
+            "hit_inside_target":json!({"type":["boolean","null"]}),
             "classification_unavailable":string_schema(),
             "classification_unavailable_facts":closed_object(json!({
                 "index":integer_schema(),
@@ -4070,6 +4141,7 @@ fn browser_result_outcome_schema() -> Value {
             "stale_snapshot",
         "ref_not_found",
         "ref_ambiguous",
+        "classification_unavailable",
         "element_intercepted",
         "outside_viewport_after_scroll",
         "point_outside_viewport",
@@ -4159,6 +4231,7 @@ fn click_result_schema() -> Value {
         json!({
             "navigation":enum_schema(&["none_observed", "same_document", "not_committed", "main_frame"]),
             "navigation_window_ms":integer_schema(),
+            "activated_element":closed_object(json!({"identity":string_schema(),"kind":string_schema()}), &["identity","kind"]),
             "url_final":nullable_string_schema(),
             "lifecycle":string_array_schema(),
             "http_status":integer_schema(),
@@ -5028,6 +5101,8 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::PageChangedSinceSnapshot { .. }
         | BrowserError::RefNotFound { .. }
         | BrowserError::RefAmbiguous { .. }
+        | BrowserError::ClassificationUnavailable(_)
+        | BrowserError::Intercepted(_)
         | BrowserError::ElementIntercepted
         | BrowserError::OutsideViewportAfterScroll { .. }
         | BrowserError::PointOutsideViewport { .. } => Outcome::StaleSnapshot,

@@ -500,6 +500,132 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )
     }
 
+    /// Observe the live target under a pixel before the caller authorizes input.
+    pub fn classify_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        deadline_ms: u64,
+    ) -> Result<Result<NonTypeClassificationRecord, ClassificationUnavailable>, NavigationDriveError>
+    {
+        let mut clock = SystemNavigationClock;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.classify_point_before(
+            context_key,
+            position,
+            document_epoch,
+            document_url,
+            deadline,
+            &mut clock,
+        )
+    }
+
+    fn classify_point_before<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<Result<NonTypeClassificationRecord, ClassificationUnavailable>, NavigationDriveError>
+    {
+        self.ensure_attached(context_key, deadline, clock)?;
+        let attachment = self
+            .attachment
+            .clone()
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let mut params = Map::new();
+        params.insert(
+            "x".into(),
+            Value::from(
+                hit_test_coordinate(position.x_css)
+                    .map_err(|_| NavigationDriveError::CdpFailure)?,
+            ),
+        );
+        params.insert(
+            "y".into(),
+            Value::from(
+                hit_test_coordinate(position.y_css)
+                    .map_err(|_| NavigationDriveError::CdpFailure)?,
+            ),
+        );
+        params.insert("includeUserAgentShadowDOM".into(), Value::Bool(true));
+        let response = self.command_response(
+            "DOM.getNodeForLocation",
+            Some(params),
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            None,
+            clock,
+        )?;
+        let Some(result) = response.result.filter(|_| response.error.is_none()) else {
+            return Ok(Err(ClassificationUnavailable::DomReadFailed));
+        };
+        let Some(backend_node_id) = result
+            .get("backendNodeId")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+        else {
+            return Ok(Err(ClassificationUnavailable::DomReadFailed));
+        };
+        let Some(frame_id) = result.get("frameId").and_then(Value::as_str) else {
+            return Ok(Err(ClassificationUnavailable::DomReadFailed));
+        };
+        let identity = BackendNodeIdentity {
+            target_id: attachment.target_id,
+            frame_id: frame_id.to_string(),
+            backend_node_id,
+        };
+        self.classify_click_before(
+            context_key,
+            &identity,
+            document_epoch,
+            document_url,
+            deadline,
+            clock,
+        )
+    }
+
+    /// Re-hit-test immediately before dispatch so a moved overlay cannot inherit authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn click_point_classified(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        expected: &NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        let actual = self
+            .classify_point(
+                context_key,
+                position,
+                document_epoch,
+                document_url,
+                deadline_ms,
+            )
+            .map_err(ClickDriveError::Navigation)?;
+        if actual.as_ref().ok() != Some(expected) {
+            return Err(ClickDriveError::ClassificationChanged);
+        }
+        self.click_point(context_key, position, deadline_ms, input_dispatched)
+            .map_err(|error| match error {
+                ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
+                ClickPointDriveError::OutsideViewport(refusal) => {
+                    ClickDriveError::OutsideViewportAfterScroll(refusal)
+                }
+            })
+    }
+
     /// Dispatch a coordinate click through this driver's owned CDP session.
     pub fn click_point(
         &mut self,
@@ -681,6 +807,39 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             })
             .ok_or(ClickDriveError::NoPosition)?;
 
+        // Geometry follows the activated element, not an AX text node with no box.
+        let activated = if let Some(record) = revalidation
+            .and_then(|(_, _, record)| record)
+            .filter(|record| record.node_identity != record.activation_target_identity)
+        {
+            let nodes = self
+                .flattened_dom_nodes_before(&attachment, deadline, clock)
+                .map_err(ClickDriveError::Navigation)?
+                .map_err(|_| ClickDriveError::ClassificationChanged)?;
+            let node = nodes
+                .iter()
+                .find(|node| {
+                    NodeIdentityInput::new(
+                        &identity.target_id,
+                        &identity.frame_id,
+                        node.backend_node_id,
+                    )
+                    .identity()
+                    .ok()
+                    .as_ref()
+                        == Some(&record.activation_target_identity)
+                })
+                .ok_or(ClickDriveError::ClassificationChanged)?;
+            Some(BackendNodeIdentity {
+                backend_node_id: node.backend_node_id,
+                ..identity.clone()
+            })
+        } else {
+            None
+        };
+        let requested_identity = identity;
+        let identity = activated.as_ref().unwrap_or(identity);
+
         // Resolve once before scrolling so a detached or geometry-less ref keeps
         // the existing no-position refusal. The post-scroll fetch below is the
         // only coordinate that may reach hit testing or input dispatch.
@@ -803,7 +962,32 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             if !described_node_contains(&described, hit_backend_node_id)
                 .map_err(ClickDriveError::Navigation)?
             {
-                return Err(ClickDriveError::NoPosition);
+                let mut params = Map::new();
+                params.insert("backendNodeId".into(), Value::from(hit_backend_node_id));
+                params.insert("fetchRelatives".into(), Value::Bool(false));
+                let ax = self
+                    .command_response(
+                        "Accessibility.getPartialAXTree",
+                        Some(params),
+                        Some(attachment.session_id.clone()),
+                        deadline,
+                        None,
+                        None,
+                        clock,
+                    )
+                    .ok()
+                    .and_then(|response| response.result);
+                let node = ax
+                    .as_ref()
+                    .and_then(|result| result.get("nodes"))
+                    .and_then(Value::as_array)
+                    .and_then(|nodes| nodes.first());
+                return Err(ClickDriveError::Intercepted(serde_json::json!({
+                    "hit_backend_node_id":hit_backend_node_id,
+                    "hit_role":node.and_then(|node| node.pointer("/role/value")),
+                    "hit_name":node.and_then(|node| node.pointer("/name/value")),
+                    "hit_inside_target":false,
+                })));
             }
         }
 
@@ -811,16 +995,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             let actual = self
                 .classify_click_before(
                     context_key,
-                    identity,
+                    requested_identity,
                     document_epoch,
                     current_origin,
                     deadline,
                     clock,
                 )
                 .map_err(ClickDriveError::Navigation)?;
-            // Any unavailable classification matches an unavailable snapshot:
-            // both were authorized as the strongest hazard, so a different
-            // reason for the same unknown does not change what was approved.
+            // Authorization binds the complete original record, including its
+            // source node and activated ancestor, rather than just its severity.
             if actual.as_ref().ok() != expected {
                 return Err(ClickDriveError::ClassificationChanged);
             }
@@ -2100,12 +2283,11 @@ fn parse_flattened_dom_nodes(
         let object = value
             .as_object()
             .ok_or(ClassificationUnavailable::NodeNotObject { index })?;
-        if object
+        let node_type = object
             .get("nodeType")
             .and_then(Value::as_u64)
-            .ok_or(field_invalid("nodeType"))?
-            != 1
-        {
+            .ok_or(field_invalid("nodeType"))?;
+        if !matches!(node_type, 1 | 3) {
             continue;
         }
         let node_id = object
@@ -2127,10 +2309,17 @@ fn parse_flattened_dom_nodes(
         // DOM.getFlattenedDocument supplies the complete attribute array for
         // element nodes. Missing it makes security-relevant facts unavailable,
         // so the entire projection becomes an unknown classification.
-        let attribute_values = object
-            .get("attributes")
-            .and_then(Value::as_array)
-            .ok_or(ClassificationUnavailable::AttributesMissing { node_id })?;
+        // Text nodes carry backend identities in AX snapshots but have no attributes.
+        // Retain them so their parent chain can identify the activated element.
+        let empty_attributes = Vec::new();
+        let attribute_values = if node_type == 3 {
+            &empty_attributes
+        } else {
+            object
+                .get("attributes")
+                .and_then(Value::as_array)
+                .ok_or(ClassificationUnavailable::AttributesMissing { node_id })?
+        };
         if attribute_values.len() % 2 != 0 {
             return Err(ClassificationUnavailable::AttributesOddLength {
                 node_id,
@@ -2341,6 +2530,15 @@ impl DomClassificationContext<'_> {
         let kind = target_kind(&node.local_name);
         let mut element = ElementClassificationInput::new(self.identity(index), kind)
             .disabled(node.attributes.contains_key("disabled"));
+        if node.attributes.get("role").is_some_and(|role| {
+            matches!(
+                role.as_str(),
+                "button" | "link" | "checkbox" | "radio" | "switch" | "tab" | "menuitem" | "option"
+            )
+        }) || matches!(node.local_name.as_str(), "select" | "textarea" | "summary")
+        {
+            element = element.built_in_activation(true);
+        }
         if matches!(kind, TargetKind::Input | TargetKind::Button) {
             if let Some(input_type) = node.attributes.get("type") {
                 element = element.input_type(input_type.to_ascii_lowercase());
@@ -2402,14 +2600,37 @@ impl DomClassificationContext<'_> {
             }),
             _ => None,
         }?;
-        if declared.contains("://") {
-            return Some(declared.clone());
+        let declared = declared.trim();
+        if declared.starts_with("//") {
+            return self
+                .current_origin
+                .split_once(":")
+                .map(|(scheme, _)| format!("{scheme}:{declared}"));
         }
-        if declared.starts_with('/') {
-            return classification::canonical_origin(self.current_origin)
-                .map(|origin| format!("{origin}{declared}"));
+        if declared
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|part| part.contains(':'))
+        {
+            return Some(declared.to_string());
         }
-        None
+        // Relative paths and fragments keep the document origin. Only the origin
+        // is used for authorization; the browser resolves the full landing path.
+        let base = self
+            .nodes
+            .iter()
+            .find(|node| node.local_name == "base" && node.attributes.contains_key("href"))
+            .and_then(|node| node.attributes.get("href"));
+        let base_origin = match base {
+            Some(base) if base.starts_with("//") => {
+                self.current_origin.split_once(':').and_then(|(scheme, _)| {
+                    classification::canonical_origin_from_url(&format!("{scheme}:{base}"))
+                })
+            }
+            Some(base) if base.contains(':') => classification::canonical_origin_from_url(base),
+            _ => classification::canonical_origin(self.current_origin),
+        };
+        base_origin.map(|origin| format!("{origin}/{}", declared.trim_start_matches('/')))
     }
 }
 
@@ -3934,11 +4155,12 @@ mod tests {
                 json!({"tier": 2, "credential": false, "financial": false}),
             )
             .await;
-            assert_eq!(reply["outcome"], "hazard_not_disclosed", "{code}: {reply}");
             assert_eq!(
-                reply["detail"]["missing_hazard"], "unverified_form_contents",
+                reply["outcome"], "classification_unavailable",
                 "{code}: {reply}"
             );
+            assert!(reply["detail"].get("required").is_none());
+            assert!(reply["detail"].get("missing_hazard").is_none());
             assert_eq!(
                 reply["detail"]["classification_unavailable"], code,
                 "{code}: {reply}"
@@ -4003,7 +4225,7 @@ mod tests {
             assert!(hazards(&record).is_empty(), "#{element_id}: {record:?}");
             assert_eq!(
                 required(&record),
-                Severity::new(2, false, false),
+                Severity::new(if element_id == "plain" { 2 } else { 1 }, false, false),
                 "#{element_id}"
             );
         }
@@ -4074,29 +4296,19 @@ mod tests {
             "{reply}"
         );
 
-        // The same link at the floor passes authorization and stops only for
-        // want of a browser session: an ordinary link is no longer refused as
-        // an unverified form.
+        // Raising severity does not grant access to the landing origin.
         let reply = click_reply(
             refs,
             json!({"tier": 2, "credential": false, "financial": false}),
         )
         .await;
-        assert_eq!(reply["outcome"], "no_session", "{reply}");
+        assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
 
-        // An unclassified target computes the strongest requirement, and the
-        // refusal names why it was unclassified.
+        // Missing facts refuse without inventing credential or payment hazards.
         let refs = snapshot_refs(vec![], Some((7, "about:blank")));
         let reply = click_reply(refs, below_floor).await;
-        assert_eq!(
-            reply["detail"]["reason_code"], "severity_below_floor",
-            "{reply}"
-        );
-        assert_eq!(
-            reply["detail"]["required"],
-            json!({"tier": 4, "credential": true, "financial": true}),
-            "{reply}"
-        );
+        assert_eq!(reply["outcome"], "classification_unavailable");
+        assert!(reply["detail"].get("required").is_none());
         assert_eq!(
             reply["detail"]["classification_unavailable"], "document_origin_unavailable",
             "{reply}"
@@ -4104,7 +4316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_point_click_below_the_floor_reports_the_severity_authorization_computed() {
+    async fn a_point_click_requires_live_observation_before_computing_severity() {
         let route = cerebellum_core::identity::RouteIdentity::from_bind(
             &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
             &Some(subc_protocol::Principal::Direct),
@@ -4132,11 +4344,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let (computed, _) = crate::authorization::computed_required_severity(
-            crate::authorization::Action::ClickPoint,
-            None,
-        )
-        .unwrap();
         let reply = plane
             .serve(
                 &route,
@@ -4153,15 +4360,8 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("the reply broke its declared schema: {error:?}"));
-        assert_eq!(
-            reply["detail"]["reason_code"], "severity_below_floor",
-            "{reply}"
-        );
-        assert_eq!(
-            reply["detail"]["required"],
-            json!({"tier": computed.tier, "credential": computed.credential, "financial": computed.financial}),
-            "{reply}"
-        );
+        assert_eq!(reply["outcome"], "no_session", "{reply}");
+        assert!(reply["detail"].get("required").is_none());
     }
 
     #[test]
@@ -4323,6 +4523,192 @@ mod tests {
             .writes
             .iter()
             .all(|write| write["method"] != "Input.dispatchMouseEvent"));
+    }
+
+    fn github_link_document() -> Value {
+        json!({"nodes":[
+            flattened_dom_node(1, None, 10, "html", &[]),
+            flattened_dom_node(2, Some(1), 42, "a", &["href", "/organizations/cortexkit/settings/installations/123", "class", "btn"]),
+            flattened_dom_node(3, Some(2), 43, "span", &[]),
+            {"nodeId":4,"parentId":3,"backendNodeId":44,"nodeType":3,"nodeName":"#text","localName":"","nodeValue":"Configure"}
+        ]})
+    }
+
+    fn github_record(backend: u64) -> NonTypeClassificationRecord {
+        classify_flattened_document(
+            github_link_document().as_object().unwrap(),
+            &BackendNodeIdentity::new("target-own", "frame-main", backend).unwrap(),
+            7,
+            "https://github.com/organizations/cortexkit/settings/installations",
+        )
+        .unwrap()
+    }
+
+    fn assert_navigation_authorized(record: &NonTypeClassificationRecord) {
+        use crate::authorization::{
+            Action, ActionGrant, AuthorizationRequest, GrantStore, Severity,
+        };
+        assert_eq!(record.required_tier, 1);
+        assert!(!record.credential && !record.financial && !record.activation_invokes_form_submit);
+        assert!(
+            crate::authorization::target_hazards(Action::Click, Some(record))
+                .unwrap()
+                .is_empty()
+        );
+        let grant = ActionGrant::new(
+            "navigation",
+            1,
+            "route-own",
+            Severity::new(1, false, false),
+            ["https://github.com".to_string()],
+        );
+        let store = GrantStore::try_new([grant]).unwrap();
+        store
+            .authorize(
+                AuthorizationRequest::click(
+                    "route-own",
+                    Severity::new(1, false, false),
+                    "snapshot",
+                    "binding",
+                    record,
+                ),
+                "https://github.com",
+            )
+            .unwrap();
+        store
+            .authorize(
+                AuthorizationRequest::click_point(
+                    "route-own",
+                    Severity::new(1, false, false),
+                    "snapshot",
+                    "binding",
+                    record,
+                ),
+                "https://github.com",
+            )
+            .unwrap();
+    }
+
+    fn github_ref_dispatch(backend: u64) {
+        let record = github_record(backend);
+        assert_navigation_authorized(&record);
+        assert_eq!(
+            record.activation_target_identity,
+            NodeIdentityInput::new("target-own", "frame-main", 42)
+                .identity()
+                .unwrap()
+        );
+        let quad = json!({"quads":[[10,20,34,20,34,52,10,52]]});
+        let mut results = Vec::new();
+        if backend != 42 {
+            results.extend([json!({}), github_link_document()]);
+        }
+        results.extend([
+            quad.clone(), json!({}), quad, layout_metrics(0.0, 0.0, 1280.0, 713.0),
+            json!({"backendNodeId":44,"frameId":"frame-main"}),
+            json!({"node":{"backendNodeId":42,"children":[{"backendNodeId":43,"children":[{"backendNodeId":44}]}]}}),
+            json!({}), github_link_document(), json!({}), json!({}), json!({}), json!({})
+        ]);
+        let mut driver = attached_driver(results.into_iter().enumerate().map(
+            |(index, result)| json!({"id":index+1,"sessionId":"session-own","result":result}),
+        ));
+        let mut events = Vec::new();
+        driver
+            .click_with_clock(
+                "route-own",
+                &BackendNodeIdentity::new("target-own", "frame-main", backend).unwrap(),
+                1000,
+                &mut |event| events.push(event),
+                Some((7, "https://github.com", Some(&record))),
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let geometry = driver
+            .pipe
+            .writes
+            .iter()
+            .find(|write| write["method"] == "DOM.getContentQuads")
+            .unwrap();
+        assert_eq!(geometry["params"]["backendNodeId"], 42);
+    }
+
+    #[test]
+    fn github_link_ref_accepts_descendant_hit_at_navigation_tier() {
+        github_ref_dispatch(42);
+    }
+
+    #[test]
+    fn github_text_ref_activates_link_at_navigation_tier() {
+        github_ref_dispatch(44);
+    }
+
+    #[test]
+    fn github_point_on_text_dispatches_at_navigation_tier() {
+        let results = [
+            json!({"backendNodeId":44,"frameId":"frame-main"}),
+            json!({}),
+            github_link_document(),
+            layout_metrics(0.0, 0.0, 1280.0, 713.0),
+            json!({}),
+            json!({}),
+            json!({}),
+            json!({}),
+        ];
+        let mut driver = attached_driver(results.into_iter().enumerate().map(
+            |(index, result)| json!({"id":index+1,"sessionId":"session-own","result":result}),
+        ));
+        let record = github_record(44);
+        assert_navigation_authorized(&record);
+        let mut events = Vec::new();
+        driver
+            .click_point_classified(
+                "route-own",
+                BrowserClickPosition {
+                    x_css: 22.0,
+                    y_css: 36.0,
+                },
+                7,
+                "https://github.com",
+                &record,
+                1000,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            record.activation_target_identity,
+            github_record(42).activation_target_identity
+        );
+    }
+
+    #[test]
+    fn github_same_origin_link_is_navigation_not_submit() {
+        assert_navigation_authorized(&github_record(42));
+    }
+
+    #[test]
+    fn password_submit_retains_tier_four_and_credential_hazard() {
+        let doc = json!({"nodes":[
+            flattened_dom_node(1,None,10,"form",&[]),
+            flattened_dom_node(2,Some(1),20,"input",&["type","password"]),
+            flattened_dom_node(3,Some(1),42,"button",&["type","submit"])
+        ]});
+        let record = classify_flattened_document(
+            doc.as_object().unwrap(),
+            &BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap(),
+            7,
+            "https://github.com",
+        )
+        .unwrap();
+        assert_eq!(record.required_tier, 4);
+        assert!(record.credential && !record.financial);
+        assert!(!crate::authorization::target_hazards(
+            crate::authorization::Action::Click,
+            Some(&record)
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -4558,6 +4944,7 @@ mod tests {
             json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
             json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":99,"frameId":"frame-main"}}),
             json!({"id":6,"sessionId":"session-own","result":{"node":{"backendNodeId":42}}}),
+            json!({"id":7,"sessionId":"session-own","result":{"nodes":[{"role":{"value":"banner"},"name":{"value":"Sticky header"}}]}}),
         ];
         let mut driver = attached_driver(frames);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
@@ -4572,7 +4959,12 @@ mod tests {
             &mut clock,
         );
 
-        assert_eq!(result, Err(ClickDriveError::NoPosition));
+        assert_eq!(
+            result,
+            Err(ClickDriveError::Intercepted(
+                json!({"hit_backend_node_id":99,"hit_role":"banner","hit_name":"Sticky header","hit_inside_target":false})
+            ))
+        );
         assert!(input_events.is_empty());
         assert_eq!(driver.pipe.writes[5]["method"], "DOM.describeNode");
         assert!(driver

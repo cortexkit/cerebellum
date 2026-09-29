@@ -1130,9 +1130,17 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
         "a refused click dispatched input"
     );
 
-    // Follow the remedy literally, then retry the identical click.
+    // Both the source and the declared landing origin must be authorized.
     open_grant_and_allow(&planes, 63, refused["detail"]["grant_request"].clone()).await;
-    let clicked = invoke_existing(&planes, 64, "browser.click", click).await;
+    let landing = invoke_existing(&planes, 64, "browser.click", click.clone()).await;
+    let landing: Value = serde_json::from_slice(&landing.body).unwrap();
+    assert_eq!(landing["outcome"], "authorization_denied", "{landing}");
+    assert_eq!(
+        landing["detail"]["attempted_origin"],
+        "https://www.iana.org"
+    );
+    open_grant_and_allow(&planes, 65, landing["detail"]["grant_request"].clone()).await;
+    let clicked = invoke_existing(&planes, 66, "browser.click", click).await;
     let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
     assert_eq!(
@@ -3233,6 +3241,50 @@ impl OwnedBrowserProcess for CdpClickProcess {
         })
     }
 
+    fn classify_point(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        deadline_ms: u64,
+    ) -> Result<
+        Result<
+            cerebellum::classification::NonTypeClassificationRecord,
+            cerebellum::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        self.driver.classify_point(
+            context_key,
+            position,
+            document_epoch,
+            document_url,
+            deadline_ms,
+        )
+    }
+
+    fn click_point_classified(
+        &mut self,
+        context_key: &str,
+        position: BrowserClickPosition,
+        document_epoch: u64,
+        document_url: &str,
+        expected: &cerebellum::classification::NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.driver.click_point_classified(
+            context_key,
+            position,
+            document_epoch,
+            document_url,
+            expected,
+            deadline_ms,
+            input_dispatched,
+        )
+    }
+
     fn click_point(
         &mut self,
         context_key: &str,
@@ -3397,7 +3449,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
             1,
             "test-session",
             Severity::new(4, false, false),
-            granted_origins.iter().copied(),
+            granted_origins.iter().copied().chain(["https://iana.org"]),
         )])),
     );
     launch_at(&planes, &page, CLICK_PAGE_ORIGIN).await;
@@ -3485,12 +3537,11 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
         commands: Arc::default(),
     }));
     bind_management_route(&planes).await;
-    // A durable-tier grant for the starting page only, so the click that
-    // leaves it is admitted and the landing origin stays ungranted.
+    // Authorize the declared destination, but not the final redirect origin.
     open_grant_and_allow(
         &planes,
         110,
-        json!({"origins": [CLICK_PAGE_ORIGIN], "hazards": [], "severity_tier": 4}),
+        json!({"origins": [CLICK_PAGE_ORIGIN, "https://iana.org"], "hazards": [], "severity_tier": 4}),
     )
     .await;
     launch_at(&planes, &page, CLICK_PAGE_ORIGIN).await;
@@ -3531,7 +3582,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     );
     assert_eq!(
         refused["detail"]["granted_origins"],
-        json!(["https://example.com"]),
+        json!(["https://example.com", "https://iana.org"]),
         "{refused}"
     );
     assert_eq!(
@@ -4010,7 +4061,7 @@ async fn actuation_planes() -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) 
             1,
             "test-session",
             Severity::new(4, true, true),
-            [CLICK_PAGE_ORIGIN],
+            [CLICK_PAGE_ORIGIN, "https://iana.org"],
         )
         .with_disclosed_hazards([HazardClass::UnverifiedFormContents])])),
     );

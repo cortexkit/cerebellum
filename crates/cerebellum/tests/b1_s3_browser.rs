@@ -17,7 +17,22 @@ use cerebellum::browser_session::{
     NavigationWait, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, ViewportRefusal,
 };
 use cerebellum::cdp::{Attachment, CdpFrameDecoder, CdpTransport, IdentityMap};
-use cerebellum::classification::ClassificationUnavailable;
+fn plain_click_classification(
+    epoch: u64,
+) -> cerebellum::classification::NonTypeClassificationRecord {
+    use cerebellum::classification::*;
+    classify_click(&NonTypeClassificationInput::new(
+        epoch,
+        ElementClassificationInput::new(
+            NodeIdentityInput::new("target-own", "frame-main", 42),
+            TargetKind::Button,
+        )
+        .input_type("button"),
+        "https://requested.example",
+    ))
+    .unwrap()
+}
+
 use cerebellum::coordinate::{
     encode_base64, InputRect, ScreenshotPayload, TransformInputs, ViewportObservation,
 };
@@ -158,7 +173,7 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
                 backend_identity: None,
                 raw_role: None,
                 raw_name: None,
-                classification: Err(ClassificationUnavailable::NotCaptured),
+                classification: Ok(Box::new(plain_click_classification(0))),
             }],
             4096,
             Some(page_document()),
@@ -353,8 +368,8 @@ impl OwnedBrowserProcess for SnapshotProcess {
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
         assert!(
-            expected.is_none(),
-            "this fixture represents an unverified target"
+            expected.is_some(),
+            "this fixture represents a classified plain button"
         );
         self.click(context_key, identity, deadline_ms, input_dispatched)
     }
@@ -442,6 +457,44 @@ impl OwnedBrowserProcess for ScreenshotProcess {
             .screenshot(context_key, document_epoch, deadline_ms, full)
     }
 
+    // These fixtures exercise geometry and input ordering, with a fixed plain button.
+    fn classify_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<
+        Result<
+            cerebellum::classification::NonTypeClassificationRecord,
+            cerebellum::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        Ok(Ok(plain_click_classification(epoch)))
+    }
+
+    fn click_point_classified(
+        &mut self,
+        key: &str,
+        position: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        expected: &cerebellum::classification::NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        assert_eq!(expected, &plain_click_classification(epoch));
+        self.click_point(key, position, deadline_ms, input_dispatched)
+            .map_err(|error| match error {
+                ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
+                ClickPointDriveError::OutsideViewport(refusal) => {
+                    ClickDriveError::OutsideViewportAfterScroll(refusal)
+                }
+            })
+    }
+
     fn click_point(
         &mut self,
         context_key: &str,
@@ -521,8 +574,8 @@ impl OwnedBrowserProcess for ClickProcess {
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
         assert!(
-            expected.is_none(),
-            "this fixture represents an unverified target"
+            expected.is_some(),
+            "this fixture represents a classified plain button"
         );
         self.click(context_key, identity, deadline_ms, input_dispatched)
     }
@@ -617,6 +670,44 @@ impl OwnedBrowserProcess for ClickPointProcess {
         _: u64,
     ) -> Result<CommittedDocument, NavigationDriveError> {
         Ok(page_document())
+    }
+
+    // These fixtures exercise geometry and input ordering, with a fixed plain button.
+    fn classify_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<
+        Result<
+            cerebellum::classification::NonTypeClassificationRecord,
+            cerebellum::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        Ok(Ok(plain_click_classification(epoch)))
+    }
+
+    fn click_point_classified(
+        &mut self,
+        key: &str,
+        position: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        expected: &cerebellum::classification::NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        assert_eq!(expected, &plain_click_classification(epoch));
+        self.click_point(key, position, deadline_ms, input_dispatched)
+            .map_err(|error| match error {
+                ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
+                ClickPointDriveError::OutsideViewport(refusal) => {
+                    ClickDriveError::OutsideViewportAfterScroll(refusal)
+                }
+            })
     }
 
     fn click_point(
@@ -878,6 +969,44 @@ impl OwnedBrowserProcess for DialogClickPointProcess {
             .navigate(context_key, url, wait, deadline_ms, tracker)
     }
 
+    // These fixtures exercise geometry and input ordering, with a fixed plain button.
+    fn classify_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<
+        Result<
+            cerebellum::classification::NonTypeClassificationRecord,
+            cerebellum::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        Ok(Ok(plain_click_classification(epoch)))
+    }
+
+    fn click_point_classified(
+        &mut self,
+        key: &str,
+        position: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        expected: &cerebellum::classification::NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        assert_eq!(expected, &plain_click_classification(epoch));
+        self.click_point(key, position, deadline_ms, input_dispatched)
+            .map_err(|error| match error {
+                ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
+                ClickPointDriveError::OutsideViewport(refusal) => {
+                    ClickDriveError::OutsideViewportAfterScroll(refusal)
+                }
+            })
+    }
+
     fn click_point(
         &mut self,
         context_key: &str,
@@ -921,6 +1050,44 @@ impl OwnedBrowserProcess for RefusingClickPointProcess {
         _: u64,
     ) -> Result<CommittedDocument, NavigationDriveError> {
         Ok(page_document())
+    }
+
+    // These fixtures exercise geometry and input ordering, with a fixed plain button.
+    fn classify_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<
+        Result<
+            cerebellum::classification::NonTypeClassificationRecord,
+            cerebellum::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        Ok(Ok(plain_click_classification(epoch)))
+    }
+
+    fn click_point_classified(
+        &mut self,
+        key: &str,
+        position: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        expected: &cerebellum::classification::NonTypeClassificationRecord,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        assert_eq!(expected, &plain_click_classification(epoch));
+        self.click_point(key, position, deadline_ms, input_dispatched)
+            .map_err(|error| match error {
+                ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
+                ClickPointDriveError::OutsideViewport(refusal) => {
+                    ClickDriveError::OutsideViewportAfterScroll(refusal)
+                }
+            })
     }
 
     fn click_point(
@@ -1131,7 +1298,7 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
                 ),
                 raw_role: Some(record.role.clone()),
                 raw_name: Some(record.name.clone()),
-                classification: Err(ClassificationUnavailable::NotCaptured),
+                classification: Ok(Box::new(plain_click_classification(0))),
             })
         })
         .collect();
@@ -2563,7 +2730,7 @@ async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> S
                 ),
                 raw_role: Some("button".into()),
                 raw_name: Some("Save".into()),
-                classification: Err(ClassificationUnavailable::NotCaptured),
+                classification: Ok(Box::new(plain_click_classification(0))),
             }],
             4096,
             Some(page_document()),
