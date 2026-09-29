@@ -4968,7 +4968,14 @@ async fn malformed_keys_and_a_second_key_on_a_withdrawal_are_invalid_requests() 
         ),
     )
     .await;
-    assert_eq!(body(&well_scoped), json!({"answer": "unknown_call"}));
+    // A well-shaped scope passes the shape check; what the answer is for an
+    // unrecorded key is the unknown-key test's business.
+    assert_ne!(
+        body(&well_scoped)["outcome"],
+        "invalid_request",
+        "{}",
+        body(&well_scoped)
+    );
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
