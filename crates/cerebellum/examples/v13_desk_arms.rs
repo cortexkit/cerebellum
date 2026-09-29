@@ -1,7 +1,10 @@
 //! Unsupervised, in-process desk checks. Build and unit-test this program away
 //! from the desk; run it only with the operator's approval on an unlocked Mac.
 //! `all` or individual arm names select live checks. No Return key is sent.
-//! Missing evidence is not a PASS, including an absent refusal-ring entry.
+//! After a refusal, query the application's state through macOS accessibility,
+//! independently of the action reply, and require no new journal rows or reservations.
+//! The bounded in-memory refusal log is mandatory only for hard-blocked chords;
+//! it is not a log of every refused computer action.
 
 // Non-macOS executables only print a refusal; the pure helpers still compile
 // and run as unit tests on every platform.
@@ -15,7 +18,9 @@ const ARMS: &[&str] = &[
     "read_ids",
     "discord_background_read",
     "ungranted_app",
-    "coordinate_covered",
+    "coordinate_covered_acts_on_target_only",
+    "coordinate_no_target_element",
+    "consent_unanswered_never_acts",
     "write_text_web",
     "identity_recheck",
     "takeover_other_conversation",
@@ -340,8 +345,73 @@ fn route_count(value: &Value, route: &str) -> Option<u64> {
         _ => None,
     }
 }
+fn rendered_element_id(line: &str) -> Option<&str> {
+    let id = line.split_whitespace().next()?;
+    let (session, number) = id.strip_prefix('s')?.split_once('-')?;
+    (!session.is_empty()
+        && !number.is_empty()
+        && session.chars().all(|c| c.is_ascii_digit())
+        && number.chars().all(|c| c.is_ascii_digit()))
+    .then_some(id)
+}
+fn refusal_ring_satisfied(reply: &Value, before: &Value, after: &Value) -> bool {
+    if reply["outcome"] != "chord_blocked" {
+        return true;
+    }
+    let Some(chord) = reply["chord"].as_str().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(reason) = reply["reason"].as_str().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    after["total_count"]
+        .as_u64()
+        .is_some_and(|n| n > before["total_count"].as_u64().unwrap_or(0))
+        && after["records"]
+            .as_array()
+            .and_then(|a| a.last())
+            .is_some_and(|record| {
+                record["claimed_addressing"] == chord
+                    && record["reason"]["chord"] == chord
+                    && record["reason"]["reason"] == reason
+            })
+}
+fn unanswered_return(reply: &Value, elapsed: std::time::Duration) -> bool {
+    reply["outcome"] == "consent_pending"
+        && reply["ask_id"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty())
+        && elapsed
+            >= cerebellum::computer_grants::CONSENT_PARK_LIMIT
+                .saturating_sub(std::time::Duration::from_secs(5))
+}
+fn covered_image_withheld(reply: &Value) -> bool {
+    reply["outcome"] == "completed"
+        && reply["tree"].as_str().is_some_and(|s| !s.is_empty())
+        && reply.get("image").is_none()
+        && reply["image_unavailable"]["reason"] == "window_covered_may_be_stale"
+}
+fn desktop_to_image(
+    mapping: &cerebellum_computer::app_state::image::ImageMapping,
+    point: (f64, f64),
+) -> Result<(u64, u64), String> {
+    let origin = mapping.pixel_to_desktop(0.0, 0.0);
+    let unit = mapping.pixel_to_desktop(1.0, 1.0);
+    let x = (point.0 - origin.0) / (unit.0 - origin.0);
+    let y = (point.1 - origin.1) / (unit.1 - origin.1);
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x > u32::MAX as f64
+        || y > u32::MAX as f64
+    {
+        return Err("invalid image mapping or desktop point".into());
+    }
+    Ok((x.round() as u64, y.round() as u64))
+}
 fn zero_post_evidence(rows: &BTreeMap<String, Value>, before: &Value, after: &Value) -> bool {
-    // Refusals belong to the refusal ring, not the authorized-dispatch journal.
+    // Refusals must not enter the authorized-dispatch journal.
     // Even an unresolved reservation prevents a claim that nothing proceeded.
     rows.is_empty() && !before.is_null() && before == after
 }
@@ -356,6 +426,11 @@ mod desk {
     use super::*;
     use cerebellum::management::{PlatformResolver, TargetResolver};
     use cerebellum::Planes;
+    use cerebellum_computer::app_state::{
+        native::MacAppStateSource,
+        session::{ElementResolution, RegisteredImage},
+        source::{AppStateSource, HitScope},
+    };
     use cerebellum_computer::platform::{native::resolve_target, ProcessGrant, TargetResolution};
     use cerebellum_core::health::HealthState;
     use std::process::{Command, Stdio};
@@ -372,10 +447,38 @@ mod desk {
     const FINDER: &str = "com.apple.finder";
     const CONTENT: &str = "CortexKit scratch desk check. Nothing in this document is user data.\n";
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CursorPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(object: *const std::ffi::c_void);
+    }
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
+        fn CGEventCreate(source: *const std::ffi::c_void) -> *const std::ffi::c_void;
+        fn CGEventGetLocation(event: *const std::ffi::c_void) -> CursorPoint;
         fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
         fn CGEventSourceFlagsState(state: i32) -> u64;
+    }
+    fn cursor_position() -> Result<Value, String> {
+        // Creating a CGEvent snapshots the current cursor; it does not post input.
+        let event = unsafe { CGEventCreate(std::ptr::null()) };
+        if event.is_null() {
+            return Err("cursor state unavailable".into());
+        }
+        // The newly created event remains owned until the matching release.
+        let point = unsafe { CGEventGetLocation(event) };
+        unsafe { CFRelease(event) };
+        check(
+            point.x.is_finite() && point.y.is_finite(),
+            "invalid cursor state",
+        )?;
+        Ok(json!({"x":point.x,"y":point.y}))
     }
     fn held_state() -> Value {
         let tables: Vec<_> = [-1, 0, 1].into_iter().map(|table| {
@@ -650,6 +753,7 @@ mod desk {
         channel: u16,
         corr: u64,
         project: String,
+        conversation: String,
     }
     struct Call {
         method: String,
@@ -667,6 +771,7 @@ mod desk {
                 channel: 1,
                 corr: 100,
                 project: format!("desk-arms-{}", std::process::id()),
+                conversation: String::new(),
             };
             if let Err(error) = &probe.planes.computer {
                 return Err(format!("computer plane unavailable: {error:?}"));
@@ -676,6 +781,7 @@ mod desk {
         }
         async fn conversation(&mut self, name: &str) -> Result<(), String> {
             self.channel += 2;
+            self.conversation = format!("{}-{name}", self.project);
             for (channel, target) in [
                 (
                     self.channel,
@@ -694,11 +800,7 @@ mod desk {
                     route_channel: channel,
                     epoch: 1,
                     target,
-                    identity: BindIdentity::new(
-                        "/tmp/ck-v13",
-                        "probe",
-                        format!("{}-{name}", self.project),
-                    ),
+                    identity: BindIdentity::new("/tmp/ck-v13", "probe", self.conversation.clone()),
                     principal: Some(Principal::Direct),
                     consumer_capabilities: Some(vec!["elicitation".into()]),
                     admission_facts: Some(
@@ -862,9 +964,12 @@ mod desk {
             zero_post_evidence(&c.rows, before, after),
             "refusal posted or target changed",
         )?;
+        if c.ring != c.ring_before {
+            println!("FRESH REFUSAL RING {}", c.ring);
+        }
         check(
-            c.ring != c.ring_before && contains_fact(&c.ring, code),
-            "missing fresh refusal-ring entry with named code",
+            refusal_ring_satisfied(&c.reply, &c.ring_before, &c.ring),
+            "hard-blocked chord lacks its fresh matching refusal-ring entry",
         )
     }
     fn element(reply: &Value, needle: &str) -> Result<String, String> {
@@ -872,12 +977,7 @@ mod desk {
         let matches: Vec<_> = tree
             .lines()
             .filter(|line| line.contains(needle))
-            .filter_map(|line| {
-                let word = line.split_whitespace().next()?;
-                let id = word.trim_matches(|c: char| c == '[' || c == ']' || c == ':');
-                (id.starts_with('e') && id[1..].chars().all(|c| c.is_ascii_digit()))
-                    .then(|| id.to_string())
-            })
+            .filter_map(|line| rendered_element_id(line).map(str::to_owned))
             .collect();
         if matches.len() != 1 {
             return Err(format!(
@@ -898,6 +998,223 @@ mod desk {
             "scratch image too small",
         )?;
         Ok(json!({"image_id":id,"x":x,"y":y}))
+    }
+    fn registered_image(p: &Probe, read: &Call) -> Result<RegisteredImage, String> {
+        let id = read.reply["image"]["image_id"]
+            .as_str()
+            .ok_or("initial image unavailable")?;
+        p.planes
+            .management
+            .app_state_sessions()
+            .resolve_image(&p.conversation, id)
+            .ok_or_else(|| "image absent from production session".into())
+    }
+    fn finder_state(f: &Fixture) -> Result<Value, String> {
+        Ok(
+            json!({"frontmost_pid":cerebellum_macos::frontmost_process_id(),"window_id":f.finder_id,
+            "bounds":script(&format!("tell application \"Finder\" to get bounds of Finder window id {}",f.finder_id))?,
+            "title":script(&format!("tell application \"Finder\" to get name of Finder window id {}",f.finder_id))?}),
+        )
+    }
+    fn cover(f: &Fixture) -> Result<(), String> {
+        script(&format!("tell application \"Finder\" to set bounds of Finder window id {} to {{80, 80, 900, 640}}",f.finder_id))?;
+        front(FINDER)?;
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(())
+    }
+    fn close_frame(pid: u32) -> Result<[f64; 4], String> {
+        let text = script(&format!("tell application \"System Events\" to tell (first application process whose unix id is {pid}) to get {{position, size}} of (first button of window 1 whose subrole is \"AXCloseButton\")"))?;
+        let numbers: Vec<f64> = text
+            .split(',')
+            .map(|s| s.trim().parse::<f64>().map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let frame: [f64; 4] = numbers
+            .try_into()
+            .map_err(|_| "AX Close button frame unavailable")?;
+        check(
+            frame.iter().all(|n| n.is_finite()) && frame[2] > 0.0 && frame[3] > 0.0,
+            "invalid AX Close button frame",
+        )?;
+        Ok(frame)
+    }
+    async fn covered_target(p: &mut Probe, f: &mut Fixture) -> Result<(), String> {
+        // Closing an unmodified scratch document is an observable AXPress effect
+        // without a save dialog or edits to a user document.
+        f.close_owned()?;
+        f.open("/System/Applications/TextEdit.app")?;
+        let result = async {
+            let initial = p.read(TEXT, true).await?;
+            let image = registered_image(p, &initial)?;
+            let grant = resolve(TEXT)?;
+            let finder_pid = resolve(FINDER)?.pid;
+            let bounds = close_frame(grant.pid)?;
+            let center = (bounds[0] + bounds[2]/2.0, bounds[1] + bounds[3]/2.0);
+            let (x,y) = desktop_to_image(&image.mapping, center)?;
+            let point = image_point(&initial,x,y)?;
+            cover(f)?;
+            let finder_before = finder_state(f)?;
+            check(finder_before["frontmost_pid"] == finder_pid,"Finder did not cover TextEdit")?;
+            let covered = p.read(TEXT,true).await?;
+            let tree = covered.reply["tree"].as_str().ok_or("covered read returned no tree")?;
+            let close_lines: Vec<_> = tree.lines().filter(|line| { let s=line.to_lowercase(); s.contains("button") && s.contains("close") }).collect();
+            check(close_lines.len()==1,"covered read must show one Close button")?;
+            let shown_line = close_lines[0];
+            let shown_id = element(&json!({"tree":shown_line}),"")?;
+            let shown_label = tree_labels(shown_line)?.into_iter().next().ok_or("Close label unavailable")?;
+            let ElementResolution::Live { handle: shown_handle, pid: shown_pid, .. } = p.planes.management.app_state_sessions().resolve(&p.conversation,&shown_id) else { return Err("shown Close id is not live".into()); };
+            check(close_frame(grant.pid)? == bounds, "Close button frame changed while covered")?;
+            let desktop = image.mapping.pixel_to_desktop(x as f64,y as f64);
+            let (hit,owner) = MacAppStateSource.element_at(HitScope::Application {pid:grant.pid},desktop).map_err(|e|format!("hit test: {e:?}"))?.ok_or("no TextEdit element at Close point")?;
+            let facts = MacAppStateSource.element_facts(&hit).map_err(|e|format!("hit facts: {e:?}"))?;
+            let same_handle = shown_handle.same_element(hit.as_ref());
+            println!("COVERED HIT {}",json!({"textedit_pid":grant.pid,"finder_pid":finder_pid,"hit_pid":owner,"facts_pid":facts.pid,"shown_pid":shown_pid,"shown_element_id":shown_id,"same_retained_element":same_handle,"role":facts.role,"label":shown_label,"title":facts.title,"frame":bounds,"image_point":[x,y],"desktop_point":[desktop.0,desktop.1]}));
+            check(owner == Some(grant.pid) && facts.pid == Some(grant.pid) && shown_pid == grant.pid && grant.pid != finder_pid,"hit belongs to another process")?;
+            check(same_handle && facts.role.as_deref()==Some("AXButton") && facts.subrole.as_deref()==Some("AXCloseButton"),"hit is not the Close element shown in read_state")?;
+            let acted = p.call("computer.press_point",point,"allow_conversation").await?;
+            let documents_after = script("tell application \"TextEdit\" to count documents")?;
+            if documents_after=="0" { f.owned=false; }
+            let finder_after = finder_state(f)?;
+            println!("COVERED EFFECT {}",json!({"shown_element_id":shown_id,"reply":acted.reply,"documents_before":1,"documents_after":documents_after,"finder_before":finder_before,"finder_after":finder_after}));
+            authorized(&initial,"completed",None)?;
+            authorized(&covered,"completed",None)?;
+            authorized(&acted,"completed",None)?;
+            check(contains_fact(&acted.reply["removed"],&shown_id),"press reply does not identify the shown Close element as removed")?;
+            check(documents_after=="0","press did not close the scratch document")?;
+            check(finder_before==finder_after,"Finder frontmost state, bounds or title changed")?;
+            check(covered_image_withheld(&covered.reply),"covered read did not withhold stale pixels while returning its tree")
+        }.await;
+        let restore_window = if !f.owned {
+            f.open("/System/Applications/TextEdit.app")
+        } else {
+            Ok(())
+        };
+        let restore_finder = f.restore_finder();
+        restore_window?;
+        restore_finder?;
+        result
+    }
+    async fn no_target_element(p: &mut Probe, f: &Fixture) -> Result<(), String> {
+        f.reset()?;
+        let initial = p.read(TEXT, true).await?;
+        let image = registered_image(p, &initial)?;
+        let grant = resolve(TEXT)?;
+        let result=async {
+            cover(f)?;
+            // Finder extends past the fixed scratch TextEdit frame (right 720,
+            // bottom 560). This point is in Finder, outside the target image.
+            let desktop=(800.0,600.0);
+            let hit=MacAppStateSource.element_at(HitScope::Application {pid:grant.pid},desktop).map_err(|e|format!("target hit test: {e:?}"))?;
+            let finder_hit=MacAppStateSource.element_at(HitScope::Application {pid:resolve(FINDER)?.pid},desktop).map_err(|e|format!("Finder hit test: {e:?}"))?;
+            check(hit.is_none(),"UNMEASURABLE: TextEdit reports an element outside its window")?;
+            check(finder_hit.is_some(),"negative point is not inside a Finder element")?;
+            let (x,y)=desktop_to_image(&image.mapping,desktop)?;
+            check(x>=image.width_px as u64 || y>=image.height_px as u64,"negative point is unexpectedly inside the TextEdit image")?;
+            let before=json!({"cursor":cursor_position()?,"finder":finder_state(f)?,"textedit":snapshot(TEXT)?});
+            let c=p.call("computer.press_point",json!({"image_id":initial.reply["image"]["image_id"],"x":x,"y":y}),"allow_conversation").await?;
+            let after=json!({"cursor":cursor_position()?,"finder":finder_state(f)?,"textedit":snapshot(TEXT)?});
+            println!("NO TARGET POINT {}",json!({"desktop_point":[desktop.0,desktop.1],"image_point":[x,y],"target_hit":null,"finder_hit_pid":finder_hit.map(|(_,pid)|pid),"reply":c.reply}));
+            refused(&c,"point_out_of_bounds",&before,&after)
+        }.await;
+        f.restore_finder()?;
+        result
+    }
+    async fn unanswered_consent(p: &mut Probe, f: &Fixture) -> Result<(), String> {
+        f.reset()?;
+        let before = snapshot(TEXT)?;
+        let journal_before = p.journal()?;
+        let ring_before = p.ring().await;
+        p.corr += 1;
+        let (writer, mut frames) = mpsc::channel(8);
+        let start = Instant::now();
+        cerebellum::handle_frame_for_test(frame(p.channel,p.corr,json!({"name":"computer.type","arguments":{"target":TEXT,"text":"ck-v13-late-must-not-type"}})),&writer,&p.planes).await.map_err(|e|e.to_string())?;
+        // Deliberately keep the relay silent until the original call returns.
+        // The question remains live after the in-call consent wait expires.
+        let question = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("no app consent question")?;
+        let question_body: Value =
+            serde_json::from_slice(&question.body).map_err(|e| e.to_string())?;
+        println!("UNANSWERED QUESTION {question_body}");
+        check(
+            question.header.ty == FrameType::Request
+                && question_body["params"]["grant_kind"] == "app",
+            "expected an app-grant question",
+        )?;
+        let returned = tokio::time::timeout(Duration::from_secs(150), frames.recv())
+            .await
+            .map_err(|e| format!("unanswered request did not return: {e}"))?
+            .ok_or("unanswered relay closed")?;
+        let elapsed = start.elapsed();
+        let reply: Value = serde_json::from_slice(&returned.body).map_err(|e| e.to_string())?;
+        let after_return = snapshot(TEXT)?;
+        let rows: BTreeMap<_, _> = p
+            .journal()?
+            .into_iter()
+            .filter(|(k, v)| journal_before.get(k) != Some(v))
+            .collect();
+        println!(
+            "UNANSWERED RETURN {}",
+            json!({"elapsed_ms":elapsed.as_millis(),"reply":reply,"journal_rows":rows,"before":before,"after_return":after_return,"refusal_ring":p.ring().await})
+        );
+        check(
+            returned.header.ty == FrameType::Response && returned.header.corr == p.corr,
+            "unexpected frame in place of original reply",
+        )?;
+        check(
+            unanswered_return(&reply, elapsed),
+            "in-call wait did not return consent_pending with ask_id after its park interval",
+        )?;
+        check(
+            reply["ask_id"] == question_body["id"],
+            "pending reply names a different consent question",
+        )?;
+        check(
+            zero_post_evidence(&rows, &before, &after_return),
+            "unanswered request dispatched or changed TextEdit",
+        )?;
+        let answer = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr,
+            serde_json::to_vec(&json!({"decision":"allow_conversation"})).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        cerebellum::handle_frame_for_test(answer, &writer, &p.planes)
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let after_late = snapshot(TEXT)?;
+        let late_rows: BTreeMap<_, _> = p
+            .journal()?
+            .into_iter()
+            .filter(|(k, v)| journal_before.get(k) != Some(v))
+            .collect();
+        let ring = p.ring().await;
+        println!(
+            "LATE ANSWER {}",
+            json!({"decision":"allow_conversation","waited_seconds":3,"original_reply":reply,"journal_rows":late_rows,"before":before,"after_late":after_late,"refusal_ring":ring,"ring_changed":ring!=ring_before})
+        );
+        check(
+            zero_post_evidence(&late_rows, &before, &after_late),
+            "late consent executed the original action",
+        )?;
+        // Prove the late answer was actually accepted: asking to open the app
+        // again must find the grant, not raise another question that we deny.
+        let granted = p
+            .call(
+                "computer.open_target",
+                json!({"bundle_identity":TEXT}),
+                "deny",
+            )
+            .await?;
+        check(
+            granted.reply["outcome"] == "granted" && granted.questions.is_empty(),
+            "late answer did not establish the conversation grant",
+        )
     }
     fn composer(snapshot: &Value) -> Result<&Value, String> {
         fn visit<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
@@ -1018,23 +1335,16 @@ mod desk {
                     .await?;
                 refused(&c, "consent_denied", &before, &snapshot(TEXT)?)
             }
-            // element_addressed: the covered coordinate must not reach Finder.
-            "coordinate_covered" => {
-                f.reset()?;
-                let read = p.read(TEXT, true).await?;
-                // Overlap title bars, not Finder's file icons: a misrouted
-                // action must not open an operator document.
-                let point = image_point(&read, 400, 20)?;
-                script(&format!("tell application \"Finder\" to set bounds of Finder window id {} to {{80, 80, 720, 560}}", f.finder_id))?;
-                front(FINDER)?;
-                let before = json!({"finder":snapshot(FINDER)?,"textedit":snapshot(TEXT)?});
-                let c = p
-                    .call("computer.press_point", point, "allow_conversation")
-                    .await?;
-                let after = json!({"finder":snapshot(FINDER)?,"textedit":snapshot(TEXT)?});
-                f.restore_finder()?;
-                refused(&c, "target_not_frontmost", &before, &after)
-            }
+            // element_addressed: app-scoped AXPress acts on the shown TextEdit
+            // element beneath Finder, without acting on or fronting the cover.
+            // A covered image is withheld even though the AX tree remains readable.
+            "coordinate_covered_acts_on_target_only" => covered_target(p, f).await,
+            // element_addressed: an out-of-target image point must refuse without
+            // a journal entry, a cursor change, or any change to the covering app.
+            "coordinate_no_target_element" => no_target_element(p, f).await,
+            // takeover_dispatch: parking an unanswered app request returns pending;
+            // granting it later must never resume the already-returned type call.
+            "consent_unanswered_never_acts" => unanswered_consent(p, f).await,
             // element_addressed: AX writes to a web composer are refused.
             "write_text_web" => {
                 p.grant(DISCORD).await?;
@@ -1607,6 +1917,86 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rendered_ids_match_the_session_numbered_tree() {
+        assert_eq!(
+            rendered_element_id("  s42-7 button \"Close\""),
+            Some("s42-7")
+        );
+        assert_eq!(
+            rendered_element_id("s1-102 text area \"scratch\""),
+            Some("s1-102")
+        );
+        assert_eq!(
+            rendered_element_id("e17 button \"not a production id\""),
+            None
+        );
+        assert_eq!(rendered_element_id("s-1 button"), None);
+    }
+    #[test]
+    fn ordinary_refusals_need_no_ring_but_blocked_chords_do() {
+        assert!(refusal_ring_satisfied(
+            &json!({"outcome":"consent_denied"}),
+            &Value::Null,
+            &Value::Null
+        ));
+        assert!(refusal_ring_satisfied(
+            &json!({"outcome":"point_out_of_bounds"}),
+            &Value::Null,
+            &Value::Null
+        ));
+        let reply = json!({"outcome":"chord_blocked","chord":"command+q","reason":"fixture_block"});
+        assert!(!refusal_ring_satisfied(&reply, &Value::Null, &Value::Null));
+        let history = json!({"total_count":1,"records":[{"claimed_addressing":"command+q","reason":{"chord":"command+q","reason":"fixture_block"}}]});
+        assert!(refusal_ring_satisfied(&reply, &Value::Null, &history));
+        assert!(!refusal_ring_satisfied(&reply, &history, &history));
+        let mut wrong = history;
+        wrong["records"][0]["reason"]["reason"] = json!("unrelated");
+        assert!(!refusal_ring_satisfied(&reply, &Value::Null, &wrong));
+    }
+    #[test]
+    fn pending_consent_requires_the_named_reply_ask_and_real_park_wait() {
+        use std::time::Duration;
+        let reply = json!({"outcome":"consent_pending","ask_id":"ask-fixture"});
+        assert!(unanswered_return(&reply, Duration::from_secs(120)));
+        assert!(!unanswered_return(&reply, Duration::from_secs(1)));
+        assert!(!unanswered_return(
+            &json!({"outcome":"consent_pending"}),
+            Duration::from_secs(120)
+        ));
+        assert!(!unanswered_return(
+            &json!({"outcome":"completed","ask_id":"ask-fixture"}),
+            Duration::from_secs(120)
+        ));
+    }
+    #[test]
+    fn covered_image_check_requires_tree_and_withheld_pixels() {
+        let good = json!({"outcome":"completed","tree":"e1 button Close","image_unavailable":{"reason":"window_covered_may_be_stale"}});
+        assert!(covered_image_withheld(&good));
+        let mut image = good.clone();
+        image["image"] = json!({"image_id":"stale"});
+        assert!(!covered_image_withheld(&image));
+        let mut tree = good;
+        tree["tree"] = json!("");
+        assert!(!covered_image_withheld(&tree));
+    }
+    #[test]
+    fn desktop_points_use_the_registered_scale_without_clamping() {
+        let mapping = cerebellum_computer::app_state::image::ImageMapping {
+            window_origin_x: 80.0,
+            window_origin_y: 80.0,
+            crop_origin_x: 0.0,
+            crop_origin_y: 0.0,
+            scale: 1.0,
+            backing_scale: 2.0,
+        };
+        assert_eq!(desktop_to_image(&mapping, (93.0, 92.0)).unwrap(), (26, 24));
+        assert_eq!(
+            desktop_to_image(&mapping, (800.0, 600.0)).unwrap(),
+            (1440, 1040)
+        );
+        assert!(desktop_to_image(&mapping, (0.0, 0.0)).is_err());
+    }
     #[test]
     fn missing_review_binding_refuses_execution() {
         let mut advertised: Vec<String> = REQUIRED_CAPABILITIES
