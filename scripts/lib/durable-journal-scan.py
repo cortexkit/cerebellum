@@ -62,6 +62,11 @@ OFFENDERS: List[Tuple[str, List[str]]] = [
         ["DurableLaunchJournal", ":", ":", "open_filesystem", "("],
     ),
     ("production_profile_lifecycle(", ["production_profile_lifecycle", "("]),
+    # The call records, which hold which calls the operator's module ran.
+    (
+        "CallRecords::open_durable(",
+        ["CallRecords", ":", ":", "open_durable", "("],
+    ),
     # The format floor chosen from the process's own data home, which in a
     # test is the operator's: any store it names under that home would raise
     # the operator's floor file. Tests choose with `governing_under` and a

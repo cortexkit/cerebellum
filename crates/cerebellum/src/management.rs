@@ -459,6 +459,20 @@ impl ManagementPlane {
         self.app_state_sessions.end_conversation(conversation_key);
     }
 
+    /// Close the consent question `ask_id`, whichever plane asked it, so an
+    /// answer that arrives afterwards writes no grant. Returns whether a
+    /// question was open. Ask ids are unique across both planes.
+    pub async fn withdraw_consent_question(&self, ask_id: &str) -> bool {
+        let computer = self.computer_grants.withdraw_question_by_id(ask_id);
+        let browser = self
+            .pending_browser_grants
+            .lock()
+            .await
+            .remove(ask_id)
+            .is_some();
+        computer || browser
+    }
+
     /// Resolve an application name to the one process answering to it now,
     /// or the refusal that says why there is not exactly one.
     ///

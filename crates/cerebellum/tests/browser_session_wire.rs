@@ -4558,3 +4558,475 @@ async fn blocking_browser_grant_goodbye_and_drain_withdraw_even_after_timeout() 
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// call_key: resends answered from the record, and tool.withdraw
+// ---------------------------------------------------------------------------
+
+/// A tool request on `channel`, epoch 3, carrying `call_key`.
+fn keyed_on(channel: u16, corr: u64, name: &str, arguments: Value, call_key: &str) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        3,
+        corr,
+        serde_json::to_vec(&json!({"name": name, "arguments": arguments, "call_key": call_key}))
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// The navigation the blocking-grant fixture asks consent for, with a key.
+fn keyed_navigation(channel: u16, corr: u64, call_key: &str) -> Frame {
+    keyed_on(
+        channel,
+        corr,
+        "browser.navigate",
+        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+        call_key,
+    )
+}
+
+fn withdraw_on(channel: u16, corr: u64, arguments: Value) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        3,
+        corr,
+        serde_json::to_vec(&json!({"name": "tool.withdraw", "arguments": arguments})).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Send `frame` and return the next frame the module writes.
+async fn exchange(
+    planes: &Planes,
+    tx: &mpsc::Sender<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
+    frame: Frame,
+) -> Frame {
+    cerebellum::handle_frame_for_test(frame, tx, planes)
+        .await
+        .unwrap();
+    consent_frame(rx).await
+}
+
+async fn withdraw(
+    planes: &Planes,
+    tx: &mpsc::Sender<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
+    channel: u16,
+    corr: u64,
+    call_key: &str,
+) -> Frame {
+    exchange(
+        planes,
+        tx,
+        rx,
+        withdraw_on(channel, corr, json!({"call_key": call_key})),
+    )
+    .await
+}
+
+fn error_code(frame: &Frame) -> String {
+    assert_eq!(frame.header.ty, FrameType::Error, "expected an error frame");
+    serde_json::from_slice::<Value>(&frame.body).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn body(frame: &Frame) -> Value {
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+/// Bind a second route, 10/3, for the same conversation under another
+/// principal, the orchestrator that carries session calls.
+async fn bind_second_principal(planes: &Planes) {
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 10,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        principal: Some(Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        }),
+        consumer_capabilities: Some(vec!["elicitation".into()]),
+        admission_facts: Some(
+            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
+        ),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        900,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+}
+
+/// Run a keyed navigation through its consent question, answered allow, and
+/// return its reply.
+async fn allowed_keyed_navigation(
+    planes: &Planes,
+    tx: &mpsc::Sender<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
+    call_key: &str,
+) -> Frame {
+    let question = exchange(planes, tx, rx, keyed_navigation(9, 801, call_key)).await;
+    assert_eq!(question.header.ty, FrameType::Request, "a consent question");
+    answer_browser(planes, tx, &question, "allow").await;
+    let reply = consent_frame(rx).await;
+    assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
+    reply
+}
+
+#[tokio::test]
+async fn a_resend_after_completion_returns_the_recorded_reply_without_executing() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let first = allowed_keyed_navigation(&planes, &tx, &mut rx, "pf:resend-1").await;
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
+
+    let resent = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(9, 802, "pf:resend-1"),
+    )
+    .await;
+    assert_eq!(resent.header.ty, FrameType::Response);
+    assert_eq!(resent.header.corr, 802, "the replay answers the resend");
+    assert_eq!(resent.body, first.body, "the recorded reply, byte for byte");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["navigate"],
+        "the resend navigated again"
+    );
+    assert!(rx.try_recv().is_err(), "the resend asked a second question");
+}
+
+#[tokio::test]
+async fn a_resend_while_the_first_is_running_does_not_run_twice() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(9, 801, "pf:inflight"),
+    )
+    .await;
+    assert_eq!(question.header.ty, FrameType::Request);
+
+    let resent = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(9, 802, "pf:inflight"),
+    )
+    .await;
+    assert_eq!(error_code(&resent), "call_in_flight");
+    assert_eq!(resent.header.corr, 802);
+
+    answer_browser(&planes, &tx, &question, "allow").await;
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(reply.header.corr, 801);
+    assert_eq!(body(&reply)["outcome"], "ok");
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
+    assert!(rx.try_recv().is_err(), "a second question or reply");
+}
+
+#[tokio::test]
+async fn the_same_call_key_from_two_principals_is_two_records() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    bind_second_principal(&planes).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let first = allowed_keyed_navigation(&planes, &tx, &mut rx, "shared-key").await;
+
+    // The conversation now holds the grant, so the other principal's call
+    // navigates without asking, and must run: it is a different call.
+    let second = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(10, 803, "shared-key"),
+    )
+    .await;
+    assert_eq!(second.header.ty, FrameType::Response, "{}", body(&second));
+    assert_eq!(body(&second)["outcome"], "ok", "{}", body(&second));
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["navigate", "navigate"],
+        "one principal's key answered for another's call"
+    );
+
+    // Each principal's withdraw reads its own record.
+    let mine = withdraw(&planes, &tx, &mut rx, 9, 804, "shared-key").await;
+    assert_eq!(body(&mine)["result"], body(&first));
+    let theirs = withdraw(&planes, &tx, &mut rx, 10, 805, "shared-key").await;
+    assert_eq!(body(&theirs)["result"], body(&second));
+}
+
+#[tokio::test]
+async fn a_call_without_a_call_key_runs_as_before_and_leaves_no_record() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(&planes, &tx, &mut rx, blocking_navigation(1)).await;
+    answer_browser(&planes, &tx, &question, "allow").await;
+    assert_eq!(body(&consent_frame(&mut rx).await)["outcome"], "ok");
+    let again = exchange(&planes, &tx, &mut rx, blocking_navigation(1)).await;
+    assert_eq!(body(&again)["outcome"], "ok");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["navigate", "navigate"],
+        "a keyless call is not deduplicated, so both ran"
+    );
+    assert_eq!(planes.calls.record_count(), 0);
+}
+
+#[tokio::test]
+async fn withdrawing_a_completed_call_answers_its_result_identically_on_every_repeat() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let reply = allowed_keyed_navigation(&planes, &tx, &mut rx, "pf:done").await;
+    let first = withdraw(&planes, &tx, &mut rx, 9, 810, "pf:done").await;
+    assert_eq!(first.header.ty, FrameType::Response);
+    assert_eq!(
+        body(&first),
+        json!({"answer": "completed", "result": body(&reply)})
+    );
+    let repeat = withdraw(&planes, &tx, &mut rx, 9, 811, "pf:done").await;
+    assert_eq!(repeat.body, first.body, "a repeat answered differently");
+}
+
+#[tokio::test]
+async fn withdrawing_a_running_call_is_already_started_with_outcome_unknown() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(9, 801, "pf:running"),
+    )
+    .await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let first = withdraw(&planes, &tx, &mut rx, 9, 812, "pf:running").await;
+    assert_eq!(
+        body(&first),
+        json!({"answer": "already_started", "outcome": "unknown"})
+    );
+    let repeat = withdraw(&planes, &tx, &mut rx, 9, 813, "pf:running").await;
+    assert_eq!(repeat.body, first.body);
+    answer_browser(&planes, &tx, &question, "deny").await;
+    assert_eq!(consent_frame(&mut rx).await.header.corr, 801);
+}
+
+#[tokio::test]
+async fn withdrawing_a_denied_call_is_refused_denied() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(&planes, &tx, &mut rx, keyed_navigation(9, 801, "pf:denied")).await;
+    answer_browser(&planes, &tx, &question, "deny").await;
+    assert_eq!(
+        body(&consent_frame(&mut rx).await)["outcome"],
+        "authorization_denied"
+    );
+    let answer = withdraw(&planes, &tx, &mut rx, 9, 814, "pf:denied").await;
+    assert_eq!(
+        body(&answer),
+        json!({"answer": "refused", "reason": "denied"})
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_a_consent_pending_call_closes_its_question_and_repeats_identically() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_browser_consent_deadline_for_test(
+        keyed_navigation(9, 801, "pf:pending"),
+        &tx,
+        &planes,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let pending = consent_frame(&mut rx).await;
+    assert_eq!(
+        body(&pending)["outcome"],
+        "consent_pending",
+        "{}",
+        body(&pending)
+    );
+
+    let first = withdraw(&planes, &tx, &mut rx, 9, 815, "pf:pending").await;
+    assert_eq!(body(&first), json!({"answer": "withdrawn"}));
+    let repeat = withdraw(&planes, &tx, &mut rx, 9, 816, "pf:pending").await;
+    assert_eq!(repeat.body, first.body, "a repeat answered differently");
+
+    // The question closed: a late allow writes no grant, and nothing ran.
+    answer_browser(&planes, &tx, &question, "allow").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn withdrawing_an_unknown_key_is_unknown_call() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let answer = withdraw(&planes, &tx, &mut rx, 9, 817, "pf:never-sent").await;
+    assert_eq!(answer.header.ty, FrameType::Response);
+    assert_eq!(body(&answer), json!({"answer": "unknown_call"}));
+}
+
+#[tokio::test]
+async fn a_third_principal_is_refused_withdrawal() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_second_principal(&planes).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    allowed_keyed_navigation(&planes, &tx, &mut rx, "pf:not-yours").await;
+    let refused = withdraw(&planes, &tx, &mut rx, 10, 818, "pf:not-yours").await;
+    assert_eq!(error_code(&refused), "withdraw_not_permitted");
+}
+
+#[tokio::test]
+async fn malformed_keys_and_a_second_key_on_a_withdrawal_are_invalid_requests() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    for bad in [
+        json!(""),
+        json!("tab\tkey"),
+        json!(7),
+        json!("k".repeat(257)),
+    ] {
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            9,
+            3,
+            820,
+            serde_json::to_vec(
+                &json!({"name": "browser.navigate", "arguments": {}, "call_key": bad}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let reply = exchange(&planes, &tx, &mut rx, frame).await;
+        assert_eq!(body(&reply)["outcome"], "invalid_request");
+        assert_eq!(body(&reply)["detail"]["field"], "call_key");
+    }
+    let doubled = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        9,
+        3,
+        821,
+        serde_json::to_vec(
+            &json!({"name": "tool.withdraw", "arguments": {"call_key": "a"}, "call_key": "b"}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let reply = exchange(&planes, &tx, &mut rx, doubled).await;
+    assert_eq!(body(&reply)["detail"]["field"], "call_key");
+    let scoped = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(9, 822, json!({"call_key": "a", "scope": {"owner": "x"}})),
+    )
+    .await;
+    assert_eq!(body(&scoped)["detail"]["field"], "arguments.scope");
+    let well_scoped = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(
+            9,
+            823,
+            json!({"call_key": "a", "scope": {"owner": "reserved:prefrontal-core", "ref": "s-1", "scope_epoch": 4}}),
+        ),
+    )
+    .await;
+    assert_eq!(body(&well_scoped), json!({"answer": "unknown_call"}));
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+/// Planted text in a keyed call's arguments reaches neither the durable call
+/// records nor a withdrawal's record, whether the call completed or was
+/// refused.
+#[tokio::test]
+async fn typed_text_never_reaches_the_call_records() {
+    const SECRET: &str = "PLANTED-SECRET-7f3c1e";
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = cerebellum::journal::call_records::InMemoryCallRecordStorage::new();
+    planes.calls = Arc::new(cerebellum::journal::call_records::CallRecords::open(
+        Box::new(storage.clone()),
+        0,
+    ));
+    let (tx, mut rx) = mpsc::channel(8);
+
+    // A completed call whose arguments carry the text.
+    let question = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_on(
+            9,
+            801,
+            "browser.navigate",
+            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            "pf:secret-1",
+        ),
+    )
+    .await;
+    answer_browser(&planes, &tx, &question, "allow").await;
+    assert_eq!(body(&consent_frame(&mut rx).await)["outcome"], "ok");
+    // A typing call carrying it, refused or not on this host.
+    exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_on(
+            9,
+            802,
+            "computer_use",
+            json!({"action": "type", "app": "com.apple.TextEdit", "text": SECRET}),
+            "pf:secret-2",
+        ),
+    )
+    .await;
+    for (corr, key) in [(803, "pf:secret-1"), (804, "pf:secret-2")] {
+        withdraw(&planes, &tx, &mut rx, 9, corr, key).await;
+    }
+
+    let stored = String::from_utf8(storage.contents().expect("records were written")).unwrap();
+    assert!(
+        stored.contains("pf:secret-1") && stored.contains("pf:secret-2"),
+        "{stored}"
+    );
+    assert!(
+        !stored.contains(SECRET),
+        "planted text reached the call records: {stored}"
+    );
+}

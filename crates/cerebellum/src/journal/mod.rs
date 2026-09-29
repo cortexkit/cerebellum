@@ -31,6 +31,7 @@
 //! the terminating LF. Callers that require exact JCS bytes substitute the
 //! canonicalizer at the export seam without changing the accounting logic.
 
+pub mod call_records;
 pub mod core_adapter;
 pub mod late_events;
 pub mod recovery;

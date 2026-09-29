@@ -1628,6 +1628,21 @@ impl ComputerGrants {
         }
     }
 
+    /// Close one open question, so an answer that arrives afterwards grants
+    /// nothing. Returns whether it was open.
+    ///
+    /// For a call that already replied `consent_pending` and is being
+    /// withdrawn: no call waits on the question any more, so closing it strands
+    /// nobody.
+    pub fn withdraw_question_by_id(&self, ask_id: &str) -> bool {
+        let mut state = lock(&self.state);
+        let Some(question) = state.questions.remove(ask_id) else {
+            return false;
+        };
+        withdraw_question(&mut state, ask_id, question);
+        true
+    }
+
     /// Whether a question is still open, for callers and tests that need to
     /// know if a late answer would still be applied.
     pub fn question_open(&self, ask_id: &str) -> bool {

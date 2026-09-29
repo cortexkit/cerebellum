@@ -28,6 +28,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         crate::browser_launch::LAUNCH_ENTRY_FORMAT,
         crate::browser_launch::LAUNCH_RECOVERY_CLEAR_FORMAT,
         cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT,
+        crate::journal::call_records::CALL_RECORD_FORMAT,
         // Under `browser/`.
         crate::profile::REGISTRY_FORMAT,
         crate::profile_custody::CUSTODY_LOCK_FORMAT,
