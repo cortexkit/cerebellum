@@ -1312,15 +1312,25 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             },
         )?;
 
+        let snapshot_dom = if classification_context.is_some() || mode == SnapshotKind::Actionable {
+            Some(
+                self.flattened_dom_nodes_before(&attachment, deadline, clock)
+                    .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
+            )
+        } else {
+            None
+        };
         if let Some((document_epoch, document_url)) = classification_context {
             // One DOM read serves every ref. A failure here leaves each ref
             // with the same named reason rather than failing the snapshot:
             // the refs are still observable, only their form facts are not.
             let projection = document_origin(document_url).and_then(|origin| {
-                match self.flattened_dom_nodes_before(&attachment, deadline, clock) {
-                    Ok(nodes) => nodes.map(|nodes| (origin, nodes)),
-                    Err(_) => Err(ClassificationUnavailable::DomReadFailed),
-                }
+                snapshot_dom
+                    .as_ref()
+                    .expect("classification requested DOM")
+                    .as_ref()
+                    .map(|nodes| (origin, nodes))
+                    .map_err(Clone::clone)
             });
             for reference in &mut observation.refs {
                 let Some(identity) = reference.backend_identity.as_ref() else {
@@ -1336,6 +1346,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
+        if mode == SnapshotKind::Actionable {
+            let nodes = snapshot_dom
+                .as_ref()
+                .and_then(|result| result.as_ref().ok());
+            render_actionable(
+                &mut observation,
+                nodes.map(Vec::as_slice).unwrap_or(&[]),
+                classification_context,
+            );
+            if nodes.is_none() {
+                observation.ax_truncated = true;
+            }
+        }
         if mode == SnapshotKind::DomFull {
             let mut params = Map::new();
             params.insert("depth".into(), Value::Number(0.into()));
@@ -2850,6 +2873,257 @@ impl NavigationClock for SystemNavigationClock {
     }
 }
 
+fn actionable_landmark(node: &RawDomNode) -> Option<&str> {
+    match node
+        .attributes
+        .get("role")
+        .map(String::as_str)
+        .unwrap_or(&node.local_name)
+    {
+        "main" => Some("main"),
+        "nav" | "navigation" => Some("navigation"),
+        "form" => Some("form"),
+        "header" | "banner" => Some("banner"),
+        "footer" | "contentinfo" => Some("contentinfo"),
+        "aside" | "complementary" => Some("complementary"),
+        "section" | "region" => Some("region"),
+        _ => None,
+    }
+}
+
+/// Keep the DOM-backed controls in document order, with landmark membership
+/// explicit so repeated navigation and form labels remain distinguishable.
+fn render_actionable(
+    observation: &mut BrowserSnapshotObservation,
+    nodes: &[RawDomNode],
+    classification_context: Option<(u64, &str)>,
+) {
+    let by_backend: HashMap<_, _> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.backend_node_id, i))
+        .collect();
+    let by_id: HashMap<_, _> = nodes.iter().map(|n| (n.node_id, n)).collect();
+    let landmark = actionable_landmark;
+    // Unnamed forms are often ignored by AX, but still own their controls.
+    // Give those DOM landmarks real backend refs rather than dangling groups.
+    for node in nodes.iter().filter(|node| landmark(node).is_some()) {
+        if observation.refs.iter().any(|r| {
+            r.backend_identity
+                .as_ref()
+                .is_some_and(|id| id.backend_node_id == node.backend_node_id)
+        }) {
+            continue;
+        }
+        if observation.refs.len() == MAX_REFS {
+            observation.refs_truncated = true;
+            observation.ax_truncated = true;
+            break;
+        }
+        let identity = observation
+            .refs
+            .iter()
+            .filter_map(|r| r.backend_identity.as_ref())
+            .find(|id| {
+                let mut current = by_backend.get(&id.backend_node_id).map(|i| &nodes[*i]);
+                let mut seen = HashSet::new();
+                while let Some(child) = current {
+                    if !seen.insert(child.node_id) {
+                        break;
+                    }
+                    if child.node_id == node.node_id {
+                        return true;
+                    }
+                    current = child.parent_id.and_then(|id| by_id.get(&id).copied());
+                }
+                false
+            })
+            .or_else(|| {
+                observation
+                    .refs
+                    .iter()
+                    .find_map(|r| r.backend_identity.as_ref())
+            })
+            .cloned();
+        let Some(mut identity) = identity else {
+            continue;
+        };
+        identity.backend_node_id = node.backend_node_id;
+        let role = landmark(node).unwrap().to_string();
+        let name = bounded_ax_field(
+            node.attributes
+                .get("aria-label")
+                .map(String::as_str)
+                .unwrap_or(""),
+            MAX_NAME_BYTES,
+        )
+        .0;
+        let reference = format!("e{}", observation.refs.len() + 1);
+        let classification = classification_context
+            .ok_or(ClassificationUnavailable::NotCaptured)
+            .and_then(|(epoch, url)| {
+                let origin = document_origin(url)?;
+                build_non_type_classification(nodes, &identity, epoch, &origin).map(Box::new)
+            });
+        observation.refs.push(RefRecord {
+            captured: SnapshotRef::new(&reference, &role, &name, 0).expect("bounded landmark"),
+            frame_path: vec![identity.frame_id.clone()],
+            backend_identity: Some(identity),
+            raw_role: Some(role.clone()),
+            raw_name: Some(name.clone()),
+            classification,
+        });
+        observation.records.push(AxRecord {
+            depth: 0,
+            role,
+            name,
+            value: None,
+            reference: Some(reference),
+        });
+    }
+    let mut rows = Vec::new();
+    let mut retained = HashSet::new();
+    for (record_index, record) in observation.records.iter().enumerate() {
+        let Some(reference) = record.reference.as_ref() else {
+            continue;
+        };
+        let Some(captured) = observation
+            .refs
+            .iter()
+            .find(|r| &r.captured.reference == reference)
+        else {
+            continue;
+        };
+        let node_index = captured
+            .backend_identity
+            .as_ref()
+            .and_then(|id| by_backend.get(&id.backend_node_id))
+            .copied();
+        let node = node_index.map(|i| &nodes[i]);
+        let region = node.and_then(&landmark).or(match record.role.as_str() {
+            "main" | "navigation" | "form" | "banner" | "contentinfo" | "complementary"
+            | "region" => Some(record.role.as_str()),
+            _ => None,
+        });
+        let is_control = matches!(
+            record.role.as_str(),
+            "link"
+                | "button"
+                | "textbox"
+                | "searchbox"
+                | "combobox"
+                | "listbox"
+                | "checkbox"
+                | "radio"
+                | "slider"
+                | "spinbutton"
+                | "switch"
+                | "heading"
+        ) || node.is_some_and(|n| {
+            matches!(
+                n.local_name.as_str(),
+                "a" | "button" | "input" | "select" | "textarea"
+            )
+        });
+        if region.is_none() && !is_control {
+            continue;
+        }
+        let mut row = serde_json::json!({"ref":reference,"role":region.unwrap_or(&record.role),"name":record.name});
+        if let Some(node) = node {
+            if let Some(href) = node.attributes.get("href") {
+                row["href"] = Value::String(href.clone());
+            }
+            let mut parent = node.parent_id;
+            let mut visited = HashSet::new();
+            while let Some(ancestor) = parent.and_then(|id| by_id.get(&id).copied()) {
+                if !visited.insert(ancestor.node_id) {
+                    break;
+                }
+                if let Some(role) = landmark(ancestor) {
+                    row["landmark"] = Value::String(format!("{}:{}", role, ancestor.node_id));
+                    break;
+                }
+                parent = ancestor.parent_id;
+            }
+            if let Some(region) = region {
+                row["group"] = Value::String(format!("{}:{}", region, node.node_id));
+            }
+            if matches!(node.local_name.as_str(), "input" | "textarea" | "select") {
+                let input_type = node
+                    .attributes
+                    .get("type")
+                    .map(String::as_str)
+                    .unwrap_or("text");
+                row["type"] = Value::String(input_type.into());
+                if let Some(name) = node.attributes.get("name") {
+                    row["input_name"] = Value::String(name.clone());
+                }
+                let sensitive = input_type.eq_ignore_ascii_case("password")
+                    || node.attributes.get("autocomplete").is_some_and(|tokens| {
+                        tokens.split_ascii_whitespace().any(|token| {
+                            matches!(
+                                token.to_ascii_lowercase().as_str(),
+                                "username" | "current-password" | "new-password" | "one-time-code"
+                            ) || token.to_ascii_lowercase().starts_with("cc-")
+                        })
+                    })
+                    || ["name", "id"]
+                        .iter()
+                        .filter_map(|key| node.attributes.get(*key))
+                        .any(|name| {
+                            let name = name.to_ascii_lowercase();
+                            [
+                                "password", "passwd", "secret", "token", "card", "cvv", "cvc",
+                                "iban",
+                            ]
+                            .iter()
+                            .any(|token| name.contains(token))
+                        });
+                if !sensitive {
+                    if let Some(value) = record.value.as_ref() {
+                        row["value"] = Value::String(value.clone());
+                    }
+                }
+            }
+        }
+        if region.is_some() {
+            let excerpt = observation.records[record_index + 1..]
+                .iter()
+                .take_while(|r| r.depth > record.depth)
+                .filter(|r| r.role == "StaticText")
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            row["excerpt"] = Value::String(bounded_ax_field(&excerpt, 240).0);
+        }
+        retained.insert(reference.clone());
+        // FlattenedDocument can list descendants before their parents. A
+        // root-to-node path preserves sibling order while placing each group
+        // before its children, independent of that CDP serialization order.
+        let mut order = vec![node_index.unwrap_or(nodes.len() + record_index)];
+        let mut parent = node.and_then(|node| node.parent_id);
+        let mut visited = HashSet::new();
+        while let Some(ancestor) = parent.and_then(|id| by_id.get(&id).copied()) {
+            if !visited.insert(ancestor.node_id) {
+                break;
+            }
+            order.push(by_backend[&ancestor.backend_node_id]);
+            parent = ancestor.parent_id;
+        }
+        order.reverse();
+        rows.push((order, row));
+    }
+    rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+    observation.dom_text = Some(
+        rows.into_iter()
+            .map(|(_, row)| format!("{row}\n"))
+            .collect(),
+    );
+    observation
+        .refs
+        .retain(|r| retained.contains(&r.captured.reference));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -4283,6 +4557,193 @@ mod tests {
             .writes
             .iter()
             .all(|write| write["method"] != "Input.dispatchMouseEvent"));
+    }
+
+    fn actionable_fixture() -> BrowserSnapshotObservation {
+        let mut password = ax_node("password", "textbox", "Password", &[], 60, None);
+        password["value"] = json!({"type":"string", "value":"secret-password-value"});
+        let mut normal = ax_node("query", "textbox", "Query", &[], 70, None);
+        normal["value"] = json!({"type":"string", "value":"visible-query"});
+        let mut payment = ax_node("payment", "textbox", "Card", &[], 80, None);
+        payment["value"] = json!({"type":"string", "value":"secret-payment-value"});
+        let mut form = ax_node(
+            "form",
+            "form",
+            "Search",
+            &[
+                "password", "query", "payment", "heading", "select", "button",
+            ],
+            50,
+            None,
+        );
+        form["ignored"] = json!(true);
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Settings", &["nav","form"],10,Some("frame-main"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
+                ax_node("nav","navigation","Navigation", &["link1","link2","text"],20,None),
+                form
+            ]}}),
+            json!({"id":4,"sessionId":"session-own","result":{"nodes":[
+                ax_node("link1","link","Home", &[],30,None), ax_node("link2","link","Apps", &[],40,None),
+                ax_node("text","StaticText","Manage installed applications", &[],35,None)
+            ]}}),
+            json!({"id":5,"sessionId":"session-own","result":{"nodes":[password,normal,payment,
+                ax_node("heading","heading","Options", &[],90,None),
+                ax_node("select","combobox","Scope", &[],100,None),
+                ax_node("button","button","Search", &[],110,None)
+            ]}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
+            json!({"id":7,"sessionId":"session-own","result":{"nodes":[
+                flattened_dom_node(3,Some(2),30,"a", &["href","/home"]),
+                flattened_dom_node(4,Some(2),40,"a", &["href","/apps"]),
+                flattened_dom_node(2,Some(1),20,"nav", &[]),
+                flattened_dom_node(6,Some(5),60,"input", &["type","password","name","password"]),
+                flattened_dom_node(7,Some(5),70,"input", &["type","search","name","q"]),
+                flattened_dom_node(8,Some(5),80,"input", &["autocomplete","cc-number"]),
+                flattened_dom_node(9,Some(5),90,"h2", &[]),
+                flattened_dom_node(10,Some(5),100,"select", &["name","scope"]),
+                flattened_dom_node(11,Some(5),110,"button", &[]),
+                flattened_dom_node(5,Some(1),50,"form", &[]),
+                flattened_dom_node(1,None,10,"html", &[])
+            ]}}),
+        ];
+        attached_driver(frames)
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Actionable,
+                1000,
+                Some((7, PAGE_URL)),
+                &mut FakeClock::new(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn actionable_snapshot_omits_credential_and_payment_values() {
+        let observation = actionable_fixture();
+        let text = observation.dom_text.unwrap();
+        assert!(!text.contains("secret-password-value"));
+        assert!(!text.contains("secret-payment-value"));
+        assert!(text.contains("visible-query"));
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(rows
+            .iter()
+            .filter(|row| row["name"] == "Password" || row["name"] == "Card")
+            .all(|row| row.get("value").is_none()));
+    }
+
+    #[test]
+    fn actionable_snapshot_links_have_hrefs_and_refs_drive_real_click() {
+        let observation = actionable_fixture();
+        let text = observation.dom_text.as_ref().unwrap();
+        assert!(text.len() < 2000);
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "navigation",
+                "link",
+                "link",
+                "form",
+                "textbox",
+                "textbox",
+                "textbox",
+                "heading",
+                "combobox",
+                "button"
+            ]
+        );
+        assert_eq!(rows[0]["excerpt"], "Manage installed applications");
+        assert!(rows[4..]
+            .iter()
+            .all(|row| row["landmark"] == rows[3]["group"]));
+        assert_eq!(rows[5]["input_name"], "q");
+        let links: Vec<_> = rows.iter().filter(|r| r["role"] == "link").collect();
+        assert_eq!(
+            links
+                .iter()
+                .map(|r| r["href"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["/home", "/apps"]
+        );
+        assert!(links.iter().all(|r| r["landmark"] == rows[0]["group"]));
+        for row in &rows {
+            assert!(observation
+                .refs
+                .iter()
+                .any(|r| r.captured.reference == row["ref"] && r.backend_identity.is_some()));
+        }
+        let id = new_snapshot_id("actionable-click");
+        let mut store = BrowserSnapshotStore::new(1).unwrap();
+        store
+            .retain_text(TextSnapshot {
+                snapshot_id: id.clone(),
+                kind: SnapshotKind::Actionable,
+                document_epoch: 7,
+                source_origin: PAGE_URL.into(),
+                source_document: None,
+                content_schema: crate::snapshot_store::ACTIONABLE_SCHEMA,
+                content: text.clone(),
+                truncated: false,
+                refs_truncated: false,
+                refs: observation.refs.clone(),
+            })
+            .unwrap();
+        let candidates: Vec<_> = observation
+            .refs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| RefCandidate {
+                identity: r.backend_identity.clone(),
+                frame_path: r.frame_path.clone(),
+                role: r.captured.role.clone(),
+                name: r.captured.name.clone(),
+                traversal_index: i,
+            })
+            .collect();
+        let resolved = store
+            .resolve_ref(&id, links[0]["ref"].as_str().unwrap(), 7, &candidates)
+            .unwrap();
+        let RefResolution::Resolved(reference) = resolved else {
+            panic!("ref must resolve");
+        };
+        let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0,0.0,1280.0,713.0)}),
+            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":30,"frameId":"frame-main"}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
+            json!({"id":7,"sessionId":"session-own","result":{}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":{}}),
+        ]);
+        let mut events = Vec::new();
+        driver
+            .click_for_test(
+                "route-own",
+                reference.backend_identity.as_ref().unwrap(),
+                1000,
+                &mut |event| events.push(event),
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .any(|w| w["method"] == "Input.dispatchMouseEvent"));
     }
 
     #[test]

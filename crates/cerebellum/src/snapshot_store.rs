@@ -24,10 +24,12 @@ pub const MAX_VALUE_BYTES: usize = 4_096;
 pub const MAX_AX_RECORD_BYTES: usize = 1_048_576;
 pub const AX_SCHEMA: &str = "ck-browser-snapshot-ax-jsonl/v1";
 pub const DOM_SCHEMA: &str = "ck-browser-snapshot-dom-text/v1";
+pub const ACTIONABLE_SCHEMA: &str = "ck-browser-snapshot-actionable-jsonl/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotKind {
+    Actionable,
     Ax,
     DomFull,
     Screenshot,
@@ -36,6 +38,7 @@ pub enum SnapshotKind {
 impl SnapshotKind {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Actionable => "actionable",
             Self::Ax => "ax",
             Self::DomFull => "dom_full",
             Self::Screenshot => "screenshot",
@@ -770,6 +773,89 @@ pub fn ax_record_from_value(value: &Value) -> Result<AxRecord, SnapshotError> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Budget the serialized reply, including JSON escaping and the ref table.
+/// Tiny budgets still need routing and truncation metadata: the fixed minimum
+/// envelope is 1024 bytes. The source document kept for actions is never shortened.
+pub fn bounded_text_reply(snapshot: &mut TextSnapshot, max_bytes: usize, context: Value) -> Value {
+    let original_bytes = snapshot.content.len();
+    let original_refs = snapshot.refs.len();
+    let mut source = snapshot.source_origin.clone();
+    // The minimum envelope pays for metadata, not extra page text when a
+    // caller deliberately requests only a tiny excerpt.
+    if snapshot.content.len() > max_bytes {
+        let mut end = max_bytes;
+        while !snapshot.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        if snapshot.kind != SnapshotKind::DomFull {
+            end = snapshot.content[..end].rfind('\n').map_or(0, |i| i + 1);
+        }
+        snapshot.content.truncate(end);
+        snapshot.truncated = true;
+    }
+    loop {
+        let reply = serde_json::json!({
+            "outcome":"ok", "mode":snapshot.kind.as_str(),
+            "snapshot_id":snapshot.snapshot_id, "document_epoch":snapshot.document_epoch,
+            "source_origin":source, "content_schema":snapshot.content_schema,
+            "truncated":snapshot.truncated, "refs_truncated":snapshot.refs_truncated,
+            "content":snapshot.content,
+            "refs":snapshot.refs.iter().map(|r| &r.captured).collect::<Vec<_>>(),
+            "omitted":{"content_bytes":original_bytes - snapshot.content.len(),
+                "refs":original_refs - snapshot.refs.len(),
+                "source_origin":source != snapshot.source_origin},
+            "context":context
+        });
+        if serde_json::to_vec(&reply)
+            .expect("snapshot reply serializes")
+            .len()
+            <= max_bytes.max(1024)
+        {
+            return reply;
+        }
+        snapshot.truncated = true;
+        if !snapshot.content.is_empty() {
+            let mut end = snapshot.content.len() / 2;
+            while !snapshot.content.is_char_boundary(end) {
+                end -= 1;
+            }
+            if snapshot.kind != SnapshotKind::DomFull {
+                end = snapshot.content[..end].rfind('\n').map_or(0, |i| i + 1);
+            }
+            snapshot.content.truncate(end);
+        }
+        if !snapshot.refs.is_empty() {
+            snapshot.refs_truncated = true;
+            snapshot.refs.truncate(snapshot.refs.len() / 2);
+            if snapshot.kind != SnapshotKind::DomFull {
+                // Never advertise a ref in the text after its private identity
+                // has been removed from the retained snapshot.
+                snapshot.content = snapshot
+                    .content
+                    .lines()
+                    .filter(|line| {
+                        let Ok(row) = serde_json::from_str::<Value>(line) else {
+                            return false;
+                        };
+                        row.get("ref")
+                            .and_then(Value::as_str)
+                            .is_none_or(|reference| {
+                                snapshot
+                                    .refs
+                                    .iter()
+                                    .any(|r| r.captured.reference == reference)
+                            })
+                    })
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+            }
+        }
+        if snapshot.content.is_empty() && snapshot.refs.is_empty() {
+            source.clear();
+        }
+    }
 }
 
 #[cfg(test)]

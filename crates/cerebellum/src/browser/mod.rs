@@ -2299,7 +2299,8 @@ impl BrowserPlane {
     ) -> Result<Value, BrowserError> {
         let object = self.validate_request(args, &["mode", "max_bytes"]).await?;
         let kind = match object.get("mode") {
-            None => SnapshotKind::Ax,
+            None => SnapshotKind::Actionable,
+            Some(Value::String(value)) if value == "actionable" => SnapshotKind::Actionable,
             Some(Value::String(value)) if value == "ax" => SnapshotKind::Ax,
             Some(Value::String(value)) if value == "dom_full" => SnapshotKind::DomFull,
             Some(Value::String(_)) => {
@@ -2556,7 +2557,7 @@ impl BrowserPlane {
                 observation.dom_text.as_deref(),
                 observation.refs,
                 max_bytes,
-                kind == SnapshotKind::Ax && observation.ax_truncated,
+                kind != SnapshotKind::DomFull && observation.ax_truncated,
                 observation.refs_truncated,
                 Some(source_document),
             )
@@ -2645,14 +2646,19 @@ impl BrowserPlane {
             return Err(BrowserError::NoSession);
         }
         let (content, encoded_truncated, schema) = match mode {
+            SnapshotKind::Actionable => (
+                dom_text.unwrap_or_default().to_string(),
+                false,
+                snapshot_store::ACTIONABLE_SCHEMA,
+            ),
             SnapshotKind::Ax => {
-                let (content, truncated) = snapshot_store::encode_ax_jsonl(records, max_bytes)
+                let (content, truncated) = snapshot_store::encode_ax_jsonl(records, usize::MAX)
                     .map_err(map_snapshot_error)?;
                 (content, truncated, AX_SCHEMA)
             }
             SnapshotKind::DomFull => {
                 let (content, truncated) =
-                    snapshot_store::encode_dom_text(dom_text.unwrap_or_default(), max_bytes);
+                    snapshot_store::encode_dom_text(dom_text.unwrap_or_default(), usize::MAX);
                 (content, truncated, DOM_SCHEMA)
             }
             SnapshotKind::Screenshot => {
@@ -2662,11 +2668,11 @@ impl BrowserPlane {
                 })
             }
         };
-        let truncated = encoded_truncated || content_incomplete;
         let refs_truncated = refs.len() > MAX_REFS || refs_incomplete;
+        let truncated = encoded_truncated || content_incomplete || refs_truncated;
         let refs = refs.into_iter().take(MAX_REFS).collect::<Vec<_>>();
         let id = context.snapshot_id(mode);
-        let snapshot = TextSnapshot {
+        let mut snapshot = TextSnapshot {
             snapshot_id: id.clone(),
             kind: mode,
             document_epoch: context.epoch.value(),
@@ -2687,14 +2693,22 @@ impl BrowserPlane {
             refs_truncated,
             refs,
         };
+        let mut reply = snapshot_store::bounded_text_reply(
+            &mut snapshot,
+            max_bytes,
+            BrowserContextResult::from_identity(identity).json(),
+        );
         context
             .snapshots
-            .retain_text(snapshot.clone())
+            .retain_text(snapshot)
             .map_err(map_snapshot_error)?;
-        let refs = snapshot.refs.iter().map(|reference| json!({"ref":reference.captured.reference,"role":reference.captured.role,"name":reference.captured.name,"nth":reference.captured.nth})).collect::<Vec<_>>();
-        Ok(
-            json!({"outcome":"ok","snapshot_id":snapshot.snapshot_id,"document_epoch":snapshot.document_epoch,"source_origin":snapshot.source_origin,"content_schema":snapshot.content_schema,"truncated":snapshot.truncated,"refs_truncated":snapshot.refs_truncated,"content":snapshot.content,"refs":refs}),
-        )
+        // Reserve the dispatch envelope in the budget, but let the outer reply
+        // own it: navigate embeds this snapshot without a second context.
+        reply
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("context");
+        Ok(reply)
     }
 
     /// Close an already-committed action that `check_snapshot_document`
@@ -3755,8 +3769,8 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         },
         BrowserToolDefinition {
             name: SNAPSHOT,
-            description: "Capture a structured accessibility or DOM snapshot.",
-            request_schema: json!({"type":"object","properties":{"mode":{"enum":["ax","dom_full"]},"max_bytes":{"type":"integer"}},"additionalProperties":false}),
+            description: "Capture a compact actionable snapshot by default; use ax or dom_full only when something is missing.",
+            request_schema: json!({"type":"object","properties":{"mode":{"enum":["actionable","ax","dom_full"],"default":"actionable"},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Serialized reply cap including refs; below 1024 uses a fixed 1024-byte metadata envelope. If truncated, narrow the page."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
         },
         BrowserToolDefinition {
@@ -3932,6 +3946,8 @@ fn refusal_detail_schema() -> Value {
 
 fn text_snapshot_properties() -> Value {
     json!({
+        "mode":{"type":"string","enum":["actionable","ax","dom_full"]},
+        "omitted":closed_object(json!({"content_bytes":integer_schema(),"refs":integer_schema(),"source_origin":boolean_schema()}), &["content_bytes","refs","source_origin"]),
         "snapshot_id":string_schema(),
         "document_epoch":integer_schema(),
         "source_origin":string_schema(),
@@ -5016,6 +5032,73 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn snapshot_whole_reply_cap_includes_escaped_content_refs_and_source() {
+        let route = identity();
+        let plane = BrowserPlane::new();
+        plane.open_context(route.clone()).await.unwrap();
+        let records: Vec<_> = (0..1000)
+            .map(|i| AxRecord {
+                depth: 0,
+                role: "link".into(),
+                name: "quoted \"\\\" café".repeat(20),
+                value: None,
+                reference: Some(format!("e{}", i + 1)),
+            })
+            .collect();
+        let refs: Vec<_> = records
+            .iter()
+            .map(|r| crate::snapshot_store::RefRecord {
+                captured: crate::snapshot_store::SnapshotRef::new(
+                    r.reference.clone().unwrap(),
+                    &r.role,
+                    &r.name,
+                    0,
+                )
+                .unwrap(),
+                frame_path: vec![],
+                backend_identity: None,
+                raw_role: None,
+                raw_name: None,
+                classification: Err(crate::classification::ClassificationUnavailable::NotCaptured),
+            })
+            .collect();
+        let (text, _) = snapshot_store::encode_ax_jsonl(&records, usize::MAX).unwrap();
+        for mode in [
+            SnapshotKind::Actionable,
+            SnapshotKind::Ax,
+            SnapshotKind::DomFull,
+        ] {
+            for budget in [1, 512, 1024, 20000] {
+                let reply = plane
+                    .retain_text_snapshot(
+                        &route,
+                        mode,
+                        &records,
+                        Some(&text),
+                        refs.clone(),
+                        budget,
+                        Some(CommittedDocument::new(
+                            format!("https://example.com/{}", "long".repeat(10000)),
+                            1,
+                            "loader",
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                let reply = plane.result(&route, Ok(reply)).await;
+                assert!(
+                    serde_json::to_vec(&reply).unwrap().len() <= budget.max(1024),
+                    "{mode:?}, budget {budget}"
+                );
+                assert_eq!(reply["truncated"], true);
+                assert_eq!(reply["refs_truncated"], true);
+                assert!(reply["omitted"]["refs"].as_u64().unwrap() > 0);
+                assert_eq!(reply["mode"], mode.as_str());
+                plane.finish_reply(SNAPSHOT, reply).unwrap();
+            }
+        }
+    }
 
     /// Each browser capability maps to its OWN journal capability.
     ///
