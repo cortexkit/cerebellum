@@ -34,7 +34,7 @@ const ARMS: &[&str] = &[
     "auth_attach_failure",
 ];
 const BUILD: &str = r#"Build (unreviewed probe bindings, NOT release attestations):
-  source <(sed -n '/^export CEREBELLUM_/p' scripts/release-build.sh)
+  eval "$(sed -n '/^export CEREBELLUM_/p' scripts/release-build.sh)"   # not `source <(...)`: macOS bash 3.2 silently runs nothing
   export CEREBELLUM_APP_STATE_REVIEW_REVISION=desk-unreviewed/v13
   export CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION=desk-unreviewed/v13
   export CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION=desk-unreviewed/v13
@@ -162,8 +162,12 @@ fn decode_payloads(value: &mut Value) -> Result<(), String> {
                 let bytes = decode_bytes(child)?;
                 *child = if bytes.is_empty() {
                     json!([])
+                } else if let Ok(value) = serde_json::from_slice(&bytes) {
+                    value
                 } else {
-                    serde_json::from_slice(&bytes).map_err(|e| format!("{key}: {e}"))?
+                    // Some byte fields are plain text rather than JSON: a read
+                    // row's final context is the target's bundle identity.
+                    Value::String(String::from_utf8(bytes).map_err(|e| format!("{key}: {e}"))?)
                 };
             }
             decode_payloads(child)?;
@@ -481,7 +485,10 @@ mod desk {
         Ok(json!({"x":point.x,"y":point.y}))
     }
     fn held_state() -> Value {
-        let tables: Vec<_> = [-1, 0, 1].into_iter().map(|table| {
+        // HID system (1) and combined session (0) only. The private id (-1)
+        // names an event source's own state, not a queryable table, and
+        // measured on macOS 27 the key-state call never returns for it.
+        let tables: Vec<_> = [0, 1].into_iter().map(|table| {
             // CoreGraphics accepts these public state-table ids; no event is posted.
             let keys: Vec<_> = (0..128).filter(|key| unsafe { CGEventSourceKeyState(table, *key) }).collect();
             let flags = unsafe { CGEventSourceFlagsState(table) };
@@ -587,8 +594,18 @@ mod desk {
     fn selected_text() -> Result<String, String> {
         script("tell application \"System Events\" to tell process \"TextEdit\" to get value of attribute \"AXSelectedText\" of text area 1 of scroll area 1 of window 1")
     }
+    /// The VERTICAL scroll bar's value. `scroll bar 1` is the horizontal bar,
+    /// which a wrapped document leaves disabled and still, so reading it would
+    /// report every vertical scroll as having done nothing.
     fn scrollbar() -> Result<String, String> {
-        script("tell application \"System Events\" to tell process \"TextEdit\" to get value of scroll bar 1 of scroll area 1 of window 1")
+        script(
+            "tell application \"System Events\" to tell process \"TextEdit\"\n\
+             repeat with bar in scroll bars of scroll area 1 of window 1\n\
+             if value of attribute \"AXOrientation\" of bar is \"AXVerticalOrientation\" then return value of bar\n\
+             end repeat\n\
+             error \"no vertical scroll bar\"\n\
+             end tell",
+        )
     }
     fn editor_focus() -> Result<(), String> {
         script("tell application \"TextEdit\" to activate")?;
@@ -683,9 +700,13 @@ mod desk {
         fn copy_signed(&self) -> Result<PathBuf, String> {
             let copy = self.root.join("TextEdit-adhoc.app");
             if !copy.exists() {
+                // `cp -R`, not `ditto`: ditto copies TextEdit's SIP
+                // `restricted` flag onto the new directory, and nothing can
+                // then be written inside it.
                 command(
-                    "/usr/bin/ditto",
+                    "/bin/cp",
                     &[
+                        "-R",
                         "/System/Applications/TextEdit.app",
                         copy.to_str().ok_or("copy path")?,
                     ],
@@ -903,6 +924,18 @@ mod desk {
             self.call(
                 "computer.read_state",
                 json!({"target":app,"include_image":image}),
+                "allow_conversation",
+            )
+            .await
+        }
+        /// A read narrowed to lines containing `text`. Discord's full tree
+        /// runs past the reply's element cap and the message box sits near
+        /// the end of it, so an unfiltered read omits the one element these
+        /// arms need; an agent would filter the same way.
+        async fn read_text(&mut self, app: &str, text: &str) -> Result<Call, String> {
+            self.call(
+                "computer.read_state",
+                json!({"target":app,"include_image":false,"text_filter":text}),
                 "allow_conversation",
             )
             .await
@@ -1138,7 +1171,7 @@ mod desk {
         println!("UNANSWERED QUESTION {question_body}");
         check(
             question.header.ty == FrameType::Request
-                && question_body["params"]["grant_kind"] == "app",
+                && question_body["params"]["target"]["kind"] == "app",
             "expected an app-grant question",
         )?;
         let returned = tokio::time::timeout(Duration::from_secs(150), frames.recv())
@@ -1301,7 +1334,7 @@ mod desk {
             "discord_background_read" => {
                 p.grant(DISCORD).await?;
                 front(FINDER)?;
-                let c = p.read(DISCORD, false).await?;
+                let c = p.read_text(DISCORD, "Message @").await?;
                 check(
                     cerebellum_macos::frontmost_process_id() != Some(resolve(DISCORD)?.pid as i32),
                     "Discord was not background",
@@ -1348,7 +1381,7 @@ mod desk {
             // element_addressed: AX writes to a web composer are refused.
             "write_text_web" => {
                 p.grant(DISCORD).await?;
-                let c = p.read(DISCORD, false).await?;
+                let c = p.read_text(DISCORD, "Message @").await?;
                 let id = element(&c.reply, "Message @")?;
                 let before = snapshot(DISCORD)?;
                 check(
@@ -1498,7 +1531,7 @@ mod desk {
             // private_input_route: the decoded dispatch row must name SkyLight.
             "route_recorded" => {
                 p.grant(DISCORD).await?;
-                let read = p.read(DISCORD, false).await?;
+                let read = p.read_text(DISCORD, "Message @").await?;
                 let id = element(&read.reply, "Message @")?;
                 check(
                     composer_empty(&snapshot(DISCORD)?),
@@ -1563,7 +1596,7 @@ mod desk {
         )?;
         front(DISCORD)?;
         if composer(&snapshot(DISCORD)?)?["focused"] != true {
-            let read = p.read(DISCORD, false).await?;
+            let read = p.read_text(DISCORD, "Message @").await?;
             let id = element(&read.reply, "Message @")?;
             p.call(
                 "computer.press_element",
