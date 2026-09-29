@@ -10,10 +10,6 @@ use cerebellum_computer::dispatch::{BracketReport, BracketStop, DispatchError, R
 use cerebellum_computer::platform::{HeldStateDisposition, ProcessEventRefusal, ProcessGrant};
 use serde_json::{json, Value};
 
-/// What a keystroke refusal that posted nothing adds to its remedy.
-pub(crate) const NOT_DISPATCHED_REMEDY: &str =
-    "No keystroke was posted, so this call can be retried safely.";
-
 /// Mark a keystroke refusal as one that made no post call at all.
 ///
 /// A refusal otherwise reads `effect_indeterminate`, which tells a caller
@@ -26,17 +22,13 @@ pub(crate) const NOT_DISPATCHED_REMEDY: &str =
 ///
 /// Call this only where it is certain no post call was made: before the
 /// dispatch, or where [`post_call_made`] answers `Some(false)`.
+///
+/// The remedy is left as the refusal wrote it: the effect status is the
+/// signal, and the computer tool's description tells the model what
+/// `not_dispatched` means.
 pub(crate) fn refused_before_posting(mut reply: Value) -> Value {
     reply["effect_status"] = json!("not_dispatched");
     reply["posts_returned"] = json!(0);
-    let remedy = match reply.get("remedy").and_then(Value::as_str) {
-        Some(existing) if existing.trim_end().ends_with('.') => {
-            format!("{} {NOT_DISPATCHED_REMEDY}", existing.trim_end())
-        }
-        Some(existing) => format!("{}. {NOT_DISPATCHED_REMEDY}", existing.trim_end()),
-        None => NOT_DISPATCHED_REMEDY.to_string(),
-    };
-    reply["remedy"] = json!(remedy);
     reply
 }
 

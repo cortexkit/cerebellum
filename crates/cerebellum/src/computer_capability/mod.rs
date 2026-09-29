@@ -1460,9 +1460,9 @@ where
         if let Some(bracket) = &bracket {
             keystrokes::disclose_failed_restore(&mut reply, bracket, &grant);
         }
-        // Applied after the restore disclosure, which replaces the remedy: a
+        // Applied after the restore disclosure, which rewrites the reply: a
         // bracket can fail to put the previous application back without ever
-        // posting, and the caller still needs to hear the retry is safe.
+        // posting, and that reply must still say nothing was posted.
         if unposted_refusal {
             reply = unposted(reply);
         }

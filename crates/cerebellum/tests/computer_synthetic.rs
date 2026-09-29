@@ -1589,20 +1589,11 @@ async fn route_summaries_reach_the_journal_not_the_wire_on_success_and_auth_fail
 // not_dispatched: a keystroke refusal that made no post call says so
 // ---------------------------------------------------------------------------
 
-/// The sentence a refusal that posted nothing adds to its remedy.
-const RETRY_IS_SAFE: &str = "No keystroke was posted, so this call can be retried safely.";
-
-/// Assert that `reply` says it made no post call, in the words a caller
-/// reads: the effect status, a zero count, and a remedy saying retry is safe.
+/// Assert that `reply` says it made no post call: the effect status and a
+/// zero count.
 fn assert_not_dispatched(reply: &Value) {
     assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
     assert_eq!(reply["posts_returned"], 0, "{reply}");
-    assert!(
-        reply["remedy"]
-            .as_str()
-            .is_some_and(|remedy| remedy.contains(RETRY_IS_SAFE)),
-        "{reply}"
-    );
 }
 
 /// A target that comes forward too slowly for even one keystroke to fit the
@@ -1772,9 +1763,6 @@ async fn a_stop_after_posting_stays_indeterminate_with_its_count() {
     assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
     assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
     assert_eq!(reply["posts_returned"], 2, "{reply}");
-    assert!(!reply["remedy"]
-        .as_str()
-        .is_some_and(|remedy| remedy.contains(RETRY_IS_SAFE)));
     assert!(plane.result_schema_findings().is_empty());
 
     // Through the bracket: the unit's key press was posted, then the process
