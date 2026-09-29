@@ -25,10 +25,12 @@ pub enum ImageUnavailable {
     AuditUnavailable,
     /// The capture had no area, so there is no size to scale it to.
     ImageNotScalable,
+    /// Chromium may have stopped painting while the window was covered.
+    WindowCoveredMayBeStale,
 }
 
 impl ImageUnavailable {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::ScreenRecordingNotLive,
         Self::NoWindowCaptured,
         Self::CaptureUnavailable,
@@ -38,6 +40,7 @@ impl ImageUnavailable {
         Self::CustodyUnavailable,
         Self::AuditUnavailable,
         Self::ImageNotScalable,
+        Self::WindowCoveredMayBeStale,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -51,6 +54,7 @@ impl ImageUnavailable {
             Self::CustodyUnavailable => "custody_unavailable",
             Self::AuditUnavailable => "audit_unavailable",
             Self::ImageNotScalable => "image_not_scalable",
+            Self::WindowCoveredMayBeStale => "window_covered_may_be_stale",
         }
     }
 }

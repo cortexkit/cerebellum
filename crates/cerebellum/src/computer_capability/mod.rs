@@ -79,6 +79,8 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 mod element_actions;
+pub mod image_freshness;
+use image_freshness::{image_freshness_decision, ImageFreshnessSource, NativeImageFreshnessSource};
 mod keystrokes;
 mod takeover;
 
@@ -435,6 +437,7 @@ where
     /// Where application state is read from: the platform's accessibility
     /// reader in a running module, a fixture in tests.
     app_state_source: Arc<dyn AppStateSource>,
+    image_freshness_source: Arc<dyn ImageFreshnessSource>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
     refusal_ring: Mutex<RefusalRing<ComputerRefusalReason>>,
@@ -528,6 +531,7 @@ where
             audit: Arc::new(Mutex::new(audit)),
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
+            image_freshness_source: Arc::new(NativeImageFreshnessSource),
             result_schema_enforcement,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
             refusal_ring: Mutex::new(
@@ -563,6 +567,12 @@ where
     /// Read application state from `source` instead of the platform's reader.
     pub fn with_app_state_source(mut self, source: Arc<dyn AppStateSource>) -> Self {
         self.app_state_source = source;
+        self
+    }
+
+    /// Read image freshness from `source` instead of the window server.
+    pub fn with_image_freshness_source(mut self, source: Arc<dyn ImageFreshnessSource>) -> Self {
+        self.image_freshness_source = source;
         self
     }
 
@@ -909,7 +919,10 @@ where
         }
         let audit = self.audit.clone();
         let grant = grant.clone();
+        let freshness = self.image_freshness_source.clone();
         tokio::task::spawn_blocking(move || {
+            let (chromium, visibility) = freshness.inspect(&grant, None);
+            image_freshness_decision(chromium, visibility)?;
             let mut audit = audit.blocking_lock();
             let mut custody = AuditImageCustody {
                 audit: &mut audit,
@@ -934,6 +947,11 @@ where
                         }
                         SingleWindowCaptureError::Capture(_) => ImageUnavailable::CaptureFailed,
                     })?;
+                // Selection and capture may race a window move or cover, so recheck
+                // visibility for the captured window before returning its pixels.
+                let (chromium, visibility) =
+                    freshness.inspect(&grant, Some(&captured.window.window_id));
+                image_freshness_decision(chromium, visibility)?;
                 Ok(WindowImageCapture {
                     window_id: captured.window.window_id.clone(),
                     owning_pid: grant.pid,

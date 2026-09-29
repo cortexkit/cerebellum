@@ -49,6 +49,12 @@ mod process_table;
 mod skylight;
 #[cfg(target_os = "macos")]
 mod window_image;
+#[cfg(any(target_os = "macos", test))]
+mod window_visibility;
+#[cfg(target_os = "macos")]
+pub use window_visibility::process_uses_chromium;
+#[cfg(any(target_os = "macos", test))]
+pub use window_visibility::{bundle_uses_chromium, WindowVisibility};
 
 // The export gate MATCHES the module gate above. `accessibility` compiles off
 // macOS under `test` on purpose, so its platform-neutral logic -- cycle
@@ -127,4 +133,4 @@ pub use skylight::{
     keyboard_auth_available, post_key_to_pid, skylight_available, OwnedKeyEvent, PostResult,
 };
 #[cfg(target_os = "macos")]
-pub use window_image::{encode_scaled_jpeg, frontmost_window_id};
+pub use window_image::{encode_scaled_jpeg, frontmost_window_id, window_visibility};

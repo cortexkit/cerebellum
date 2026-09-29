@@ -16,6 +16,8 @@ use crate::macos::{bgra_image, encode_image};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayBounds(display: u32) -> CGRect;
     /// A drawing context backed by memory the system allocates.
     fn CGBitmapContextCreate(
         data: *mut c_void,
@@ -149,6 +151,89 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
         }
     }
     None
+}
+
+/// Whether this exact window is wholly on screen and unobstructed now.
+/// The on-screen list is front-to-back; missing data never proves visibility.
+pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
+    use crate::window_visibility::{visibility_from_windows, Rect, Window};
+    use crate::WindowVisibility;
+    let Some(windows) = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    ) else {
+        return WindowVisibility::Unknown;
+    };
+    // SAFETY: CoreGraphics documents this result as an array of string-keyed dictionaries.
+    let windows: &CFArray<CFDictionary<CFString, CFType>> = unsafe { windows.cast_unchecked() };
+    let mut entries = Vec::new();
+    for index in 0..windows.len() {
+        let Some(window) = windows.get(index) else {
+            return WindowVisibility::Unknown;
+        };
+        let number = |key: &str| -> Option<f64> {
+            window
+                .get(&CFString::from_str(key))?
+                .downcast::<CFNumber>()
+                .ok()?
+                .as_f64()
+        };
+        let bounds = window
+            .get(&CFString::from_static_str("kCGWindowBounds"))
+            .and_then(|value| value.downcast::<CFDictionary>().ok())
+            .and_then(|dictionary| {
+                // SAFETY: the window bounds dictionary contains numeric X/Y/Width/Height keys.
+                let dictionary: &CFDictionary<CFString, CFType> =
+                    unsafe { dictionary.cast_unchecked() };
+                let value = |key: &str| -> Option<f64> {
+                    dictionary
+                        .get(&CFString::from_str(key))?
+                        .downcast::<CFNumber>()
+                        .ok()?
+                        .as_f64()
+                };
+                Some(Rect {
+                    x: value("X")?,
+                    y: value("Y")?,
+                    width: value("Width")?,
+                    height: value("Height")?,
+                })
+            });
+        let identifier = |key: &str| {
+            number(key)
+                .filter(|v| {
+                    v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX) && v.fract() == 0.0
+                })
+                .map(|v| v as u32)
+        };
+        entries.push(Window {
+            id: identifier("kCGWindowNumber"),
+            pid: identifier("kCGWindowOwnerPID"),
+            bounds,
+            alpha: number("kCGWindowAlpha"),
+        });
+    }
+    let mut ids = [0u32; 32];
+    let mut count = 0;
+    // SAFETY: ids has capacity for 32 display IDs and count is a valid output pointer.
+    let status = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if status != 0 || count == 0 || count as usize >= ids.len() {
+        return WindowVisibility::Unknown;
+    }
+    let displays = ids[..count as usize]
+        .iter()
+        .map(|id| {
+            // SAFETY: the display ID was supplied by CoreGraphics immediately above.
+            let bounds = unsafe { CGDisplayBounds(*id) };
+            Rect {
+                x: bounds.origin.x,
+                y: bounds.origin.y,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            }
+        })
+        .collect::<Vec<_>>();
+    visibility_from_windows(pid, id, &entries, &displays)
 }
 
 #[cfg(test)]

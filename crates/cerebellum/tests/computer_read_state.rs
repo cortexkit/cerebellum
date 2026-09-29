@@ -507,3 +507,138 @@ async fn an_ungranted_read_is_refused_before_anything_is_read() {
     assert!(reply.get("tree").is_none());
     assert_eq!(management.app_state_sessions().session_count(), 0);
 }
+
+struct FixtureFreshness {
+    chromium: bool,
+    before: cerebellum::computer_capability::image_freshness::WindowVisibility,
+    after: cerebellum::computer_capability::image_freshness::WindowVisibility,
+    seen: Mutex<Vec<Option<String>>>,
+}
+
+impl cerebellum::computer_capability::image_freshness::ImageFreshnessSource for FixtureFreshness {
+    fn inspect(
+        &self,
+        target: &ProcessGrant,
+        window_id: Option<&str>,
+    ) -> (
+        bool,
+        cerebellum::computer_capability::image_freshness::WindowVisibility,
+    ) {
+        assert_eq!(target.bundle_identity, TARGET_BUNDLE_ID);
+        self.seen.lock().unwrap().push(window_id.map(str::to_owned));
+        (
+            self.chromium,
+            if window_id.is_some() {
+                self.after
+            } else {
+                self.before
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn covered_chromium_image_refusal_passes_withholding_and_keeps_tree() {
+    use cerebellum::computer_capability::image_freshness::WindowVisibility;
+    let management = granted_management().await;
+    for visibility in [WindowVisibility::Covered, WindowVisibility::Unknown] {
+        let facts = Arc::new(FixtureFreshness {
+            chromium: true,
+            before: visibility,
+            after: visibility,
+            seen: Mutex::new(vec![]),
+        });
+        let plane = plane(FixtureSource::new(vec![chat_window()]))
+            .with_image_freshness_source(facts.clone());
+        let journal_before = plane.journal_entry_count().await;
+        let reply = serve(
+            &plane,
+            &management,
+            "conversation-1",
+            no_relay(),
+            json!({"target": TARGET_BUNDLE_ID, "include_image": true}),
+            capturing(jpeg(1250, 750, 0)),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(
+            reply["image_unavailable"],
+            json!({"reason": "window_covered_may_be_stale"})
+        );
+        assert!(reply.get("image").is_none());
+        assert!(reply["tree"].as_str().unwrap().contains("GoToWindow"));
+        assert!(plane.result_schema_findings().is_empty());
+        assert_eq!(*facts.seen.lock().unwrap(), vec![None]);
+        assert_eq!(
+            plane.journal_entry_count().await,
+            journal_before,
+            "no capture was admitted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn capture_rechecks_exact_window_and_native_images_remain_available() {
+    use cerebellum::computer_capability::image_freshness::WindowVisibility::*;
+    let management = granted_management().await;
+    for (chromium, before, after, allowed) in [
+        (true, FullyVisible, FullyVisible, true),
+        (true, FullyVisible, Covered, false),
+        (true, FullyVisible, Unknown, false),
+        (false, Covered, Covered, true),
+        (false, Unknown, Unknown, true),
+    ] {
+        let facts = Arc::new(FixtureFreshness {
+            chromium,
+            before,
+            after,
+            seen: Mutex::new(vec![]),
+        });
+        let plane = plane(FixtureSource::new(vec![chat_window()]))
+            .with_image_freshness_source(facts.clone());
+        let reply = serve(
+            &plane,
+            &management,
+            "conversation-1",
+            no_relay(),
+            json!({"target": TARGET_BUNDLE_ID, "include_image": true}),
+            capturing(jpeg(1250, 750, 0)),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "completed");
+        assert_eq!(reply.get("image").is_some(), allowed, "{reply}");
+        if !allowed {
+            assert_eq!(
+                reply["image_unavailable"]["reason"],
+                "window_covered_may_be_stale"
+            );
+        }
+        assert_eq!(*facts.seen.lock().unwrap(), vec![None, Some("77".into())]);
+        assert!(plane.result_schema_findings().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn tree_only_reads_do_not_probe_image_freshness() {
+    use cerebellum::computer_capability::image_freshness::WindowVisibility::Covered;
+    let facts = Arc::new(FixtureFreshness {
+        chromium: true,
+        before: Covered,
+        after: Covered,
+        seen: Mutex::new(vec![]),
+    });
+    let plane =
+        plane(FixtureSource::new(vec![chat_window()])).with_image_freshness_source(facts.clone());
+    let management = granted_management().await;
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed");
+    assert!(facts.seen.lock().unwrap().is_empty());
+}

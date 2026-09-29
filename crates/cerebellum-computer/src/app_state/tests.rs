@@ -778,6 +778,7 @@ fn every_image_unavailable_reason_is_reachable() {
         ImageUnavailable::NoWindowCaptured,
         ImageUnavailable::CaptureUnavailable,
         ImageUnavailable::CaptureFailed,
+        ImageUnavailable::WindowCoveredMayBeStale,
     ] {
         assert_eq!(run(&mut ScriptedCustody::default(), Err(reason)), reason);
     }
