@@ -5051,3 +5051,600 @@ async fn typed_text_never_reaches_the_call_records() {
         "planted text reached the call records: {stored}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Session scopes: the daemon's stamp on the bind, recorded on calls, the
+// owner's withdraw, and what a scope's end takes with it
+// ---------------------------------------------------------------------------
+
+const SCOPE_OWNER: &str = "reserved:prefrontal-core";
+const SCOPE_CARRIER: &str = "reserved:broca";
+
+fn scope_stamp(scope_epoch: u64, owner_authorized: bool) -> subc_protocol::scope::ScopeStamp {
+    subc_protocol::scope::ScopeStamp {
+        owner: Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        scope_ref: "s-1".into(),
+        scope_epoch,
+        kind: subc_protocol::scope::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+        attributes: subc_protocol::scope::ScopeAttributes::default(),
+        owner_authorized,
+    }
+}
+
+/// Bind route `channel`/3 for the fixture's conversation under `principal`,
+/// carrying `scope` exactly as the daemon would stamp it.
+async fn bind_route(
+    planes: &Planes,
+    channel: u16,
+    principal: Principal,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+) {
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: channel,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        principal: Some(principal),
+        consumer_capabilities: Some(vec!["elicitation".into()]),
+        admission_facts: Some(
+            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
+        ),
+        scope,
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        900 + u64::from(channel),
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+}
+
+fn reserved(module_id: &str) -> Principal {
+    Principal::Reserved {
+        module_id: module_id.into(),
+    }
+}
+
+fn goodbye(channel: u16) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Goodbye,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        3,
+        0,
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+/// Planes whose call records can be read back as the durable file holds them.
+fn with_readable_call_records(
+    planes: &mut Planes,
+) -> cerebellum::journal::call_records::InMemoryCallRecordStorage {
+    let storage = cerebellum::journal::call_records::InMemoryCallRecordStorage::new();
+    planes.calls = Arc::new(cerebellum::journal::call_records::CallRecords::open(
+        Box::new(storage.clone()),
+        0,
+    ));
+    storage
+}
+
+/// A route opened without a scope is served exactly as before scopes: its
+/// call record names no scope, its close tears the browser down at once as
+/// `route_unbound` and ends the conversation's computer state as it always
+/// did, and the module asks the daemon nothing.
+#[tokio::test]
+async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let refused = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_on(
+            9,
+            801,
+            "browser.navigate",
+            json!({"url":"https://requested.example/path", "intent":"read", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            "pf:unscoped",
+        ),
+    )
+    .await;
+    assert_eq!(refused.header.corr, 801);
+    let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
+    assert!(stored.contains("\"scope\":null"), "{stored}");
+
+    assert!(planes.sessions.has_open_session("test-session"));
+    cerebellum::handle_frame_for_test(goodbye(9), &tx, &planes)
+        .await
+        .unwrap();
+    // Torn down on the frame loop itself, before the GOODBYE returns.
+    assert!(!planes.sessions.has_open_session("test-session"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "an unscoped route's close sent the daemon a question"
+    );
+    assert_eq!(planes.scopes.control.outstanding(), 0);
+    // Browser grants were never ended by a route close, and still are not.
+    assert_eq!(planes.management.browser_grant_count().await, 1);
+}
+
+/// A keyed call on a scoped route records the stamp's owner, ref and epoch,
+/// and no text from its arguments.
+#[tokio::test]
+async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
+    const SECRET: &str = "PLANTED-SECRET-5d2a90";
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+    bind_route(&planes, 12, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_on(
+            12,
+            801,
+            "browser.navigate",
+            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            "pf:scoped-1",
+        ),
+    )
+    .await;
+    if question.header.ty == FrameType::Request {
+        let answer = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            12,
+            3,
+            question.header.corr,
+            serde_json::to_vec(&json!({"decision":"deny"})).unwrap(),
+        )
+        .unwrap();
+        cerebellum::handle_frame_for_test(answer, &tx, &planes)
+            .await
+            .unwrap();
+        consent_frame(&mut rx).await;
+    }
+    let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
+    assert!(
+        stored.contains(
+            r#""scope":{"owner":"reserved:prefrontal-core","ref":"s-1","scope_epoch":4}"#
+        ),
+        "{stored}"
+    );
+    assert!(
+        !stored.contains(SECRET),
+        "planted text reached the call records: {stored}"
+    );
+}
+
+/// The fixture for the owner's withdraw: a carrier's keyed call recorded under
+/// scope s-1 at epoch 4, and the carrier's own answer for it.
+async fn carrier_call_under_scope() -> (Planes, mpsc::Sender<Frame>, mpsc::Receiver<Frame>, Value)
+{
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_route(&planes, 10, reserved("broca"), Some(scope_stamp(4, true))).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    // Broca may not act in a conversation, so the call is refused before
+    // dispatch; it is still a call recorded under the scope.
+    let refused = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(10, 801, "br:1"),
+    )
+    .await;
+    assert_eq!(
+        error_code(&refused),
+        cerebellum_core::principal::SESSION_CALLER_NOT_ADMITTED
+    );
+    let own = withdraw(&planes, &tx, &mut rx, 10, 802, "br:1").await;
+    let own = body(&own);
+    assert_eq!(
+        own,
+        json!({"answer": "refused", "reason": "session_caller_not_admitted"})
+    );
+    (planes, tx, rx, own)
+}
+
+#[tokio::test]
+async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
+    let (planes, tx, mut rx, own) = carrier_call_under_scope().await;
+    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    let answer = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+    )
+    .await;
+    assert_eq!(answer.header.ty, FrameType::Response);
+    assert_eq!(body(&answer), own, "the owner was answered differently");
+    // Naming the route's own scope is allowed and changes nothing.
+    let scoped = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(
+            11,
+            804,
+            json!({"call_key": "br:1", "carrier": SCOPE_CARRIER, "scope": {"owner": SCOPE_OWNER, "ref": "s-1", "scope_epoch": 4}}),
+        ),
+    )
+    .await;
+    assert_eq!(body(&scoped), own);
+}
+
+#[tokio::test]
+async fn an_owner_withdraw_without_a_carrier_is_an_invalid_request() {
+    let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
+    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    let refused = withdraw(&planes, &tx, &mut rx, 11, 803, "br:1").await;
+    assert_eq!(body(&refused)["outcome"], "invalid_request");
+    assert_eq!(body(&refused)["detail"]["field"], "arguments.carrier");
+    assert_eq!(body(&refused)["detail"]["reason_code"], "missing_field");
+}
+
+#[tokio::test]
+async fn a_carrier_naming_another_carrier_is_an_invalid_request() {
+    let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
+    bind_route(&planes, 13, reserved("aft"), Some(scope_stamp(4, true))).await;
+    let refused = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(13, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+    )
+    .await;
+    assert_eq!(body(&refused)["outcome"], "invalid_request");
+    assert_eq!(body(&refused)["detail"]["field"], "arguments.carrier");
+    // The carrier itself naming its own label is its ordinary withdraw.
+    let own = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(10, 804, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+    )
+    .await;
+    assert_eq!(
+        body(&own),
+        json!({"answer": "refused", "reason": "session_caller_not_admitted"})
+    );
+}
+
+#[tokio::test]
+async fn an_owner_naming_a_carrier_that_raised_no_such_call_learns_nothing() {
+    let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
+    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    let answer = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": "reserved:aft"})),
+    )
+    .await;
+    assert_eq!(body(&answer), json!({"answer": "unknown_call"}));
+}
+
+#[tokio::test]
+async fn an_owner_the_daemon_does_not_authorize_may_not_withdraw() {
+    let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
+    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, false))).await;
+    let refused = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+    )
+    .await;
+    assert_eq!(error_code(&refused), "withdraw_not_permitted");
+}
+
+#[tokio::test]
+async fn an_owner_at_another_epoch_may_not_withdraw() {
+    let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
+    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(5, true))).await;
+    let refused = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+    )
+    .await;
+    assert_eq!(error_code(&refused), "withdraw_not_permitted");
+}
+
+#[tokio::test]
+async fn a_named_scope_that_differs_from_the_stamp_is_refused() {
+    let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
+    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    for (corr, scope) in [
+        (803, json!({"owner": SCOPE_OWNER, "ref": "s-other", "scope_epoch": 4})),
+        (804, json!({"owner": SCOPE_OWNER, "ref": "s-1", "scope_epoch": 3})),
+        (805, json!({"owner": "reserved:aft", "ref": "s-1", "scope_epoch": 4})),
+    ] {
+        let refused = exchange(
+            &planes,
+            &tx,
+            &mut rx,
+            withdraw_on(
+                11,
+                corr,
+                json!({"call_key": "br:1", "carrier": SCOPE_CARRIER, "scope": scope}),
+            ),
+        )
+        .await;
+        assert_eq!(body(&refused)["outcome"], "invalid_request", "{scope}");
+        assert_eq!(body(&refused)["detail"]["field"], "arguments.scope");
+    }
+}
+
+/// The scoped-route revocation fixture: the fixture's browser open for the
+/// conversation, route 12 bound under scope s-1 at epoch 4, one browser grant
+/// held and one browser grant question open for the conversation. Returns the
+/// open question's id.
+async fn scoped_browser(planes: &Planes) -> String {
+    bind_route(planes, 12, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    grant_browser(planes, "https://requested.example", Vec::new()).await;
+    let question = planes
+        .management
+        .browser_grant_question_for_test(
+            "test-session",
+            vec!["https://other.example".to_string()],
+            Vec::new(),
+        )
+        .await;
+    assert!(planes.sessions.has_open_session("test-session"));
+    assert_eq!(planes.management.browser_grant_count().await, 1);
+    assert!(
+        planes
+            .management
+            .browser_grant_question_open(&question.ask_id)
+            .await
+    );
+    question.ask_id
+}
+
+/// Close route 12 and return the `scope.describe` it makes the module send.
+async fn close_scoped_route(
+    planes: &Planes,
+    tx: &mpsc::Sender<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
+) -> Frame {
+    cerebellum::handle_frame_for_test(goodbye(12), tx, planes)
+        .await
+        .unwrap();
+    // Nothing is torn down by the close itself.
+    assert!(planes.sessions.has_open_session("test-session"));
+    next_describe(rx).await
+}
+
+async fn next_describe(rx: &mut mpsc::Receiver<Frame>) -> Frame {
+    let question = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("the module asks the daemon about the scope")
+        .unwrap();
+    assert_eq!(question.header.ty, FrameType::Request);
+    assert_eq!(question.header.channel, 0);
+    assert_eq!(
+        body(&question),
+        json!({"op": "scope.describe", "owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "s-1"})
+    );
+    question
+}
+
+/// Answer a `scope.describe` as the daemon would.
+async fn answer_describe(
+    planes: &Planes,
+    tx: &mpsc::Sender<Frame>,
+    question: &Frame,
+    ty: FrameType,
+    answer: Value,
+) {
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        ty,
+        cerebellum::control_flags(),
+        0,
+        0,
+        question.header.corr,
+        serde_json::to_vec(&answer).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(frame, tx, planes)
+        .await
+        .unwrap();
+}
+
+fn describe_answer(status: &str, scope_epoch: Option<u64>, synced: bool, configured: bool) -> Value {
+    let mut answer = json!({
+        "op": "scope.describe",
+        "status": status,
+        "daemon_incarnation": "test-incarnation",
+        "owner_synced": synced,
+        "owner_configured": configured,
+    });
+    if let Some(epoch) = scope_epoch {
+        answer["scope_epoch"] = json!(epoch);
+    }
+    answer
+}
+
+async fn wait_until_closed(planes: &Planes) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while planes.sessions.has_open_session("test-session") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the scope's browser closes");
+}
+
+/// A definitive end of the scope closes its browser as `scope_revoked`, drops
+/// the conversation's browser grants, and closes its open question so a late
+/// answer grants nothing. `browser.status` then reports the outcome through
+/// the production reply boundary, which withholds a reply its result schema
+/// does not declare.
+#[tokio::test]
+async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_question() {
+    for answer in [
+        describe_answer("ended", Some(4), true, true),
+        describe_answer("live", Some(5), true, true),
+        describe_answer("not_live", None, true, true),
+        describe_answer("not_live", None, false, false),
+    ] {
+        let (planes, _launcher) = blocking_grant_fixture().await;
+        let ask_id = scoped_browser(&planes).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let question = close_scoped_route(&planes, &tx, &mut rx).await;
+        answer_describe(&planes, &tx, &question, FrameType::Response, answer.clone()).await;
+        wait_until_closed(&planes).await;
+        assert_eq!(
+            planes.management.browser_grant_count().await,
+            0,
+            "{answer}"
+        );
+        assert!(
+            !planes.management.browser_grant_question_open(&ask_id).await,
+            "the scope's open question survived its end: {answer}"
+        );
+        assert!(
+            !planes
+                .management
+                .settle_browser_grant(&ask_id, Some(&json!({"decision": "allow"})))
+                .await
+        );
+        assert_eq!(planes.management.browser_grant_count().await, 0);
+
+        let status = exchange(&planes, &tx, &mut rx, request(830, "browser.status", json!({}))).await;
+        assert_eq!(status.header.ty, FrameType::Response, "{}", body(&status));
+        assert_eq!(body(&status)["terminal_outcome"], "scope_revoked", "{}", body(&status));
+    }
+}
+
+/// Every answer that does not definitively end the scope leaves the browser,
+/// the grants and the open question in place, and the scope is asked about
+/// again while its browser stays open. An owner that has not synced since a
+/// daemon restart is the case that matters most: a restart must not destroy
+/// an agent's work.
+#[tokio::test]
+async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question() {
+    let restart_like = (
+        FrameType::Response,
+        describe_answer("not_live", None, false, true),
+    );
+    for (ty, answer) in [
+        restart_like,
+        (FrameType::Response, describe_answer("live", Some(4), true, true)),
+        (FrameType::Response, describe_answer("ended", Some(3), true, true)),
+        (
+            FrameType::Error,
+            json!({"code": "unknown_control_op", "message": "this daemon has no scope.describe"}),
+        ),
+    ] {
+        let (mut planes, _launcher) = blocking_grant_fixture().await;
+        planes.scopes = Arc::new(cerebellum::scope_watch::ScopeRevocation::with_intervals(
+            Duration::from_millis(40),
+            Duration::from_secs(5),
+        ));
+        let ask_id = scoped_browser(&planes).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let question = close_scoped_route(&planes, &tx, &mut rx).await;
+        answer_describe(&planes, &tx, &question, ty, answer.clone()).await;
+        // Asked again once the interval passes, because the browser is still
+        // open and no route under the scope is bound.
+        let again = next_describe(&mut rx).await;
+        assert!(planes.sessions.has_open_session("test-session"), "{answer}");
+        assert_eq!(planes.management.browser_grant_count().await, 1, "{answer}");
+        assert!(
+            planes.management.browser_grant_question_open(&ask_id).await,
+            "{answer}"
+        );
+        // A definitive answer on the re-ask then ends it.
+        answer_describe(
+            &planes,
+            &tx,
+            &again,
+            FrameType::Response,
+            describe_answer("ended", Some(4), true, true),
+        )
+        .await;
+        wait_until_closed(&planes).await;
+        assert_eq!(planes.management.browser_grant_count().await, 0);
+    }
+}
+
+/// No answer at all within the describe bound is not an end either.
+#[tokio::test]
+async fn an_unanswered_describe_leaves_everything_in_place() {
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    planes.scopes = Arc::new(cerebellum::scope_watch::ScopeRevocation::with_intervals(
+        Duration::from_secs(60),
+        Duration::from_millis(30),
+    ));
+    let ask_id = scoped_browser(&planes).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = close_scoped_route(&planes, &tx, &mut rx).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    // An answer after the bound finds nobody waiting and is dropped.
+    answer_describe(
+        &planes,
+        &tx,
+        &question,
+        FrameType::Response,
+        describe_answer("ended", Some(4), true, true),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(planes.sessions.has_open_session("test-session"));
+    assert_eq!(planes.management.browser_grant_count().await, 1);
+    assert!(planes.management.browser_grant_question_open(&ask_id).await);
+    assert_eq!(planes.scopes.control.outstanding(), 0);
+}
+
+/// While another route under the same scope is still bound, a non-definitive
+/// answer is not asked about again: that route's own close will ask.
+#[tokio::test]
+async fn a_scope_with_a_route_still_bound_is_not_polled() {
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    planes.scopes = Arc::new(cerebellum::scope_watch::ScopeRevocation::with_intervals(
+        Duration::from_millis(20),
+        Duration::from_secs(5),
+    ));
+    scoped_browser(&planes).await;
+    bind_route(&planes, 14, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = close_scoped_route(&planes, &tx, &mut rx).await;
+    answer_describe(
+        &planes,
+        &tx,
+        &question,
+        FrameType::Response,
+        describe_answer("live", Some(4), true, true),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(rx.try_recv().is_err(), "a scope with a bound route was polled");
+    assert!(planes.sessions.has_open_session("test-session"));
+}

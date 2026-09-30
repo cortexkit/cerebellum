@@ -269,6 +269,10 @@ impl ScopeKey {
 struct Watched {
     /// The conversations routes under this scope carried when they closed.
     conversations: BTreeSet<String>,
+    /// Woken when another route under the scope closes while its watcher
+    /// waits out an interval, so that close is asked about at once rather
+    /// than at the next interval.
+    closed_again: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// The scopes whose routes closed and whose end has not been settled, and how
@@ -316,12 +320,21 @@ impl ScopeRevocation {
     pub fn note_closed(&self, key: &ScopeKey, conversation_key: &str) -> bool {
         let mut watched = self.watched();
         let starting = !watched.contains_key(key);
-        watched
+        let entry = watched.entry(key.clone()).or_default();
+        entry.conversations.insert(conversation_key.to_string());
+        if !starting {
+            entry.closed_again.notify_one();
+        }
+        starting
+    }
+
+    /// What wakes `key`'s watcher when another route under it closes.
+    pub fn closed_again(&self, key: &ScopeKey) -> std::sync::Arc<tokio::sync::Notify> {
+        self.watched()
             .entry(key.clone())
             .or_default()
-            .conversations
-            .insert(conversation_key.to_string());
-        starting
+            .closed_again
+            .clone()
     }
 
     /// The conversations noted for `key` so far.

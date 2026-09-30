@@ -1220,12 +1220,14 @@ impl RouteBindings {
 ///
 /// Only a definitive end ends anything (see [`scope_watch::classify`]). While
 /// the answer is unresolved everything stays, and the scope is asked about
-/// again once per [`scope_watch::SCOPE_RECHECK_INTERVAL`], but only while a
+/// again when another route under it closes, or once per
+/// [`scope_watch::SCOPE_RECHECK_INTERVAL`], but only while a
 /// browser it opened is still open and no route under it is bound: a bound
 /// route asks again itself when it closes, and with no browser open nothing is
 /// running that a late end would have to stop.
 async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_watch::ScopeKey) {
     let mut drain = planes.drain_signal.subscribe();
+    let closed_again = planes.scopes.closed_again(&key);
     loop {
         let answer = planes.scopes.describe(&writer, &key).await;
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
@@ -1249,6 +1251,8 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
         }
         tokio::select! {
             _ = tokio::time::sleep(planes.scopes.recheck_interval) => {}
+            // Another route under the scope closed: ask about it now.
+            _ = closed_again.notified() => {}
             // A draining module closes every browser itself.
             _ = drain.wait_for(|draining| *draining) => {
                 planes.scopes.finish(&key);
