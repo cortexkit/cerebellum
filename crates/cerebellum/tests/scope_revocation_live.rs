@@ -256,7 +256,9 @@ impl Owner {
                     (FrameType::Request, 0) => {
                         let body: Value = serde_json::from_slice(&frame.body).unwrap_or_default();
                         let reply = match body["op"].as_str() {
-                            Some("health.check") => json!({"op": "health.check", "status": "healthy"}),
+                            Some("health.check") => {
+                                json!({"op": "health.check", "status": "healthy"})
+                            }
                             _ => json!({"op": "route.bind"}),
                         };
                         let reply = Frame::build(
@@ -381,7 +383,11 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
         .unwrap(),
     )
     .unwrap();
-    let run = home.join(".local").join("share").join("cortexkit").join("run");
+    let run = home
+        .join(".local")
+        .join("share")
+        .join("cortexkit")
+        .join("run");
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
@@ -525,10 +531,16 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
     })
     .await;
     sleep(Duration::from_millis(300)).await;
-    assert!(sessions.has_open_session(CONVERSATION), "an ordinary close closed the browser");
+    assert!(
+        sessions.has_open_session(CONVERSATION),
+        "an ordinary close closed the browser"
+    );
     assert_eq!(management.browser_grant_count().await, 1);
     assert!(management.browser_grant_question_open(&open.ask_id).await);
-    assert!(scopes.is_watching(&key), "a live scope with an open browser stopped being watched");
+    assert!(
+        scopes.is_watching(&key),
+        "a live scope with an open browser stopped being watched"
+    );
     assert_eq!(*ended.lock().unwrap(), None);
 
     // The session reconnects, then its owner ends it. The daemon drains the

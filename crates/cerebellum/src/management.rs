@@ -787,7 +787,10 @@ impl ManagementPlane {
     /// Whether the browser grant question `ask_id` is still open, so that an
     /// answer arriving now would still be applied.
     pub async fn browser_grant_question_open(&self, ask_id: &str) -> bool {
-        self.pending_browser_grants.lock().await.contains_key(ask_id)
+        self.pending_browser_grants
+            .lock()
+            .await
+            .contains_key(ask_id)
     }
 
     /// Forget the browser origin grants a conversation holds and close every

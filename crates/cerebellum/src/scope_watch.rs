@@ -462,14 +462,19 @@ mod tests {
         let body: Value = serde_json::from_slice(&question.body).unwrap();
         assert_eq!(body["op"], "scope.describe");
         assert_eq!(body["ref"], "s-1");
-        assert!(!requests.deliver(question.header.corr + 1, ControlAnswer::Response(Value::Null)));
+        assert!(!requests.deliver(
+            question.header.corr + 1,
+            ControlAnswer::Response(Value::Null)
+        ));
         assert!(requests.deliver(
             question.header.corr,
             ControlAnswer::Response(serde_json::json!({"answered": true}))
         ));
         assert_eq!(
             asking.await.unwrap(),
-            Some(ControlAnswer::Response(serde_json::json!({"answered": true})))
+            Some(ControlAnswer::Response(
+                serde_json::json!({"answered": true})
+            ))
         );
         assert!(!requests.deliver(question.header.corr, ControlAnswer::Response(Value::Null)));
         assert_eq!(requests.outstanding(), 0);

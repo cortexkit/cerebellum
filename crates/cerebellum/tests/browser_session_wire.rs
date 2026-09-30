@@ -5195,7 +5195,13 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
     const SECRET: &str = "PLANTED-SECRET-5d2a90";
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
-    bind_route(&planes, 12, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     let (tx, mut rx) = mpsc::channel(8);
     let question = exchange(
         &planes,
@@ -5241,20 +5247,13 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
 
 /// The fixture for the owner's withdraw: a carrier's keyed call recorded under
 /// scope s-1 at epoch 4, and the carrier's own answer for it.
-async fn carrier_call_under_scope() -> (Planes, mpsc::Sender<Frame>, mpsc::Receiver<Frame>, Value)
-{
+async fn carrier_call_under_scope() -> (Planes, mpsc::Sender<Frame>, mpsc::Receiver<Frame>, Value) {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_route(&planes, 10, reserved("broca"), Some(scope_stamp(4, true))).await;
     let (tx, mut rx) = mpsc::channel(8);
     // Broca may not act in a conversation, so the call is refused before
     // dispatch; it is still a call recorded under the scope.
-    let refused = exchange(
-        &planes,
-        &tx,
-        &mut rx,
-        keyed_navigation(10, 801, "br:1"),
-    )
-    .await;
+    let refused = exchange(&planes, &tx, &mut rx, keyed_navigation(10, 801, "br:1")).await;
     assert_eq!(
         error_code(&refused),
         cerebellum_core::principal::SESSION_CALLER_NOT_ADMITTED
@@ -5271,12 +5270,22 @@ async fn carrier_call_under_scope() -> (Planes, mpsc::Sender<Frame>, mpsc::Recei
 #[tokio::test]
 async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
     let (planes, tx, mut rx, own) = carrier_call_under_scope().await;
-    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        11,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     let answer = exchange(
         &planes,
         &tx,
         &mut rx,
-        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+        withdraw_on(
+            11,
+            803,
+            json!({"call_key": "br:1", "carrier": SCOPE_CARRIER}),
+        ),
     )
     .await;
     assert_eq!(answer.header.ty, FrameType::Response);
@@ -5299,7 +5308,13 @@ async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
 #[tokio::test]
 async fn an_owner_withdraw_without_a_carrier_is_an_invalid_request() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
-    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        11,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     let refused = withdraw(&planes, &tx, &mut rx, 11, 803, "br:1").await;
     assert_eq!(body(&refused)["outcome"], "invalid_request");
     assert_eq!(body(&refused)["detail"]["field"], "arguments.carrier");
@@ -5314,7 +5329,11 @@ async fn a_carrier_naming_another_carrier_is_an_invalid_request() {
         &planes,
         &tx,
         &mut rx,
-        withdraw_on(13, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+        withdraw_on(
+            13,
+            803,
+            json!({"call_key": "br:1", "carrier": SCOPE_CARRIER}),
+        ),
     )
     .await;
     assert_eq!(body(&refused)["outcome"], "invalid_request");
@@ -5324,7 +5343,11 @@ async fn a_carrier_naming_another_carrier_is_an_invalid_request() {
         &planes,
         &tx,
         &mut rx,
-        withdraw_on(10, 804, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+        withdraw_on(
+            10,
+            804,
+            json!({"call_key": "br:1", "carrier": SCOPE_CARRIER}),
+        ),
     )
     .await;
     assert_eq!(
@@ -5336,12 +5359,22 @@ async fn a_carrier_naming_another_carrier_is_an_invalid_request() {
 #[tokio::test]
 async fn an_owner_naming_a_carrier_that_raised_no_such_call_learns_nothing() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
-    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        11,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     let answer = exchange(
         &planes,
         &tx,
         &mut rx,
-        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": "reserved:aft"})),
+        withdraw_on(
+            11,
+            803,
+            json!({"call_key": "br:1", "carrier": "reserved:aft"}),
+        ),
     )
     .await;
     assert_eq!(body(&answer), json!({"answer": "unknown_call"}));
@@ -5350,12 +5383,22 @@ async fn an_owner_naming_a_carrier_that_raised_no_such_call_learns_nothing() {
 #[tokio::test]
 async fn an_owner_the_daemon_does_not_authorize_may_not_withdraw() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
-    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, false))).await;
+    bind_route(
+        &planes,
+        11,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, false)),
+    )
+    .await;
     let refused = exchange(
         &planes,
         &tx,
         &mut rx,
-        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+        withdraw_on(
+            11,
+            803,
+            json!({"call_key": "br:1", "carrier": SCOPE_CARRIER}),
+        ),
     )
     .await;
     assert_eq!(error_code(&refused), "withdraw_not_permitted");
@@ -5364,12 +5407,22 @@ async fn an_owner_the_daemon_does_not_authorize_may_not_withdraw() {
 #[tokio::test]
 async fn an_owner_at_another_epoch_may_not_withdraw() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
-    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(5, true))).await;
+    bind_route(
+        &planes,
+        11,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(5, true)),
+    )
+    .await;
     let refused = exchange(
         &planes,
         &tx,
         &mut rx,
-        withdraw_on(11, 803, json!({"call_key": "br:1", "carrier": SCOPE_CARRIER})),
+        withdraw_on(
+            11,
+            803,
+            json!({"call_key": "br:1", "carrier": SCOPE_CARRIER}),
+        ),
     )
     .await;
     assert_eq!(error_code(&refused), "withdraw_not_permitted");
@@ -5378,11 +5431,26 @@ async fn an_owner_at_another_epoch_may_not_withdraw() {
 #[tokio::test]
 async fn a_named_scope_that_differs_from_the_stamp_is_refused() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
-    bind_route(&planes, 11, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        11,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     for (corr, scope) in [
-        (803, json!({"owner": SCOPE_OWNER, "ref": "s-other", "scope_epoch": 4})),
-        (804, json!({"owner": SCOPE_OWNER, "ref": "s-1", "scope_epoch": 3})),
-        (805, json!({"owner": "reserved:aft", "ref": "s-1", "scope_epoch": 4})),
+        (
+            803,
+            json!({"owner": SCOPE_OWNER, "ref": "s-other", "scope_epoch": 4}),
+        ),
+        (
+            804,
+            json!({"owner": SCOPE_OWNER, "ref": "s-1", "scope_epoch": 3}),
+        ),
+        (
+            805,
+            json!({"owner": "reserved:aft", "ref": "s-1", "scope_epoch": 4}),
+        ),
     ] {
         let refused = exchange(
             &planes,
@@ -5405,7 +5473,13 @@ async fn a_named_scope_that_differs_from_the_stamp_is_refused() {
 /// held and one browser grant question open for the conversation. Returns the
 /// open question's id.
 async fn scoped_browser(planes: &Planes) -> String {
-    bind_route(planes, 12, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     grant_browser(planes, "https://requested.example", Vec::new()).await;
     let question = planes
         .management
@@ -5477,7 +5551,12 @@ async fn answer_describe(
         .unwrap();
 }
 
-fn describe_answer(status: &str, scope_epoch: Option<u64>, synced: bool, configured: bool) -> Value {
+fn describe_answer(
+    status: &str,
+    scope_epoch: Option<u64>,
+    synced: bool,
+    configured: bool,
+) -> Value {
     let mut answer = json!({
         "op": "scope.describe",
         "status": status,
@@ -5520,11 +5599,7 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
         let question = close_scoped_route(&planes, &tx, &mut rx).await;
         answer_describe(&planes, &tx, &question, FrameType::Response, answer.clone()).await;
         wait_until_closed(&planes).await;
-        assert_eq!(
-            planes.management.browser_grant_count().await,
-            0,
-            "{answer}"
-        );
+        assert_eq!(planes.management.browser_grant_count().await, 0, "{answer}");
         assert!(
             !planes.management.browser_grant_question_open(&ask_id).await,
             "the scope's open question survived its end: {answer}"
@@ -5537,9 +5612,20 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
         );
         assert_eq!(planes.management.browser_grant_count().await, 0);
 
-        let status = exchange(&planes, &tx, &mut rx, request(830, "browser.status", json!({}))).await;
+        let status = exchange(
+            &planes,
+            &tx,
+            &mut rx,
+            request(830, "browser.status", json!({})),
+        )
+        .await;
         assert_eq!(status.header.ty, FrameType::Response, "{}", body(&status));
-        assert_eq!(body(&status)["terminal_outcome"], "scope_revoked", "{}", body(&status));
+        assert_eq!(
+            body(&status)["terminal_outcome"],
+            "scope_revoked",
+            "{}",
+            body(&status)
+        );
     }
 }
 
@@ -5556,8 +5642,14 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
     );
     for (ty, answer) in [
         restart_like,
-        (FrameType::Response, describe_answer("live", Some(4), true, true)),
-        (FrameType::Response, describe_answer("ended", Some(3), true, true)),
+        (
+            FrameType::Response,
+            describe_answer("live", Some(4), true, true),
+        ),
+        (
+            FrameType::Response,
+            describe_answer("ended", Some(3), true, true),
+        ),
         (
             FrameType::Error,
             json!({"code": "unknown_control_op", "message": "this daemon has no scope.describe"}),
@@ -5633,7 +5725,13 @@ async fn a_scope_with_a_route_still_bound_is_not_polled() {
         Duration::from_secs(5),
     ));
     scoped_browser(&planes).await;
-    bind_route(&planes, 14, reserved("prefrontal-core"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        14,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     let (tx, mut rx) = mpsc::channel(8);
     let question = close_scoped_route(&planes, &tx, &mut rx).await;
     answer_describe(
@@ -5645,6 +5743,9 @@ async fn a_scope_with_a_route_still_bound_is_not_polled() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(120)).await;
-    assert!(rx.try_recv().is_err(), "a scope with a bound route was polled");
+    assert!(
+        rx.try_recv().is_err(),
+        "a scope with a bound route was polled"
+    );
     assert!(planes.sessions.has_open_session("test-session"));
 }
