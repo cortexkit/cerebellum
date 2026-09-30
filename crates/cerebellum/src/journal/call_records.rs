@@ -407,8 +407,9 @@ pub struct Settlement {
     refusal_reason: Option<String>,
     effect_status: Option<String>,
     posts_returned: Option<u64>,
-    /// The open question a `consent_pending` reply named. Memory only: a
-    /// restart withdraws every open question anyway.
+    /// The id of the consent question a `consent_pending` reply left open, so
+    /// a withdrawal can close it. Kept in memory only: a module restart closes
+    /// every open consent question, so after one there is nothing to close.
     ask_id: Option<String>,
     reply: CachedReply,
 }
@@ -977,9 +978,9 @@ impl CallRecords {
         if let Some(entry) = inner.entries.get(&key) {
             return Lookup::Own(entry.snapshot());
         }
-        // The owner of the call's scope may also withdraw it. That needs the
-        // scope stamped on the route by the daemon, which does not exist yet;
-        // until it does, only the principal that raised the call may.
+        // The owner of the call's scope may also withdraw it, but a route does
+        // not yet carry its scope: the daemon does not stamp one on the bind.
+        // Until it does, only the principal that raised the call may withdraw.
         if inner
             .entries
             .keys()

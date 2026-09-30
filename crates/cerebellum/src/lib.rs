@@ -4107,8 +4107,9 @@ async fn handle_keyed_tool_request(
     };
     let mut call = frame;
     call.body = serde_json::to_vec(&Value::Object(object)).map_err(ModuleError::Json)?;
-    // Without an accepted bind there is no principal to key on. The call is
-    // refused below for the unbound route, before it can do anything.
+    // Without an accepted bind there is no principal to record the call under.
+    // Nothing is lost by not recording it: `handle_tool_request` refuses any
+    // call on an unbound route (`route_not_bound`) before it does anything.
     let Some(facts) = planes.routes.get(channel, epoch) else {
         return handle_tool_request(call, writer, planes).await;
     };
@@ -4289,10 +4290,11 @@ async fn handle_tool_withdraw(
             Some(Value::String(key)) if call_records::valid_call_key(key) => key.clone(),
             Some(_) => return invalid("arguments.call_key", "wrong_type"),
         };
-        // Shape only. A scope named here is the caller's word, and authority is
-        // never read from a request. When the daemon stamps a scope on the
-        // route, a scope named here that differs from the stamp is refused
-        // rather than resolved by picking one; that check goes here.
+        // Only the shape is checked. A scope named in the request is the
+        // caller's own claim, and authority is never read from a request. Once
+        // the daemon stamps the route's scope on the bind, a scope named here
+        // that differs from the stamp must be refused, not reconciled by
+        // preferring either one; that comparison belongs at this point.
         if let Some(scope) = arguments.get("scope") {
             let shaped = scope.as_object().is_some_and(|scope| {
                 scope.len() == 3

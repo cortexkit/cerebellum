@@ -62,7 +62,8 @@ OFFENDERS: List[Tuple[str, List[str]]] = [
         ["DurableLaunchJournal", ":", ":", "open_filesystem", "("],
     ),
     ("production_profile_lifecycle(", ["production_profile_lifecycle", "("]),
-    # The call records, which hold which calls the operator's module ran.
+    # Cerebellum's call records (one entry per tool call that carried a
+    # call_key), kept in the operator's backed-up journal directory.
     (
         "CallRecords::open_durable(",
         ["CallRecords", ":", ":", "open_durable", "("],

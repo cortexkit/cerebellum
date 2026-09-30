@@ -4644,8 +4644,9 @@ fn body(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
-/// Bind a second route, 10/3, for the same conversation under another
-/// principal, the orchestrator that carries session calls.
+/// Bind a second route, 10/3, for the same conversation under a different
+/// principal (`reserved:prefrontal-core`), so calls on the two routes carry
+/// the same keys from two principals.
 async fn bind_second_principal(planes: &Planes) {
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 10,
@@ -5009,7 +5010,8 @@ async fn typed_text_never_reaches_the_call_records() {
     .await;
     answer_browser(&planes, &tx, &question, "allow").await;
     assert_eq!(body(&consent_frame(&mut rx).await)["outcome"], "ok");
-    // A typing call carrying it, refused or not on this host.
+    // A computer typing call whose text is the planted string. Whether this
+    // host serves or refuses it, its record must not hold the text.
     exchange(
         &planes,
         &tx,
