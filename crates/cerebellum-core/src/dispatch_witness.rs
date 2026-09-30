@@ -53,9 +53,10 @@ impl DispatchWitness {
         Self(Kind::Armed(Arc::new(AtomicBool::new(false))))
     }
 
-    /// A witness nobody reads: for work that no call record is waiting on
-    /// (a call without a key, a recovery pass, a test that drives a plane
-    /// directly).
+    /// A witness nobody reads: for a commitment made outside any tool
+    /// request (a recovery pass, a test that drives a plane directly). Every
+    /// tool request, keyed or not, is armed instead, so in a running module a
+    /// commit under this witness means a site lost its request's witness.
     pub fn detached() -> Self {
         Self(Kind::Detached)
     }
