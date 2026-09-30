@@ -759,8 +759,9 @@ where
         }
         committed.reservations.insert(sequence, dispatched_record);
         self.commit_state(committed)?;
-        // The single commit point every journal shares, so no plane's commit
-        // can go unwitnessed.
+        // Every journal's dispatch commitment passes here, so a commit made for
+        // a request marks that request's witness, and one made under a
+        // detached witness is counted as unattributed.
         record.identity.witness.mark_committed();
         Ok(DispatchCommitmentToken {
             action_obligation_id: sequence,

@@ -4114,7 +4114,7 @@ async fn handle_keyed_tool_request(
         return handle_tool_request(call, writer, planes, &CallObservation::new()).await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
-    // The record is synced to disk before the call may proceed. The write and
+    // The call's record is synced to disk before the call may proceed. The write and
     // its fsync run on the blocking pool, not on this runtime thread, and the
     // call waits for them.
     let begun = {
@@ -4246,7 +4246,8 @@ async fn handle_keyed_tool_request(
     result
 }
 
-/// What a keyed call's handler watches while the call runs.
+/// What the tool handler watches while one request runs, so a keyed call's
+/// record can say whether the action was dispatched.
 ///
 /// Armed for every tool request, keyed or not, so that in a running module a
 /// dispatch commitment made under a detached witness always means a commit
@@ -4330,7 +4331,8 @@ async fn forward_recording_reply(
                     != pending.unattributed_at_start,
                 refused_before_dispatch: refused_before_dispatch(&out),
             };
-            // Written before the reply is forwarded, on the blocking pool.
+            // The call's record is written before its reply is forwarded, on
+            // the blocking pool.
             let calls = Arc::clone(&planes.calls);
             let settlement = journal::call_records::Settlement::from_reply(&out, evidence);
             let _ = tokio::task::spawn_blocking(move || {
