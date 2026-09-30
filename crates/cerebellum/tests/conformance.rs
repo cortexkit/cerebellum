@@ -626,7 +626,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
             "opencode",
             "conversation-subagent",
         ),
-        principal: Some(Principal::Direct),
+        principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(json!({
             "agentProjectId": "pj-accepted",
@@ -699,7 +699,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
             module_id: MODULE_ID.to_string(),
         },
         identity: BindIdentity::new("/tmp/project", "opencode", "conversation-scoped"),
-        principal: Some(Principal::Direct),
+        principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(json!({
             "agentProjectId": "pj-scoped",

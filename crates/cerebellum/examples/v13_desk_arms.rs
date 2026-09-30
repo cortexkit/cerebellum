@@ -451,7 +451,7 @@ mod desk {
     use std::time::{Duration, Instant};
     use subc_protocol::session::ModuleControlRequest;
     use subc_protocol::{
-        BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
+        BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
     };
     use tokio::sync::mpsc;
 
@@ -871,7 +871,7 @@ mod desk {
                     epoch: 1,
                     target,
                     identity: BindIdentity::new("/tmp/ck-v13", "probe", self.conversation.clone()),
-                    principal: Some(Principal::Direct),
+                    principal: cerebellum::session_caller_principal_for_test(),
                     consumer_capabilities: Some(vec!["elicitation".into()]),
                     admission_facts: Some(
                         json!({"agentProjectId":self.project,"sessionKind":"primary","effectiveCapabilityScope":["*"]}),

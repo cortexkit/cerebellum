@@ -723,6 +723,15 @@ async fn bind_management_route(
     writer: &mpsc::Sender<Frame>,
     rx: &mut mpsc::Receiver<Frame>,
 ) {
+    bind_management_route_as(planes, writer, rx, Some(Principal::Direct)).await;
+}
+
+async fn bind_management_route_as(
+    planes: &Planes,
+    writer: &mpsc::Sender<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
+    principal: Option<Principal>,
+) {
     let request = ModuleControlRequest::RouteBind {
         route_channel: 4,
         epoch: 1,
@@ -734,7 +743,7 @@ async fn bind_management_route(
             "opencode".to_string(),
             "profile-root-rebind-conversation".to_string(),
         ),
-        principal: Some(Principal::Direct),
+        principal,
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({
             "agentProjectId": "profile-root-rebind-project",
@@ -923,4 +932,51 @@ async fn management_wire_rebind_params_are_closed() {
         0
     );
     assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
+}
+
+/// Rebind the recreated root through the wire as `principal` and return the
+/// conversation the durable provenance record attributes the rebind to.
+async fn rebind_attributed_conversation(label: &str, principal: Option<Principal>) -> Value {
+    let root = TestRoot::new(label);
+    mint_durable_record(root.path(), &format!("project-{label}"));
+    recreate_root(root.path());
+    let planes = management_planes(root.path());
+    let (writer, mut rx) = mpsc::channel(8);
+    bind_management_route_as(&planes, &writer, &mut rx, principal).await;
+    let (reply, question_frame, _) = open_rebind_over_wire(&planes, &writer, &mut rx).await;
+    assert_eq!(reply["outcome"], "consent_pending", "{label}: {reply}");
+    answer_rebind(&planes, &writer, &question_frame, "allow").await;
+    let record_bytes = fs::read_to_string(root.path().join(PROFILE_ROOT_REBINDS_FILE))
+        .expect("durable rebind record");
+    let durable: Value =
+        serde_json::from_str(record_bytes.lines().next().expect("one provenance line"))
+            .expect("rebind record JSON");
+    durable["elicited"]["conversation_key"].clone()
+}
+
+/// A `direct` desk route may rebind the profile root, and does so outside any
+/// conversation: the route names one, and the rebind is attributed to none.
+/// Prefrontal's core module, which acts in the conversation its route names,
+/// keeps the attribution.
+///
+/// The attribution is the one place a rebind reads the route's conversation,
+/// so it shows whether the operator's call saw that conversation at all.
+#[tokio::test]
+async fn an_operator_rebind_runs_outside_the_conversation_its_route_names() {
+    assert_eq!(
+        rebind_attributed_conversation("operator-direct", Some(Principal::Direct)).await,
+        "",
+        "an operator's rebind is attributed to no conversation"
+    );
+    assert_eq!(
+        rebind_attributed_conversation(
+            "session-caller",
+            Some(Principal::Reserved {
+                module_id: "prefrontal-core".to_string(),
+            }),
+        )
+        .await,
+        "profile-root-rebind-conversation",
+        "the session caller's rebind keeps its conversation"
+    );
 }

@@ -99,6 +99,57 @@ fn is_first_party_module_id(module_id: &str) -> bool {
     FIRST_PARTY_MODULE_IDS.contains(&module_id)
 }
 
+/// The one module admitted to call cerebellum in a conversation's name.
+///
+/// Cerebellum's standing permissions (site grants, app grants, the takeover
+/// grant) belong to the conversation a person gave them in. Every session's
+/// browser and computer calls reach cerebellum through Prefrontal's forwarding
+/// operations, so Prefrontal's core module is the only caller that may act
+/// under a conversation. Any other first-party module (AFT, Broca, the routing
+/// module, a `direct` host plugin) could otherwise open a route under a
+/// conversation and act on the permissions given there without anyone being
+/// asked.
+///
+/// A single exact id rather than a list: the older `alfonso-core` and bare
+/// `prefrontal` spellings stay first-party for the operator's own operations,
+/// but they do not carry sessions, so they are not admitted here.
+pub const SESSION_CALLER_MODULE_ID: &str = "prefrontal-core";
+
+/// The refusal code for a call that needs a conversation, made by a caller
+/// not admitted to act in one.
+pub const SESSION_CALLER_NOT_ADMITTED: &str = "session_caller_not_admitted";
+
+/// What a caller refused with [`SESSION_CALLER_NOT_ADMITTED`] does next.
+pub const SESSION_CALLER_NOT_ADMITTED_REMEDY: &str =
+    "calls made in a conversation's name reach cerebellum only through Prefrontal's forwarding \
+     operations (reserved:prefrontal-core); route this call through them. Only the operator's \
+     own operations (browser.rebind_profile_root, browser.clear_launch_recovery, \
+     computer.list_app_grants, computer.revoke_app_grant) are served to other callers, and \
+     those run outside any conversation";
+
+/// Whether a bind principal may make calls in a conversation's name.
+///
+/// Exact equality on the reserved module id: no prefix, suffix, case or
+/// whitespace tolerance, since the daemon issues other reserved ids that
+/// share a prefix with this one and a looser match would admit them.
+pub fn admits_session_calls(principal: &Option<Principal>) -> bool {
+    matches!(
+        principal,
+        Some(Principal::Reserved { module_id }) if module_id == SESSION_CALLER_MODULE_ID
+    )
+}
+
+/// A principal as the refusal messages name it: `reserved:<id>`, `direct`,
+/// `unverified`, or `absent` when the daemon stamped none.
+pub fn principal_label(principal: &Option<Principal>) -> String {
+    match principal {
+        Some(Principal::Reserved { module_id }) => format!("reserved:{module_id}"),
+        Some(Principal::Direct) => "direct".to_string(),
+        Some(Principal::Unverified) => "unverified".to_string(),
+        None => "absent".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +297,70 @@ mod tests {
                 "{module_id:?} resembles a trusted id but is not one"
             );
         }
+    }
+
+    fn reserved(module_id: &str) -> Option<Principal> {
+        Some(Principal::Reserved {
+            module_id: module_id.to_string(),
+        })
+    }
+
+    #[test]
+    fn only_prefrontal_core_makes_session_calls() {
+        assert!(admits_session_calls(&reserved("prefrontal-core")));
+    }
+
+    /// Every other first-party principal is still first-party, and still not
+    /// admitted to act in a conversation. Named by literal so that widening
+    /// the rule back to "any first-party principal" fails here.
+    #[test]
+    fn other_first_party_principals_make_no_session_calls() {
+        let others = [
+            Some(Principal::Direct),
+            reserved("aft"),
+            reserved("broca"),
+            reserved("prefrontal-routing"),
+            reserved("alfonso-routing"),
+            reserved("alfonso-core"),
+            reserved("prefrontal"),
+        ];
+        for principal in others {
+            assert!(trust_for_principal(&principal).is_first_party());
+            assert!(
+                !admits_session_calls(&principal),
+                "{} is admitted to act in a conversation",
+                principal_label(&principal)
+            );
+        }
+    }
+
+    /// Ids that differ from the admitted one by a character, a case, a
+    /// trailing space or an affix are refused: the match is exact.
+    #[test]
+    fn ids_resembling_the_session_caller_make_no_session_calls() {
+        for module_id in [
+            "prefrontal-cor",
+            "prefrontal-core-x",
+            "Prefrontal-Core",
+            "PREFRONTAL-CORE",
+            "prefrontal-core ",
+            " prefrontal-core",
+            "prefrontal-core\0",
+            "xprefrontal-core",
+            "prefrontal-host:prefrontal-core",
+            "",
+        ] {
+            assert!(
+                !admits_session_calls(&reserved(module_id)),
+                "{module_id:?} resembles the session caller but is not it"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_and_absent_principals_make_no_session_calls() {
+        assert!(!admits_session_calls(&reserved("subc-mcp")));
+        assert!(!admits_session_calls(&Some(Principal::Unverified)));
+        assert!(!admits_session_calls(&None));
     }
 }

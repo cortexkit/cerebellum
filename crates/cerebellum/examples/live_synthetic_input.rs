@@ -61,7 +61,7 @@ mod macos_probe {
     use serde_json::{json, Value};
     use subc_protocol::session::ModuleControlRequest;
     use subc_protocol::{
-        BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget, PROTOCOL_VERSION,
+        BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
     };
     use tokio::sync::mpsc;
 
@@ -695,7 +695,7 @@ mod macos_probe {
             epoch,
             target,
             identity: probe_identity(),
-            principal: Some(Principal::Direct),
+            principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: declares_elicitation.then(|| vec!["elicitation".to_string()]),
             admission_facts: Some(json!({
                 "agentProjectId": GRANTEE,

@@ -1205,7 +1205,7 @@ mod macos_probe {
             epoch,
             target,
             identity: probe_identity(),
-            principal: Some(Principal::Direct),
+            principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: declares_elicitation.then(|| vec!["elicitation".to_string()]),
             admission_facts: Some(json!({
                 "agentProjectId": GRANTEE,
