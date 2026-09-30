@@ -2626,6 +2626,16 @@ mod executable_identity_launch_tests {
                 OsString::from("LD_PRELOAD"),
                 OsString::from("/tmp/inject.so"),
             ),
+            // The daemon starts this module with its launch nonce in the
+            // environment; the browser must not receive it.
+            (
+                OsString::from("SUBC_LAUNCH_NONCE"),
+                OsString::from("0123456789abcdef"),
+            ),
+            (
+                OsString::from("SUBC_LAUNCH_NONCE_FD"),
+                OsString::from("3:12345"),
+            ),
         ];
 
         assert_eq!(

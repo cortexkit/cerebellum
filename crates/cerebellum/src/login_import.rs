@@ -676,6 +676,7 @@ fn sqlite_write(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
 
 fn sqlite(program: &Path, mode: Option<&OsStr>, store: &OsStr, sql: &str) -> io::Result<String> {
     let mut command = Command::new(program);
+    crate::launch_nonce::without_launch_nonce(&mut command);
     command.arg("-batch");
     if let Some(mode) = mode {
         command.arg(mode);

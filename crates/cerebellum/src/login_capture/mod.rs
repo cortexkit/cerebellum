@@ -583,7 +583,8 @@ pub fn run_bounded(
 ) -> Result<String, ToolError> {
     const POLL: Duration = Duration::from_millis(10);
     let started = Instant::now();
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    let mut child = crate::launch_nonce::without_launch_nonce(&mut command)
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

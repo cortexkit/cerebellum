@@ -237,9 +237,9 @@ fn build_provenance() -> Option<ManifestProvenance> {
     let rev = env!("CEREBELLUM_BUILD_REV");
     let tree = env!("CEREBELLUM_BUILD_TREE");
     let build_git_sha = attestable_commit(rev, tree);
-    // Where the launch nonce was read from is left undeclared until this
-    // module reads it through the daemon's nonce accessor, which is what
-    // records the source.
+    // Where the launch nonce came from (the daemon's pipe or the environment
+    // copy) is a fact about this running process rather than the build, but
+    // provenance is where the daemon's census reads it.
     Some(
         ManifestProvenance::new()
             .with_build_git_sha_absence_reason(
@@ -248,7 +248,8 @@ fn build_provenance() -> Option<ManifestProvenance> {
                     .then(|| build_git_sha_absence_reason(rev, tree)),
             )
             .with_build_git_sha(build_git_sha)
-            .with_wire_crate_version(Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string())),
+            .with_wire_crate_version(Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string()))
+            .with_launch_nonce_source(crate::launch_nonce::provenance_source()),
     )
 }
 

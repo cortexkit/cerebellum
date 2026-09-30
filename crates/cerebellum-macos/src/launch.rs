@@ -1573,6 +1573,48 @@ mod tests {
         child.terminate_and_reap().expect("reap descriptor fixture");
     }
 
+    /// The subc daemon hands this module its launch nonce on a pipe that is
+    /// inheritable by design (it has to survive the daemon's exec). The module
+    /// reads and closes it at startup, but the browser launch must not depend
+    /// on that: a pipe left open without close-on-exec, on whatever number,
+    /// must reach neither the browser nor its guardian. Checked by the pipe
+    /// itself: once this process drops its read end, a write fails with
+    /// `EPIPE` only if no other process holds a read end.
+    #[test]
+    fn the_target_does_not_inherit_an_inheritable_pipe() {
+        let _serial = serialize_launch_fixtures();
+        let (stand_in, stand_in_write) = create_pipe().expect("stand-in pipe");
+        // `create_pipe` opens close-on-exec; clear it, as the daemon does for
+        // the nonce pipe it hands over.
+        assert_eq!(unsafe { fcntl(stand_in.as_raw_fd(), F_SETFD, 0) }, 0);
+        let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
+        let child = spawn_barred(
+            Path::new("/bin/sleep"),
+            &[OsString::from("30")],
+            &[],
+            command_read.as_raw_fd(),
+            response_write.as_raw_fd(),
+        )
+        .expect("spawn suspended sleep");
+        drop(stand_in);
+        // The guardian is forked with every descriptor and closes them itself,
+        // possibly after this resumes, so allow that finite step to finish.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let written = loop {
+            let written = write_byte(stand_in_write.as_raw_fd(), b'x');
+            if written.is_err() || Instant::now() >= deadline {
+                break written;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            written,
+            Err(io::ErrorKind::BrokenPipe),
+            "a spawned process still holds the stand-in pipe's read end"
+        );
+        child.terminate_and_reap().expect("reap descriptor fixture");
+    }
+
     #[test]
     fn security_framework_validates_the_running_guest_before_reading_identity() {
         let source = include_str!("launch.rs");

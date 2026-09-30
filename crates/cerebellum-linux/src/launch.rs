@@ -1386,6 +1386,41 @@ mod tests {
         assert!(!signalled, "a replaced pid belongs to another process");
     }
 
+    /// The subc daemon hands this module its launch nonce on a pipe that is
+    /// inheritable by design (it has to survive the daemon's exec). The module
+    /// reads and closes it at startup, but the browser launch must not depend
+    /// on that: a pipe left open without close-on-exec, on whatever number,
+    /// must not reach the browser. Checked from the kernel's side, by the
+    /// pipe's identity in the target's descriptor table, so a number reused
+    /// for an intended pipe is not mistaken for inheritance.
+    #[test]
+    fn the_target_does_not_inherit_an_inheritable_pipe() {
+        let (stand_in, _stand_in_write) = pipe();
+        // `pipe()` above opens close-on-exec; clear it, as the daemon does for
+        // the nonce pipe it hands over.
+        assert_eq!(
+            unsafe { libc::fcntl(stand_in.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let identity = std::fs::read_link(format!("/proc/self/fd/{}", stand_in.as_raw_fd()))
+            .expect("read the stand-in pipe's identity");
+        let child = spawn_sleep();
+        let pid = child.generation().pid;
+        let held: Vec<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .expect("list the target's descriptors")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .collect();
+        // The standard streams and both CDP pipes are there, so an empty
+        // listing cannot pass for an absent pipe.
+        assert_eq!(held.len(), 5, "{held:?}");
+        assert!(
+            !held.contains(&identity),
+            "the target inherited the stand-in pipe {identity:?}: {held:?}"
+        );
+        child.terminate_and_reap().expect("reap the target");
+    }
+
     #[test]
     fn a_spawned_generation_reads_back_as_its_own_exact_match() {
         let child = spawn_sleep();
