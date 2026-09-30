@@ -28,6 +28,7 @@ cerebellum-computer = { path = "../cerebellum-computer" }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }
+subc-os = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

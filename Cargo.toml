@@ -30,6 +30,11 @@ members = [
 # reason.
 subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
+# The launch-nonce accessor. The module reads the secret the daemon launched it
+# with through this one function (a pipe on descriptor 3, or the environment
+# copy while modules move over), so it must be the same code the daemon's
+# handoff was written against: a sibling path, pinned like the wire crates.
+subc-os = { path = "../subconscious/crates/subc-os" }
 # Test-only: the in-process daemon the live tests boot, and the client control
 # types they speak to it. Taken from crates.io at a fixed version so the lock
 # moves on them only when this repo chooses, not whenever the sibling does.
@@ -65,3 +70,6 @@ signal-hook = { version = "0.4", default-features = false }
 subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
+# One copy of subc-os as well: the published daemon depends on it by version,
+# and a second copy would carry a second process-wide nonce cache.
+subc-os = { path = "../subconscious/crates/subc-os" }
