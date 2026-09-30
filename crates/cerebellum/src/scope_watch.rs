@@ -277,11 +277,41 @@ struct Watched {
     closed_again: std::sync::Arc<tokio::sync::Notify>,
 }
 
+/// The highest epoch cerebellum has seen stamped for one `(owner, ref)`, and
+/// the conversations routes stamped with it carried.
+#[derive(Debug, Default)]
+struct EpochSeen {
+    epoch: u64,
+    conversations: BTreeSet<String>,
+}
+
+/// What a stamped bind says about its session's epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindEpoch {
+    /// The highest epoch seen for its `(owner, ref)`, or the first.
+    Current,
+    /// Higher than any seen before: every lower epoch of this `(owner, ref)`
+    /// has ended, the same as a `live` answer at a higher epoch says. The
+    /// conversations those epochs' routes carried are returned so what they
+    /// were allowed can be ended before the new route is served.
+    Advanced {
+        ended_conversations: BTreeSet<String>,
+    },
+    /// Lower than an epoch already seen: an ended session. Refused.
+    Stale { current: u64 },
+}
+
 /// The scopes whose routes closed and whose end has not been settled, and how
 /// to ask the daemon about them.
 pub struct ScopeRevocation {
     pub control: ControlRequests,
     watched: Mutex<HashMap<ScopeKey, Watched>>,
+    /// Keyed by `(owner label, ref)`. Grants and questions are keyed by
+    /// conversation, and an owner may reuse a ref for a new session whose
+    /// route binds before anything noticed the old one ending. This is what
+    /// lets the bind itself notice, so a new session never serves under what a
+    /// person allowed the old one.
+    epochs: Mutex<HashMap<(String, String), EpochSeen>>,
     /// How long an unresolved scope waits before it is asked about again.
     /// [`SCOPE_RECHECK_INTERVAL`] in production; tests shorten it.
     pub recheck_interval: Duration,
@@ -295,6 +325,7 @@ impl Default for ScopeRevocation {
         Self {
             control: ControlRequests::default(),
             watched: Mutex::new(HashMap::new()),
+            epochs: Mutex::new(HashMap::new()),
             recheck_interval: SCOPE_RECHECK_INTERVAL,
             describe_timeout: SCOPE_DESCRIBE_TIMEOUT,
         }
@@ -314,6 +345,66 @@ impl ScopeRevocation {
 
     fn watched(&self) -> std::sync::MutexGuard<'_, HashMap<ScopeKey, Watched>> {
         self.watched.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Note a bind stamped with `stamp` carrying `conversation_key`, and say
+    /// whether its epoch is current, newer than any seen, or already ended.
+    ///
+    /// On an advance, any watcher of a lower epoch of the same `(owner, ref)`
+    /// stops holding its conversations: they are returned here to be ended
+    /// now, rather than after that watcher's next answer.
+    pub fn note_bind(&self, stamp: &ScopeStamp, conversation_key: &str) -> BindEpoch {
+        let owner = crate::journal::call_records::principal_label(Some(&stamp.owner));
+        let mut epochs = self.epochs.lock().unwrap_or_else(PoisonError::into_inner);
+        let seen = epochs
+            .entry((owner, stamp.scope_ref.clone()))
+            .or_insert_with(|| EpochSeen {
+                epoch: stamp.scope_epoch,
+                conversations: BTreeSet::new(),
+            });
+        if stamp.scope_epoch < seen.epoch {
+            return BindEpoch::Stale {
+                current: seen.epoch,
+            };
+        }
+        let verdict = if stamp.scope_epoch > seen.epoch {
+            let mut ended_conversations = std::mem::take(&mut seen.conversations);
+            seen.epoch = stamp.scope_epoch;
+            let mut watched = self.watched();
+            let superseded: Vec<ScopeKey> = watched
+                .keys()
+                .filter(|key| {
+                    key.owner == stamp.owner
+                        && key.scope_ref == stamp.scope_ref
+                        && key.scope_epoch < stamp.scope_epoch
+                })
+                .cloned()
+                .collect();
+            for key in superseded {
+                if let Some(old) = watched.remove(&key) {
+                    ended_conversations.extend(old.conversations);
+                }
+            }
+            BindEpoch::Advanced {
+                ended_conversations,
+            }
+        } else {
+            BindEpoch::Current
+        };
+        seen.conversations.insert(conversation_key.to_string());
+        verdict
+    }
+
+    /// Whether a newer epoch of `stamp`'s `(owner, ref)` has been seen, which
+    /// means `stamp`'s session has ended. A route still bound under it (its
+    /// close not yet delivered) must serve nothing more.
+    pub fn is_superseded(&self, stamp: &ScopeStamp) -> bool {
+        let owner = crate::journal::call_records::principal_label(Some(&stamp.owner));
+        self.epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(owner, stamp.scope_ref.clone()))
+            .is_some_and(|seen| seen.epoch > stamp.scope_epoch)
     }
 
     /// Note that a route under `key`, carrying `conversation_key`, closed.

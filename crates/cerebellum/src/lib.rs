@@ -1262,6 +1262,79 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
     }
 }
 
+/// Check a stamped `route.bind` against the highest epoch seen for its
+/// session's `(owner, ref)`, before the route is bound and so before anything
+/// is served on it. Returns whether the bind may go on to ordinary admission.
+///
+/// - A higher epoch than any seen means every lower one ended, as a `live`
+///   answer at a higher epoch would say. The ended epochs' conversations lose
+///   their browser grants, their "this conversation" app and takeover grants
+///   and their open questions here, before this returns, so the new session
+///   can never be served under what a person allowed the old one. Their
+///   browsers are marked `scope_revoked` here too, so no call is admitted on
+///   them, and the bounded teardown finishes on the blocking pool without
+///   holding up the bind's reply.
+/// - A lower epoch than one seen is an ended session: refused `scope_ended`,
+///   the daemon's own code for an epoch that is not the live one, and never
+///   bound.
+///
+/// Anything that is not a stamped bind passes untouched.
+async fn scope_epoch_admits_bind(
+    frame: &Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<bool, ModuleError> {
+    let Ok(ModuleControlRequest::RouteBind {
+        identity,
+        scope: Some(stamp),
+        ..
+    }) = serde_json::from_slice::<ModuleControlRequest>(&frame.body)
+    else {
+        return Ok(true);
+    };
+    match planes.scopes.note_bind(&stamp, &identity.session) {
+        scope_watch::BindEpoch::Current => Ok(true),
+        scope_watch::BindEpoch::Advanced {
+            ended_conversations,
+        } => {
+            for conversation_key in &ended_conversations {
+                planes
+                    .management
+                    .end_browser_conversation(conversation_key)
+                    .await;
+                planes.management.end_conversation(conversation_key);
+                if let Some(config) = planes.browser_config.as_ref() {
+                    if let Some(finish) = planes.sessions.begin_teardown_route(
+                        conversation_key,
+                        browser_session::BrowserSessionTerminalOutcome::ScopeRevoked,
+                        config,
+                    ) {
+                        tokio::task::spawn_blocking(finish);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        scope_watch::BindEpoch::Stale { current } => {
+            let refusal = build_error_frame(
+                frame.header.ver,
+                0,
+                0,
+                frame.header.corr,
+                "scope_ended",
+                &format!(
+                    "scope epoch {} has ended: epoch {current} of the same session scope has \
+                     already been bound here",
+                    stamp.scope_epoch
+                ),
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            send(writer, refusal).await?;
+            Ok(false)
+        }
+    }
+}
+
 /// End what a session scope that definitively ended was allowed, for each
 /// conversation its routes carried: the browser grant questions and the
 /// computer consent questions it has open (so a late answer grants nothing),
@@ -2817,7 +2890,9 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
+            if scope_epoch_admits_bind(&frame, writer, planes).await? {
+                handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
+            }
             Ok(true)
         }
         FrameType::Request => {
@@ -2900,6 +2975,26 @@ async fn handle_route_request(
         )
         .await;
     };
+    // A route of a session that a newer epoch has replaced, whose close has
+    // not reached this module yet. Serving it could mint a grant under the
+    // conversation the new session now holds.
+    if facts
+        .scope
+        .as_ref()
+        .is_some_and(|stamp| planes.scopes.is_superseded(stamp))
+    {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "scope_ended",
+            "this route's session scope has ended: a newer session under the same scope has \
+             been bound",
+        )
+        .await;
+    }
 
     match facts.surface {
         RouteSurface::Tools => handle_keyed_tool_request(frame, writer, planes).await,

@@ -5093,7 +5093,7 @@ async fn bind_route(
         principal: Some(principal),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
+            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status", "browser.close"]}),
         ),
         scope,
     };
@@ -5628,9 +5628,249 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
             "{}",
             body(&status)
         );
+        // `browser.close` of the revoked session answers the outcome through
+        // the same Withhold boundary. Asked on an unscoped route of the same
+        // conversation that may close.
+        bind_route(&planes, 17, reserved("prefrontal-core"), None).await;
+        let session_id = body(&status)["browser_session_id"].clone();
+        assert!(session_id.is_string(), "{}", body(&status));
+        let closed = exchange(
+            &planes,
+            &tx,
+            &mut rx,
+            request_on(
+                17,
+                831,
+                "browser.close",
+                json!({"browser_session_id": session_id}),
+            ),
+        )
+        .await;
+        assert_eq!(closed.header.ty, FrameType::Response, "{}", body(&closed));
+        assert_eq!(
+            body(&closed)["outcome"],
+            "scope_revoked",
+            "{}",
+            body(&closed)
+        );
     }
 }
 
+/// A tool request on `channel`, epoch 3.
+fn request_on(channel: u16, corr: u64, name: &str, arguments: Value) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        3,
+        corr,
+        serde_json::to_vec(&json!({"name": name, "arguments": arguments})).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Bind a route stamped `stamp` and return the daemon-bound reply frame,
+/// which a refused bind answers with an error.
+async fn bind_reply(
+    planes: &Planes,
+    channel: u16,
+    stamp: subc_protocol::scope::ScopeStamp,
+) -> Frame {
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: channel,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        principal: Some(reserved("prefrontal-core")),
+        consumer_capabilities: Some(vec!["elicitation".into()]),
+        admission_facts: Some(
+            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status", "browser.close"]}),
+        ),
+        scope: Some(stamp),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        950 + u64::from(channel),
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    rx.recv().await.unwrap()
+}
+
+/// A grant a person gave the epoch-1 session is gone the moment an epoch-2
+/// route of the same scope binds, with no watcher running (route 12 never
+/// closed), so nothing on the new route is served under it.
+#[tokio::test]
+async fn a_grant_made_under_epoch_1_is_not_usable_from_an_epoch_2_route() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    bind_route(
+        &planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(1, true)),
+    )
+    .await;
+    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    assert_eq!(planes.management.browser_grant_count().await, 1);
+
+    let bound = bind_reply(&planes, 15, scope_stamp(2, true)).await;
+    assert_eq!(bound.header.ty, FrameType::Response, "{}", body(&bound));
+    // Gone before the bind was answered, so before any call on route 15.
+    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert!(!planes
+        .scopes
+        .is_watching(&cerebellum::scope_watch::ScopeKey::from_stamp(
+            &scope_stamp(1, true)
+        )));
+
+    let (tx, mut rx) = mpsc::channel(8);
+    let navigated = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        request_on(
+            15,
+            840,
+            "browser.navigate",
+            json!({"url":"https://requested.example/path", "intent":"read", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+        ),
+    )
+    .await;
+    assert!(
+        navigated.header.ty == FrameType::Request || body(&navigated)["outcome"] != "ok",
+        "the epoch-2 route navigated under the epoch-1 grant: {}",
+        body(&navigated)
+    );
+    assert!(
+        !launcher.effects.lock().unwrap().contains(&"navigate"),
+        "navigated under the old session's grant"
+    );
+}
+
+/// A question the epoch-1 session left open grants nothing when answered
+/// after the epoch-2 bind.
+#[tokio::test]
+async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_route(
+        &planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(1, true)),
+    )
+    .await;
+    let question = planes
+        .management
+        .browser_grant_question_for_test(
+            "test-session",
+            vec!["https://asked.example".to_string()],
+            Vec::new(),
+        )
+        .await;
+    let bound = bind_reply(&planes, 15, scope_stamp(2, true)).await;
+    assert_eq!(bound.header.ty, FrameType::Response);
+    assert!(
+        !planes
+            .management
+            .browser_grant_question_open(&question.ask_id)
+            .await
+    );
+    assert!(
+        !planes
+            .management
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+            .await
+    );
+    assert_eq!(planes.management.browser_grant_count().await, 0);
+}
+
+/// An epoch-2 bind while the epoch-1 session's browser is open closes it as
+/// `scope_revoked`.
+#[tokio::test]
+async fn an_epoch_2_bind_closes_the_epoch_1_browser_as_scope_revoked() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_route(
+        &planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(1, true)),
+    )
+    .await;
+    assert!(planes.sessions.has_open_session("test-session"));
+    let bound = bind_reply(&planes, 15, scope_stamp(2, true)).await;
+    assert_eq!(bound.header.ty, FrameType::Response);
+    wait_until_closed(&planes).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let status = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        request_on(15, 841, "browser.status", json!({})),
+    )
+    .await;
+    assert_eq!(
+        body(&status)["terminal_outcome"],
+        "scope_revoked",
+        "{}",
+        body(&status)
+    );
+}
+
+/// A bind at a lower epoch than one already bound is an ended session: refused
+/// `scope_ended` and never bound. A route of the replaced epoch that is still
+/// bound serves nothing more either.
+#[tokio::test]
+async fn a_stale_lower_epoch_bind_is_refused() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_route(
+        &planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(1, true)),
+    )
+    .await;
+    let bound = bind_reply(&planes, 15, scope_stamp(2, true)).await;
+    assert_eq!(bound.header.ty, FrameType::Response);
+    let stale = bind_reply(&planes, 16, scope_stamp(1, true)).await;
+    assert_eq!(error_code(&stale), "scope_ended");
+    let (tx, mut rx) = mpsc::channel(8);
+    let unbound = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        request_on(16, 842, "browser.status", json!({})),
+    )
+    .await;
+    assert_eq!(error_code(&unbound), "route_not_bound");
+    let replaced = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        request_on(12, 843, "browser.status", json!({})),
+    )
+    .await;
+    assert_eq!(error_code(&replaced), "scope_ended");
+    // The live epoch is served.
+    let current = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        request_on(15, 844, "browser.status", json!({})),
+    )
+    .await;
+    assert_eq!(current.header.ty, FrameType::Response, "{}", body(&current));
+}
 /// Every answer that does not definitively end the scope leaves the browser,
 /// the grants and the open question in place, and the scope is asked about
 /// again while its browser stays open. An owner that has not synced since a

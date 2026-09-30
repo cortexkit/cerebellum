@@ -2281,6 +2281,36 @@ impl BrowserSessions {
             .is_some_and(|cell| !recovered(cell.meta()).lifecycle.is_settled())
     }
 
+    /// [`Self::teardown_route`] in two halves. The first runs here and takes
+    /// only the brief registry and meta locks: it marks the route's session
+    /// terminal with `reason`, so no further call is admitted on it, and pins
+    /// the teardown to that session. The returned second half is the ordinary
+    /// bounded teardown (the configured grace, then the existing kill rules)
+    /// and blocks, so a caller runs it on the blocking pool. Pinned to the
+    /// session marked here, it can never close a browser launched on the route
+    /// afterwards. `None` when the route has no unfinished session.
+    pub fn begin_teardown_route(
+        &self,
+        route_key: &str,
+        reason: BrowserSessionTerminalOutcome,
+        config: &BrowserConfig,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        let cell = self.active_cell_recovering(route_key)?;
+        {
+            let mut meta = recovered(cell.meta());
+            if meta.lifecycle.is_settled() {
+                return None;
+            }
+            meta.terminal.get_or_insert(reason);
+        }
+        cell.notify();
+        let sessions = self.clone();
+        let grace = configured_grace(config);
+        Some(Box::new(move || {
+            sessions.finish_teardown(&cell, reason, grace)
+        }))
+    }
+
     pub fn teardown_route(
         &self,
         route_key: &str,
