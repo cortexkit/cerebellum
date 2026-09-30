@@ -784,6 +784,40 @@ impl ManagementPlane {
         self.browser_grants.lock().await.current_grants().count()
     }
 
+    /// Whether the browser grant question `ask_id` is still open, so that an
+    /// answer arriving now would still be applied.
+    pub async fn browser_grant_question_open(&self, ask_id: &str) -> bool {
+        self.pending_browser_grants
+            .lock()
+            .await
+            .contains_key(ask_id)
+    }
+
+    /// Forget the browser origin grants a conversation holds and close every
+    /// browser grant question it has open, so an answer that arrives
+    /// afterwards grants nothing.
+    ///
+    /// For a conversation whose session scope ended. An ordinary route close
+    /// does not come here: browser grants outlive a route, and a session that
+    /// reconnects keeps them.
+    pub async fn end_browser_conversation(&self, conversation_key: &str) {
+        self.pending_browser_grants
+            .lock()
+            .await
+            .retain(|_, pending| pending.conversation_key != conversation_key);
+        let mut grants = self.browser_grants.lock().await;
+        let held: Vec<String> = grants
+            .current_grants()
+            .filter(|grant| grant.conversation_key == conversation_key)
+            .map(|grant| grant.grant_id().to_string())
+            .collect();
+        for grant_id in held {
+            // A store that refuses a revocation is one that no longer
+            // validates, and such a store authorizes nothing anyway.
+            let _ = grants.revoke(&grant_id);
+        }
+    }
+
     fn profile_lifecycle_for_rebind(&self) -> Result<Arc<ProfileLifecycle>, &'static str> {
         if let Some(lifecycle) = self.profile_lifecycle.as_ref() {
             return Ok(Arc::clone(lifecycle));

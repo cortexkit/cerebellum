@@ -17,8 +17,8 @@
 //! # What is durable and what is not
 //!
 //! The durable file (`call_records.jsonl` beside the audit journal) holds only
-//! closed, text-free facts: principal, call_key, the scope identity (always
-//! absent for now, see [`ScopeIdentity`]), the state, the outcome code, a
+//! closed, text-free facts: principal, call_key, the scope identity (from the
+//! daemon's stamp on the call's route, see [`ScopeIdentity`]), the state, the outcome code, a
 //! refusal reason code, `effect_status`, `posts_returned` and timestamps. It
 //! never holds arguments, element ids, labels, typed text or reply bodies: a
 //! reply to a read or a typing call can carry screen text, and this directory is
@@ -116,11 +116,14 @@ pub fn principal_label(principal: Option<&Principal>) -> String {
 
 /// The scope a call ran under: `(owner, ref, scope_epoch)`.
 ///
-/// Always absent today. The daemon does not yet stamp a scope on the route
-/// bind, and a scope named in a request body is caller-chosen, so recording
-/// one would put an identity nobody verified into an audit record. When the
-/// daemon stamps scopes, [`CallRecords::begin`]'s caller fills this from the
-/// stamp and nowhere else.
+/// Taken only from the scope stamp the daemon put on the call's route bind,
+/// never from a request body: a scope named in a request is caller-chosen, so
+/// recording it would put an identity nobody verified into an audit record.
+/// Absent for a call on a route opened without a scope.
+///
+/// These are identifiers (a principal label, the owner's opaque session ref,
+/// a number), not screen text. The field has been part of this file's format
+/// since its first version, so recording it changes no format version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeIdentity {
@@ -128,6 +131,17 @@ pub struct ScopeIdentity {
     #[serde(rename = "ref")]
     pub reference: String,
     pub scope_epoch: u64,
+}
+
+impl ScopeIdentity {
+    /// The identity a daemon scope stamp names.
+    pub fn from_stamp(stamp: &subc_protocol::scope::ScopeStamp) -> Self {
+        Self {
+            owner: principal_label(Some(&stamp.owner)),
+            reference: stamp.scope_ref.clone(),
+            scope_epoch: stamp.scope_epoch,
+        }
+    }
 }
 
 /// Where a recorded call stands.
@@ -545,6 +559,9 @@ pub enum Begin {
 /// What is known about a call, for `tool.withdraw`.
 #[derive(Debug, Clone)]
 pub struct CallSnapshot {
+    /// The scope the call was recorded under, which decides whether a scope's
+    /// owner may withdraw it.
+    pub scope: Option<ScopeIdentity>,
     pub state: CallState,
     pub outcome: Option<String>,
     pub refusal_reason: Option<String>,
@@ -612,6 +629,7 @@ struct Entry {
 impl Entry {
     fn snapshot(&self) -> CallSnapshot {
         CallSnapshot {
+            scope: self.record.scope.clone(),
             state: self.record.state,
             outcome: self.record.outcome.clone(),
             refusal_reason: self.record.refusal_reason.clone(),
@@ -902,6 +920,20 @@ impl CallRecords {
         conversation_key: &str,
         now_ms: u64,
     ) -> Begin {
+        self.begin_scoped(principal, call_key, conversation_key, None, now_ms)
+    }
+
+    /// [`Self::begin`] for a call whose route carries a daemon scope stamp:
+    /// a new record stores `scope`. A key already recorded is answered from
+    /// its record exactly as [`Self::begin`] answers it.
+    pub fn begin_scoped(
+        &self,
+        principal: &str,
+        call_key: &str,
+        conversation_key: &str,
+        scope: Option<ScopeIdentity>,
+        now_ms: u64,
+    ) -> Begin {
         let mut inner = self.lock();
         if let Some(error) = inner.broken.clone() {
             return Begin::Unavailable(error);
@@ -925,7 +957,7 @@ impl CallRecords {
         let record = CallRecord {
             principal: principal.to_string(),
             call_key: call_key.to_string(),
-            scope: None,
+            scope,
             state: CallState::Started,
             outcome: None,
             refusal_reason: None,
@@ -1018,9 +1050,9 @@ impl CallRecords {
         if let Some(entry) = inner.entries.get(&key) {
             return Lookup::Own(entry.snapshot());
         }
-        // The owner of the call's scope may also withdraw it, but a route does
-        // not yet carry its scope: the daemon does not stamp one on the bind.
-        // Until it does, only the principal that raised the call may withdraw.
+        // A scope's owner withdrawing a call it did not raise names the
+        // carrier and comes through [`Self::lookup_exact`] instead; here only
+        // the principal that raised the call finds it.
         if inner
             .entries
             .keys()
@@ -1029,6 +1061,23 @@ impl CallRecords {
             return Lookup::OtherPrincipal;
         }
         Lookup::Unknown
+    }
+
+    /// The call `call_key` raised by exactly `carrier`, for a scope owner's
+    /// withdraw: [`Lookup::Own`] with the carrier's record, or
+    /// [`Lookup::Unknown`]. Never matched by key alone, so a key another
+    /// principal also used can never answer for the carrier's call.
+    pub fn lookup_exact(&self, carrier: &str, call_key: &str) -> Lookup {
+        let mut inner = self.lock();
+        if let Some(error) = inner.broken.clone() {
+            return Lookup::Unavailable(error);
+        }
+        let key: Key = (carrier.to_string(), call_key.to_string());
+        Self::expire_reply(&mut inner, &key);
+        match inner.entries.get(&key) {
+            Some(entry) => Lookup::Own(entry.snapshot()),
+            None => Lookup::Unknown,
+        }
     }
 
     /// How many calls are recorded.

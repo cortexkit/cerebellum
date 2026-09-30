@@ -4430,7 +4430,7 @@ fn browser_status_result_schema() -> Value {
             "profile_disposition":enum_schema(&["durable", "disposable"]),
             "lease":browser_lease_result_schema(),
             "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", "crash_reports_delete", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
-            "terminal_outcome":enum_schema(&["closed", "browser_crashed", "connector_failure", "cdp_failure", "idle_expired", "route_unbound", "module_shutdown", "cleanup_failure", "startup_indeterminate"]),
+            "terminal_outcome":enum_schema(&["closed", "browser_crashed", "connector_failure", "cdp_failure", "idle_expired", "route_unbound", "scope_revoked", "module_shutdown", "cleanup_failure", "startup_indeterminate"]),
             "failed_signals":string_array_schema(),
         }),
     )
@@ -4445,6 +4445,7 @@ fn browser_close_result_schema() -> Value {
             "cdp_failure",
             "idle_expired",
             "route_unbound",
+            "scope_revoked",
             "module_shutdown",
             "cleanup_failure",
             "startup_indeterminate",

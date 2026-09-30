@@ -44,6 +44,7 @@ pub mod manifest;
 pub mod network;
 pub mod profile;
 pub mod profile_custody;
+pub mod scope_watch;
 pub mod snapshot_store;
 pub mod wire;
 
@@ -1188,6 +1189,184 @@ impl RouteBindings {
                 .any(|facts| facts.identity.conversation_key == conversation_key)
         })
     }
+
+    /// Whether any bound route was stamped with this session scope.
+    fn carries_scope(&self, key: &scope_watch::ScopeKey) -> bool {
+        !self.conversations_under_scope(key).is_empty()
+    }
+
+    /// The conversations of the bound routes stamped with this session scope.
+    fn conversations_under_scope(
+        &self,
+        key: &scope_watch::ScopeKey,
+    ) -> std::collections::BTreeSet<String> {
+        self.inner
+            .read()
+            .map(|routes| {
+                routes
+                    .values()
+                    .filter(|facts| facts.scope.as_ref().is_some_and(|stamp| key.names(stamp)))
+                    .map(|facts| facts.identity.conversation_key.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Watch one session scope whose route closed until the daemon says, one way
+/// or the other, whether it ended. Runs on its own task, never on the frame
+/// loop, and is the only watcher of its scope (see
+/// [`scope_watch::ScopeRevocation::note_closed`]).
+///
+/// Only a definitive end ends anything (see [`scope_watch::classify`]). While
+/// the answer is unresolved everything stays, and the scope is asked about
+/// again when another route under it closes, or once per
+/// [`scope_watch::SCOPE_RECHECK_INTERVAL`], but only while a
+/// browser it opened is still open and no route under it is bound: a bound
+/// route asks again itself when it closes, and with no browser open nothing is
+/// running that a late end would have to stop.
+async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_watch::ScopeKey) {
+    let mut drain = planes.drain_signal.subscribe();
+    let closed_again = planes.scopes.closed_again(&key);
+    loop {
+        let answer = planes.scopes.describe(&writer, &key).await;
+        if scope_watch::classify(answer.as_ref(), key.scope_epoch)
+            == scope_watch::ScopeVerdict::Ended
+        {
+            let mut conversations = planes.scopes.finish(&key);
+            // A route under the scope whose close has not reached this module
+            // yet belongs to the ended session too.
+            conversations.extend(planes.routes.conversations_under_scope(&key));
+            revoke_scope(&planes, &conversations).await;
+            return;
+        }
+        let browser_open = planes
+            .scopes
+            .conversations(&key)
+            .iter()
+            .any(|conversation_key| planes.sessions.has_open_session(conversation_key));
+        if !browser_open || planes.routes.carries_scope(&key) {
+            planes.scopes.finish(&key);
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(planes.scopes.recheck_interval) => {}
+            // Another route under the scope closed: ask about it now.
+            _ = closed_again.notified() => {}
+            // A draining module closes every browser itself.
+            _ = drain.wait_for(|draining| *draining) => {
+                planes.scopes.finish(&key);
+                return;
+            }
+        }
+    }
+}
+
+/// Check a stamped `route.bind` against the highest epoch seen for its
+/// session's `(owner, ref)`, before the route is bound and so before anything
+/// is served on it. Returns whether the bind may go on to ordinary admission.
+///
+/// - A higher epoch than any seen means every lower one ended, as a `live`
+///   answer at a higher epoch would say. The ended epochs' conversations lose
+///   their browser grants, their "this conversation" app and takeover grants
+///   and their open questions here, before this returns, so the new session
+///   can never be served under what a person allowed the old one. Their
+///   browsers are marked `scope_revoked` here too, so no call is admitted on
+///   them, and the bounded teardown finishes on the blocking pool without
+///   holding up the bind's reply.
+/// - A lower epoch than one seen is an ended session: refused `scope_ended`,
+///   the daemon's own code for an epoch that is not the live one, and never
+///   bound.
+///
+/// Anything that is not a stamped bind passes untouched.
+async fn scope_epoch_admits_bind(
+    frame: &Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<bool, ModuleError> {
+    let Ok(ModuleControlRequest::RouteBind {
+        identity,
+        scope: Some(stamp),
+        ..
+    }) = serde_json::from_slice::<ModuleControlRequest>(&frame.body)
+    else {
+        return Ok(true);
+    };
+    match planes.scopes.note_bind(&stamp, &identity.session) {
+        scope_watch::BindEpoch::Current => Ok(true),
+        scope_watch::BindEpoch::Advanced {
+            ended_conversations,
+        } => {
+            for conversation_key in &ended_conversations {
+                planes
+                    .management
+                    .end_browser_conversation(conversation_key)
+                    .await;
+                planes.management.end_conversation(conversation_key);
+                if let Some(config) = planes.browser_config.as_ref() {
+                    if let Some(finish) = planes.sessions.begin_teardown_route(
+                        conversation_key,
+                        browser_session::BrowserSessionTerminalOutcome::ScopeRevoked,
+                        config,
+                    ) {
+                        tokio::task::spawn_blocking(finish);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        scope_watch::BindEpoch::Stale { current } => {
+            let refusal = build_error_frame(
+                frame.header.ver,
+                0,
+                0,
+                frame.header.corr,
+                "scope_ended",
+                &format!(
+                    "scope epoch {} has ended: epoch {current} of the same session scope has \
+                     already been bound here",
+                    stamp.scope_epoch
+                ),
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            send(writer, refusal).await?;
+            Ok(false)
+        }
+    }
+}
+
+/// End what a session scope that definitively ended was allowed, for each
+/// conversation its routes carried: the browser grant questions and the
+/// computer consent questions it has open (so a late answer grants nothing),
+/// its browser origin grants and "this conversation" app and takeover grants,
+/// and its browser, closed as `scope_revoked`.
+///
+/// The questions and grants go first, so an answer landing while the browser
+/// closes finds nothing to grant. The browser goes through the same bounded
+/// close as any other teardown: in-flight operations get the configured grace,
+/// and a kill happens only under the existing kill rules.
+async fn revoke_scope(planes: &Planes, conversations: &std::collections::BTreeSet<String>) {
+    for conversation_key in conversations {
+        planes
+            .management
+            .end_browser_conversation(conversation_key)
+            .await;
+        planes.management.end_conversation(conversation_key);
+        if let Some(config) = planes.browser_config.clone() {
+            let sessions = planes.sessions.clone();
+            let conversation_key = conversation_key.clone();
+            // The teardown waits for in-flight work within its grace, so it
+            // runs on the blocking pool.
+            let _ = tokio::task::spawn_blocking(move || {
+                sessions.teardown_route(
+                    &conversation_key,
+                    browser_session::BrowserSessionTerminalOutcome::ScopeRevoked,
+                    &config,
+                )
+            })
+            .await;
+        }
+    }
 }
 
 /// The route one computer call arrived on, as the call's consent wait sees it.
@@ -2202,6 +2381,9 @@ pub struct Planes {
     /// One record per call that arrived with a `call_key`, so a resend is
     /// answered from it instead of running again.
     pub calls: Arc<journal::call_records::CallRecords>,
+    /// Session scopes whose routes closed and whose end is not yet settled,
+    /// and this module's channel-0 questions to the daemon about them.
+    pub scopes: Arc<scope_watch::ScopeRevocation>,
 }
 
 /// Retention for the browser DRIVE journal: navigate, snapshot, click,
@@ -2498,6 +2680,7 @@ impl Planes {
             elicitor: Arc::new(Elicitor::new()),
             capture,
             calls,
+            scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         }
     }
 }
@@ -2540,6 +2723,7 @@ impl Clone for Planes {
             elicitor: Arc::clone(&self.elicitor),
             capture: Arc::clone(&self.capture),
             calls: Arc::clone(&self.calls),
+            scopes: Arc::clone(&self.scopes),
         }
     }
 }
@@ -2563,6 +2747,23 @@ async fn handle_frame(
             )
             .map_err(|e| ModuleError::Message(e.to_string()))?;
             send(writer, pong).await?;
+            Ok(true)
+        }
+        // The daemon's answer to a control request this module sent on its own
+        // connection (`scope.describe`). The daemon's requests to the module
+        // arrive as requests, so a response or error on channel 0 can only be
+        // one of these; it is handed to whoever asked, or dropped if nobody
+        // still waits. Without this arm such an answer would be dropped by the
+        // branches below, which know only questions asked on route channels,
+        // so every describe would wait out its deadline as if unanswered.
+        FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
+            let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
+            let answer = if frame.header.ty == FrameType::Response {
+                scope_watch::ControlAnswer::Response(body)
+            } else {
+                scope_watch::ControlAnswer::Error(body)
+            };
+            planes.scopes.control.deliver(frame.header.corr, answer);
             Ok(true)
         }
         // An answer to a question this module asked. Requests are what we
@@ -2632,25 +2833,41 @@ async fn handle_frame(
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
             if let Some(facts) = removed {
-                // A conversation's computer grants end with its last route:
-                // another route may still carry the same conversation.
-                if !planes
-                    .routes
-                    .carries_conversation(&facts.identity.conversation_key)
-                {
-                    planes
-                        .management
-                        .end_conversation(&facts.identity.conversation_key);
-                    planes
-                        .calls
-                        .end_conversation(&facts.identity.conversation_key);
-                }
-                if let Some(config) = planes.browser_config.as_ref() {
-                    planes.sessions.teardown_route(
-                        &facts.identity.conversation_key,
-                        browser_session::BrowserSessionTerminalOutcome::RouteUnbound,
-                        config,
-                    );
+                let conversation_key = &facts.identity.conversation_key;
+                let last_route = !planes.routes.carries_conversation(conversation_key);
+                match facts.scope.as_ref() {
+                    None => {
+                        // A conversation's computer grants end with its last
+                        // route: another route may still carry the same
+                        // conversation.
+                        if last_route {
+                            planes.management.end_conversation(conversation_key);
+                            planes.calls.end_conversation(conversation_key);
+                        }
+                        if let Some(config) = planes.browser_config.as_ref() {
+                            planes.sessions.teardown_route(
+                                conversation_key,
+                                browser_session::BrowserSessionTerminalOutcome::RouteUnbound,
+                                config,
+                            );
+                        }
+                    }
+                    // A route under a session scope closing is not the session
+                    // ending: a client reconnect or a daemon restart closes it
+                    // too, and the agent's browser and grants must survive
+                    // those. The daemon is asked whether the scope ended, off
+                    // this loop, and they end only on a definitive answer.
+                    Some(stamp) => {
+                        if last_route {
+                            // Held reply bodies are a memory bound, not a
+                            // permission: they go with the last route as always.
+                            planes.calls.end_conversation(conversation_key);
+                        }
+                        let key = scope_watch::ScopeKey::from_stamp(stamp);
+                        if planes.scopes.note_closed(&key, conversation_key) {
+                            tokio::spawn(watch_scope(planes.clone(), writer.clone(), key));
+                        }
+                    }
                 }
             }
             Ok(true)
@@ -2673,7 +2890,9 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
+            if scope_epoch_admits_bind(&frame, writer, planes).await? {
+                handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
+            }
             Ok(true)
         }
         FrameType::Request => {
@@ -2756,6 +2975,26 @@ async fn handle_route_request(
         )
         .await;
     };
+    // A route of a session that a newer epoch has replaced, whose close has
+    // not reached this module yet. Serving it could mint a grant under the
+    // conversation the new session now holds.
+    if facts
+        .scope
+        .as_ref()
+        .is_some_and(|stamp| planes.scopes.is_superseded(stamp))
+    {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "scope_ended",
+            "this route's session scope has ended: a newer session under the same scope has \
+             been bound",
+        )
+        .await;
+    }
 
     match facts.surface {
         RouteSurface::Tools => handle_keyed_tool_request(frame, writer, planes).await,
@@ -3886,11 +4125,7 @@ async fn handle_control_request(
             admission_facts,
             consumer_capabilities,
             target,
-            // The daemon's scope stamp is not read yet: cerebellum still takes
-            // the conversation from the bind identity and admits session
-            // callers by principal. Reading it belongs with recording scope in
-            // call records and letting a scope's owner withdraw a call.
-            scope: _,
+            scope,
         } => {
             // In-module principal default-deny backstop: the gateway policy
             // (subc-mcp) is the primary exclusion of cerebellum capabilities
@@ -3943,7 +4178,12 @@ async fn handle_control_request(
                 admission_facts.as_ref(),
                 consumer_capabilities.as_deref(),
                 &target,
-            );
+            )
+            // The scope stamp is kept exactly as the daemon sent it. It names
+            // the session a call is recorded under, lets that session's owner
+            // withdraw a call, and decides what a revoked session takes with
+            // it; admission is still by principal, as before scopes.
+            .with_scope(scope);
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}
@@ -4131,8 +4371,19 @@ async fn handle_keyed_tool_request(
         let calls = Arc::clone(&planes.calls);
         let conversation_key = facts.identity.conversation_key.clone();
         let call_key = call_key.clone();
+        // The scope comes from the route's bind stamp, never from the request.
+        let scope = facts
+            .scope
+            .as_ref()
+            .map(call_records::ScopeIdentity::from_stamp);
         tokio::task::spawn_blocking(move || {
-            calls.begin(&principal, &call_key, &conversation_key, wall_clock_ms())
+            calls.begin_scoped(
+                &principal,
+                &call_key,
+                &conversation_key,
+                scope,
+                wall_clock_ms(),
+            )
         })
         .await
         .unwrap_or_else(|error| {
@@ -4354,19 +4605,28 @@ async fn forward_recording_reply(
     send(writer, out).await
 }
 
-/// `tool.withdraw {call_key, scope}`: what became of a recorded call, and, for
-/// one that only asked a person, the question closed so it can never act.
+/// `tool.withdraw {call_key, scope?, carrier?}`: what became of a recorded
+/// call, and, for one that only asked a person, the question closed so it can
+/// never act.
 ///
-/// The answer is read from the record, so it is the same for every repeat.
-/// Only the principal that raised the call may withdraw it for now; the scope's
-/// owner joins when the daemon stamps scopes on routes.
+/// The answer is read from the record, so it is the same for every repeat and
+/// for every caller permitted to ask. Two callers are permitted:
+/// - the principal that raised the call (its carrier), as always;
+/// - the owner of the session scope the call was recorded under, when the
+///   daemon's stamp on the owner's own route says the owner is authorized
+///   (`owner_authorized`), the route's principal is that owner, the call was
+///   recorded under the same `(owner, ref, scope_epoch)`, and the request names
+///   the carrier in `arguments.carrier`. The lookup stays exact on
+///   `(carrier, call_key)`: a key is never matched on its own.
+///
+/// Everyone else is refused `withdraw_not_permitted`.
 async fn handle_tool_withdraw(
     object: &serde_json::Map<String, Value>,
     (ver, channel, epoch, corr): (u8, u16, u32, u64),
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
-    use journal::call_records::{self, Lookup};
+    use journal::call_records::{self, Lookup, ScopeIdentity};
 
     let invalid = |field: &str, reason: &'static str| Err((field.to_string(), reason));
     let checked = (|| {
@@ -4384,7 +4644,7 @@ async fn handle_tool_withdraw(
         };
         if let Some(field) = arguments
             .keys()
-            .filter(|field| !matches!(field.as_str(), "call_key" | "scope"))
+            .filter(|field| !matches!(field.as_str(), "call_key" | "scope" | "carrier"))
             .min()
         {
             return Err((format!("arguments.{field}"), "unknown_field"));
@@ -4394,26 +4654,37 @@ async fn handle_tool_withdraw(
             Some(Value::String(key)) if call_records::valid_call_key(key) => key.clone(),
             Some(_) => return invalid("arguments.call_key", "wrong_type"),
         };
-        // Only the shape is checked. A scope named in the request is the
-        // caller's own claim, and authority is never read from a request. Once
-        // the daemon stamps the route's scope on the bind, a scope named here
-        // that differs from the stamp must be refused, not reconciled by
-        // preferring either one; that comparison belongs at this point.
-        if let Some(scope) = arguments.get("scope") {
-            let shaped = scope.as_object().is_some_and(|scope| {
-                scope.len() == 3
-                    && scope.get("owner").is_some_and(Value::is_string)
-                    && scope.get("ref").is_some_and(Value::is_string)
-                    && scope.get("scope_epoch").is_some_and(Value::is_u64)
-            });
-            if !shaped {
-                return invalid("arguments.scope", "wrong_type");
+        // Only the shape is checked here. A scope named in the request is the
+        // caller's own claim; below it is compared with the route's stamp and
+        // never used in its place.
+        let named_scope = match arguments.get("scope") {
+            None => None,
+            Some(scope) => {
+                let named = scope.as_object().and_then(|scope| {
+                    (scope.len() == 3).then_some(())?;
+                    Some(ScopeIdentity {
+                        owner: scope.get("owner")?.as_str()?.to_string(),
+                        reference: scope.get("ref")?.as_str()?.to_string(),
+                        scope_epoch: scope.get("scope_epoch")?.as_u64()?,
+                    })
+                });
+                match named {
+                    Some(named) => Some(named),
+                    None => return invalid("arguments.scope", "wrong_type"),
+                }
             }
-        }
-        Ok(call_key)
+        };
+        // The carrier is a principal label such as `reserved:prefrontal-core`,
+        // the form call records are kept under.
+        let carrier = match arguments.get("carrier") {
+            None => None,
+            Some(Value::String(carrier)) if !carrier.is_empty() => Some(carrier.clone()),
+            Some(_) => return invalid("arguments.carrier", "wrong_type"),
+        };
+        Ok((call_key, named_scope, carrier))
     })();
-    let call_key = match checked {
-        Ok(call_key) => call_key,
+    let (call_key, named_scope, carrier) = match checked {
+        Ok(checked) => checked,
         Err((field, reason)) => {
             return send_invalid_request_response(writer, ver, channel, epoch, corr, &field, reason)
                 .await
@@ -4432,7 +4703,91 @@ async fn handle_tool_withdraw(
         .await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
-    match planes.calls.lookup(&principal, &call_key) {
+    let stamped = facts.scope.as_ref().map(ScopeIdentity::from_stamp);
+    // A scope named in the request must be the one the daemon stamped on this
+    // route. A mismatch is refused rather than resolved by preferring either:
+    // the caller and the daemon disagree about which session this is. A route
+    // opened without a scope has no stamp to compare with, and is answered as
+    // it was before scopes.
+    if let (Some(named), Some(stamped)) = (named_scope.as_ref(), stamped.as_ref()) {
+        if named != stamped {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "arguments.scope",
+                "unsupported_value",
+            )
+            .await;
+        }
+    }
+    // The caller is its route's scope owner when the stamp names the route's
+    // own principal as the owner. Whether that owner may act for its scope is
+    // the daemon's `owner_authorized`, and nothing cerebellum keeps.
+    let owner_stamp = facts
+        .scope
+        .as_ref()
+        .filter(|stamp| facts.principal.as_ref() == Some(&stamp.owner));
+    let lookup = match carrier.as_deref() {
+        // Naming another principal's call is the owner's arm and nobody else's.
+        Some(carrier) if carrier != principal => match owner_stamp {
+            Some(stamp) if stamp.owner_authorized => {
+                let scope = ScopeIdentity::from_stamp(stamp);
+                match planes.calls.lookup_exact(carrier, &call_key) {
+                    // Recorded under this owner's scope at this epoch: the
+                    // owner gets exactly the answer the carrier would.
+                    Lookup::Own(snapshot) if snapshot.scope.as_ref() == Some(&scope) => {
+                        Lookup::Own(snapshot)
+                    }
+                    // Recorded under no scope, another scope, or an earlier
+                    // session under the same ref: not this owner's call.
+                    Lookup::Own(_) | Lookup::OtherPrincipal => Lookup::OtherPrincipal,
+                    other => other,
+                }
+            }
+            // The owner, but the daemon does not authorize it to act for its
+            // scope.
+            Some(_) => Lookup::OtherPrincipal,
+            // A carrier may name only itself.
+            None => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "arguments.carrier",
+                    "unsupported_value",
+                )
+                .await
+            }
+        },
+        // The caller's own call, which is today's rule and needs no scope.
+        named_self => match planes.calls.lookup(&principal, &call_key) {
+            Lookup::Own(snapshot) => Lookup::Own(snapshot),
+            // An authorized owner asking about a call it did not raise must
+            // say whose it is: the lookup is exact on the carrier, so without
+            // one there is nothing to look up.
+            _ if named_self.is_none()
+                && owner_stamp.is_some_and(|stamp| stamp.owner_authorized) =>
+            {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "arguments.carrier",
+                    "missing_field",
+                )
+                .await
+            }
+            other => other,
+        },
+    };
+    match lookup {
         Lookup::Own(snapshot) => {
             let answer = call_records::withdraw_answer(&snapshot);
             // Close the question the call left open, so a late answer cannot
@@ -4463,7 +4818,8 @@ async fn handle_tool_withdraw(
                 epoch,
                 corr,
                 "withdraw_not_permitted",
-                "only the principal that raised a call may withdraw it",
+                "only the principal that raised a call, or the authorized owner of the scope it \
+                 was recorded under, may withdraw it",
             )
             .await
         }
@@ -6501,6 +6857,7 @@ mod tests {
             elicitor: Arc::clone(&elicitor),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
             .await
@@ -6555,6 +6912,7 @@ mod tests {
             elicitor: Arc::clone(&elicitor),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
             .await
@@ -7141,6 +7499,7 @@ mod tests {
             elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         planes.routes.insert(
             6,
@@ -7209,6 +7568,7 @@ mod tests {
             elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         planes.routes.insert(
             channel,

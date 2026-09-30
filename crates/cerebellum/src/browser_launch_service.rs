@@ -2756,6 +2756,7 @@ mod executable_identity_launch_tests {
             effective_capability_scope: None,
             consumer_capabilities: Vec::new(),
             surface: RouteSurface::Tools,
+            scope: None,
         }
     }
 
@@ -4148,6 +4149,7 @@ mod orphan_recovery_tests {
                 effective_capability_scope: None,
                 consumer_capabilities: Vec::new(),
                 surface: RouteSurface::Tools,
+                scope: None,
             }
         }
 
