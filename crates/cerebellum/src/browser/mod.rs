@@ -1117,6 +1117,7 @@ pub fn journal_identity(identity: &RouteIdentity) -> JournalIdentity {
         profile_uuid: None,
         profile_name: (identity.session_kind != SessionKind::Ephemeral)
             .then(|| "default".to_string()),
+        witness: identity.witness.clone(),
     }
 }
 
@@ -2093,6 +2094,11 @@ impl BrowserPlane {
                     .map_err(map_journal_error)?;
             }
         }
+        // The browser plane's dispatch commitment, reached before any CDP
+        // command and only once the journal (when enabled) has committed. The
+        // journal's own commit marks the request too; with the journal
+        // disabled this is the only mark.
+        identity.witness.mark_committed();
         let mut state = self.state.lock().await;
         Self::op(
             &mut state,

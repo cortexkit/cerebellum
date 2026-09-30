@@ -1847,3 +1847,147 @@ async fn a_successful_keystroke_reply_is_unchanged() {
     assert!(reply.get("remedy").is_none(), "{reply}");
     assert!(plane.result_schema_findings().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Keyed calls: a resend is answered from the record, and never typed again
+// ---------------------------------------------------------------------------
+//
+// The module's tool route cannot host this scripted plane (its computer plane
+// is the native one), so these tests take the steps the route's keyed-call
+// handler takes around `ComputerPlane::serve`: record the key before serving,
+// serve with the request's dispatch witness in the journal identity, record
+// the reply with what the witness saw, and answer a resend from the record.
+
+use cerebellum::journal::call_records::{
+    withdraw_answer, Begin, CallRecords, CallState, DispatchEvidence, Lookup, Settlement,
+};
+use cerebellum_core::dispatch_witness::DispatchWitness;
+use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
+
+const CARRIER: &str = "reserved:prefrontal-core";
+
+fn response(corr: u64, body: &Value) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        1,
+        1,
+        corr,
+        serde_json::to_vec(body).unwrap(),
+    )
+    .unwrap()
+}
+
+/// One keyed `computer.type`, as the route's handler runs it: served only when
+/// the record says this key is new, otherwise answered from the record.
+async fn keyed_type(
+    calls: &CallRecords,
+    plane: &TestPlane,
+    management: &Arc<ManagementPlane>,
+    call_key: &str,
+    corr: u64,
+) -> Frame {
+    match calls.begin(CARRIER, call_key, "conversation-1", 1) {
+        Begin::Execute(ticket) => {
+            let witness = DispatchWitness::armed();
+            let clock = FakeClock::new();
+            let reply = plane
+                .serve(
+                    servable("computer.type").expect("the capability is servable"),
+                    &type_request(),
+                    ServeContext {
+                        cancel: cerebellum::CancelHandle::pending(),
+                        grantee: GRANTEE,
+                        identity: cerebellum_core::journal::JournalIdentity {
+                            witness: witness.clone(),
+                            ..identity()
+                        },
+                        management,
+                        consent: no_relay(),
+                        clock: &clock,
+                        now_ms: 10,
+                    },
+                    |_| InMemoryCaptureBackend::default(),
+                )
+                .await
+                .expect("the reply is inside its row");
+            let frame = response(corr, &reply);
+            let evidence = DispatchEvidence {
+                committed: witness.committed(),
+                commit_point: true,
+                ..DispatchEvidence::default()
+            };
+            calls.settle(ticket, Settlement::from_reply(&frame, evidence), 2);
+            frame
+        }
+        Begin::Replay(recorded) => recorded.readdressed(PROTOCOL_VERSION, 1, 1, corr),
+        other => panic!("unexpected record answer: {other:?}"),
+    }
+}
+
+fn own_record(
+    calls: &CallRecords,
+    call_key: &str,
+) -> cerebellum::journal::call_records::CallSnapshot {
+    match calls.lookup(CARRIER, call_key) {
+        Lookup::Own(snapshot) => snapshot,
+        other => panic!("expected the carrier's own record, got {other:?}"),
+    }
+}
+
+/// Typing twice is what the call key exists to prevent: the resend gets the
+/// first reply byte for byte, and the driver is asked to post exactly once.
+#[tokio::test]
+async fn a_keyed_type_resent_with_the_same_key_types_once_and_replays_the_reply() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().readbacks =
+        [Some("ab".to_string()), Some("ahib".to_string())].into();
+    let plane = plane_on(&shared, &desk, false);
+    let management = granted_management().await;
+    let calls = CallRecords::in_memory();
+
+    let first = keyed_type(&calls, &plane, &management, "pf:type-once", 1).await;
+    let reply: Value = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(dispatched_calls(&shared).len(), 1);
+
+    let resent = keyed_type(&calls, &plane, &management, "pf:type-once", 2).await;
+    assert_eq!(resent.body, first.body, "the resend got a different reply");
+    assert_eq!(resent.header.corr, 2);
+    assert_eq!(
+        dispatched_calls(&shared).len(),
+        1,
+        "the resend typed the text a second time"
+    );
+
+    // The audit journal's dispatch commitment marked the call, so it ran.
+    let record = own_record(&calls, "pf:type-once");
+    assert_eq!(record.state, CallState::Replied);
+    assert_eq!(
+        withdraw_answer(&record),
+        json!({"answer": "completed", "result": reply})
+    );
+}
+
+/// A keystroke refused at a password field posted nothing and committed no
+/// dispatch, so the call answers `refused`: a runner may safely run it again.
+#[tokio::test]
+async fn a_keyed_type_refused_at_a_secure_field_answers_refused() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let calls = CallRecords::in_memory();
+
+    let frame = keyed_type(&calls, &plane, &management, "pf:secure", 1).await;
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(reply["outcome"], "secure_field_refused", "{reply}");
+    assert!(dispatched_calls(&shared).is_empty());
+    assert_eq!(
+        withdraw_answer(&own_record(&calls, "pf:secure")),
+        json!({"answer": "refused", "reason": "secure_field_refused"})
+    );
+}

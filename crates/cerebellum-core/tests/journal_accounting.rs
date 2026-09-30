@@ -77,6 +77,7 @@ impl PlaneJournalCodec for AccountingCodec {
 
 fn identity() -> JournalIdentity {
     JournalIdentity {
+        witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
         principal: "principal-1".to_string(),
         conversation_key: "conversation-1".to_string(),
         agent_project_id: "project-1".to_string(),

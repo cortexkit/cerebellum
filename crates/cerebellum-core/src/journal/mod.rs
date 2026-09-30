@@ -70,6 +70,10 @@ pub struct JournalIdentity {
     pub conversation_key: String,
     pub agent_project_id: String,
     pub session_kind: SessionKind,
+    /// The request this obligation serves, marked when its dispatch is
+    /// committed. Never persisted; a reloaded identity carries a detached one.
+    #[serde(skip)]
+    pub witness: crate::dispatch_witness::DispatchWitness,
 }
 
 /// A positive capacity configuration.
@@ -755,6 +759,10 @@ where
         }
         committed.reservations.insert(sequence, dispatched_record);
         self.commit_state(committed)?;
+        // Every journal's dispatch commitment passes here, so a commit made for
+        // a request marks that request's witness, and one made under a
+        // detached witness is counted as unattributed.
+        record.identity.witness.mark_committed();
         Ok(DispatchCommitmentToken {
             action_obligation_id: sequence,
         })
@@ -1663,6 +1671,7 @@ mod tests {
 
     fn identity() -> JournalIdentity {
         JournalIdentity {
+            witness: crate::dispatch_witness::DispatchWitness::detached(),
             principal: "p".to_string(),
             conversation_key: "c".to_string(),
             agent_project_id: "a".to_string(),

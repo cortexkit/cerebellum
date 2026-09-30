@@ -31,6 +31,7 @@
 //! the terminating LF. Callers that require exact JCS bytes substitute the
 //! canonicalizer at the export seam without changing the accounting logic.
 
+pub mod call_records;
 pub mod core_adapter;
 pub mod late_events;
 pub mod recovery;
@@ -289,6 +290,10 @@ pub struct JournalIdentity {
     pub session_kind: SessionKind,
     pub profile_uuid: Option<String>,
     pub profile_name: Option<String>,
+    /// The request this entry serves, handed on to the core journal so its
+    /// dispatch commitment marks the request. Never exported or persisted.
+    #[serde(skip)]
+    pub witness: cerebellum_core::dispatch_witness::DispatchWitness,
 }
 
 /// Effective session kind, mirroring the closed Spec A enum.
@@ -582,6 +587,7 @@ mod tests {
 
     fn identity() -> JournalIdentity {
         JournalIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
             principal: "direct:agent".to_string(),
             conversation_key: "conv-1".to_string(),
             agent_project_id: "proj-1".to_string(),

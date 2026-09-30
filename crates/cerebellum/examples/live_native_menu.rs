@@ -1094,6 +1094,7 @@ mod macos_probe {
         )
         .with_semantic(element, action_name);
         let identity = JournalIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
             principal: format!("{:?}", Principal::Direct),
             conversation_key: CONVERSATION.to_string(),
             agent_project_id: GRANTEE.to_string(),

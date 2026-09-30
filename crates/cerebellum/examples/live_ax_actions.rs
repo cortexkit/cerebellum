@@ -128,6 +128,7 @@ mod macos_probe {
 
     fn identity() -> JournalIdentity {
         JournalIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
             principal: "live-probe".into(),
             conversation_key: "live-ax-actions".into(),
             agent_project_id: "live-probe".into(),

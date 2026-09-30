@@ -2732,6 +2732,7 @@ mod executable_identity_launch_tests {
     fn accepted_facts(project_root: &Path) -> AcceptedBindFacts {
         AcceptedBindFacts {
             identity: RouteIdentity {
+                witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
                 conversation_key: "conversation-1".to_string(),
                 agent_project_id: "project-1".to_string(),
                 session_kind: SessionKind::Primary,
@@ -4123,6 +4124,7 @@ mod orphan_recovery_tests {
         fn accepted() -> AcceptedBindFacts {
             AcceptedBindFacts {
                 identity: RouteIdentity {
+                    witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
                     conversation_key: "conversation-2".to_string(),
                     agent_project_id: PROJECT.to_string(),
                     session_kind: SessionKind::Primary,

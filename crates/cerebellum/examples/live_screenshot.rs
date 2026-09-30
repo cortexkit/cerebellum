@@ -93,6 +93,7 @@ fn main() {
                     cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
                     grantee,
                     identity: JournalIdentity {
+                        witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
                         principal: "prefrontal-core".to_string(),
                         conversation_key: "live-probe".to_string(),
                         agent_project_id: grantee.to_string(),

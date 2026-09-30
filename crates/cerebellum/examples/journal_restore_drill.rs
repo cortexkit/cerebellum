@@ -180,6 +180,7 @@ fn main() -> ExitCode {
         // the open reservation is on disk when this process exits -- the
         // state a crash between intent and outcome leaves behind.
         let identity = JournalIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
             principal: "drill".into(),
             conversation_key: "journal-restore-drill".into(),
             agent_project_id: "drill".into(),

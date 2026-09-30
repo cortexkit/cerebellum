@@ -134,6 +134,16 @@ pub fn drive_for_test() -> Planes {
 RUST
 expect "an offender in a function named for tests" 1 "crates/demo/src/lib.rs:24: Planes::new(" "$tree"
 
+tree="$(fresh_tree call_records)"
+cat >>"$tree/crates/demo/src/lib.rs" <<'RUST'
+
+#[test]
+fn durable_call_records() {
+    let _ = CallRecords::open_durable(0);
+}
+RUST
+expect "the durable call records opened in a test" 1 "CallRecords::open_durable(" "$tree"
+
 tree="$(fresh_tree integration)"
 cat >>"$tree/crates/demo/tests/wire.rs" <<'RUST'
 

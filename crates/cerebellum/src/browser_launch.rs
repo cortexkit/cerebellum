@@ -1730,6 +1730,9 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
         intent: &AuthorizedLaunchIntent,
     ) -> Result<Self::Handle, CoreJournalError> {
         let identity = JournalIdentity {
+            // A launch is not a plane whose commitment settles a tool call, so
+            // its commit must not make concurrent calls read as "may have run".
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::outside_tool_calls(),
             principal: intent.route.principal.clone(),
             conversation_key: intent.route.conversation_key.clone(),
             agent_project_id: intent.route.agent_project_id.clone(),
