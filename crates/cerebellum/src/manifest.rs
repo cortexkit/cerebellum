@@ -248,9 +248,7 @@ fn build_provenance() -> Option<ManifestProvenance> {
                     .then(|| build_git_sha_absence_reason(rev, tree)),
             )
             .with_build_git_sha(build_git_sha)
-            .with_wire_crate_version(Some(
-                subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string(),
-            )),
+            .with_wire_crate_version(Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string())),
     )
 }
 
