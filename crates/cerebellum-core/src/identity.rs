@@ -128,6 +128,10 @@ pub struct RouteIdentity {
     /// The project root remains available as routing metadata, but is not used
     /// when an admitted agentProjectId is present.
     pub project_root: PathBuf,
+    /// The request being served under this identity, marked when a plane
+    /// commits a dispatch for it. A route's stored identity carries a detached
+    /// one; the tool handler gives each request's copy its own.
+    pub witness: crate::dispatch_witness::DispatchWitness,
 }
 
 impl RouteIdentity {
@@ -157,6 +161,7 @@ impl RouteIdentity {
             session_kind,
             profile_disposition,
             project_root: identity.project_root.clone(),
+            witness: crate::dispatch_witness::DispatchWitness::detached(),
         }
     }
 
@@ -424,6 +429,7 @@ impl AcceptedBindFacts {
                 session_kind: SessionKind::Ephemeral,
                 profile_disposition: ProfileDisposition::None,
                 project_root: self.identity.project_root.clone(),
+                witness: self.identity.witness.clone(),
             },
             principal: self.principal.clone(),
             agent_project_id_attested: false,

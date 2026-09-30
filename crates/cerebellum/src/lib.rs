@@ -4067,7 +4067,7 @@ async fn handle_keyed_tool_request(
     // A body that does not decode, or is not an object, is left to the call's
     // own envelope check, which already refuses it by name.
     let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(&frame.body) else {
-        return handle_tool_request(frame, writer, planes).await;
+        return handle_tool_request(frame, writer, planes, &CallObservation::new()).await;
     };
     let call_key = match object.remove("call_key") {
         None => None,
@@ -4103,7 +4103,7 @@ async fn handle_keyed_tool_request(
         return handle_tool_withdraw(&object, (ver, channel, epoch, corr), writer, planes).await;
     }
     let Some(call_key) = call_key else {
-        return handle_tool_request(frame, writer, planes).await;
+        return handle_tool_request(frame, writer, planes, &CallObservation::new()).await;
     };
     let mut call = frame;
     call.body = serde_json::to_vec(&Value::Object(object)).map_err(ModuleError::Json)?;
@@ -4111,15 +4111,27 @@ async fn handle_keyed_tool_request(
     // Nothing is lost by not recording it: `handle_tool_request` refuses any
     // call on an unbound route (`route_not_bound`) before it does anything.
     let Some(facts) = planes.routes.get(channel, epoch) else {
-        return handle_tool_request(call, writer, planes).await;
+        return handle_tool_request(call, writer, planes, &CallObservation::new()).await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
-    let ticket = match planes.calls.begin(
-        &principal,
-        &call_key,
-        &facts.identity.conversation_key,
-        wall_clock_ms(),
-    ) {
+    // The record is synced to disk before the call may proceed. The write and
+    // its fsync run on the blocking pool, not on this runtime thread, and the
+    // call waits for them.
+    let begun = {
+        let calls = Arc::clone(&planes.calls);
+        let conversation_key = facts.identity.conversation_key.clone();
+        let call_key = call_key.clone();
+        tokio::task::spawn_blocking(move || {
+            calls.begin(&principal, &call_key, &conversation_key, wall_clock_ms())
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Begin::Unavailable(call_records::CallRecordError::WriteFailed(format!(
+                "the record task did not finish: {error}"
+            )))
+        })
+    };
+    let ticket = match begun {
         Begin::Execute(ticket) => ticket,
         Begin::Replay(reply) => {
             return send(writer, reply.readdressed(ver, channel, epoch, corr)).await;
@@ -4190,16 +4202,21 @@ async fn handle_keyed_tool_request(
     // follows the reply must find it. Every other frame (a consent question,
     // say) is forwarded untouched.
     let (proxy, mut outgoing) = mpsc::channel::<Frame>(16);
-    let mut ticket = Some(ticket);
+    let mut pending = PendingSettlement {
+        ticket: Some(ticket),
+        observation: CallObservation::new(),
+        unattributed_at_start: cerebellum_core::dispatch_witness::unattributed_commit_count(),
+        request: (channel, epoch, corr),
+    };
     let result = {
-        let call = handle_tool_request(call, &proxy, planes);
+        let observation = pending.observation.clone();
+        let call = handle_tool_request(call, &proxy, planes, &observation);
         tokio::pin!(call);
         loop {
             tokio::select! {
                 biased;
                 Some(out) = outgoing.recv() => {
-                    forward_recording_reply(out, (channel, epoch, corr), &mut ticket, writer, planes)
-                        .await?;
+                    forward_recording_reply(out, &mut pending, writer, planes).await?;
                 }
                 result = &mut call => break result,
             }
@@ -4207,12 +4224,14 @@ async fn handle_keyed_tool_request(
     };
     drop(proxy);
     while let Ok(out) = outgoing.try_recv() {
-        forward_recording_reply(out, (channel, epoch, corr), &mut ticket, writer, planes).await?;
+        forward_recording_reply(out, &mut pending, writer, planes).await?;
     }
     // No reply: the route closed while the call ran, so nobody is owed one.
     // The call may have acted, which is what the record now says.
-    if let Some(ticket) = ticket.take() {
-        planes.calls.settle_unknown(ticket, wall_clock_ms());
+    if let Some(ticket) = pending.ticket.take() {
+        let calls = Arc::clone(&planes.calls);
+        let _ = tokio::task::spawn_blocking(move || calls.settle_unknown(ticket, wall_clock_ms()))
+            .await;
     }
     // A task the call started (a consent question still waiting for its answer)
     // can hold a clone of the channel past the call. Keep forwarding for it.
@@ -4227,24 +4246,97 @@ async fn handle_keyed_tool_request(
     result
 }
 
+/// What a keyed call's handler watches while the call runs.
+///
+/// Armed for every tool request, keyed or not, so that in a running module a
+/// dispatch commitment made under a detached witness always means a commit
+/// site lost its request's witness.
+#[derive(Clone)]
+struct CallObservation {
+    /// Marked at a plane's dispatch commitment for this request.
+    dispatch: cerebellum_core::dispatch_witness::DispatchWitness,
+    /// Set just before the request is handed to a plane every one of whose
+    /// dispatches passes a commitment that marks `dispatch`.
+    commit_point: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CallObservation {
+    fn new() -> Self {
+        Self {
+            dispatch: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
+            commit_point: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn commit_point_follows(&self) {
+        self.commit_point
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A keyed call whose reply has not been recorded yet.
+struct PendingSettlement {
+    ticket: Option<journal::call_records::CallTicket>,
+    observation: CallObservation,
+    unattributed_at_start: u64,
+    request: (u16, u32, u64),
+}
+
+/// Whether `reply` is one `handle_tool_request` sends from its own checks,
+/// before any plane is reached. These are the refusals that prove by
+/// themselves that nothing ran.
+fn refused_before_dispatch(reply: &Frame) -> bool {
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    match reply.header.ty {
+        // The envelope and argument checks answer in the reply body.
+        FrameType::Response => body["outcome"] == "invalid_request",
+        FrameType::Error => body["code"].as_str().is_some_and(|code| {
+            [
+                "invalid_request",
+                "route_not_bound",
+                "capability_denied",
+                "computer_plane_unavailable",
+                "request_not_interruptible",
+                cerebellum_core::principal::SESSION_CALLER_NOT_ADMITTED,
+                CapabilityWithheld::Unknown.reason_code(),
+                CapabilityWithheld::BrowserNotConfigured.reason_code(),
+                CapabilityWithheld::NotAdmitted.reason_code(),
+            ]
+            .contains(&code)
+        }),
+        _ => false,
+    }
+}
+
 /// Forward one frame of a keyed call, recording the call's reply first when
 /// this frame is that reply.
 async fn forward_recording_reply(
     out: Frame,
-    (channel, epoch, corr): (u16, u32, u64),
-    ticket: &mut Option<journal::call_records::CallTicket>,
+    pending: &mut PendingSettlement,
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
     let is_reply = matches!(out.header.ty, FrameType::Response | FrameType::Error)
-        && (out.header.channel, out.header.epoch, out.header.corr) == (channel, epoch, corr);
+        && (out.header.channel, out.header.epoch, out.header.corr) == pending.request;
     if is_reply {
-        if let Some(ticket) = ticket.take() {
-            planes.calls.settle(
-                ticket,
-                journal::call_records::Settlement::from_reply(&out),
-                wall_clock_ms(),
-            );
+        if let Some(ticket) = pending.ticket.take() {
+            let evidence = journal::call_records::DispatchEvidence {
+                committed: pending.observation.dispatch.committed(),
+                commit_point: pending
+                    .observation
+                    .commit_point
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                unattributed_commit: cerebellum_core::dispatch_witness::unattributed_commit_count()
+                    != pending.unattributed_at_start,
+                refused_before_dispatch: refused_before_dispatch(&out),
+            };
+            // Written before the reply is forwarded, on the blocking pool.
+            let calls = Arc::clone(&planes.calls);
+            let settlement = journal::call_records::Settlement::from_reply(&out, evidence);
+            let _ = tokio::task::spawn_blocking(move || {
+                calls.settle(ticket, settlement, wall_clock_ms())
+            })
+            .await;
         }
     }
     send(writer, out).await
@@ -4382,6 +4474,7 @@ async fn handle_tool_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
+    call: &CallObservation,
 ) -> Result<(), ModuleError> {
     let route_bindings = &planes.routes;
     let channel = frame.header.channel;
@@ -4476,7 +4569,7 @@ async fn handle_tool_request(
         .await;
     };
 
-    let Some(accepted_facts) = route_bindings.get(channel, epoch) else {
+    let Some(mut accepted_facts) = route_bindings.get(channel, epoch) else {
         return send_route_error(
             writer,
             ver,
@@ -4488,6 +4581,9 @@ async fn handle_tool_request(
         )
         .await;
     };
+    // This request's copy of the route identity carries its own witness, so a
+    // browser dispatch committed for it marks this request and no other.
+    accepted_facts.identity.witness = call.dispatch.clone();
     // Session admission, before the capability scope and before anything
     // below reads a grant, asks a person or reserves a journal entry; see
     // `send_session_caller_not_admitted`. Every tool call acts in the route's
@@ -4695,6 +4791,10 @@ async fn handle_tool_request(
             )
             .await;
         };
+        // Every computer capability passes the audit journal's dispatch
+        // commitment before its first input, so an unmarked witness after this
+        // point means nothing was dispatched.
+        call.commit_point_follows();
         let result = plane
             .serve(
                 servable,
@@ -4706,6 +4806,7 @@ async fn handle_tool_request(
                     // choose is a lease granted to whoever asks for it.
                     grantee: &accepted_facts.identity.agent_project_id,
                     identity: cerebellum_core::journal::JournalIdentity {
+                        witness: call.dispatch.clone(),
                         principal: accepted_facts
                             .principal
                             .as_ref()
@@ -4783,6 +4884,12 @@ async fn handle_tool_request(
         )
         .await;
     };
+    // These browser capabilities all pass `BrowserPlane::commit` before any
+    // CDP command. `wait_for` has no dispatch commitment, so for it an
+    // unmarked witness proves nothing.
+    if capability != browser::BrowserCapability::WaitFor {
+        call.commit_point_follows();
+    }
     let result = serve_browser_with_consent(
         planes,
         &accepted_facts,
@@ -5815,7 +5922,9 @@ mod tests {
             )
             .unwrap();
             let (tx, mut rx) = mpsc::channel(2);
-            handle_tool_request(flat_frame, &tx, &planes).await.unwrap();
+            handle_tool_request(flat_frame, &tx, &planes, &CallObservation::new())
+                .await
+                .unwrap();
             handle_management_request(management_frame, &tx, &facts, &planes)
                 .await
                 .unwrap();
@@ -8538,7 +8647,9 @@ mod cancel_frame_tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         // Deliberately NOT registered: the only way to reach the state.
-        handle_tool_request(request, &tx, &planes).await.unwrap();
+        handle_tool_request(request, &tx, &planes, &CallObservation::new())
+            .await
+            .unwrap();
 
         let reply = rx.recv().await.unwrap();
         assert_eq!(reply.header.ty, FrameType::Error);

@@ -2273,6 +2273,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
     );
     let accepted = AcceptedBindFacts {
         identity: RouteIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
             conversation_key: "isolated-conversation".to_string(),
             agent_project_id: "isolated-project".to_string(),
             session_kind: SessionKind::Primary,
@@ -4645,8 +4646,9 @@ fn body(frame: &Frame) -> Value {
 }
 
 /// Bind a second route, 10/3, for the same conversation under a different
-/// principal (`reserved:prefrontal-core`), so calls on the two routes carry
-/// the same keys from two principals.
+/// principal (`direct`), so calls on the two routes carry the same keys from
+/// two principals. Only the session caller is admitted to act in a
+/// conversation, so this principal's calls are refused before dispatch.
 async fn bind_second_principal(planes: &Planes) {
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 10,
@@ -4655,9 +4657,7 @@ async fn bind_second_principal(planes: &Planes) {
             module_id: "cerebellum".into(),
         },
         identity: BindIdentity::new("/test/project", "test", "test-session"),
-        principal: Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
-        }),
+        principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
@@ -4759,8 +4759,10 @@ async fn the_same_call_key_from_two_principals_is_two_records() {
     let (tx, mut rx) = mpsc::channel(8);
     let first = allowed_keyed_navigation(&planes, &tx, &mut rx, "shared-key").await;
 
-    // The conversation now holds the grant, so the other principal's call
-    // navigates without asking, and must run: it is a different call.
+    // The other principal's call with the same key is its own call: it is
+    // not answered with the first one's reply. It is refused before dispatch,
+    // since that principal may not act in a conversation, and its record
+    // says so.
     let second = exchange(
         &planes,
         &tx,
@@ -4768,19 +4770,24 @@ async fn the_same_call_key_from_two_principals_is_two_records() {
         keyed_navigation(10, 803, "shared-key"),
     )
     .await;
-    assert_eq!(second.header.ty, FrameType::Response, "{}", body(&second));
-    assert_eq!(body(&second)["outcome"], "ok", "{}", body(&second));
     assert_eq!(
-        launcher.effects.lock().unwrap().as_slice(),
-        ["navigate", "navigate"],
+        error_code(&second),
+        cerebellum_core::principal::SESSION_CALLER_NOT_ADMITTED,
         "one principal's key answered for another's call"
     );
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
 
     // Each principal's withdraw reads its own record.
     let mine = withdraw(&planes, &tx, &mut rx, 9, 804, "shared-key").await;
-    assert_eq!(body(&mine)["result"], body(&first));
+    assert_eq!(
+        body(&mine),
+        json!({"answer": "completed", "result": body(&first)})
+    );
     let theirs = withdraw(&planes, &tx, &mut rx, 10, 805, "shared-key").await;
-    assert_eq!(body(&theirs)["result"], body(&second));
+    assert_eq!(
+        body(&theirs),
+        json!({"answer": "refused", "reason": "session_caller_not_admitted"})
+    );
 }
 
 #[tokio::test]

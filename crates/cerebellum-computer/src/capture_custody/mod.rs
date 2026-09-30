@@ -1517,6 +1517,7 @@ pub fn identity(
     session_kind: SessionKind,
 ) -> JournalIdentity {
     JournalIdentity {
+        witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
         principal: principal.into(),
         conversation_key: conversation_key.into(),
         agent_project_id: agent_project_id.into(),

@@ -193,6 +193,7 @@ impl JournalStore {
 
     pub(crate) fn browser_identity(identity: &JournalIdentity) -> CoreIdentity {
         CoreIdentity {
+            witness: identity.witness.clone(),
             principal: identity.principal.clone(),
             conversation_key: identity.conversation_key.clone(),
             agent_project_id: identity.agent_project_id.clone(),

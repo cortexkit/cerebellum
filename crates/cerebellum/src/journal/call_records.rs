@@ -144,12 +144,18 @@ pub struct ScopeIdentity {
 pub enum CallState {
     /// Accepted and running in this process.
     Started,
-    /// Replied with a result.
+    /// A dispatch was committed and the reply is final: the action ran.
     Replied,
-    /// Replied with a refusal: an error frame, or a consent denial.
+    /// Nothing was dispatched, and that is proven (see [`DispatchEvidence`]):
+    /// the action never ran.
     Refused,
-    /// Started, and no reply was recorded: the module stopped, or the route
-    /// closed, before the call answered. It may or may not have run.
+    /// Nothing was dispatched: the call stopped to ask a person
+    /// (`consent_pending`). It never ran, and never will, since cerebellum
+    /// holds no call to run later.
+    Asked,
+    /// It may or may not have run: a dispatch was committed and its effect is
+    /// indeterminate, or nothing proves that no dispatch was committed, or no
+    /// reply was recorded (the module stopped, or the route closed, first).
     Unknown,
 }
 
@@ -414,35 +420,81 @@ pub struct Settlement {
     reply: CachedReply,
 }
 
+/// What the handler observed while the call ran, beside its reply.
+///
+/// `refused` needs positive evidence that nothing was dispatched: a runner
+/// reads `refused` as "never ran" and may run the action again, so a wrong
+/// `refused` is a double execution. Everything ambiguous settles as unknown.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatchEvidence {
+    /// The request's witness was marked at a plane's dispatch commitment.
+    pub committed: bool,
+    /// The call reached a plane every one of whose dispatches passes a
+    /// commitment that marks the witness, so an unmarked witness means none
+    /// was made.
+    pub commit_point: bool,
+    /// A commitment no request could claim happened while the call ran. It
+    /// might have been this call's, so the call's unmarked witness proves
+    /// nothing.
+    pub unattributed_commit: bool,
+    /// The reply is one the tool handler sends from its checks before any
+    /// plane is reached (a malformed request, an unbound route, a refused
+    /// caller or capability).
+    pub refused_before_dispatch: bool,
+}
+
 impl Settlement {
-    /// Read the facts to record from the call's terminal frame.
+    /// Read the facts to record from the call's terminal frame and what the
+    /// handler observed.
     ///
     /// Only closed codes are taken, each checked to look like one, so a reply
     /// that put text where a code belongs records nothing for it.
-    pub fn from_reply(frame: &Frame) -> Self {
+    pub fn from_reply(frame: &Frame, evidence: DispatchEvidence) -> Self {
         let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
         let reply = CachedReply {
             frame: frame.clone(),
         };
-        if frame.header.ty == FrameType::Error {
-            let code = code(body.get("code"));
-            return Self {
-                state: CallState::Refused,
-                refusal_reason: code.clone(),
-                outcome: code,
-                effect_status: None,
-                posts_returned: None,
-                ask_id: None,
-                reply,
-            };
-        }
-        let outcome = code(body.get("outcome"));
+        let is_error = frame.header.ty == FrameType::Error;
+        let outcome = if is_error {
+            code(body.get("code"))
+        } else {
+            code(body.get("outcome"))
+        };
+        let effect_status = code(body.get("effect_status"));
+        let indeterminate = is_error
+            || outcome.as_deref() == Some("dispatch_outcome_unknown")
+            || effect_status.as_deref() == Some("effect_indeterminate");
+        let never_dispatched = !evidence.committed
+            && !evidence.unattributed_commit
+            && (evidence.refused_before_dispatch || evidence.commit_point);
+        let state = if evidence.committed {
+            if indeterminate {
+                CallState::Unknown
+            } else {
+                CallState::Replied
+            }
+        } else if !never_dispatched {
+            CallState::Unknown
+        } else if outcome.as_deref() == Some("consent_pending") {
+            CallState::Asked
+        } else {
+            CallState::Refused
+        };
         // A person's denial, as the computer plane words it and as the browser
         // plane words it (a refused authorization whose question was declined).
         let denied = outcome.as_deref() == Some("consent_denied")
             || (outcome.as_deref() == Some("authorization_denied")
                 && body.pointer("/detail/decision").and_then(Value::as_str) == Some("declined"));
-        let ask_id = (outcome.as_deref() == Some("consent_pending"))
+        let refusal_reason = (state == CallState::Refused).then(|| {
+            if denied {
+                "denied".to_string()
+            } else {
+                outcome
+                    .clone()
+                    .unwrap_or_else(|| "not_dispatched".to_string())
+            }
+        });
+        let ask_id = (state == CallState::Asked)
             .then(|| {
                 body.get("ask_id")
                     .and_then(Value::as_str)
@@ -450,14 +502,10 @@ impl Settlement {
             })
             .flatten();
         Self {
-            state: if denied {
-                CallState::Refused
-            } else {
-                CallState::Replied
-            },
-            refusal_reason: denied.then(|| "denied".to_string()),
+            state,
+            refusal_reason,
             outcome,
-            effect_status: code(body.get("effect_status")),
+            effect_status,
             posts_returned: body.get("posts_returned").and_then(Value::as_u64),
             ask_id,
             reply,
@@ -545,9 +593,7 @@ pub fn withdraw_answer(snapshot: &CallSnapshot) -> Value {
         }),
         // The call only asked a person and never acted. Cerebellum holds no
         // call to run later, so it is guaranteed never to run.
-        CallState::Replied if snapshot.outcome.as_deref() == Some("consent_pending") => {
-            json!({"answer": "withdrawn"})
-        }
+        CallState::Asked => json!({"answer": "withdrawn"}),
         CallState::Replied => match snapshot.reply.as_ref().and_then(CachedReply::result) {
             Some(result) => json!({"answer": "completed", "result": result}),
             None => json!({
@@ -873,13 +919,15 @@ impl CallRecords {
         if let Some(entry) = inner.entries.get(&key) {
             return match entry.record.state {
                 CallState::Started => Begin::InFlight,
-                CallState::Unknown => Begin::OutcomeUnknown,
-                CallState::Replied | CallState::Refused => match &entry.reply {
-                    Some(reply) => Begin::Replay(reply.clone()),
-                    None => Begin::NotRetained {
-                        outcome: entry.record.outcome.clone(),
-                    },
-                },
+                CallState::Unknown if entry.reply.is_none() => Begin::OutcomeUnknown,
+                CallState::Replied | CallState::Refused | CallState::Asked | CallState::Unknown => {
+                    match &entry.reply {
+                        Some(reply) => Begin::Replay(reply.clone()),
+                        None => Begin::NotRetained {
+                            outcome: entry.record.outcome.clone(),
+                        },
+                    }
+                }
             };
         }
         let record = CallRecord {
@@ -1035,6 +1083,15 @@ mod tests {
         .unwrap()
     }
 
+    /// A call whose dispatch was committed.
+    fn ran() -> DispatchEvidence {
+        DispatchEvidence {
+            committed: true,
+            commit_point: true,
+            ..DispatchEvidence::default()
+        }
+    }
+
     fn executed(begin: Begin) -> CallTicket {
         match begin {
             Begin::Execute(ticket) => ticket,
@@ -1100,9 +1157,10 @@ mod tests {
         let ticket = executed(first.begin("direct", "k", "c", 1_000));
         first.settle(
             ticket,
-            Settlement::from_reply(&reply(
-                json!({"outcome": "delivery_unconfirmed", "posts_returned": 2}),
-            )),
+            Settlement::from_reply(
+                &reply(json!({"outcome": "delivery_unconfirmed", "posts_returned": 2})),
+                ran(),
+            ),
             1_001,
         );
         drop(first);
@@ -1159,7 +1217,7 @@ mod tests {
         let ticket = executed(first.begin("direct", "k", "c", 1_000));
         first.settle(
             ticket,
-            Settlement::from_reply(&reply(json!({"outcome": "ok"}))),
+            Settlement::from_reply(&reply(json!({"outcome": "ok"})), ran()),
             1_000,
         );
         drop(first);
@@ -1175,7 +1233,7 @@ mod tests {
             let ticket = executed(records.begin("direct", &format!("k{index}"), "c", 1));
             records.settle(
                 ticket,
-                Settlement::from_reply(&reply(json!({"outcome": "ok"}))),
+                Settlement::from_reply(&reply(json!({"outcome": "ok"})), ran()),
                 1,
             );
         }
@@ -1196,14 +1254,59 @@ mod tests {
 
     #[test]
     fn only_code_shaped_values_are_recorded() {
-        let settlement = Settlement::from_reply(&reply(json!({
-            "outcome": "Typed secret text",
-            "effect_status": "effect_indeterminate",
-        })));
+        let settlement = Settlement::from_reply(
+            &reply(json!({
+                "outcome": "Typed secret text",
+                "effect_status": "effect_indeterminate",
+            })),
+            ran(),
+        );
         assert_eq!(settlement.outcome, None);
         assert_eq!(
             settlement.effect_status.as_deref(),
             Some("effect_indeterminate")
         );
+    }
+
+    /// `refused` only with proof nothing was dispatched; anything ambiguous is
+    /// unknown.
+    #[test]
+    fn a_call_is_refused_only_when_nothing_can_have_been_dispatched() {
+        let refusal = || reply(json!({"outcome": "no_grant", "effect_status": "not_dispatched"}));
+        let state = |evidence| Settlement::from_reply(&refusal(), evidence).state;
+        let reached_plane = DispatchEvidence {
+            commit_point: true,
+            ..DispatchEvidence::default()
+        };
+        assert_eq!(state(reached_plane), CallState::Refused);
+        assert_eq!(
+            Settlement::from_reply(&refusal(), reached_plane)
+                .refusal_reason
+                .as_deref(),
+            Some("no_grant")
+        );
+        // No commit point: the op could have acted without one.
+        assert_eq!(state(DispatchEvidence::default()), CallState::Unknown);
+        // A commit nobody could claim happened meanwhile.
+        assert_eq!(
+            state(DispatchEvidence {
+                unattributed_commit: true,
+                ..reached_plane
+            }),
+            CallState::Unknown
+        );
+        // Committed: it ran, whatever the reply's words.
+        assert_eq!(state(ran()), CallState::Replied);
+        let indeterminate = reply(
+            json!({"outcome": "delivery_unconfirmed", "effect_status": "effect_indeterminate"}),
+        );
+        assert_eq!(
+            Settlement::from_reply(&indeterminate, ran()).state,
+            CallState::Unknown
+        );
+        let pending = reply(json!({"outcome": "consent_pending", "ask_id": "ask-1"}));
+        let asked = Settlement::from_reply(&pending, reached_plane);
+        assert_eq!(asked.state, CallState::Asked);
+        assert_eq!(asked.ask_id.as_deref(), Some("ask-1"));
     }
 }

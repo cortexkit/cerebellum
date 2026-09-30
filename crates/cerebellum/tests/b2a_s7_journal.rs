@@ -22,6 +22,7 @@ use cerebellum::journal::{
 
 fn identity() -> JournalIdentity {
     JournalIdentity {
+        witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
         principal: "direct:agent".to_string(),
         conversation_key: "conv-1".to_string(),
         agent_project_id: "proj-1".to_string(),

@@ -431,6 +431,7 @@ impl JournalPin {
         // Build the reservation-bound identity from the validated facts only;
         // profile facts come from the validated current-open association.
         let identity = JournalIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
             principal: bind_facts.principal.clone(),
             conversation_key: bind_facts.conversation_key.clone(),
             agent_project_id: bind_facts.agent_project_id.clone(),
