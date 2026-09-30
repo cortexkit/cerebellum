@@ -455,6 +455,7 @@ async fn bind_route(
                 "browser.close"
             ]
         })),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

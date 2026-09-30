@@ -258,6 +258,7 @@ mod probe {
                 consumer_identity: None,
                 consumer_capabilities: Some(vec!["elicitation".to_string()]),
                 admission_facts: None,
+                scope: None,
             };
             let corr = self.corr();
             let frame = Frame::build(

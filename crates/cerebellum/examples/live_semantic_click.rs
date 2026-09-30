@@ -903,6 +903,7 @@ mod macos_probe {
                     "browser.close"
                 ]
             })),
+            scope: None,
         };
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,

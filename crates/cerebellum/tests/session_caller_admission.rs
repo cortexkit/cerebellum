@@ -104,6 +104,7 @@ async fn bind(planes: &Planes, principal: Option<Principal>, target: RouteTarget
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.launch", "browser.status", "browser.close"],
         })),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

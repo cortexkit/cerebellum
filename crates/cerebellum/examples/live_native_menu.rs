@@ -1213,6 +1213,7 @@ mod macos_probe {
                 "sessionKind": "primary",
                 "effectiveCapabilityScope": ["*"]
             })),
+            scope: None,
         };
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,

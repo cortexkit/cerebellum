@@ -136,6 +136,7 @@ async fn bind_management_route(planes: &Planes) {
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.open_grant"]
         })),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1690,6 +1691,7 @@ async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame 
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(admission_facts),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -4234,6 +4236,7 @@ async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
         ),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -4662,6 +4665,7 @@ async fn bind_second_principal(planes: &Planes) {
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
         ),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

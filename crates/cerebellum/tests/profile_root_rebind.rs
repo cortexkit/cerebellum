@@ -750,6 +750,7 @@ async fn bind_management_route_as(
             "sessionKind": "primary",
             "effectiveCapabilityScope": ["*"],
         })),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

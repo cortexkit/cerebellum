@@ -876,6 +876,7 @@ mod desk {
                     admission_facts: Some(
                         json!({"agentProjectId":self.project,"sessionKind":"primary","effectiveCapabilityScope":["*"]}),
                     ),
+                    scope: None,
                 };
                 let (writer, mut replies) = mpsc::channel(2);
                 cerebellum::handle_control_request_for_test_with_bindings(

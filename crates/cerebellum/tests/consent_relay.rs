@@ -89,6 +89,7 @@ async fn management_planes() -> Planes {
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.open_grant"]
         })),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

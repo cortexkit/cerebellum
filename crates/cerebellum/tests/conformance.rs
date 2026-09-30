@@ -126,6 +126,7 @@ async fn first_party_route_bind_is_acked() {
         principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
         admission_facts: Some(json!({"schema": 1, "verified_class": "member"})),
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -170,6 +171,7 @@ async fn ineligible_principal_receives_transport_rejection() {
         }),
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -252,6 +254,7 @@ async fn absent_principal_is_rejected() {
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -634,6 +637,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
             "effectiveCapabilityScope": ["browser.status"],
             "browserControlOperations": ["browser.status"],
         })),
+        scope: None,
     };
     let bind_frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -706,6 +710,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
             "sessionKind": "primary",
             "effectiveCapabilityScope": [],
         })),
+        scope: None,
     };
     let bind_frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1212,6 +1217,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         },
     )
     .await;

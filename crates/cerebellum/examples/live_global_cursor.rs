@@ -1141,6 +1141,7 @@ mod probe {
                 consumer_identity: None,
                 consumer_capabilities: Some(vec!["elicitation".to_string()]),
                 admission_facts: None,
+                scope: None,
             };
             let corr = self.corr();
             let body = serde_json::to_vec(&request).map_err(|error| error.to_string())?;

@@ -3886,6 +3886,11 @@ async fn handle_control_request(
             admission_facts,
             consumer_capabilities,
             target,
+            // The daemon's scope stamp is not read yet: cerebellum still takes
+            // the conversation from the bind identity and admits session
+            // callers by principal. Reading it belongs with recording scope in
+            // call records and letting a scope's owner withdraw a call.
+            scope: _,
         } => {
             // In-module principal default-deny backstop: the gateway policy
             // (subc-mcp) is the primary exclusion of cerebellum capabilities

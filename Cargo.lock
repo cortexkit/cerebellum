@@ -709,9 +709,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20d30ba73332abc412959d2d6de1e4f74356fba73a1f9a824272a6f64e8974ba"
+checksum = "a04b292ba293c304c9e075413ea90964bc6268a39a0400da34e890f440cc679d"
 dependencies = [
  "serde",
  "serde_json",
@@ -720,9 +720,9 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "354390487a061a9fd542517d7fde2ca3d7806fad51170e07a604ae5cb3748c2e"
+checksum = "9f758ed568ec6b60ea15db02009c89865453785bb29f0238f80bde3a1751bed9"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "libc",
  "rustix",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "getrandom",
  "hmac",

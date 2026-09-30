@@ -96,6 +96,7 @@ mod live {
             principal: Some(Principal::Direct),
             consumer_capabilities: Some(vec!["elicitation".to_string()]),
             admission_facts: None,
+            scope: None,
         };
         let (bind_writer, mut bind_replies) = mpsc::channel(2);
         let bind_frame = Frame::build_with_version(
