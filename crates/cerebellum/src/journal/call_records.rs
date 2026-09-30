@@ -77,9 +77,6 @@ pub const CALL_RECORD_FORMAT: cerebellum_core::format_floor::DurableFormat =
 /// The name `tool.withdraw` arrives under on a tool route.
 pub const WITHDRAW_OPERATION: &str = "tool.withdraw";
 
-/// The longest `call_key` accepted, in bytes (all of them ASCII).
-pub const CALL_KEY_MAX_BYTES: usize = 256;
-
 /// How long a record is kept after it was last written.
 pub const RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 
@@ -100,16 +97,11 @@ pub const CACHE_MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 /// How long a reply body is held for resends.
 pub const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
-/// Whether `key` is an acceptable `call_key`: 1 to 256 printable ASCII
-/// characters (space through tilde).
-///
-/// The single place the bound is checked. The shared wire crate is adding the
-/// same field with its own validator to the same bound; when this module moves
-/// to that release, this body becomes a call to it and nothing else changes.
+/// Whether `key` is an acceptable `call_key`, by the shared wire crate's own
+/// rule (1 to 256 printable ASCII characters, 0x21 to 0x7E, no space), so every
+/// provider and carrier agrees on the same bound.
 pub fn valid_call_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= CALL_KEY_MAX_BYTES
-        && key.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    subc_protocol::tool_call::validate_call_key(key).is_ok()
 }
 
 /// The label a record stores for the route's verified principal.
@@ -1100,12 +1092,13 @@ mod tests {
     }
 
     #[test]
-    fn the_key_bound_is_one_to_256_printable_ascii_characters() {
+    fn the_key_bound_is_the_wire_crates_one_to_256_printable_non_space_ascii() {
         assert!(valid_call_key("a"));
-        assert!(valid_call_key("pf:0193 ~ x"));
+        assert!(valid_call_key("pf:0193~x"));
         assert!(valid_call_key(&"k".repeat(256)));
         assert!(!valid_call_key(""));
         assert!(!valid_call_key(&"k".repeat(257)));
+        assert!(!valid_call_key("pf:0193 x"), "space is outside the bound");
         assert!(!valid_call_key("tab\there"));
         assert!(!valid_call_key("é"));
         assert!(!valid_call_key("line\n"));

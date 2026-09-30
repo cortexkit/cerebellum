@@ -237,15 +237,21 @@ fn build_provenance() -> Option<ManifestProvenance> {
     let rev = env!("CEREBELLUM_BUILD_REV");
     let tree = env!("CEREBELLUM_BUILD_TREE");
     let build_git_sha = attestable_commit(rev, tree);
-    Some(ManifestProvenance {
-        build_git_sha_absence_reason: build_git_sha
-            .is_none()
-            .then(|| build_git_sha_absence_reason(rev, tree)),
-        build_git_sha,
-        build_lock_digest: None,
-        wire_crate_version: Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
-        store_schema_version: None,
-    })
+    // Where the launch nonce was read from is left undeclared until this
+    // module reads it through the daemon's nonce accessor, which is what
+    // records the source.
+    Some(
+        ManifestProvenance::new()
+            .with_build_git_sha_absence_reason(
+                build_git_sha
+                    .is_none()
+                    .then(|| build_git_sha_absence_reason(rev, tree)),
+            )
+            .with_build_git_sha(build_git_sha)
+            .with_wire_crate_version(Some(
+                subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string(),
+            )),
+    )
 }
 
 /// Why no commit is attested, when none is. A reader of an absent sha needs
