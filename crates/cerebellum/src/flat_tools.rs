@@ -130,9 +130,17 @@ fn declare_one_type(schema: &mut Value) {
             .filter(|(key, value)| branches.iter().all(|branch| branch.get(key) == Some(value)))
             .collect();
         Value::Object(shared)
-    } else if let [single, many] | [many, single] = branches.as_slice() {
+    } else if branches.len() == 2 {
+        // Whichever order the two branches come in, one must be an array whose
+        // elements have the other branch's type.
+        let is_array = |branch: &Value| branch.get("type").and_then(Value::as_str) == Some("array");
+        let (many, single) = if is_array(&branches[0]) {
+            (&branches[0], &branches[1])
+        } else {
+            (&branches[1], &branches[0])
+        };
         let single_type = single.get("type").and_then(Value::as_str);
-        let many_is_array_of_single = many.get("type").and_then(Value::as_str) == Some("array")
+        let many_is_array_of_single = is_array(many)
             && many
                 .get("items")
                 .and_then(|items| items.get("type"))
@@ -955,6 +963,32 @@ mod tests {
     /// field such as `{"enum": [...]}` is valid JSON Schema and passes every
     /// other provider, so only this check catches it before a head's session
     /// breaks.
+    /// A one-or-many field collapses to its array whichever order its branches
+    /// come in, keeps its description, and a same-type pair keeps only the
+    /// keywords both branches share.
+    #[test]
+    fn alternatives_collapse_to_one_declared_type() {
+        let one = json!({"type":"string","minLength":1});
+        let many = json!({"type":"array","items":{"type":"string","minLength":1},"minItems":1});
+        for branches in [json!([one, many]), json!([many, one])] {
+            let mut schema = json!({"anyOf": branches, "description": "roles"});
+            declare_one_type(&mut schema);
+            assert_eq!(schema["type"], "array", "{schema}");
+            assert_eq!(schema["items"]["type"], "string", "{schema}");
+            assert_eq!(schema["description"], "roles", "{schema}");
+            assert!(schema.get("anyOf").is_none(), "{schema}");
+        }
+
+        let mut same = json!({"oneOf":[{"type":"string"},{"type":"string","minLength":1}]});
+        declare_one_type(&mut same);
+        assert_eq!(same, json!({"type":"string"}));
+
+        // A mix this function does not recognise is left for the type test to name.
+        let mut mixed = json!({"anyOf":[{"type":"string"},{"type":"integer"}]});
+        declare_one_type(&mut mixed);
+        assert!(mixed.get("type").is_none(), "{mixed}");
+    }
+
     #[test]
     fn every_advertised_property_declares_its_type() {
         let browser_names: Vec<String> = [
