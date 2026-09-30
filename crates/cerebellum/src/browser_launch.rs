@@ -35,8 +35,13 @@ const ATTESTATION_SLOT: &str = "browser.launch.attestation";
 /// active, profile refused), which is the safe direction.
 const RECOVERY_CLEAR_SLOT: &str = "browser.launch.recovery_clear";
 const RECOVERY_CLEAR_FORMAT_VERSION: &str = "ck-browser-launch-recovery-clear/v1";
-/// Version 5 admits `capture` as a launch profile (see [`LaunchProfile`]).
-const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v5";
+/// Version 6 admits `scope_revoked` as a session's terminal outcome (see
+/// [`LaunchSessionCompletion`]). A build that reads only up to version 5 has
+/// no such outcome, so records written from now on carry version 6 and such a
+/// build refuses them by name instead of misreading them.
+const LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v6";
+/// Version 5 admitted `capture` as a launch profile (see [`LaunchProfile`]).
+const V5_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v5";
 /// Version 4 added `boot_id` to the process generation. When present, the
 /// generation's start time is clock ticks since that boot, not epoch microseconds.
 const V4_LAUNCH_CODEC_VERSION: &str = "ck-browser-launch-attestation/v4";
@@ -1419,7 +1424,7 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
             let intent = serde_json::from_slice::<AuthorizedLaunchIntent>(&audit.descriptor_bytes)
                 .ok()
                 .filter(|intent| match intent.format_version.as_str() {
-                    LAUNCH_CODEC_VERSION => true,
+                    LAUNCH_CODEC_VERSION | V5_LAUNCH_CODEC_VERSION => true,
                     // No writer before version 5 could record a capture, so
                     // an older record claiming one is not a record this
                     // module wrote, and recovery must not act on it.
@@ -1455,7 +1460,9 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                                 // pair a boot with the wrong unit.
                                 && (matches!(
                                     intent.format_version.as_str(),
-                                    LAUNCH_CODEC_VERSION | V4_LAUNCH_CODEC_VERSION
+                                    LAUNCH_CODEC_VERSION
+                                        | V5_LAUNCH_CODEC_VERSION
+                                        | V4_LAUNCH_CODEC_VERSION
                                 ) || attestation
                                         .generation
                                         .process_generation
@@ -2940,7 +2947,7 @@ mod tests {
             crate::browser_session::BrowserSessionTerminalOutcome::Closed
         );
         assert_eq!(completion.failure, None);
-        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v5");
+        assert_eq!(LAUNCH_CODEC_VERSION, "ck-browser-launch-attestation/v6");
     }
 
     fn terminal_completion(
@@ -4143,6 +4150,53 @@ mod tests {
         assert_eq!(journal.core.status().active_reservation_count, 0);
         assert_eq!(journal.core.status().entry_count, 1);
         assert_eq!(terminal_completion(&journal, sequence), expected);
+    }
+
+    /// A session closed because its scope was revoked is recorded as such,
+    /// and reads back through the current reader.
+    #[test]
+    fn a_scope_revoked_session_round_trips_through_the_launch_journal() {
+        let mut journal = DurableLaunchJournal::open(
+            JournalConfig {
+                journal_retention_bytes: 64 * 1024,
+                journal_max_entry_bytes: 32 * 1024,
+            },
+            InMemoryJournalStorage::new(),
+        )
+        .expect("open launch journal");
+        let request = request();
+        let (sequence, _) = dispatch_attempt(&mut journal, &request);
+        journal
+            .finalize_session(
+                &request.launch_attempt_id,
+                crate::browser_session::BrowserSessionTerminalOutcome::ScopeRevoked,
+            )
+            .expect("finalize launch session");
+        let completion = terminal_completion(&journal, sequence);
+        assert_eq!(
+            completion.terminal_outcome,
+            crate::browser_session::BrowserSessionTerminalOutcome::ScopeRevoked
+        );
+        assert_eq!(completion.format_version, LAUNCH_CODEC_VERSION);
+        let written = String::from_utf8(journal.core.export_bytes()).unwrap();
+        assert!(written.contains("\"scope_revoked\""), "{written}");
+    }
+
+    /// A build that reads up to version 5, which has no `scope_revoked`
+    /// outcome, refuses a version 6 record by name rather than misreading it.
+    #[test]
+    fn a_version_5_reader_refuses_a_version_6_record_by_name() {
+        let version_5_reader = cerebellum_core::format_floor::DurableFormat::new(
+            LAUNCH_ENTRY_FORMAT.name,
+            cerebellum_core::format_floor::tag_version(V5_LAUNCH_CODEC_VERSION),
+        );
+        let refused = version_5_reader
+            .refuse_newer_tag(LAUNCH_CODEC_VERSION, V5_LAUNCH_CODEC_VERSION)
+            .expect_err("a version 5 reader must refuse a version 6 record");
+        assert_eq!(refused.format, "launch-attestation");
+        assert_eq!(refused.found, 6);
+        assert_eq!(refused.supported, 5);
+        assert_eq!(LAUNCH_ENTRY_FORMAT.version, 6);
     }
 
     #[test]

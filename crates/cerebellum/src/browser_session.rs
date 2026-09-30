@@ -74,6 +74,10 @@ pub enum BrowserSessionTerminalOutcome {
     CdpFailure,
     IdleExpired,
     RouteUnbound,
+    /// The session scope the browser was opened under ended: its owner removed
+    /// it or began a new session under the same ref. Distinct from
+    /// `RouteUnbound`, which is an ordinary route close the work survives.
+    ScopeRevoked,
     ModuleShutdown,
     CleanupFailure,
     StartupIndeterminate,
@@ -88,6 +92,7 @@ impl BrowserSessionTerminalOutcome {
             Self::CdpFailure => "cdp_failure",
             Self::IdleExpired => "idle_expired",
             Self::RouteUnbound => "route_unbound",
+            Self::ScopeRevoked => "scope_revoked",
             Self::ModuleShutdown => "module_shutdown",
             Self::CleanupFailure => "cleanup_failure",
             Self::StartupIndeterminate => "startup_indeterminate",
@@ -2266,6 +2271,14 @@ impl BrowserSessions {
             return json!({"outcome": "browser_session_not_found"});
         }
         meta.record(browser_session_id).close_result()
+    }
+
+    /// Whether the route has a session that has not finished: starting,
+    /// ready, or being torn down. Read-only, and takes only the brief registry
+    /// and meta locks.
+    pub fn has_open_session(&self, route_key: &str) -> bool {
+        self.active_cell_recovering(route_key)
+            .is_some_and(|cell| !recovered(cell.meta()).lifecycle.is_settled())
     }
 
     pub fn teardown_route(

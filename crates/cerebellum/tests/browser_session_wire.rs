@@ -2293,6 +2293,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
         effective_capability_scope: None,
         consumer_capabilities: Vec::new(),
         surface: RouteSurface::Tools,
+        scope: None,
     };
     // It must succeed: a refusal before the registry opened would also leave
     // the data home empty, and would pass the parent's check for nothing.

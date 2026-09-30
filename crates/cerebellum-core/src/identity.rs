@@ -317,6 +317,12 @@ pub struct AcceptedBindFacts {
     /// Which surface this route reaches, so a request on it is parsed as the
     /// envelope that surface uses rather than as whichever one it resembles.
     pub surface: RouteSurface,
+    /// The session scope the daemon stamped on this route's bind, if it was
+    /// opened under one. The daemon's word, fixed for the route's life: a
+    /// change that revokes authority closes the route instead. Never read from
+    /// a request body. `None` for a route opened without a scope, which is
+    /// served exactly as routes were before scopes existed.
+    pub scope: Option<subc_protocol::scope::ScopeStamp>,
 }
 
 impl AcceptedBindFacts {
@@ -347,7 +353,14 @@ impl AcceptedBindFacts {
             },
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
             surface: RouteSurface::from_target(target),
+            scope: None,
         }
+    }
+
+    /// These facts carrying the scope stamp the daemon put on the bind.
+    pub fn with_scope(mut self, scope: Option<subc_protocol::scope::ScopeStamp>) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Why these admission facts must refuse the bind outright, if they must.
@@ -438,6 +451,9 @@ impl AcceptedBindFacts {
             effective_capability_scope: Some(Vec::new()),
             consumer_capabilities: self.consumer_capabilities.clone(),
             surface: self.surface,
+            // A scope is session identity, like the conversation above, so an
+            // operator's view outside any session carries none.
+            scope: None,
         }
     }
 
