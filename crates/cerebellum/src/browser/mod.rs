@@ -3906,13 +3906,13 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         BrowserToolDefinition {
             name: NAVIGATE,
             description: "Navigate managed Chromium through the enforcing connector. Set read_page to return a bounded snapshot of the landing page.",
-            request_schema: json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return an accessibility snapshot of the landing page."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
+            request_schema: json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"type":"string","enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return an accessibility snapshot of the landing page."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
             result_schema: navigate_result_schema(),
         },
         BrowserToolDefinition {
             name: SNAPSHOT,
             description: "Capture a compact actionable snapshot by default; use ax or dom_full only when something is missing.",
-            request_schema: json!({"type":"object","properties":{"mode":{"enum":["actionable","ax","dom_full"],"default":"actionable"},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Serialized reply cap including refs; below 1024 uses a fixed 1024-byte metadata envelope. If truncated, narrow the page."}},"additionalProperties":false}),
+            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Serialized reply cap including refs; below 1024 uses a fixed 1024-byte metadata envelope. If truncated, narrow the page."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
         },
         BrowserToolDefinition {
