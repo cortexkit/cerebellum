@@ -35,6 +35,7 @@ pub mod flat_tools;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
+mod launch_nonce;
 pub mod launch_recovery;
 pub mod login_capture;
 pub mod login_import;
@@ -1278,6 +1279,10 @@ fn consent_context(
 /// It also decides how the process ends: a SIGTERM ending does not return at
 /// all, because the process re-raises the signal once teardown has finished.
 pub async fn run_entry() -> Result<(), ModuleError> {
+    // First, before anything can spawn a process: loading the browser
+    // configuration can already run a browser probe, and a child started
+    // before this read would inherit the launch-nonce pipe.
+    launch_nonce::read_before_any_spawn();
     let config = ModuleConfig::from_env()?;
     conclude(run(config, |_| {}).await)
 }
@@ -2012,9 +2017,9 @@ async fn send_hello(
             "route.status".to_string(),
             MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
         ]),
-        launch_nonce: std::env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
-            .ok()
-            .filter(|value| !value.is_empty()),
+        launch_nonce: launch_nonce::for_hello().map_err(|error| {
+            ModuleError::Message(format!("cannot read the launch nonce: {error}"))
+        })?,
     })
     .map_err(ModuleError::Json)?;
     body["manifest"] = serialize_manifest_with_computer_plane_configured(

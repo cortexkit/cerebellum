@@ -278,8 +278,8 @@ mod macos {
         deadline: Duration,
     ) -> Result<(), CrashReportRefusal> {
         let deadline = Instant::now() + deadline;
-        let mut child = query
-            .command(path)
+        let mut command = query.command(path);
+        let mut child = crate::launch_nonce::without_launch_nonce(&mut command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

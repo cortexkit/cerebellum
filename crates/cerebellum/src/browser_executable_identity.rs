@@ -210,6 +210,7 @@ fn read_signing_details(
     deadline: std::time::Instant,
 ) -> Result<SigningDetails, Value> {
     let mut command = std::process::Command::new(verifier);
+    crate::launch_nonce::without_launch_nonce(&mut command);
     command.args(["-d", "--verbose=4"]);
     if let Some(architecture) = architecture {
         command.args(["--arch", architecture]);
