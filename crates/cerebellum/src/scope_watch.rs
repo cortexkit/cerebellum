@@ -240,8 +240,10 @@ pub struct ScopeKey {
 
 impl std::hash::Hash for ScopeKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // `Principal` has no hash of its own; its label is equal exactly when
-        // the principals are.
+        // `Principal` does not implement `Hash`, so its label (the
+        // `reserved:<module>` form call records use) is hashed instead. Two
+        // principals have the same label exactly when they are equal, so this
+        // agrees with `Eq`.
         crate::journal::call_records::principal_label(Some(&self.owner)).hash(state);
         self.scope_ref.hash(state);
         self.scope_epoch.hash(state);
@@ -267,7 +269,7 @@ impl ScopeKey {
 
 #[derive(Debug, Default)]
 struct Watched {
-    /// The conversations routes under this scope carried when they closed.
+    /// The conversation key of each route under this scope that has closed.
     conversations: BTreeSet<String>,
     /// Woken when another route under the scope closes while its watcher
     /// waits out an interval, so that close is asked about at once rather

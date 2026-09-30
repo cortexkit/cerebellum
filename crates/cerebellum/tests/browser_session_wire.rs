@@ -5176,7 +5176,8 @@ async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
     cerebellum::handle_frame_for_test(goodbye(9), &tx, &planes)
         .await
         .unwrap();
-    // Torn down on the frame loop itself, before the GOODBYE returns.
+    // The browser is torn down on the frame loop itself, before the GOODBYE
+    // returns.
     assert!(!planes.sessions.has_open_session("test-session"));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
@@ -5509,7 +5510,8 @@ async fn close_scoped_route(
     cerebellum::handle_frame_for_test(goodbye(12), tx, planes)
         .await
         .unwrap();
-    // Nothing is torn down by the close itself.
+    // Closing the route alone leaves the browser open while the daemon is
+    // asked about the scope.
     assert!(planes.sessions.has_open_session("test-session"));
     next_describe(rx).await
 }

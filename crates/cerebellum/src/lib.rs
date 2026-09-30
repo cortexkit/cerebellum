@@ -2676,20 +2676,13 @@ async fn handle_frame(
             send(writer, pong).await?;
             Ok(true)
         }
-        // An answer to a question this module asked. Requests are what we
-        // ANSWER and responses are what we RECEIVE, so an inbound response can
-        // only belong to an exchange we opened; the direction settles ownership
-        // without a private correlation space.
-        //
-        // Without this arm the frame fell through to the catch-all and was
-        // dropped, so a question waited out its whole deadline and reported that
-        // nobody replied. That is indistinguishable from a consumer ignoring it,
-        // which is why the absence could not have been noticed from the outside.
         // The daemon's answer to a control request this module sent on its own
         // connection (`scope.describe`). The daemon's requests to the module
         // arrive as requests, so a response or error on channel 0 can only be
         // one of these; it is handed to whoever asked, or dropped if nobody
-        // still waits.
+        // still waits. Without this arm such an answer would be dropped by the
+        // branches below, which know only questions asked on route channels,
+        // so every describe would wait out its deadline as if unanswered.
         FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
             let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
             let answer = if frame.header.ty == FrameType::Response {
@@ -2700,6 +2693,15 @@ async fn handle_frame(
             planes.scopes.control.deliver(frame.header.corr, answer);
             Ok(true)
         }
+        // An answer to a question this module asked. Requests are what we
+        // ANSWER and responses are what we RECEIVE, so an inbound response can
+        // only belong to an exchange we opened; the direction settles ownership
+        // without a private correlation space.
+        //
+        // Without this arm the frame fell through to the catch-all and was
+        // dropped, so a question waited out its whole deadline and reported that
+        // nobody replied. That is indistinguishable from a consumer ignoring it,
+        // which is why the absence could not have been noticed from the outside.
         FrameType::Response => {
             let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
             if !planes

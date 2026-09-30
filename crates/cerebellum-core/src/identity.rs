@@ -357,7 +357,8 @@ impl AcceptedBindFacts {
         }
     }
 
-    /// These facts carrying the scope stamp the daemon put on the bind.
+    /// Attach the scope stamp the daemon put on the bind (`None` for a route
+    /// opened without a scope).
     pub fn with_scope(mut self, scope: Option<subc_protocol::scope::ScopeStamp>) -> Self {
         self.scope = scope;
         self
