@@ -1555,17 +1555,29 @@ mod tests {
     /// macOS only: the computer plane is built only there and on Windows, and
     /// its test driver is the macOS one. The screen is pinned unlocked, because
     /// a locked screen refuses every computer call before its parser runs and
-    /// would hide what this checks. The applications named are not installed,
-    /// so a call that wrongly went ahead could reach no real application.
+    /// would hide what this checks. No application name resolves to a running
+    /// process, so a call that wrongly went ahead could reach no real one.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_computer_call_missing_a_required_field_is_refused_before_dispatch() {
         use crate::computer_capability::{ComputerPlane, NativeComputerPlatformDriver};
+        use cerebellum_computer::platform::TargetResolution;
+
+        struct NothingRuns;
+        impl crate::management::TargetResolver for NothingRuns {
+            fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+                TargetResolution::NotRunning
+            }
+        }
+
         let mut planes = crate::Planes::with_browser_config_journaling(
             std::sync::Arc::new(cerebellum_core::health::HealthState::default()),
             None,
             crate::JournalPersistence::Isolated,
         );
+        planes.management = std::sync::Arc::new(crate::management::ManagementPlane::new(
+            std::sync::Arc::new(NothingRuns),
+        ));
         planes.computer = crate::computer_capability::computer_audit(
             crate::JournalPersistence::Isolated,
         )
