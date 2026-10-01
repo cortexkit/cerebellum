@@ -161,9 +161,9 @@ fn management_surface() -> ProviderRole {
             (
                 crate::management::CAPTURE_LOGIN,
                 "With the person's approval, have them log in to credential_domain in a fresh \
-                 throwaway browser, write the request Cookie header for fetch_url to one local \
-                 file deleted after 10 minutes, and return the ck auth commands the operator \
-                 runs to store it for insula. No cookie value is returned.",
+                 throwaway browser and store the request Cookie header for fetch_url in the \
+                 vault for insula as cookie:<credential_domain>:<account>. Replies with the \
+                 vault's outcome; no cookie value is returned.",
             ),
             (
                 crate::management::CLEAR_LAUNCH_RECOVERY,
@@ -181,7 +181,7 @@ fn management_surface() -> ProviderRole {
                 // cookie store after the person chooses a source browser.
                 ManagementOperationKind::Mutate
             } else if name == crate::management::CAPTURE_LOGIN {
-                // A capture writes a file holding a login onto this machine.
+                // A capture stores a login in the vault.
                 ManagementOperationKind::Mutate
             } else if name == crate::management::REVOKE_APP_GRANT {
                 // A revoke rewrites the durable grant store.
