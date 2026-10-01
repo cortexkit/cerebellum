@@ -71,7 +71,8 @@ impl Fact {
 
 /// How loudly the person's phone announces a card.
 ///
-/// Prefrontal core refuses a consent request without one. The rule this crate
+/// Prefrontal core, which puts consent questions to the person, refuses a
+/// consent request without one. The rule this crate
 /// follows: `High` when a tool call is held open while the person decides, so
 /// the agent is stuck until they answer; `Normal` when the question was asked
 /// ahead and the call that raised it has already returned.
@@ -322,7 +323,8 @@ pub(crate) fn core_refusals(params: &Value) -> Vec<String> {
     {
         refusals.push("`expires_in_ms` is not positive and at most 24 hours".into());
     }
-    // Core decodes both as optional, so an explicit null counts as absent.
+    // Core decodes `scope` and `args_digest` as optional, so an explicit null
+    // counts as absent.
     let has_digest = nonempty(&params["args_digest"]);
     let has_scope = !params["scope"].is_null();
     if !has_digest && !has_scope {
@@ -368,7 +370,8 @@ pub(crate) fn core_refusals(params: &Value) -> Vec<String> {
         refusals.push("`preview` is not a label and text".into());
     }
     if !params["requestedSchema"].is_null() {
-        // Core compares the two as sets, so order is not part of its contract.
+        // Core compares the schema's decision enum and the option ids as
+        // sets, so their order is not part of its contract.
         let mut answerable: Vec<&str> = params["requestedSchema"]
             .pointer("/properties/decision/enum")
             .and_then(Value::as_array)
@@ -497,8 +500,9 @@ mod every_card_kind {
     use crate::elicit::Elicitor;
     use std::sync::Arc;
 
-    /// The `params` exactly as they leave this module: the deadline
-    /// `Elicitor::ask` writes over whatever the builder put there.
+    /// The `params` exactly as they leave this module, with the
+    /// `expires_in_ms` that `Elicitor::ask` writes from `deadline` in place of
+    /// the builder's.
     async fn as_sent(body: Value, deadline: Duration) -> Value {
         let elicitor = Arc::new(Elicitor::new());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);

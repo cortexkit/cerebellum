@@ -6567,8 +6567,9 @@ mod tests {
             question["params"]["scope"]["hazards"],
             json!(["credential_form_submit", "unverified_form_contents"])
         );
-        // A disclosed hazard mints the durable tier, and the grant is asked
-        // ahead of the call that needs it.
+        // A disclosed hazard raises the ceiling to tier 4 (mutate_durable).
+        // The open_grant call replies consent_pending without waiting for the
+        // answer, so the card is not an interrupting alert.
         assert_eq!(question["params"]["scope"]["tier"], 4);
         assert_eq!(question["params"]["urgency"], "normal");
         // The person must be told, in words they can act on, what the grant

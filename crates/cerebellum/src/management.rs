@@ -1413,7 +1413,8 @@ pub(crate) fn profile_root_rebind_question(
         decline: ConsentOption::decline("deny", "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
-        // Asked ahead: the management call has already answered consent_pending.
+        // Asked ahead: the management call replies consent_pending without
+        // waiting for the answer, so no tool call is blocked on the person.
         urgency: Urgency::Normal,
         scope: profile_root_rebind_scope(preview),
         duration: None,
@@ -1483,10 +1484,12 @@ pub(crate) fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPrevie
         decline: ConsentOption::decline("keep", "Keep it locked"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
-        // Asked ahead: the management call has already answered consent_pending.
+        // Asked ahead: the management call replies consent_pending without
+        // waiting for the answer, so no tool call is blocked on the person.
         urgency: Urgency::Normal,
-        // The clear consumes exactly the launch record with this sequence, and
-        // that record is the one launch of this profile recovery kept.
+        // An allowing answer clears exactly the launch-journal record with
+        // this sequence number: the one launch of this profile that startup
+        // recovery kept active.
         scope: Scope::new()
             .with("profile_uuid", preview.profile_uuid.as_str())
             .with("sequence", preview.sequence),
@@ -1775,7 +1778,8 @@ mod tests {
             question.body["params"]["scope"]["tier"],
             reply["severity_ceiling"]["tier"]
         );
-        // Asked ahead of the call that needs it, so not an interrupting alert.
+        // `open_browser_grant` replies consent_pending without waiting for the
+        // answer, so the card is not an interrupting alert.
         assert_eq!(question.body["params"]["urgency"], "normal");
         // The prose is for the person; the structured fields above are the
         // scope. It must say what the grant allows AND what it still refuses.

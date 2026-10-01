@@ -1127,8 +1127,9 @@ async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
         let p = &question["params"];
         assert_eq!(p["kind"], "consent", "{kind}");
         assert_eq!(p["target"]["kind"], "app", "{kind}");
-        // The call is held open on the answer, and the grant binds the bundle
-        // identity under the signer of the process the person is asked about.
+        // The call waits on the answer, so urgency is high. The scope names the
+        // bundle identity and the Team ID of the process this question was
+        // raised for, the signer the grant would be bound to.
         assert_eq!(p["urgency"], "high", "{kind}");
         assert_eq!(p["scope"], json!({"app": APP, "team_id": team}), "{kind}");
         assert!(

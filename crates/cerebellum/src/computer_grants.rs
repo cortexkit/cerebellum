@@ -1842,8 +1842,9 @@ pub(crate) fn question_body(
 ///
 /// An app grant is keyed on the bundle identity and is only honoured for a
 /// process that still satisfies the signing identity read at ask time, so the
-/// signer is named too: the Team ID as an "always" record stores it, or the
-/// marker that Apple signed it. The display name stays in the card's label.
+/// signer is named too: `team_id` as an "always" record stores it, or
+/// `apple_anchored: true` for Apple's own applications, which have no Team ID.
+/// The display name stays in the card's label.
 /// A takeover grant hands over the machine's real pointer and keyboard.
 fn grant_scope(need: &GrantNeed, identity: Option<&AppIdentity>) -> crate::consent_card::Scope {
     use crate::consent_card::Scope;

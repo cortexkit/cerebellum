@@ -865,10 +865,11 @@ async fn management_wire_allows_rebinding_the_recreated_root() {
     assert_eq!(question["params"]["kind"], "consent");
     assert_eq!(question["params"]["default"], "deny");
     assert_eq!(question["params"]["on_expiry"], "deny");
-    // Asked ahead: the rebind call already answered consent_pending.
+    // The rebind call replied consent_pending without waiting for the
+    // answer, so the card is not an interrupting alert.
     assert_eq!(question["params"]["urgency"], "normal");
-    // The scope is the registry transition the answer applies, the same one
-    // the reply discloses, without the root's path.
+    // The scope carries the generation and root identity the reply discloses,
+    // which an allowing answer applies, but never the root's path.
     let scope = &question["params"]["scope"];
     assert_eq!(scope["generation"], reply["generation"]);
     assert_eq!(
