@@ -14,6 +14,7 @@ mod browser_profile_custody;
 mod c1_s6_integration;
 mod computer_consent;
 mod computer_element_actions;
+mod computer_person_changes;
 mod computer_read_state;
 mod computer_result_schema;
 mod computer_screen_lock;

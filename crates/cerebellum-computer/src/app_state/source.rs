@@ -286,11 +286,46 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// The target application's own focused window and its title, asked of
+    /// that application rather than of whichever one is frontmost. `Ok(None)`
+    /// when it reports no focused window.
+    fn focused_window(
+        &self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<WindowMark>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// How long ago the session last received a key press, a mouse-button
+    /// press or a scroll, from anyone: the platform's own count, which on
+    /// macOS includes input this module posted. Pointer movement alone is
+    /// not counted, because a person resting a hand on the mouse has not
+    /// changed anything an agent read. `None` when it cannot be read.
+    fn time_since_last_input(&self) -> Option<Duration> {
+        None
+    }
+
     /// The regular applications running now: the ones with a Dock icon and
     /// windows a person works in, not agents, helpers or menu-bar extras.
     /// Names and identities only; nothing of any window's content.
     fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
         Err(AppStateReadError::UnsupportedOnPlatform)
+    }
+}
+
+/// An application's focused window as one reading saw it: which window, and
+/// the title it showed. A browser's title follows its active tab, so a tab
+/// switch shows up as a changed title on the same window.
+#[derive(Debug, Clone)]
+pub struct WindowMark {
+    pub handle: ElementHandle,
+    pub title: Option<String>,
+}
+
+impl WindowMark {
+    /// Whether `other` is the same window showing the same title.
+    pub fn same_as(&self, other: &WindowMark) -> bool {
+        self.handle.same_element(other.handle.as_ref()) && self.title == other.title
     }
 }
 

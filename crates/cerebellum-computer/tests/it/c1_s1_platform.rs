@@ -912,7 +912,8 @@ fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
 
 /// Undo revision 15: the tree and diff arrays back in place of state_text,
 /// subtree_element_id back in place of zoom, no target names, no element
-/// targets, no diff cap word, and no list_apps row.
+/// targets, no diff cap word, no state_changed_by_person refusal, and no
+/// list_apps row.
 fn recreated_v14() -> Value {
     let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
     vocabulary["revision"] = historical_revision(14);
@@ -924,6 +925,22 @@ fn recreated_v14() -> Value {
         let id = row["capability_id"].as_str().unwrap().to_string();
         let id = id.as_str();
         let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        // The state_changed_by_person refusal was the last revision 15
+        // change applied, so it is the first removed.
+        if vocabulary_mint::V15_PERSON_CHANGE_ROWS.contains(&id) {
+            let outcome = properties["outcome"].as_object_mut().unwrap();
+            let tokens = outcome["enum"].as_array_mut().unwrap();
+            let before = tokens.len();
+            tokens.retain(|word| word != vocabulary_mint::V15_PERSON_CHANGE_OUTCOME);
+            assert_eq!(tokens.len(), before - 1, "{id}");
+            let description = outcome["description"]
+                .as_str()
+                .unwrap()
+                .strip_suffix(vocabulary_mint::V15_PERSON_CHANGE_ADDITION)
+                .expect("state_changed_by_person is described")
+                .to_owned();
+            outcome.insert("description".into(), json!(description));
+        }
         if vocabulary_mint::V15_NAMED_TARGET_ROWS.contains(&id) {
             assert!(properties.remove("candidates").is_some(), "{id}");
             assert!(properties.remove("target").is_some(), "{id}");

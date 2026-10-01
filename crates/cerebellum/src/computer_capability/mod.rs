@@ -22,6 +22,7 @@ use cerebellum_computer::app_state::render::{render_state, StateHeader, StateReq
 // The browser plane's reply field, shared so that both planes' state reaches a
 // host under one key.
 use crate::browser::state_text::STATE_TEXT_FIELD;
+use cerebellum_computer::app_state::person::{self, OwnInputLedger, SeenMarks};
 use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage};
 use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
@@ -454,6 +455,11 @@ where
     /// it such keystrokes are refused, and the refusal names only what the
     /// build can do instead.
     fronting_bracket_admitted: bool,
+    /// Records when this module posted input, so an action's check for the
+    /// person's use of an application does not mistake this module's own
+    /// posts for the person's. One ledger for every conversation: a post
+    /// counts as this module's whichever conversation asked for it.
+    own_input: Arc<OwnInputLedger>,
     /// The screen-lock reading this crate's own tests serve under, in place of
     /// the machine's. Tests that drive the production plane through the frame
     /// loop must not refuse or disclose according to whether the developer's
@@ -549,6 +555,7 @@ where
             ),
             make_synthetic_driver,
             fronting_bracket_admitted: false,
+            own_input: Arc::new(OwnInputLedger::new()),
             #[cfg(test)]
             session_lock_for_test: None,
         }
@@ -835,17 +842,22 @@ where
 
         let source = self.app_state_source.clone();
         let read_grant = grant.clone();
-        let (raw, manual_accessibility) = tokio::task::spawn_blocking(move || {
+        let (raw, manual_accessibility, seen) = tokio::task::spawn_blocking(move || {
             let _scope =
                 cerebellum_computer::audit::AccessibilityReadScope::new(read_grant.pid, None);
+            // Read before the tree, so a change the person makes while the
+            // tree is read shows up at the next action rather than passing
+            // as something this read showed.
+            let seen = SeenMarks::read(source.as_ref(), &read_grant);
             let raw = source.read_app_state(&read_grant, ReadBounds::default());
             (
                 raw,
                 cerebellum_computer::audit::AccessibilityReadScope::current(),
+                Some(seen),
             )
         })
         .await
-        .unwrap_or((Err(AppStateReadError::Unreadable), None));
+        .unwrap_or((Err(AppStateReadError::Unreadable), None, None));
         let raw = match raw {
             Ok(raw) => raw,
             Err(AppStateReadError::TargetGone) => {
@@ -961,6 +973,11 @@ where
                 admission.decorate(&mut refusal);
                 return refusal;
             }
+        }
+        // The conversation is shown this state now, so whatever the person
+        // did before it is no longer a change the agent has not seen.
+        if let Some(seen) = seen {
+            sessions.remember_seen(&conversation_key, &grant, seen);
         }
         admission.decorate(&mut reply);
         reply
@@ -1222,6 +1239,13 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return unposted(locked);
         }
+        if let Some(mut refusal) = self
+            .refuse_if_person_changed(management, &identity.conversation_key, &grant)
+            .await
+        {
+            admission.decorate(&mut refusal);
+            return unposted(refusal);
+        }
 
         // Before anything is posted or fronted: the target's own focused
         // element must be readable and must not be a secure field. Asked of
@@ -1415,11 +1439,16 @@ where
         let make_driver = self.make_synthetic_driver.clone();
         let conversation_key = identity.conversation_key.clone();
         let mut unposted_refusal = false;
+        let own_input = self.own_input.clone();
+        let input_source = self.app_state_source.clone();
         let (dispatched, bracket) = tokio::task::spawn_blocking(move || {
             let mut audit = audit.blocking_lock();
             let cancelled = || cancel.is_cancelled();
             let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
+            let posting =
+                own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
             let dispatched = dispatcher.dispatch(&mut audit, identity, request);
+            own_input.end_posting(posting);
             (dispatched, dispatcher.last_bracket().cloned())
         })
         .await

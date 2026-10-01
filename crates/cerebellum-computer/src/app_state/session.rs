@@ -35,6 +35,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::Mutex;
 
 use super::image::ImageMapping;
+use super::person::SeenMarks;
 use super::render::{self, describe, is_session_ending_item, ObservedNode};
 use super::source::{ElementHandle, RawAppState, RawElement};
 use crate::platform::ProcessGrant;
@@ -104,6 +105,10 @@ struct Session {
     /// Whether any read has set a baseline yet. A diff with none reports
     /// nothing rather than reporting everything as added.
     has_baseline: bool,
+    /// The focused element and window the conversation was last shown, by a
+    /// read or an action reply's diff, and when. An action compares them
+    /// with the application now to learn whether the person used it since.
+    seen: Option<SeenMarks>,
 }
 
 impl Session {
@@ -377,6 +382,7 @@ impl AppStateSessions {
                 entries: BTreeMap::new(),
                 by_hash: HashMap::new(),
                 has_baseline: false,
+                seen: None,
             });
         let session = state
             .sessions
@@ -545,6 +551,23 @@ impl AppStateSessions {
                 .entries
                 .values()
                 .any(|entry| entry.in_baseline && !seen.contains(&entry.number))
+    }
+
+    /// Record what the conversation was just shown of this process's focused
+    /// element and window. Kept only while the session lives, so a new
+    /// process generation starts with nothing remembered.
+    pub fn remember_seen(&self, conversation_key: &str, target: &ProcessGrant, marks: SeenMarks) {
+        let key = SessionKey::new(conversation_key, target);
+        if let Some(session) = self.lock().sessions.get_mut(&key) {
+            session.seen = Some(marks);
+        }
+    }
+
+    /// What the conversation was last shown of this process's focused element
+    /// and window, or `None` when it has not been shown this process.
+    pub fn last_seen(&self, conversation_key: &str, target: &ProcessGrant) -> Option<SeenMarks> {
+        let key = SessionKey::new(conversation_key, target);
+        self.lock().sessions.get(&key)?.seen.clone()
     }
 
     /// Where an element id leads, for the conversation holding it.
