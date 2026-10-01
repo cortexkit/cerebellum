@@ -3662,21 +3662,18 @@ async fn handle_management_request(
             let outcome = elicitor
                 .ask(&writer, channel, epoch, question.body, question.deadline)
                 .await;
-            let answer = match outcome {
-                elicit::AskOutcome::Answered(body) => Some(body),
-                elicit::AskOutcome::NoAnswer
-                | elicit::AskOutcome::NotPutToAnyone
-                | elicit::AskOutcome::Undeliverable => None,
-            };
+            // The whole ending is handed on, not just an answer or its absence:
+            // the next request reports a question nobody was shown differently
+            // from one a person left unanswered, and only the ending says which.
             match settlement {
                 Settlement::BrowserGrant => {
                     management_plane
-                        .settle_browser_grant(&question.ask_id, answer.as_ref())
+                        .settle_browser_grant_ending(&question.ask_id, Some(&outcome))
                         .await;
                 }
                 Settlement::ProfileRootRebind => {
                     management_plane
-                        .settle_profile_root_rebind(&question.ask_id, answer.as_ref())
+                        .settle_profile_root_rebind_ending(&question.ask_id, Some(&outcome))
                         .await;
                 }
                 Settlement::LaunchRecoveryClear => {
@@ -3684,7 +3681,7 @@ async fn handle_management_request(
                     // process table and writes the journal; the outcome is
                     // kept by the plane and reported on the next request.
                     management_plane
-                        .settle_launch_recovery_clear(&question.ask_id, answer.as_ref())
+                        .settle_launch_recovery_clear_ending(&question.ask_id, &outcome)
                         .await;
                 }
             }
@@ -3793,27 +3790,31 @@ async fn complete_login_import(
 ) -> Value {
     let ask_id = login_import::new_ask_id();
     let question = plan.question(&ask_id, &facts.identity.agent_project_id);
+    // `None` when the caller cancelled the request before the question ended.
     let answer = tokio::select! {
-        answer = planes.elicitor.ask(writer, channel, epoch, question, login_import::ELICITATION_DEADLINE) => answer,
+        answer = planes.elicitor.ask(writer, channel, epoch, question, login_import::ELICITATION_DEADLINE) => Some(answer),
         () = async {
             match &cancel {
                 Some(cancel) => cancel.cancelled().await,
                 None => std::future::pending::<()>().await,
             }
-        } => elicit::AskOutcome::NoAnswer,
+        } => None,
     };
-    let decision = match &answer {
-        elicit::AskOutcome::Answered(body) => body.get("decision").and_then(Value::as_str),
-        // None of the three permits a transfer, and they are listed rather than
-        // wildcarded so a future outcome has to be decided about here.
-        elicit::AskOutcome::NoAnswer
-        | elicit::AskOutcome::NotPutToAnyone
-        | elicit::AskOutcome::Undeliverable => None,
-    };
-    let decision = if cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
+    let answer = if cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
         None
     } else {
-        decision
+        answer
+    };
+    let decision = match &answer {
+        Some(elicit::AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
+        // None of these permits a transfer, and they are listed rather than
+        // wildcarded so a future outcome has to be decided about here.
+        Some(
+            elicit::AskOutcome::NoAnswer
+            | elicit::AskOutcome::NotPutToAnyone
+            | elicit::AskOutcome::Undeliverable,
+        )
+        | None => None,
     };
     let mut reopen = None;
     if plan.permits_transfer(decision) {
@@ -3850,7 +3851,12 @@ async fn complete_login_import(
             }
         }
     }
-    let result = plan.decide(decision);
+    let result = match &answer {
+        Some(answer) => plan.conclude(answer),
+        // A cancelled request is still recorded as not transferred, as it
+        // always has been; its caller has stopped waiting for the reply.
+        None => plan.decide(None),
+    };
     let mut reply = journal_login_import_result(planes, &facts.identity, result).await;
     if let Some(url) = reopen {
         // Even a failed copy must not leave a session we closed unnecessarily down.
@@ -5384,24 +5390,29 @@ async fn serve_browser_with_consent(
     // still creates the browser grant. Cancellation, route closure and shutdown
     // instead remove the pending question from the answer registry.
     let mut settlement = tokio::spawn(async move {
-        let outcome = tokio::select! {
+        // `Err` names how the question was withdrawn before it ended.
+        let ending = tokio::select! {
             biased;
-            _ = cancel.cancelled() => (None, "cancelled"),
-            _ = routes.closed(channel, epoch) => (None, "route_closed"),
-            _ = drain.wait_for(|draining| *draining) => (None, "draining"),
-            outcome = elicitor.ask(&writer, channel, epoch, question.body, question.deadline) => (Some(outcome), "unavailable"),
-        };
-        let answer = match &outcome.0 {
-            Some(elicit::AskOutcome::Answered(answer)) => Some(answer),
-            _ => None,
+            _ = cancel.cancelled() => Err("cancelled"),
+            _ = routes.closed(channel, epoch) => Err("route_closed"),
+            _ = drain.wait_for(|draining| *draining) => Err("draining"),
+            outcome = elicitor.ask(&writer, channel, epoch, question.body, question.deadline) => Ok(outcome),
         };
         let settled = management
-            .settle_browser_grant(&question.ask_id, answer)
+            .settle_browser_grant_ending(&question.ask_id, ending.as_ref().ok())
             .await;
-        match answer.and_then(|answer| answer["decision"].as_str()) {
-            Some("allow") if settled => "allow",
-            Some("deny") => "declined",
-            _ => outcome.1,
+        match &ending {
+            // An allowing answer to a question no longer held (withdrawn with
+            // its conversation meanwhile) grants nothing.
+            Ok(elicit::AskOutcome::Answered(answer)) if answer["decision"] == "allow" => {
+                if settled {
+                    "allow"
+                } else {
+                    "unavailable"
+                }
+            }
+            Ok(outcome) => in_call_grant_decision(outcome),
+            Err(withdrawn) => *withdrawn,
         }
     });
     let guard = elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
@@ -5418,13 +5429,52 @@ async fn serve_browser_with_consent(
                 .await
         }
         Ok(decision) => {
-            reply["detail"]["decision"] = json!(decision.unwrap_or("unavailable"));
+            let decision = decision.unwrap_or("unavailable");
+            reply["detail"]["decision"] = json!(decision);
+            if let Some(remedy) = in_call_grant_remedy(decision) {
+                reply["remedy"] = json!(remedy);
+            }
             planes.browser.finish_reply(capability.name(), reply)
         }
         Err(_) => {
             pending["context"] = reply["context"].clone();
             planes.browser.finish_reply(capability.name(), pending)
         }
+    }
+}
+
+/// The `detail.decision` a browser action held open on a grant question
+/// reports when the question ended without an allowing answer.
+///
+/// Each ending keeps its own word because each calls for a different next
+/// step; reporting a question nobody was shown the same way as one a person
+/// ignored would send the caller to wait for an answer that cannot come.
+fn in_call_grant_decision(ending: &elicit::AskOutcome) -> &'static str {
+    match ending {
+        elicit::AskOutcome::Answered(answer) => match answer["decision"].as_str() {
+            Some("deny") => "declined",
+            _ => "unrecognized_answer",
+        },
+        elicit::AskOutcome::NoAnswer => "no_answer",
+        elicit::AskOutcome::NotPutToAnyone => "not_put_to_anyone",
+        elicit::AskOutcome::Undeliverable => "undeliverable",
+    }
+}
+
+/// What the caller should do after each [`in_call_grant_decision`]. It replaces
+/// the remedy the `authorization_denied` refusal already carries (open the
+/// grant and retry), which is right only for a question a person might still
+/// answer. `None` keeps that remedy: the question was cancelled, its route
+/// closed, or the module began draining before the question ended, so nothing
+/// was decided.
+fn in_call_grant_remedy(decision: &str) -> Option<&'static str> {
+    match decision {
+        "declined" => Some("the person declined this grant; ask again only if they change their mind"),
+        "no_answer" => Some("the person was asked but did not answer in time; retry this action when they are available"),
+        "not_put_to_anyone" => Some("the question was shown to no one, and repeating this action puts it to no one either until the caller's consent route can put it to a person"),
+        "undeliverable" => Some("the question could not be sent; retry once, and if it fails again the module needs attention"),
+        "unrecognized_answer" => Some("the answer was not one this question offered; retry this action to ask again"),
+        _ => None,
     }
 }
 
@@ -6641,6 +6691,260 @@ mod tests {
                 .unwrap();
         assert_ne!(navigated["outcome"], "authorization_denied", "{navigated}");
         assert_eq!(navigated["outcome"], "no_session", "{navigated}");
+    }
+
+    /// Planes with one management route (channel 4, epoch 1) whose consumer
+    /// declares it can relay a question to a person.
+    fn open_grant_planes() -> Planes {
+        let planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        );
+        planes.routes.insert(
+            4,
+            1,
+            AcceptedBindFacts::from_bind(
+                &bind_identity_for_test(),
+                session_caller_principal_for_test(),
+                Some(&json!({
+                    "agentProjectId": "test-project",
+                    "sessionKind": "primary",
+                    "effectiveCapabilityScope": ["*"],
+                })),
+                Some(&["elicitation".to_string()]),
+                &subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+        planes
+    }
+
+    fn open_grant_frame(corr: u64) -> Frame {
+        Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            4,
+            1,
+            corr,
+            serde_json::to_vec(&json!({
+                "method": management::OPEN_GRANT,
+                "params": {"origins": ["https://requested.example"], "hazards": []}
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// One `browser.open_grant` through the production frame dispatcher: the
+    /// caller's immediate reply, and the question frame sent to the consumer.
+    async fn open_grant_over_wire(
+        planes: &Planes,
+        writer: &mpsc::Sender<Frame>,
+        rx: &mut mpsc::Receiver<Frame>,
+        corr: u64,
+    ) -> (Value, Frame) {
+        handle_frame(open_grant_frame(corr), writer, planes)
+            .await
+            .unwrap();
+        let mut reply = None;
+        let mut question = None;
+        for _ in 0..2 {
+            let frame = next_frame(rx).await;
+            if frame.header.ty == FrameType::Request {
+                question = Some(frame);
+            } else {
+                reply = Some(serde_json::from_slice(&frame.body).unwrap());
+            }
+        }
+        (
+            reply.expect("a pending reply"),
+            question.expect("a question"),
+        )
+    }
+
+    /// End `question` as described by `ending`: an answer carrying that
+    /// decision word, or for `refused` an error frame in place of an answer,
+    /// which is how a consumer with no handler for questions refuses one.
+    async fn end_question(
+        planes: &Planes,
+        writer: &mpsc::Sender<Frame>,
+        question: &Frame,
+        ending: &str,
+    ) {
+        let (ty, body) = if ending == "refused" {
+            (
+                FrameType::Error,
+                serde_json::to_vec(&ErrorBody {
+                    code: "REVERSE_REQUEST_UNHANDLED".to_string(),
+                    message: "no reverse-request handler is registered".to_string(),
+                    detail: None,
+                })
+                .unwrap(),
+            )
+        } else {
+            (
+                FrameType::Response,
+                serde_json::to_vec(&json!({"decision": ending})).unwrap(),
+            )
+        };
+        let answer = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            ty,
+            Flags::new(false, Priority::Interactive, false),
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr,
+            body,
+        )
+        .unwrap();
+        handle_frame(answer, writer, planes).await.unwrap();
+    }
+
+    async fn browser_grants_settled(planes: &Planes) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while planes.management.browser_grant_pending_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the question settles");
+    }
+
+    /// A browser grant question settled by nobody being asked is named on the
+    /// next request for the same grant, and no other ending is, while none of
+    /// them grants anything.
+    ///
+    /// The caller's pending reply says to retry once the request has been
+    /// answered. For a question nobody was shown that answer never comes, so
+    /// the next reply has to say so; silence from a person who was asked is not
+    /// reported this way, or the field would only repeat "not answered yet".
+    #[tokio::test]
+    async fn a_browser_grant_nobody_was_asked_is_named_on_the_next_request() {
+        // The ending, and whether the next request reports it.
+        let cases = [
+            ("deny", false),
+            ("no_answer", false),
+            ("not_put_to_anyone", true),
+            ("refused", true),
+            ("undeliverable", false),
+            ("some_future_word", false),
+        ];
+        for (ending, reported) in cases {
+            let planes = open_grant_planes();
+            let (writer, mut rx) = mpsc::channel::<Frame>(8);
+            let first_ask = if ending == "undeliverable" {
+                // A closed carrier: the question cannot be sent, and neither
+                // can the reply, so only the settlement is observable.
+                let (closed, mut closed_rx) = mpsc::channel::<Frame>(8);
+                closed_rx.close();
+                let _ = handle_frame(open_grant_frame(80), &closed, &planes).await;
+                None
+            } else {
+                let (first, question) = open_grant_over_wire(&planes, &writer, &mut rx, 80).await;
+                assert_eq!(first["outcome"], "consent_pending", "{first}");
+                assert!(first.get("previous_request").is_none(), "{first}");
+                end_question(&planes, &writer, &question, ending).await;
+                Some(first["ask_id"].as_str().unwrap().to_string())
+            };
+            browser_grants_settled(&planes).await;
+            assert_eq!(
+                planes.management.browser_grant_count().await,
+                0,
+                "{ending} granted something"
+            );
+
+            let (next, _) = open_grant_over_wire(&planes, &writer, &mut rx, 81).await;
+            assert_eq!(next["outcome"], "consent_pending", "{ending}: {next}");
+            if reported {
+                let previous = &next["previous_request"];
+                assert_eq!(previous["ask_id"], json!(first_ask), "{ending}: {next}");
+                assert_eq!(previous["disposition"], "not_put_to_anyone", "{next}");
+                let remedy = previous["remedy"].as_str().unwrap().to_lowercase();
+                for loop_word in ["ask again", "retry", "wait"] {
+                    assert!(
+                        !remedy.contains(loop_word),
+                        "a question nobody was shown sends the caller round a loop: {remedy}"
+                    );
+                }
+            } else {
+                assert!(
+                    next.get("previous_request").is_none(),
+                    "{ending} was reported as unreached: {next}"
+                );
+            }
+        }
+    }
+
+    /// Every ending of a grant question a browser action is held open on maps
+    /// to its own decision word and remedy. The wire test drives each ending a
+    /// consumer can produce; a question that could not be sent also fails the
+    /// reply on the same closed writer, so its word is pinned here.
+    #[test]
+    fn each_in_call_grant_ending_has_its_own_decision_and_remedy() {
+        let cases = [
+            (
+                elicit::AskOutcome::Answered(json!({"decision": "deny"})),
+                "declined",
+            ),
+            (elicit::AskOutcome::NoAnswer, "no_answer"),
+            (elicit::AskOutcome::NotPutToAnyone, "not_put_to_anyone"),
+            (elicit::AskOutcome::Undeliverable, "undeliverable"),
+            (
+                elicit::AskOutcome::Answered(json!({"decision": "some_future_word"})),
+                "unrecognized_answer",
+            ),
+        ];
+        let mut remedies = std::collections::BTreeSet::new();
+        for (ending, decision) in cases {
+            assert_eq!(in_call_grant_decision(&ending), decision);
+            let remedy = in_call_grant_remedy(decision).expect("a remedy");
+            assert!(remedies.insert(remedy), "{decision} shares a remedy");
+            if decision == "not_put_to_anyone" {
+                let remedy = remedy.to_lowercase();
+                for loop_word in ["ask again", "retry", "wait"] {
+                    assert!(!remedy.contains(loop_word), "{remedy}");
+                }
+            }
+        }
+        // A question withdrawn before it ended keeps the refusal's remedy.
+        for withdrawn in ["cancelled", "route_closed", "draining", "unavailable"] {
+            assert_eq!(in_call_grant_remedy(withdrawn), None);
+        }
+    }
+
+    /// Once a person is reached, the next `browser.open_grant` reply stops
+    /// carrying `previous_request` for an earlier question nobody was shown. A
+    /// question that could not be sent says nothing about whether a person is
+    /// reachable, so `previous_request` keeps naming the earlier one.
+    #[tokio::test]
+    async fn reaching_a_person_retires_the_earlier_unreached_browser_grant_report() {
+        let planes = open_grant_planes();
+        let (writer, mut rx) = mpsc::channel::<Frame>(8);
+        let (first, question) = open_grant_over_wire(&planes, &writer, &mut rx, 90).await;
+        end_question(&planes, &writer, &question, "refused").await;
+        browser_grants_settled(&planes).await;
+
+        let (closed, mut closed_rx) = mpsc::channel::<Frame>(8);
+        closed_rx.close();
+        let _ = handle_frame(open_grant_frame(91), &closed, &planes).await;
+        browser_grants_settled(&planes).await;
+
+        let (second, question) = open_grant_over_wire(&planes, &writer, &mut rx, 92).await;
+        assert_eq!(
+            second["previous_request"]["ask_id"], first["ask_id"],
+            "an undeliverable question retired the report: {second}"
+        );
+        end_question(&planes, &writer, &question, "no_answer").await;
+        browser_grants_settled(&planes).await;
+
+        let (third, _) = open_grant_over_wire(&planes, &writer, &mut rx, 93).await;
+        assert!(
+            third.get("previous_request").is_none(),
+            "a stale unreached report survived reaching a person: {third}"
+        );
     }
 
     /// The refusal names the exact target fact absent from the human disclosure.

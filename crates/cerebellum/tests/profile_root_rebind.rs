@@ -928,6 +928,141 @@ async fn management_wire_denial_writes_nothing_and_leaves_the_root_refused() {
     assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
 }
 
+/// A rebind question settled by nobody being asked is named on the next rebind
+/// request from the same conversation, and no other ending is, while none of
+/// them rebinds anything.
+///
+/// The pending reply says to wait for the person to answer. For a question
+/// nobody was shown no answer comes, so the next reply has to say so; silence
+/// from a person who was asked is not reported this way, or the field would
+/// only repeat "not answered yet".
+#[tokio::test]
+async fn management_wire_names_a_rebind_question_nobody_was_asked() {
+    // The ending, and whether the next request reports it. `refused` is an
+    // error frame in place of an answer, which is how a consumer with no
+    // handler for questions refuses one.
+    let cases = [
+        ("deny", false),
+        ("no_answer", false),
+        ("not_put_to_anyone", true),
+        ("refused", true),
+        ("undeliverable", false),
+        ("some_future_word", false),
+    ];
+    for (ending, reported) in cases {
+        let root = TestRoot::new("wire-endings");
+        let project_id = "project-wire-endings";
+        mint_durable_record(root.path(), project_id);
+        recreate_root(root.path());
+        let planes = management_planes(root.path());
+        let (writer, mut rx) = mpsc::channel(8);
+        bind_management_route(&planes, &writer, &mut rx).await;
+
+        let first_ask = if ending == "undeliverable" {
+            // A closed carrier: neither the question nor the reply can be
+            // sent, so only the settlement is observable.
+            let (closed, mut closed_rx) = mpsc::channel(8);
+            closed_rx.close();
+            let _ =
+                cerebellum::handle_frame_for_test(rebind_request(20, json!({})), &closed, &planes)
+                    .await;
+            None
+        } else {
+            let (reply, question, _) = open_rebind_over_wire(&planes, &writer, &mut rx).await;
+            assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+            assert!(reply.get("previous_request").is_none(), "{reply}");
+            end_rebind_question(&planes, &writer, &question, ending).await;
+            Some(reply["ask_id"].as_str().unwrap().to_string())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while planes.management.profile_root_rebind_pending_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settlement completes");
+        let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
+        assert_identity_mismatch(&lifecycle, project_id);
+        drop(lifecycle);
+        assert!(
+            !root.path().join(PROFILE_ROOT_REBINDS_FILE).exists(),
+            "{ending} rebound the root"
+        );
+
+        cerebellum::handle_frame_for_test(rebind_request(21, json!({})), &writer, &planes)
+            .await
+            .expect("rebind request is handled");
+        let mut next = None;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("management reply and question are prompt")
+                .expect("writer stays open");
+            if frame.header.ty != FrameType::Request {
+                next = Some(serde_json::from_slice::<Value>(&frame.body).unwrap());
+            }
+        }
+        let next = next.expect("immediate reply");
+        assert_eq!(next["outcome"], "consent_pending", "{ending}: {next}");
+        if reported {
+            let previous = &next["previous_request"];
+            assert_eq!(previous["ask_id"], json!(first_ask), "{ending}: {next}");
+            assert_eq!(previous["disposition"], "not_put_to_anyone", "{next}");
+            let remedy = previous["remedy"].as_str().unwrap().to_lowercase();
+            for loop_word in ["ask again", "retry", "wait"] {
+                assert!(
+                    !remedy.contains(loop_word),
+                    "a question nobody was shown sends the caller round a loop: {remedy}"
+                );
+            }
+        } else {
+            assert!(
+                next.get("previous_request").is_none(),
+                "{ending} was reported as unreached: {next}"
+            );
+        }
+    }
+}
+
+/// End a rebind question with the decision word `ending`, or for `refused`
+/// with an error frame in place of an answer.
+async fn end_rebind_question(
+    planes: &Planes,
+    writer: &mpsc::Sender<Frame>,
+    question: &Frame,
+    ending: &str,
+) {
+    let (ty, body) = if ending == "refused" {
+        (
+            FrameType::Error,
+            serde_json::to_vec(&subc_protocol::ErrorBody {
+                code: "REVERSE_REQUEST_UNHANDLED".to_string(),
+                message: "no reverse-request handler is registered".to_string(),
+                detail: None,
+            })
+            .unwrap(),
+        )
+    } else {
+        (
+            FrameType::Response,
+            serde_json::to_vec(&json!({"decision": ending})).unwrap(),
+        )
+    };
+    let answer = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        ty,
+        Flags::new(false, Priority::Interactive, false),
+        question.header.channel,
+        question.header.epoch,
+        question.header.corr,
+        body,
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(answer, writer, planes)
+        .await
+        .expect("the ending is handled");
+}
+
 #[tokio::test]
 async fn management_wire_rebind_params_are_closed() {
     let root = TestRoot::new("wire-params");

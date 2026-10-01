@@ -3937,6 +3937,7 @@ mod orphan_recovery_tests {
             ExecutableIdentityRecord, LaunchGenerationRecord, LaunchJournalPort,
             RecoveredBrowserProcess, RecoveryPendingReason,
         };
+        use crate::elicit::AskOutcome;
         use crate::launch_recovery::{
             ClearFailure, ClearRefusal, ProcessFact, ProcessTable, ProcessUsers, Unreadable,
         };
@@ -4532,6 +4533,76 @@ mod orphan_recovery_tests {
                 .open_launch_recovery_clear(PROJECT, None, true)
                 .await;
             assert_eq!(reply["previous_answer"]["outcome"], "kept", "{reply}");
+        }
+
+        /// Each way a clear question can end without an answer to clear is
+        /// reported on the next request as that ending, not folded into
+        /// `kept`, and clears nothing.
+        ///
+        /// `kept` says the person decided; silence says they may answer next
+        /// time; a question nobody was shown will be shown to nobody next time
+        /// either. A silence that arrives with the question's own deadline is
+        /// still silence, not a late answer.
+        #[tokio::test]
+        async fn a_clear_question_that_ended_unanswered_is_reported_as_its_ending() {
+            let deadline_passed = Instant::now() + Duration::from_secs(31 * 60);
+            let cases = [
+                (
+                    AskOutcome::Answered(json!({"decision": "keep"})),
+                    ClearSettlement::Kept,
+                    "kept",
+                ),
+                (AskOutcome::NoAnswer, ClearSettlement::NoAnswer, "no_answer"),
+                (
+                    AskOutcome::NotPutToAnyone,
+                    ClearSettlement::NotPutToAnyone,
+                    "not_put_to_anyone",
+                ),
+                (
+                    AskOutcome::Undeliverable,
+                    ClearSettlement::Undeliverable,
+                    "undeliverable",
+                ),
+                (
+                    AskOutcome::Answered(json!({"decision": "some_future_word"})),
+                    ClearSettlement::UnrecognizedAnswer,
+                    "unrecognized_answer",
+                ),
+            ];
+            for (ending, settlement, outcome) in cases {
+                let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+                let (_, ask_id) = fixture.ask().await;
+                let ended_at = if matches!(ending, AskOutcome::NoAnswer) {
+                    deadline_passed
+                } else {
+                    Instant::now()
+                };
+                assert_eq!(
+                    fixture
+                        .plane
+                        .settle_launch_recovery_clear_ending_at(&ask_id, &ending, ended_at)
+                        .await,
+                    settlement,
+                    "{outcome}"
+                );
+                fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, outcome);
+                let (reply, _) = fixture
+                    .plane
+                    .open_launch_recovery_clear(PROJECT, None, true)
+                    .await;
+                let previous = &reply["previous_answer"];
+                assert_eq!(previous["outcome"], outcome, "{reply}");
+                let remedy = previous["remedy"].as_str().unwrap().to_lowercase();
+                assert!(remedy.starts_with("nothing was cleared"), "{remedy}");
+                if outcome == "not_put_to_anyone" {
+                    for loop_word in ["ask again", "retry", "wait"] {
+                        assert!(
+                            !remedy.contains(loop_word),
+                            "a question nobody was shown sends the caller round a loop: {remedy}"
+                        );
+                    }
+                }
+            }
         }
 
         #[tokio::test]

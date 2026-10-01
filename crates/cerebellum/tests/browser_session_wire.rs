@@ -4373,6 +4373,91 @@ async fn blocking_browser_grant_deny_never_navigates() {
     assert!(planes.browser.result_schema_findings().is_empty());
 }
 
+/// A browser action held open on a grant question reports how the question
+/// ended, each ending under its own `detail.decision` and remedy, and acts on
+/// none of them.
+///
+/// Before, silence, a question nobody was shown and an unreadable answer all
+/// came back as `unavailable` with the refusal's own remedy, which tells the
+/// caller to open the grant and retry: a loop for a question that reaches
+/// nobody. `refused` is an error frame in place of an answer, which is how a
+/// consumer with no handler for questions refuses one.
+#[tokio::test]
+async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
+    let cases = [
+        (
+            "deny",
+            "declined",
+            "ask again only if they change their mind",
+        ),
+        ("no_answer", "no_answer", "when they are available"),
+        ("not_put_to_anyone", "not_put_to_anyone", "shown to no one"),
+        ("refused", "not_put_to_anyone", "shown to no one"),
+        (
+            "some_future_word",
+            "unrecognized_answer",
+            "not one this question offered",
+        ),
+    ];
+    for (ending, decision, remedy) in cases {
+        let (planes, launcher) = blocking_grant_fixture().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
+            .await
+            .unwrap();
+        let question = consent_frame(&mut rx).await;
+        assert_eq!(question.header.ty, FrameType::Request);
+        if ending == "refused" {
+            let refusal = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Error,
+                Flags::new(false, Priority::Interactive, false),
+                9,
+                3,
+                question.header.corr,
+                serde_json::to_vec(&subc_protocol::ErrorBody {
+                    code: "REVERSE_REQUEST_UNHANDLED".to_string(),
+                    message: "no reverse-request handler is registered".to_string(),
+                    detail: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            cerebellum::handle_frame_for_test(refusal, &tx, &planes)
+                .await
+                .unwrap();
+        } else {
+            answer_browser(&planes, &tx, &question, ending).await;
+        }
+        let reply = consent_frame(&mut rx).await;
+        assert_eq!(reply.header.corr, 801);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "authorization_denied", "{ending}: {body}");
+        assert_eq!(body["detail"]["decision"], decision, "{ending}: {body}");
+        let said = body["remedy"].as_str().unwrap().to_lowercase();
+        assert!(said.contains(remedy), "{ending}: {said}");
+        if decision == "not_put_to_anyone" {
+            for loop_word in ["ask again", "retry", "wait"] {
+                assert!(
+                    !said.contains(loop_word),
+                    "a question nobody was shown sends the caller round a loop: {said}"
+                );
+            }
+        }
+        assert!(
+            launcher.effects.lock().unwrap().is_empty(),
+            "{ending} navigated"
+        );
+        assert_eq!(
+            planes.management.browser_grant_count().await,
+            0,
+            "{ending} granted something"
+        );
+        assert!(rx.try_recv().is_err(), "no second question");
+        assert!(planes.browser.result_schema_findings().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn blocking_browser_grant_timeout_keeps_late_answer() {
     let (planes, launcher) = blocking_grant_fixture().await;
