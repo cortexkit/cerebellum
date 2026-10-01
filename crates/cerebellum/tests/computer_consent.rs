@@ -487,6 +487,8 @@ async fn an_always_answer_survives_a_module_restart() {
     assert_eq!(params["kind"], "consent");
     assert_eq!(params["default"], "deny");
     assert_eq!(params["on_expiry"], "deny");
+    assert_eq!(params["urgency"], "high");
+    assert_eq!(params["scope"]["app"], APP);
     assert!(params.get("duration").is_none());
     assert_eq!(
         params["options"]
@@ -799,6 +801,8 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
     assert_eq!(questions.len(), 2, "takeover was not asked on its own");
     let takeover = &questions[1];
     assert_eq!(takeover["params"]["target"]["kind"], "machine");
+    assert_eq!(takeover["params"]["urgency"], "high");
+    assert_eq!(takeover["params"]["scope"], json!({"takeover": "machine"}));
     assert_eq!(decisions(takeover), ["allow_conversation", "deny"]);
     assert!(takeover["params"].get("app").is_none());
     // Pinned byte for byte: the host shows this line unchanged, and it has to
@@ -1106,21 +1110,27 @@ async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
         "the changed requirement was not asked about"
     );
     assert!(question_message(&questions[3]).contains(SIGNATURE_CHANGED));
-    for (kind, question, ids) in [
+    for (kind, question, ids, team) in [
         (
             "signature-changed conversation app",
             &questions[1],
             &["allow_conversation", "deny"][..],
+            "IMPOSTOR01",
         ),
         (
             "signature-changed persistent app",
             &questions[3],
             &["allow_conversation", "allow_always", "deny"][..],
+            FIXTURE_TEAM,
         ),
     ] {
         let p = &question["params"];
         assert_eq!(p["kind"], "consent", "{kind}");
         assert_eq!(p["target"]["kind"], "app", "{kind}");
+        // The call is held open on the answer, and the grant binds the bundle
+        // identity under the signer of the process the person is asked about.
+        assert_eq!(p["urgency"], "high", "{kind}");
+        assert_eq!(p["scope"], json!({"app": APP, "team_id": team}), "{kind}");
         assert!(
             p["prompt"].as_str().unwrap().contains(SIGNATURE_CHANGED),
             "{kind}"

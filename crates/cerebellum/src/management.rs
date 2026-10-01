@@ -79,7 +79,7 @@ pub const OPERATIONS: [&str; 10] = [
 /// notice a phone prompt rather than to a desk session. Measured: an operator
 /// answered a grant after about 12 minutes, after a 5-minute deadline had
 /// already expired it.
-const PHONE_CONSENT_DEADLINE: Duration = Duration::from_secs(30 * 60);
+pub(crate) const PHONE_CONSENT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// Resolving an application name to the process that answers to it.
 ///
@@ -651,6 +651,10 @@ impl ManagementPlane {
     /// imply; the credential and financial flags still come only from disclosed
     /// hazards, so a number alone never lets the agent submit a sign-in or
     /// payment form.
+    ///
+    /// For a question asked ahead of the browser call that needs it: the call
+    /// asking returns `consent_pending` at once, so the card is sent at normal
+    /// urgency.
     pub async fn open_browser_grant_at_tier(
         &self,
         conversation_key: &str,
@@ -658,6 +662,47 @@ impl ManagementPlane {
         hazards: Vec<HazardClass>,
         severity_tier: Option<u8>,
         can_relay_to_a_person: bool,
+    ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
+        self.open_browser_grant_with_urgency(
+            conversation_key,
+            origins,
+            hazards,
+            severity_tier,
+            can_relay_to_a_person,
+            crate::consent_card::Urgency::Normal,
+        )
+        .await
+    }
+
+    /// [`Self::open_browser_grant_at_tier`] for a browser call that is held
+    /// open while the person decides. The agent is blocked on the answer, so
+    /// the card is sent at high urgency.
+    pub async fn open_in_call_browser_grant(
+        &self,
+        conversation_key: &str,
+        origins: Vec<String>,
+        hazards: Vec<HazardClass>,
+        severity_tier: Option<u8>,
+    ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
+        self.open_browser_grant_with_urgency(
+            conversation_key,
+            origins,
+            hazards,
+            severity_tier,
+            true,
+            crate::consent_card::Urgency::High,
+        )
+        .await
+    }
+
+    async fn open_browser_grant_with_urgency(
+        &self,
+        conversation_key: &str,
+        origins: Vec<String>,
+        hazards: Vec<HazardClass>,
+        severity_tier: Option<u8>,
+        can_relay_to_a_person: bool,
+        urgency: crate::consent_card::Urgency,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         if severity_tier.is_some_and(|tier| {
             !(crate::authorization::OBSERVE..=crate::authorization::MAX_GRANTABLE_TIER)
@@ -727,6 +772,7 @@ impl ManagementPlane {
                 &authorized_origins,
                 &disclosed_hazards_wire,
                 severity,
+                urgency,
             ),
             deadline: PHONE_CONSENT_DEADLINE,
         };
@@ -1259,11 +1305,12 @@ fn browser_grant_severity_value(severity: Severity) -> Value {
     })
 }
 
-fn browser_grant_question(
+pub(crate) fn browser_grant_question(
     ask_id: &str,
     origins: &[String],
     hazards: &[String],
     severity: Severity,
+    urgency: crate::consent_card::Urgency,
 ) -> Value {
     use crate::consent_card::*;
     let hosts: Vec<String> = origins
@@ -1295,16 +1342,57 @@ fn browser_grant_question(
     }
     ConsentCard {
         title: format!("Allow access to {}?", hosts.join(", ")),
-        prompt: format!("Let the agent use its own browser on {} to read pages and click{}.", hosts.join(", "), if severity.tier >= MUTATE_DURABLE { ", including actions that make lasting changes" } else if severity.tier == MUTATE_REVERSIBLE { " and make changes that can be undone" } else { "" }),
-        target: Target { kind: TargetKind::Site, label: hosts.join(", ") }, facts,
+        prompt: format!(
+            "Let the agent use its own browser on {} to read pages and click{}.",
+            hosts.join(", "),
+            if severity.tier >= MUTATE_DURABLE {
+                ", including actions that make lasting changes"
+            } else if severity.tier == MUTATE_REVERSIBLE {
+                " and make changes that can be undone"
+            } else {
+                ""
+            }
+        ),
+        target: Target {
+            kind: TargetKind::Site,
+            label: hosts.join(", "),
+        },
+        facts,
         grants: vec![ConsentOption::grant("allow", "Allow")],
         decline: ConsentOption::decline("deny", "Don't allow"),
-        expires_in: PHONE_CONSENT_DEADLINE, material_damage: true,
-        scope: Some(json!({"origins": origins, "hazards": hazards, "severity_ceiling": browser_grant_severity_value(severity)})), duration: None,
-    }.render(ask_id)
+        expires_in: PHONE_CONSENT_DEADLINE,
+        material_damage: true,
+        urgency,
+        scope: browser_grant_scope(origins, hazards, severity),
+        duration: None,
+    }
+    .render(ask_id)
 }
 
-fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindReport) -> Value {
+/// The values `settle_browser_grant` mints the grant from: its authorized
+/// origins, its ceiling tier, and the hazards it discloses. The credential and
+/// financial flags of the ceiling are not repeated because only those hazards
+/// set them.
+fn browser_grant_scope(
+    origins: &[String],
+    hazards: &[String],
+    severity: Severity,
+) -> crate::consent_card::Scope {
+    let scope = crate::consent_card::Scope::new()
+        .with("origins", origins)
+        .with("tier", severity.tier);
+    if hazards.is_empty() {
+        scope
+    } else {
+        scope.with("hazards", hazards)
+    }
+}
+
+pub(crate) fn profile_root_rebind_question(
+    ask_id: &str,
+    root_path: &str,
+    preview: &RebindReport,
+) -> Value {
     use crate::consent_card::*;
     ConsentCard {
         title: "Re-identify browser profiles?".into(),
@@ -1325,14 +1413,38 @@ fn profile_root_rebind_question(ask_id: &str, root_path: &str, preview: &RebindR
         decline: ConsentOption::decline("deny", "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
-        scope: None,
+        // Asked ahead: the management call has already answered consent_pending.
+        urgency: Urgency::Normal,
+        scope: profile_root_rebind_scope(preview),
         duration: None,
     }
     .render(ask_id)
 }
 
+/// The registry transition an allowing answer applies only if it still holds:
+/// the stored identity, the identity recorded in its place, and the registry
+/// generation. The root's path is left out of both identities; the rest of
+/// each is what the registry compares, and the reply already discloses them.
+fn profile_root_rebind_scope(preview: &RebindReport) -> crate::consent_card::Scope {
+    let facts_without_path = |facts: &crate::profile::RootIdentityFacts| {
+        json!({
+            "formula": facts.formula,
+            "inode": facts.inode,
+            "birth_time": facts.birth_time,
+        })
+    };
+    let old_identity = match &preview.old_identity {
+        crate::profile::ManagedRootIdentity::HashOnly(digest) => json!({ "digest": digest }),
+        crate::profile::ManagedRootIdentity::Facts(facts) => facts_without_path(facts),
+    };
+    crate::consent_card::Scope::new()
+        .with("old_identity", old_identity)
+        .with("new_identity", facts_without_path(&preview.new_identity))
+        .with("generation", preview.generation_before)
+}
+
 /// Evidence is checked again before clearing; consent is not proof the browser exited.
-fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value {
+pub(crate) fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value {
     use crate::consent_card::*;
     ConsentCard {
         title: "Clear the stuck browser record?".into(),
@@ -1371,7 +1483,13 @@ fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value
         decline: ConsentOption::decline("keep", "Keep it locked"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
-        scope: None,
+        // Asked ahead: the management call has already answered consent_pending.
+        urgency: Urgency::Normal,
+        // The clear consumes exactly the launch record with this sequence, and
+        // that record is the one launch of this profile recovery kept.
+        scope: Scope::new()
+            .with("profile_uuid", preview.profile_uuid.as_str())
+            .with("sequence", preview.sequence),
         duration: None,
     }
     .render(ask_id)
@@ -1579,8 +1697,13 @@ mod tests {
             vec!["https://github.com", "https://github.com:8443"],
         ] {
             let origins = origins.into_iter().map(str::to_string).collect::<Vec<_>>();
-            let body =
-                browser_grant_question("sites", &origins, &[], Severity::new(2, false, false));
+            let body = browser_grant_question(
+                "sites",
+                &origins,
+                &[],
+                Severity::new(2, false, false),
+                crate::consent_card::Urgency::Normal,
+            );
             assert_eq!(body["params"]["scope"]["origins"], json!(origins));
             assert!(body["params"]["facts"]
                 .as_array()
@@ -1593,6 +1716,7 @@ mod tests {
             &["https://github.com".into()],
             &[],
             Severity::new(2, false, false),
+            crate::consent_card::Urgency::Normal,
         );
         assert!(!body["params"]["facts"]
             .as_array()
@@ -1648,9 +1772,11 @@ mod tests {
             reply["hazards"]
         );
         assert_eq!(
-            question.body["params"]["scope"]["severity_ceiling"],
-            reply["severity_ceiling"]
+            question.body["params"]["scope"]["tier"],
+            reply["severity_ceiling"]["tier"]
         );
+        // Asked ahead of the call that needs it, so not an interrupting alert.
+        assert_eq!(question.body["params"]["urgency"], "normal");
         // The prose is for the person; the structured fields above are the
         // scope. It must say what the grant allows AND what it still refuses.
         assert_eq!(
@@ -1728,8 +1854,8 @@ mod tests {
             json!({"tier": 4, "name": "mutate_durable", "credential": false, "financial": false})
         );
         assert_eq!(
-            question.body["params"]["scope"]["severity_ceiling"],
-            reply["severity_ceiling"]
+            question.body["params"]["scope"],
+            json!({"origins": ["https://example.com"], "tier": 4})
         );
         assert_eq!(
             card_capabilities(&question.body),
@@ -1846,5 +1972,23 @@ mod tests {
         assert_eq!(unavailable["outcome"], "consent_unavailable");
         assert!(question.is_none());
         assert_eq!(plane.browser_grant_count().await, 0);
+    }
+
+    /// A browser call held open on the answer blocks the agent, so its card is
+    /// sent at high urgency; the same grant asked ahead is not.
+    #[tokio::test]
+    async fn only_a_browser_grant_held_in_call_is_sent_at_high_urgency() {
+        let plane = plane(TargetResolution::NotRunning);
+        let origins = vec!["https://example.com".to_string()];
+        let (_, held) = plane
+            .open_in_call_browser_grant("conversation", origins.clone(), vec![], Some(OBSERVE))
+            .await
+            .unwrap();
+        let (_, ahead) = plane
+            .open_browser_grant_at_tier("conversation", origins, vec![], Some(OBSERVE), true)
+            .await
+            .unwrap();
+        assert_eq!(held.unwrap().body["params"]["urgency"], "high");
+        assert_eq!(ahead.unwrap().body["params"]["urgency"], "normal");
     }
 }

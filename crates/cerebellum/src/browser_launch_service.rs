@@ -1679,6 +1679,7 @@ impl crate::launch_recovery::LaunchRecoveryClearer for RecoveryClearState {
         evidence.permits_clear()?;
         Ok(crate::launch_recovery::ClearPreview {
             agent_project_id: agent_project_id.to_string(),
+            profile_uuid: retained.intent.profile.profile_uuid.clone(),
             sequence: retained.sequence,
             reason: retained.reason,
             launched_at: crate::launch_recovery::launched_at(record.browser_started_at_micros),
@@ -4580,6 +4581,8 @@ mod orphan_recovery_tests {
             );
             let (question, ask_id) = fixture.ask().await;
             crate::consent_card::assert_contract(&question, &["clear", "keep"], "keep");
+            assert_eq!(question["params"]["urgency"], "normal");
+            assert_eq!(question["params"]["scope"]["profile_uuid"], "profile-1");
             let message = question["params"]["facts"].to_string();
             assert!(!message.contains(PROJECT), "{message}");
             assert!(!message.contains("attestation_untrusted"), "{message}");

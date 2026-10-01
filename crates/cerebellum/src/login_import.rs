@@ -245,59 +245,7 @@ impl LoginImportPlan {
     }
 
     pub fn question(&self, ask_id: &str, _agent: &str) -> Value {
-        use crate::consent_card::*;
-        let mut grants: Vec<_> = self
-            .presence
-            .iter()
-            .filter(|b| b.transfer == "available")
-            .map(|b| {
-                ConsentOption::grant(
-                    format!("transfer:{}", b.browser),
-                    format!("Copy my login from {}", b.name),
-                )
-            })
-            .collect();
-        grants.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
-        let mut facts: Vec<_> = self
-            .presence
-            .iter()
-            .map(|b| {
-                Fact::new(
-                    &b.name,
-                    match b.reason {
-                        Some("different_keychain_item") => "can't be copied (different keychain)",
-                        Some("session_only") if b.session_rows > 0 => {
-                            "only a temporary login is saved"
-                        }
-                        Some("session_only") => "nothing saved",
-                        Some("unreadable") => "can't read saved logins",
-                        Some("safari_transfer_unsupported") => "can't be copied from Safari",
-                        _ if b.transfer == "available" => "login available",
-                        _ => "can't be copied",
-                    },
-                )
-            })
-            .collect();
-        facts.push(Fact::new("Privacy", "No cookie value is read by the agent"));
-        ConsentCard {
-            title: format!("Copy your {} login?", self.host),
-            prompt: format!(
-                "Copy your {} login from a browser on this Mac into the agent's browser.",
-                self.host
-            ),
-            target: Target {
-                kind: TargetKind::Site,
-                label: self.host.clone(),
-            },
-            facts,
-            grants,
-            decline: ConsentOption::decline("deny", "Don't allow"),
-            expires_in: ELICITATION_DEADLINE,
-            material_damage: true,
-            scope: None,
-            duration: None,
-        }
-        .render(ask_id)
+        import_question(ask_id, &self.origin, &self.host, &self.presence)
     }
 
     pub fn refusal(&self, code: &'static str, remedy: &'static str) -> ImportResult {
@@ -425,6 +373,72 @@ impl LoginImportPlan {
         }
         transferred
     }
+}
+
+/// The consent card for copying a login for `origin` into the agent's browser.
+///
+/// One grant per browser the login can be copied from, plus signing in by
+/// hand; `presence` says which browsers hold a login and why the others can't
+/// give one.
+pub(crate) fn import_question(
+    ask_id: &str,
+    origin: &str,
+    host: &str,
+    presence: &[BrowserPresence],
+) -> Value {
+    use crate::consent_card::*;
+    let mut grants: Vec<_> = presence
+        .iter()
+        .filter(|b| b.transfer == "available")
+        .map(|b| {
+            ConsentOption::grant(
+                format!("transfer:{}", b.browser),
+                format!("Copy my login from {}", b.name),
+            )
+        })
+        .collect();
+    grants.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
+    let mut facts: Vec<_> = presence
+        .iter()
+        .map(|b| {
+            Fact::new(
+                &b.name,
+                match b.reason {
+                    Some("different_keychain_item") => "can't be copied (different keychain)",
+                    Some("session_only") if b.session_rows > 0 => "only a temporary login is saved",
+                    Some("session_only") => "nothing saved",
+                    Some("unreadable") => "can't read saved logins",
+                    Some("safari_transfer_unsupported") => "can't be copied from Safari",
+                    _ if b.transfer == "available" => "login available",
+                    _ => "can't be copied",
+                },
+            )
+        })
+        .collect();
+    facts.push(Fact::new("Privacy", "No cookie value is read by the agent"));
+    ConsentCard {
+        title: format!("Copy your {host} login?"),
+        prompt: format!(
+            "Copy your {host} login from a browser on this Mac into the agent's browser."
+        ),
+        target: Target {
+            kind: TargetKind::Site,
+            label: host.to_string(),
+        },
+        facts,
+        grants,
+        decline: ConsentOption::decline("deny", "Don't allow"),
+        expires_in: ELICITATION_DEADLINE,
+        material_damage: true,
+        // The import call waits on the answer, so the agent is blocked until
+        // the person decides.
+        urgency: Urgency::High,
+        // The plan the answer applies to is prepared for this one origin: the
+        // cookie domains it copies are derived from it.
+        scope: Scope::new().with("origin", origin),
+        duration: None,
+    }
+    .render(ask_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2098,6 +2112,8 @@ mod tests {
                 &["transfer:chrome", "hand_off", "deny"],
                 "deny",
             );
+            assert_eq!(card["params"]["urgency"], "high");
+            assert_eq!(card["params"]["scope"], json!({"origin": "https://x.com"}));
             let banned = [
                 "agent_",
                 "persistent row",

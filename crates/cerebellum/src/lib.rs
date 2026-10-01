@@ -5364,12 +5364,11 @@ async fn serve_browser_with_consent(
     };
     let Ok((mut pending, Some(question))) = planes
         .management
-        .open_browser_grant_at_tier(
+        .open_in_call_browser_grant(
             &facts.identity.conversation_key,
             origins,
             hazards,
             Some(tier),
-            true,
         )
         .await
     else {
@@ -6568,6 +6567,10 @@ mod tests {
             question["params"]["scope"]["hazards"],
             json!(["credential_form_submit", "unverified_form_contents"])
         );
+        // A disclosed hazard mints the durable tier, and the grant is asked
+        // ahead of the call that needs it.
+        assert_eq!(question["params"]["scope"]["tier"], 4);
+        assert_eq!(question["params"]["urgency"], "normal");
         // The person must be told, in words they can act on, what the grant
         // unlocks: each disclosed hazard names the kind of form it allows.
         let message =

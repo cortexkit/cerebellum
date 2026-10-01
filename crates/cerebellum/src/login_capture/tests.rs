@@ -436,6 +436,11 @@ fn the_question_names_the_holder_site_account_and_lifetime() {
         question["params"]["prompt"],
         "insula will hold a copy of your ollama.com login."
     );
+    assert_eq!(question["params"]["urgency"], "high");
+    assert_eq!(
+        question["params"]["scope"],
+        json!({"credential_domain": "ollama.com", "account": "work"})
+    );
     let facts = &question["params"]["facts"];
     assert_eq!(facts[0], json!({"label": "Account", "value": "work"}));
     assert!(facts.to_string().contains("Deleted after 10 minutes"));

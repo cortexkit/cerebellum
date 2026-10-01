@@ -865,6 +865,27 @@ async fn management_wire_allows_rebinding_the_recreated_root() {
     assert_eq!(question["params"]["kind"], "consent");
     assert_eq!(question["params"]["default"], "deny");
     assert_eq!(question["params"]["on_expiry"], "deny");
+    // Asked ahead: the rebind call already answered consent_pending.
+    assert_eq!(question["params"]["urgency"], "normal");
+    // The scope is the registry transition the answer applies, the same one
+    // the reply discloses, without the root's path.
+    let scope = &question["params"]["scope"];
+    assert_eq!(scope["generation"], reply["generation"]);
+    assert_eq!(
+        scope["new_identity"]["inode"],
+        reply["new_identity"]["inode"]
+    );
+    assert_eq!(
+        scope["new_identity"]["birth_time"],
+        reply["new_identity"]["birth_time"]
+    );
+    assert!(scope["new_identity"].get("path").is_none(), "{scope}");
+    assert!(
+        !scope
+            .to_string()
+            .contains(&fs::canonicalize(root.path()).unwrap().display().to_string()),
+        "{scope}"
+    );
     assert_eq!(
         question["params"]["options"]
             .as_array()

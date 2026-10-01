@@ -1452,6 +1452,11 @@ fn new_capture_id() -> String {
     )
 }
 
+/// How loudly the capture's consent card notifies. High because `run` holds
+/// the `browser.capture_login` call open on the answer, with no shorter park:
+/// the agent is blocked until the person decides or the question expires.
+const CAPTURE_CONSENT_URGENCY: crate::consent_card::Urgency = crate::consent_card::Urgency::High;
+
 /// Built before a browser exists so no captured cookie can enter the question.
 pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Value {
     use crate::consent_card::*;
@@ -1480,7 +1485,12 @@ pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Va
         decline: ConsentOption::decline(DENY_DECISION, "Don't allow"),
         expires_in: crate::login_import::ELICITATION_DEADLINE,
         material_damage: true,
-        scope: None,
+        urgency: CAPTURE_CONSENT_URGENCY,
+        // The two parts of the vault id the captured login is stored under
+        // (see `CaptureRequest::credential_id`).
+        scope: Scope::new()
+            .with("credential_domain", request.credential_domain.as_str())
+            .with("account", request.account.as_str()),
         duration: None,
     }
     .render(&format!("capture-login-{}", new_capture_id()))

@@ -1328,7 +1328,13 @@ impl ComputerGrants {
             GrantNeed::Takeover => TAKEOVER_QUESTION_DEADLINE,
         };
         let ask_id = new_ask_id(grant_kind);
-        let body = question_body(&ask_id, need, &offered, signature_changed);
+        let body = question_body(
+            &ask_id,
+            need,
+            &offered,
+            signature_changed,
+            identity.as_ref(),
+        );
         let (settled_tx, settled) = watch::channel(None);
         state.questions.insert(
             ask_id.clone(),
@@ -1771,11 +1777,15 @@ fn wall_clock_ms() -> u64 {
 }
 
 /// Display effects describe consent; settlement still validates the original offered words.
-fn question_body(
+///
+/// `identity` is the code-signing identity the grant will be recorded
+/// against, read for the process the call resolved.
+pub(crate) fn question_body(
     ask_id: &str,
     need: &GrantNeed,
     offered: &[&'static str],
     signature_changed: bool,
+    identity: Option<&AppIdentity>,
 ) -> Value {
     use crate::consent_card::*;
     let (title, prompt, target, deadline) = match need {
@@ -1815,7 +1825,10 @@ fn question_body(
         decline: ConsentOption::decline(DENY, "Don't allow"),
         expires_in: deadline,
         material_damage: true,
-        scope: None,
+        // Both kinds hold the call that needs the grant open while the person
+        // decides (up to CONSENT_PARK_LIMIT), so the agent is blocked on it.
+        urgency: Urgency::High,
+        scope: grant_scope(need, identity),
         duration: if offered.contains(&ALLOW_ALWAYS) {
             None
         } else {
@@ -1823,6 +1836,33 @@ fn question_body(
         },
     }
     .render(ask_id)
+}
+
+/// What an answer grants, named by the values the grant is recorded under.
+///
+/// An app grant is keyed on the bundle identity and is only honoured for a
+/// process that still satisfies the signing identity read at ask time, so the
+/// signer is named too: the Team ID as an "always" record stores it, or the
+/// marker that Apple signed it. The display name stays in the card's label.
+/// A takeover grant hands over the machine's real pointer and keyboard.
+fn grant_scope(need: &GrantNeed, identity: Option<&AppIdentity>) -> crate::consent_card::Scope {
+    use crate::consent_card::Scope;
+    match need {
+        GrantNeed::App {
+            bundle_identity, ..
+        } => {
+            let scope = Scope::new().with("app", bundle_identity.as_str());
+            match identity {
+                Some(AppIdentity {
+                    team_id: Some(team_id),
+                    ..
+                }) => scope.with("team_id", team_id.as_str()),
+                Some(identity) if identity.apple_anchored => scope.with("apple_anchored", true),
+                _ => scope,
+            }
+        }
+        GrantNeed::Takeover => Scope::new().with("takeover", "machine"),
+    }
 }
 
 /// What the answer to a question is applied against, copied out so the store
@@ -1869,9 +1909,12 @@ mod consent_card_tests {
             &GrantNeed::Takeover,
             &[ALLOW_CONVERSATION, DENY],
             false,
+            None,
         );
         crate::consent_card::assert_contract(&body, &["allow_conversation", "deny"], "deny");
         assert_eq!(body["params"]["duration"], "conversation");
         assert_eq!(body["params"]["expires_in_ms"], 300_000);
+        assert_eq!(body["params"]["urgency"], "high");
+        assert_eq!(body["params"]["scope"], json!({"takeover": "machine"}));
     }
 }
