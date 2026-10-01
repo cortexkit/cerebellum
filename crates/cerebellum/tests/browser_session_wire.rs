@@ -387,6 +387,9 @@ impl CommittedPage {
 enum PageMove {
     Commit(&'static str),
     Back,
+    /// The capture itself fails after the moves before it, as Chrome's
+    /// accessibility read does once the document it was reading is gone.
+    CaptureFails,
 }
 
 #[derive(Default)]
@@ -485,13 +488,17 @@ struct RecordingProcess {
 }
 
 impl RecordingProcess {
-    fn apply_moves_during_capture(&mut self) {
+    /// Apply the moves queued for this capture; whether the capture fails.
+    fn apply_moves_during_capture(&mut self) -> bool {
+        let mut capture_fails = false;
         for page_move in std::mem::take(&mut *self.moves_during_capture.lock().unwrap()) {
             match page_move {
                 PageMove::Commit(url) => self.page.commit(url),
                 PageMove::Back => self.page.back(),
+                PageMove::CaptureFails => capture_fails = true,
             }
         }
+        capture_fails
     }
 }
 
@@ -571,7 +578,9 @@ impl OwnedBrowserProcess for RecordingProcess {
             document_epoch,
             current_origin,
         );
-        self.apply_moves_during_capture();
+        if self.apply_moves_during_capture() {
+            return Err(NavigationDriveError::CdpFailure);
+        }
         Ok(observation)
     }
 
@@ -593,7 +602,9 @@ impl OwnedBrowserProcess for RecordingProcess {
             after: viewport,
             invalidation_observed: false,
         };
-        self.apply_moves_during_capture();
+        if self.apply_moves_during_capture() {
+            return Err(NavigationDriveError::CdpFailure);
+        }
         Ok(observation)
     }
 
@@ -3856,6 +3867,36 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screen
         "a refused screenshot still reached the capture: {:?}",
         launcher.effects.lock().unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_snapshot_that_fails_because_the_page_moved_reports_the_move() {
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+
+    *launcher.moves_during_capture.lock().unwrap() = vec![
+        PageMove::Commit("https://attacker.example/mid-read"),
+        PageMove::CaptureFails,
+    ];
+    let moved = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(moved["outcome"], "page_navigated_during_read", "{moved}");
+    assert_eq!(
+        moved["detail"]["authorized_origin"], "https://landed.example",
+        "{moved}"
+    );
+    assert_eq!(
+        moved["detail"]["live_origin"], "https://attacker.example",
+        "{moved}"
+    );
+    assert_no_page_content(&moved);
+
+    // A capture that fails while the page stays where it was authorized has
+    // no move to report, so it is still the module's own failure.
+    launcher.page.commit("https://landed.example/final");
+    *launcher.moves_during_capture.lock().unwrap() = vec![PageMove::CaptureFails];
+    let failed = response_body(&planes, 4, "browser.snapshot", json!({"mode": "ax"})).await;
+    assert_eq!(failed["outcome"], "internal_error", "{failed}");
+    assert_eq!(failed["detail"]["reason_code"], "cdp_failure", "{failed}");
+    assert_no_page_content(&failed);
 }
 
 #[tokio::test]

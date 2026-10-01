@@ -2629,7 +2629,30 @@ impl BrowserPlane {
         })?;
         let (session_operation, drive_result, live_after) = driven;
         session_operation.finish();
-        let observation = drive_result.map_err(map_navigation_drive_error)?;
+        let observation = match drive_result {
+            Ok(observation) => observation,
+            Err(error) => {
+                // A capture fails when the page commits another document
+                // while it is being read: Chrome answers the accessibility
+                // read with "Invalid ID" once the nodes it named are gone
+                // (`examples/handoff_attachment_probe.rs` records it). The
+                // caller can act on that move, so it is reported as the move
+                // rather than as a module failure.
+                if live_after
+                    .as_ref()
+                    .is_ok_and(|live| *live != source_document)
+                {
+                    self.confirm_read_document(
+                        identity,
+                        BrowserCapability::Snapshot,
+                        &source_document,
+                        live_after,
+                    )
+                    .await?;
+                }
+                return Err(map_navigation_drive_error(error));
+            }
+        };
         self.confirm_read_document(
             identity,
             BrowserCapability::Snapshot,

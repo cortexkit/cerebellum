@@ -2373,8 +2373,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             // the transport reads it below; it accepts the unpaired
             // surrogates Chrome sends for page text that serde_json alone
             // refuses.
-            let value =
-                crate::cdp::parse_json_message(&frame).map_err(|_| NavigationDriveError::CdpFailure)?;
+            let value = crate::cdp::parse_json_message(&frame)
+                .map_err(|_| NavigationDriveError::CdpFailure)?;
             if value.get("id").is_some() {
                 let response = self
                     .transport

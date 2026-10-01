@@ -25,13 +25,19 @@
 //! temp directory; the probe prints the log's path, every event method it saw
 //! on the route's session, and each read's result.
 //!
+//! With `--url <url>` it opens that page instead and waits, polling as the
+//! handoff does, until a person signs in there (or five minutes pass), then
+//! reads the page twice and once more after a fresh load of where it ended.
+//! That is the live reproduction of a sign-in on a real site.
+//!
 //! It launches Chrome as a session does on a throwaway profile under the temp
-//! directory and signs in nowhere. Pass `--headless` to run Chrome with no
-//! window at all; without it Chrome opens a visible window, so run it that
-//! way only with the operator's permission:
+//! directory. Pass `--headless` to run Chrome with no window at all; without
+//! it Chrome opens a visible window, so run it that way only with the
+//! operator's permission:
 //!
 //! ```text
 //! cargo run -p cerebellum --example handoff_attachment_probe -- --headless
+//! cargo run -p cerebellum --example handoff_attachment_probe -- --url https://x.com/
 //! ```
 
 #[cfg(not(target_os = "macos"))]
@@ -93,12 +99,16 @@ mod probe {
                 for &byte in &destination[..count] {
                     if byte == 0 {
                         let frame = std::mem::take(&mut self.inbound);
-                        // Whether the driver's JSON parser accepts the frame is
-                        // recorded beside it: a frame it rejects fails the read
-                        // that was waiting when it arrived.
-                        let verdict = match serde_json::from_slice::<Value>(&frame) {
-                            Ok(_) => "",
-                            Err(_) => "UNPARSEABLE ",
+                        // A frame serde_json alone refuses is marked: before
+                        // the CDP parser learned to read unpaired surrogate
+                        // halves, such a frame failed the read waiting on it.
+                        // `UNREADABLE` marks one the driver's parser refuses.
+                        let verdict = if cerebellum::cdp::parse_json_message(&frame).is_err() {
+                            "UNREADABLE "
+                        } else if serde_json::from_slice::<Value>(&frame).is_err() {
+                            "SERDE_REFUSES "
+                        } else {
+                            ""
                         };
                         self.push(format!("<< {verdict}{}", String::from_utf8_lossy(&frame)));
                     } else {
@@ -237,7 +247,10 @@ mod probe {
         pages.insert("/home", (String::new(), home));
         pages.insert(
             "/frame",
-            (String::new(), page("Frame", "<button>Provider button</button>")),
+            (
+                String::new(),
+                page("Frame", "<button>Provider button</button>"),
+            ),
         );
         pages.insert(
             "/surrogate",
@@ -261,7 +274,11 @@ mod probe {
         label: &str,
     ) -> bool {
         let before = driver.committed_document(CONTEXT, DEADLINE_MS);
-        mark(log, started, format!("{label}: committed_document before = {before:?}"));
+        mark(
+            log,
+            started,
+            format!("{label}: committed_document before = {before:?}"),
+        );
         let Ok(before) = before else { return false };
         let snapshot = driver.snapshot_classified(
             CONTEXT,
@@ -289,14 +306,23 @@ mod probe {
             }
         };
         let after = driver.committed_document(CONTEXT, DEADLINE_MS);
-        mark(log, started, format!("{label}: committed_document after = {after:?}"));
+        mark(
+            log,
+            started,
+            format!("{label}: committed_document after = {after:?}"),
+        );
         ok && after.is_ok()
     }
 
     pub fn run() {
-        let headless = std::env::args().any(|argument| argument == "--headless");
-        let chrome =
-            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        let arguments = std::env::args().collect::<Vec<_>>();
+        let headless = arguments.iter().any(|argument| argument == "--headless");
+        let live_url = arguments
+            .iter()
+            .position(|argument| argument == "--url")
+            .and_then(|index| arguments.get(index + 1))
+            .cloned();
+        let chrome = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
         if !chrome.is_file() {
             println!("skipped: no Chrome at {}", chrome.display());
             return;
@@ -317,8 +343,7 @@ mod probe {
         let _server_a = start_on(port_a, Arc::clone(&table));
         let _server_b = start_on(port_b, Arc::clone(&table));
 
-        let profile =
-            std::env::temp_dir().join(format!("ck-handoff-probe-{}", std::process::id()));
+        let profile = std::env::temp_dir().join(format!("ck-handoff-probe-{}", std::process::id()));
         std::fs::create_dir_all(&profile).expect("profile dir");
         let mut arguments = cerebellum::browser_launch_service::browser_launch_arguments(
             &profile,
@@ -352,26 +377,51 @@ mod probe {
         let mut driver =
             CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default());
 
-        mark(&log, started, format!("A={origin_a} B={origin_b} headless={headless}"));
+        let start_url = live_url
+            .clone()
+            .unwrap_or_else(|| format!("{origin_a}/start"));
+        let origin = match &live_url {
+            Some(url) => origin_of(url),
+            None => origin_a.clone(),
+        };
+        mark(
+            &log,
+            started,
+            format!("start={start_url} origin={origin} B={origin_b} headless={headless}"),
+        );
         let mut tracker = Tracker::default();
         let navigated = driver.navigate(
             CONTEXT,
-            &format!("{origin_a}/start"),
+            &start_url,
             NavigationWait::Settle,
             DEADLINE_MS,
             &mut tracker,
         );
-        mark(&log, started, format!("navigate /start = {navigated:?}"));
+        mark(
+            &log,
+            started,
+            format!("navigate {start_url} = {navigated:?}"),
+        );
         let baseline = read_like_snapshot(&mut driver, &log, started, "baseline");
         let presented = driver.present(CONTEXT, DEADLINE_MS);
         mark(&log, started, format!("present = {presented:?}"));
 
-        // The handoff's poll, at a quarter of its real interval so the
-        // transitions above are crossed by several polls.
-        let poll_until = Instant::now() + Duration::from_secs(15);
-        let mut home_seen_at = None;
+        // The handoff's poll. For the scripted sign-in it runs at a quarter of
+        // its real interval so each step is crossed by several polls; on a
+        // live site it runs at the real interval until the handoff would
+        // observe the sign-in, and a little after, as a caller's resume does.
+        let (interval, give_up) = match live_url {
+            Some(_) => (Duration::from_millis(2_000), Duration::from_secs(300)),
+            None => (Duration::from_millis(500), Duration::from_secs(15)),
+        };
+        let poll_until = Instant::now() + give_up;
+        let opening_cookies = driver
+            .cookie_names_for_origin(CONTEXT, &origin, DEADLINE_MS)
+            .unwrap_or_default();
+        let mut saw_credential_field = false;
+        let mut done_at = None;
         while Instant::now() < poll_until {
-            let cookies = driver.cookie_names_for_origin(CONTEXT, &origin_a, DEADLINE_MS);
+            let cookies = driver.cookie_names_for_origin(CONTEXT, &origin, DEADLINE_MS);
             let url = driver.main_frame_url(CONTEXT, DEADLINE_MS);
             let credential = driver.has_credential_field(CONTEXT, DEADLINE_MS);
             mark(
@@ -379,51 +429,89 @@ mod probe {
                 started,
                 format!("poll cookies={cookies:?} url={url:?} credential_field={credential:?}"),
             );
-            if url.as_deref().is_ok_and(|url| url.contains("/home")) {
-                let seen = *home_seen_at.get_or_insert_with(Instant::now);
-                if seen.elapsed() > Duration::from_secs(1) {
+            let done = match (&live_url, &cookies, &url, &credential) {
+                (Some(_), Ok(cookies), Ok(url), Ok(credential)) => {
+                    let observed = cerebellum::browser_session::handoff_login_observed(
+                        saw_credential_field,
+                        *credential,
+                        &opening_cookies,
+                        cookies,
+                        url,
+                        &origin,
+                    );
+                    saw_credential_field |= *credential;
+                    observed
+                }
+                (None, _, Ok(url), _) => url.contains("/home"),
+                _ => false,
+            };
+            if done || done_at.is_some() {
+                let at = *done_at.get_or_insert_with(Instant::now);
+                if at.elapsed() > Duration::from_secs(2) {
                     break;
                 }
             }
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(interval);
         }
         mark(&log, started, "resume (no CDP traffic of its own)");
         let first = read_like_snapshot(&mut driver, &log, started, "after-resume #1");
         let second = read_like_snapshot(&mut driver, &log, started, "after-resume #2");
 
-        let navigated = driver.navigate(
-            CONTEXT,
-            &format!("{origin_a}/surrogate"),
-            NavigationWait::Settle,
-            DEADLINE_MS,
-            &mut tracker,
-        );
-        mark(&log, started, format!("navigate /surrogate = {navigated:?}"));
-        let surrogate = read_like_snapshot(&mut driver, &log, started, "lone surrogate");
+        let surrogate = if live_url.is_none() {
+            let navigated = driver.navigate(
+                CONTEXT,
+                &format!("{origin_a}/surrogate"),
+                NavigationWait::Settle,
+                DEADLINE_MS,
+                &mut tracker,
+            );
+            mark(
+                &log,
+                started,
+                format!("navigate /surrogate = {navigated:?}"),
+            );
+            read_like_snapshot(&mut driver, &log, started, "lone surrogate")
+        } else {
+            true
+        };
 
+        // A fresh load of where the sign-in ended, as the person's own
+        // recovery did.
+        let fresh_url = match driver.main_frame_url(CONTEXT, DEADLINE_MS) {
+            Ok(url) if live_url.is_some() => url,
+            _ => format!("{origin_a}/home"),
+        };
         let navigated = driver.navigate(
             CONTEXT,
-            &format!("{origin_a}/home"),
+            &fresh_url,
             NavigationWait::Settle,
             DEADLINE_MS,
             &mut tracker,
         );
-        mark(&log, started, format!("navigate /home = {navigated:?}"));
+        mark(
+            &log,
+            started,
+            format!("navigate {fresh_url} = {navigated:?}"),
+        );
         let fresh = read_like_snapshot(&mut driver, &log, started, "fresh home");
 
         let lines = log.lock().unwrap().clone();
-        let path = std::env::temp_dir().join(format!(
-            "ck-handoff-probe-{}.log",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ck-handoff-probe-{}.log", std::process::id()));
         std::fs::write(&path, lines.join("\n")).expect("write log");
         let mut methods = BTreeMap::<String, usize>::new();
         for line in &lines {
             let Some(frame) = line.split_once("<< ").map(|(_, frame)| frame) else {
                 continue;
             };
+            if let Some(marker) = ["UNREADABLE", "SERDE_REFUSES"]
+                .into_iter()
+                .find(|marker| frame.starts_with(marker))
+            {
+                *methods.entry(marker.into()).or_default() += 1;
+                continue;
+            }
             let Ok(value) = serde_json::from_str::<Value>(frame) else {
-                *methods.entry("UNPARSEABLE".into()).or_default() += 1;
                 continue;
             };
             if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -438,6 +526,14 @@ mod probe {
 
         let _ = released.terminate_and_reap();
         let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// `scheme://host[:port]` of a URL, which is how the handoff names the
+    /// origin it was opened for.
+    fn origin_of(url: &str) -> String {
+        let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        format!("{scheme}://{}", authority.to_ascii_lowercase())
     }
 
     fn start_on(port: u16, pages: Arc<BTreeMap<&'static str, (String, String)>>) -> Server {
