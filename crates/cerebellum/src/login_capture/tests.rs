@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 use subc_protocol::Principal;
 
 use super::test_support::{
-    contains_bytes, fixture, fixture_with, BrowserScript, FakeEntry, Fixture, PLANTED_VALUE, ROOT,
+    contains_bytes, fixture, fixture_with, BrowserScript, FakeEntry, Fixture, ScriptedVerification,
+    PLANTED_VALUE, ROOT,
 };
 use super::*;
 use crate::elicit::AskOutcome;
@@ -756,6 +757,319 @@ async fn an_unobserved_login_expires_with_nothing_written() {
     assert_eq!(outcome.reply["outcome"], "expired");
     nothing_captured(&fixture);
     assert!(fixture.events.contains_prefix("profile_deleted"));
+    // Nobody signed in, so nothing was verified and the reply does not claim
+    // a sign-in that failed to verify.
+    assert_eq!(fixture.launcher.verifications.count(), 0);
+    assert!(outcome.reply.get("reason").is_none(), "{}", outcome.reply);
+}
+
+// --- session verification ---------------------------------------------------
+
+fn probe(final_url: &str, status: Option<u16>, credential_field: bool) -> SessionProbe {
+    SessionProbe {
+        final_url: final_url.to_string(),
+        status,
+        credential_field,
+    }
+}
+
+#[test]
+fn the_fetch_url_served_signed_in_verifies() {
+    assert_eq!(
+        session_verified(
+            "https://ollama.com/settings",
+            &probe("https://ollama.com/settings", Some(200), false)
+        ),
+        Ok(())
+    );
+    // Another page on the same origin, such as a settings page that moved,
+    // still shows the session works.
+    assert_eq!(
+        session_verified(
+            "https://ollama.com/settings",
+            &probe("https://ollama.com/settings/keys", Some(204), false)
+        ),
+        Ok(())
+    );
+}
+
+/// Everything else about the load passes, so only the origin can refuse it.
+#[test]
+fn an_off_origin_final_url_is_refused() {
+    for final_url in [
+        "https://signin.ollama.com/",
+        "https://ollama.com.evil.example/settings",
+        "http://ollama.com/settings",
+        "about:blank",
+    ] {
+        assert_eq!(
+            session_verified(
+                "https://ollama.com/settings",
+                &probe(final_url, Some(200), false)
+            ),
+            Err(VerificationFailure::OffOrigin),
+            "{final_url}"
+        );
+    }
+}
+
+#[test]
+fn a_sign_in_page_on_the_same_origin_is_refused() {
+    // Served at the requested URL, but asking for a password.
+    assert_eq!(
+        session_verified(
+            "https://ollama.com/settings",
+            &probe("https://ollama.com/settings", Some(200), true)
+        ),
+        Err(VerificationFailure::SignInPage)
+    );
+    // Redirected to a sign-in path whose first step asks only for an email.
+    for final_url in [
+        "https://ollama.com/signin?next=%2Fsettings",
+        "https://ollama.com/auth/Login",
+        "https://ollama.com/sign-in/",
+    ] {
+        assert_eq!(
+            session_verified(
+                "https://ollama.com/settings",
+                &probe(final_url, Some(200), false)
+            ),
+            Err(VerificationFailure::SignInPage),
+            "{final_url}"
+        );
+    }
+    // A word inside a segment or in the query is not a sign-in path.
+    assert_eq!(
+        session_verified(
+            "https://ollama.com/settings",
+            &probe("https://ollama.com/settings?from=login", Some(200), false)
+        ),
+        Ok(())
+    );
+    // A fetch URL that is itself on such a path cannot be told apart from a
+    // redirect to it, so the path alone does not refuse it.
+    assert_eq!(
+        session_verified(
+            "https://example.com/login/status",
+            &probe("https://example.com/login/status", Some(200), false)
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_status_outside_2xx_or_none_is_refused() {
+    for status in [Some(199), Some(301), Some(401), Some(403), Some(500), None] {
+        assert_eq!(
+            session_verified(
+                "https://ollama.com/settings",
+                &probe("https://ollama.com/settings", status, false)
+            ),
+            Err(VerificationFailure::Status(status)),
+            "{status:?}"
+        );
+    }
+}
+
+/// A multi-step sign-in (Ollama's goes through a separate sign-in host)
+/// satisfies the login heuristic between steps, before the session works. The
+/// first verification fails there, the handoff stays open, and the capture
+/// happens only once a later verification passes.
+#[tokio::test]
+async fn a_failed_verification_keeps_the_handoff_open_until_one_passes() {
+    let fixture = fixture();
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        verifications: vec![
+            ScriptedVerification::redirected_off_origin(),
+            ScriptedVerification::works(),
+        ],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+    assert_eq!(fixture.launcher.verifications.count(), 2);
+    assert_eq!(fixture.fs.files().len(), 1);
+    let events = fixture.events.snapshot();
+    let verified = events
+        .iter()
+        .rposition(|event| event == "verify:https://ollama.com/settings")
+        .unwrap();
+    let read = events
+        .iter()
+        .position(|event| event.starts_with("cookie_header:"))
+        .unwrap();
+    assert!(
+        verified < read,
+        "the cookie was read before the passing verification: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_never_verifies_expires_as_not_verified_with_nothing_written() {
+    let fixture = fixture_with(|env| env.handoff_duration = Duration::from_millis(100));
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        verifications: vec![ScriptedVerification::redirected_off_origin()],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "expired", "{}", outcome.reply);
+    assert_eq!(outcome.reply["reason"], LOGIN_NOT_VERIFIED);
+    assert!(fixture.launcher.verifications.count() >= 1);
+    nothing_captured(&fixture);
+    assert!(!fixture.events.contains_prefix("cookie_header:"));
+    assert!(fixture.events.contains_prefix("profile_deleted"));
+    // The journal record carries the plain outcome; the reason is reply-only.
+    assert_eq!(outcome.journal.outcome, "expired");
+    crate::browser::validate_browser_result(crate::management::CAPTURE_LOGIN, &outcome.reply)
+        .expect("the not-verified reply matches its schema");
+}
+
+#[tokio::test]
+async fn a_sign_in_page_on_the_same_origin_never_captures() {
+    let fixture = fixture_with(|env| env.handoff_duration = Duration::from_millis(100));
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        verifications: vec![ScriptedVerification::Ends {
+            final_url: Some("https://ollama.com/signin".to_string()),
+            status: Some(200),
+            credential_field: true,
+        }],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "expired", "{}", outcome.reply);
+    assert_eq!(outcome.reply["reason"], LOGIN_NOT_VERIFIED);
+    assert!(outcome.reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("ended on a sign-in page"));
+    nothing_captured(&fixture);
+}
+
+/// A browser that cannot carry out the load is not a working session either,
+/// and does not end the handoff.
+#[tokio::test]
+async fn a_verification_the_browser_cannot_run_keeps_the_handoff_open() {
+    let fixture = fixture();
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        verifications: vec![
+            ScriptedVerification::DriveFails,
+            ScriptedVerification::works(),
+        ],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+}
+
+#[tokio::test]
+async fn a_window_closed_after_a_failed_verification_says_so() {
+    let fixture = fixture_with(|env| env.verification_retry_interval = Duration::from_secs(60));
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        exits_at_poll: Some(6),
+        verifications: vec![ScriptedVerification::redirected_off_origin()],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(
+        outcome.reply["outcome"], "no_login_observed",
+        "{}",
+        outcome.reply
+    );
+    assert_eq!(outcome.reply["reason"], LOGIN_NOT_VERIFIED);
+    nothing_captured(&fixture);
+}
+
+/// The gap between the end of one verification and the start of the next.
+fn verification_gaps(fixture: &Fixture) -> Vec<Duration> {
+    let spans = fixture.launcher.verifications.spans.lock().unwrap().clone();
+    spans
+        .windows(2)
+        .map(|pair| pair[1].0.saturating_duration_since(pair[0].1))
+        .collect()
+}
+
+/// A site whose cookie names change on every poll would otherwise be
+/// verified on every poll. Changed inputs make a verification due, but never
+/// sooner than the minimum spacing, and never two at once.
+#[tokio::test]
+async fn changed_inputs_reverify_no_sooner_than_the_minimum_spacing() {
+    let spacing = Duration::from_millis(40);
+    let fixture = fixture_with(|env| {
+        env.handoff_duration = Duration::from_millis(400);
+        env.verification_min_spacing = spacing;
+        env.verification_retry_interval = Duration::from_secs(60);
+    });
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        cookie_names_churn: true,
+        verifications: vec![ScriptedVerification::redirected_off_origin()],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(
+        outcome.reply["reason"], LOGIN_NOT_VERIFIED,
+        "{}",
+        outcome.reply
+    );
+    let gaps = verification_gaps(&fixture);
+    assert!(
+        !gaps.is_empty(),
+        "changed inputs never re-verified within the handoff"
+    );
+    for gap in &gaps {
+        assert!(*gap >= spacing, "re-verified after {gap:?}: {gaps:?}");
+    }
+    assert_eq!(
+        fixture
+            .launcher
+            .verifications
+            .max_in_flight
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+/// With nothing the heuristic reads changing, polls that keep satisfying it
+/// do not verify again until the retry interval has passed.
+#[tokio::test]
+async fn unchanged_inputs_wait_for_the_retry_interval() {
+    let fixture = fixture_with(|env| {
+        env.handoff_duration = Duration::from_millis(150);
+        env.verification_min_spacing = Duration::from_millis(1);
+        env.verification_retry_interval = Duration::from_secs(60);
+    });
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        verifications: vec![ScriptedVerification::redirected_off_origin()],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(
+        outcome.reply["reason"], LOGIN_NOT_VERIFIED,
+        "{}",
+        outcome.reply
+    );
+    assert_eq!(fixture.launcher.verifications.count(), 1);
+
+    let retry = Duration::from_millis(40);
+    let fixture = fixture_with(|env| {
+        env.handoff_duration = Duration::from_millis(400);
+        env.verification_min_spacing = Duration::from_millis(1);
+        env.verification_retry_interval = retry;
+    });
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        verifications: vec![ScriptedVerification::redirected_off_origin()],
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(
+        outcome.reply["reason"], LOGIN_NOT_VERIFIED,
+        "{}",
+        outcome.reply
+    );
+    let gaps = verification_gaps(&fixture);
+    assert!(!gaps.is_empty(), "the retry interval never re-verified");
+    for gap in &gaps {
+        assert!(*gap >= retry, "re-verified after {gap:?}: {gaps:?}");
+    }
 }
 
 #[tokio::test]

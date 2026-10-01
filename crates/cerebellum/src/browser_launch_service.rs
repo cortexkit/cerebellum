@@ -853,6 +853,19 @@ impl crate::login_capture::CaptureBrowser for ProductionCaptureBrowser {
         capture_drive(driver.cookie_request_header_for_url(CAPTURE_CONTEXT_KEY, url, deadline_ms))
     }
 
+    fn verify_session(
+        &mut self,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<crate::login_capture::SessionProbe, crate::login_capture::CaptureDriveError> {
+        let driver = self
+            .process
+            .driver
+            .as_mut()
+            .ok_or(crate::login_capture::CaptureDriveError)?;
+        capture_drive(driver.load_in_background_tab(url, deadline_ms))
+    }
+
     fn liveness(&mut self) -> crate::browser_launch::BrowserProcessLiveness {
         match self.process.process.as_ref() {
             Some(process) => {

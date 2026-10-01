@@ -505,8 +505,17 @@ async fn run_capture_arm(config: BrowserConfig, url: &str) -> bool {
         }
     };
     let outcome = reply["outcome"].as_str().unwrap_or("?").to_string();
+    // Whether the session check ran and what it found, from the reply's
+    // outcome and reason alone: a capture happens only after a passing check,
+    // and a handoff that ended after failed checks names that reason. The
+    // reply never carries a cookie value, so nothing here can print one.
+    let verification = match (outcome.as_str(), reply["reason"].as_str()) {
+        ("captured", _) => "passed",
+        (_, Some(cerebellum::login_capture::LOGIN_NOT_VERIFIED)) => "failed",
+        _ => "not_reached",
+    };
     let evidence = format!(
-        "outcome={outcome} after {} ms; browser closed by the arm at {closed_at:?} s",
+        "outcome={outcome} session_verification={verification} after {} ms; browser closed by the arm at {closed_at:?} s",
         elapsed.as_millis()
     );
     let verdict = match (outcome.as_str(), closed_at) {
