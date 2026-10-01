@@ -949,17 +949,19 @@ async fn every_fixture_reply_gives_the_capture_reply_it_should() {
         validate(&outcome.reply);
         assert_eq!(outcome.journal.outcome, format!("captured:{case}"));
     }
+    // Each refusal is scripted for every attempt, so this holds whether or not
+    // its code is retried; which codes are retried is the retry tests' check,
+    // except that the contract's one transient code is seen to be retried.
     for (code, remedy, calls) in [
-        ("invalid_id", "internal fault", 1),
-        ("invalid_payload", "internal fault", 1),
-        ("not_found", "deposit grant", 1),
+        ("invalid_id", "internal fault", None),
+        ("invalid_payload", "internal fault", None),
+        ("not_found", "deposit grant", None),
         (
             "not_permitted",
             "operator-managed vault record already holds cookie:ollama.com:ufuk",
-            1,
+            None,
         ),
-        // The contract's one transient code: retried, then reported.
-        ("store_error", "Capture again shortly", 4),
+        ("store_error", "Capture again shortly", Some(4)),
     ] {
         let fixture = fixture();
         fixture
@@ -973,7 +975,9 @@ async fn every_fixture_reply_gives_the_capture_reply_it_should() {
         assert!(text.contains(remedy), "{code}: {reply}");
         assert!(text.contains("nothing was stored"), "{code}: {reply}");
         validate(reply);
-        assert_eq!(fixture.vault.calls(), calls, "{code}");
+        if let Some(calls) = calls {
+            assert_eq!(fixture.vault.calls(), calls, "{code}");
+        }
     }
 }
 
