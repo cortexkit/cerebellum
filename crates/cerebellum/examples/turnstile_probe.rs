@@ -18,6 +18,12 @@
 //! - `--mode browser`: a poll that touches only the browser target:
 //!   `Storage.getCookies` and `Target.getTargetInfo`.
 //! - `--runtime-enable`: send `Runtime.enable` on the page right after attach.
+//! - `--detach`: detach from the page after the opening reads, so nothing is
+//!   attached to it during the handoff (not with `--mode page`).
+//! - `--unattached`: skip the capture's opening altogether; the browser target
+//!   creates the page on the URL and fronts it, and nothing attaches to the
+//!   page until the final reads. The quietest the pipe allows.
+//! - `--screenshot <file>`: write the final page as base64 PNG.
 //! - `--arg <flag>`: add one Chrome argument (repeatable).
 //!
 //! After `--seconds` (default 25) it reports, reading as late as possible so
@@ -77,7 +83,11 @@ impl Cdp {
         }
         self.log.push(format!(
             "{}{method}",
-            if session.is_some() { "page:" } else { "browser:" }
+            if session.is_some() {
+                "page:"
+            } else {
+                "browser:"
+            }
         ));
         let mut bytes = serde_json::to_vec(&message).expect("json");
         bytes.push(0);
@@ -114,6 +124,9 @@ struct Options {
     url: String,
     mode: String,
     runtime_enable: bool,
+    detach: bool,
+    unattached: bool,
+    screenshot: Option<String>,
     extra_arguments: Vec<OsString>,
     seconds: u64,
     report: Option<String>,
@@ -126,6 +139,9 @@ fn options() -> Options {
         url: String::new(),
         mode: "nopoll".into(),
         runtime_enable: false,
+        detach: false,
+        unattached: false,
+        screenshot: None,
         extra_arguments: Vec::new(),
         seconds: 25,
         report: None,
@@ -134,6 +150,9 @@ fn options() -> Options {
         match argument.as_str() {
             "--mode" => options.mode = arguments.next().expect("--mode value"),
             "--runtime-enable" => options.runtime_enable = true,
+            "--detach" => options.detach = true,
+            "--unattached" => options.unattached = true,
+            "--screenshot" => options.screenshot = arguments.next(),
             "--arg" => options
                 .extra_arguments
                 .push(OsString::from(arguments.next().expect("--arg value"))),
@@ -151,6 +170,10 @@ fn options() -> Options {
         ["nopoll", "page", "browser"].contains(&options.mode.as_str()),
         "--mode is nopoll, page or browser"
     );
+    assert!(
+        !((options.detach || options.unattached) && options.mode == "page"),
+        "--detach and --unattached leave no page session for --mode page to poll"
+    );
     assert!(options.url.starts_with("https://"), "pass an https URL");
     options
 }
@@ -164,7 +187,14 @@ fn walk_accessibility_tree(cdp: &mut Cdp, session: &str) {
     let root = cdp.call("Accessibility.getRootAXNode", json!({}), Some(session));
     let mut pending: Vec<(String, Option<String>)> = root["result"]["node"]["nodeId"]
         .as_str()
-        .map(|id| vec![(id.to_string(), root["result"]["node"]["frameId"].as_str().map(str::to_string))])
+        .map(|id| {
+            vec![(
+                id.to_string(),
+                root["result"]["node"]["frameId"]
+                    .as_str()
+                    .map(str::to_string),
+            )]
+        })
         .unwrap_or_default();
     let mut seen = 0;
     while let Some((node_id, frame_id)) = pending.pop() {
@@ -182,7 +212,10 @@ fn walk_accessibility_tree(cdp: &mut Cdp, session: &str) {
                 if id != node_id {
                     pending.push((
                         id.to_string(),
-                        node["frameId"].as_str().map(str::to_string).or(frame_id.clone()),
+                        node["frameId"]
+                            .as_str()
+                            .map(str::to_string)
+                            .or(frame_id.clone()),
                     ));
                 }
             }
@@ -231,41 +264,69 @@ fn main() {
     };
 
     cdp.call("Browser.getVersion", json!({}), None);
-    let created = cdp.call(
-        "Target.createTarget",
-        json!({"url": "about:blank", "background": true}),
-        None,
-    );
-    let target_id = created["result"]["targetId"]
-        .as_str()
-        .expect("targetId")
-        .to_string();
-    let attached = cdp.call(
-        "Target.attachToTarget",
-        json!({"targetId": target_id, "flatten": true}),
-        None,
-    );
-    let session = attached["result"]["sessionId"]
-        .as_str()
-        .expect("sessionId")
-        .to_string();
-    if options.runtime_enable {
-        cdp.call("Runtime.enable", json!({}), Some(&session));
-    }
-    cdp.call("Page.enable", json!({}), Some(&session));
-    cdp.call("Network.enable", json!({}), Some(&session));
-    cdp.call("Page.navigate", json!({"url": options.url}), Some(&session));
-    cdp.call("Page.bringToFront", json!({}), Some(&session));
-    cdp.call(
-        "Target.activateTarget",
-        json!({"targetId": target_id}),
-        None,
-    );
     let origin = {
         let rest = options.url.trim_start_matches("https://");
         format!("https://{}", rest.split('/').next().unwrap_or_default())
     };
-    cdp.call("Network.getCookies", json!({"urls": [origin]}), Some(&session));
+    let (target_id, session) = if options.unattached {
+        // The quietest opening the pipe allows: the browser target opens the
+        // page and fronts it, and nothing attaches to the page at all.
+        let created = cdp.call("Target.createTarget", json!({"url": options.url}), None);
+        let target_id = created["result"]["targetId"]
+            .as_str()
+            .expect("targetId")
+            .to_string();
+        cdp.call(
+            "Target.activateTarget",
+            json!({"targetId": target_id}),
+            None,
+        );
+        (target_id, String::new())
+    } else {
+        let created = cdp.call(
+            "Target.createTarget",
+            json!({"url": "about:blank", "background": true}),
+            None,
+        );
+        let target_id = created["result"]["targetId"]
+            .as_str()
+            .expect("targetId")
+            .to_string();
+        let attached = cdp.call(
+            "Target.attachToTarget",
+            json!({"targetId": target_id, "flatten": true}),
+            None,
+        );
+        let session = attached["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
+        if options.runtime_enable {
+            cdp.call("Runtime.enable", json!({}), Some(&session));
+        }
+        cdp.call("Page.enable", json!({}), Some(&session));
+        cdp.call("Network.enable", json!({}), Some(&session));
+        cdp.call("Page.navigate", json!({"url": options.url}), Some(&session));
+        cdp.call("Page.bringToFront", json!({}), Some(&session));
+        cdp.call(
+            "Target.activateTarget",
+            json!({"targetId": target_id}),
+            None,
+        );
+        cdp.call(
+            "Network.getCookies",
+            json!({"urls": [origin]}),
+            Some(&session),
+        );
+        if options.detach {
+            cdp.call(
+                "Target.detachFromTarget",
+                json!({"sessionId": session}),
+                None,
+            );
+        }
+        (target_id, session)
+    };
     let opening_commands = cdp.log.len();
 
     let started = Instant::now();
@@ -274,7 +335,11 @@ fn main() {
         std::thread::sleep(Duration::from_secs(2));
         match options.mode.as_str() {
             "page" => {
-                cdp.call("Network.getCookies", json!({"urls": [origin]}), Some(&session));
+                cdp.call(
+                    "Network.getCookies",
+                    json!({"urls": [origin]}),
+                    Some(&session),
+                );
                 cdp.call("Page.getNavigationHistory", json!({}), Some(&session));
                 walk_accessibility_tree(&mut cdp, &session);
                 cdp.call("DOM.enable", json!({}), Some(&session));
@@ -286,8 +351,29 @@ fn main() {
                 polls += 1;
             }
             "browser" => {
-                cdp.call("Storage.getCookies", json!({}), None);
-                cdp.call("Target.getTargetInfo", json!({"targetId": target_id}), None);
+                let cookies = cdp.call("Storage.getCookies", json!({}), None);
+                let info = cdp.call("Target.getTargetInfo", json!({"targetId": target_id}), None);
+                if polls == 0 {
+                    // Whether the browser target answers each of the three
+                    // calls at all. For the two cookie calls only the count is
+                    // printed, never a cookie.
+                    let network = cdp.call("Network.getCookies", json!({"urls": [origin]}), None);
+                    let verdict = |reply: &Value| {
+                        if reply.get("error").is_some() {
+                            "refused"
+                        } else {
+                            "answered"
+                        }
+                    };
+                    println!(
+                        "browser-level poll: Storage.getCookies {} ({} cookies), Network.getCookies {} ({} cookies), Target.getTargetInfo {}",
+                        verdict(&cookies),
+                        cookies["result"]["cookies"].as_array().map_or(0, Vec::len),
+                        verdict(&network),
+                        network["result"]["cookies"].as_array().map_or(0, Vec::len),
+                        verdict(&info),
+                    );
+                }
                 polls += 1;
             }
             _ => {}
@@ -296,13 +382,33 @@ fn main() {
 
     // Read from the browser target first: it does not touch the page.
     let info = cdp.call("Target.getTargetInfo", json!({"targetId": target_id}), None);
-    let title = info["result"]["targetInfo"]["title"].as_str().unwrap_or("?").to_string();
-    let url = info["result"]["targetInfo"]["url"].as_str().unwrap_or("?").to_string();
+    let title = info["result"]["targetInfo"]["title"]
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
+    let url = info["result"]["targetInfo"]["url"]
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
+    // A detached run has no page session left, so it attaches once more here,
+    // after the check has had its time.
+    let read_session = if options.detach || options.unattached {
+        cdp.call(
+            "Target.attachToTarget",
+            json!({"targetId": target_id, "flatten": true}),
+            None,
+        )["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string()
+    } else {
+        session.clone()
+    };
     let evaluate = |cdp: &mut Cdp, expression: &str| {
         cdp.call(
             "Runtime.evaluate",
             json!({"expression": expression, "returnByValue": true}),
-            Some(&session),
+            Some(&read_session),
         )["result"]["result"]["value"]
             .clone()
     };
@@ -315,13 +421,26 @@ fn main() {
         .report
         .as_deref()
         .map(|expression| evaluate(&mut cdp, expression));
+    if let Some(path) = &options.screenshot {
+        // Base64 PNG of the page as it ended, so the widget's own state
+        // (passed, asking for a click, failed) can be looked at afterwards.
+        let shot = cdp.call("Page.captureScreenshot", json!({}), Some(&read_session));
+        if let Some(data) = shot["result"]["data"].as_str() {
+            std::fs::write(path, data).expect("write screenshot");
+        }
+    }
 
     let mut commands: Vec<String> = cdp.log[..opening_commands].to_vec();
     commands.dedup();
     println!("url_requested: {}", options.url);
     println!(
-        "mode: {} runtime_enable: {} extra_arguments: {:?} seconds: {} polls: {polls}",
-        options.mode, options.runtime_enable, options.extra_arguments, options.seconds
+        "mode: {} unattached: {} runtime_enable: {} detach: {} extra_arguments: {:?} seconds: {} polls: {polls}",
+        options.mode,
+        options.unattached,
+        options.runtime_enable,
+        options.detach,
+        options.extra_arguments,
+        options.seconds
     );
     println!("opening commands: {}", commands.join(", "));
     println!("final title: {title:?}");

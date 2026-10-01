@@ -75,8 +75,10 @@ fn main() {
         .unwrap_or(8);
     let profile = std::env::temp_dir().join(format!("ck-liveness-probe-{}", std::process::id()));
     std::fs::create_dir_all(&profile).expect("profile dir");
-    let mut arguments =
-        cerebellum::browser_launch_service::browser_launch_arguments(&profile, &profile.join("crash-dumps"));
+    let mut arguments = cerebellum::browser_launch_service::browser_launch_arguments(
+        &profile,
+        &profile.join("crash-dumps"),
+    );
     if headless {
         arguments.push(OsString::from("--headless=new"));
     }

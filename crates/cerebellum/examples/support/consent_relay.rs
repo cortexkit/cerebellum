@@ -43,7 +43,30 @@ pub async fn elicit_and_answer_observing(
     opening: Frame,
     answer_body: Value,
     label: &str,
+    observe: impl FnMut(&Value),
+) -> Result<Value, String> {
+    elicit_and_answer_waiting(
+        planes,
+        opening,
+        answer_body,
+        label,
+        observe,
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+/// As [`elicit_and_answer_observing`], waiting up to `frame_wait` for each
+/// frame. For a request that holds its reply open on purpose after the answer,
+/// such as a login capture waiting out its handoff.
+#[allow(dead_code)]
+pub async fn elicit_and_answer_waiting(
+    planes: &Planes,
+    opening: Frame,
+    answer_body: Value,
+    label: &str,
     mut observe: impl FnMut(&Value),
+    frame_wait: Duration,
 ) -> Result<Value, String> {
     let (writer, mut frames) = mpsc::channel(8);
     // Returns once the request is spawned, so a request that waits for its
@@ -55,7 +78,7 @@ pub async fn elicit_and_answer_observing(
     let mut reply = None;
     let mut answered = false;
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+        let frame = tokio::time::timeout(frame_wait, frames.recv())
             .await
             .map_err(|_| format!("{label} reply or question timed out"))?
             .ok_or_else(|| format!("{label} relay closed"))?;

@@ -1049,6 +1049,21 @@ pub fn browser_launch_arguments(
         // readiness handshake is `Browser.getVersion` and needs no page. The
         // flag has the same meaning for Chromium on Linux.
         OsString::from("--no-startup-window"),
+        // `--remote-debugging-pipe` alone turns on Blink's AutomationControlled
+        // feature, which sets `navigator.webdriver` to true on every page, and
+        // Cloudflare's human verification refuses such a browser. A person
+        // signing in through `browser.capture_login` or `browser.present`
+        // then cannot get past it. Measured on macOS with Chrome 154
+        // (2026-10-01), on a real Cloudflare challenge page
+        // (scrapingcourse.com/cloudflare-challenge), one change at a time:
+        // without this flag `navigator.webdriver` was true and the page stayed
+        // on "Just a moment..." in every run, with no polling, with
+        // browser-level polling only, and with nothing attached to the page at
+        // all. With it, `navigator.webdriver` was false and the page passed in
+        // every run, including with the handoff's page-level polling and
+        // with `Runtime.enable`. The flag changes only that feature;
+        // `examples/turnstile_probe.rs` repeats the measurement.
+        OsString::from("--disable-blink-features=AutomationControlled"),
     ]
 }
 
@@ -2824,8 +2839,22 @@ mod executable_identity_launch_tests {
                 OsString::from("--no-first-run"),
                 OsString::from("--no-default-browser-check"),
                 OsString::from("--no-startup-window"),
+                OsString::from("--disable-blink-features=AutomationControlled"),
             ]
         );
+    }
+
+    /// `--disable-blink-features=AutomationControlled`, like every other launch
+    /// argument, must pass the custody quarantine's refused-argument list;
+    /// otherwise every launch would be refused there.
+    #[test]
+    fn every_launch_argument_passes_the_custody_quarantine() {
+        let profile = Path::new("/tmp/probe-profile");
+        let arguments = browser_launch_arguments(profile, &profile.join("crash"))
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(crate::custody::arguments_are_quarantinable(&arguments));
     }
 
     struct UnsignedExecutable(PathBuf);
