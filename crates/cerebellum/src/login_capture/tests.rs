@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,9 +8,10 @@ use serde_json::{json, Value};
 use subc_protocol::Principal;
 
 use super::test_support::{
-    contains_bytes, fixture, fixture_with, BrowserScript, FakeEntry, Fixture, ScriptedVerification,
-    PLANTED_VALUE, ROOT,
+    contains_bytes, fixture, fixture_with, BrowserScript, FakeEntry, FakeReply, Fixture,
+    ScriptedVerification, PLANTED_VALUE, ROOT,
 };
+use super::vault::VaultReachError;
 use super::*;
 use crate::elicit::AskOutcome;
 
@@ -37,6 +38,11 @@ fn ollama() -> CaptureRequest {
 
 fn allow() -> AskOutcome {
     AskOutcome::Answered(json!({"decision": "allow"}))
+}
+
+/// The header the fake browser's default cookies make.
+fn planted_header() -> String {
+    format!("session={PLANTED_VALUE}; csrf=t0k3n")
 }
 
 /// Run one capture, answering the consent question with `answer`. Returns the
@@ -77,35 +83,50 @@ async fn capture_cancelling(
     (outcome, question)
 }
 
+/// Nothing was written to disk and nothing was sent to the vault.
 fn nothing_captured(fixture: &Fixture) {
     assert!(
         fixture.fs.files().is_empty(),
         "a file was written: {:?}",
         fixture.fs.contents()
     );
+    assert_eq!(fixture.vault.calls(), 0, "a deposit was made");
+}
+
+/// The reply's keys, sorted.
+fn keys(reply: &Value) -> Vec<String> {
+    let mut keys = reply
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
 }
 
 // --- leak -----------------------------------------------------------------
 
-/// The planted cookie value reaches the one file and nothing else. The scanner
-/// is first shown to find the value where it was planted, so an absence below
-/// is evidence rather than a scanner that finds nothing anywhere.
+/// The planted cookie value reaches the vault request and nothing else. The
+/// scanner is first shown to find the value where it was planted, so an
+/// absence below is evidence rather than a scanner that finds nothing anywhere.
 #[tokio::test]
-async fn a_planted_cookie_value_reaches_only_the_capture_file() {
+async fn a_planted_cookie_value_reaches_only_the_vault_request() {
     let fixture = fixture();
     let (outcome, question) = capture(&fixture, &ollama(), allow()).await;
     assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
 
-    let files = fixture.fs.files();
-    assert_eq!(files.len(), 1);
+    let requests = fixture.vault.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
     assert!(
-        contains_bytes(&files[0].1, PLANTED_VALUE),
-        "positive control: the scanner must find the planted value in the file"
+        contains_bytes(&requests[0], PLANTED_VALUE),
+        "positive control: the scanner must find the planted value in the request"
     );
     assert_eq!(
-        files[0].1,
-        format!("session={PLANTED_VALUE}; csrf=t0k3n").as_bytes()
+        fixture.vault.request_params()[0]["cookie"],
+        planted_header()
     );
+    assert!(fixture.fs.files().is_empty(), "{:?}", fixture.fs.contents());
 
     let reply = serde_json::to_vec(&outcome.reply).unwrap();
     assert!(
@@ -127,7 +148,66 @@ async fn a_planted_cookie_value_reaches_only_the_capture_file() {
         !contains_bytes(&question, PLANTED_VALUE),
         "the ask leaked it"
     );
-    assert_eq!(outcome.journal.bytes, files[0].1.len() as u64);
+    assert_eq!(outcome.journal.bytes, planted_header().len() as u64);
+}
+
+/// Every way a deposit can end, the planted value stays out of the reply, the
+/// journal record and the remedy text. The vault's request is the positive
+/// control each time, so a pass is not a capture that never read the cookie.
+#[tokio::test]
+async fn a_planted_cookie_value_never_reaches_the_reply_the_journal_or_an_error() {
+    let endings = [
+        ("stored", vec![]),
+        (
+            "refused",
+            vec![FakeReply::refused("permanent", "not_found")],
+        ),
+        (
+            "transient",
+            vec![FakeReply::refused("transient", "store_busy"); 4],
+        ),
+        (
+            "malformed",
+            vec![FakeReply::Raw(json!({"result": {"id": 1}}))],
+        ),
+        (
+            "call failed",
+            vec![FakeReply::Fails(VaultReachError::CallFailed { code: None })],
+        ),
+    ];
+    for (ending, replies) in endings {
+        let fixture = fixture();
+        fixture.vault.script(replies);
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        assert!(
+            fixture
+                .vault
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| contains_bytes(request, PLANTED_VALUE)),
+            "{ending}: positive control: every request carries the planted value"
+        );
+        assert!(
+            fixture.vault.calls() >= 1,
+            "{ending}: nothing was deposited"
+        );
+        for (what, bytes) in [
+            ("reply", serde_json::to_vec(&outcome.reply).unwrap()),
+            ("journal", serde_json::to_vec(&outcome.journal).unwrap()),
+            ("debug", format!("{outcome:?}").into_bytes()),
+        ] {
+            assert!(
+                !contains_bytes(&bytes, PLANTED_VALUE),
+                "{ending}: the {what} leaked it"
+            );
+            assert!(
+                !contains_bytes(&bytes, "csrf"),
+                "{ending}: the {what} named a cookie"
+            );
+        }
+    }
 }
 
 #[test]
@@ -249,8 +329,6 @@ async fn exclusion_is_proven_again_on_every_capture() {
     let fixture = fixture();
     let (first, _) = capture(&fixture, &ollama(), allow()).await;
     assert_eq!(first.reply["outcome"], "captured");
-    let path = PathBuf::from(first.reply["path"].as_str().unwrap());
-    fixture.fs.remove_file(&path).unwrap();
     *fixture.exclusion.answer.lock().unwrap() = Ok(false);
     let (second, _) = capture(&fixture, &ollama(), allow()).await;
     assert_eq!(second.reply["outcome"], "capture_location_not_excluded");
@@ -289,11 +367,11 @@ fn a_tool_that_never_answers_times_out() {
 
 // --- ordering -------------------------------------------------------------
 
-/// The browser is closed and the throwaway profile deleted before the capture
-/// returns, so a caller replying afterwards never replies while a second copy
-/// of the session exists.
+/// The browser is closed and the throwaway profile deleted before the login is
+/// deposited and before the capture returns, so once the login is stored no
+/// second copy of the session exists.
 #[tokio::test]
-async fn the_profile_is_deleted_before_the_capture_returns() {
+async fn the_profile_is_deleted_before_the_deposit_and_the_return() {
     let fixture = fixture();
     // Held inside the deletion so that a deletion moved off the return path
     // would still be running when the check below looks.
@@ -307,15 +385,17 @@ async fn the_profile_is_deleted_before_the_capture_returns() {
     );
     let events = fixture.events.snapshot();
     let position = |name: &str| events.iter().position(|event| event == name).unwrap();
-    assert!(position("file_written") < position("browser_closed"));
+    assert!(position("cookie_header:https://ollama.com/settings") < position("browser_closed"));
     assert!(position("browser_closed") < position("profile_deleted"));
+    assert!(position("profile_deleted") < position("vault_open"));
     assert_eq!(outcome.journal.deletion_succeeded, Some(true));
 }
 
-/// A profile that cannot be deleted leaves two copies of the session, so the
-/// file is withdrawn and the capture reports the profile by path.
+/// A profile that cannot be deleted would leave a second copy of the session
+/// beside a stored one, and a deposit cannot be withdrawn, so nothing is
+/// stored and the capture reports the profile by path.
 #[tokio::test]
-async fn an_undeletable_profile_withdraws_the_file() {
+async fn an_undeletable_profile_stores_nothing() {
     let fixture = fixture();
     fixture
         .fs
@@ -329,8 +409,8 @@ async fn an_undeletable_profile_withdraws_the_file() {
         placement.profile_directory().display().to_string()
     );
     nothing_captured(&fixture);
+    assert_eq!(fixture.vault.opens.load(Ordering::SeqCst), 0);
     assert_eq!(outcome.journal.deletion_succeeded, Some(false));
-    assert!(outcome.captured_file.is_none());
 
     // The profile left behind is residue, and the next capture says so.
     fixture
@@ -356,10 +436,8 @@ async fn leftover_residue_refuses_the_next_capture_by_path() {
     for entry in [FakeEntry::File(b"old".to_vec()), FakeEntry::Dir] {
         let fixture = fixture();
         let leftover = Path::new(ROOT).join("login-leftover.cookie");
-        fixture
-            .fs
-            .plant(Path::new(ROOT), FakeEntry::Dir, fixture.clock.now());
-        fixture.fs.plant(&leftover, entry, fixture.clock.now());
+        fixture.fs.plant(Path::new(ROOT), FakeEntry::Dir);
+        fixture.fs.plant(&leftover, entry);
         let (outcome, question) = capture(&fixture, &ollama(), allow()).await;
         assert_eq!(outcome.reply["outcome"], "capture_residue_present");
         assert_eq!(outcome.reply["path"], leftover.display().to_string());
@@ -375,15 +453,9 @@ async fn leftover_residue_refuses_the_next_capture_by_path() {
 #[tokio::test]
 async fn a_startup_sweep_that_cannot_delete_leaves_the_refusal_in_place() {
     let fixture = fixture();
-    let stale = Path::new(ROOT).join("login-stale.cookie");
-    fixture
-        .fs
-        .plant(Path::new(ROOT), FakeEntry::Dir, fixture.clock.now());
-    fixture.fs.plant(
-        &stale,
-        FakeEntry::File(b"x".to_vec()),
-        fixture.clock.now() - FILE_LIFETIME - Duration::from_secs(1),
-    );
+    let stale = Path::new(ROOT).join("profile-stale");
+    fixture.fs.plant(Path::new(ROOT), FakeEntry::Dir);
+    fixture.fs.plant(&stale, FakeEntry::Dir);
     fixture.fs.undeletable.lock().unwrap().insert(stale.clone());
 
     fixture.module.sweep_at_startup();
@@ -394,32 +466,29 @@ async fn a_startup_sweep_that_cannot_delete_leaves_the_refusal_in_place() {
     assert_eq!(outcome.reply["reason"], "deletion_failed:PermissionDenied");
 }
 
+/// At startup nothing in the capture root is in use, so all of it goes at
+/// once: a profile a crashed capture left, and a cookie file an earlier build
+/// wrote.
 #[tokio::test]
-async fn the_startup_sweep_deletes_stale_residue_and_schedules_the_rest() {
+async fn the_startup_sweep_deletes_all_residue() {
     let fixture = fixture();
-    let now = fixture.clock.now();
-    let stale = Path::new(ROOT).join("login-stale.cookie");
-    let young = Path::new(ROOT).join("login-young.cookie");
-    fixture.fs.plant(Path::new(ROOT), FakeEntry::Dir, now);
+    let profile = Path::new(ROOT).join("profile-crashed");
+    let old_file = Path::new(ROOT).join("login-old.cookie");
+    fixture.fs.plant(Path::new(ROOT), FakeEntry::Dir);
+    fixture.fs.plant(&profile, FakeEntry::Dir);
     fixture.fs.plant(
-        &stale,
-        FakeEntry::File(b"x".to_vec()),
-        now - FILE_LIFETIME - Duration::from_secs(1),
+        &old_file,
+        FakeEntry::File(PLANTED_VALUE.as_bytes().to_vec()),
     );
-    let young_written = now - Duration::from_secs(60);
-    fixture
-        .fs
-        .plant(&young, FakeEntry::File(b"y".to_vec()), young_written);
 
     fixture.module.sweep_at_startup();
-    assert!(!fixture.fs.exists(&stale));
-    assert!(fixture.fs.exists(&young));
-    assert_eq!(
-        fixture.scheduler.deadlines(),
-        vec![young_written + FILE_LIFETIME]
+    assert!(
+        fixture.fs.contents().is_empty(),
+        "{:?}",
+        fixture.fs.contents()
     );
-    fixture.scheduler.run_due(young_written + FILE_LIFETIME);
-    assert!(!fixture.fs.exists(&young));
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
 }
 
 #[tokio::test]
@@ -485,9 +554,10 @@ async fn only_an_affirmative_answer_proceeds() {
 }
 
 #[test]
-fn the_question_names_the_holder_site_account_and_lifetime() {
-    let question = consent_question(&ollama(), FILE_LIFETIME);
+fn the_question_names_the_holder_site_account_and_the_vault() {
+    let question = consent_question(&ollama(), "capture-login-test");
     crate::consent_card::assert_contract(&question, &["allow", "deny"], "deny");
+    assert_eq!(question["id"], "capture-login-test");
     assert_eq!(
         question["params"]["prompt"],
         "insula will hold a copy of your ollama.com login."
@@ -499,8 +569,54 @@ fn the_question_names_the_holder_site_account_and_lifetime() {
     );
     let facts = &question["params"]["facts"];
     assert_eq!(facts[0], json!({"label": "Account", "value": "work"}));
-    assert!(facts.to_string().contains("Deleted after 10 minutes"));
-    assert!(facts.to_string().contains("ck auth put"));
+    let text = facts.to_string();
+    assert!(text.contains("stored in the vault for insula"), "{text}");
+    assert!(
+        text.contains("Some sites allow one sign-in at a time; signing in here may sign you out of this site in your other browsers."),
+        "{text}"
+    );
+    assert!(!text.contains("ck auth"), "{text}");
+}
+
+/// The deposit names the card the person granted: the vault binds that id
+/// into its audit row.
+#[tokio::test]
+async fn the_deposit_names_the_granted_card_as_its_consent() {
+    let fixture = fixture();
+    let (outcome, question) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+    let ask_id = question.unwrap()["id"].as_str().unwrap().to_string();
+    assert!(ask_id.starts_with("capture-login-"), "{ask_id}");
+    assert_eq!(fixture.vault.request_params()[0]["consent_ref"], ask_id);
+}
+
+/// A module with no vault to deposit into refuses before the person is asked
+/// to sign in, rather than after.
+#[tokio::test]
+async fn a_module_without_a_vault_refuses_before_asking() {
+    let fixture = super::test_support::fixture_without_vault();
+    let facts = accepted();
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raised = Arc::clone(&asked);
+    let outcome = fixture
+        .module
+        .run(
+            &ollama(),
+            CaptureCall {
+                accepted: &facts,
+                declares_elicitation: true,
+                ask: move |_: Value, _: Duration| {
+                    raised.store(true, Ordering::SeqCst);
+                    async { AskOutcome::Answered(json!({"decision": "allow"})) }
+                },
+                cancelled: || false,
+            },
+        )
+        .await;
+    assert_eq!(outcome.reply["outcome"], "capture_not_stored");
+    assert_eq!(outcome.reply["reason"], VAULT_UNREACHABLE);
+    assert!(!asked.load(Ordering::SeqCst), "the person was asked anyway");
+    assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -642,63 +758,312 @@ fn request_parameters_are_closed_and_the_account_is_required() {
     );
 }
 
-// --- commands -------------------------------------------------------------
+// --- the vault ------------------------------------------------------------
 
-/// Compared against literal strings rather than strings built the way the code
+fn validate(reply: &Value) {
+    crate::browser::validate_browser_result(crate::management::CAPTURE_LOGIN, reply)
+        .unwrap_or_else(|error| panic!("{reply} does not match its schema: {error:?}"));
+}
+
+/// Compared against literal values rather than ones built the way the code
 /// under test builds them.
 #[tokio::test]
-async fn the_printed_commands_carry_exactly_the_requested_id_and_selector() {
+async fn created_and_replaced_each_reply_captured_with_the_vault_fields() {
+    for (vault_outcome, version) in [("created", 1), ("replaced", 4)] {
+        let fixture = fixture();
+        fixture.vault.script([FakeReply::Stored {
+            outcome: vault_outcome,
+            version,
+        }]);
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        assert_eq!(
+            outcome.reply,
+            json!({
+                "outcome": "captured",
+                "credential_id": "cookie:ollama.com:work",
+                "vault_outcome": vault_outcome,
+                "record_version": version,
+            })
+        );
+        validate(&outcome.reply);
+        assert_eq!(outcome.journal.outcome, format!("captured:{vault_outcome}"));
+        assert_eq!(outcome.journal.credential_id, "cookie:ollama.com:work");
+        assert_eq!(outcome.journal.bytes, planted_header().len() as u64);
+        assert_eq!(fixture.vault.opens.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Each refusal is answered by its code, with the remedy that code needs. Each
+/// refusal is scripted for every attempt, so this test holds whether or not
+/// the code is retried; retrying is the next tests' concern.
+#[tokio::test]
+async fn each_vault_refusal_is_capture_not_stored_with_its_reason_and_remedy() {
+    for (class, code, remedy) in [
+        ("permanent", "not_found", "deposit grant"),
+        (
+            "permanent",
+            "not_permitted",
+            "operator-managed vault record already holds cookie:ollama.com:work",
+        ),
+        ("permanent", "invalid_id", "internal fault"),
+        ("permanent", "invalid_payload", "internal fault"),
+        ("permanent", "invalid_params", "internal fault"),
+        ("transient", "store_busy", "Capture again shortly"),
+        ("transient", "store_error", "Capture again shortly"),
+    ] {
+        let fixture = fixture();
+        fixture
+            .vault
+            .script(vec![FakeReply::refused(class, code); 4]);
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        let reply = &outcome.reply;
+        assert_eq!(reply["outcome"], "capture_not_stored", "{code}: {reply}");
+        assert_eq!(reply["reason"], code, "{reply}");
+        assert_eq!(reply["credential_id"], "cookie:ollama.com:work");
+        assert!(
+            reply["remedy"].as_str().unwrap().contains(remedy),
+            "{code}: {reply}"
+        );
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was stored"),
+            "{code}: {reply}"
+        );
+        assert_eq!(
+            keys(reply),
+            ["credential_id", "outcome", "reason", "remedy"]
+        );
+        validate(reply);
+        assert_eq!(
+            outcome.journal.outcome,
+            format!("refused:capture_not_stored:{code}")
+        );
+        assert_eq!(outcome.journal.bytes, planted_header().len() as u64);
+        assert!(fixture.fs.files().is_empty());
+        assert!(fixture.events.contains_prefix("profile_deleted"));
+    }
+}
+
+#[tokio::test]
+async fn a_transient_refusal_is_retried_until_the_vault_stores_it() {
     let fixture = fixture();
+    fixture.vault.script([
+        FakeReply::refused("transient", "store_busy"),
+        FakeReply::refused("transient", "store_error"),
+        FakeReply::refused("transient", "store_busy"),
+        FakeReply::Stored {
+            outcome: "replaced",
+            version: 2,
+        },
+    ]);
     let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
-    let path = outcome.reply["path"].as_str().unwrap().to_string();
-    assert!(path.starts_with("/fake-tmp/ck-cerebellum-capture/login-"));
-    assert_eq!(
-        outcome.reply["commands"],
-        json!([
-            format!("ck auth put --id cookie:ollama.com:work --payload-file {path}"),
-            "ck auth grant --principal reserved:insula --selector-kind exact --selector cookie:ollama.com:work --operation read",
-        ])
-    );
-    assert_eq!(outcome.reply["credential_id"], "cookie:ollama.com:work");
-    assert_eq!(outcome.reply["holder"], "reserved:insula");
-    assert!(outcome.reply["replace_note"]
-        .as_str()
-        .unwrap()
-        .contains("--replace"));
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+    assert_eq!(outcome.reply["vault_outcome"], "replaced");
+    assert_eq!(fixture.vault.calls(), 4);
+    // Every retry rides the one route opened for the deposit.
+    assert_eq!(fixture.vault.opens.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_transient_refusal_that_outlasts_the_retries_is_not_stored() {
+    let fixture = fixture();
+    fixture
+        .vault
+        .script(vec![FakeReply::refused("transient", "store_busy"); 10]);
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "capture_not_stored");
+    assert_eq!(outcome.reply["reason"], "store_busy");
+    // The first attempt and three retries.
+    assert_eq!(fixture.vault.calls(), 1 + vault::RETRY_BACKOFF.len());
+    assert_eq!(fixture.vault.calls(), 4);
+}
+
+/// The vault would store on a second attempt, so a retry of a permanent
+/// refusal shows up as a captured login rather than only as a call count.
+#[tokio::test]
+async fn a_permanent_refusal_is_never_retried() {
+    for code in ["not_found", "not_permitted", "invalid_params"] {
+        let fixture = fixture();
+        fixture
+            .vault
+            .script([FakeReply::refused("permanent", code)]);
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        assert_eq!(
+            outcome.reply["outcome"], "capture_not_stored",
+            "{code}: {}",
+            outcome.reply
+        );
+        assert_eq!(fixture.vault.calls(), 1, "{code} was retried");
+    }
+}
+
+/// The request is exactly the contract's: the method and four keys, `email`
+/// only when the account label is an email address. Any other key is refused
+/// by the vault as `invalid_params`.
+#[tokio::test]
+async fn the_vault_request_carries_exactly_the_contract_keys() {
+    for (account, email) in [("work", None), ("me@example.com", Some("me@example.com"))] {
+        let fixture = fixture();
+        let request = CaptureRequest {
+            account: account.to_string(),
+            ..ollama()
+        };
+        let (outcome, question) = capture(&fixture, &request, allow()).await;
+        assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+        let consent_ref = question.unwrap()["id"].clone();
+        let sent: Value =
+            serde_json::from_slice(&fixture.vault.requests.lock().unwrap()[0]).unwrap();
+        let mut params = json!({
+            "id": format!("cookie:ollama.com:{account}"),
+            "cookie": planted_header(),
+            "consent_ref": consent_ref,
+        });
+        if let Some(email) = email {
+            params["email"] = json!(email);
+        }
+        assert_eq!(
+            sent,
+            json!({"method": "credential.deposit_cookie", "params": params}),
+            "{account}"
+        );
+    }
 }
 
 #[test]
-fn a_path_that_needs_quoting_is_quoted() {
-    let [put, _] = operator_commands("cookie:ollama.com:work", Path::new("/tmp/a b/it's.cookie"));
-    assert_eq!(
-        put,
-        "ck auth put --id cookie:ollama.com:work --payload-file '/tmp/a b/it'\\''s.cookie'"
-    );
+fn only_an_email_shaped_account_label_is_sent_as_email() {
+    for (account, email) in [
+        ("me@example.com", true),
+        ("first.last+tag@mail.example.co", true),
+        ("work", false),
+        ("me@localhost", false),
+        ("@example.com", false),
+        ("me@.com", false),
+        ("me@example.", false),
+        ("a@b@example.com", false),
+    ] {
+        let request = CaptureRequest {
+            account: account.to_string(),
+            ..ollama()
+        };
+        assert_eq!(request.account_email().is_some(), email, "{account}");
+    }
 }
 
-// --- reply ----------------------------------------------------------------
-
-/// A captured reply carries every field the operator needs and passes the
-/// declared closed reply schema.
+/// A daemon that cannot be reached, a route the daemon refuses, and a route
+/// that fails after the request was sent each say which, so the caller can
+/// tell a daemon that is down from one that will not route to the vault.
 #[tokio::test]
-async fn a_captured_reply_is_complete_and_passes_its_schema() {
-    let fixture = fixture();
-    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
-    for field in [
-        "outcome",
-        "path",
-        "bytes",
-        "expires_at",
-        "credential_id",
-        "holder",
-        "commands",
-        "replace_note",
+async fn an_unreachable_vault_and_a_refused_route_each_have_their_own_reason() {
+    for (open_fails, reply, reason, calls) in [
+        (
+            Some(VaultReachError::Unreachable),
+            None,
+            VAULT_UNREACHABLE,
+            0,
+        ),
+        (
+            Some(VaultReachError::RouteRefused {
+                code: Some("capability_forbidden".to_string()),
+            }),
+            None,
+            VAULT_ROUTE_REFUSED,
+            0,
+        ),
+        (
+            None,
+            Some(FakeReply::Fails(VaultReachError::CallFailed { code: None })),
+            VAULT_CALL_FAILED,
+            1,
+        ),
     ] {
-        assert!(outcome.reply.get(field).is_some(), "missing {field}");
+        let fixture = fixture();
+        *fixture.vault.open_fails.lock().unwrap() = open_fails;
+        fixture.vault.script(reply);
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        assert_eq!(outcome.reply["outcome"], "capture_not_stored");
+        assert_eq!(outcome.reply["reason"], reason, "{}", outcome.reply);
+        assert_eq!(fixture.vault.calls(), calls, "{reason}");
+        validate(&outcome.reply);
+        assert_eq!(
+            outcome.journal.outcome,
+            format!("refused:capture_not_stored:{reason}")
+        );
     }
-    assert_eq!(outcome.reply["expires_at"], "2026-09-21T14:23:20.000Z");
-    crate::browser::validate_browser_result(crate::management::CAPTURE_LOGIN, &outcome.reply)
-        .expect("the captured reply matches its schema");
+    let fixture = fixture();
+    *fixture.vault.open_fails.lock().unwrap() = Some(VaultReachError::RouteRefused {
+        code: Some("capability_forbidden".to_string()),
+    });
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert!(outcome.reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("capability_forbidden"));
+}
+
+/// A vault that never answers cannot hold the call open: the deposit's
+/// deadline ends it, and the reply says the login may have been stored.
+#[tokio::test]
+async fn a_vault_that_never_answers_is_bounded_by_the_deposit_deadline() {
+    let fixture = fixture_with(|env| env.deposit_deadline = Duration::from_millis(50));
+    fixture.vault.script([FakeReply::Hangs]);
+    let (outcome, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        capture(&fixture, &ollama(), allow()),
+    )
+    .await
+    .expect("the deposit deadline ended the wait");
+    assert_eq!(outcome.reply["outcome"], "capture_not_stored");
+    assert_eq!(outcome.reply["reason"], VAULT_DEADLINE_EXCEEDED);
+    assert!(outcome.reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("may or may not"));
+}
+
+/// A stored reply that names another id answers some other request, so it is
+/// not taken as this login's.
+#[tokio::test]
+async fn a_reply_for_another_id_is_not_taken_as_stored() {
+    let fixture = fixture();
+    fixture.vault.script([FakeReply::Raw(json!({
+        "result": {"id": "cookie:other.com:work", "outcome": "created", "record_version": 1}
+    }))]);
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "capture_not_stored");
+    assert_eq!(outcome.reply["reason"], VAULT_REPLY_MALFORMED);
+}
+
+/// The file path and the operator commands are gone: no reply names a capture
+/// file or a `ck auth` command, and the schema no longer declares the fields
+/// that carried them.
+#[tokio::test]
+async fn no_reply_names_a_capture_file_or_a_command() {
+    let schema = reply_schema();
+    for field in ["commands", "expires_at", "replace_note", "holder", "bytes"] {
+        assert!(
+            schema["properties"].get(field).is_none(),
+            "the reply schema still declares {field}"
+        );
+    }
+    for (case, arrange) in [
+        ("stored", None),
+        (
+            "refused",
+            Some(FakeReply::refused("permanent", "not_found")),
+        ),
+    ] {
+        let fixture = fixture();
+        fixture.vault.script(arrange);
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        let text = outcome.reply.to_string();
+        for absent in ["ck auth", "--payload-file", ROOT, ".cookie"] {
+            assert!(!text.contains(absent), "{case}: {text}");
+        }
+        assert!(outcome.reply.get("path").is_none(), "{case}: {text}");
+        assert!(fixture.fs.files().is_empty(), "{case}");
+    }
 }
 
 // --- handoff endings --------------------------------------------------------
@@ -888,7 +1253,7 @@ async fn a_failed_verification_keeps_the_handoff_open_until_one_passes() {
     let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
     assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
     assert_eq!(fixture.launcher.verifications.count(), 2);
-    assert_eq!(fixture.fs.files().len(), 1);
+    assert_eq!(fixture.vault.calls(), 1);
     let events = fixture.events.snapshot();
     let verified = events
         .iter()
@@ -1159,56 +1524,4 @@ async fn an_unsupported_platform_refuses_before_touching_anything() {
     assert!(question.is_none());
     assert!(fixture.fs.contents().is_empty());
     assert!(!fixture.events.contains_prefix("tmutil"));
-}
-
-// --- deletion -------------------------------------------------------------
-
-#[tokio::test]
-async fn the_file_is_unlinked_at_its_deadline() {
-    let fixture = fixture();
-    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
-    let path = outcome.captured_file.clone().unwrap();
-    let deadline = fixture.clock.now() + FILE_LIFETIME;
-    assert_eq!(fixture.scheduler.deadlines(), vec![deadline]);
-    fixture.scheduler.run_due(deadline - Duration::from_secs(1));
-    assert!(fixture.fs.exists(&path), "deleted before its deadline");
-    fixture.clock.advance(FILE_LIFETIME);
-    fixture.scheduler.run_due(deadline);
-    assert!(!fixture.fs.exists(&path));
-}
-
-/// A failed unlink at the deadline is kept, not swallowed: the next capture
-/// refuses, naming the file and why it could not be removed.
-#[tokio::test]
-async fn a_failed_unlink_at_the_deadline_surfaces_as_residue() {
-    let fixture = fixture();
-    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
-    let path = outcome.captured_file.clone().unwrap();
-    fixture.fs.undeletable.lock().unwrap().insert(path.clone());
-    fixture
-        .scheduler
-        .run_due(fixture.clock.now() + FILE_LIFETIME);
-    assert!(fixture.fs.exists(&path));
-    let (next, _) = capture(&fixture, &ollama(), allow()).await;
-    assert_eq!(next.reply["outcome"], "capture_residue_present");
-    assert_eq!(next.reply["path"], path.display().to_string());
-    assert_eq!(next.reply["reason"], "deletion_failed:PermissionDenied");
-}
-
-/// The production scheduler really runs the deletion when the deadline comes.
-#[tokio::test]
-async fn the_production_scheduler_deletes_at_the_deadline() {
-    let fixture = fixture_with(|env| {
-        env.clock = Arc::new(SystemWallClock);
-        env.scheduler = Arc::new(TokioDeletionScheduler);
-        env.file_lifetime = Duration::from_millis(50);
-    });
-    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
-    let path = outcome.captured_file.clone().unwrap();
-    assert!(fixture.fs.exists(&path));
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        !fixture.fs.exists(&path),
-        "the deadline passed and the file stayed"
-    );
 }

@@ -3,23 +3,33 @@
 //! A consumer (today only insula) needs one raw session cookie per provider.
 //! Copying the person's live session would give it two holders, and some sites
 //! sign one copy out. So this operation launches a THROWAWAY browser profile,
-//! hands the window to the person to log in, and after the login is observed
+//! hands the window to the person to log in, and after the login is verified
 //! reads the request `Cookie:` header for the one URL the holder will fetch.
 //!
 //! This is the only path in the module that holds a cookie VALUE. The value
-//! goes to exactly one place: one 0600 file in a directory proven excluded from
-//! backups, deleted after [`FILE_LIFETIME`]. It never reaches the wire reply,
-//! the consent question, the journal, or a panic message: [`CookieHeader`] has
-//! no `Display`, no `Serialize`, and a `Debug` that prints only its length.
+//! goes to exactly one place: the vault. Once the person grants the consent
+//! card, the capture deposits the header in claustrum with
+//! `credential.deposit_cookie` (see [`vault`]), and the vault decides who may
+//! read it. Nothing is written to disk by this module and no command is handed
+//! back for anyone to run.
 //!
-//! The vault write stays with the operator. The reply carries the two `ck auth`
-//! commands that store the file and grant the holder read access, because
-//! deposits are master-key gated and this module must never reach the
-//! credentials provider.
+//! The value never reaches the wire reply, the consent question, the journal,
+//! or a panic message: [`CookieHeader`] has no `Display`, no `Serialize`, and
+//! a `Debug` that prints only its length. It is moved into the request bytes
+//! ([`vault_wire::deposit_request`]) and wiped there the moment those bytes
+//! exist; the request bytes are wiped when the deposit ends. The reply carries
+//! the vault's id, outcome and record version, and the journal the id, the
+//! outcome or refusal code, and the header's length.
+//!
+//! The throwaway profile lives under the per-user temporary directory, is
+//! proven excluded from backups before the browser starts (the profile holds
+//! the session too), and is deleted before the deposit is made, so the login
+//! exists in one place only once it is stored.
 //!
 //! Everything that touches the host sits behind a seam ([`BackupExclusion`],
-//! [`CaptureFs`], [`WallClock`], [`DeletionScheduler`], [`CaptureLauncher`]),
-//! so the decisions below are exercised on any platform without a browser.
+//! [`CaptureFs`], [`CaptureLauncher`], [`vault::CookieVault`]), so the
+//! decisions below are exercised on any platform without a browser or a
+//! daemon.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -35,19 +45,22 @@ use serde_json::{json, Map, Value};
 use crate::elicit::AskOutcome;
 use crate::journal::LoginCapturePayload;
 
-/// The principal that will hold a captured login.
+pub mod vault;
+pub mod vault_wire;
+
+/// The principal a captured login is for, as the consent card names it and
+/// the journal records it.
 ///
-/// A fixed set rather than a request parameter: the holder is who the grant
-/// command names, so a caller-chosen holder would be the caller choosing who
-/// receives the person's login.
+/// The vault decides who may read a deposited cookie (its `browser-session`
+/// category), and this module sends no holder with the deposit. The constant
+/// is what the person is told, so it is fixed rather than a request
+/// parameter: a caller-chosen holder would be the caller choosing whom the
+/// person is told receives their login.
 pub const HOLDER: &str = "reserved:insula";
 /// How the holder is named to the person in the consent question.
 const HOLDER_DISPLAY_NAME: &str = "insula";
-/// How long the captured file exists before the module unlinks it, whether or
-/// not the operator stored it.
-pub const FILE_LIFETIME: Duration = Duration::from_secs(10 * 60);
-/// The directory under the per-user temporary directory that holds the file
-/// and the throwaway profile.
+/// The directory under the per-user temporary directory that holds the
+/// throwaway profile.
 pub const CAPTURE_ROOT_NAME: &str = "ck-cerebellum-capture";
 /// Every `tmutil` call on the capture path gets this long before it is killed
 /// and reported as timed out. A healthy call answers in milliseconds; the bound
@@ -114,7 +127,7 @@ pub const OUTCOMES: [&str; 18] = [
     "elicitation_undeclared",
     "capture_browser_unavailable",
     "capture_launch_failed",
-    "capture_write_failed",
+    "capture_not_stored",
     "capture_profile_not_deleted",
     "internal_failure",
 ];
@@ -128,13 +141,11 @@ pub fn reply_schema() -> Value {
         "type": "object",
         "properties": {
             "outcome": {"type": "string", "enum": OUTCOMES},
-            "path": string(),
-            "bytes": {"type": "integer"},
-            "expires_at": string(),
             "credential_id": string(),
-            "holder": string(),
-            "commands": {"type": "array", "items": {"type": "string"}},
-            "replace_note": string(),
+            "vault_outcome": {"type": "string", "enum": ["created", "replaced"]},
+            "record_version": {"type": "integer"},
+            // Refusals only: the capture directory or profile they name.
+            "path": string(),
             "url": string(),
             "tool": string(),
             "reason": string(),
@@ -188,9 +199,9 @@ const FIELDS: [&str; 4] = ["credential_domain", "account", "fetch_url", "login_u
 /// The account is required and non-empty because the vault id is always
 /// `cookie:<domain>:<account>`: insula reads a bare `cookie:<domain>` as a
 /// fallback behind its own Chrome reader, and only the account-suffixed id
-/// takes that reader out of the path. It is also limited to characters that
-/// need no quoting, because it is printed inside shell commands the operator
-/// runs.
+/// takes that reader out of the path. It is also limited to a small character
+/// set, because it becomes part of that id, and an id the vault refuses as
+/// `invalid_id` would only be found after the person had signed in.
 pub fn parse_request(params: &Map<String, Value>) -> Result<CaptureRequest, InvalidCaptureRequest> {
     if let Some(field) = params
         .keys()
@@ -240,9 +251,22 @@ pub fn parse_request(params: &Map<String, Value>) -> Result<CaptureRequest, Inva
 }
 
 impl CaptureRequest {
-    /// The vault id the operator stores the capture under.
+    /// The vault id the capture is deposited under.
     pub fn credential_id(&self) -> String {
         format!("cookie:{}:{}", self.credential_domain, self.account)
+    }
+
+    /// The account label when it is an email address, which the deposit
+    /// passes on as `email`; `None` for any other label, which the deposit
+    /// then omits. A label is read as an email address when it has exactly
+    /// one `@`, something before it, and a dotted domain after it.
+    pub fn account_email(&self) -> Option<&str> {
+        let (local, domain) = self.account.split_once('@')?;
+        let email = !local.is_empty()
+            && !domain.contains('@')
+            && domain.split('.').count() >= 2
+            && domain.split('.').all(|label| !label.is_empty());
+        email.then_some(self.account.as_str())
     }
 
     /// The origin of the login page, which is where the login observation is
@@ -381,7 +405,7 @@ impl std::fmt::Debug for CookieHeader {
 
 impl Drop for CookieHeader {
     fn drop(&mut self) {
-        self.0.iter_mut().for_each(|byte| *byte = 0);
+        vault_wire::wipe(&mut self.0);
     }
 }
 
@@ -411,7 +435,8 @@ impl ToolError {
     }
 }
 
-/// Keeping the capture directory out of Time Machine.
+/// Keeping the capture directory, where the throwaway profile and its session
+/// live while the person signs in, out of Time Machine.
 pub trait BackupExclusion: Send + Sync {
     /// The tool named in a refusal.
     fn tool_name(&self) -> &'static str;
@@ -426,7 +451,6 @@ pub trait BackupExclusion: Send + Sync {
 pub struct ResidueEntry {
     pub path: PathBuf,
     pub is_dir: bool,
-    pub modified: Option<SystemTime>,
 }
 
 /// Every file-system effect of a capture.
@@ -438,22 +462,10 @@ pub trait CaptureFs: Send + Sync {
     fn residue(&self, root: &Path) -> io::Result<Vec<ResidueEntry>>;
     /// Create one fresh private directory; fail if anything is already there.
     fn create_profile_dir(&self, path: &Path) -> io::Result<()>;
-    /// Create the file exclusively with mode 0600, write it in one call, and
-    /// flush it to disk.
-    fn write_new_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+    /// Remove a file found as residue (a cookie file a build that still wrote
+    /// one left behind).
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
-}
-
-/// The wall clock, for `expires_at` and residue age.
-pub trait WallClock: Send + Sync {
-    fn now(&self) -> SystemTime;
-}
-
-/// Unlinks a captured file at its deadline.
-pub trait DeletionScheduler: Send + Sync {
-    /// Arrange for `delete` to run at `at`. `delete` records its own failure.
-    fn schedule(&self, at: SystemTime, delete: Box<dyn FnOnce() + Send>);
 }
 
 /// Why a capture browser operation failed. Carries no page or cookie text.
@@ -779,7 +791,6 @@ impl CaptureFs for HostFs {
             residue.push(ResidueEntry {
                 path: entry.path(),
                 is_dir: metadata.file_type().is_dir(),
-                modified: metadata.modified().ok(),
             });
         }
         residue.sort_by(|left, right| left.path.cmp(&right.path));
@@ -788,20 +799,6 @@ impl CaptureFs for HostFs {
 
     fn create_profile_dir(&self, path: &Path) -> io::Result<()> {
         create_private_dir(path)
-    }
-
-    fn write_new_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -835,34 +832,6 @@ fn set_private_dir_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The system wall clock.
-#[derive(Debug, Default)]
-pub struct SystemWallClock;
-
-impl WallClock for SystemWallClock {
-    fn now(&self) -> SystemTime {
-        SystemTime::now()
-    }
-}
-
-/// Runs each deletion on the tokio runtime at its deadline. Outside a runtime
-/// nothing is scheduled, and the file is left for the residue rule to report.
-#[derive(Debug, Default)]
-pub struct TokioDeletionScheduler;
-
-impl DeletionScheduler for TokioDeletionScheduler {
-    fn schedule(&self, at: SystemTime, delete: Box<dyn FnOnce() + Send>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let wait = at.duration_since(SystemTime::now()).unwrap_or_default();
-        runtime.spawn(async move {
-            tokio::time::sleep(wait).await;
-            delete();
-        });
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The capture module
 // ---------------------------------------------------------------------------
@@ -875,9 +844,6 @@ pub struct CaptureEnv {
     pub root: Option<PathBuf>,
     pub exclusion: Arc<dyn BackupExclusion>,
     pub fs: Arc<dyn CaptureFs>,
-    pub clock: Arc<dyn WallClock>,
-    pub scheduler: Arc<dyn DeletionScheduler>,
-    pub file_lifetime: Duration,
     /// The same handoff bound `browser.present` uses.
     pub handoff_duration: Duration,
     /// The same poll interval `browser.present` uses.
@@ -890,6 +856,11 @@ pub struct CaptureEnv {
     pub verification_retry_interval: Duration,
     /// See [`VERIFICATION_DEADLINE`].
     pub verification_deadline: Duration,
+    /// See [`vault::DEPOSIT_DEADLINE`].
+    pub deposit_deadline: Duration,
+    /// The wait before each retry of a transient vault refusal; its length is
+    /// the number of retries. See [`vault::RETRY_BACKOFF`].
+    pub deposit_backoff: Vec<Duration>,
 }
 
 impl CaptureEnv {
@@ -900,24 +871,24 @@ impl CaptureEnv {
             root: production_root(),
             exclusion: Arc::new(Tmutil::default()),
             fs: Arc::new(HostFs),
-            clock: Arc::new(SystemWallClock),
-            scheduler: Arc::new(TokioDeletionScheduler),
-            file_lifetime: FILE_LIFETIME,
             handoff_duration: Duration::from_millis(crate::browser_session::HANDOFF_DURATION_MS),
             poll_interval: Duration::from_millis(crate::browser_session::HANDOFF_POLL_INTERVAL_MS),
             drive_deadline_ms,
             verification_min_spacing: VERIFICATION_MIN_SPACING,
             verification_retry_interval: VERIFICATION_RETRY_INTERVAL,
             verification_deadline: VERIFICATION_DEADLINE,
+            deposit_deadline: vault::DEPOSIT_DEADLINE,
+            deposit_backoff: vault::RETRY_BACKOFF.to_vec(),
         }
     }
 }
 
-/// Module-owned capture state: one capture at a time, and the unlink failures
-/// the residue refusal reports.
+/// Module-owned capture state: one capture at a time, and the deletion
+/// failures the residue refusal reports.
 pub struct CaptureModule {
     env: CaptureEnv,
     launcher: Mutex<Option<Arc<dyn CaptureLauncher>>>,
+    vault: Mutex<Option<Arc<dyn vault::CookieVault>>>,
     in_progress: Arc<Mutex<bool>>,
     /// Paths whose deletion failed, with the error kind. The residue refusal
     /// names the path from disk; this adds why the module could not remove it.
@@ -936,12 +907,11 @@ pub struct CaptureCall<'a, Ask, Cancelled> {
 }
 
 /// A finished capture: the reply to send and the journal record to write
-/// first. When `captured_file` is set the reply names that file.
+/// first.
 #[derive(Debug)]
 pub struct CaptureOutcome {
     pub reply: Value,
     pub journal: LoginCapturePayload,
-    pub captured_file: Option<PathBuf>,
 }
 
 enum HandoffEnd {
@@ -980,6 +950,7 @@ impl CaptureModule {
         Self {
             env,
             launcher: Mutex::new(None),
+            vault: Mutex::new(None),
             in_progress: Arc::new(Mutex::new(false)),
             failed_deletions: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -1001,6 +972,22 @@ impl CaptureModule {
             .clone()
     }
 
+    /// Publish the vault captures deposit into. Set once the module knows the
+    /// daemon's connection file, which is after the planes are built.
+    pub fn set_vault(&self, vault: Arc<dyn vault::CookieVault>) {
+        *self
+            .vault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(vault);
+    }
+
+    fn vault(&self) -> Option<Arc<dyn vault::CookieVault>> {
+        self.vault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn try_begin(&self) -> Option<InProgress> {
         let mut busy = self
             .in_progress
@@ -1013,14 +1000,15 @@ impl CaptureModule {
         Some(InProgress(Arc::clone(&self.in_progress)))
     }
 
-    /// Delete residue older than the file lifetime, and schedule deletion of
-    /// anything younger at its own deadline. Run once at module startup, after
-    /// launch recovery has terminated any orphaned capture browser.
+    /// Delete everything left in the capture root. Run once at module startup,
+    /// after launch recovery has terminated any capture browser an earlier
+    /// module process left running, so nothing there is in use: what is left
+    /// is a throwaway profile a crashed capture never deleted, or a cookie
+    /// file from a build that still wrote one.
     ///
-    /// A module crash between writing a file and its deadline leaves the file
-    /// here. A deletion that fails is recorded, and the next capture refuses
-    /// with `capture_residue_present`: the module logs nothing, so that
-    /// refusal is the report.
+    /// A deletion that fails is recorded, and the next capture refuses with
+    /// `capture_residue_present`: the module logs nothing, so that refusal is
+    /// the report.
     pub fn sweep_at_startup(&self) {
         let Some(root) = self.env.root.clone() else {
             return;
@@ -1028,47 +1016,19 @@ impl CaptureModule {
         let Ok(residue) = self.env.fs.residue(&root) else {
             return;
         };
-        let now = self.env.clock.now();
         for entry in residue {
-            let deadline = entry
-                .modified
-                .and_then(|modified| modified.checked_add(self.env.file_lifetime));
-            match deadline {
-                Some(deadline) if deadline > now => {
-                    self.schedule_deletion(entry.path, entry.is_dir, deadline)
-                }
-                _ => {
-                    delete_recording(
-                        &self.env.fs,
-                        &self.failed_deletions,
-                        &entry.path,
-                        entry.is_dir,
-                    );
-                }
-            }
+            delete_recording(
+                &self.env.fs,
+                &self.failed_deletions,
+                &entry.path,
+                entry.is_dir,
+            );
         }
     }
 
-    fn schedule_deletion(&self, path: PathBuf, is_dir: bool, at: SystemTime) {
-        let fs = Arc::clone(&self.env.fs);
-        let failures = Arc::clone(&self.failed_deletions);
-        self.env.scheduler.schedule(
-            at,
-            Box::new(move || {
-                delete_recording(&fs, &failures, &path, is_dir);
-            }),
-        );
-    }
-
-    /// Remove a captured file now, for a capture whose record could not be
-    /// written: nothing may outlive an attempt the journal does not describe.
-    pub fn discard_captured_file(&self, path: &Path) {
-        delete_recording(&self.env.fs, &self.failed_deletions, path, false);
-    }
-
     /// Run one capture to its end. The throwaway profile is deleted before
-    /// this returns, so a caller that sends the reply afterwards can never
-    /// reply while a second copy of the session exists.
+    /// the login is deposited and before this returns, so the session exists
+    /// in one place, the vault, by the time a caller hears back.
     pub async fn run<Ask, AskFuture, Cancelled>(
         &self,
         request: &CaptureRequest,
@@ -1118,6 +1078,18 @@ impl CaptureModule {
                 json!({"remedy": "configure a supported browser executable for this module"}),
             );
         };
+        // Refused before the person is asked: a sign-in whose login cannot be
+        // stored afterwards is a sign-in wasted.
+        let Some(vault) = self.vault() else {
+            return record.refused(
+                "capture_not_stored",
+                json!({
+                    "credential_id": request.credential_id(),
+                    "reason": VAULT_UNREACHABLE,
+                    "remedy": "this module has no route to the vault, so nothing was captured; it needs a daemon connection",
+                }),
+            );
+        };
         let Some(root) = self.env.root.clone() else {
             return record.refused(
                 "capture_location_not_excluded",
@@ -1137,7 +1109,11 @@ impl CaptureModule {
         if (call.cancelled)() {
             return record.ended("cancelled", None);
         }
-        let question = consent_question(request, self.env.file_lifetime);
+        // The card's id is the consent reference the vault binds into its
+        // audit row for the deposit, so the stored login names the grant that
+        // allowed it.
+        let consent_ref = new_consent_ask_id();
+        let question = consent_question(request, &consent_ref);
         // The question can wait minutes for a person, so a cancel is watched
         // for alongside it rather than only after it ends.
         let answer = {
@@ -1233,7 +1209,6 @@ impl CaptureModule {
             root: root.clone(),
             profile_directory: root.join(format!("profile-{capture_id}")),
         };
-        let file_path = root.join(format!("login-{capture_id}.cookie"));
         if self
             .env
             .fs
@@ -1348,38 +1323,30 @@ impl CaptureModule {
                 .ended("cancelled", None);
         }
 
+        // The header moves into the request bytes and is wiped there as soon
+        // as they exist; from here the request is the only copy of the cookie.
+        let credential_id = request.credential_id();
         let bytes = header.len() as u64;
-        let written = self.env.fs.write_new_file(&file_path, header.bytes());
-        drop(header);
-        if written.is_err() {
-            // An exclusive create that failed part-way may still have left a
-            // file; remove it so the failure leaves nothing behind.
-            let _ = self.env.fs.remove_file(&file_path);
-            let disposal = self.dispose(browser, &placement).await;
-            return record.with_deletion(disposal.deleted).refused(
-                "capture_write_failed",
-                json!({"path": file_path.display().to_string(), "remedy": "check the capture directory is writable, then retry"}),
-            );
-        }
-        let expires_at = self
-            .env
-            .clock
-            .now()
-            .checked_add(self.env.file_lifetime)
-            .unwrap_or(UNIX_EPOCH);
-        // Scheduled before disposal so the file is covered by its deadline
-        // even if what follows fails.
-        self.schedule_deletion(file_path.clone(), false, expires_at);
-
-        // From here a cancel changes nothing: the file exists and its deadline
-        // deletes it. The profile goes first, and only then is anything
-        // returned, so the session exists in exactly one place: the file.
+        let deposit_request = vault_wire::deposit_request(
+            &credential_id,
+            header,
+            &consent_ref,
+            request.account_email(),
+        );
+        // The profile goes before the deposit: once the login is stored, no
+        // second copy of the session may exist. A cancel from here changes
+        // nothing; the deposit is bounded by its own deadline.
         let disposal = self.dispose(browser, &placement).await;
+        let record = record.with_deletion(disposal.deleted);
+        let deposit_request = match deposit_request {
+            Ok(deposit_request) => deposit_request,
+            Err(_) => return record.not_stored(bytes, REQUEST_UNBUILDABLE, None),
+        };
         if !disposal.deleted {
-            // A second copy of the session survives in the profile. Withdraw
-            // the file rather than hand out one of two copies.
-            delete_recording(&self.env.fs, &self.failed_deletions, &file_path, false);
-            return record.with_deletion(false).refused(
+            // A copy of the session survives in the profile, and a deposit
+            // cannot be withdrawn, so nothing is stored.
+            drop(deposit_request);
+            return record.refused(
                 "capture_profile_not_deleted",
                 json!({
                     "path": placement.profile_directory.display().to_string(),
@@ -1388,22 +1355,15 @@ impl CaptureModule {
             );
         }
 
-        let credential_id = request.credential_id();
-        let reply = json!({
-            "outcome": "captured",
-            "path": file_path.display().to_string(),
-            "bytes": bytes,
-            "expires_at": crate::browser_session::render_rfc3339_millis(expires_at),
-            "credential_id": credential_id,
-            "holder": HOLDER,
-            "commands": operator_commands(&credential_id, &file_path),
-            "replace_note": replace_note(&credential_id),
-        });
-        CaptureOutcome {
-            reply,
-            journal: record.with_deletion(true).payload("captured", bytes),
-            captured_file: Some(file_path),
-        }
+        let end = vault::deposit(
+            vault.as_ref(),
+            deposit_request,
+            &credential_id,
+            self.env.deposit_deadline,
+            &self.env.deposit_backoff,
+        )
+        .await;
+        record.deposited(bytes, end, self.env.deposit_deadline)
     }
 
     fn residue_refusal(&self, root: &Path) -> Option<Value> {
@@ -1754,15 +1714,22 @@ fn new_capture_id() -> String {
     )
 }
 
+/// A fresh id for one capture's consent card. It is also the deposit's
+/// `consent_ref`, so it stays within the vault's limit: printable ASCII, at
+/// most [`vault_wire::MAX_CONSENT_REF_BYTES`] bytes (this is under 70).
+fn new_consent_ask_id() -> String {
+    format!("capture-login-{}", new_capture_id())
+}
+
 /// How loudly the capture's consent card notifies. High because `run` holds
 /// the `browser.capture_login` call open on the answer, with no shorter park:
 /// the agent is blocked until the person decides or the question expires.
 const CAPTURE_CONSENT_URGENCY: crate::consent_card::Urgency = crate::consent_card::Urgency::High;
 
 /// Built before a browser exists so no captured cookie can enter the question.
-pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Value {
+/// `ask_id` is the card's id, which the deposit later names as its consent.
+pub fn consent_question(request: &CaptureRequest, ask_id: &str) -> Value {
     use crate::consent_card::*;
-    let minutes = file_lifetime.as_secs().div_ceil(60);
     let site = &request.credential_domain;
     ConsentCard {
         title: format!("Save your {site} login?"),
@@ -1777,10 +1744,15 @@ pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Va
                 "Browser",
                 "Sign in in a new, empty browser window; your own browser is not touched",
             ),
-            Fact::new("Local copy", format!("Deleted after {minutes} minutes")),
             Fact::new(
                 "Storage",
-                format!("The operator stores the login for {HOLDER_DISPLAY_NAME} with ck auth put"),
+                format!(
+                    "Your login is stored in the vault for {HOLDER_DISPLAY_NAME}; the sign-in window is deleted afterwards"
+                ),
+            ),
+            Fact::new(
+                "Other browsers",
+                "Some sites allow one sign-in at a time; signing in here may sign you out of this site in your other browsers.",
             ),
         ],
         grants: vec![ConsentOption::grant(ALLOW_DECISION, "Allow")],
@@ -1795,7 +1767,7 @@ pub fn consent_question(request: &CaptureRequest, file_lifetime: Duration) -> Va
             .with("account", request.account.as_str()),
         duration: None,
     }
-    .render(&format!("capture-login-{}", new_capture_id()))
+    .render(ask_id)
 }
 
 /// `None` only for an affirmative answer. Every other ending -- a refusal,
@@ -1830,36 +1802,34 @@ fn consent_refusal_remedy(reason: &str) -> &'static str {
     }
 }
 
-/// The two commands the operator runs: store the file under the credential
-/// id, then grant the holder read access to exactly that id.
-pub fn operator_commands(credential_id: &str, path: &Path) -> [String; 2] {
-    [
-        format!(
-            "ck auth put --id {credential_id} --payload-file {}",
-            shell_word(&path.display().to_string())
-        ),
-        format!(
-            "ck auth grant --principal {HOLDER} --selector-kind exact --selector {credential_id} --operation read"
-        ),
-    ]
-}
+/// The `capture_not_stored` reason when no route to the vault could be opened:
+/// the module has none configured, or the daemon could not be connected to.
+pub const VAULT_UNREACHABLE: &str = "vault_unreachable";
+/// The reason when the daemon refused to open the route to the vault.
+pub const VAULT_ROUTE_REFUSED: &str = "vault_route_refused";
+/// The reason when the route failed after the request was sent.
+pub const VAULT_CALL_FAILED: &str = "vault_call_failed";
+/// The reason when the deposit did not finish inside its deadline.
+pub const VAULT_DEADLINE_EXCEEDED: &str = "vault_deadline_exceeded";
+/// The reason when the vault answered outside its contract.
+pub const VAULT_REPLY_MALFORMED: &str = "vault_reply_malformed";
+/// The reason when the deposit request could not be built from the capture.
+pub const REQUEST_UNBUILDABLE: &str = "request_unbuildable";
 
-fn replace_note(credential_id: &str) -> String {
-    format!(
-        "If {credential_id} already exists in the vault, run the put with --replace instead of adding a new account suffix: insula refuses a second handle for one cookie family, so a re-capture replaces the same id. Cerebellum cannot tell which case applies because it never reads the vault."
-    )
-}
+const INTERNAL_FAULT: &str = "an internal fault in this module's deposit; nothing was stored and capturing again will not help. Report it.";
 
-/// Quote a path for a POSIX shell only when it needs it.
-fn shell_word(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
-    {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
+/// What the caller should do after a vault refusal, chosen by class first:
+/// a transient refusal clears by itself whatever its code, and new codes may
+/// join either class.
+fn vault_refusal_remedy(refusal: &vault_wire::VaultRefusal, credential_id: &str) -> String {
+    if refusal.is_transient() {
+        return "the vault was busy and kept refusing through every retry; nothing was stored. Capture again shortly.".to_string();
+    }
+    match refusal.code.as_str() {
+        "not_found" => "the vault refused the deposit because this module holds no deposit grant, or reached the vault without its module identity; nothing was stored. An operator must grant reserved:cerebellum the deposit operation on the browser-session category, then capture again.".to_string(),
+        "not_permitted" => format!("an operator-managed vault record already holds {credential_id}; nothing was stored. Capture under another account label, or have the operator retire that record."),
+        code if code.starts_with("invalid_") => INTERNAL_FAULT.to_string(),
+        _ => "the vault refused the deposit; nothing was stored.".to_string(),
     }
 }
 
@@ -1902,7 +1872,77 @@ impl Record {
         CaptureOutcome {
             reply: detail,
             journal: self.payload(&format!("refused:{code}"), 0),
-            captured_file: None,
+        }
+    }
+
+    /// How a deposit ended, as the reply and the journal record. The journal
+    /// keeps the vault's outcome or the refusal's reason, and the header's
+    /// length; never anything else from the vault's reply.
+    fn deposited(self, bytes: u64, end: vault::DepositEnd, deadline: Duration) -> CaptureOutcome {
+        let seconds = deadline.as_secs_f64();
+        let (reason, remedy): (String, String) = match end {
+            vault::DepositEnd::Stored(deposited) => {
+                let vault_outcome = deposited.outcome.as_str();
+                let reply = json!({
+                    "outcome": "captured",
+                    "credential_id": self.credential_id,
+                    "vault_outcome": vault_outcome,
+                    "record_version": deposited.record_version,
+                });
+                return CaptureOutcome {
+                    reply,
+                    journal: self.payload(&format!("captured:{vault_outcome}"), bytes),
+                };
+            }
+            vault::DepositEnd::Refused(refusal) => {
+                let remedy = vault_refusal_remedy(&refusal, &self.credential_id);
+                (refusal.code, remedy)
+            }
+            vault::DepositEnd::Unreachable => (
+                VAULT_UNREACHABLE.to_string(),
+                "the daemon could not be reached to open a route to the vault; nothing was stored. Capture again once the daemon is running.".to_string(),
+            ),
+            vault::DepositEnd::RouteRefused { code } => (
+                VAULT_ROUTE_REFUSED.to_string(),
+                format!(
+                    "the daemon refused to open a route to the vault ({}); nothing was stored. Check that claustrum is registered and that this module may reach it, then capture again.",
+                    code.as_deref().unwrap_or("no code given")
+                ),
+            ),
+            vault::DepositEnd::CallFailed { code } => (
+                VAULT_CALL_FAILED.to_string(),
+                format!(
+                    "the route to the vault failed after the deposit was sent ({}), so the login may or may not be stored. Capturing again replaces it under the same id.",
+                    code.as_deref().unwrap_or("connection closed")
+                ),
+            ),
+            vault::DepositEnd::DeadlineExceeded { sent: true } => (
+                VAULT_DEADLINE_EXCEEDED.to_string(),
+                format!("the vault did not answer within {seconds} s, so the login may or may not be stored. Capturing again replaces it under the same id."),
+            ),
+            vault::DepositEnd::DeadlineExceeded { sent: false } => (
+                VAULT_DEADLINE_EXCEEDED.to_string(),
+                format!("the vault could not be reached within {seconds} s; nothing was stored. Capture again shortly."),
+            ),
+            vault::DepositEnd::Malformed => {
+                (VAULT_REPLY_MALFORMED.to_string(), INTERNAL_FAULT.to_string())
+            }
+        };
+        self.not_stored(bytes, &reason, Some(remedy))
+    }
+
+    /// The login was captured but is not in the vault, and nothing else holds
+    /// it: the header and the request were wiped and the profile is gone.
+    fn not_stored(self, bytes: u64, reason: &str, remedy: Option<String>) -> CaptureOutcome {
+        let reply = json!({
+            "outcome": "capture_not_stored",
+            "credential_id": self.credential_id,
+            "reason": reason,
+            "remedy": remedy.unwrap_or_else(|| INTERNAL_FAULT.to_string()),
+        });
+        CaptureOutcome {
+            reply,
+            journal: self.payload(&format!("refused:capture_not_stored:{reason}"), bytes),
         }
     }
 
@@ -1939,7 +1979,6 @@ impl Record {
         CaptureOutcome {
             reply,
             journal: self.payload(outcome, 0),
-            captured_file: None,
         }
     }
 }
