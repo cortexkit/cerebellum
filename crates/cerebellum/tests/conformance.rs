@@ -883,7 +883,10 @@ impl Drop for LiveDaemonGuard {
         // it first, while the panic is unwinding, and libtest shows it beside
         // the assertion that failed.
         if std::thread::panicking() {
-            eprintln!("{}", module_output_report(&self.module_output));
+            eprintln!(
+                "{}",
+                module_output_report(&self.module_output, Duration::from_secs(2))
+            );
         }
         self.stop();
     }
@@ -895,10 +898,10 @@ impl Drop for LiveDaemonGuard {
 /// here is the module's own account of why it stopped. The daemon copies the
 /// child's output into the file from a background task, line by line, so the
 /// last line can land a moment after the test has already seen the module's
-/// connection close; a short bounded wait for a non-empty file covers that.
-/// The wait only ever runs on a test that is already failing.
-fn module_output_report(path: &Path) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+/// connection close; waiting up to `wait` for a non-empty file covers that.
+/// The guard only waits on a test that is already failing.
+fn module_output_report(path: &Path, wait: Duration) -> String {
+    let deadline = std::time::Instant::now() + wait;
     let captured = loop {
         let text = fs::read_to_string(path).unwrap_or_default();
         if !text.trim().is_empty() || std::time::Instant::now() >= deadline {
@@ -1045,7 +1048,10 @@ async fn start_live_daemon_with_browser(
         .duration_since(UNIX_EPOCH)
         .expect("system clock must be after the Unix epoch")
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!("cerebellum-conformance-{nonce}"));
+    let directory = live_daemon_directory(nonce);
+    // `create_dir`, not `create_dir_all`: a directory that already exists
+    // belongs to another test's daemon, and is refused rather than shared.
+    fs::create_dir(&directory).expect("create a live-daemon directory no other test holds");
     let home = directory.join("home");
     fs::create_dir_all(&home).expect("create isolated module home");
     let connection_file_path = directory.join("subc-connection.json");
@@ -1177,6 +1183,69 @@ async fn start_live_daemon_with_browser(
         },
         connection,
     )
+}
+
+/// A directory for one live daemon that no other daemon will be given, even
+/// one started at the same clock reading.
+///
+/// A timestamp alone is not a unique name. Two test processes started together
+/// (nextest runs every test as its own process, in parallel) can read the same
+/// clock value, and then both daemons share one directory: the second finds
+/// the first's connection file, logs "subc daemon already running" and returns
+/// without serving, its test talks to the other test's daemon, and that daemon
+/// disappears when the other test ends -- a connection reset in the middle of
+/// a test that did nothing wrong. The process id separates processes and the
+/// counter separates the daemons of one process; the timestamp only keeps
+/// names from repeating across runs.
+fn live_daemon_directory(nonce: u128) -> PathBuf {
+    static LIVE_DAEMONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = LIVE_DAEMONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "cerebellum-conformance-{}-{sequence}-{nonce}",
+        std::process::id()
+    ))
+}
+
+/// Two live daemons started at the same clock reading get different
+/// directories. Sharing one makes the second daemon defer to the first and
+/// leaves its test talking to a daemon that another test owns and tears down.
+#[test]
+fn live_daemons_started_at_the_same_instant_get_separate_directories() {
+    let first = live_daemon_directory(1_790_000_000_000_000_000);
+    let second = live_daemon_directory(1_790_000_000_000_000_000);
+    assert_ne!(
+        first, second,
+        "two live daemons with the same timestamp were given one directory"
+    );
+}
+
+/// A failing live test prints what the module wrote, so a module that exited
+/// with an error names the error instead of leaving only the daemon's
+/// "exited abnormally" line.
+#[test]
+fn a_failing_live_test_reports_what_the_module_wrote() {
+    let directory = live_daemon_directory(0);
+    fs::create_dir(&directory).expect("create a scratch directory");
+    let captured = directory.join(format!("{MODULE_ID}.stderr.log"));
+    fs::write(
+        &captured,
+        "2026-09-29T22:35:29.498Z Error: Message(\"egress channel closed\")\n",
+    )
+    .expect("write a stand-in capture file");
+    let report = module_output_report(&captured, Duration::ZERO);
+    let silent = directory.join("silent.stderr.log");
+    fs::write(&silent, "").expect("write an empty capture file");
+    let nothing = module_output_report(&silent, Duration::ZERO);
+    let _ = fs::remove_dir_all(&directory);
+
+    assert!(
+        report.contains("Error: Message(\"egress channel closed\")"),
+        "the report must carry the module's own error line: {report}"
+    );
+    assert!(
+        nothing.contains("(the module wrote nothing)"),
+        "an empty capture must say so rather than print nothing: {nothing}"
+    );
 }
 
 async fn connect_client(connection: &subc_transport::ConnectionInfo) -> TcpStream {
