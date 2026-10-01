@@ -168,7 +168,8 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
     fit(header, header_refs, lines, &tree, input.max_bytes)
 }
 
-/// Accessibility roles printed as some other word.
+/// The role word a line prints: `StaticText` reads as `text` and the root
+/// `RootWebArea` as `page`; every other accessibility role prints as is.
 fn display_role(role: &str) -> &str {
     match role {
         "StaticText" => "text",
@@ -217,12 +218,15 @@ fn is_actionable(role: &str) -> bool {
     )
 }
 
-/// Fields whose value is something a person typed.
+/// Text-entry fields (`textbox`, `searchbox`, `combobox`): their value is
+/// what a person typed, so it prints only for a field known not to hold a
+/// credential or payment detail.
 fn is_text_field(role: &str) -> bool {
     matches!(role, "textbox" | "searchbox" | "combobox")
 }
 
-/// Controls whose value is a number or a position, printed as is.
+/// Controls whose value is a number or a position (a slider's level, a
+/// progress bar's percentage); their value always prints.
 fn is_value_control(role: &str) -> bool {
     matches!(
         role,
@@ -234,8 +238,9 @@ const CONTENT: u8 = 0;
 const NEUTRAL: u8 = 1;
 const CHROME: u8 = 2;
 
-/// Which landmarks are the page's content and which are its chrome. A cut
-/// keeps content first, and the outline lists it first.
+/// Which landmarks hold the page's content and which its chrome (navigation,
+/// header, sidebar, footer). When `max_bytes` forces lines out, content lines
+/// are kept first, and the outline lists content first.
 fn landmark_class(role: &str) -> u8 {
     match role {
         "main" | "feed" | "article" | "dialog" | "alertdialog" => CONTENT,
@@ -334,11 +339,12 @@ fn shape(name: &str) -> String {
 struct Line {
     depth: usize,
     text: String,
-    /// Content (0) is kept before neutral (1) before chrome (2) when a cut
-    /// has to choose.
+    /// When `max_bytes` forces lines out, content (0) is kept before neutral
+    /// (1) before chrome (2).
     class: u8,
     refs: Vec<String>,
-    /// The outermost landmark the line belongs to, for the cut report.
+    /// The outermost landmark the line belongs to, so the closing line that
+    /// reports what `max_bytes` removed can name it.
     section: Option<usize>,
 }
 
@@ -471,9 +477,11 @@ impl<'a> Tree<'a> {
         ) || (role == "group" && !self.names[node].is_empty())
     }
 
-    /// Compute every node's children after the two collapse rules. Records
-    /// are in document order, so walking them backwards visits each node's
-    /// descendants before the node itself.
+    /// Compute every node's printed children: an unlabelled wrapper with one
+    /// child is replaced by that child (and dropped when it has none), a text
+    /// node empty or equal to its parent's name is dropped, and below a text
+    /// field only controls remain. Records are in document order, so walking
+    /// them backwards visits each node's descendants before the node itself.
     fn collapse(&mut self) {
         let count = self.records.len();
         let mut replacement: Vec<Vec<usize>> = vec![Vec::new(); count];
@@ -539,8 +547,9 @@ impl<'a> Tree<'a> {
             };
             section[node] = section[parent].or(self.is_landmark(node).then_some(node));
         }
-        // A wrapper holding the main content ranks with it, so a cut never
-        // keeps a line while dropping the line that contains it.
+        // A wrapper holding the main content gets the main content's rank,
+        // so trimming to `max_bytes` never keeps a child line while dropping
+        // the parent line it is indented under.
         let mut class = inherited;
         let mut below = vec![false; count];
         for node in (0..count).rev() {
@@ -599,8 +608,8 @@ impl<'a> Tree<'a> {
                 .and_then(|facts| facts.url.as_deref())
                 .and_then(short_url)
         } else if is_text_field(role) {
-            // Only a field the page's own markup shows is not a credential
-            // or payment field prints what is in it.
+            // Print the value only when the field's DOM was read and shows it
+            // is not a credential or payment field.
             value.filter(|_| credential == Some(false)).map(one_line)
         } else if is_value_control(role) {
             value.map(one_line)
@@ -781,8 +790,9 @@ impl<'a> Tree<'a> {
                         out.extend(lines);
                         previous_hidden = false;
                     } else {
-                        // Once one loose element does not fit, the rest stay
-                        // hidden too, so what is printed has no gaps.
+                        // Once one loose element (content outside any nested
+                        // landmark) does not fit its allowance, the later ones
+                        // stay hidden too, so nothing prints after a hidden one.
                         let (lines, bytes) = self.zoom_size(node);
                         let total = hidden.get_or_insert((0, 0));
                         total.0 += lines;
