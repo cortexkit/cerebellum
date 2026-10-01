@@ -4309,6 +4309,14 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     );
     let p = &body["params"];
     assert_eq!(p["kind"], "consent");
+    // The navigation is held open on the answer, so the phone alerts loudly.
+    assert_eq!(p["urgency"], "high");
+    // No hazard was disclosed and navigation asks for no higher tier, so the
+    // ceiling is tier 2, the floor every browser grant is minted at.
+    assert_eq!(
+        p["scope"],
+        json!({"origins": ["https://requested.example"], "tier": 2})
+    );
     assert_eq!(
         p["target"],
         json!({"kind": "site", "label": "requested.example"})

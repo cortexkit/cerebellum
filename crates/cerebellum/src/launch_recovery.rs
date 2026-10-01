@@ -29,6 +29,9 @@ use crate::browser_launch::RecoveryPendingReason;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClearPreview {
     pub agent_project_id: String,
+    /// The profile registry's uuid for the profile whose launch record
+    /// startup recovery kept active.
+    pub profile_uuid: String,
     /// The launch journal sequence of the record recovery kept active.
     pub sequence: u64,
     pub reason: RecoveryPendingReason,
