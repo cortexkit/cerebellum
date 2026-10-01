@@ -269,7 +269,8 @@ pub fn cap_chars(value: String, max: usize) -> String {
 pub fn short_url(url: &str) -> Option<String> {
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("javascript:") || lower.starts_with("data:") || lower.starts_with("blob:") {
+    if lower.starts_with("javascript:") || lower.starts_with("data:") || lower.starts_with("blob:")
+    {
         return None;
     }
     let rest = ["https://", "http://"]
@@ -282,7 +283,9 @@ pub fn short_url(url: &str) -> Option<String> {
     };
     let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
     let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let path = if path == "/" { "" } else { path };
     Some(cap_chars(one_line(&format!("{host}{path}")), NAME_CHARS))
 }
@@ -386,7 +389,11 @@ impl<'a> Tree<'a> {
         // parent is the nearest earlier record that is shallower.
         let mut stack: Vec<(i64, usize)> = vec![(i64::MIN, 0)];
         for record in rest {
-            while stack.len() > 1 && stack.last().is_some_and(|(depth, _)| *depth >= record.depth) {
+            while stack.len() > 1
+                && stack
+                    .last()
+                    .is_some_and(|(depth, _)| *depth >= record.depth)
+            {
                 stack.pop();
             }
             let owner = stack.last().expect("the page is never popped").1;
@@ -399,7 +406,11 @@ impl<'a> Tree<'a> {
         }
         let names = nodes
             .iter()
-            .map(|record| record.map(|record| one_line(&record.name)).unwrap_or_default())
+            .map(|record| {
+                record
+                    .map(|record| one_line(&record.name))
+                    .unwrap_or_default()
+            })
             .collect();
         let by_ref = nodes
             .iter()
@@ -626,7 +637,11 @@ impl<'a> Tree<'a> {
             depth,
             text,
             class: self.class[node],
-            refs: self.reference(node).map(str::to_string).into_iter().collect(),
+            refs: self
+                .reference(node)
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
             section: self.section[node],
         }
     }
@@ -642,6 +657,12 @@ impl<'a> Tree<'a> {
     /// The element and everything below it with repeated siblings folded:
     /// how the outline prints a small region.
     fn folded_lines(&self, node: usize, depth: usize, out: &mut Vec<Line>) {
+        // The outline keeps every article to its one line even inside a
+        // region small enough to print in full; see `emit_landmark`.
+        if self.role(node) == "article" {
+            out.push(self.summary_line(node, depth));
+            return;
+        }
         out.push(self.line(node, depth, self.element_text(node, self.name_chars(node))));
         for item in self.fold(&self.kids[node]) {
             match item {
@@ -794,7 +815,11 @@ impl<'a> Tree<'a> {
             out.push(Line {
                 depth,
                 text,
-                class: if owner == 0 { NEUTRAL } else { self.class[owner] },
+                class: if owner == 0 {
+                    NEUTRAL
+                } else {
+                    self.class[owner]
+                },
                 refs,
                 section: self.section[owner],
             });
@@ -891,16 +916,11 @@ fn fit(
         cut_bytes += header_bytes;
         cut_lines += 1;
     }
-    if cut_lines > 0 {
-        let room = max_bytes.saturating_sub(text.len());
-        let mut end = trailer.len().min(room.saturating_sub(1));
-        while !trailer.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end > 0 {
-            text.push_str(&trailer[..end]);
-            text.push('\n');
-        }
+    // A budget too small for the report leaves it out whole rather than
+    // printing half a sentence; the reply's `omitted` counts still say it.
+    if cut_lines > 0 && text.len() + trailer.len() < max_bytes {
+        text.push_str(&trailer);
+        text.push('\n');
     }
     RenderedState {
         text,
@@ -1058,7 +1078,12 @@ mod tests {
         let mut records = vec![record(0, "RootWebArea", "Page", Some("e1"))];
         records.push(record(1, "navigation", "Primary", Some("e2")));
         for index in 0..40 {
-            records.push(record(2, "link", &format!("Chrome link {index}"), Some(&format!("e{}", 3 + index))));
+            records.push(record(
+                2,
+                "link",
+                &format!("Chrome link {index}"),
+                Some(&format!("e{}", 3 + index)),
+            ));
         }
         records.push(record(1, "main", "", Some("e50")));
         records.push(record(2, "heading", "Main heading", Some("e51")));
@@ -1074,24 +1099,71 @@ mod tests {
             max_bytes: 320,
         });
         assert!(state.text.len() <= 320, "{}", state.text);
-        assert!(state.text.contains("e51 heading Main heading"), "{}", state.text);
+        assert!(
+            state.text.contains("e51 heading Main heading"),
+            "{}",
+            state.text
+        );
         assert!(state.text.contains("navigation e2 ("), "{}", state.text);
         assert!(!state.printed_refs.contains("e42"));
         assert!(state.cut_lines > 0);
+    }
+
+    /// The CDP reader replaces an unpaired surrogate in page text with
+    /// U+FFFD; such a name prints as is and caps on a character boundary.
+    #[test]
+    fn a_replacement_character_in_a_name_prints_and_caps_cleanly() {
+        let long = format!("{}\u{FFFD}", "a".repeat(NAME_CHARS - 2)) + &"\u{FFFD}".repeat(10);
+        let records = vec![
+            record(0, "RootWebArea", "Bad \u{FFFD} title", Some("e1")),
+            record(1, "button", "Send \u{FFFD}", Some("e2")),
+            record(1, "link", &long, Some("e3")),
+        ];
+        let text = render_plain(&records, &HashMap::new()).text;
+        let expected_link = format!("{}\u{FFFD}…", "a".repeat(NAME_CHARS - 2));
+        assert_eq!(
+            text,
+            format!(
+                "Bad \u{FFFD} title · example.com/page · snapshot s1\n\
+                 e2 button Send \u{FFFD}\n\
+                 e3 link {expected_link}\n"
+            )
+        );
+        let cut = render(&RenderInput {
+            records: &records,
+            facts: &HashMap::new(),
+            page_url: "https://example.com/",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 150,
+        });
+        assert!(cut.text.len() <= 150, "{}", cut.text);
     }
 
     #[test]
     fn short_urls_and_relative_hrefs() {
         assert_eq!(short_url("https://x.com/"), Some("x.com".into()));
         assert_eq!(short_url("javascript:void(0)"), None);
-        assert_eq!(short_url("mailto:a@b.c?subject=x"), Some("mailto:a@b.c".into()));
+        assert_eq!(
+            short_url("mailto:a@b.c?subject=x"),
+            Some("mailto:a@b.c".into())
+        );
         assert_eq!(
             resolve_href("/a/b?c", "https://x.com/home?x=1"),
             "https://x.com/a/b?c"
         );
         assert_eq!(resolve_href("c", "https://x.com/a/b"), "https://x.com/a/c");
-        assert_eq!(resolve_href("//cdn.x.com/i", "https://x.com/a"), "https://cdn.x.com/i");
-        assert_eq!(resolve_href("#top", "https://x.com/a?q#f"), "https://x.com/a#top");
-        assert_eq!(resolve_href("https://y.com/", "https://x.com/"), "https://y.com/");
+        assert_eq!(
+            resolve_href("//cdn.x.com/i", "https://x.com/a"),
+            "https://cdn.x.com/i"
+        );
+        assert_eq!(
+            resolve_href("#top", "https://x.com/a?q#f"),
+            "https://x.com/a#top"
+        );
+        assert_eq!(
+            resolve_href("https://y.com/", "https://x.com/"),
+            "https://y.com/"
+        );
     }
 }

@@ -2409,7 +2409,13 @@ impl BrowserPlane {
         // members were added rather than by anything here changing.
         let read_start = self.state.lock().await.operations.len();
         let mut page = match self
-            .capture_snapshot(identity, SnapshotKind::Actionable, read_max_bytes, true, None)
+            .capture_snapshot(
+                identity,
+                SnapshotKind::Actionable,
+                read_max_bytes,
+                true,
+                None,
+            )
             .await
         {
             Ok(snapshot) => snapshot,
@@ -2857,9 +2863,8 @@ impl BrowserPlane {
             });
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
-                let target = zoom.and_then(|requested| {
-                    zoom_target(context, requested, records, &refs)
-                });
+                let target =
+                    zoom.and_then(|requested| zoom_target(context, requested, records, &refs));
                 let rendered = state_text::render(&state_text::RenderInput {
                     records,
                     facts,
@@ -5356,13 +5361,72 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
 
 #[cfg(test)]
 mod tests {
+    /// A zoom names a ref from the last snapshot; after the page grew above
+    /// that element its number in the fresh capture differs, and the element
+    /// is still the one zoomed.
+    #[test]
+    fn a_zoom_follows_its_element_when_the_page_renumbers() {
+        let record = |reference: &str, backend: u64| crate::snapshot_store::RefRecord {
+            captured: crate::snapshot_store::SnapshotRef::new(reference, "article", "Post", 0)
+                .unwrap(),
+            frame_path: vec!["frame".into()],
+            backend_identity: Some(
+                crate::snapshot_store::BackendNodeIdentity::new("target", "frame", backend)
+                    .unwrap(),
+            ),
+            raw_role: None,
+            raw_name: None,
+            classification: Err(ClassificationUnavailable::NotCaptured),
+        };
+        let ax = |reference: &str| AxRecord {
+            depth: 0,
+            role: "article".into(),
+            name: "Post".into(),
+            value: None,
+            reference: Some(reference.into()),
+        };
+        let mut context = ContextState::new(identity());
+        // No earlier snapshot: the number is all there is to go on.
+        assert_eq!(
+            zoom_target(&context, "e5", &[ax("e5")], &[record("e5", 50)]),
+            Some("e5".into())
+        );
+        context
+            .snapshots
+            .retain_text(TextSnapshot {
+                snapshot_id: snapshot_store::new_snapshot_id("previous"),
+                kind: SnapshotKind::Actionable,
+                document_epoch: context.epoch.value(),
+                source_origin: "https://example.com/".into(),
+                source_document: None,
+                content_schema: snapshot_store::STATE_TEXT_SCHEMA,
+                content: "e5 article Post\n".into(),
+                truncated: false,
+                refs_truncated: false,
+                refs: vec![record("e5", 50)],
+            })
+            .unwrap();
+        context.last_text_snapshot = Some(snapshot_store::new_snapshot_id("previous"));
+        // Two posts loaded above it: the same element is e7 now, and e5 is
+        // another post that must not be shown in its place.
+        let fresh = [record("e5", 70), record("e6", 60), record("e7", 50)];
+        let records = [ax("e5"), ax("e6"), ax("e7")];
+        assert_eq!(
+            zoom_target(&context, "e5", &records, &fresh),
+            Some("e7".into())
+        );
+        // Gone from the page: no element is substituted for it.
+        assert_eq!(zoom_target(&context, "e5", &records, &fresh[..2]), None);
+    }
+
     /// `max_bytes` bounds the page text in every mode, the reply's copy of a
     /// huge source URL is cut, and the reply still matches its declared
     /// schema on a plane that withholds any reply that does not.
     #[tokio::test]
     async fn snapshot_state_text_cap_and_long_source_hold_in_every_mode() {
         let route = identity();
-        let plane = BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+        let plane =
+            BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
         plane.open_context(route.clone()).await.unwrap();
         let records: Vec<_> = (0..1000)
             .map(|i| AxRecord {

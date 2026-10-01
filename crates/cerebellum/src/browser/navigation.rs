@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::browser::geometry::{self, Quad};
+use crate::browser::state_text::{self, NodeFacts};
 use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use crate::browser_session::{
@@ -18,7 +19,6 @@ use crate::classification::{
     NodeIdentityInput, NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
 };
 use crate::coordinate::{InputRect, TransformInputs, ViewportObservation};
-use crate::browser::state_text::{self, NodeFacts};
 use crate::snapshot_store::{
     truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
     MAX_NAME_BYTES, MAX_REFS, MAX_ROLE_BYTES, MAX_VALUE_BYTES,
@@ -3245,8 +3245,8 @@ impl RawAxNode {
 /// them. Others (focusable, settable, live-region settings, relations) describe
 /// how the page is built rather than what a reader sees.
 const AX_STATES: [&str; 10] = [
-    "focused", "disabled", "checked", "pressed", "selected", "expanded", "required",
-    "invalid", "readonly", "modal",
+    "focused", "disabled", "checked", "pressed", "selected", "expanded", "required", "invalid",
+    "readonly", "modal",
 ];
 
 /// Read the printable states and a link's URL from a node's `properties`.
@@ -5297,7 +5297,11 @@ mod tests {
     /// `frame-main`. Replies are queued in the order the traversal asks: the
     /// root, then each node's children in document order, then the DOM read.
     fn fixture_observation(fixture: &str) -> (BrowserSnapshotObservation, String) {
-        fn flatten(node: &Value, parent: Option<usize>, out: &mut Vec<(Value, Option<usize>, Vec<usize>)>) {
+        fn flatten(
+            node: &Value,
+            parent: Option<usize>,
+            out: &mut Vec<(Value, Option<usize>, Vec<usize>)>,
+        ) {
             let index = out.len();
             out.push((node.clone(), parent, Vec::new()));
             for child in node["children"].as_array().into_iter().flatten() {
@@ -5330,7 +5334,11 @@ mod tests {
                 value["properties"] = properties
                     .iter()
                     .map(|(name, property)| {
-                        let kind = if property.is_boolean() { "boolean" } else { "token" };
+                        let kind = if property.is_boolean() {
+                            "boolean"
+                        } else {
+                            "token"
+                        };
                         json!({"name": name, "value": {"type": kind, "value": property}})
                     })
                     .collect();
@@ -5427,7 +5435,10 @@ mod tests {
         let zoomed = render_fixture(&observation, &url, Some(&article), 65_536).text;
         assert_eq!(zoomed, include_str!("fixtures/x_like_zoom_article.txt"));
         assert!(zoomed.contains("text A seed swap with"), "{zoomed}");
-        assert!(zoomed.contains("@moss_example, Value: example.com/moss_example"), "{zoomed}");
+        assert!(
+            zoomed.contains("@moss_example, Value: example.com/moss_example"),
+            "{zoomed}"
+        );
     }
 
     #[test]
@@ -5454,11 +5465,18 @@ mod tests {
         // sidebar, and the last line says so.
         let cut = render_fixture(&observation, &url, None, 1_200);
         assert!(cut.text.len() <= 1_200, "{}", cut.text);
-        assert!(cut.text.contains("article Paper Kite Club"), "{}", cut.text);
-        assert!(!cut.text.contains("complementary Trending"), "{}", cut.text);
-        assert!(!cut.printed_refs.contains(&ref_of(&observation, "searchbox", None)));
         assert!(
-            cut.text.ends_with("complementary e100 (all); zoom one of them or raise max_bytes]\n"),
+            cut.text.contains("article Paper Kite Club"),
+            "{}",
+            cut.text
+        );
+        assert!(!cut.text.contains("complementary Trending"), "{}", cut.text);
+        assert!(!cut
+            .printed_refs
+            .contains(&ref_of(&observation, "searchbox", None)));
+        assert!(
+            cut.text
+                .ends_with("complementary e100 (all); zoom one of them or raise max_bytes]\n"),
             "{}",
             cut.text
         );
@@ -5469,7 +5487,12 @@ mod tests {
         let page = render_fixture(&observation, &url, Some(&root), 3_000);
         assert!(page.text.len() <= 3_000, "{}", page.text);
         assert!(page.text.contains("text A seed swap with"), "{}", page.text);
-        assert!(page.text.contains("Curious about balcony gardening?"), "{}", page.text);
+        assert!(
+            page.text
+                .contains("Curious about balcony gardening?"),
+            "{}",
+            page.text
+        );
         assert!(!page.text.contains("Who to follow"), "{}", page.text);
         assert!(!page.text.contains("link Explore"), "{}", page.text);
         assert!(page.text.contains("banner e3 (all)"), "{}", page.text);
@@ -5487,8 +5510,14 @@ mod tests {
                 .filter(|record| {
                     matches!(
                         record.role.as_str(),
-                        "link" | "button" | "textbox" | "searchbox" | "combobox" | "checkbox"
-                            | "tab" | "MenuListOption"
+                        "link"
+                            | "button"
+                            | "textbox"
+                            | "searchbox"
+                            | "combobox"
+                            | "checkbox"
+                            | "tab"
+                            | "MenuListOption"
                     )
                 })
                 .filter_map(|record| record.reference.as_deref())
@@ -5497,7 +5526,10 @@ mod tests {
             for reference in actionable {
                 assert!(
                     page.printed_refs.contains(reference)
-                        && page.text.lines().any(|line| line.trim_start().starts_with(&format!("{reference} "))),
+                        && page
+                            .text
+                            .lines()
+                            .any(|line| line.trim_start().starts_with(&format!("{reference} "))),
                     "{reference} missing from\n{}",
                     page.text
                 );
@@ -5520,15 +5552,32 @@ mod tests {
             render_fixture(&observation, &url, Some(&inner_text), 65_536).text,
         ];
         for text in &texts {
-            for secret in ["hunter2-planted", "s3cret-new-value", "octocat-private", "4111111111111111"] {
+            for secret in [
+                "hunter2-planted",
+                "s3cret-new-value",
+                "octocat-private",
+                "4111111111111111",
+            ] {
                 assert!(!text.contains(secret), "{secret} printed in\n{text}");
             }
         }
         // Values do print where the field is ordinary, so the checks above
         // are not passing for want of any value at all.
-        assert!(texts[1].contains("textbox Backup email, Value: octo@example.com"), "{}", texts[1]);
-        assert!(texts[1].contains("(credential field) Old password"), "{}", texts[1]);
-        assert!(texts[3].contains(&format!("zoom {old_password}")), "{}", texts[3]);
+        assert!(
+            texts[1].contains("textbox Backup email, Value: octo@example.com"),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains("(credential field) Old password"),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[3].contains(&format!("zoom {old_password}")),
+            "{}",
+            texts[3]
+        );
     }
 
     #[test]
@@ -5615,11 +5664,20 @@ mod tests {
         let tab = ref_of(&observation, "tab", Some("For you"));
         let search = ref_of(&observation, "searchbox", None);
         // Chrome's own absolute URL wins; a bare href is resolved against the page.
-        assert_eq!(observation.facts[&home].url.as_deref(), Some("https://example.com/home"));
-        assert_eq!(observation.facts[&explore].url.as_deref(), Some("https://example.com/explore"));
+        assert_eq!(
+            observation.facts[&home].url.as_deref(),
+            Some("https://example.com/home")
+        );
+        assert_eq!(
+            observation.facts[&explore].url.as_deref(),
+            Some("https://example.com/explore")
+        );
         assert_eq!(observation.facts[&tab].states, ["selected"]);
         assert_eq!(observation.facts[&search].credential, Some(false));
-        assert_eq!(observation.facts[&search].placeholder.as_deref(), Some("Search"));
+        assert_eq!(
+            observation.facts[&search].placeholder.as_deref(),
+            Some("Search")
+        );
     }
 
     #[test]

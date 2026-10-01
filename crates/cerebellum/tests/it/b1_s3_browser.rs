@@ -1308,6 +1308,7 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
         refs,
         ax_truncated: false,
         refs_truncated: false,
+        facts: Default::default(),
     }
 }
 
@@ -1967,7 +1968,7 @@ async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
         .await;
 
     assert_eq!(result["outcome"], "ok");
-    let records = result["content"]
+    let records = result["state_text"]
         .as_str()
         .unwrap()
         .lines()
@@ -1977,8 +1978,9 @@ async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
     assert_eq!(records[1]["name"], "Account details");
     assert_eq!(records[2]["role"], "button");
     assert_eq!(records[2]["name"], "Save profile");
-    assert_eq!(result["refs"][2]["ref"], "e3");
-    assert_eq!(result["refs"][2]["name"], "Save profile");
+    // The rows carry the refs; there is no second ref table.
+    assert_eq!(records[2]["ref"], "e3");
+    assert!(result.get("refs").is_none(), "{result}");
     assert_eq!(result["truncated"], false);
     assert_eq!(result["refs_truncated"], false);
 
@@ -1992,6 +1994,127 @@ async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
         .position(|(_, operation)| *operation == browser::Operation::CdpObserve)
         .unwrap();
     assert!(committed < observed, "{operations:?}");
+}
+
+/// The default snapshot, a zoom into it and a click on a ref read off the
+/// zoomed text all pass through the real serve boundary on a plane that
+/// withholds any reply its declared result schema does not admit.
+#[tokio::test]
+async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
+    use cerebellum::computer_capability::ResultSchemaEnforcement;
+    let route = identity();
+    let record = |depth: i64, role: &str, name: &str, reference: usize| AxRecord {
+        depth,
+        role: role.into(),
+        name: name.into(),
+        value: None,
+        reference: Some(format!("e{reference}")),
+    };
+    let mut records = vec![
+        record(0, "RootWebArea", "Feed fixture", 1),
+        record(1, "navigation", "Primary", 2),
+    ];
+    for index in 0..30 {
+        records.push(record(2, "link", &format!("Section {index}"), 3 + index));
+    }
+    records.push(record(1, "main", "", 40));
+    records.push(record(2, "article", "Ada posted: the first post text", 41));
+    records.push(record(3, "StaticText", "the first post text", 42));
+    records.push(record(3, "button", "Like", 43));
+    let plane = plane_with_process(
+        &route,
+        Box::new(SnapshotProcess {
+            observation: snapshot_observation(records),
+        }),
+        1_000,
+    )
+    .with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let outline = plane
+        .serve(&route, BrowserCapability::Snapshot, &json!({}))
+        .await
+        .expect("the outline reply matches its declared schema");
+    assert_eq!(outline["outcome"], "ok", "{outline}");
+    let text = outline["state_text"].as_str().unwrap();
+    assert!(
+        text.find("e41 article Ada posted") < text.find("e2 navigation Primary"),
+        "main content is listed before the navigation: {text}"
+    );
+    assert!(
+        !text.contains("Like"),
+        "the post is folded to one line: {text}"
+    );
+
+    let zoomed = plane
+        .serve(&route, BrowserCapability::Snapshot, &json!({"zoom": "e41"}))
+        .await
+        .expect("the zoom reply matches its declared schema");
+    let text = zoomed["state_text"].as_str().unwrap();
+    assert!(text.contains(" · zoom e41\n"), "{text}");
+    assert!(text.contains("e42 text the first post text"), "{text}");
+    assert!(!text.contains("Section 1"), "{text}");
+    let reference = text
+        .lines()
+        .find(|line| line.trim_end().ends_with("button Like"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap();
+
+    let clicked = plane
+        .serve(
+            &route,
+            BrowserCapability::Click,
+            &json!({
+                "ref": reference,
+                "snapshot_id": zoomed["snapshot_id"],
+                "intent": "like the post",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await
+        .expect("the click reply matches its declared schema");
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+
+    // A ref the outline never printed is not usable for a click.
+    let unprinted = plane
+        .serve(
+            &route,
+            BrowserCapability::Click,
+            &json!({
+                "ref": "e43",
+                "snapshot_id": outline["snapshot_id"],
+                "intent": "like the post",
+                "severity": {"tier": 2, "credential": false, "financial": false}
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unprinted["outcome"], "ref_not_found", "{unprinted}");
+
+    // A zoom on an element no longer on the page says so and shows the outline.
+    let missing = plane
+        .serve(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"zoom": "e999"}),
+        )
+        .await
+        .unwrap();
+    let text = missing["state_text"].as_str().unwrap();
+    assert!(
+        text.contains("\nzoom e999: no such element on the page now; showing the outline\n"),
+        "{text}"
+    );
+    let invalid = plane
+        .serve(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"zoom": "e41", "mode": "ax"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid["outcome"], "invalid_request", "{invalid}");
 }
 
 #[tokio::test]
@@ -2032,8 +2155,8 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
         .await;
 
     assert_eq!(result["truncated"], true);
-    assert_eq!(result["content"], first_line);
-    for line in result["content"].as_str().unwrap().lines() {
+    assert_eq!(result["state_text"], first_line);
+    for line in result["state_text"].as_str().unwrap().lines() {
         let parsed: Value = serde_json::from_str(line).unwrap();
         assert!(parsed.get("role").is_some());
         assert!(parsed.get("name").is_some());
@@ -2155,7 +2278,16 @@ async fn read_page_returns_a_bounded_clickable_snapshot_in_the_navigation_reply(
     assert_eq!(result["outcome"], "ok", "{result}");
     let page = &result["read_page"];
     assert_eq!(page["outcome"], "ok", "{result}");
-    assert!(page["content"].as_str().unwrap().contains("Save profile"));
+    // The landing page's text sits at the top of the navigation reply.
+    assert_eq!(
+        result["state_text"].as_str().unwrap(),
+        format!(
+            "Structured fixture · requested.example/page · snapshot {}\ne2 button Save profile\n",
+            page["snapshot_id"].as_str().unwrap()
+        ),
+        "{result}"
+    );
+    assert!(page.get("state_text").is_none(), "{result}");
     assert_eq!(page["truncated"], false);
     assert_eq!(page["refs_truncated"], false);
     let snapshot_id = page["snapshot_id"].as_str().unwrap();
@@ -2231,7 +2363,16 @@ async fn read_page_marks_content_truncated_at_its_requested_bound() {
 
     assert_eq!(result["outcome"], "ok", "{result}");
     assert_eq!(result["read_page"]["truncated"], true, "{result}");
-    assert_eq!(result["read_page"]["content"], first_line, "{result}");
+    let text = result["state_text"].as_str().unwrap();
+    assert!(text.len() <= first_line.len(), "{result}");
+    assert!(!text.contains("This record exceeds"), "{result}");
+    assert!(
+        result["read_page"]["omitted"]["state_text_lines"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{result}"
+    );
 }
 
 struct RedirectingNavigationProcess;
@@ -3187,8 +3328,10 @@ async fn a_redirect_off_the_authorized_origin_withholds_read_page_content() {
     assert!(
         result.get("content").is_none()
             && result.get("refs").is_none()
+            && result.get("state_text").is_none()
             && result.pointer("/read_page/content").is_none()
             && result.pointer("/read_page/refs").is_none()
+            && result.pointer("/read_page/state_text").is_none()
             && !reply.contains("Private page"),
         "a refused read must not return page content: {result}"
     );

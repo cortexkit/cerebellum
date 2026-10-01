@@ -7000,7 +7000,14 @@ mod tests {
             .retain_text_snapshot(
                 &route,
                 crate::snapshot_store::SnapshotKind::Ax,
-                &[],
+                // A snapshot keeps only the refs its text names.
+                &["e1", "e2"].map(|reference| crate::snapshot_store::AxRecord {
+                    depth: 0,
+                    role: "button".into(),
+                    name: String::new(),
+                    value: None,
+                    reference: Some(reference.into()),
+                }),
                 None,
                 vec![
                     crate::snapshot_store::RefRecord {
