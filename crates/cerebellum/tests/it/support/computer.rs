@@ -718,6 +718,9 @@ pub struct DeskState {
     /// Swapped in for `roots` by the first press or write, so the diff that
     /// follows has something to report.
     pub after_action: Option<Vec<RawElement>>,
+    /// Taken as the application's focus by the first press or write, the
+    /// way pressing a button can move focus to what it opened.
+    pub focus_after_action: Option<DeskFocus>,
     pub focused_in_tree: Option<u64>,
     pub elements: std::collections::HashMap<u64, DeskElement>,
     pub focus: DeskFocus,
@@ -734,6 +737,13 @@ pub struct DeskState {
     pub writes: Vec<(u64, TextAttribute)>,
     pub hit_scopes: Vec<HitScope>,
     pub focus_reads: usize,
+    /// The target application's focused window: a token and its title.
+    pub window: Option<(u64, Option<String>)>,
+    /// Every key press, click and scroll the desk's input count has taken,
+    /// with the pid that sent it (0 for the person's hardware) and when it
+    /// was counted. Like the HID system's table, the count takes this
+    /// module's own posts as well as the person's.
+    pub input: Vec<(i64, std::time::Instant)>,
     /// The running applications `list_apps` lists and a target given by
     /// name is matched against; `None` when the list cannot be read.
     pub running: Option<Vec<cerebellum_computer::app_state::source::RunningApp>>,
@@ -751,6 +761,7 @@ impl Desk {
         Self(Arc::new(Mutex::new(DeskState {
             roots,
             after_action: None,
+            focus_after_action: None,
             focused_in_tree: None,
             elements: std::collections::HashMap::new(),
             focus: DeskFocus::Nothing,
@@ -762,6 +773,8 @@ impl Desk {
             writes: Vec::new(),
             hit_scopes: Vec::new(),
             focus_reads: 0,
+            window: None,
+            input: Vec::new(),
             running: Some(vec![cerebellum_computer::app_state::source::RunningApp {
                 name: "Safari".into(),
                 bundle_identity: grant().bundle_identity,
@@ -838,6 +851,9 @@ impl AppStateSource for Desk {
         if let Some(after) = state.after_action.take() {
             state.roots = after;
         }
+        if let Some(focus) = state.focus_after_action.take() {
+            state.focus = focus;
+        }
         Ok(())
     }
 
@@ -878,6 +894,9 @@ impl AppStateSource for Desk {
         state.writes.push((token, attribute));
         if let Some(after) = state.after_action.take() {
             state.roots = after;
+        }
+        if let Some(focus) = state.focus_after_action.take() {
+            state.focus = focus;
         }
         let element = state
             .elements
@@ -932,6 +951,26 @@ impl AppStateSource for Desk {
 
     fn frontmost_pid(&self) -> Option<u32> {
         self.state().frontmost
+    }
+
+    fn focused_window(
+        &self,
+        _target: &ProcessGrant,
+    ) -> Result<Option<cerebellum_computer::app_state::source::WindowMark>, ElementActionError>
+    {
+        Ok(self.state().window.clone().map(|(token, title)| {
+            cerebellum_computer::app_state::source::WindowMark {
+                handle: fixture_handle(token),
+                title,
+            }
+        }))
+    }
+
+    /// The age of the newest counted input; an input counted for a moment
+    /// still ahead reads as arriving now.
+    fn time_since_last_input(&self) -> Option<std::time::Duration> {
+        let latest = self.state().input.iter().map(|(_, at)| *at).max()?;
+        Some(std::time::Instant::now().saturating_duration_since(latest))
     }
 
     fn running_apps(

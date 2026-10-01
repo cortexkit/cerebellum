@@ -620,11 +620,21 @@ where
         // runtime so a cancel frame can still be read and set the signal.
         let audit = self.audit.clone();
         let make_driver = self.make_synthetic_driver.clone();
+        // The pointer events posted here reach the platform's input count
+        // like the person's do; noting them keeps a later element or
+        // keystroke action from taking them for the person's use.
+        let own_input = self.own_input.clone();
+        let input_source = self.app_state_source.clone();
         let dispatched = tokio::task::spawn_blocking(move || {
             let mut audit = audit.blocking_lock();
             let cancelled = || cancel.is_cancelled();
             let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
-            dispatcher.dispatch(&mut audit, identity, request)
+            let posting = own_input.begin_posting(
+                cerebellum_computer::app_state::person::last_input_instant(input_source.as_ref()),
+            );
+            let dispatched = dispatcher.dispatch(&mut audit, identity, request);
+            own_input.end_posting(posting);
+            dispatched
         })
         .await
         .unwrap_or(Err(DispatchError::Platform));

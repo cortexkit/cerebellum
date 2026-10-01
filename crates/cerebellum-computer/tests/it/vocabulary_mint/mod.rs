@@ -1352,6 +1352,10 @@ pub fn v14_from_v13(v13: &Value, revision: &str) -> Value {
 // * An action's diff that passes its byte cap says `diff_cap_reached`.
 // * `computer.list_apps` is added: the running regular applications, by
 //   name, bundle identity, pid and whether frontmost.
+// * The element and keystroke rows refuse `state_changed_by_person` when the
+//   person used the application since the conversation was last shown it:
+//   its focused element or focused window changed, or it took a key press,
+//   click or scroll this module did not post while it was frontmost.
 
 /// The row order of revision 15: revision 14's, then list_apps.
 pub const V15_ROW_IDS: [&str; 11] = [
@@ -1396,6 +1400,29 @@ pub const V15_NAMED_TARGET_ROWS: [&str; 4] = [
 
 /// The two refusals of a target given by name.
 pub const V15_NAME_OUTCOMES: [&str; 2] = ["ambiguous_app", "no_running_app_named"];
+
+/// The rows that refuse to act on an application the person used since the
+/// conversation was last shown it: the element rows and the keystroke rows.
+/// Reads, waits, list_apps and the takeover rows never do; the takeover rows
+/// already refuse while the person is active.
+pub const V15_PERSON_CHANGE_ROWS: [&str; 5] = [
+    "computer.press_element",
+    "computer.press_point",
+    "computer.write_text",
+    "computer.type",
+    "computer.keys",
+];
+
+/// The refusal for an application the person used since the last look.
+pub const V15_PERSON_CHANGE_OUTCOME: &str = "state_changed_by_person";
+
+/// What revision 15 appends to those rows' outcome description, after its
+/// other additions.
+pub const V15_PERSON_CHANGE_ADDITION: &str = " state_changed_by_person means the person used \
+     the application since this conversation's last read_state or action reply: its focused \
+     element or focused window changed, or it took a key press, click or scroll this module did \
+     not post while it was frontmost. reason says which: focus_changed, window_changed or \
+     input_seen. Nothing was done; call read_state, then act on what it shows.";
 
 /// The start of read_state's outcome description in revision 14, and what
 /// revision 15 says in its place.
@@ -1687,6 +1714,22 @@ pub fn v15_from_v14(v14: &Value, revision: &str) -> Value {
                 );
                 outcome.insert("description".into(), json!(description));
             }
+        }
+        // Last, so its words close the description and undoing it first
+        // leaves the other revision 15 changes as they were made.
+        if V15_PERSON_CHANGE_ROWS.contains(&id) {
+            let outcome = object_mut(row, "/result_schema/properties/outcome");
+            let tokens = outcome["enum"].as_array_mut().unwrap();
+            tokens.push(json!(V15_PERSON_CHANGE_OUTCOME));
+            // The keystroke rows publish their outcomes sorted.
+            if matches!(id, "computer.type" | "computer.keys") {
+                tokens.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            }
+            let description = format!(
+                "{}{V15_PERSON_CHANGE_ADDITION}",
+                outcome["description"].as_str().unwrap()
+            );
+            outcome.insert("description".into(), json!(description));
         }
     }
     rows.push(list_apps());

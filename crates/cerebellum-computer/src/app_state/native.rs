@@ -11,7 +11,7 @@ use cerebellum_macos::{
 use super::source::{
     AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
     ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds, RunningApp,
-    TextAttribute,
+    TextAttribute, WindowMark,
 };
 use crate::platform::native::{verify_grant, GrantVerification};
 use crate::platform::ProcessGrant;
@@ -208,6 +208,39 @@ impl AppStateSource for MacAppStateSource {
 
     fn frontmost_pid(&self) -> Option<u32> {
         cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    /// Read only while the process is still the granted one, for the same
+    /// reason a state read is.
+    fn focused_window(
+        &self,
+        target: &ProcessGrant,
+    ) -> Result<Option<WindowMark>, ElementActionError> {
+        match verify_grant(target.pid, target) {
+            GrantVerification::Current => {}
+            GrantVerification::TargetGone | GrantVerification::TargetReplaced => {
+                return Err(ElementActionError::Gone)
+            }
+            GrantVerification::TargetUnreadable | GrantVerification::DifferentProcess => {
+                return Err(ElementActionError::Failed)
+            }
+        }
+        Ok(cerebellum_macos::focused_window(target.pid)
+            .map_err(action_error)?
+            .map(|(window, title)| WindowMark {
+                handle: handle(window),
+                title,
+            }))
+    }
+
+    /// Read from the HID system's table, which counts the person's hardware
+    /// input and also the events this module posts at the session tap; the
+    /// caller tells the two apart by when this module posted.
+    fn time_since_last_input(&self) -> Option<std::time::Duration> {
+        let seconds = cerebellum_macos::seconds_since_last_deliberate_input(
+            cerebellum_macos::EventSourceStateTable::HidSystem,
+        );
+        std::time::Duration::try_from_secs_f64(seconds).ok()
     }
 
     /// Regular applications only: an application whose policy could not be

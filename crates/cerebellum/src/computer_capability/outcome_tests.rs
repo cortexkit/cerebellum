@@ -72,6 +72,7 @@ const COMMON_OUTCOMES: &[&str] = &[
     "private_input_auth_failed",
     "ambiguous_app",
     "no_running_app_named",
+    "state_changed_by_person",
 ];
 
 fn dispatch_refusals() -> Vec<DispatchError> {
@@ -203,6 +204,10 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         keystrokes::FocusRefusal::Secure.reply(),
         keystrokes::FocusRefusal::Unreadable.reply(),
         keystrokes::needs_foreground_reply(),
+        keystrokes::refused_before_posting(element_actions::state_changed_by_person_reply(
+            "Editor",
+            cerebellum_computer::app_state::person::PersonChange::InputSeen,
+        )),
         screen_locked_reply(),
         synthetic_success_reply("pid_structural", false, "effect_indeterminate", None),
         synthetic_wire_envelope(json!({})),

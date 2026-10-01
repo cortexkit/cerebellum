@@ -80,8 +80,8 @@ pub use ax_actions::enable_manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_actions::{
     element_at_position, element_facts, element_selected_range, element_text_value,
-    focused_element, press_element, request_frontmost, write_element_text, AxElementActionError,
-    AxElementFacts, AxHitScope, AxTextAttribute,
+    focused_element, focused_window, press_element, request_frontmost, write_element_text,
+    AxElementActionError, AxElementFacts, AxHitScope, AxTextAttribute,
 };
 #[cfg(target_os = "macos")]
 pub use manual_accessibility::prepare_manual_accessibility;
@@ -105,8 +105,8 @@ pub use event_tap::{SessionEvent, SessionEventTapError};
 pub use input::{
     event_post_access, heartbeat_marker_event, horizontal_scroll_wheel_event,
     input_monitoring_access, key_combination_events, mouse_drag_events, mouse_move_event,
-    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_input,
-    text_input_events,
+    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_deliberate_input,
+    seconds_since_last_input, text_input_events,
 };
 #[cfg(any(target_os = "macos", test))]
 pub use input::{

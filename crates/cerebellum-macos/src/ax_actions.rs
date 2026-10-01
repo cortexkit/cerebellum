@@ -459,6 +459,30 @@ pub fn focused_element(pid: u32) -> Result<Option<AxRetainedElement>, AxElementA
     }
 }
 
+/// The window that is focused inside the application `pid` runs, with its
+/// title, asked of that application rather than of whichever one is
+/// frontmost. `Ok(None)` when the application reports no focused window; a
+/// title that cannot be read is `None` beside the window.
+pub fn focused_window(
+    pid: u32,
+) -> Result<Option<(AxRetainedElement, Option<String>)>, AxElementActionError> {
+    crate::manual_accessibility::prepare(pid, false);
+    require_trust()?;
+    let application = application(pid)?;
+    let window = match copy(application.as_ptr(), "AXFocusedWindow") {
+        Ok(value) => value
+            .filter(|value| is_ax_element(value))
+            .map(AxRetainedElement),
+        Err(AX_ERROR_NO_VALUE) => None,
+        Err(code) => return Err(classify(code)),
+    };
+    Ok(window.map(|window| {
+        bound_messages(window.as_ptr());
+        let title = string(window.as_ptr(), "AXTitle").unwrap_or(None);
+        (window, title)
+    }))
+}
+
 /// Ask the application `pid` runs to become the active application.
 ///
 /// A request, answered asynchronously: the caller watches which process is

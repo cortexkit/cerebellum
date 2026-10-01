@@ -2,12 +2,14 @@
 //! attached to their elements across reads and a diff between reads.
 //!
 //! [`source`] is the seam a platform reads through, [`render`] turns elements
-//! into lines, [`session`] numbers elements and diffs reads, and [`image`]
-//! carries the optional window image through custody.
+//! into lines, [`session`] numbers elements and diffs reads, [`person`] tells
+//! whether the person used an application since the agent last saw it, and
+//! [`image`] carries the optional window image through custody.
 
 pub mod image;
 #[cfg(target_os = "macos")]
 pub mod native;
+pub mod person;
 pub mod render;
 pub mod session;
 pub mod source;

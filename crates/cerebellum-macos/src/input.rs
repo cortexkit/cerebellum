@@ -374,6 +374,27 @@ mod framework {
         )
     }
 
+    /// Seconds since the last key press, mouse-button press or scroll in
+    /// `table`: the input that changes what an application shows. Pointer
+    /// movement is left out, so a hand resting on the mouse does not count.
+    pub fn seconds_since_last_deliberate_input(table: EventSourceStateTable) -> f64 {
+        [
+            CGEventType::KeyDown,
+            CGEventType::LeftMouseDown,
+            CGEventType::RightMouseDown,
+            CGEventType::OtherMouseDown,
+            CGEventType::ScrollWheel,
+        ]
+        .into_iter()
+        .map(|event_type| {
+            CGEventSource::seconds_since_last_event_type(
+                CGEventSourceStateID(table.raw_id()),
+                event_type,
+            )
+        })
+        .fold(f64::INFINITY, f64::min)
+    }
+
     fn modifier_flags(modifiers: KeyModifiers) -> CGEventFlags {
         let mut flags = CGEventFlags::empty();
         if modifiers.command {
@@ -569,8 +590,8 @@ mod framework {
 pub use framework::{
     event_post_access, heartbeat_marker_event, horizontal_scroll_wheel_event,
     input_monitoring_access, key_combination_events, mouse_drag_events, mouse_move_event,
-    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_input,
-    text_input_events,
+    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_deliberate_input,
+    seconds_since_last_input, text_input_events,
 };
 
 #[cfg(test)]

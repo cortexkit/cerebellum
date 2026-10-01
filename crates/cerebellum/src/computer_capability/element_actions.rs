@@ -19,6 +19,9 @@
 
 use std::time::{Duration, Instant};
 
+use cerebellum_computer::app_state::person::{
+    last_input_instant, person_change, OwnInputLedger, PersonChange, SeenMarks,
+};
 use cerebellum_computer::app_state::render::{is_session_ending_title, render_diff};
 use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
 
@@ -89,6 +92,41 @@ pub(crate) fn previous_run_reply() -> Value {
         "outcome": "stale_element",
         "remedy": "read_state again; ids from before a restart no longer apply",
     })
+}
+
+/// The refusal for an action on an application the person used since this
+/// conversation was last shown it. Nothing was done, so after a read the
+/// action may be tried again.
+pub(crate) fn state_changed_by_person_reply(app_name: &str, change: PersonChange) -> Value {
+    json!({
+        "outcome": "state_changed_by_person",
+        "reason": change.as_str(),
+        "remedy": format!(
+            "The person used {app_name} since your last read. Call read_state, then act on what \
+             it shows."
+        ),
+    })
+}
+
+/// Whether the person used the application since the conversation was last
+/// shown it, by a read or an action reply's diff. `None` when it was never
+/// shown this process, since there is then nothing to compare against.
+///
+/// Every reading here is taken now: the focused element and window are read
+/// again, the frontmost application asked, and the platform's input count
+/// read once and set against this module's own posts.
+pub(crate) fn person_change_since_seen(
+    source: &dyn AppStateSource,
+    sessions: &AppStateSessions,
+    own_input: &OwnInputLedger,
+    conversation_key: &str,
+    grant: &ProcessGrant,
+) -> Option<PersonChange> {
+    let seen = sessions.last_seen(conversation_key, grant)?;
+    let now = SeenMarks::read(source, grant);
+    let frontmost_now = source.frontmost_pid() == Some(grant.pid);
+    let person_input_at = own_input.latest_person_input(last_input_instant(source));
+    person_change(&seen, &now, frontmost_now, person_input_at)
 }
 
 fn blocked_menu_item_reply() -> Value {
@@ -782,6 +820,12 @@ pub(crate) fn adopt(
 /// conversation's baseline, then diff against it and make that read the new
 /// baseline. An unchanged state after the bound is reported as an empty diff.
 /// `None` when the application could not be read at all.
+///
+/// The read that becomes the baseline also becomes what the conversation
+/// was last shown of the focused element and window, since the diff shows
+/// it: a change this action caused is then never taken for the person's.
+/// Those are read just before each tree read, so the pair describes one
+/// moment.
 pub(crate) fn settle_and_observe(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
@@ -791,12 +835,15 @@ pub(crate) fn settle_and_observe(
 ) -> Option<SessionRead> {
     let deadline = Instant::now() + bound;
     loop {
+        let seen = SeenMarks::read(source, grant);
         match source.read_app_state(grant, ReadBounds::default()) {
             Ok(read) => {
                 if Instant::now() >= deadline
                     || sessions.differs_from_baseline(conversation_key, grant, &read)
                 {
-                    return Some(sessions.observe(conversation_key, grant, &read));
+                    let observed = sessions.observe(conversation_key, grant, &read);
+                    sessions.remember_seen(conversation_key, grant, seen);
+                    return Some(observed);
                 }
             }
             // Nothing could be read, so nothing is known about what changed.
@@ -950,6 +997,13 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
+        if let Some(mut refusal) = self
+            .refuse_if_person_changed(management, &conversation_key, &grant)
+            .await
+        {
+            admission.decorate(&mut refusal);
+            return refusal;
+        }
         let mut reply = self
             .press_and_diff(
                 identity,
@@ -1026,6 +1080,13 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
+        if let Some(mut refusal) = self
+            .refuse_if_person_changed(management, &conversation_key, &grant)
+            .await
+        {
+            admission.decorate(&mut refusal);
+            return refusal;
+        }
         let point = image
             .mapping
             .pixel_to_desktop(parsed.x as f64, parsed.y as f64);
@@ -1101,6 +1162,13 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
+        if let Some(mut refusal) = self
+            .refuse_if_person_changed(management, &conversation_key, &grant)
+            .await
+        {
+            admission.decorate(&mut refusal);
+            return refusal;
+        }
         let audit = self.audit.clone();
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
@@ -1146,6 +1214,44 @@ where
         .unwrap_or_else(|_| audit_unavailable_reply(true));
         admission.decorate(&mut reply);
         reply
+    }
+
+    /// The refusal for an action on an application the person used since
+    /// this conversation was last shown it, or `None` when it may go ahead.
+    ///
+    /// Asked after the grant is held and before anything is sent, so a
+    /// refusal has done nothing and a read followed by a retry is safe. The
+    /// element and keystroke rows ask it; reads, waits and takeover pointer
+    /// actions do not, the last because they already refuse while the person
+    /// is active.
+    pub(super) async fn refuse_if_person_changed(
+        &self,
+        management: &ManagementPlane,
+        conversation_key: &str,
+        grant: &ProcessGrant,
+    ) -> Option<Value> {
+        let source = self.app_state_source.clone();
+        let sessions = management.app_state_sessions().clone();
+        let own_input = self.own_input.clone();
+        let conversation_key = conversation_key.to_string();
+        let checked = grant.clone();
+        let change = tokio::task::spawn_blocking(move || {
+            let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(checked.pid, None);
+            person_change_since_seen(
+                source.as_ref(),
+                &sessions,
+                &own_input,
+                &conversation_key,
+                &checked,
+            )
+        })
+        .await
+        .ok()
+        .flatten()?;
+        Some(state_changed_by_person_reply(
+            &management.application_name(grant),
+            change,
+        ))
     }
 
     /// The refusal for an element action whose `target` names another
