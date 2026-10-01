@@ -6636,8 +6636,9 @@ mod signed_in_page_read_tests {
     const SESSION: &str = "session-own";
     const ROUTE: &str = "route-own";
 
-    /// Answers a command written to it with Chrome's response text, built from
-    /// raw JSON so it can carry what `serde_json` would never write itself.
+    /// Answers each command written to it with Chrome's response written out
+    /// as raw JSON text. A `serde_json::Value` cannot hold an unpaired
+    /// surrogate half, so these bytes could not be produced by serializing one.
     struct ChromeBytesPipe {
         methods: Vec<String>,
         reads: VecDeque<Vec<u8>>,
@@ -6660,8 +6661,9 @@ mod signed_in_page_read_tests {
                     r#"{"node":{"nodeId":"86","ignored":false,"role":{"type":"internalRole","value":"RootWebArea"},"chromeRole":{"type":"internalRole","value":144},"name":{"type":"computedString","value":"Home"},"properties":[],"childIds":["93"],"backendDOMNodeId":86,"frameId":"target-own"}}"#,
                     Vec::new(),
                 ),
-                // The page's text holds half of a surrogate pair. These are
-                // the bytes Chrome 154 sent for such a button, recorded by
+                // A button whose text a script set to "cut " followed by the
+                // first half of an emoji's surrogate pair. These are the bytes
+                // Chrome 154 answered with for it, as logged by
                 // `examples/handoff_attachment_probe.rs`.
                 "Accessibility.getChildAXNodes" => (
                     r#"{"nodes":[{"nodeId":"93","ignored":false,"role":{"type":"role","value":"button"},"chromeRole":{"type":"internalRole","value":9},"name":{"type":"computedString","value":"cut \ud83d","sources":[{"type":"relatedElement","attribute":"aria-labelledby"},{"type":"attribute","attribute":"aria-label"},{"type":"relatedElement","nativeSource":"label"},{"type":"contents","value":{"type":"computedString","value":"cut \ud83d"}},{"type":"attribute","attribute":"title","superseded":true}]},"properties":[{"name":"invalid","value":{"type":"token","value":"false"}},{"name":"focusable","value":{"type":"booleanOrUndefined","value":true}}],"parentId":"86","childIds":[],"backendDOMNodeId":93}]}"#,

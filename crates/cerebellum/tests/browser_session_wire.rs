@@ -387,8 +387,9 @@ impl CommittedPage {
 enum PageMove {
     Commit(&'static str),
     Back,
-    /// The capture itself fails after the moves before it, as Chrome's
-    /// accessibility read does once the document it was reading is gone.
+    /// The capture returns an error once the moves queued ahead of this one
+    /// in the same list have been applied, as Chrome's accessibility read
+    /// does once the document it was reading is gone.
     CaptureFails,
 }
 

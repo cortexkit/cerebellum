@@ -99,10 +99,11 @@ mod probe {
                 for &byte in &destination[..count] {
                     if byte == 0 {
                         let frame = std::mem::take(&mut self.inbound);
-                        // A frame serde_json alone refuses is marked: before
-                        // the CDP parser learned to read unpaired surrogate
-                        // halves, such a frame failed the read waiting on it.
-                        // `UNREADABLE` marks one the driver's parser refuses.
+                        // `UNREADABLE` marks a frame the driver's CDP parser
+                        // refuses, which fails the read waiting on it.
+                        // `SERDE_REFUSES` marks one that parser reads but plain
+                        // serde_json refuses: page text holding an unpaired
+                        // surrogate half, which the CDP parser reads as U+FFFD.
                         let verdict = if cerebellum::cdp::parse_json_message(&frame).is_err() {
                             "UNREADABLE "
                         } else if serde_json::from_slice::<Value>(&frame).is_err() {
@@ -475,8 +476,10 @@ mod probe {
             true
         };
 
-        // A fresh load of where the sign-in ended, as the person's own
-        // recovery did.
+        // Load where the sign-in ended afresh and read it once more. A
+        // navigation was what made reads work again after the failing
+        // sign-in, so this shows whether the reads above differ from a
+        // fresh page's.
         let fresh_url = match driver.main_frame_url(CONTEXT, DEADLINE_MS) {
             Ok(url) if live_url.is_some() => url,
             _ => format!("{origin_a}/home"),
