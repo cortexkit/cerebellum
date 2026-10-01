@@ -8,7 +8,12 @@
 # rewrite that preserves content orphans nothing.
 #
 # Re-derive rather than edit:
-# for c in cortexkit-store-types; do
+# for c in cortexkit-store-types cortexkit-role-tool-provider; do
 # echo "$(git -C ../commons rev-parse HEAD:crates/$c) $c"
 # done > commons-source.txt
+#
+# cortexkit-role-tool-provider is linked by the cerebellum crate's tests only
+# (its flatness check), so it never reaches a release binary; it is pinned so
+# the test gate verifies the sibling those tests compile against.
 6676798778308ecee47e02486203e706630d8e00 cortexkit-store-types
+fda8cc03d1deb6b30ebf4b51802585bf0366436d cortexkit-role-tool-provider
