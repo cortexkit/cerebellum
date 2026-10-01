@@ -239,5 +239,6 @@ impl AppStateSource for MacAppStateSource {
     }
 }
 
-/// How long the window server may take to list the running applications.
-const RUNNING_APPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the window server may take to list the running applications:
+/// the `computer.list_apps` row declares the same 1000 ms deadline.
+const RUNNING_APPS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);

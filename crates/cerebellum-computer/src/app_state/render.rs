@@ -16,8 +16,9 @@
 //! The same grammar serves four views of one read, so a caller learns it once:
 //! an outline of the window (the default), one subtree in full (`zoom`), the
 //! matches of a filter with the labelled ancestors that place them, and the
-//! diff an action left behind. Every view drops what carries nothing (see
-//! [`build`]) and never drops an element a caller could act on.
+//! diff an action left behind. Every view leaves out unlabelled wrapper
+//! groups and text that repeats its parent's label (see [`build`]), and
+//! never an element a caller could press, type into or set.
 
 use std::collections::HashSet;
 
@@ -48,9 +49,10 @@ pub const INLINE_REGION_BYTES: usize = 600;
 pub const MAX_OUTLINE_BYTES: usize = 6 * 1024;
 
 /// The largest diff text an action reply carries, in bytes. Past it the diff
-/// says how much it left out, and the caller reads the state for the rest:
-/// one tab switch once returned 1,492 added elements, and no caller reads
-/// that as a diff.
+/// says how much it left out, and the caller reads the state for the rest.
+/// One tab switch once added 1,492 elements; listing them all would bury the
+/// few lines that say what the action did, while a read's outline shows the
+/// new state in a fraction of the size.
 pub const MAX_DIFF_BYTES: usize = 4 * 1024;
 
 /// Siblings that repeat the same role and label shape are listed one by one
@@ -295,8 +297,8 @@ fn role_words(element: &RawElement) -> String {
             @ ("AXCloseButton" | "AXMinimizeButton" | "AXZoomButton" | "AXFullScreenButton"),
         ) => Some(subrole),
         Some("AXTabButton") => Some("AXTab"),
-        // Web landmarks are groups to the role, and their subrole is the only
-        // thing that says which part of the page they are.
+        // Accessibility reports every web landmark with the group role; only
+        // its subrole says which part of the page it is.
         Some("AXLandmarkNavigation") => Some("AXNavigation"),
         Some("AXLandmarkMain") => Some("AXMain"),
         Some("AXLandmarkRegion") => Some("AXRegion"),
@@ -558,7 +560,8 @@ fn is_menu_bar(node: &ObservedNode) -> bool {
 /// What collapse drops, and why none of it can be acted on:
 ///
 /// * an unlabelled plain container with one child or none, whose child is
-///   printed at its depth: it names nothing and arranges nothing;
+///   printed at the container's depth: it names nothing and arranges
+///   nothing;
 /// * a static text whose label equals the label of the nearest labelled
 ///   element above it: it is that element's own text a second time;
 /// * an unlabelled plain container that is the only thing its parent holds,

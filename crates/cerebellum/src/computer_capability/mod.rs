@@ -1548,10 +1548,12 @@ where
     /// application's display name, or the refusal for a name that matches
     /// no running application or several.
     ///
-    /// A target spelled like a bundle identity is passed on unread, so it is
-    /// resolved exactly as before and one nobody runs is still `not_running`.
-    /// A name needs the running applications; when they cannot be listed the
-    /// name is passed on too, and resolving it says what it always said.
+    /// A target spelled like a bundle identity (dotted, no spaces) is returned
+    /// as it is, without listing anything, so the process lookup that follows
+    /// still refuses one nobody runs as `not_running`. A display name is
+    /// matched against the running applications; when they cannot be listed,
+    /// the name is returned as it is and the process lookup refuses it as it
+    /// would any unknown bundle identity.
     pub(crate) async fn resolve_target_name(&self, target: &str) -> Result<String, Value> {
         if looks_like_bundle_identity(target) {
             return Ok(target.to_string());
@@ -1643,7 +1645,8 @@ where
         ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
     };
     use cerebellum_computer::grounding::ContainmentRung;
-    // No process is read, so no rung narrower than the whole machine applies.
+    // The journal row records how narrowly an action was contained to one
+    // process. Listing reads no process, so its scope is the whole machine.
     let rung = ContainmentRung::GlobalNone;
     let descriptor = ComputerPlaneDescriptor::new(
         ComputerCapability::ListApps,

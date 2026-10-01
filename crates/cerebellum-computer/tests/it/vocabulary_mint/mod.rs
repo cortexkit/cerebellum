@@ -1564,7 +1564,8 @@ fn list_apps() -> Value {
     json!({
         "capability_id": "computer.list_apps",
         // Listing changes nothing on the machine, so the person need not be
-        // attending, and asking twice answers the same way.
+        // attending and a retry is always safe, though applications may have
+        // started or quit in between.
         "attendance_requirement": "not_required",
         "retry_class": "idempotent",
         // Journaled before the list is returned, as every read is, with the
@@ -1573,8 +1574,8 @@ fn list_apps() -> Value {
         // Nothing is dispatched to any application, so no delivery mode
         // applies; the window server is asked for its list.
         "dispatch_modes": [],
-        // The window server answers within one capture-list call; 1000 ms is
-        // the bound the state read uses for the same call.
+        // One call to the window server for its application list, which the
+        // native reader waits on for at most this long.
         "effect_observation": {
             "deadline_ms": 1000,
             "failure_reasons": [],

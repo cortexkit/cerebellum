@@ -14,9 +14,11 @@
 //! numbers continue the count, so nothing it numbers can answer to an old
 //! id, and two conversations never hold the same number.
 //!
-//! The count restarts with the module. A caller that kept an id from before
-//! a restart finds it stale until it reads again, because nothing resolves
-//! before a read; once it has read, the ids it holds are the new ones.
+//! The count restarts with the module process. Until the first read after a
+//! restart no id resolves, because no session exists. After that read,
+//! however, a number kept from before the restart can name whatever element
+//! the new read numbered the same: unlike the image ids, element numbers
+//! carry no per-process salt, which is the price of keeping them short.
 //!
 //! The map belongs to a conversation. Two conversations reading the same
 //! application get separate sessions with disjoint ids, so neither can act on
@@ -568,8 +570,10 @@ impl AppStateSessions {
         for key in ended {
             state.remove_session(&key);
         }
-        // The count goes on across conversations, so one that later starts
-        // under the same key never resolves an id issued before.
+        // The element-number counter is shared by every conversation and is
+        // not reset here, so a conversation that later starts under the same
+        // key is numbered from where the counter stands and never resolves an
+        // id issued before.
         state
             .images
             .retain(|_, (conversation, _)| conversation != conversation_key);
