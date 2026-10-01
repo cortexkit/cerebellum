@@ -57,6 +57,41 @@ pub const TOOL_DEADLINE: Duration = Duration::from_secs(10);
 /// How often a capture waiting on the person checks whether it was cancelled.
 const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The shortest gap between the end of one session verification and the start
+/// of the next, whatever changed in between.
+///
+/// The login heuristic (a credential field came and went, the origin gained
+/// cookie names, the page is back on the origin) can hold between the steps of
+/// a multi-step sign-in, so a capture verifies before it reads anything: it
+/// loads `fetch_url` in a background tab and checks the site served it as a
+/// signed-in page. Each verification is a full page load the site sees, and a
+/// page whose cookies churn changes the heuristic's inputs on every 2 s poll.
+/// Five seconds keeps that to at most one load per two to three polls, while a
+/// person who has just finished signing in waits at most about five seconds
+/// longer for the capture.
+pub const VERIFICATION_MIN_SPACING: Duration = Duration::from_secs(5);
+
+/// How long a capture waits before verifying again when nothing the heuristic
+/// reads (the origin's cookie NAMES and the page URL) has changed since the
+/// last failed verification.
+///
+/// A sign-in can finish without changing either: the last step often rewrites
+/// an existing session cookie in place, and the capture deliberately never
+/// reads cookie values. Fifteen seconds still re-checks such a session within a
+/// few polls, and bounds the loads over a ten-minute handoff to about forty.
+pub const VERIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long one verification load may take, from opening its background tab to
+/// reading where it ended. The tab is closed on a separate short bound after
+/// this, so a page that never finishes loading cannot keep it open.
+pub const VERIFICATION_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The reply `reason` when a handoff ended after the login heuristic held at
+/// least once but no verification ever showed a working session. It lets a
+/// caller tell "nobody signed in" from "signed in, but the session the browser
+/// holds does not load `fetch_url`".
+pub const LOGIN_NOT_VERIFIED: &str = "login_not_verified";
+
 const ALLOW_DECISION: &str = "allow";
 const DENY_DECISION: &str = "deny";
 const MAX_ACCOUNT_BYTES: usize = 128;
@@ -425,6 +460,94 @@ pub trait DeletionScheduler: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureDriveError;
 
+/// Where a verification load of `fetch_url` ended. Carries no cookie, header
+/// or page text: only the URL the tab settled on, the HTTP status of the main
+/// document it settled on, and whether that page asks for a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProbe {
+    pub final_url: String,
+    /// `None` when no main-document response was seen, which never passes.
+    pub status: Option<u16>,
+    pub credential_field: bool,
+}
+
+/// Why a verification did not show a working session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationFailure {
+    /// The load ended on another origin, as a site does when it sends an
+    /// unauthenticated request to a separate sign-in host.
+    OffOrigin,
+    /// The load stayed on the origin but ended on a sign-in page.
+    SignInPage,
+    /// The main document's status was not 2xx, or none was seen.
+    Status(Option<u16>),
+    /// The browser could not carry out the load.
+    Unreadable,
+    /// The heuristic held with no handoff time left to load anything.
+    NotChecked,
+}
+
+impl VerificationFailure {
+    /// Words for the reply's remedy. Never names the final URL: a sign-in
+    /// redirect can carry tokens in its query.
+    fn describe(self) -> String {
+        match self {
+            Self::OffOrigin => "ended on another origin".to_string(),
+            Self::SignInPage => "ended on a sign-in page".to_string(),
+            Self::Status(Some(status)) => format!("answered HTTP {status}"),
+            Self::Status(None) => "returned no page response".to_string(),
+            Self::Unreadable => "could not be loaded".to_string(),
+            Self::NotChecked => "was not checked before the handoff ended".to_string(),
+        }
+    }
+}
+
+/// Path segments that name a sign-in page. A load of `fetch_url` that ends on
+/// one of these, on `fetch_url`'s own origin, was redirected to sign in.
+const SIGN_IN_PATH_SEGMENTS: [&str; 6] =
+    ["login", "log-in", "signin", "sign-in", "sign_in", "logon"];
+
+fn has_sign_in_segment(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let path = rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split_once('/')
+        .map_or("", |(_, path)| path);
+    path.split('/').any(|segment| {
+        SIGN_IN_PATH_SEGMENTS
+            .iter()
+            .any(|sign_in| segment.eq_ignore_ascii_case(sign_in))
+    })
+}
+
+/// Whether a verification load of `fetch_url` shows the session works the way
+/// its holder will use it: the browser, with its own cookie jar, asked for
+/// `fetch_url` and was served a 2xx page on `fetch_url`'s origin that is not a
+/// sign-in page. All three are required; any one alone is what an expired
+/// session also produces on some site.
+pub fn session_verified(fetch_url: &str, probe: &SessionProbe) -> Result<(), VerificationFailure> {
+    let expected = crate::browser_session::main_frame_origin(fetch_url);
+    if expected == "null" || crate::browser_session::main_frame_origin(&probe.final_url) != expected
+    {
+        return Err(VerificationFailure::OffOrigin);
+    }
+    // A sign-in path only counts when `fetch_url` is not itself on one;
+    // otherwise every load of it would read as a redirect to sign in.
+    if probe.credential_field
+        || (has_sign_in_segment(&probe.final_url) && !has_sign_in_segment(fetch_url))
+    {
+        return Err(VerificationFailure::SignInPage);
+    }
+    match probe.status {
+        Some(200..=299) => Ok(()),
+        status => Err(VerificationFailure::Status(status)),
+    }
+}
+
 /// The throwaway browser a capture drives.
 ///
 /// Separate from the route session's process trait on purpose: this is the
@@ -449,6 +572,17 @@ pub trait CaptureBrowser: Send {
         url: &str,
         deadline_ms: u64,
     ) -> Result<Result<CookieHeader, CookieHeaderError>, CaptureDriveError>;
+    /// Load `url` in a separate background tab of this browser, with its own
+    /// cookie jar, report where the load ended, and close the tab.
+    ///
+    /// The person's sign-in page is never touched and never loses focus, and
+    /// no cookie value is read: the request is the browser's own, as the
+    /// holder's will be. At most one such tab exists at a time.
+    fn verify_session(
+        &mut self,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<SessionProbe, CaptureDriveError>;
     /// Whether the browser process is running, has gone (for instance because
     /// the person closed the window), or cannot be told. Only `Gone` ends the
     /// handoff.
@@ -750,6 +884,12 @@ pub struct CaptureEnv {
     pub poll_interval: Duration,
     /// Deadline for each single browser operation.
     pub drive_deadline_ms: u64,
+    /// See [`VERIFICATION_MIN_SPACING`].
+    pub verification_min_spacing: Duration,
+    /// See [`VERIFICATION_RETRY_INTERVAL`].
+    pub verification_retry_interval: Duration,
+    /// See [`VERIFICATION_DEADLINE`].
+    pub verification_deadline: Duration,
 }
 
 impl CaptureEnv {
@@ -766,6 +906,9 @@ impl CaptureEnv {
             handoff_duration: Duration::from_millis(crate::browser_session::HANDOFF_DURATION_MS),
             poll_interval: Duration::from_millis(crate::browser_session::HANDOFF_POLL_INTERVAL_MS),
             drive_deadline_ms,
+            verification_min_spacing: VERIFICATION_MIN_SPACING,
+            verification_retry_interval: VERIFICATION_RETRY_INTERVAL,
+            verification_deadline: VERIFICATION_DEADLINE,
         }
     }
 }
@@ -802,9 +945,17 @@ pub struct CaptureOutcome {
 }
 
 enum HandoffEnd {
-    LoginObserved,
-    Expired,
-    Exited,
+    /// The heuristic held and a verification load showed the session works.
+    LoginVerified,
+    /// `unverified` carries the last verification's failure when the login
+    /// heuristic held at least once but no verification passed, and is `None`
+    /// when the heuristic never held.
+    Expired {
+        unverified: Option<VerificationFailure>,
+    },
+    Exited {
+        unverified: Option<VerificationFailure>,
+    },
     Cancelled,
 }
 
@@ -1137,14 +1288,18 @@ impl CaptureModule {
             }
         };
         let outcome_word = match end {
-            HandoffEnd::LoginObserved => None,
-            HandoffEnd::Expired => Some("expired"),
-            HandoffEnd::Exited => Some("no_login_observed"),
-            HandoffEnd::Cancelled => Some("cancelled"),
+            HandoffEnd::LoginVerified => None,
+            HandoffEnd::Expired { unverified } => Some(("expired", unverified)),
+            HandoffEnd::Exited { unverified } => Some(("no_login_observed", unverified)),
+            HandoffEnd::Cancelled => Some(("cancelled", None)),
         };
-        if let Some(word) = outcome_word {
+        if let Some((word, unverified)) = outcome_word {
             let disposal = self.dispose(browser, &placement).await;
-            return record.with_deletion(disposal.deleted).ended(word, None);
+            let record = record.with_deletion(disposal.deleted);
+            return match unverified {
+                None => record.ended(word, None),
+                Some(failure) => record.ended_unverified(word, &request.fetch_url, failure),
+            };
         }
 
         let Some(browser) = browser else {
@@ -1154,7 +1309,7 @@ impl CaptureModule {
                 json!({"stage": "handoff_poll", "remedy": "retry the capture"}),
             );
         };
-        // Login observed: read the header the holder's own request would send.
+        // Login verified: read the header the holder's own request would send.
         let fetch_url = request.fetch_url.clone();
         let deadline_ms = self.env.drive_deadline_ms;
         let (browser, header) = on_browser(browser, move |browser| {
@@ -1283,9 +1438,18 @@ impl CaptureModule {
         Some(refusal)
     }
 
-    /// Hand the window to the person and wait for the login observation that
-    /// `browser.present` uses, parked as a consent wait so the Busy gauge and
-    /// in-flight age do not read a person's typing as a stuck module.
+    /// Hand the window to the person and wait until their session works,
+    /// parked as a consent wait so the Busy gauge and in-flight age do not
+    /// read a person's typing as a stuck module.
+    ///
+    /// Each poll first applies the login heuristic `browser.present` uses (a
+    /// credential field came and went, the origin gained cookie names, the
+    /// page is back on the origin). That heuristic also holds between the
+    /// steps of a multi-step sign-in, so it only nominates a moment: the
+    /// handoff ends as a login only when a verification load of `fetch_url`
+    /// then passes [`session_verified`]. A failed verification keeps the
+    /// handoff open for the person to finish; see [`VerificationRecord::due`]
+    /// for when it is tried again.
     async fn hand_off<Cancelled: Fn() -> bool>(
         &self,
         browser: Box<dyn CaptureBrowser>,
@@ -1318,12 +1482,18 @@ impl CaptureModule {
         let _parked = guard.as_ref().map(|guard| guard.park_on_consent());
         let started = Instant::now();
         let mut saw_credential_field = false;
+        let mut verification = VerificationRecord::default();
         loop {
             if cancelled() {
                 return (Some(browser), Ok(HandoffEnd::Cancelled));
             }
             if started.elapsed() >= self.env.handoff_duration {
-                return (Some(browser), Ok(HandoffEnd::Expired));
+                return (
+                    Some(browser),
+                    Ok(HandoffEnd::Expired {
+                        unverified: verification.last_failure(),
+                    }),
+                );
             }
             tokio::time::sleep(self.env.poll_interval).await;
             let poll_origin = origin.to_string();
@@ -1361,7 +1531,10 @@ impl CaptureModule {
                     &url,
                     &poll_origin,
                 ) {
-                    Poll::LoginObserved
+                    Poll::HeuristicHeld(HeuristicInputs {
+                        cookie_names: current,
+                        url,
+                    })
                 } else {
                     Poll::Open {
                         saw_credential_field: saw || has_credential_field,
@@ -1373,13 +1546,67 @@ impl CaptureModule {
                 return (None, Err("handoff_poll"));
             };
             browser = returned;
-            match polled {
-                Some(Poll::LoginObserved) => return (Some(browser), Ok(HandoffEnd::LoginObserved)),
-                Some(Poll::Exited) => return (Some(browser), Ok(HandoffEnd::Exited)),
+            let inputs = match polled {
+                Some(Poll::HeuristicHeld(inputs)) => inputs,
+                Some(Poll::Exited) => {
+                    return (
+                        Some(browser),
+                        Ok(HandoffEnd::Exited {
+                            unverified: verification.last_failure(),
+                        }),
+                    )
+                }
                 Some(Poll::Open {
                     saw_credential_field: saw,
-                }) => saw_credential_field = saw,
+                }) => {
+                    saw_credential_field = saw;
+                    continue;
+                }
                 None => return (Some(browser), Err("handoff_poll")),
+            };
+            if !verification.due(
+                &inputs,
+                Instant::now(),
+                self.env.verification_min_spacing,
+                self.env.verification_retry_interval,
+            ) {
+                continue;
+            }
+            // The handoff deadline bounds the verification too, so a load
+            // started just before it cannot hold the person's window open past
+            // the time the caller was promised.
+            let budget = self
+                .env
+                .verification_deadline
+                .min(self.env.handoff_duration.saturating_sub(started.elapsed()));
+            let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+            if budget_ms == 0 {
+                // The deadline check at the top of the loop ends the handoff
+                // next. A failure an earlier verification found says more
+                // than "no time was left", so it is kept when there is one.
+                if verification.last_failure().is_none() {
+                    verification.failed(inputs, VerificationFailure::NotChecked, Instant::now());
+                }
+                continue;
+            }
+            let fetch_url = request.fetch_url.clone();
+            let (returned, probed) = on_browser(browser, move |browser| {
+                browser.verify_session(&fetch_url, budget_ms)
+            })
+            .await;
+            let Some(returned) = returned else {
+                return (None, Err("session_verification"));
+            };
+            browser = returned;
+            let verdict = match probed {
+                Some(Ok(probe)) => session_verified(&request.fetch_url, &probe),
+                Some(Err(CaptureDriveError)) | None => Err(VerificationFailure::Unreadable),
+            };
+            match verdict {
+                Ok(()) => return (Some(browser), Ok(HandoffEnd::LoginVerified)),
+                // Not the end of the handoff: the person may still be part way
+                // through a multi-step sign-in.
+                Err(failure) => verification.failed(inputs, failure, Instant::now()),
             }
         }
     }
@@ -1407,8 +1634,55 @@ impl CaptureModule {
 
 enum Poll {
     Open { saw_credential_field: bool },
-    LoginObserved,
+    HeuristicHeld(HeuristicInputs),
     Exited,
+}
+
+/// What the login heuristic read on a poll where it held. Names and a URL
+/// only, never a cookie value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeuristicInputs {
+    cookie_names: BTreeSet<String>,
+    url: String,
+}
+
+/// One handoff's record of its failed verifications, used to decide when the
+/// next verification may start. Verifications run one at a time on the
+/// handoff's own task, so a second can never start while one is in flight.
+#[derive(Default)]
+struct VerificationRecord {
+    /// What the heuristic read before the last failed verification, when that
+    /// verification finished, and why it failed.
+    last: Option<(HeuristicInputs, Instant, VerificationFailure)>,
+}
+
+impl VerificationRecord {
+    /// Whether a poll on which the heuristic held should verify. The first
+    /// such poll always does. After a failure the next waits at least
+    /// `min_spacing`, and then goes ahead if the heuristic's inputs changed,
+    /// or once `retry_interval` has passed if they did not.
+    fn due(
+        &self,
+        inputs: &HeuristicInputs,
+        now: Instant,
+        min_spacing: Duration,
+        retry_interval: Duration,
+    ) -> bool {
+        let Some((previous, finished, _)) = &self.last else {
+            return true;
+        };
+        let since = now.saturating_duration_since(*finished);
+        since >= retry_interval || (since >= min_spacing && previous != inputs)
+    }
+
+    fn failed(&mut self, inputs: HeuristicInputs, failure: VerificationFailure, at: Instant) {
+        self.last = Some((inputs, at, failure));
+    }
+
+    /// The last failure, when the heuristic held but no verification passed.
+    fn last_failure(&self) -> Option<VerificationFailure> {
+        self.last.as_ref().map(|(_, _, failure)| *failure)
+    }
 }
 
 /// Run blocking browser work off the async runtime, handing the browser back.
@@ -1630,6 +1904,31 @@ impl Record {
             journal: self.payload(&format!("refused:{code}"), 0),
             captured_file: None,
         }
+    }
+
+    /// A handoff that ended after the login heuristic held but no verification
+    /// showed a working session. The journal records the plain outcome; the
+    /// reply adds the reason and what the last verification found.
+    fn ended_unverified(
+        self,
+        outcome: &'static str,
+        fetch_url: &str,
+        failure: VerificationFailure,
+    ) -> CaptureOutcome {
+        let mut ended = self.ended(
+            outcome,
+            Some(&format!(
+                "the sign-in looked finished, but loading {fetch_url} with the browser's session {}; nothing was captured. Have the person finish signing in (every step, until {fetch_url} opens signed in), then capture again",
+                failure.describe()
+            )),
+        );
+        if let Some(object) = ended.reply.as_object_mut() {
+            object.insert(
+                "reason".into(),
+                Value::String(LOGIN_NOT_VERIFIED.to_string()),
+            );
+        }
+        ended
     }
 
     fn ended(self, outcome: &'static str, remedy: Option<&str>) -> CaptureOutcome {

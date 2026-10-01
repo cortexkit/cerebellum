@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use cerebellum_core::identity::AcceptedBindFacts;
 
@@ -15,8 +15,59 @@ use crate::browser_launch::BrowserProcessLiveness;
 use super::{
     BackupExclusion, CaptureBrowser, CaptureDriveError, CaptureEnv, CaptureFs,
     CaptureLaunchRefusal, CaptureLauncher, CaptureModule, CapturePlacement, CookieHeader,
-    CookieHeaderError, DeletionScheduler, ResidueEntry, ToolError, WallClock,
+    CookieHeaderError, DeletionScheduler, ResidueEntry, SessionProbe, ToolError, WallClock,
 };
+
+/// What one scripted verification load reports.
+#[derive(Clone, Debug)]
+pub(crate) enum ScriptedVerification {
+    /// The load ended on this URL with this status, and the page did or did
+    /// not show a credential field. `None` for the URL means the URL that
+    /// was requested, as a working session leaves it.
+    Ends {
+        final_url: Option<String>,
+        status: Option<u16>,
+        credential_field: bool,
+    },
+    /// The browser could not carry out the load.
+    DriveFails,
+}
+
+impl ScriptedVerification {
+    /// A load that stays on the requested URL and answers 200.
+    pub(crate) fn works() -> Self {
+        Self::Ends {
+            final_url: None,
+            status: Some(200),
+            credential_field: false,
+        }
+    }
+
+    /// A load sent to the sign-in host, as Ollama sends an expired session.
+    pub(crate) fn redirected_off_origin() -> Self {
+        Self::Ends {
+            final_url: Some("https://signin.ollama.com/?return=settings".to_string()),
+            status: Some(200),
+            credential_field: true,
+        }
+    }
+}
+
+/// Every verification the fake browsers ran, shared with the test.
+#[derive(Clone, Default)]
+pub(crate) struct Verifications {
+    /// Start and end of each verification, in order.
+    pub(crate) spans: Arc<Mutex<Vec<(Instant, Instant)>>>,
+    in_flight: Arc<AtomicUsize>,
+    /// The most verifications ever running at once.
+    pub(crate) max_in_flight: Arc<AtomicUsize>,
+}
+
+impl Verifications {
+    pub(crate) fn count(&self) -> usize {
+        self.spans.lock().unwrap().len()
+    }
+}
 
 /// A value planted in the fake browser's cookies so leak tests can look for it.
 pub(crate) const PLANTED_VALUE: &str = "ck-planted-cookie-value-9e3b71";
@@ -301,6 +352,12 @@ pub(crate) struct BrowserScript {
     /// Cookies CDP returns for the fetch URL, in order.
     pub(crate) cookies: Vec<(String, String)>,
     pub(crate) launch_refusal: Option<String>,
+    /// Verification results in order; the last repeats once the rest are
+    /// used.
+    pub(crate) verifications: Vec<ScriptedVerification>,
+    /// After the login, add a new cookie name on every poll, as a site that
+    /// sets a fresh tracking cookie per request does.
+    pub(crate) cookie_names_churn: bool,
 }
 
 impl Default for BrowserScript {
@@ -314,6 +371,8 @@ impl Default for BrowserScript {
                 ("csrf".to_string(), "t0k3n".to_string()),
             ],
             launch_refusal: None,
+            verifications: vec![ScriptedVerification::works()],
+            cookie_names_churn: false,
         }
     }
 }
@@ -323,6 +382,7 @@ pub(crate) struct FakeLauncher {
     pub(crate) events: Events,
     pub(crate) launches: AtomicUsize,
     pub(crate) placements: Mutex<Vec<CapturePlacement>>,
+    pub(crate) verifications: Verifications,
 }
 
 impl CaptureLauncher for FakeLauncher {
@@ -346,6 +406,8 @@ impl CaptureLauncher for FakeLauncher {
             name_reads: 0,
             login_url: String::new(),
             closed: false,
+            verifications: self.verifications.clone(),
+            verified: 0,
         }))
     }
 }
@@ -357,6 +419,8 @@ struct FakeBrowser {
     name_reads: usize,
     login_url: String,
     closed: bool,
+    verifications: Verifications,
+    verified: usize,
 }
 
 impl CaptureBrowser for FakeBrowser {
@@ -390,7 +454,11 @@ impl CaptureBrowser for FakeBrowser {
         // The opening read and the first poll see no session cookie; it
         // appears once the person has submitted the form.
         if self.script.logs_in && self.name_reads >= 3 {
-            Ok(BTreeSet::from(["session".to_string()]))
+            let mut names = BTreeSet::from(["session".to_string()]);
+            if self.script.cookie_names_churn {
+                names.insert(format!("tracker-{}", self.name_reads));
+            }
+            Ok(names)
         } else {
             Ok(BTreeSet::new())
         }
@@ -408,6 +476,48 @@ impl CaptureBrowser for FakeBrowser {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         ))
+    }
+
+    fn verify_session(
+        &mut self,
+        url: &str,
+        _deadline_ms: u64,
+    ) -> Result<SessionProbe, CaptureDriveError> {
+        let started = Instant::now();
+        let running = self.verifications.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.verifications
+            .max_in_flight
+            .fetch_max(running, Ordering::SeqCst);
+        self.events.push(format!("verify:{url}"));
+        let scripted = self
+            .script
+            .verifications
+            .get(self.verified)
+            .or(self.script.verifications.last())
+            .cloned()
+            .unwrap_or(ScriptedVerification::DriveFails);
+        self.verified += 1;
+        // Held open briefly so a second verification started alongside this
+        // one would be counted as running at the same time.
+        std::thread::sleep(Duration::from_millis(2));
+        self.verifications.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.verifications
+            .spans
+            .lock()
+            .unwrap()
+            .push((started, Instant::now()));
+        match scripted {
+            ScriptedVerification::Ends {
+                final_url,
+                status,
+                credential_field,
+            } => Ok(SessionProbe {
+                final_url: final_url.unwrap_or_else(|| url.to_string()),
+                status,
+                credential_field,
+            }),
+            ScriptedVerification::DriveFails => Err(CaptureDriveError),
+        }
     }
 
     fn liveness(&mut self) -> BrowserProcessLiveness {
@@ -464,6 +574,7 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
         events: events.clone(),
         launches: AtomicUsize::new(0),
         placements: Mutex::new(Vec::new()),
+        verifications: Verifications::default(),
     });
     let mut env = CaptureEnv {
         platform_supported: true,
@@ -476,6 +587,11 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
         handoff_duration: Duration::from_secs(5),
         poll_interval: Duration::from_millis(1),
         drive_deadline_ms: 100,
+        // Short so the re-verification tests run in milliseconds; the tests
+        // that measure spacing set their own.
+        verification_min_spacing: Duration::from_millis(5),
+        verification_retry_interval: Duration::from_millis(10),
+        verification_deadline: Duration::from_millis(100),
     };
     adjust(&mut env);
     let module = Arc::new(CaptureModule::new(env));

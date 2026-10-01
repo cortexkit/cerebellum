@@ -2828,7 +2828,8 @@ fn remaining_ms(expires_at: MonoInstant, now: MonoInstant) -> u64 {
     expires_at.as_nanos().saturating_sub(now.as_nanos()) / 1_000_000
 }
 
-fn main_frame_origin(url: &str) -> String {
+/// The canonical origin of a full URL, or `"null"` when it has none.
+pub(crate) fn main_frame_origin(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "null".to_string();
     };

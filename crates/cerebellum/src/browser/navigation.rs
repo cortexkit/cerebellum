@@ -40,6 +40,30 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_AX_NODES: usize = MAX_REFS;
 const MAX_AX_DEPTH: usize = 64;
 
+/// How long a session-verification tab must stay loaded, with no further
+/// main-frame commit, before where it ended is read.
+///
+/// A server that refuses an expired session redirects before the load event,
+/// but a single-page app often loads first and then sends an unauthenticated
+/// visitor to its sign-in route from script, after asking its own API who is
+/// signed in. That API round trip is typically a few hundred milliseconds, so
+/// 1.5 s after the load event catches it without making every verification
+/// slow.
+const VERIFICATION_SETTLE: Duration = Duration::from_millis(1_500);
+
+/// The bound on closing a session-verification tab, separate from the load's
+/// own deadline so a load that ran out of time still gets its tab closed.
+const VERIFICATION_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Matches what [`NonTypeClassificationRecord::is_credential_field`] counts as
+/// a credential field: password inputs, and any element carrying one of the
+/// three credential autocomplete tokens.
+const CREDENTIAL_FIELD_SELECTOR: &str = "input[type=\"password\" i], [autocomplete~=\"current-password\" i], [autocomplete~=\"new-password\" i], [autocomplete~=\"one-time-code\" i]";
+
+/// How many credential-field matches a verification checks for a rendered
+/// box before giving up and counting the page as having none visible.
+const MAX_CREDENTIAL_FIELD_CANDIDATES: usize = 16;
+
 use cerebellum_core::vision::max_vision_width_px;
 /// Standard-tier vision long-edge cap, in pixels.
 ///
@@ -186,6 +210,78 @@ struct AttachedTarget {
     context_key: String,
 }
 
+/// What a session-verification tab has shown so far, fed from the events of
+/// its own CDP session only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerificationLoad {
+    target_id: String,
+    session_id: String,
+    /// Whether the main frame has committed a document other than the blank
+    /// page the tab opens on. A load event before that is the blank page's.
+    committed: bool,
+    /// When the main frame's load event fired after its latest commit.
+    loaded_at: Option<Instant>,
+    /// The HTTP status of the latest main-frame document response. Redirect
+    /// hops do not produce one, so this is the status of where it ended.
+    status: Option<u16>,
+}
+
+impl VerificationLoad {
+    fn observe(&mut self, event: &CdpEvent, observed_at: Instant) {
+        match event.method.as_str() {
+            "Page.frameNavigated" => {
+                let Some(frame) = event
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("frame"))
+                    .and_then(Value::as_object)
+                    .filter(|frame| !frame.contains_key("parentId"))
+                else {
+                    return;
+                };
+                if frame
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| !url.starts_with("about:"))
+                {
+                    self.committed = true;
+                }
+                // A new main-frame document has not loaded yet, whatever the
+                // one before it did; a script redirect lands here.
+                self.loaded_at = None;
+            }
+            "Page.loadEventFired" if self.committed => self.loaded_at = Some(observed_at),
+            "Network.responseReceived" => {
+                let Some(params) = event.params.as_ref() else {
+                    return;
+                };
+                if params.get("type").and_then(Value::as_str) != Some("Document")
+                    || params.get("frameId").and_then(Value::as_str)
+                        != Some(self.target_id.as_str())
+                {
+                    return;
+                }
+                if let Some(status) = params
+                    .get("response")
+                    .and_then(|response| response.get("status"))
+                    .and_then(Value::as_u64)
+                    .and_then(|status| u16::try_from(status).ok())
+                {
+                    self.status = Some(status);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.committed
+            && self
+                .loaded_at
+                .is_some_and(|loaded| now.saturating_duration_since(loaded) >= VERIFICATION_SETTLE)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingJavaScriptDialog {
     session_id: String,
@@ -204,6 +300,13 @@ pub struct CdpNavigationDriver<IO> {
     pending_responses: HashMap<u64, CdpResponse>,
     pending_javascript_dialogs: VecDeque<PendingJavaScriptDialog>,
     read_buffer: Vec<u8>,
+    /// What the session-verification tab currently open has shown, while a
+    /// [`Self::load_in_background_tab`] call is running.
+    verification: Option<VerificationLoad>,
+    /// A session-verification tab whose close was not confirmed. The next
+    /// verification closes it before opening another, so there is never more
+    /// than one.
+    unclosed_verification_target: Option<String>,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -221,6 +324,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             pending_responses: HashMap::new(),
             pending_javascript_dialogs: VecDeque::new(),
             read_buffer: vec![0; READ_CHUNK_BYTES],
+            verification: None,
+            unclosed_verification_target: None,
         }
     }
 
@@ -373,6 +478,26 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .collect::<Option<Vec<_>>>()
             .ok_or(NavigationDriveError::CdpFailure)?;
         Ok(crate::login_capture::CookieHeader::from_pairs(pairs))
+    }
+
+    /// Load `url` in a new background tab, report where it ended, and close
+    /// the tab. `browser.capture_login` uses this to check a session works
+    /// the way its holder will use it before capturing it.
+    ///
+    /// The tab is opened with `background: true`, so the person keeps their
+    /// own tab in front and in focus, and it shares the browser's cookie jar,
+    /// so the request carries exactly the cookies a capture would read. Only
+    /// the `Page`, `Network` and `DOM` domains are enabled, and only on the new
+    /// tab's own session: nothing is sent to the person's page, and `Runtime`
+    /// is never enabled, so the page cannot observe an automation client
+    /// through it. No cookie value is read.
+    pub fn load_in_background_tab(
+        &mut self,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<crate::login_capture::SessionProbe, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        self.load_in_background_tab_with_clock(url, deadline_ms, &mut clock)
     }
 
     pub fn main_frame_url(
@@ -1578,6 +1703,256 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         Ok(observation)
     }
 
+    fn load_in_background_tab_with_clock<C: NavigationClock>(
+        &mut self,
+        url: &str,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<crate::login_capture::SessionProbe, NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        if let Some(target_id) = self.unclosed_verification_target.clone() {
+            self.close_verification_target(&target_id, clock)?;
+        }
+        let mut create_params = Map::new();
+        create_params.insert("url".into(), Value::String("about:blank".into()));
+        create_params.insert("background".into(), Value::Bool(true));
+        let created = self.command(
+            "Target.createTarget",
+            Some(create_params),
+            None,
+            deadline,
+            None,
+            clock,
+        )?;
+        let target_id = required_result_string(&created, "targetId")?;
+        // The new tab is remembered before anything else can fail, so it is
+        // closed below or, if that close fails, before the next verification
+        // opens another.
+        self.unclosed_verification_target = Some(target_id.clone());
+        let probe = self.load_in_verification_target(&target_id, url, deadline, clock);
+        self.verification = None;
+        // A close that fails leaves the tab recorded; the next verification
+        // refuses to open another until it is gone. What this load saw stands.
+        let _ = self.close_verification_target(&target_id, clock);
+        probe
+    }
+
+    fn load_in_verification_target<C: NavigationClock>(
+        &mut self,
+        target_id: &str,
+        url: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<crate::login_capture::SessionProbe, NavigationDriveError> {
+        let mut attach_params = Map::new();
+        attach_params.insert("targetId".into(), Value::String(target_id.to_string()));
+        attach_params.insert("flatten".into(), Value::Bool(true));
+        let attached = self.command(
+            "Target.attachToTarget",
+            Some(attach_params),
+            None,
+            deadline,
+            None,
+            clock,
+        )?;
+        let session_id = required_result_string(&attached, "sessionId")?;
+        self.verification = Some(VerificationLoad {
+            target_id: target_id.to_string(),
+            session_id: session_id.clone(),
+            committed: false,
+            loaded_at: None,
+            status: None,
+        });
+        for domain in ["Page.enable", "Network.enable"] {
+            self.command(
+                domain,
+                None,
+                Some(session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+        }
+        let mut params = Map::new();
+        params.insert("url".into(), Value::String(url.to_string()));
+        let navigated = self.command(
+            "Page.navigate",
+            Some(params),
+            Some(session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        if let Some(error_text) = navigated
+            .get("errorText")
+            .and_then(Value::as_str)
+            .filter(|error_text| !error_text.is_empty())
+        {
+            return Err(NavigationDriveError::NavigationFailed {
+                error_text: error_text.to_string(),
+            });
+        }
+        loop {
+            if self
+                .verification
+                .as_ref()
+                .is_some_and(|load| load.settled(clock.now()))
+            {
+                break;
+            }
+            // A page that never finishes loading is not shown to work.
+            if clock.now() >= deadline {
+                return Err(NavigationDriveError::CdpFailure);
+            }
+            self.read_turn(None, None, clock.now())?;
+            let remaining = deadline.saturating_duration_since(clock.now());
+            clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+        }
+        let status = self.verification.as_ref().and_then(|load| load.status);
+        let history = self.command(
+            "Page.getNavigationHistory",
+            None,
+            Some(session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let final_url = current_history_url(&history).ok_or(NavigationDriveError::CdpFailure)?;
+        let credential_field = self.visible_credential_field(&session_id, deadline, clock)?;
+        Ok(crate::login_capture::SessionProbe {
+            final_url,
+            status,
+            credential_field,
+        })
+    }
+
+    /// Whether the verification tab's page shows a credential field. A match
+    /// with no rendered box (`display: none`, a detached template) is not
+    /// shown to anyone, so it does not make a signed-in page a sign-in page.
+    fn visible_credential_field<C: NavigationClock>(
+        &mut self,
+        session_id: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<bool, NavigationDriveError> {
+        let mut params = Map::new();
+        params.insert("depth".into(), Value::from(0));
+        let document = self.command(
+            "DOM.getDocument",
+            Some(params),
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let root = document
+            .get("root")
+            .and_then(|root| root.get("nodeId"))
+            .and_then(Value::as_u64)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let mut params = Map::new();
+        params.insert("nodeId".into(), Value::from(root));
+        params.insert(
+            "selector".into(),
+            Value::String(CREDENTIAL_FIELD_SELECTOR.to_string()),
+        );
+        let matched = self.command(
+            "DOM.querySelectorAll",
+            Some(params),
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let node_ids = matched
+            .get("nodeIds")
+            .and_then(Value::as_array)
+            .ok_or(NavigationDriveError::CdpFailure)?
+            .iter()
+            .filter_map(Value::as_u64)
+            .take(MAX_CREDENTIAL_FIELD_CANDIDATES)
+            .collect::<Vec<_>>();
+        for node_id in node_ids {
+            let mut params = Map::new();
+            params.insert("nodeId".into(), Value::from(node_id));
+            // Chrome answers an element with no layout box with an error, so
+            // an error here means "not rendered" rather than a failed read.
+            let boxed = self.command_response(
+                "DOM.getBoxModel",
+                Some(params),
+                Some(session_id.to_string()),
+                deadline,
+                None,
+                None,
+                clock,
+            )?;
+            let rendered = boxed
+                .result
+                .as_ref()
+                .and_then(|result| result.get("model"))
+                .is_some_and(|model| {
+                    let positive = |key: &str| {
+                        model
+                            .get(key)
+                            .and_then(Value::as_f64)
+                            .is_some_and(|value| value > 0.0)
+                    };
+                    positive("width") && positive("height")
+                });
+            if rendered {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Close a session-verification tab, and forget it once it is gone. A
+    /// close Chrome refuses because the tab no longer exists (the person
+    /// closed it) also counts as gone.
+    fn close_verification_target<C: NavigationClock>(
+        &mut self,
+        target_id: &str,
+        clock: &mut C,
+    ) -> Result<(), NavigationDriveError> {
+        let deadline = clock
+            .now()
+            .checked_add(VERIFICATION_CLOSE_DEADLINE)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let mut params = Map::new();
+        params.insert("targetId".into(), Value::String(target_id.to_string()));
+        let closed = self.command_response(
+            "Target.closeTarget",
+            Some(params.clone()),
+            None,
+            deadline,
+            None,
+            None,
+            clock,
+        )?;
+        let gone = closed.error.is_none() || {
+            let still_there = self.command_response(
+                "Target.getTargetInfo",
+                Some(params),
+                None,
+                deadline,
+                None,
+                None,
+                clock,
+            )?;
+            still_there.error.is_some()
+        };
+        if !gone {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        if self.unclosed_verification_target.as_deref() == Some(target_id) {
+            self.unclosed_verification_target = None;
+        }
+        Ok(())
+    }
+
     fn main_frame_url_with_clock<C: NavigationClock>(
         &mut self,
         context_key: &str,
@@ -2014,6 +2389,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .accept_event(&frame)
                 .map_err(|_| NavigationDriveError::CdpFailure)?;
             let _ = self.transport.pop_event();
+            // Events from the session-verification tab update only that tab's
+            // load record; they are never applied to the person's page or to a
+            // navigation's tracker.
+            if let Some(load) = self.verification.as_mut() {
+                if event.session_id.as_deref() == Some(load.session_id.as_str()) {
+                    load.observe(&event, observed_at);
+                    continue;
+                }
+            }
             if event.method == "Page.javascriptDialogOpening" {
                 if let (Some(attachment), Some(session_id)) =
                     (self.attachment.as_ref(), event.session_id.as_deref())
@@ -2269,6 +2653,18 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             _ => {}
         }
     }
+}
+
+/// The URL of the current entry in a `Page.getNavigationHistory` result.
+fn current_history_url(history: &Map<String, Value>) -> Option<String> {
+    let current_index = usize::try_from(history.get("currentIndex")?.as_u64()?).ok()?;
+    history
+        .get("entries")?
+        .as_array()?
+        .get(current_index)?
+        .get("url")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn parse_flattened_dom_nodes(
@@ -5883,5 +6279,342 @@ mod tests {
                 .any(|command| command.to_string().contains(SECRET)),
             "a cookie value escaped into a driver command"
         );
+    }
+}
+
+/// The session-verification tab, driven against a pipe that answers each
+/// command as Chrome would. Answers are produced when a command is written,
+/// so a response can never arrive before the command it answers.
+#[cfg(test)]
+mod verification_tests {
+    use std::collections::VecDeque;
+    use std::io;
+
+    use serde_json::json;
+
+    use super::*;
+
+    /// How the fake browser answers one command: its result or error, and
+    /// the events it emits right after.
+    type Answer = (Result<Value, Value>, Vec<Value>);
+    type Answerer = Box<dyn FnMut(&str, &Value) -> Answer>;
+
+    struct RespondingPipe {
+        writes: Vec<Value>,
+        reads: VecDeque<Vec<u8>>,
+        answer: Answerer,
+    }
+
+    impl CdpPipeIo for RespondingPipe {
+        fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            let method = command["method"].as_str().unwrap().to_string();
+            let (outcome, events) = (self.answer)(&method, &command);
+            let mut response = json!({"id": command["id"]});
+            if let Some(session_id) = command.get("sessionId") {
+                response["sessionId"] = session_id.clone();
+            }
+            match outcome {
+                Ok(result) => response["result"] = result,
+                Err(error) => response["error"] = error,
+            }
+            for frame in std::iter::once(response).chain(events) {
+                let mut bytes = serde_json::to_vec(&frame).unwrap();
+                bytes.push(0);
+                self.reads.push_back(bytes);
+            }
+            self.writes.push(command);
+            Ok(())
+        }
+
+        fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+            let Some(bytes) = self.reads.pop_front() else {
+                return Ok(PipeRead::WouldBlock);
+            };
+            destination[..bytes.len()].copy_from_slice(&bytes);
+            Ok(PipeRead::Bytes(bytes.len()))
+        }
+    }
+
+    struct StepClock(Instant);
+
+    impl NavigationClock for StepClock {
+        fn now(&mut self) -> Instant {
+            self.0
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.0 += duration;
+        }
+    }
+
+    const TAB: &str = "verify-tab";
+    const SESSION: &str = "verify-session";
+
+    fn event(method: &str, params: Value) -> Value {
+        json!({"method": method, "sessionId": SESSION, "params": params})
+    }
+
+    fn document_response(frame_id: &str, status: u64) -> Value {
+        event(
+            "Network.responseReceived",
+            json!({"type": "Document", "frameId": frame_id, "requestId": "r", "response": {"status": status}}),
+        )
+    }
+
+    fn committed(url: &str) -> Value {
+        event(
+            "Page.frameNavigated",
+            json!({"frame": {"id": TAB, "url": url}}),
+        )
+    }
+
+    /// The page the tab ends on.
+    struct Ending {
+        url: &'static str,
+        /// Events Chrome emits after `Page.navigate` answers.
+        events: Vec<Value>,
+        credential_boxes: Vec<Result<(f64, f64), ()>>,
+        close_fails: bool,
+    }
+
+    fn signed_in_page() -> Ending {
+        Ending {
+            url: "https://ollama.com/settings",
+            events: vec![
+                document_response(TAB, 200),
+                committed("https://ollama.com/settings"),
+                event("Page.loadEventFired", json!({})),
+            ],
+            credential_boxes: Vec::new(),
+            close_fails: false,
+        }
+    }
+
+    fn browser(ending: Ending) -> CdpNavigationDriver<RespondingPipe> {
+        let Ending {
+            url,
+            mut events,
+            credential_boxes,
+            close_fails,
+        } = ending;
+        let mut boxes = credential_boxes.clone().into_iter();
+        let answer = move |method: &str, command: &Value| -> Answer {
+            let ok = |result: Value| (Ok(result), Vec::new());
+            match method {
+                "Target.createTarget" => ok(json!({"targetId": TAB})),
+                "Target.attachToTarget" => ok(json!({"sessionId": SESSION})),
+                "Page.navigate" => (
+                    Ok(json!({"frameId": TAB, "loaderId": "loader"})),
+                    std::mem::take(&mut events),
+                ),
+                "Page.getNavigationHistory" => {
+                    ok(json!({"currentIndex": 0, "entries": [{"id": 1, "url": url}]}))
+                }
+                "DOM.getDocument" => ok(json!({"root": {"nodeId": 1}})),
+                "DOM.querySelectorAll" => ok(json!({
+                    "nodeIds": (0..credential_boxes.len()).map(|index| index + 10).collect::<Vec<_>>()
+                })),
+                "DOM.getBoxModel" => match boxes.next() {
+                    Some(Ok((width, height))) => {
+                        ok(json!({"model": {"width": width, "height": height}}))
+                    }
+                    _ => (
+                        Err(json!({"code": -32000, "message": "Could not compute box model."})),
+                        Vec::new(),
+                    ),
+                },
+                "Target.closeTarget" if close_fails => (
+                    Err(json!({"code": -32000, "message": "close refused"})),
+                    Vec::new(),
+                ),
+                // The tab still exists whenever its close was refused.
+                "Target.getTargetInfo" => {
+                    ok(json!({"targetInfo": {"targetId": command["params"]["targetId"]}}))
+                }
+                _ => ok(json!({})),
+            }
+        };
+        let mut driver = CdpNavigationDriver::new(
+            RespondingPipe {
+                writes: Vec::new(),
+                reads: VecDeque::new(),
+                answer: Box::new(answer),
+            },
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        );
+        // The person's own sign-in page, attached the way a capture attaches
+        // it, so the test can show nothing is sent to it.
+        driver
+            .identities
+            .attach(Attachment {
+                target_id: "person-tab".into(),
+                session_id: "person-session".into(),
+                frame_ids: Vec::new(),
+                context_key: "browser.capture_login".into(),
+            })
+            .unwrap();
+        driver.attachment = Some(AttachedTarget {
+            target_id: "person-tab".into(),
+            session_id: "person-session".into(),
+            context_key: "browser.capture_login".into(),
+        });
+        driver
+    }
+
+    fn verify(
+        driver: &mut CdpNavigationDriver<RespondingPipe>,
+    ) -> Result<crate::login_capture::SessionProbe, NavigationDriveError> {
+        driver.load_in_background_tab_with_clock(
+            "https://ollama.com/settings",
+            5_000,
+            &mut StepClock(Instant::now()),
+        )
+    }
+
+    fn methods(driver: &CdpNavigationDriver<RespondingPipe>) -> Vec<String> {
+        driver
+            .pipe
+            .writes
+            .iter()
+            .map(|write| write["method"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_verification_loads_in_a_background_tab_and_closes_it() {
+        let mut driver = browser(signed_in_page());
+        let probe = verify(&mut driver).unwrap();
+        assert_eq!(
+            probe,
+            crate::login_capture::SessionProbe {
+                final_url: "https://ollama.com/settings".to_string(),
+                status: Some(200),
+                credential_field: false,
+            }
+        );
+        assert_eq!(
+            methods(&driver),
+            [
+                "Target.createTarget",
+                "Target.attachToTarget",
+                "Page.enable",
+                "Network.enable",
+                "Page.navigate",
+                "Page.getNavigationHistory",
+                "DOM.getDocument",
+                "DOM.querySelectorAll",
+                "Target.closeTarget",
+            ]
+        );
+        let created = &driver.pipe.writes[0]["params"];
+        assert_eq!(created["background"], true, "{created}");
+        assert_eq!(created["url"], "about:blank");
+        assert_eq!(driver.pipe.writes[8]["params"]["targetId"], TAB);
+        for write in &driver.pipe.writes {
+            assert_ne!(
+                write.get("sessionId").and_then(Value::as_str),
+                Some("person-session"),
+                "a verification sent {write} to the person's page"
+            );
+            assert!(
+                !write["method"].as_str().unwrap().starts_with("Runtime."),
+                "a verification enabled or used Runtime: {write}"
+            );
+        }
+        assert_eq!(driver.unclosed_verification_target, None);
+    }
+
+    /// The status is the main frame's own: a redirect hop sends no document
+    /// response, and a subframe's document response is not the page's.
+    #[test]
+    fn the_status_is_the_main_documents_and_the_url_is_where_it_ended() {
+        let mut driver = browser(Ending {
+            url: "https://ollama.com/signin?next=%2Fsettings",
+            events: vec![
+                document_response(TAB, 401),
+                committed("https://ollama.com/signin?next=%2Fsettings"),
+                document_response("an-iframe", 200),
+                event("Page.loadEventFired", json!({})),
+            ],
+            ..signed_in_page()
+        });
+        let probe = verify(&mut driver).unwrap();
+        assert_eq!(probe.status, Some(401));
+        assert_eq!(
+            probe.final_url,
+            "https://ollama.com/signin?next=%2Fsettings"
+        );
+    }
+
+    /// The blank page the tab opens on fires its own load event; that is not
+    /// the requested page loading, so the verification keeps waiting and, with
+    /// nothing else arriving, runs out of time and still closes its tab.
+    #[test]
+    fn a_load_that_never_finishes_fails_and_still_closes_the_tab() {
+        let mut driver = browser(Ending {
+            events: vec![
+                committed("about:blank"),
+                event("Page.loadEventFired", json!({})),
+            ],
+            ..signed_in_page()
+        });
+        assert!(verify(&mut driver).is_err());
+        assert_eq!(methods(&driver).last().unwrap(), "Target.closeTarget");
+    }
+
+    /// A commit after the load event is a script redirect, so the load that
+    /// counts is the one after it.
+    #[test]
+    fn a_script_redirect_after_load_is_waited_for() {
+        let mut driver = browser(Ending {
+            url: "https://ollama.com/login",
+            events: vec![
+                document_response(TAB, 200),
+                committed("https://ollama.com/settings"),
+                event("Page.loadEventFired", json!({})),
+                committed("https://ollama.com/login"),
+            ],
+            ..signed_in_page()
+        });
+        assert!(
+            verify(&mut driver).is_err(),
+            "the second document never loaded, so nothing settled"
+        );
+    }
+
+    #[test]
+    fn only_a_rendered_credential_field_counts() {
+        let mut hidden = browser(Ending {
+            credential_boxes: vec![Err(()), Ok((0.0, 0.0))],
+            ..signed_in_page()
+        });
+        assert!(!verify(&mut hidden).unwrap().credential_field);
+
+        let mut shown = browser(Ending {
+            credential_boxes: vec![Err(()), Ok((240.0, 32.0))],
+            ..signed_in_page()
+        });
+        assert!(verify(&mut shown).unwrap().credential_field);
+    }
+
+    /// A tab whose close was refused is closed before another opens, and while
+    /// it cannot be closed no second tab is ever opened.
+    #[test]
+    fn a_tab_that_would_not_close_blocks_the_next_one() {
+        let mut driver = browser(Ending {
+            close_fails: true,
+            ..signed_in_page()
+        });
+        assert!(
+            verify(&mut driver).is_ok(),
+            "what the load saw stands even when its tab would not close"
+        );
+        assert_eq!(driver.unclosed_verification_target.as_deref(), Some(TAB));
+        let before = driver.pipe.writes.len();
+        assert!(verify(&mut driver).is_err());
+        let after = methods(&driver)[before..].to_vec();
+        assert_eq!(after, ["Target.closeTarget", "Target.getTargetInfo"]);
     }
 }
