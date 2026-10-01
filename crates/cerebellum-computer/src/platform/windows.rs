@@ -759,6 +759,7 @@ impl WindowsPlatformDriver {
                 // writes built on it, are macOS accessibility; Windows has
                 // none of them, and the Windows review never covered them.
                 "computer.read_state"
+                | "computer.list_apps"
                 | "computer.press_element"
                 | "computer.press_point"
                 | "computer.write_text" => {

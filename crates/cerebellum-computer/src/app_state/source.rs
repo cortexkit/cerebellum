@@ -73,6 +73,8 @@ pub struct RawElement {
     pub focused: bool,
     /// `None` where the element exposes no expanded state.
     pub expanded: Option<bool>,
+    /// The address a link or a web page points at (`AXURL`), when it has one.
+    pub url: Option<String>,
     pub children: Vec<RawElement>,
     /// Children reported beneath this element that could not be read. Their
     /// descendants are unknown, which is why a read carrying any is never
@@ -283,6 +285,25 @@ pub trait AppStateSource: Send + Sync {
     fn frontmost_pid(&self) -> Option<u32> {
         None
     }
+
+    /// The regular applications running now: the ones with a Dock icon and
+    /// windows a person works in, not agents, helpers or menu-bar extras.
+    /// Names and identities only; nothing of any window's content.
+    fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
+        Err(AppStateReadError::UnsupportedOnPlatform)
+    }
+}
+
+/// One running application, as `list_apps` reports it and as a `target`
+/// given by name is matched against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningApp {
+    /// The name the person sees. An application picks its own name, so it
+    /// is only ever matched to a bundle identity, never used as one.
+    pub name: String,
+    pub bundle_identity: String,
+    pub pid: u32,
+    pub frontmost: bool,
 }
 
 /// The reader for a platform with none: every read is refused by name.
@@ -339,6 +360,7 @@ impl RawElement {
             enabled: true,
             focused: false,
             expanded: None,
+            url: None,
             children: Vec::new(),
             unreadable_children: 0,
         }
@@ -351,6 +373,21 @@ impl RawElement {
 
     pub fn with_children(mut self, children: Vec<RawElement>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub fn described(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+
+    pub fn with_subrole(mut self, subrole: &str) -> Self {
+        self.subrole = Some(subrole.to_string());
+        self
+    }
+
+    pub fn with_url(mut self, url: &str) -> Self {
+        self.url = Some(url.to_string());
         self
     }
 }

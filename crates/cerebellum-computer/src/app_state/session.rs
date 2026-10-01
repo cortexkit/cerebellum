@@ -4,9 +4,19 @@
 //! A session is one conversation reading one process generation of one
 //! application. Its map pairs each retained element with a small number;
 //! a later read finds the same element again by token equality, never by
-//! position or title, so the id keeps naming it while it lives. Ids are never
-//! reused: a number is issued once per session, and a new process generation
-//! is a new session whose ids share nothing with the old one.
+//! position or title, so the id keeps naming it while it lives.
+//!
+//! An id is the bare number, such as `389`, because a caller reads and types
+//! hundreds of them. Every session draws from one counter, so a number names
+//! one element of one application of one conversation, and an action given
+//! only the number knows which application it is about. A number is issued
+//! once and never again: a new process generation is a new session whose
+//! numbers continue the count, so nothing it numbers can answer to an old
+//! id, and two conversations never hold the same number.
+//!
+//! The count restarts with the module. A caller that kept an id from before
+//! a restart finds it stale until it reads again, because nothing resolves
+//! before a read; once it has read, the ids it holds are the new ones.
 //!
 //! The map belongs to a conversation. Two conversations reading the same
 //! application get separate sessions with disjoint ids, so neither can act on
@@ -83,8 +93,6 @@ struct Entry {
 
 #[derive(Debug)]
 struct Session {
-    token: String,
-    next_number: u64,
     entries: BTreeMap<u64, Entry>,
     by_hash: HashMap<u64, Vec<u64>>,
     /// Whether any read has set a baseline yet. A diff with none reports
@@ -94,7 +102,7 @@ struct Session {
 
 impl Session {
     fn element_id(&self, number: u64) -> String {
-        format!("s{}-{}", self.token, number)
+        session_element_id(number)
     }
 
     fn find(&self, handle: &ElementHandle) -> Option<u64> {
@@ -109,12 +117,20 @@ impl Session {
             })
     }
 
-    fn insert(&mut self, handle: ElementHandle, signature: String, refusing: bool) -> Option<u64> {
+    /// Number a new element with the conversation's next number, or `None`
+    /// when the session is at its cap.
+    fn insert(
+        &mut self,
+        next_number: &mut u64,
+        handle: ElementHandle,
+        signature: String,
+        refusing: bool,
+    ) -> Option<u64> {
         if self.entries.len() >= MAX_SESSION_ELEMENTS {
             return None;
         }
-        self.next_number += 1;
-        let number = self.next_number;
+        *next_number += 1;
+        let number = *next_number;
         self.by_hash
             .entry(handle.identity_hash())
             .or_default()
@@ -210,19 +226,33 @@ pub struct RegisteredImage {
 
 #[derive(Debug, Default)]
 struct StoreState {
-    next_session: u64,
     next_image: u64,
     sessions: BTreeMap<SessionKey, Session>,
-    tokens: HashMap<String, SessionKey>,
+    /// The last element number issued, by any session.
+    last_number: u64,
+    /// Which session issued each live number.
+    owners: HashMap<u64, SessionKey>,
     images: HashMap<String, (String, RegisteredImage)>,
+}
+
+impl StoreState {
+    /// Drop a session and forget which numbers it issued.
+    fn remove_session(&mut self, key: &SessionKey) {
+        if let Some(session) = self.sessions.remove(key) {
+            for number in session.entries.keys() {
+                self.owners.remove(number);
+            }
+        }
+    }
 }
 
 /// Every conversation's element sessions, for the life of the module.
 #[derive(Debug)]
 pub struct AppStateSessions {
-    /// Distinguishes this module process's ids from a previous one's. Session
-    /// numbers restart with the process, and without this an id handed out
-    /// before a restart would name whatever a new session numbered the same.
+    /// Distinguishes this module process's image ids from a previous one's.
+    /// Image numbers restart with the process, and without this an image id
+    /// handed out before a restart would name whatever image a new read
+    /// numbered the same.
     salt: String,
     state: Mutex<StoreState>,
 }
@@ -279,7 +309,8 @@ impl AppStateSessions {
         read: &RawAppState,
     ) -> SessionRead {
         let key = SessionKey::new(conversation_key, target);
-        let mut state = self.lock();
+        let mut guard = self.lock();
+        let state = &mut *guard;
         let replaced: Vec<SessionKey> = state
             .sessions
             .keys()
@@ -287,32 +318,23 @@ impl AppStateSessions {
             .cloned()
             .collect();
         for old in replaced {
-            if let Some(session) = state.sessions.remove(&old) {
-                state.tokens.remove(&session.token);
-            }
+            state.remove_session(&old);
         }
-        if !state.sessions.contains_key(&key) {
-            state.next_session += 1;
-            let token = format!("{}{}", self.salt, state.next_session);
-            state.tokens.insert(token.clone(), key.clone());
-            state.sessions.insert(
-                key.clone(),
-                Session {
-                    token,
-                    next_number: 0,
-                    entries: BTreeMap::new(),
-                    by_hash: HashMap::new(),
-                    has_baseline: false,
-                },
-            );
-        }
+        state.sessions.entry(key.clone()).or_insert_with(|| Session {
+            entries: BTreeMap::new(),
+            by_hash: HashMap::new(),
+            has_baseline: false,
+        });
         let session = state
             .sessions
             .get_mut(&key)
             .expect("the session was just ensured");
+        let next_number = &mut state.last_number;
+        let first_new = *next_number + 1;
 
         let mut walk = Walk {
             session,
+            next_number,
             seen: HashSet::new(),
             diff: StateDiff::default(),
         };
@@ -324,9 +346,11 @@ impl AppStateSessions {
             .collect();
         let Walk {
             session,
+            next_number,
             seen,
             mut diff,
         } = walk;
+        let last_new = *next_number;
 
         let complete = read.is_complete();
         let had_baseline = session.has_baseline;
@@ -340,8 +364,7 @@ impl AppStateSessions {
                 // gone. A read that left a subtree unopened may simply not
                 // have reached it, so it neither removes nor ages anything.
                 if entry.in_baseline && !entry.refusing && had_baseline {
-                    diff.removed
-                        .push(session_element_id(&session.token, entry.number));
+                    diff.removed.push(session_element_id(entry.number));
                 }
                 entry.in_baseline = false;
                 entry.absent_reads = entry.absent_reads.saturating_add(1);
@@ -350,15 +373,14 @@ impl AppStateSessions {
                 }
             }
         }
-        for number in evicted {
-            session.evict(number);
+        for number in &evicted {
+            session.evict(*number);
         }
         if !had_baseline {
             diff = StateDiff::default();
         }
         session.has_baseline = true;
-
-        let focused_element_id = read
+        let focused_number = read
             .focused
             .as_ref()
             .and_then(|handle| session.find(handle))
@@ -368,8 +390,18 @@ impl AppStateSessions {
                         .entries
                         .get(number)
                         .is_some_and(|entry| !entry.refusing)
-            })
-            .map(|number| session.element_id(number));
+            });
+        let issued: Vec<u64> = (first_new..=last_new)
+            .filter(|number| session.entries.contains_key(number))
+            .collect();
+        for number in issued {
+            state.owners.insert(number, key.clone());
+        }
+        for number in evicted {
+            state.owners.remove(&number);
+        }
+
+        let focused_element_id = focused_number.map(session_element_id);
 
         SessionRead {
             roots,
@@ -393,7 +425,8 @@ impl AppStateSessions {
         handle: &ElementHandle,
     ) -> Adoption {
         let key = SessionKey::new(conversation_key, target);
-        let mut state = self.lock();
+        let mut guard = self.lock();
+        let state = &mut *guard;
         let Some(session) = state.sessions.get_mut(&key) else {
             return Adoption::NoSession;
         };
@@ -408,8 +441,11 @@ impl AppStateSessions {
                 Adoption::Numbered(session.element_id(number))
             };
         }
-        match session.insert(handle.clone(), String::new(), false) {
-            Some(number) => Adoption::Numbered(session.element_id(number)),
+        match session.insert(&mut state.last_number, handle.clone(), String::new(), false) {
+            Some(number) => {
+                state.owners.insert(number, key);
+                Adoption::Numbered(session_element_id(number))
+            }
             None => Adoption::Full,
         }
     }
@@ -456,11 +492,11 @@ impl AppStateSessions {
 
     /// Where an element id leads, for the conversation holding it.
     pub fn resolve(&self, conversation_key: &str, element_id: &str) -> ElementResolution {
-        let Some((token, number)) = parse_element_id(element_id) else {
+        let Some(number) = parse_element_id(element_id) else {
             return ElementResolution::Stale;
         };
         let state = self.lock();
-        let Some(key) = state.tokens.get(token) else {
+        let Some(key) = state.owners.get(&number) else {
             return ElementResolution::Stale;
         };
         if key.conversation_key != conversation_key {
@@ -527,10 +563,10 @@ impl AppStateSessions {
             .cloned()
             .collect();
         for key in ended {
-            if let Some(session) = state.sessions.remove(&key) {
-                state.tokens.remove(&session.token);
-            }
+            state.remove_session(&key);
         }
+        // The count goes on across conversations, so one that later starts
+        // under the same key never resolves an id issued before.
         state
             .images
             .retain(|_, (conversation, _)| conversation != conversation_key);
@@ -542,18 +578,22 @@ impl AppStateSessions {
     }
 }
 
-fn session_element_id(token: &str, number: u64) -> String {
-    format!("s{token}-{number}")
+fn session_element_id(number: u64) -> String {
+    number.to_string()
 }
 
-fn parse_element_id(element_id: &str) -> Option<(&str, u64)> {
-    let rest = element_id.strip_prefix('s')?;
-    let (token, number) = rest.rsplit_once('-')?;
-    Some((token, number.parse().ok()?))
+/// The number an element id names: digits only, so `"389"` and nothing
+/// like `"+389"` or `"389 "`.
+fn parse_element_id(element_id: &str) -> Option<u64> {
+    if element_id.is_empty() || !element_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    element_id.parse().ok()
 }
 
 struct Walk<'a> {
     session: &'a mut Session,
+    next_number: &'a mut u64,
     seen: HashSet<u64>,
     diff: StateDiff,
 }
@@ -594,7 +634,7 @@ impl Walk<'_> {
                 // re-admitted, because its id was never shown.
                 entry.refusing |= hazard;
                 if !entry.refusing && !self.seen.contains(&number) {
-                    let id = session_element_id(&self.session.token, number);
+                    let id = session_element_id(number);
                     if !entry.in_baseline {
                         self.diff.added.push(id);
                     } else if entry.signature != signature {
@@ -605,14 +645,15 @@ impl Walk<'_> {
                 Some(number)
             }
             None => {
-                let number = self
-                    .session
-                    .insert(element.handle.clone(), signature, hazard);
+                let number = self.session.insert(
+                    self.next_number,
+                    element.handle.clone(),
+                    signature,
+                    hazard,
+                );
                 if let Some(number) = number {
                     if !hazard {
-                        self.diff
-                            .added
-                            .push(session_element_id(&self.session.token, number));
+                        self.diff.added.push(session_element_id(number));
                     }
                 }
                 number
@@ -648,4 +689,4 @@ impl Walk<'_> {
 
 // The render module owns the grammar; re-exported here so a caller holding a
 // session read can render it without naming both modules.
-pub use render::render;
+pub use render::{render_diff, render_state};

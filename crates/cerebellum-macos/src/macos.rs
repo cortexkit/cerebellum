@@ -873,6 +873,104 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
         .unwrap_or_else(|| Err(format!("the window list did not arrive within {timeout:?}")))
 }
 
+/// One running application, as the window server lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningApplication {
+    pub pid: u32,
+    pub bundle_identifier: String,
+    /// The display name. For showing to a person only: an application picks
+    /// its own name, so it is not identity evidence.
+    pub name: String,
+    /// Whether the application's activation policy is regular: it has a Dock
+    /// icon and windows a person works in. `None` when the policy could not
+    /// be read.
+    pub regular: Option<bool>,
+}
+
+// AppKit is where NSRunningApplication lives. Nothing here starts an
+// application object or a run loop; the class is only asked about pids.
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
+
+/// Whether a process's activation policy is regular, asked of
+/// NSRunningApplication for that one pid.
+///
+/// Asked per pid rather than taken from the shared workspace's list, because
+/// that list is kept current by notifications a process without a run loop
+/// never receives; an instance looked up by pid is built from the live
+/// process. The answer is read only, and nothing is activated or hidden.
+fn activation_policy_is_regular(pid: i32) -> Option<bool> {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    let class = AnyClass::get(c"NSRunningApplication")?;
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: a documented class method taking a pid_t; it returns nil
+        // or an instance, which `Retained` takes ownership of.
+        let application: Option<Retained<AnyObject>> =
+            unsafe { msg_send![class, runningApplicationWithProcessIdentifier: pid] };
+        let application = application?;
+        // SAFETY: a documented read-only property returning NSInteger.
+        let policy: isize = unsafe { msg_send![&*application, activationPolicy] };
+        // NSApplicationActivationPolicyRegular is zero.
+        Some(policy == 0)
+    })
+}
+
+/// Every application the window server describes to this process, with
+/// whether each is a regular one.
+///
+/// Reads names, identities and pids only: nothing of any window's content,
+/// title or position. Returns an error rather than an empty list when the
+/// system declines, because "no applications" and "not permitted to look" are
+/// different answers.
+pub fn running_applications(timeout: Duration) -> Result<Vec<RunningApplication>, String> {
+    let delivery: Arc<Delivery<Result<Vec<(u32, String, String)>, String>>> = Delivery::new();
+    let sink = delivery.clone();
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            // SAFETY: the system passes either a content object or an error,
+            // both valid for the duration of this callback. Every value read
+            // below is copied out before it returns.
+            let outcome = unsafe {
+                if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else if let Some(content) = content.as_ref() {
+                    Ok(content
+                        .applications()
+                        .iter()
+                        .filter_map(|application| {
+                            Some((
+                                u32::try_from(application.processID()).ok()?,
+                                application.bundleIdentifier().to_string(),
+                                application.applicationName().to_string(),
+                            ))
+                        })
+                        .collect())
+                } else {
+                    Err("the system reported neither content nor an error".to_string())
+                }
+            };
+            sink.deliver(outcome);
+        },
+    );
+    // SAFETY: the handler outlives the call through the block's own retain,
+    // and the delivery it writes into is kept alive by this frame until the
+    // wait below returns.
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+    let listed = delivery
+        .wait(timeout)
+        .unwrap_or_else(|| Err(format!("the application list did not arrive within {timeout:?}")))?;
+    Ok(listed
+        .into_iter()
+        .map(|(pid, bundle_identifier, name)| RunningApplication {
+            regular: i32::try_from(pid).ok().and_then(activation_policy_is_regular),
+            pid,
+            bundle_identifier,
+            name,
+        })
+        .collect())
+}
+
 /// One window's pixels, as the system produced them.
 ///
 /// The owner is read again at capture time rather than carried over from

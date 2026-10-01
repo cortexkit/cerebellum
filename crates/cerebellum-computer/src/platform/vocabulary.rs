@@ -115,7 +115,7 @@ pub struct ValidatedVocabulary {
 /// The one list other closed per-id tables are checked against: the
 /// declaration set, the dispatch rows and the grounding policy each name these
 /// ids and no others.
-pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 10] = [
+pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 11] = [
     "computer.read_state",
     "computer.press_element",
     "computer.press_point",
@@ -126,6 +126,7 @@ pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 10] = [
     "computer.takeover_drag",
     "computer.takeover_scroll",
     "computer.wait",
+    "computer.list_apps",
 ];
 
 /// Rows whose target is an element named through the accessibility tree.
@@ -358,7 +359,7 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
     // Named per id with no default, so a row added to the artifact without a
     // decision here fails validation instead of inheriting a retry class.
     let expected_retry = match id {
-        "computer.read_state" | "computer.wait" => "idempotent",
+        "computer.read_state" | "computer.wait" | "computer.list_apps" => "idempotent",
         "computer.press_element"
         | "computer.press_point"
         | "computer.write_text"
@@ -1071,6 +1072,7 @@ mod tests {
             ),
             ("computer.takeover_scroll", keystroke),
             ("computer.wait", Vec::new()),
+            ("computer.list_apps", Vec::new()),
         ] {
             assert_eq!(
                 required_permission_services(id).expect("a frozen row"),
