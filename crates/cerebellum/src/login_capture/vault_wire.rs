@@ -70,9 +70,10 @@ impl SecretBytes {
         let mut bytes = Self(Vec::with_capacity(bound));
         serde_json::to_writer(&mut bytes.0, value).map_err(|_| RequestBuildError::Unencodable)?;
         if bytes.0.capacity() != bound {
-            // The buffer grew, so a copy was freed unwiped. Not reachable while
-            // the bound below holds; refusing keeps the request from being
-            // sent as if nothing happened.
+            // The buffer reallocated, so an unwiped copy of the secret was
+            // freed. The callers' bounds (see `encoded_bound`) rule this out;
+            // if one is ever wrong, the request is refused rather than sent
+            // as if no copy had been left behind.
             return Err(RequestBuildError::Unencodable);
         }
         Ok(bytes)

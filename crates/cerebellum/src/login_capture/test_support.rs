@@ -298,7 +298,8 @@ impl FakeReply {
 pub(crate) struct FakeVault {
     /// When set, opening the route fails this way.
     pub(crate) open_fails: Mutex<Option<VaultReachError>>,
-    /// Answers in order; once used up, every call is stored as `created`.
+    /// Answers in order, one per call; once they run out, every further call
+    /// is answered as stored with outcome `created`.
     pub(crate) replies: Mutex<VecDeque<FakeReply>>,
     pub(crate) requests: Mutex<Vec<Vec<u8>>>,
     pub(crate) opens: AtomicUsize,

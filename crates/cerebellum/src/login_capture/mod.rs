@@ -144,7 +144,8 @@ pub fn reply_schema() -> Value {
             "credential_id": string(),
             "vault_outcome": {"type": "string", "enum": ["created", "replaced"]},
             "record_version": {"type": "integer"},
-            // Refusals only: the capture directory or profile they name.
+            // Only on the residue, placement and profile-deletion refusals:
+            // the capture directory or profile directory they are about.
             "path": string(),
             "url": string(),
             "tool": string(),
@@ -972,8 +973,9 @@ impl CaptureModule {
             .clone()
     }
 
-    /// Publish the vault captures deposit into. Set once the module knows the
-    /// daemon's connection file, which is after the planes are built.
+    /// Publish the vault captures deposit into. Set at module startup, once
+    /// the daemon's connection file is known; that is after this module is
+    /// constructed, so it cannot be a constructor argument.
     pub fn set_vault(&self, vault: Arc<dyn vault::CookieVault>) {
         *self
             .vault
@@ -1078,8 +1080,8 @@ impl CaptureModule {
                 json!({"remedy": "configure a supported browser executable for this module"}),
             );
         };
-        // Refused before the person is asked: a sign-in whose login cannot be
-        // stored afterwards is a sign-in wasted.
+        // With no vault to deposit into, the capture is refused before the
+        // person is asked to sign in: the login could not be stored after.
         let Some(vault) = self.vault() else {
             return record.refused(
                 "capture_not_stored",

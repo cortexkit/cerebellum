@@ -793,9 +793,10 @@ async fn created_and_replaced_each_reply_captured_with_the_vault_fields() {
     }
 }
 
-/// Each refusal is answered by its code, with the remedy that code needs. Each
-/// refusal is scripted for every attempt, so this test holds whether or not
-/// the code is retried; retrying is the next tests' concern.
+/// Each vault refusal code becomes `capture_not_stored` with that code as the
+/// reason and the remedy written for it. The refusal is scripted for every
+/// attempt, so this holds whether or not the code is retried; which codes are
+/// retried is checked by the retry tests below.
 #[tokio::test]
 async fn each_vault_refusal_is_capture_not_stored_with_its_reason_and_remedy() {
     for (class, code, remedy) in [

@@ -7782,7 +7782,9 @@ mod tests {
             .browser
             .finish_reply(management::CAPTURE_LOGIN, json!({"path": "/tmp/x"}))
             .is_err());
-        // The fields the removed capture file used to be handed back with.
+        // `commands` carried the `ck auth` commands a capture used to return
+        // for storing its cookie file by hand; the schema no longer declares
+        // it, so a reply carrying it is withheld.
         assert!(planes
             .browser
             .finish_reply(
