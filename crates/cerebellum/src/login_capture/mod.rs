@@ -483,6 +483,8 @@ pub enum VerificationFailure {
     Status(Option<u16>),
     /// The browser could not carry out the load.
     Unreadable,
+    /// The heuristic held with no handoff time left to load anything.
+    NotChecked,
 }
 
 impl VerificationFailure {
@@ -495,6 +497,7 @@ impl VerificationFailure {
             Self::Status(Some(status)) => format!("answered HTTP {status}"),
             Self::Status(None) => "returned no page response".to_string(),
             Self::Unreadable => "could not be loaded".to_string(),
+            Self::NotChecked => "was not checked before the handoff ended".to_string(),
         }
     }
 }
@@ -1577,22 +1580,27 @@ impl CaptureModule {
                 .verification_deadline
                 .min(self.env.handoff_duration.saturating_sub(started.elapsed()));
             let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
-            let verdict = if budget_ms == 0 {
-                Err(VerificationFailure::Unreadable)
-            } else {
-                let fetch_url = request.fetch_url.clone();
-                let (returned, probed) = on_browser(browser, move |browser| {
-                    browser.verify_session(&fetch_url, budget_ms)
-                })
-                .await;
-                let Some(returned) = returned else {
-                    return (None, Err("session_verification"));
-                };
-                browser = returned;
-                match probed {
-                    Some(Ok(probe)) => session_verified(&request.fetch_url, &probe),
-                    Some(Err(CaptureDriveError)) | None => Err(VerificationFailure::Unreadable),
+            if budget_ms == 0 {
+                // The deadline check at the top of the loop ends the handoff
+                // next. A failure an earlier verification found says more
+                // than "no time was left", so it is kept when there is one.
+                if verification.last_failure().is_none() {
+                    verification.failed(inputs, VerificationFailure::NotChecked, Instant::now());
                 }
+                continue;
+            }
+            let fetch_url = request.fetch_url.clone();
+            let (returned, probed) = on_browser(browser, move |browser| {
+                browser.verify_session(&fetch_url, budget_ms)
+            })
+            .await;
+            let Some(returned) = returned else {
+                return (None, Err("session_verification"));
+            };
+            browser = returned;
+            let verdict = match probed {
+                Some(Ok(probe)) => session_verified(&request.fetch_url, &probe),
+                Some(Err(CaptureDriveError)) | None => Err(VerificationFailure::Unreadable),
             };
             match verdict {
                 Ok(()) => return (Some(browser), Ok(HandoffEnd::LoginVerified)),
