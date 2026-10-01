@@ -1219,32 +1219,76 @@ fn live_daemons_started_at_the_same_instant_get_separate_directories() {
     );
 }
 
+/// Set only in the child process that
+/// `a_failing_live_test_prints_what_the_module_wrote` starts, which is meant to
+/// fail.
+const FAILING_LIVE_CHILD: &str = "CEREBELLUM_CONFORMANCE_FAILING_LIVE_CHILD";
+
 /// A failing live test prints what the module wrote, so a module that exited
 /// with an error names the error instead of leaving only the daemon's
 /// "exited abnormally" line.
+///
+/// The report is printed by the guard's `Drop` while a panic unwinds, and
+/// libtest only shows a test's output when the test fails, so the property can
+/// only be observed from outside a failing test. This test therefore runs
+/// itself again as a child that holds a guard over a stand-in capture file and
+/// panics, and reads the child's output the way a CI log would show it.
 #[test]
-fn a_failing_live_test_reports_what_the_module_wrote() {
+fn a_failing_live_test_prints_what_the_module_wrote() {
+    const MODULE_ERROR: &str = "Error: Message(\"egress channel closed\")";
+    if std::env::var_os(FAILING_LIVE_CHILD).is_some() {
+        let directory = live_daemon_directory(0);
+        fs::create_dir(&directory).expect("create a scratch directory");
+        let module_output = directory.join(format!("{MODULE_ID}.stderr.log"));
+        fs::write(
+            &module_output,
+            format!("2026-09-29T22:35:29.498Z {MODULE_ERROR}\n"),
+        )
+        .expect("write a stand-in capture file");
+        let _guard = LiveDaemonGuard {
+            task: None,
+            directory,
+            module_output,
+        };
+        panic!("a live test failing while the module's output is on disk");
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "a_failing_live_test_prints_what_the_module_wrote",
+            "--test-threads=1",
+        ])
+        .env(FAILING_LIVE_CHILD, "1")
+        .output()
+        .expect("run the failing child");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // A filter that matched nothing would also leave no report, having tested
+    // nothing; the child must have run the one test and failed it.
+    assert!(
+        !output.status.success() && shown.contains("1 failed"),
+        "the child was meant to fail exactly one test:\n{shown}"
+    );
+    assert!(
+        shown.contains(MODULE_ERROR),
+        "a failing live test must show the module's own error line:\n{shown}"
+    );
+
+    // An empty capture says so, rather than printing a header over nothing
+    // that reads like truncated output.
     let directory = live_daemon_directory(0);
     fs::create_dir(&directory).expect("create a scratch directory");
-    let captured = directory.join(format!("{MODULE_ID}.stderr.log"));
-    fs::write(
-        &captured,
-        "2026-09-29T22:35:29.498Z Error: Message(\"egress channel closed\")\n",
-    )
-    .expect("write a stand-in capture file");
-    let report = module_output_report(&captured, Duration::ZERO);
-    let silent = directory.join("silent.stderr.log");
+    let silent = directory.join(format!("{MODULE_ID}.stderr.log"));
     fs::write(&silent, "").expect("write an empty capture file");
     let nothing = module_output_report(&silent, Duration::ZERO);
     let _ = fs::remove_dir_all(&directory);
-
-    assert!(
-        report.contains("Error: Message(\"egress channel closed\")"),
-        "the report must carry the module's own error line: {report}"
-    );
     assert!(
         nothing.contains("(the module wrote nothing)"),
-        "an empty capture must say so rather than print nothing: {nothing}"
+        "an empty capture must say so: {nothing}"
     );
 }
 
