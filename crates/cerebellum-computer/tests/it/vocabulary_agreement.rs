@@ -26,7 +26,7 @@ use cerebellum_computer::{
 };
 use serde_json::Value;
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v14.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v15.json");
 
 /// These frozen fields have no per-capability code counterpart to compare.
 ///
@@ -172,7 +172,7 @@ fn code_permission_services(capability: &str) -> Vec<PermissionService> {
 fn grounding_rules_agree_with_the_frozen_vocabulary() {
     let vocabulary: Value = serde_json::from_str(VOCABULARY).expect("the vocabulary parses");
     let rows = vocabulary["rows"].as_array().expect("rows");
-    assert_eq!(rows.len(), 10, "the vocabulary is frozen at ten rows");
+    assert_eq!(rows.len(), 11, "the vocabulary is frozen at eleven rows");
 
     let mut disagreements = Vec::new();
     for row in rows {
@@ -356,9 +356,10 @@ fn the_two_required_audit_obligations_are_not_interchangeable() {
         "eight actuating rows must record intent before the machine changes"
     );
     assert_eq!(
-        before_result, 1,
-        "only the state read, whose image passes through capture custody, may \
-         account for its record after the fact"
+        before_result, 2,
+        "only the state read, whose image passes through capture custody, and \
+         the application list, which changes nothing, may account for their \
+         record after the fact"
     );
 }
 
@@ -503,7 +504,7 @@ fn semantic_support_is_claimed_only_where_something_serves_it() {
         "computer.write_text",
     ];
     let declarations = capability_declarations(&context, true);
-    assert_eq!(declarations.len(), 10, "every row was checked");
+    assert_eq!(declarations.len(), 11, "every row was checked");
     for declaration in &declarations {
         let expected = if served.contains(&declaration.capability_id.as_str()) {
             SupportState::Supported
@@ -645,7 +646,7 @@ fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
 
     // Both populations must be non-empty, or the loop above asserts nothing.
     assert_eq!(actuating, 8, "the actuating rows are not all present");
-    assert_eq!(observing, 2, "the observing rows are not all present");
+    assert_eq!(observing, 3, "the observing rows are not all present");
 }
 
 /// A row's observed-path claim agrees with the dispatch modes beside it.
@@ -685,7 +686,7 @@ fn the_observed_claim_and_the_dispatch_modes_agree() {
     // Both sides must occur, or the equality above is satisfied by one uniform
     // answer and proves nothing about the agreement.
     assert_eq!(with_observed, 5, "the rows with an observed mode changed");
-    assert_eq!(without, 5, "the rows without one changed");
+    assert_eq!(without, 6, "the rows without one changed");
 }
 
 #[test]

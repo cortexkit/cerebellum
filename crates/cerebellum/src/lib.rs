@@ -430,11 +430,15 @@ fn declaration_gate_passes(
         return false;
     }
     let id = declaration.capability_id.as_str();
-    if matches!(id, "computer.read_state" | "computer.wait") {
-        // Every read of an application's accessibility tree is one reviewed
-        // surface: the state tree with its element ids and image, and the
-        // wait that polls that same tree for a condition. Keeping both under
-        // one key means a single unbinding withdraws every tree read.
+    if matches!(
+        id,
+        "computer.read_state" | "computer.wait" | "computer.list_apps"
+    ) {
+        // Every read of application state is one reviewed surface: the state
+        // tree with its element ids and image, the wait that polls that same
+        // tree for a condition, and the list of running applications a
+        // caller picks a target from. Keeping them under one key means a
+        // single unbinding withdraws every read.
         // Signing topology is required as for every reviewed row, because
         // the accessibility grant it reads under is pinned to a stable
         // signature.

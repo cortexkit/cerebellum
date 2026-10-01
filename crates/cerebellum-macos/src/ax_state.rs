@@ -54,6 +54,9 @@ extern "C" {
 
 extern "C" {
     fn CFGetTypeID(value: CfTypeRef) -> usize;
+    fn CFURLGetTypeID() -> usize;
+    /// Follows the Get rule: the string belongs to the URL.
+    fn CFURLGetString(url: CfTypeRef) -> CfTypeRef;
     #[link_name = "kill"]
     fn process_signal(pid: c_int, signal: c_int) -> c_int;
     #[link_name = "__error"]
@@ -122,6 +125,8 @@ pub struct AxStateElement {
     pub enabled: bool,
     pub focused: bool,
     pub expanded: Option<bool>,
+    /// Where a link or a web page points (`AXURL`), as its absolute string.
+    pub url: Option<String>,
     pub children: Vec<AxStateElement>,
     /// Children this element reported that could not be read.
     pub unreadable_children: usize,
@@ -157,7 +162,8 @@ pub struct AxAppStateBounds {
 }
 
 /// The attributes read per element, in one message to the application.
-const ATTRIBUTES: [&str; 11] = [
+/// Their positions are the indexes `Reader::read` takes them by.
+const ATTRIBUTES: [&str; 12] = [
     "AXRole",
     "AXSubrole",
     "AXTitle",
@@ -169,6 +175,7 @@ const ATTRIBUTES: [&str; 11] = [
     "AXFocused",
     "AXExpanded",
     "AXChildren",
+    "AXURL",
 ];
 
 pub(crate) fn process_exists(pid: c_int) -> bool {
@@ -194,6 +201,24 @@ pub(crate) unsafe fn owned(value: CfTypeRef) -> Option<CFRetained<CFType>> {
 fn type_id(value: &CFType) -> usize {
     // SAFETY: the value is a live Core Foundation object for this call.
     unsafe { CFGetTypeID((value as *const CFType).cast()) }
+}
+
+/// A URL attribute's text. Web content reports `AXURL` as a URL object;
+/// some applications report a plain string, which is taken as it is.
+fn url_string(value: &CFType) -> Option<String> {
+    if let Some(text) = value.downcast_ref::<CFString>() {
+        return Some(text.to_string());
+    }
+    // SAFETY: takes no arguments and returns a stable type identifier.
+    if type_id(value) != unsafe { CFURLGetTypeID() } {
+        return None;
+    }
+    // SAFETY: the type check establishes this is a CFURL, live for the call.
+    let string = unsafe { CFURLGetString((value as *const CFType).cast()) };
+    let string = NonNull::new(string.cast_mut().cast::<CFString>())?;
+    // SAFETY: under the Get rule the string is owned by the URL, which
+    // `value` keeps alive for this borrow; it is copied out before returning.
+    Some(unsafe { string.as_ref() }.to_string())
 }
 
 pub(crate) fn is_ax_element(value: &CFType) -> bool {
@@ -344,6 +369,7 @@ impl Reader {
             enabled: bool_at(7).unwrap_or(true),
             focused: bool_at(8).unwrap_or(false),
             expanded: bool_at(9),
+            url: value_at(11).and_then(|value| url_string(&value)),
             children: Vec::new(),
             unreadable_children: 0,
             element,

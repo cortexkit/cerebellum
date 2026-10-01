@@ -50,6 +50,7 @@ pub enum ComputerCapability {
     TakeoverDrag,
     TakeoverScroll,
     Wait,
+    ListApps,
     /// Retired; readable from the journal only.
     Click,
     /// Retired; readable from the journal only.
@@ -64,7 +65,7 @@ pub enum ComputerCapability {
 
 impl ComputerCapability {
     /// The capabilities the current vocabulary carries, in artifact order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::ReadState,
         Self::PressElement,
         Self::PressPoint,
@@ -75,6 +76,7 @@ impl ComputerCapability {
         Self::TakeoverDrag,
         Self::TakeoverScroll,
         Self::Wait,
+        Self::ListApps,
     ];
 
     /// Capabilities an earlier vocabulary served, kept only so journal
@@ -99,6 +101,7 @@ impl ComputerCapability {
             Self::TakeoverDrag => "computer.takeover_drag",
             Self::TakeoverScroll => "computer.takeover_scroll",
             Self::Wait => "computer.wait",
+            Self::ListApps => "computer.list_apps",
             Self::Click => "computer.click",
             Self::Scroll => "computer.scroll",
             Self::Move => "computer.move",
@@ -125,7 +128,7 @@ impl ComputerCapability {
     pub const fn action_kind(self) -> ActionKind {
         match self {
             Self::Drag | Self::TakeoverDrag => ActionKind::MutateDurable,
-            Self::Screenshot | Self::Wait | Self::ReadState => ActionKind::Observe,
+            Self::Screenshot | Self::Wait | Self::ReadState | Self::ListApps => ActionKind::Observe,
             Self::Click
             | Self::Type
             | Self::Keys
@@ -882,6 +885,9 @@ impl AuditCapabilityGate {
             // Wait has no capture or redaction obligation, but it still needs a
             // durable journal obligation under the C2 fail-closed rule.
             ComputerCapability::Wait => self.journal_available && self.severity_available,
+            // Listing applications returns names and identities only, never
+            // pixels, so like wait it needs the journal and nothing more.
+            ComputerCapability::ListApps => self.journal_available && self.severity_available,
             // Reading state can return an image, which passes through capture
             // custody and redaction exactly as a screenshot did.
             ComputerCapability::ReadState => self.ready(),
@@ -1150,7 +1156,8 @@ pub const fn recovery_entry_class(capability: ComputerCapability) -> ComputerRec
     match capability {
         ComputerCapability::Screenshot
         | ComputerCapability::Wait
-        | ComputerCapability::ReadState => ComputerRecoveryEntryClass::Capture,
+        | ComputerCapability::ReadState
+        | ComputerCapability::ListApps => ComputerRecoveryEntryClass::Capture,
         ComputerCapability::Click
         | ComputerCapability::Type
         | ComputerCapability::Keys

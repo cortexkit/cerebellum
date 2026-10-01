@@ -10,7 +10,8 @@ use cerebellum_macos::{
 
 use super::source::{
     AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
-    ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds, TextAttribute,
+    ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds, RunningApp,
+    TextAttribute,
 };
 use crate::platform::native::{verify_grant, GrantVerification};
 use crate::platform::ProcessGrant;
@@ -78,6 +79,7 @@ fn convert(element: AxStateElement) -> RawElement {
         enabled: element.enabled,
         focused: element.focused,
         expanded: element.expanded,
+        url: element.url,
         children: element.children.into_iter().map(convert).collect(),
         unreadable_children: element.unreadable_children,
     }
@@ -207,4 +209,36 @@ impl AppStateSource for MacAppStateSource {
     fn frontmost_pid(&self) -> Option<u32> {
         cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
     }
+
+    /// Regular applications only: an application whose policy could not be
+    /// read is left out rather than guessed at, because the list is what a
+    /// name given as a target is matched against.
+    fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
+        let applications = cerebellum_macos::running_applications(RUNNING_APPS_TIMEOUT)
+            .map_err(|_| AppStateReadError::Unreadable)?;
+        let frontmost = self.frontmost_pid();
+        let mut apps: Vec<RunningApp> = applications
+            .into_iter()
+            .filter(|application| {
+                application.regular == Some(true) && !application.bundle_identifier.is_empty()
+            })
+            .map(|application| RunningApp {
+                frontmost: frontmost == Some(application.pid),
+                name: application.name,
+                bundle_identity: application.bundle_identifier,
+                pid: application.pid,
+            })
+            .collect();
+        apps.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then(left.pid.cmp(&right.pid))
+        });
+        Ok(apps)
+    }
 }
+
+/// How long the window server may take to list the running applications:
+/// the `computer.list_apps` row declares the same 1000 ms deadline.
+const RUNNING_APPS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);

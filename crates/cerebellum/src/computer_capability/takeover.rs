@@ -387,10 +387,18 @@ where
         arguments: &Value,
         context: super::ServeContext<'_, C>,
     ) -> Value {
-        let request = match parse_request(capability, arguments) {
+        let mut request = match parse_request(capability, arguments) {
             Ok(request) => request,
             Err(refusal) => return refusal,
         };
+        // A scroll's target may be the application's name; it is resolved
+        // to a bundle identity once, before anything is placed or asked.
+        if let TakeoverRequest::Scroll { target, .. } = &mut request {
+            *target = match self.resolve_target_name(target).await {
+                Ok(bundle_identity) => bundle_identity,
+                Err(refusal) => return refusal,
+            };
+        }
         let super::ServeContext {
             cancel,
             grantee,

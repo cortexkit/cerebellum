@@ -309,7 +309,9 @@ fn capability_declaration(
     let id = capability.capability_id();
     let action_kind = capability.action_kind();
     let retry_class = match capability {
-        ComputerCapability::ReadState | ComputerCapability::Wait => RetryClass::Idempotent,
+        ComputerCapability::ReadState | ComputerCapability::Wait | ComputerCapability::ListApps => {
+            RetryClass::Idempotent
+        }
         _ => RetryClass::NeverAutomaticRetry,
     };
     // Use the shared capability-vocabulary lookup instead of duplicating its
@@ -399,6 +401,22 @@ fn capability_declaration(
                         .to_string(),
                 ),
             }
+        };
+        advertised = suppression_reason.is_none();
+    } else if id == "computer.list_apps" {
+        // Names, bundle identities and pids of running applications: no
+        // window content, so no accessibility or screen grant is a condition.
+        // It is part of reading application state and shares that review.
+        suppression_reason = if !platform_available {
+            Some("no application-state reader on this platform".to_string())
+        } else if !context.inputs.vocabulary_ready() {
+            Some("computer action vocabulary input unresolved".to_string())
+        } else if context.inputs.app_state_review_revision.is_none() {
+            Some("application state review revision is not bound".to_string())
+        } else if context.inputs.release_signing_topology_revision.is_none() {
+            Some("release signing topology revision is not bound".to_string())
+        } else {
+            None
         };
         advertised = suppression_reason.is_none();
     } else if id == "computer.wait" {

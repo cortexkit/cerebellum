@@ -93,7 +93,9 @@ impl FrozenDispatchRow {
                 ComputerCapability::TakeoverMove
                 | ComputerCapability::TakeoverDrag
                 | ComputerCapability::TakeoverScroll => (false, false, true),
-                ComputerCapability::ReadState | ComputerCapability::Wait => (false, false, false),
+                ComputerCapability::ReadState
+                | ComputerCapability::Wait
+                | ComputerCapability::ListApps => (false, false, false),
                 ComputerCapability::Click
                 | ComputerCapability::Scroll
                 | ComputerCapability::Move
