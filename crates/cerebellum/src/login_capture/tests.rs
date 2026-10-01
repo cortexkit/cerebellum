@@ -415,6 +415,14 @@ async fn only_an_affirmative_answer_proceeds() {
         assert!(question.is_some());
         assert_eq!(outcome.reply["outcome"], "capture_consent_not_given");
         assert_eq!(outcome.reply["reason"], reason);
+        // A question nobody saw must not tell the caller to ask again: the
+        // next one reaches nobody either, so that remedy is a loop.
+        let remedy = outcome.reply["remedy"].as_str().unwrap();
+        assert_eq!(
+            remedy.contains("Ask again"),
+            reason != "not_put_to_anyone" && reason != "undeliverable",
+            "{reason}: {remedy}"
+        );
         assert!(fixture.fs.contents().is_empty(), "{reason}");
         assert_eq!(
             fixture.launcher.launches.load(Ordering::SeqCst),

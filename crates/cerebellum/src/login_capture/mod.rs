@@ -1012,7 +1012,7 @@ impl CaptureModule {
         if let Some(reason) = consent_refusal(&answer) {
             return record.refused(
                 "capture_consent_not_given",
-                json!({"reason": reason, "remedy": "nothing was captured; ask again only if the person wants this login held"}),
+                json!({"reason": reason, "remedy": consent_refusal_remedy(reason)}),
             );
         }
 
@@ -1510,6 +1510,21 @@ fn consent_refusal(answer: &AskOutcome) -> Option<&'static str> {
         AskOutcome::NoAnswer => Some("no_answer"),
         AskOutcome::NotPutToAnyone => Some("not_put_to_anyone"),
         AskOutcome::Undeliverable => Some("undeliverable"),
+    }
+}
+
+/// What a caller should do after each refusal [`consent_refusal`] names.
+///
+/// One remedy for all of them would be wrong for most: telling a caller to ask
+/// again after a question nobody was shown sends it round a loop it cannot
+/// leave, because the next question reaches nobody either.
+fn consent_refusal_remedy(reason: &str) -> &'static str {
+    match reason {
+        "deny" => "nothing was captured; the person declined. Ask again only if they now want this login held.",
+        "no_answer" => "nothing was captured; the person was asked but did not answer in time. Ask again when they are available.",
+        "not_put_to_anyone" => "nothing was captured; the question reached nobody, so asking again will not help until a person can be reached through the caller's consent route.",
+        "undeliverable" => "nothing was captured; the question could not be sent. Retry once; if it fails again, the module needs attention.",
+        _ => "nothing was captured; the answer was not one this question offered. Ask again.",
     }
 }
 
