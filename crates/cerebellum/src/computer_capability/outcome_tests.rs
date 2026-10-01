@@ -70,6 +70,8 @@ const COMMON_OUTCOMES: &[&str] = &[
     "delivery_unconfirmed",
     "refused",
     "private_input_auth_failed",
+    "ambiguous_app",
+    "no_running_app_named",
 ];
 
 fn dispatch_refusals() -> Vec<DispatchError> {
@@ -209,9 +211,29 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         json!({"outcome": "not_servable", "remedy": "this capability has no dispatch row; report it"}),
         json!({"outcome": "private_input_auth_failed"}),
     ]);
+    // A target given by name that matches nobody, and one that matches two
+    // different applications.
+    let editor = |bundle_identity: &str, pid| RunningApp {
+        name: "Editor".into(),
+        bundle_identity: bundle_identity.into(),
+        pid,
+        frontmost: false,
+    };
+    replies.push(match_target_name("Nobody", &[editor("com.example.Editor", 1)]).unwrap_err());
+    replies.push(
+        match_target_name(
+            "Editor",
+            &[editor("com.example.Editor", 1), editor("org.example.Editor", 2)],
+        )
+        .unwrap_err(),
+    );
     match capability {
         ComputerCapability::Type => {
-            replies.push(json!({"outcome": "completed", "effect_status": "effect_observed"}))
+            replies.push(json!({"outcome": "completed", "effect_status": "effect_observed"}));
+            // The diff an accepted keystroke carries, as text.
+            let mut typed = json!({"outcome": "completed", "effect_status": "effect_observed"});
+            element_actions::add_diff(&mut typed, None);
+            replies.push(typed);
         }
         ComputerCapability::Keys => replies.extend([
             chord_blocked_refusal("command+option+escape", "session_ending"),

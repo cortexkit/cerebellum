@@ -9,12 +9,20 @@
 //! restarted names nothing.
 //!
 //! Each reply carries the diff from the conversation's last state read, taken
-//! after a short wait for the application to show the effect.
+//! after a short wait for the application to show the effect, as text in the
+//! read's own line grammar.
+//!
+//! A request may also name the application with `target`. The element or
+//! image already decides which application is acted in, so the target only
+//! guards against a caller that confused two applications' ids: one naming
+//! another application is refused, and otherwise it changes nothing.
 
 use std::time::{Duration, Instant};
 
-use cerebellum_computer::app_state::render::is_session_ending_title;
-use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, StateDiff};
+use cerebellum_computer::app_state::render::{
+    is_session_ending_title, render_diff, STATE_TEXT_FIELD,
+};
+use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
 use cerebellum_computer::app_state::source::{
     AppStateSource, ElementActionError, ElementFacts, ElementHandle, HitScope, ReadBounds,
     TextAttribute,
@@ -39,11 +47,6 @@ use crate::CancelHandle;
 
 /// How often the state is re-read while waiting for an action's effect.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
-
-/// The most element ids one diff lists across its three arrays. Past it the
-/// rest are counted in `truncation`, which keeps an action's reply well under
-/// the 64 KB every reply is held to even with long session tokens.
-pub(crate) const MAX_DIFF_ENTRIES: usize = 1_500;
 
 /// The longest an action waits for its effect to show before taking the
 /// diff, from the row's own settle bound. A row that declares none (keys)
@@ -101,8 +104,8 @@ fn audit_unavailable_reply(acted: bool) -> Value {
     }
 }
 
-/// Fields a request may carry, refusing any other; every listed field is
-/// required.
+/// Fields a request may carry, refusing any other. Which of them are
+/// required is each parser's own check.
 fn object_with_fields<'a>(
     arguments: &'a Value,
     fields: &[&str],
@@ -129,20 +132,43 @@ fn required_string(object: &serde_json::Map<String, Value>, field: &str) -> Resu
     }
 }
 
-/// Every field `computer.press_element` accepts; all are required.
-pub(crate) const PRESS_ELEMENT_FIELDS: [&str; 1] = ["element_id"];
-/// Every field `computer.press_point` accepts; all are required.
-pub(crate) const PRESS_POINT_FIELDS: [&str; 3] = ["image_id", "x", "y"];
-/// Every field `computer.write_text` accepts; all are required.
-pub(crate) const WRITE_TEXT_FIELDS: [&str; 3] = ["element_id", "text", "write_mode"];
+/// Every field `computer.press_element` accepts, and the ones it requires.
+pub(crate) const PRESS_ELEMENT_FIELDS: [&str; 2] = ["element_id", "target"];
+#[cfg(test)]
+pub(crate) const PRESS_ELEMENT_REQUIRED: [&str; 1] = ["element_id"];
+/// Every field `computer.press_point` accepts, and the ones it requires.
+pub(crate) const PRESS_POINT_FIELDS: [&str; 4] = ["image_id", "target", "x", "y"];
+#[cfg(test)]
+pub(crate) const PRESS_POINT_REQUIRED: [&str; 3] = ["image_id", "x", "y"];
+/// Every field `computer.write_text` accepts, and the ones it requires.
+pub(crate) const WRITE_TEXT_FIELDS: [&str; 4] = ["element_id", "target", "text", "write_mode"];
+#[cfg(test)]
+pub(crate) const WRITE_TEXT_REQUIRED: [&str; 3] = ["element_id", "text", "write_mode"];
 
-pub(crate) fn parse_press_element(arguments: &Value) -> Result<String, Value> {
+/// The optional `target` an element action carries.
+fn optional_target(object: &serde_json::Map<String, Value>) -> Result<Option<String>, Value> {
+    match object.get("target") {
+        None => Ok(None),
+        Some(_) => required_string(object, "target").map(Some),
+    }
+}
+
+pub(crate) struct ParsedPressElement {
+    pub element_id: String,
+    pub target: Option<String>,
+}
+
+pub(crate) fn parse_press_element(arguments: &Value) -> Result<ParsedPressElement, Value> {
     let object = object_with_fields(arguments, &PRESS_ELEMENT_FIELDS)?;
-    required_string(object, "element_id")
+    Ok(ParsedPressElement {
+        element_id: required_string(object, "element_id")?,
+        target: optional_target(object)?,
+    })
 }
 
 pub(crate) struct ParsedPressPoint {
     pub image_id: String,
+    pub target: Option<String>,
     pub x: u64,
     pub y: u64,
 }
@@ -150,12 +176,14 @@ pub(crate) struct ParsedPressPoint {
 pub(crate) fn parse_press_point(arguments: &Value) -> Result<ParsedPressPoint, Value> {
     let object = object_with_fields(arguments, &PRESS_POINT_FIELDS)?;
     let image_id = required_string(object, "image_id")?;
+    let target = optional_target(object)?;
     let coordinate = |field: &str| match object.get(field) {
         Some(value) => value.as_u64().ok_or_else(|| invalid(field, "wrong_type")),
         None => Err(invalid(field, "missing_field")),
     };
     Ok(ParsedPressPoint {
         image_id,
+        target,
         x: coordinate("x")?,
         y: coordinate("y")?,
     })
@@ -173,6 +201,7 @@ pub(crate) enum WriteMode {
 
 pub(crate) struct ParsedWriteText {
     pub element_id: String,
+    pub target: Option<String>,
     pub text: String,
     pub mode: WriteMode,
 }
@@ -180,6 +209,7 @@ pub(crate) struct ParsedWriteText {
 pub(crate) fn parse_write_text(arguments: &Value) -> Result<ParsedWriteText, Value> {
     let object = object_with_fields(arguments, &WRITE_TEXT_FIELDS)?;
     let element_id = required_string(object, "element_id")?;
+    let target = optional_target(object)?;
     // Empty text is allowed: replacing a value with nothing clears it.
     let text = match object.get("text") {
         Some(Value::String(text)) => text.clone(),
@@ -198,6 +228,7 @@ pub(crate) fn parse_write_text(arguments: &Value) -> Result<ParsedWriteText, Val
     };
     Ok(ParsedWriteText {
         element_id,
+        target,
         text,
         mode,
     })
@@ -546,6 +577,7 @@ where
         element_id,
         text,
         mode,
+        target: _,
     } = request;
     let (element_id, text, mode) = (element_id.as_str(), text.as_str(), *mode);
     let facts = match source.element_facts(handle) {
@@ -738,13 +770,14 @@ pub(crate) fn adopt(
 /// Wait up to `bound` for the application's state to differ from the
 /// conversation's baseline, then diff against it and make that read the new
 /// baseline. An unchanged state after the bound is reported as an empty diff.
+/// `None` when the application could not be read at all.
 pub(crate) fn settle_and_observe(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
     conversation_key: &str,
     grant: &ProcessGrant,
     bound: Duration,
-) -> (StateDiff, Option<String>, usize) {
+) -> Option<SessionRead> {
     let deadline = Instant::now() + bound;
     loop {
         match source.read_app_state(grant, ReadBounds::default()) {
@@ -752,50 +785,84 @@ pub(crate) fn settle_and_observe(
                 if Instant::now() >= deadline
                     || sessions.differs_from_baseline(conversation_key, grant, &read)
                 {
-                    let observed = sessions.observe(conversation_key, grant, &read);
-                    return (
-                        observed.diff,
-                        observed.focused_element_id,
-                        observed.unreadable_subtrees,
-                    );
+                    return Some(sessions.observe(conversation_key, grant, &read));
                 }
             }
             // Nothing could be read, so nothing is known about what changed.
-            Err(_) => return (StateDiff::default(), None, 1),
+            Err(_) => return None,
         }
         std::thread::sleep(SETTLE_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
-/// Add a diff to a reply, cutting it to [`MAX_DIFF_ENTRIES`] ids and saying
-/// how many were left out.
-pub(crate) fn add_diff(
-    reply: &mut Value,
-    diff: StateDiff,
-    focused_element_id: Option<String>,
-    unreadable_subtrees: usize,
-) {
-    let mut room = MAX_DIFF_ENTRIES;
-    let mut omitted = 0;
-    let mut listed = |ids: Vec<String>| -> Vec<Value> {
-        let keep = ids.len().min(room);
-        room -= keep;
-        omitted += ids.len() - keep;
-        ids.into_iter()
-            .take(keep)
-            .map(|element_id| json!({"element_id": element_id}))
-            .collect()
+/// What an action reply says when the application could not be read after
+/// the action: nothing is known of what changed, which is not "nothing
+/// changed".
+const DIFF_UNREADABLE: &str =
+    "The application could not be read after the action, so what changed is unknown; \
+     read_state to see its state.\n";
+
+/// Add what an action changed to its reply, as text in the read grammar,
+/// with the cap's disclosure, the focused element and how much of the read
+/// behind it could not be opened.
+pub(crate) fn add_diff(reply: &mut Value, observed: Option<&SessionRead>) {
+    let Some(observed) = observed else {
+        reply[STATE_TEXT_FIELD] = json!(DIFF_UNREADABLE);
+        reply["unreadable_subtrees"] = json!(1);
+        return;
     };
-    reply["changed"] = Value::Array(listed(diff.changed));
-    reply["added"] = Value::Array(listed(diff.added));
-    reply["removed"] = Value::Array(listed(diff.removed));
-    if omitted > 0 {
-        reply["truncation"] = json!({"reason": "element_cap_reached", "omitted_elements": omitted});
+    let rendered = render_diff(
+        &observed.roots,
+        &observed.diff,
+        observed.focused_element_id.as_deref(),
+    );
+    reply[STATE_TEXT_FIELD] = json!(rendered.text);
+    if let Some(truncation) = rendered.truncation {
+        reply["truncation"] = json!({
+            "reason": truncation.reason.as_str(),
+            "omitted_elements": truncation.omitted_elements,
+        });
     }
-    if let Some(focused) = focused_element_id {
+    if let Some(focused) = &observed.focused_element_id {
         reply["focused_element_id"] = json!(focused);
     }
-    reply["unreadable_subtrees"] = json!(unreadable_subtrees);
+    reply["unreadable_subtrees"] = json!(observed.unreadable_subtrees);
+}
+
+/// Whether an element action's `target` names the application the element
+/// belongs to: its bundle identity, or the name it runs under.
+///
+/// A name is checked against the running applications; when they cannot be
+/// read, a name cannot be confirmed or denied and is let through, because
+/// the element already decides where the action lands. A bundle identity
+/// needs no list to compare.
+pub(crate) fn target_names_application(
+    source: &dyn AppStateSource,
+    target: &str,
+    bundle_identity: &str,
+    pid: u32,
+) -> bool {
+    let wanted = target.trim();
+    if wanted.eq_ignore_ascii_case(bundle_identity) {
+        return true;
+    }
+    match source.running_apps() {
+        Ok(apps) => apps
+            .iter()
+            .any(|app| app.pid == pid && app.name.trim().eq_ignore_ascii_case(wanted)),
+        Err(_) => !super::looks_like_bundle_identity(wanted),
+    }
+}
+
+/// The refusal for a `target` naming another application than the element's.
+pub(crate) fn target_mismatch_reply(target: &str) -> Value {
+    json!({
+        "outcome": "target_mismatch",
+        "target": target,
+        "remedy": "target names a different application from the one this element or image \
+                   belongs to, so nothing was done; drop target, or use an id read from the \
+                   application target names",
+    })
 }
 
 enum PressTarget {
@@ -820,8 +887,8 @@ where
         arguments: &Value,
         context: super::ServeContext<'_, C>,
     ) -> Value {
-        let element_id = match parse_press_element(arguments) {
-            Ok(element_id) => element_id,
+        let ParsedPressElement { element_id, target } = match parse_press_element(arguments) {
+            Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
         let super::ServeContext {
@@ -848,6 +915,9 @@ where
                     return stale_element_reply()
                 }
             };
+        if let Some(refusal) = self.check_target(target, &bundle_identity, pid).await {
+            return refusal;
+        }
         let (grant, admission) = match admit_session_app(
             management,
             &consent,
@@ -909,6 +979,12 @@ where
         let Some(image) = sessions.resolve_image(&conversation_key, &parsed.image_id) else {
             return image_unknown();
         };
+        if let Some(refusal) = self
+            .check_target(parsed.target.clone(), &image.bundle_identity, image.pid)
+            .await
+        {
+            return refusal;
+        }
         if parsed.x >= u64::from(image.width_px) || parsed.y >= u64::from(image.height_px) {
             return json!({
                 "outcome": "point_out_of_bounds",
@@ -984,6 +1060,12 @@ where
                 // was never shown; it names nothing writable.
                 _ => return stale_element_reply(),
             };
+        if let Some(refusal) = self
+            .check_target(parsed.target.clone(), &bundle_identity, pid)
+            .await
+        {
+            return refusal;
+        }
         let (grant, admission) = match admit_session_app(
             management,
             &consent,
@@ -1029,14 +1111,14 @@ where
                 reply["outcome"].as_str(),
                 Some("completed" | "delivery_unconfirmed")
             ) {
-                let (diff, focused, unreadable) = settle_and_observe(
+                let observed = settle_and_observe(
                     source.as_ref(),
                     &sessions,
                     &conversation_key,
                     &grant,
                     settle,
                 );
-                add_diff(&mut reply, diff, focused, unreadable);
+                add_diff(&mut reply, observed.as_ref());
             }
             if journal.finish().is_err() {
                 return audit_unavailable_reply(true);
@@ -1047,6 +1129,29 @@ where
         .unwrap_or_else(|_| audit_unavailable_reply(true));
         admission.decorate(&mut reply);
         reply
+    }
+
+    /// The refusal for an element action whose `target` names another
+    /// application than the one the element or image belongs to, or `None`
+    /// when it names that one or there is no target. Checked before any
+    /// grant is asked for, so nobody is asked about an action that will not
+    /// happen.
+    async fn check_target(
+        &self,
+        target: Option<String>,
+        bundle_identity: &str,
+        pid: u32,
+    ) -> Option<Value> {
+        let target = target?;
+        let source = self.app_state_source.clone();
+        let bundle_identity = bundle_identity.to_string();
+        let checked = target.clone();
+        let matches = tokio::task::spawn_blocking(move || {
+            target_names_application(source.as_ref(), &checked, &bundle_identity, pid)
+        })
+        .await
+        .unwrap_or(false);
+        (!matches).then(|| target_mismatch_reply(&target))
     }
 
     /// Press an element and, when the press went through, wait for its effect
@@ -1098,14 +1203,14 @@ where
             };
             let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if reply["outcome"] == "completed" {
-                let (diff, focused, unreadable) = settle_and_observe(
+                let observed = settle_and_observe(
                     source.as_ref(),
                     &sessions,
                     &identity.conversation_key,
                     &grant,
                     settle,
                 );
-                add_diff(&mut reply, diff, focused, unreadable);
+                add_diff(&mut reply, observed.as_ref());
             }
             if journal.finish().is_err() {
                 return audit_unavailable_reply(true);

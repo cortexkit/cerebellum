@@ -35,7 +35,9 @@ mod macos_probe {
     use std::time::{Duration, Instant};
 
     use cerebellum_computer::app_state::native::MacAppStateSource;
-    use cerebellum_computer::app_state::render::{render, RenderFilter};
+    use cerebellum_computer::app_state::render::{
+        render_state, StateHeader, StateRequest, Truncation, Zoom,
+    };
     use cerebellum_computer::app_state::session::AppStateSessions;
     use cerebellum_computer::app_state::source::{AppStateSource, ReadBounds};
     use cerebellum_computer::platform::native::resolve_target;
@@ -95,7 +97,32 @@ mod macos_probe {
         let elapsed = started.elapsed();
         let sessions = AppStateSessions::new();
         let observed = sessions.observe("live-probe", &grant, &raw);
-        let rendered = render(&observed.roots, &RenderFilter::default());
+        // Every top-level element in full, as zooming into each one prints
+        // it, so the probe sees the whole tree rather than the outline.
+        let mut tree = String::new();
+        let mut truncation: Option<Truncation> = None;
+        for root in observed.roots.iter().filter_map(|root| root.element_id.as_deref()) {
+            let rendered = render_state(
+                &StateHeader {
+                    app_name: &grant.bundle_identity,
+                    focused_element_id: None,
+                },
+                &observed.roots,
+                &StateRequest {
+                    zoom: Some(Zoom::Element(root)),
+                    ..Default::default()
+                },
+            );
+            if let Some((_, body)) = rendered.text.split_once('\n') {
+                tree.push_str(body);
+            }
+            truncation = truncation.or(rendered.truncation);
+        }
+        struct Rendered {
+            tree: String,
+            truncation: Option<Truncation>,
+        }
+        let rendered = Rendered { tree, truncation };
         let lines: Vec<&str> = rendered.tree.lines().collect();
 
         println!("application: {} (pid {})", grant.bundle_identity, grant.pid);

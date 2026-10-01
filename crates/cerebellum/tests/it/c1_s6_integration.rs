@@ -86,6 +86,7 @@ fn every_served_row() -> Vec<&'static str> {
         "computer.takeover_drag",
         "computer.takeover_scroll",
         "computer.wait",
+        "computer.list_apps",
     ]
 }
 
@@ -118,8 +119,8 @@ fn empty_runtime_advertisement_reports_every_frozen_row_without_functional_claim
         startup: StartupCapabilityProbe::default(),
     };
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.frozen_row_count, 10);
-    assert_eq!(evidence.canonical_row_count, 10);
+    assert_eq!(evidence.frozen_row_count, 11);
+    assert_eq!(evidence.canonical_row_count, 11);
     assert_eq!(evidence.advertised_row_count, 0);
     assert_eq!(evidence.exercised_row_count, 0);
     assert_eq!(
@@ -499,8 +500,8 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             ),
             "app_state_review_revision" => assert_eq!(
                 admitted,
-                every_served_row_but(&["computer.read_state"]),
-                "{gate} governs the state read alone"
+                every_served_row_but(&["computer.read_state", "computer.list_apps"]),
+                "{gate} governs the state read and the application list"
             ),
             "element_addressed_review_revision" => assert_eq!(
                 admitted,
@@ -664,10 +665,11 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
 /// The wait polls the same tree read_state reads, under the same app grant, so
 /// it must not stay advertised when that review is unbound: otherwise a build
 /// placed with the key unbound would still read trees, with no key left that
-/// withdraws it.
+/// withdraws it. The list of running applications a caller picks a target
+/// from is part of the same reviewed surface, so the key withdraws it too.
 #[test]
 fn every_tree_read_is_withdrawn_by_the_app_state_key() {
-    const TREE_READS: [&str; 2] = ["computer.read_state", "computer.wait"];
+    const TREE_READS: [&str; 3] = ["computer.read_state", "computer.wait", "computer.list_apps"];
     let bound = valid_context();
     let mut inputs = valid_inputs();
     inputs.app_state_review_revision = None;

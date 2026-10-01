@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use cerebellum_computer::app_state::image::{
     release_through_custody, ImageUnavailable, ReleasedImage, WindowImageCapture,
 };
-use cerebellum_computer::app_state::render::{render, RenderFilter};
+use cerebellum_computer::app_state::render::{
+    render_state, StateHeader, StateRequest, Zoom, STATE_TEXT_FIELD,
+};
+use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage};
 use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
 use cerebellum_computer::app_state::AuditImageCustody;
@@ -308,6 +311,7 @@ enum Served {
     TakeoverDrag,
     TakeoverScroll,
     Wait,
+    ListApps,
 }
 
 impl Servable {
@@ -323,6 +327,7 @@ impl Servable {
             Served::TakeoverDrag => ComputerCapability::TakeoverDrag,
             Served::TakeoverScroll => ComputerCapability::TakeoverScroll,
             Served::Wait => ComputerCapability::Wait,
+            Served::ListApps => ComputerCapability::ListApps,
         }
     }
 }
@@ -351,6 +356,7 @@ pub fn servable(name: &str) -> Option<Servable> {
         ComputerCapability::TakeoverMove => Served::TakeoverMove,
         ComputerCapability::TakeoverDrag => Served::TakeoverDrag,
         ComputerCapability::TakeoverScroll => Served::TakeoverScroll,
+        ComputerCapability::ListApps => Served::ListApps,
         // Readable from the journal only; never served.
         ComputerCapability::Click
         | ComputerCapability::Scroll
@@ -687,6 +693,7 @@ where
                     .await
             }
             Served::Wait => self.serve_wait(arguments, context).await,
+            Served::ListApps => self.serve_list_apps(arguments, context).await,
             Served::PressElement => self.serve_press_element(arguments, context).await,
             Served::PressPoint => self.serve_press_point(arguments, context).await,
             Served::WriteText => self.serve_write_text(arguments, context).await,
@@ -765,8 +772,12 @@ where
         context: ServeContext<'_, C>,
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Value {
-        let parsed = match parse_read_state_request(arguments) {
+        let mut parsed = match parse_read_state_request(arguments) {
             Ok(parsed) => parsed,
+            Err(refusal) => return refusal,
+        };
+        parsed.target = match self.resolve_target_name(&parsed.target).await {
+            Ok(bundle_identity) => bundle_identity,
             Err(refusal) => return refusal,
         };
         let ServeContext {
@@ -797,8 +808,9 @@ where
         // An id from another application, another process generation or
         // another conversation names nothing here; refused before reading so
         // the caller learns it at once.
-        if let Some(subtree) = &parsed.subtree_element_id {
-            match sessions.resolve(&conversation_key, subtree) {
+        let zoom = parsed.zoom.as_deref().map(Zoom::parse);
+        if let Some(Zoom::Element(zoomed)) = zoom {
+            match sessions.resolve(&conversation_key, zoomed) {
                 ElementResolution::Live {
                     bundle_identity,
                     pid,
@@ -808,7 +820,7 @@ where
                     && pid == grant.pid
                     && process_generation == grant.process_generation_evidence => {}
                 _ => {
-                    let mut reply = stale_subtree_reply();
+                    let mut reply = stale_zoom_reply();
                     admission.decorate(&mut reply);
                     return reply;
                 }
@@ -860,23 +872,28 @@ where
         };
 
         let observed = sessions.observe(&conversation_key, &grant, &raw);
-        let rendered = render(
+        let app_name = management.application_name(&grant);
+        let rendered = render_state(
+            &StateHeader {
+                app_name: &app_name,
+                focused_element_id: observed.focused_element_id.as_deref(),
+            },
             &observed.roots,
-            &RenderFilter {
+            &StateRequest {
+                zoom,
                 roles: &parsed.role_filter,
                 text: parsed.text_filter.as_deref(),
-                subtree: parsed.subtree_element_id.as_deref(),
             },
         );
-        if parsed.subtree_element_id.is_some() && !rendered.subtree_found {
-            let mut reply = stale_subtree_reply();
+        if !rendered.zoom_found {
+            let mut reply = stale_zoom_reply();
             admission.decorate(&mut reply);
             return reply;
         }
 
         let mut reply = json!({
             "outcome": "completed",
-            "tree": rendered.tree,
+            STATE_TEXT_FIELD: rendered.text,
             "unreadable_subtrees": observed.unreadable_subtrees,
         });
         if let Some(focused) = observed.focused_element_id {
@@ -1142,6 +1159,10 @@ where
         use keystrokes::refused_before_posting as unposted;
         let mut parsed = match parse_synthetic_request(capability, arguments) {
             Ok(parsed) => parsed,
+            Err(refusal) => return unposted(refusal),
+        };
+        parsed.target = match self.resolve_target_name(&parsed.target).await {
+            Ok(bundle_identity) => bundle_identity,
             Err(refusal) => return unposted(refusal),
         };
 
@@ -1494,14 +1515,14 @@ where
                         finished["effect_status"] = json!("effect_observed");
                     }
                 }
-                let (diff, focused_id, unreadable) = element_actions::settle_and_observe(
+                let observed = element_actions::settle_and_observe(
                     source.as_ref(),
                     &sessions,
                     &conversation_key,
                     &grant,
                     settle,
                 );
-                element_actions::add_diff(&mut finished, diff, focused_id, unreadable);
+                element_actions::add_diff(&mut finished, observed.as_ref());
                 finished
             })
             .await
@@ -1521,6 +1542,131 @@ where
             },
         );
     }
+
+    /// The bundle identity a request's `target` names, which may be the
+    /// application's display name, or the refusal for a name that matches
+    /// no running application or several.
+    ///
+    /// A target spelled like a bundle identity is passed on unread, so it is
+    /// resolved exactly as before and one nobody runs is still `not_running`.
+    /// A name needs the running applications; when they cannot be listed the
+    /// name is passed on too, and resolving it says what it always said.
+    pub(crate) async fn resolve_target_name(&self, target: &str) -> Result<String, Value> {
+        if looks_like_bundle_identity(target) {
+            return Ok(target.to_string());
+        }
+        let source = self.app_state_source.clone();
+        let listed = tokio::task::spawn_blocking(move || source.running_apps())
+            .await
+            .unwrap_or(Err(AppStateReadError::Unreadable));
+        match listed {
+            Ok(apps) => match_target_name(target, &apps),
+            Err(_) => Ok(target.to_string()),
+        }
+    }
+
+    /// `computer.list_apps`: the running regular applications, by name,
+    /// bundle identity and pid.
+    ///
+    /// No application's grant is asked for: the list names applications and
+    /// reveals nothing of any window. The caller still reached this through
+    /// an admitted session route, and the read is journaled with the count of
+    /// applications alone, never their names.
+    async fn serve_list_apps<C: MonotonicClock>(
+        &self,
+        arguments: &Value,
+        context: ServeContext<'_, C>,
+    ) -> Value {
+        if let Err(refusal) = parse_list_apps_request(arguments) {
+            return refusal;
+        }
+        let source = self.app_state_source.clone();
+        let listed = tokio::task::spawn_blocking(move || source.running_apps())
+            .await
+            .unwrap_or(Err(AppStateReadError::Unreadable));
+        let audit = self.audit.clone();
+        let identity = context.identity;
+        let summary = match &listed {
+            Ok(apps) => json!({"app_count": apps.len()}),
+            Err(_) => json!({"app_count": 0, "listed": false}),
+        };
+        let journaled = tokio::task::spawn_blocking(move || {
+            journal_list_apps(&mut audit.blocking_lock(), identity, &summary)
+        })
+        .await
+        .unwrap_or(Err(()));
+        if journaled.is_err() {
+            return json!({
+                "outcome": "audit_unavailable",
+                "remedy": "the module could not record the listing, so it withheld it; retry shortly",
+            });
+        }
+        match listed {
+            Ok(apps) => json!({
+                "outcome": "completed",
+                STATE_TEXT_FIELD: running_apps_text(&apps),
+                "apps": apps
+                    .iter()
+                    .map(|app| json!({
+                        "name": app.name,
+                        "bundle_identity": app.bundle_identity,
+                        "pid": app.pid,
+                        "frontmost": app.frontmost,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Err(_) => json!({
+                "outcome": "targets_unreadable",
+                "unreadable": {"reason": "window_list_unavailable"},
+                "remedy": "the running applications could not be read; retry, and if it keeps \
+                           failing name the application by its bundle identity",
+            }),
+        }
+    }
+}
+
+/// One text-free journal row for a `list_apps` call: the capability and the
+/// count of applications listed, never their names, so a journal reader
+/// learns that the list was read and not what was running.
+fn journal_list_apps<R, T, S>(
+    audit: &mut ComputerAudit<R, T, S>,
+    identity: JournalIdentity,
+    summary: &Value,
+) -> Result<(), ()>
+where
+    R: Redactor,
+    T: SeverityTaxonomy,
+    S: JournalStorage,
+{
+    use cerebellum_computer::audit::{
+        ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
+    };
+    use cerebellum_computer::grounding::ContainmentRung;
+    // No process is read, so no rung narrower than the whole machine applies.
+    let rung = ContainmentRung::GlobalNone;
+    let descriptor = ComputerPlaneDescriptor::new(
+        ComputerCapability::ListApps,
+        rung,
+        ObservationState::HumanUnobserved,
+    );
+    let reservation = audit.reserve(identity, descriptor).map_err(|_| ())?;
+    let dispatch = TypedCaptureDispatch::new(
+        ComputerCapability::ListApps,
+        rung,
+        ObservationState::HumanUnobserved,
+    )
+    .dispatch_material(ComputerCapability::ListApps.capability_id().as_bytes().to_vec());
+    let token = audit
+        .commit_dispatched(reservation, &dispatch, b"session_route".to_vec(), None)
+        .map_err(|_| ())?;
+    audit
+        .finalize_dispatched(
+            token,
+            serde_json::to_vec(summary).map_err(|_| ())?,
+            Vec::new(),
+        )
+        .map_err(|_| ())?;
+    Ok(())
 }
 
 /// The platform's application-state reader, or one that refuses where there
@@ -1543,7 +1689,7 @@ const MAX_ROLE_FILTERS: usize = 16;
 const READ_STATE_REQUEST_FIELDS: [&str; 5] = [
     "target",
     "role_filter",
-    "subtree_element_id",
+    "zoom",
     "text_filter",
     "include_image",
 ];
@@ -1554,7 +1700,8 @@ const READ_STATE_REQUIRED_FIELDS: [&str; 1] = ["target"];
 struct ParsedReadState {
     target: String,
     role_filter: Vec<String>,
-    subtree_element_id: Option<String>,
+    /// An element id, or `menubar`; see [`Zoom::parse`].
+    zoom: Option<String>,
     text_filter: Option<String>,
     include_image: bool,
 }
@@ -1620,7 +1767,7 @@ fn parse_read_state_request(arguments: &Value) -> Result<ParsedReadState, Value>
     Ok(ParsedReadState {
         target,
         role_filter,
-        subtree_element_id: optional_text(object, "subtree_element_id")?,
+        zoom: optional_text(object, "zoom")?,
         text_filter: optional_text(object, "text_filter")?,
         include_image,
     })
@@ -1644,12 +1791,100 @@ fn screen_locked_reply() -> Value {
     })
 }
 
-fn stale_subtree_reply() -> Value {
+fn stale_zoom_reply() -> Value {
     json!({
         "outcome": "stale_element",
-        "remedy": "subtree_element_id names no element of this application's current state; \
-                   read the state again without it and use an id from that read",
+        "remedy": "zoom names no element of this application's current state; read the state \
+                   again without it and zoom into an id from that read",
     })
+}
+
+/// Whether a target is spelled like a bundle identity (`com.apple.Safari`)
+/// rather than a display name (`Safari`): dotted, with no spaces.
+pub(crate) fn looks_like_bundle_identity(target: &str) -> bool {
+    let target = target.trim();
+    target.contains('.') && !target.contains(char::is_whitespace)
+}
+
+/// Every field `computer.list_apps` accepts: none.
+fn parse_list_apps_request(arguments: &Value) -> Result<(), Value> {
+    let Some(object) = arguments.as_object() else {
+        return Err(invalid_read_state_request("$", "wrong_type"));
+    };
+    match object.keys().min() {
+        Some(field) => Err(invalid_read_state_request(field, "unknown_field")),
+        None => Ok(()),
+    }
+}
+
+/// The running applications as `list_apps` prints them: one per line.
+fn running_apps_text(apps: &[RunningApp]) -> String {
+    if apps.is_empty() {
+        return "No regular application is running.\n".to_string();
+    }
+    let mut text = String::new();
+    for app in apps {
+        let name = cerebellum_computer::app_state::render::one_line(&app.name);
+        text.push_str(&format!("{name} · {} · pid {}", app.bundle_identity, app.pid));
+        if app.frontmost {
+            text.push_str(" · frontmost");
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// What a `target` given as a name resolves to among the running
+/// applications: the one bundle identity carrying that name, or the refusal
+/// that says why there is not exactly one.
+///
+/// A name is matched whole and without regard to case. Several processes of
+/// one application are one match here; resolving the bundle identity then
+/// refuses them as `ambiguous` exactly as it always has.
+fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<String, Value> {
+    let wanted = target.trim();
+    if let Some(app) = apps
+        .iter()
+        .find(|app| app.bundle_identity.eq_ignore_ascii_case(wanted))
+    {
+        return Ok(app.bundle_identity.clone());
+    }
+    let named: Vec<&RunningApp> = apps
+        .iter()
+        .filter(|app| app.name.trim().eq_ignore_ascii_case(wanted))
+        .collect();
+    let mut identities: Vec<&str> = named
+        .iter()
+        .map(|app| app.bundle_identity.as_str())
+        .collect();
+    identities.sort_unstable();
+    identities.dedup();
+    match identities.as_slice() {
+        [only] => Ok((*only).to_string()),
+        [] => Err(json!({
+            "outcome": "no_running_app_named",
+            "target": wanted,
+            "remedy": "no running application has this name or bundle identity; list_apps shows \
+                       the running applications, and any of their names or bundle identities \
+                       is a target",
+        })),
+        _ => Err(json!({
+            "outcome": "ambiguous_app",
+            "target": wanted,
+            "candidates": named
+                .iter()
+                .map(|app| json!({
+                    "name": app.name,
+                    "bundle_identity": app.bundle_identity,
+                    "pid": app.pid,
+                }))
+                .collect::<Vec<_>>(),
+            // Named rather than chosen between: picking one would act on an
+            // application the caller did not single out.
+            "remedy": "several running applications have this name; retry with the bundle \
+                       identity of the one you mean",
+        })),
+    }
 }
 
 /// A read the application did not answer at all. Reported as a completed
@@ -1670,7 +1905,7 @@ fn unreadable_application_reply(error: AppStateReadError) -> Value {
     };
     json!({
         "outcome": "completed",
-        "tree": "",
+        STATE_TEXT_FIELD: "",
         "unreadable_subtrees": 1,
         "reason": error.as_str(),
         "remedy": remedy,
@@ -1715,16 +1950,17 @@ pub(crate) fn served_request_fields(
         ComputerCapability::Wait => Some((&WAIT_REQUEST_FIELDS, &WAIT_REQUEST_FIELDS)),
         ComputerCapability::PressElement => Some((
             &element_actions::PRESS_ELEMENT_FIELDS,
-            &element_actions::PRESS_ELEMENT_FIELDS,
+            &element_actions::PRESS_ELEMENT_REQUIRED,
         )),
         ComputerCapability::PressPoint => Some((
             &element_actions::PRESS_POINT_FIELDS,
-            &element_actions::PRESS_POINT_FIELDS,
+            &element_actions::PRESS_POINT_REQUIRED,
         )),
         ComputerCapability::WriteText => Some((
             &element_actions::WRITE_TEXT_FIELDS,
-            &element_actions::WRITE_TEXT_FIELDS,
+            &element_actions::WRITE_TEXT_REQUIRED,
         )),
+        ComputerCapability::ListApps => Some((&[], &[])),
         ComputerCapability::Type | ComputerCapability::Keys => {
             let fields = synthetic_request_fields(capability)?;
             Some((fields, fields))
@@ -1749,6 +1985,7 @@ pub(crate) fn parse_served_request(
 ) -> Result<(), Value> {
     match capability {
         ComputerCapability::ReadState => parse_read_state_request(arguments).map(|_| ()),
+        ComputerCapability::ListApps => parse_list_apps_request(arguments),
         ComputerCapability::Wait => parse_wait_request(arguments).map(|_| ()),
         ComputerCapability::PressElement => {
             element_actions::parse_press_element(arguments).map(|_| ())

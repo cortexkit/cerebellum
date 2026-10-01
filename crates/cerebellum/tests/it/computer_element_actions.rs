@@ -180,27 +180,48 @@ fn id_of(tree: &str, needle: &str) -> String {
         .to_string()
 }
 
+/// The window's outline and the menu bar, which the outline names in one
+/// line and a zoom prints whole.
 async fn read(plane: &Plane, management: &Arc<ManagementPlane>) -> String {
-    let reply = serve(
-        plane,
-        management,
-        "computer.read_state",
+    let mut tree = String::new();
+    for arguments in [
         json!({"target": TARGET_BUNDLE_ID}),
-    )
-    .await;
-    reply["tree"]
-        .as_str()
-        .expect("the read returns a tree")
-        .to_string()
+        json!({"target": TARGET_BUNDLE_ID, "zoom": "menubar"}),
+    ] {
+        let reply = serve(plane, management, "computer.read_state", arguments).await;
+        tree.push_str(
+            reply["state_text"]
+                .as_str()
+                .expect("the read returns its state as text"),
+        );
+    }
+    tree
 }
 
+/// The ids an action reply's diff names as `added` (`+` lines), `changed`
+/// (`~` lines) or `removed` (the ranges after `Removed element IDs:`).
 fn ids(reply: &Value, field: &str) -> Vec<String> {
-    reply[field]
-        .as_array()
-        .unwrap_or_else(|| panic!("{field} is missing from {reply}"))
-        .iter()
-        .map(|entry| entry["element_id"].as_str().unwrap().to_string())
-        .collect()
+    let text = reply["state_text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the diff is missing from {reply}"));
+    let first_word = |line: &str| line[1..].split_whitespace().next().unwrap().to_string();
+    match field {
+        "added" => text.lines().filter(|line| line.starts_with('+')).map(first_word).collect(),
+        "changed" => text.lines().filter(|line| line.starts_with('~')).map(first_word).collect(),
+        "removed" => text
+            .lines()
+            .filter_map(|line| line.strip_prefix("Removed element IDs: "))
+            .flat_map(|ranges| ranges.split(", "))
+            .flat_map(|range| match range.split_once('-') {
+                Some((start, end)) => {
+                    let (start, end): (u64, u64) = (start.parse().unwrap(), end.parse().unwrap());
+                    (start..=end).map(|id| id.to_string()).collect::<Vec<_>>()
+                }
+                None => vec![range.to_string()],
+            })
+            .collect(),
+        _ => unreachable!("no diff field {field}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +237,7 @@ async fn pressing_a_live_element_presses_it_and_returns_the_diff() {
     let plane = plane(&desk);
     let management = granted_management().await;
     let tree = read(&plane, &management).await;
-    let send = id_of(&tree, "\"Send\"");
+    let send = id_of(&tree, " button Send");
     let journaled = plane.journal_entry_count().await;
 
     let reply = serve(
@@ -248,7 +269,7 @@ async fn a_press_that_changes_nothing_reports_an_empty_diff() {
         &plane,
         &management,
         "computer.press_element",
-        json!({"element_id": id_of(&tree, "\"Send\"")}),
+        json!({"element_id": id_of(&tree, " button Send")}),
     )
     .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
@@ -265,10 +286,8 @@ async fn pressing_a_stale_id_refuses_and_presses_nothing() {
     let plane = plane(&desk);
     let management = granted_management().await;
     let tree = read(&plane, &management).await;
-    let send = id_of(&tree, "\"Send\"");
-    let (prefix, _) = send.rsplit_once('-').unwrap();
-
-    for stale in ["sgone1-4".to_string(), format!("{prefix}-9999")] {
+    // An id in the old shape, and a number this session never issued.
+    for stale in ["sgone1-4", "999999"] {
         let reply = serve(
             &plane,
             &management,
@@ -291,14 +310,18 @@ async fn pressing_a_session_ending_menu_item_is_refused() {
     let plane = plane(&desk);
     let management = granted_management().await;
     let tree = read(&plane, &management).await;
-    let menu = id_of(&tree, "menu \"\"");
-    let save = id_of(&tree, "\"Save\"");
-    let (prefix, menu_number) = menu.rsplit_once('-').unwrap();
-    let menu_number: u64 = menu_number.parse().unwrap();
-    assert_eq!(save, format!("{prefix}-{}", menu_number + 2), "{tree}");
-    let log_out = format!("{prefix}-{}", menu_number + 1);
+    let menu = tree
+        .lines()
+        .find(|line| line.ends_with(" menu"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no menu line in\n{tree}"));
+    let save = id_of(&tree, " menu item Save");
+    let menu_number: u64 = menu.parse().unwrap();
+    assert_eq!(save, (menu_number + 2).to_string(), "{tree}");
+    let log_out = (menu_number + 1).to_string();
     assert!(
-        !tree.contains(&log_out) && !tree.contains("Log Out"),
+        !tree.lines().any(|line| line.trim_start().starts_with(&format!("{log_out} ")))
+            && !tree.contains("Log Out"),
         "{tree}"
     );
 
@@ -326,7 +349,7 @@ async fn an_element_without_a_press_names_what_it_supports() {
         &plane,
         &management,
         "computer.press_element",
-        json!({"element_id": id_of(&tree, "\"Hello\"")}),
+        json!({"element_id": id_of(&tree, " text Hello")}),
     )
     .await;
     assert_eq!(reply["outcome"], "no_press_action", "{reply}");
@@ -363,7 +386,7 @@ async fn an_id_from_an_ended_process_generation_is_stale() {
         &plane,
         &management,
         "computer.press_element",
-        json!({"element_id": id_of(&tree, "\"Send\"")}),
+        json!({"element_id": id_of(&tree, " button Send")}),
     )
     .await;
     assert_eq!(reply["outcome"], "stale_element", "{reply}");
@@ -629,7 +652,7 @@ async fn replace_writes_the_value_and_confirms_it() {
     assert_eq!(desk.state().writes, vec![(12, TextAttribute::Value)]);
     assert_eq!(desk.state().elements[&12].value.as_deref(), Some("draft"));
     assert!(
-        reply.get("changed").is_some(),
+        reply.get("state_text").is_some(),
         "the diff is missing: {reply}"
     );
 }
@@ -689,7 +712,7 @@ async fn a_field_that_cannot_be_written_names_type() {
     let reply = write(
         &plane,
         &management,
-        &id_of(&tree, "\"Send\""),
+        &id_of(&tree, " button Send"),
         "x",
         "replace_value",
     )
@@ -906,7 +929,7 @@ async fn written_and_typed_text_never_reach_the_journal() {
         InMemoryCaptureBackend::default(),
     )
     .await;
-    let composer = id_of(read["tree"].as_str().unwrap(), "Composer");
+    let composer = id_of(read["state_text"].as_str().unwrap(), "Composer");
     for mode in ["replace_value", "insert_at_caret"] {
         let reply = serve_as(
             &plane,
