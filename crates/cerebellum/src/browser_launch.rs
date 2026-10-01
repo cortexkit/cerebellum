@@ -496,6 +496,22 @@ impl From<cerebellum_macos::ProcessGeneration> for BrowserProcessGeneration {
     }
 }
 
+/// What a liveness check can say about one recorded browser generation.
+///
+/// Three answers, not a yes/no, because "the kernel would not say" is not
+/// evidence that the browser is gone. A caller that folds `Unreadable` into
+/// `Gone` ends a person's login handoff, or tears down a session, while the
+/// browser is still on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserProcessLiveness {
+    /// The pid still names the recorded process.
+    Live,
+    /// No process holds the pid, or another process holds it now.
+    Gone,
+    /// The reading failed, so neither of the above can be told.
+    Unreadable,
+}
+
 /// Durable generation-stage record written while the process remains barred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
