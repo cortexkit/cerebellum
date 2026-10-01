@@ -117,6 +117,11 @@ pub enum DepositEnd {
     CallFailed {
         code: Option<String>,
     },
+    /// The vault could not decode the request (an unknown, missing or
+    /// mistyped field) and said so with a transport Error frame carrying
+    /// [`vault_wire::INVALID_PARAMS`]. Nothing was written, and only a bug in
+    /// this module's request causes it.
+    RequestRejected,
     /// The deadline passed. `sent` says whether any request had been written,
     /// so whether the vault may have stored the login after all.
     DeadlineExceeded {
@@ -154,6 +159,11 @@ pub async fn deposit(
             sent.store(true, Ordering::Release);
             let reply = match route.call(request.as_bytes()).await {
                 Ok(reply) => reply,
+                Err(VaultReachError::CallFailed { code: Some(code) })
+                    if code == vault_wire::INVALID_PARAMS =>
+                {
+                    return DepositEnd::RequestRejected
+                }
                 Err(VaultReachError::CallFailed { code })
                 | Err(VaultReachError::RouteRefused { code }) => {
                     return DepositEnd::CallFailed { code }

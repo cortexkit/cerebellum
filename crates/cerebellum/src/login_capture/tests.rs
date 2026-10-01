@@ -921,6 +921,150 @@ async fn each_vault_refusal_is_capture_not_stored_with_its_reason_and_remedy() {
     }
 }
 
+/// Every reply body in claustrum's pinned contract, sent byte for byte
+/// through a whole capture, gives the reply and remedy the tests above expect
+/// of its case.
+#[tokio::test]
+async fn every_fixture_reply_gives_the_capture_reply_it_should() {
+    use super::test_support::contract_reply;
+    let ufuk = CaptureRequest {
+        account: "ufuk".to_string(),
+        ..ollama()
+    };
+    for (case, version) in [("created", 1), ("replaced", 2)] {
+        let fixture = fixture();
+        fixture
+            .vault
+            .script([FakeReply::Bytes(contract_reply(case))]);
+        let (outcome, _) = capture(&fixture, &ufuk, allow()).await;
+        assert_eq!(
+            outcome.reply,
+            json!({
+                "outcome": "captured",
+                "credential_id": "cookie:ollama.com:ufuk",
+                "vault_outcome": case,
+                "record_version": version,
+            })
+        );
+        validate(&outcome.reply);
+        assert_eq!(outcome.journal.outcome, format!("captured:{case}"));
+    }
+    for (code, remedy, calls) in [
+        ("invalid_id", "internal fault", 1),
+        ("invalid_payload", "internal fault", 1),
+        ("not_found", "deposit grant", 1),
+        (
+            "not_permitted",
+            "operator-managed vault record already holds cookie:ollama.com:ufuk",
+            1,
+        ),
+        // The contract's one transient code: retried, then reported.
+        ("store_error", "Capture again shortly", 4),
+    ] {
+        let fixture = fixture();
+        fixture
+            .vault
+            .script(vec![FakeReply::Bytes(contract_reply(code)); 4]);
+        let (outcome, _) = capture(&fixture, &ufuk, allow()).await;
+        let reply = &outcome.reply;
+        assert_eq!(reply["outcome"], "capture_not_stored", "{code}: {reply}");
+        assert_eq!(reply["reason"], code, "{reply}");
+        let text = reply["remedy"].as_str().unwrap();
+        assert!(text.contains(remedy), "{code}: {reply}");
+        assert!(text.contains("nothing was stored"), "{code}: {reply}");
+        validate(reply);
+        assert_eq!(fixture.vault.calls(), calls, "{code}");
+    }
+}
+
+/// A transport Error frame with `invalid_params` is the vault saying it could
+/// not decode the request: this module's bug, reported as an internal fault
+/// and not retried. Any other Error frame code is a failed call.
+#[tokio::test]
+async fn an_invalid_params_error_frame_is_an_internal_fault() {
+    let fixture = fixture();
+    fixture
+        .vault
+        .script([FakeReply::Fails(VaultReachError::CallFailed {
+            code: Some("invalid_params".to_string()),
+        })]);
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "capture_not_stored");
+    assert_eq!(
+        outcome.reply["reason"], "invalid_params",
+        "{}",
+        outcome.reply
+    );
+    assert!(outcome.reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("internal fault"));
+    validate(&outcome.reply);
+    assert_eq!(
+        outcome.journal.outcome,
+        "refused:capture_not_stored:invalid_params"
+    );
+    assert_eq!(fixture.vault.calls(), 1);
+}
+
+#[tokio::test]
+async fn any_other_error_frame_code_is_a_failed_call() {
+    let fixture = fixture();
+    fixture
+        .vault
+        .script([FakeReply::Fails(VaultReachError::CallFailed {
+            code: Some("route_closed".to_string()),
+        })]);
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(
+        outcome.reply["reason"], VAULT_CALL_FAILED,
+        "{}",
+        outcome.reply
+    );
+    let remedy = outcome.reply["remedy"].as_str().unwrap();
+    assert!(remedy.contains("route_closed"), "{remedy}");
+    assert!(!remedy.contains("internal fault"), "{remedy}");
+    validate(&outcome.reply);
+}
+
+/// A header over the vault's 16384-byte limit is refused by name and never
+/// sent; one at the limit is stored. The profile is still deleted.
+#[tokio::test]
+async fn a_cookie_header_the_vault_would_refuse_is_never_sent() {
+    // `session=` is eight bytes of the header.
+    for (value_bytes, stored) in [
+        (vault_wire::MAX_COOKIE_BYTES - 8, true),
+        (vault_wire::MAX_COOKIE_BYTES - 7, false),
+    ] {
+        let fixture = fixture();
+        *fixture.launcher.script.lock().unwrap() = BrowserScript {
+            cookies: vec![("session".to_string(), "v".repeat(value_bytes))],
+            ..BrowserScript::default()
+        };
+        let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+        let reply = &outcome.reply;
+        validate(reply);
+        assert!(fixture.events.contains_prefix("profile_deleted"));
+        if stored {
+            assert_eq!(reply["outcome"], "captured", "{value_bytes}: {reply}");
+            assert_eq!(fixture.vault.calls(), 1);
+            continue;
+        }
+        assert_eq!(reply["outcome"], "capture_not_stored", "{reply}");
+        assert_eq!(reply["reason"], COOKIE_NOT_STORABLE, "{reply}");
+        assert!(
+            reply["remedy"].as_str().unwrap().contains("16384"),
+            "{reply}"
+        );
+        assert_eq!(fixture.vault.opens.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.vault.calls(), 0);
+        assert_eq!(
+            outcome.journal.bytes,
+            vault_wire::MAX_COOKIE_BYTES as u64 + 1
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_transient_refusal_is_retried_until_the_vault_stores_it() {
     let fixture = fixture();

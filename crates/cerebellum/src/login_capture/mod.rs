@@ -1358,6 +1358,19 @@ impl CaptureModule {
         let record = record.with_deletion(disposal.deleted);
         let deposit_request = match deposit_request {
             Ok(deposit_request) => deposit_request,
+            // Checked against the vault's cookie rules before anything is
+            // sent, so an oversize or odd header gets its own answer rather
+            // than the vault's generic `invalid_payload`.
+            Err(vault_wire::RequestBuildError::CookieNotStorable) => {
+                return record.not_stored(
+                    bytes,
+                    COOKIE_NOT_STORABLE,
+                    Some(format!(
+                        "this site's cookie header cannot be stored in the vault, which takes 1 to {} bytes with no control characters other than tab; nothing was stored.",
+                        vault_wire::MAX_COOKIE_BYTES
+                    )),
+                )
+            }
             Err(_) => return record.not_stored(bytes, REQUEST_UNBUILDABLE, None),
         };
         if !disposal.deleted {
@@ -1853,6 +1866,9 @@ pub const VAULT_DEADLINE_EXCEEDED: &str = "vault_deadline_exceeded";
 pub const VAULT_REPLY_MALFORMED: &str = "vault_reply_malformed";
 /// The reason when the deposit request could not be built from the capture.
 pub const REQUEST_UNBUILDABLE: &str = "request_unbuildable";
+/// The reason when the captured header breaks the vault's cookie rules (see
+/// [`vault_wire::cookie_storable`]), so no deposit was attempted.
+pub const COOKIE_NOT_STORABLE: &str = "cookie_not_storable";
 
 const INTERNAL_FAULT: &str = "an internal fault in this module's deposit; nothing was stored and capturing again will not help. Report it.";
 
@@ -1962,6 +1978,9 @@ impl Record {
                 VAULT_DEADLINE_EXCEEDED.to_string(),
                 format!("the vault could not be reached within {seconds} s; nothing was stored. Capture again shortly."),
             ),
+            vault::DepositEnd::RequestRejected => {
+                (vault_wire::INVALID_PARAMS.to_string(), INTERNAL_FAULT.to_string())
+            }
             vault::DepositEnd::Malformed => {
                 (VAULT_REPLY_MALFORMED.to_string(), INTERNAL_FAULT.to_string())
             }

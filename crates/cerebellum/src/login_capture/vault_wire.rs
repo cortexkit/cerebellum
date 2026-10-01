@@ -15,14 +15,17 @@
 //!   (the envelope ck-bus reads for `credential.sign`). The four deposit keys
 //!   are the `params`.
 //!
-//! The deposit shapes are written from that contract, not from a recorded
-//! exchange. When claustrum publishes its producer-pinned wire fixture for
-//! `credential.deposit_cookie`, the fixture's request replaces the literal in
-//! `login_capture::tests::the_vault_request_carries_exactly_the_contract_keys`,
-//! and its replies replace the literals in this file's
-//! `tests::deposit_replies_parse_as_the_contract_states` and
-//! `tests::refusals_parse_by_class_and_code`. Nothing outside this file builds
-//! or reads either body, so the swap touches this file and those two tests.
+//! The deposit shapes follow claustrum's published wire contract for the op
+//! (its `docs/wire-contract-v1.md`, "Cookie deposit", at claustrum f3f968a).
+//! Its producer-pinned fixture is copied byte for byte to
+//! `crates/cerebellum/tests/fixtures/deposit_cookie_wire_contract.json`, and
+//! this file's tests run every reply body in it through
+//! [`parse_deposit_reply`] and check the request built for the documented
+//! example against the doc's bytes.
+//!
+//! Malformed requests (an unknown, missing or mistyped field) are not answered
+//! with a refusal body: the vault answers them with a transport Error frame
+//! whose code is [`INVALID_PARAMS`].
 
 use serde::{Deserialize, Serialize};
 use subc_protocol::{BindIdentity, ErrorBody, RouteTarget};
@@ -35,9 +38,26 @@ pub const VAULT_MODULE_ID: &str = "claustrum";
 pub const DEPOSIT_METHOD: &str = "credential.deposit_cookie";
 /// The longest `consent_ref` the vault accepts.
 pub const MAX_CONSENT_REF_BYTES: usize = 128;
+/// The longest cookie header the vault stores, in bytes.
+pub const MAX_COOKIE_BYTES: usize = 16_384;
+/// The Error frame code the vault answers a request it cannot decode with.
+/// Only a bug in this module's request can cause it.
+pub const INVALID_PARAMS: &str = "invalid_params";
 /// The longest vault or daemon code passed on in a reply. Codes are short
 /// snake_case words; anything longer or shaped otherwise is not one.
 const MAX_CODE_BYTES: usize = 64;
+
+/// Whether the vault accepts `cookie` as a deposit's cookie: 1 to
+/// [`MAX_COOKIE_BYTES`] bytes, each a horizontal tab, printable ASCII
+/// (0x20 to 0x7E), or a byte of 0x80 and above (UTF-8). Every other control
+/// byte and DEL are refused. Checked before anything is sent, so a header the
+/// vault would refuse as `invalid_payload` is answered here by name.
+pub fn cookie_storable(cookie: &[u8]) -> bool {
+    (1..=MAX_COOKIE_BYTES).contains(&cookie.len())
+        && cookie
+            .iter()
+            .all(|&byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
+}
 
 /// Claustrum registers its operations as a management surface, not a tool
 /// provider, and the daemon routes by role.
@@ -116,6 +136,9 @@ fn encoded_bound(text: &str) -> usize {
 pub enum RequestBuildError {
     /// The cookie header is not UTF-8 text, which a JSON string must be.
     CookieNotText,
+    /// The cookie header breaks the vault's cookie rules (see
+    /// [`cookie_storable`]).
+    CookieNotStorable,
     /// The consent reference is empty, too long or not printable ASCII.
     ConsentRefOutOfShape,
     /// The encoder failed, or the encoding outgrew its reserved buffer.
@@ -234,6 +257,9 @@ pub fn deposit_request(
     {
         return Err(RequestBuildError::ConsentRefOutOfShape);
     }
+    if !cookie_storable(cookie.bytes()) {
+        return Err(RequestBuildError::CookieNotStorable);
+    }
     let cookie_text =
         std::str::from_utf8(cookie.bytes()).map_err(|_| RequestBuildError::CookieNotText)?;
     let bound = encoded_bound(credential_id)
@@ -343,32 +369,95 @@ mod tests {
         parse_deposit_reply(&serde_json::to_vec(&value).unwrap())
     }
 
+    use crate::login_capture::test_support::{contract_reply, DEPOSIT_CONTRACT};
+    use sha2::{Digest, Sha256};
+
+    /// The copy is the file claustrum published at f3f968a, unedited.
     #[test]
-    fn deposit_replies_parse_as_the_contract_states() {
+    fn the_fixture_is_the_one_claustrum_published() {
+        let digest = Sha256::digest(DEPOSIT_CONTRACT.as_bytes());
+        let hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         assert_eq!(
-            reply(
-                json!({"result": {"id": "cookie:ollama.com:work", "outcome": "created", "record_version": 1}})
-            ),
+            hex,
+            "1eb8e1360d4a1267fa4f5a760634a2a16fbeedb58b0184f297b1cb20d3f64430"
+        );
+    }
+
+    /// Every reply body in claustrum's fixture parses to the typed result it
+    /// stands for, and the fixture holds no reply this test does not name.
+    #[test]
+    fn every_fixture_reply_parses_to_its_typed_result() {
+        let fixture: serde_json::Value = serde_json::from_str(DEPOSIT_CONTRACT).unwrap();
+        let mut cases = fixture
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.as_str() != "payload_hash")
+            .cloned()
+            .collect::<Vec<_>>();
+        cases.sort();
+        assert_eq!(
+            cases,
+            [
+                "created",
+                "invalid_id",
+                "invalid_payload",
+                "not_found",
+                "not_permitted",
+                "replaced",
+                "store_error"
+            ]
+        );
+        let stored = |outcome, record_version| {
             Ok(DepositReply::Deposited(Deposited {
-                id: "cookie:ollama.com:work".to_string(),
-                outcome: VaultOutcome::Created,
-                record_version: 1,
+                id: "cookie:ollama.com:ufuk".to_string(),
+                outcome,
+                record_version,
             }))
+        };
+        assert_eq!(
+            parse_deposit_reply(&contract_reply("created")),
+            stored(VaultOutcome::Created, 1)
         );
         assert_eq!(
-            reply(
-                json!({"result": {"id": "cookie:ollama.com:work", "outcome": "replaced", "record_version": 7}})
-            ),
-            Ok(DepositReply::Deposited(Deposited {
-                id: "cookie:ollama.com:work".to_string(),
-                outcome: VaultOutcome::Replaced,
-                record_version: 7,
-            }))
+            parse_deposit_reply(&contract_reply("replaced")),
+            stored(VaultOutcome::Replaced, 2)
         );
+        for (code, class, transient) in [
+            ("invalid_id", "permanent", false),
+            ("invalid_payload", "permanent", false),
+            ("not_found", "permanent", false),
+            ("not_permitted", "permanent", false),
+            ("store_error", "transient", true),
+        ] {
+            let parsed = parse_deposit_reply(&contract_reply(code));
+            assert_eq!(
+                parsed,
+                Ok(DepositReply::Refused(VaultRefusal {
+                    class: class.to_string(),
+                    code: code.to_string(),
+                })),
+                "{code}"
+            );
+            let Ok(DepositReply::Refused(refusal)) = parsed else {
+                unreachable!()
+            };
+            assert_eq!(refusal.is_transient(), transient, "{code}");
+        }
+    }
+
+    /// Shapes the fixture does not carry, because the vault never sends them:
+    /// each must be refused as malformed rather than read as a result.
+    #[test]
+    fn replies_outside_the_contract_are_malformed() {
         for malformed in [
             json!({"id": "x", "outcome": "created", "record_version": 1}),
             json!({"result": {"id": "x", "outcome": "kept", "record_version": 1}}),
             json!({"result": {"id": "x", "outcome": "created"}}),
+            json!({"result": {"id": "x", "outcome": "created", "record_version": "1"}}),
             json!({"result": {"error": {"code": "not_found"}}}),
             json!({"result": {"error": {"class": "permanent", "code": "Not Found!"}}}),
         ] {
@@ -377,21 +466,91 @@ mod tests {
         assert_eq!(parse_deposit_reply(b"not json"), Err(MalformedReply));
     }
 
+    /// The class decides, not the code: a code the fixture does not list is
+    /// still transient when its class says so.
     #[test]
-    fn refusals_parse_by_class_and_code() {
-        for (class, code, transient) in [
-            ("permanent", "not_found", false),
-            ("permanent", "not_permitted", false),
-            ("permanent", "invalid_params", false),
-            ("transient", "store_busy", true),
-            ("transient", "store_error", true),
+    fn an_unlisted_code_is_read_by_its_class() {
+        let parsed =
+            reply(json!({"result": {"error": {"class": "transient", "code": "store_busy"}}}));
+        let Ok(DepositReply::Refused(refusal)) = parsed else {
+            panic!("{parsed:?}");
+        };
+        assert!(refusal.is_transient());
+    }
+
+    /// The request built for the contract's documented example is, byte for
+    /// byte, the request the doc shows. serde_json writes struct fields in
+    /// declaration order, which is the doc's order (`method`, then `params`
+    /// with `id`, `cookie`, `consent_ref`, `email`), so no reordering is
+    /// needed. The fixture's `payload_hash`, the vault's audit commitment over
+    /// id, consent_ref and the cookie's SHA-256, also matches what was sent.
+    #[test]
+    fn the_example_request_is_built_byte_for_byte() {
+        let header = CookieHeader::from_pairs([("session", "abc")]).unwrap();
+        let request = deposit_request(
+            "cookie:ollama.com:ufuk",
+            header,
+            "consent-123",
+            Some("me@example.com"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(request.as_bytes()).unwrap(),
+            r#"{"method":"credential.deposit_cookie","params":{"id":"cookie:ollama.com:ufuk","cookie":"session=abc","consent_ref":"consent-123","email":"me@example.com"}}"#
+        );
+
+        let sent: serde_json::Value = serde_json::from_slice(request.as_bytes()).unwrap();
+        let field = |name: &str| sent["params"][name].as_str().unwrap().as_bytes().to_vec();
+        let mut committed = b"ck-deposit-cookie/v1".to_vec();
+        for part in [field("id"), field("consent_ref")] {
+            committed.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            committed.extend_from_slice(&part);
+        }
+        committed.extend_from_slice(&Sha256::digest(field("cookie")));
+        let hex = Sha256::digest(&committed)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let fixture: serde_json::Value = serde_json::from_str(DEPOSIT_CONTRACT).unwrap();
+        assert_eq!(fixture["payload_hash"], hex);
+    }
+
+    /// A header the vault would refuse is refused before any request exists.
+    /// Built directly: the browser's header builder already refuses control
+    /// bytes, and this is the check behind it.
+    #[test]
+    fn a_header_breaking_the_cookie_rules_builds_no_request() {
+        for cookie in [
+            b"a=\x01b".to_vec(),
+            b"a=\x7fb".to_vec(),
+            vec![b'a'; MAX_COOKIE_BYTES + 1],
         ] {
-            let parsed = reply(json!({"result": {"error": {"class": class, "code": code}}}));
-            let Ok(DepositReply::Refused(refusal)) = parsed else {
-                panic!("{class}/{code}: {parsed:?}");
-            };
-            assert_eq!(refusal.code, code);
-            assert_eq!(refusal.is_transient(), transient, "{class}/{code}");
+            assert_eq!(
+                deposit_request("cookie:x.com:a", CookieHeader(cookie), "ref", None).unwrap_err(),
+                RequestBuildError::CookieNotStorable
+            );
+        }
+        assert!(deposit_request(
+            "cookie:x.com:a",
+            CookieHeader(vec![b'a'; MAX_COOKIE_BYTES]),
+            "ref",
+            None
+        )
+        .is_ok());
+    }
+
+    /// The contract's cookie rules, at each boundary.
+    #[test]
+    fn cookie_bytes_follow_the_contract() {
+        assert!(!cookie_storable(b""));
+        assert!(cookie_storable(b"a"));
+        assert!(cookie_storable(&[b'a'; MAX_COOKIE_BYTES]));
+        assert!(!cookie_storable(&[b'a'; MAX_COOKIE_BYTES + 1]));
+        assert!(cookie_storable(b"a=b;\tc=d e"));
+        assert!(cookie_storable(&[0x20, 0x7e, 0x80, 0xff]));
+        assert!(cookie_storable("a=éè".as_bytes()));
+        for byte in (0x00..0x20u8).filter(|&byte| byte != b'\t').chain([0x7f]) {
+            assert!(!cookie_storable(&[b'a', byte, b'b']), "{byte:#04x}");
         }
     }
 

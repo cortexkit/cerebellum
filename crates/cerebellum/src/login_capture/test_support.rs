@@ -71,6 +71,23 @@ impl Verifications {
     }
 }
 
+/// Claustrum's producer-pinned wire contract for `credential.deposit_cookie`,
+/// copied byte for byte from claustrum f3f968a,
+/// `crates/credentials-module/tests/fixtures/deposit_cookie_wire_contract.json`.
+/// See the README beside the copy.
+pub(crate) const DEPOSIT_CONTRACT: &str =
+    include_str!("../../tests/fixtures/deposit_cookie_wire_contract.json");
+
+/// The exact reply bytes the contract fixture gives for `case`.
+pub(crate) fn contract_reply(case: &str) -> Vec<u8> {
+    let fixture: Value = serde_json::from_str(DEPOSIT_CONTRACT).unwrap();
+    fixture[case]
+        .as_str()
+        .unwrap_or_else(|| panic!("the contract fixture has no {case}"))
+        .as_bytes()
+        .to_vec()
+}
+
 /// A value planted in the fake browser's cookies so leak tests can look for it.
 pub(crate) const PLANTED_VALUE: &str = "ck-planted-cookie-value-9e3b71";
 pub(crate) const ROOT: &str = "/fake-tmp/ck-cerebellum-capture";
@@ -280,6 +297,8 @@ pub(crate) enum FakeReply {
     },
     /// Exactly this reply body.
     Raw(Value),
+    /// Exactly these reply bytes, as a fixture holds them.
+    Bytes(Vec<u8>),
     /// The route fails instead of answering.
     Fails(VaultReachError),
     /// No answer, ever.
@@ -369,6 +388,7 @@ impl VaultRoute for FakeRoute {
                     json!({"result": {"error": {"class": class, "code": code}}})
                 }
                 FakeReply::Raw(body) => body,
+                FakeReply::Bytes(bytes) => return Ok(bytes),
                 FakeReply::Fails(error) => return Err(error),
                 FakeReply::Hangs => std::future::pending().await,
             };
