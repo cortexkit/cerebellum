@@ -1020,11 +1020,17 @@ impl CaptureModule {
         // Time Machine settings between two of them.
         let tool = self.env.exclusion.tool_name();
         let not_excluded = |reason: &str| {
+            // A tool that did not answer says nothing about the exclusion, so
+            // the caller is not sent to fix one that may already be in place.
+            let remedy = match reason {
+                "timed_out" => format!("{tool} did not answer in time; nothing was captured. Retry; if it keeps happening, check {tool} on this Mac"),
+                _ => format!("make {tool} report {} as excluded, then retry", root.display()),
+            };
             json!({
                 "tool": tool,
                 "path": root.display().to_string(),
                 "reason": reason,
-                "remedy": format!("make {tool} report {} as excluded, then retry", root.display()),
+                "remedy": remedy,
             })
         };
         if self.env.fs.prepare_root(&root).is_err() {
@@ -1033,16 +1039,34 @@ impl CaptureModule {
                 not_excluded("capture_directory_unusable"),
             );
         }
-        if let Err(error) = self.env.exclusion.add_exclusion(&root) {
-            return record.refused(
-                "capture_location_not_excluded",
-                not_excluded(error.as_str()),
-            );
-        }
+        // Read first, and add an exclusion only when the root is not already
+        // excluded. The per-user temporary directory is excluded by Time
+        // Machine's own rules, and `tmutil addexclusion` was measured at about
+        // 11 s on this machine while `isexcluded` answers in under 1.5 s, so
+        // adding unconditionally made every capture outrun its deadline on an
+        // exclusion that was already in place.
         match self.env.exclusion.is_excluded(&root) {
             Ok(true) => {}
             Ok(false) => {
-                return record.refused("capture_location_not_excluded", not_excluded("included"))
+                if let Err(error) = self.env.exclusion.add_exclusion(&root) {
+                    return record.refused(
+                        "capture_location_not_excluded",
+                        not_excluded(error.as_str()),
+                    );
+                }
+                match self.env.exclusion.is_excluded(&root) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return record
+                            .refused("capture_location_not_excluded", not_excluded("included"))
+                    }
+                    Err(error) => {
+                        return record.refused(
+                            "capture_location_not_excluded",
+                            not_excluded(error.as_str()),
+                        )
+                    }
+                }
             }
             Err(error) => {
                 return record.refused(

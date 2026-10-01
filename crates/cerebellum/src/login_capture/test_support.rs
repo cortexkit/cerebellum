@@ -194,6 +194,10 @@ impl CaptureFs for FakeFs {
 
 pub(crate) struct FakeExclusion {
     pub(crate) answer: Mutex<Result<bool, ToolError>>,
+    /// What `is_excluded` answers once an exclusion has been added, when set;
+    /// otherwise it keeps answering `answer`.
+    pub(crate) answer_after_add: Mutex<Option<Result<bool, ToolError>>>,
+    pub(crate) added: std::sync::atomic::AtomicBool,
     pub(crate) add_fails: Mutex<Option<ToolError>>,
     pub(crate) events: Events,
 }
@@ -207,12 +211,20 @@ impl BackupExclusion for FakeExclusion {
         self.events.push("tmutil_addexclusion");
         match *self.add_fails.lock().unwrap() {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => {
+                self.added.store(true, Ordering::SeqCst);
+                Ok(())
+            }
         }
     }
 
     fn is_excluded(&self, _path: &Path) -> Result<bool, ToolError> {
         self.events.push("tmutil_isexcluded");
+        if self.added.load(Ordering::SeqCst) {
+            if let Some(answer) = *self.answer_after_add.lock().unwrap() {
+                return answer;
+            }
+        }
         *self.answer.lock().unwrap()
     }
 }
@@ -429,6 +441,8 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
     let fs = Arc::new(FakeFs::new(events.clone(), Arc::clone(&clock)));
     let exclusion = Arc::new(FakeExclusion {
         answer: Mutex::new(Ok(true)),
+        answer_after_add: Mutex::new(None),
+        added: std::sync::atomic::AtomicBool::new(false),
         add_fails: Mutex::new(None),
         events: events.clone(),
     });

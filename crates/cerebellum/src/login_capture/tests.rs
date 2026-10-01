@@ -180,8 +180,10 @@ async fn an_included_capture_directory_refuses_before_any_file_or_profile_exists
 
 #[tokio::test]
 async fn a_timed_out_exclusion_tool_is_a_typed_refusal() {
+    // An exclusion is added only to a root not already excluded, so the
+    // add's failure is reached only when the first read says included.
     for (add, answer, reason) in [
-        (Some(ToolError::TimedOut), Ok(true), "timed_out"),
+        (Some(ToolError::TimedOut), Ok(false), "timed_out"),
         (None, Err(ToolError::TimedOut), "timed_out"),
         (None, Err(ToolError::Failed), "failed"),
     ] {
@@ -191,9 +193,52 @@ async fn a_timed_out_exclusion_tool_is_a_typed_refusal() {
         let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
         assert_eq!(outcome.reply["outcome"], "capture_location_not_excluded");
         assert_eq!(outcome.reply["reason"], reason);
+        // A tool that did not answer says nothing about the exclusion, so
+        // the remedy must not send the caller to fix one.
+        let remedy = outcome.reply["remedy"].as_str().unwrap();
+        assert_eq!(
+            remedy.contains("as excluded"),
+            reason != "timed_out",
+            "{reason}: {remedy}"
+        );
         assert!(fixture.fs.contents().is_empty());
         assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
     }
+}
+
+/// A root already excluded is captured without `tmutil addexclusion`, which
+/// was measured at about 11 s on the desk Mac and outran the tool deadline
+/// every time. A root not yet excluded gets the exclusion added and is read
+/// again before anything is written.
+#[tokio::test]
+async fn an_exclusion_is_added_only_when_the_root_is_not_already_excluded() {
+    let tmutil_calls = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .events
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.starts_with("tmutil_"))
+            .collect()
+    };
+
+    let excluded = fixture();
+    let (outcome, _) = capture(&excluded, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+    assert_eq!(tmutil_calls(&excluded), ["tmutil_isexcluded"]);
+
+    let included = fixture();
+    *included.exclusion.answer.lock().unwrap() = Ok(false);
+    *included.exclusion.answer_after_add.lock().unwrap() = Some(Ok(true));
+    let (outcome, _) = capture(&included, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
+    assert_eq!(
+        tmutil_calls(&included),
+        [
+            "tmutil_isexcluded",
+            "tmutil_addexclusion",
+            "tmutil_isexcluded"
+        ]
+    );
 }
 
 /// Exclusion is proven on every capture, not once, because the person can
@@ -214,7 +259,9 @@ async fn exclusion_is_proven_again_on_every_capture() {
         .into_iter()
         .filter(|event| event == "tmutil_isexcluded")
         .count();
-    assert_eq!(checks, 2);
+    // One read for the first capture, which was already excluded; two for the
+    // second, which read included, added the exclusion and read again.
+    assert_eq!(checks, 3);
 }
 
 #[tokio::test]
