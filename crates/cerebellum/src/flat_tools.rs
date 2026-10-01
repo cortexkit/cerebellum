@@ -167,39 +167,33 @@ fn set_description(schema: &mut Value, description: &str) {
 }
 
 /// Write "Required for: a, b." into each property's description from the
-/// per-action `required` conditions. The conditional blocks are the machine
-/// truth, but a host that rebuilds the root schema from bare properties
-/// (OpenCode's plugin tool definition does) drops root-level `allOf`, so
-/// the model would see no requirement at all. Descriptions survive that
-/// rebuild byte for byte; this keeps the two in step from one source.
-fn annotate_required_actions(properties: &mut Map<String, Value>, conditions: &[Value]) {
-    let mut requiring: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for condition in conditions {
-        let Some(action) = condition["if"]["properties"]["action"]["const"].as_str() else {
-            continue;
-        };
-        for field in condition["then"]["required"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if let Some(field) = field.as_str() {
-                requiring
-                    .entry(field.to_string())
-                    .or_default()
-                    .push(action.to_string());
-            }
+/// per-action requirement lists.
+///
+/// This is the only place the schema tells the model which fields an action
+/// needs. The root carries no per-action conditions: the `tool-provider/v1`
+/// contract refuses an argument schema with a root-level `allOf`, `anyOf` or
+/// `oneOf`, and a host that rebuilds the root from bare properties (OpenCode's
+/// plugin tool definition does) would drop such conditions anyway. A
+/// description survives both byte for byte. Nothing is weakened by it: each
+/// action's parser refuses a request missing a field this note names.
+///
+/// Every required field gets its note, including one whose property two
+/// actions declare differently: the note names actions, not shapes, so it is
+/// true whichever shape the property ends up advertising.
+fn annotate_required_actions(
+    properties: &mut Map<String, Value>,
+    requirements: &[(String, Vec<String>)],
+) {
+    let mut requiring: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (action, required) in requirements {
+        for field in required {
+            requiring.entry(field).or_default().push(action);
         }
     }
     for (name, actions) in requiring {
-        let Some(schema) = properties.get_mut(&name) else {
+        let Some(schema) = properties.get_mut(name) else {
             continue;
         };
-        // A property two actions declare differently names its actions per
-        // branch; a union note here would claim both shapes for every action.
-        if schema.get("oneOf").is_some() {
-            continue;
-        }
         let note = format!(" Required for: {}.", actions.join(", "));
         match schema.get_mut("description") {
             Some(Value::String(text)) => text.push_str(&note),
@@ -277,16 +271,27 @@ fn point_schema(description: &str) -> Value {
     })
 }
 
+/// The fields each admitted flat `computer_use` action requires, in vocabulary
+/// order: each action's own row's `required` list.
+///
+/// The same rows, from [`computer_action_fields`], that `computer_tool`
+/// writes its "Required for" notes from, so what the tests check and what the
+/// model is told come from one list.
+#[cfg(test)]
+pub(crate) fn computer_action_requirements(admitted: &[String]) -> Vec<(String, Vec<String>)> {
+    computer_action_fields(admitted)
+        .into_iter()
+        .map(|(action, _, required)| (action, required))
+        .collect()
+}
+
 pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
     let mut actions = Vec::new();
-    let mut conditions = Vec::new();
+    let mut requirements = Vec::new();
     let mut properties = Map::new();
     for (action, source, required) in computer_action_fields(admitted) {
-        conditions.push(json!({
-            "if":{"properties":{"action":{"const":action}}},
-            "then":{"required":required}
-        }));
-        actions.push(Value::String(action));
+        actions.push(Value::String(action.clone()));
+        requirements.push((action, required));
         for (name, original) in source {
             let mut schema = original;
             describe_computer_field(&name, &mut schema);
@@ -318,7 +323,7 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
     for schema in properties.values_mut() {
         declare_one_type(schema);
     }
-    annotate_required_actions(&mut properties, &conditions);
+    annotate_required_actions(&mut properties, &requirements);
     properties.insert(
         "action".into(),
         json!({"type":"string","enum":actions,"description":"Admitted computer action to perform."}),
@@ -327,11 +332,12 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
         name: COMPUTER_USE.into(),
         description: Some(COMPUTER_DESCRIPTION.into()),
         execution_mode: ExecutionMode::Unfenceable,
+        // Flat: no root-level union. Which fields each action needs is in
+        // the property descriptions (see `annotate_required_actions`).
         schema: json!({
             "type":"object",
             "properties":properties,
             "required":["action"],
-            "allOf":conditions,
             "additionalProperties":false
         }),
     })
@@ -352,43 +358,98 @@ fn browser_action_schema(action: &str) -> Option<Map<String, Value>> {
     schema["properties"].as_object().cloned()
 }
 
-pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
-    let mut actions = Vec::new();
-    let mut conditions = Vec::new();
-    let mut properties = Map::new();
-    for action in [
-        "launch",
-        "status",
-        "close",
-        "navigate",
-        "snapshot",
-        "screenshot",
-        "click",
-        "click_point",
-    ] {
+/// The flat `browser_use` actions that dispatch to a browser capability, in
+/// the order the tool lists them. Each is offered only when its capability is
+/// admitted.
+const BROWSER_CAPABILITY_ACTIONS: [&str; 8] = [
+    "launch",
+    "status",
+    "close",
+    "navigate",
+    "snapshot",
+    "screenshot",
+    "click",
+    "click_point",
+];
+
+/// The flat `browser_use` actions that run a management operation, each with
+/// the operation it runs. Offered whenever any browser capability is.
+const BROWSER_MANAGEMENT_ACTIONS: [(&str, &str); 5] = [
+    ("open_grant", crate::management::OPEN_GRANT),
+    ("present", crate::management::PRESENT),
+    ("resume", crate::management::RESUME),
+    ("import_login", crate::management::IMPORT_LOGIN),
+    ("capture_login", crate::management::CAPTURE_LOGIN),
+];
+
+/// The fields a flat `browser_use` action requires, in the flat tool's own
+/// terms: `click_point` takes one `point` where its capability takes `x_px`
+/// and `y_px`.
+fn browser_required_fields(action: &str) -> &'static [&'static str] {
+    match action {
+        "close" => &["browser_session_id"],
+        "navigate" => &["url", "intent", "severity"],
+        "click" => &["ref", "snapshot_id", "intent", "severity"],
+        "click_point" => &[
+            "point",
+            "snapshot_id",
+            "image_width_px",
+            "image_height_px",
+            "intent",
+            "severity",
+        ],
+        "open_grant" => &["origins", "hazards"],
+        "present" | "import_login" => &["origin"],
+        "capture_login" => &["credential_domain", "account", "fetch_url", "login_url"],
+        _ => &[],
+    }
+}
+
+/// The fields each flat `browser_use` action requires, for every action the
+/// tool offers given `admitted`, in the order the tool lists them; empty when
+/// no browser capability is admitted, because then there is no tool.
+///
+/// The schema's "Required for" notes are written from this, and the tests
+/// read this, so what the model is told and what is checked come from one
+/// list.
+pub(crate) fn browser_action_requirements(admitted: &[String]) -> Vec<(String, Vec<String>)> {
+    let capability_actions = BROWSER_CAPABILITY_ACTIONS.into_iter().filter(|action| {
         let capability = browser_capability(action).expect("known browser action");
-        if !admitted.iter().any(|name| name == capability) {
+        admitted.iter().any(|name| name == capability)
+    });
+    let mut offered: Vec<&str> = capability_actions.collect();
+    if offered.is_empty() {
+        return Vec::new();
+    }
+    offered.extend(BROWSER_MANAGEMENT_ACTIONS.map(|(action, _)| action));
+    offered
+        .into_iter()
+        .map(|action| {
+            let required = browser_required_fields(action)
+                .iter()
+                .map(|field| field.to_string())
+                .collect();
+            (action.to_string(), required)
+        })
+        .collect()
+}
+
+pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
+    let requirements = browser_action_requirements(admitted);
+    if requirements.is_empty() {
+        return None;
+    }
+    let actions: Vec<Value> = requirements
+        .iter()
+        .map(|(action, _)| Value::String(action.clone()))
+        .collect();
+    let mut properties = Map::new();
+    for (action, _) in &requirements {
+        let action = action.as_str();
+        if browser_capability(action).is_none() {
+            // A management action; its properties are added below.
             continue;
         }
-        actions.push(Value::String(action.into()));
-        let required: &[&str] = match action {
-            "close" => &["browser_session_id"],
-            "navigate" => &["url", "intent", "severity"],
-            "click" => &["ref", "snapshot_id", "intent", "severity"],
-            "click_point" => &[
-                "point",
-                "snapshot_id",
-                "image_width_px",
-                "image_height_px",
-                "intent",
-                "severity",
-            ],
-            _ => &[],
-        };
-        conditions.push(json!({
-            "if":{"properties":{"action":{"const":action}}},
-            "then":{"required":required}
-        }));
         for (name, mut schema) in browser_action_schema(action).expect("browser action schema") {
             let output_name = if action == "click_point" && matches!(name.as_str(), "x_px" | "y_px")
             {
@@ -415,34 +476,8 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
             properties.entry(output_name.to_string()).or_insert(schema);
         }
     }
-    if actions.is_empty() {
-        return None;
-    }
-    for (action, method, required) in [
-        (
-            "open_grant",
-            crate::management::OPEN_GRANT,
-            vec!["origins", "hazards"],
-        ),
-        ("present", crate::management::PRESENT, vec!["origin"]),
-        ("resume", crate::management::RESUME, Vec::new()),
-        (
-            "import_login",
-            crate::management::IMPORT_LOGIN,
-            vec!["origin"],
-        ),
-        (
-            "capture_login",
-            crate::management::CAPTURE_LOGIN,
-            vec!["credential_domain", "account", "fetch_url", "login_url"],
-        ),
-    ] {
-        actions.push(json!(action));
+    for (_, method) in BROWSER_MANAGEMENT_ACTIONS {
         debug_assert!(crate::dispatchable_management_operation(method));
-        conditions.push(json!({
-            "if":{"properties":{"action":{"const":action}}},
-            "then":{"required":required}
-        }));
     }
     properties.insert(
         "origins".into(),
@@ -480,7 +515,7 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
         "point".into(),
         point_schema("Pixel in the echoed screenshot; it is meaningful only with that image's required width and height."),
     );
-    annotate_required_actions(&mut properties, &conditions);
+    annotate_required_actions(&mut properties, &requirements);
     properties.insert(
         "action".into(),
         json!({"type":"string","enum":actions,"description":"Admitted browser action to perform."}),
@@ -489,11 +524,12 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
         name: BROWSER_USE.into(),
         description: Some(BROWSER_DESCRIPTION.into()),
         execution_mode: ExecutionMode::Unfenceable,
+        // Flat: no root-level union. Which fields each action needs is in
+        // the property descriptions (see `annotate_required_actions`).
         schema: json!({
             "type":"object",
             "properties":properties,
             "required":["action"],
-            "allOf":conditions,
             "additionalProperties":false
         }),
     })
@@ -639,6 +675,29 @@ mod tests {
             .collect()
     }
 
+    /// Every browser capability the flat browser tool can offer.
+    fn browser_names() -> Vec<String> {
+        BROWSER_CAPABILITY_ACTIONS
+            .into_iter()
+            .map(|action| browser_capability(action).unwrap().to_string())
+            .collect()
+    }
+
+    /// The actions a property's description names in its "Required for:"
+    /// note, or none when it has no note.
+    fn required_actions_named(schema: &Value, field: &str) -> std::collections::BTreeSet<String> {
+        let description = schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_default();
+        let Some((_, note)) = description.split_once("Required for: ") else {
+            return Default::default();
+        };
+        note.trim_end_matches('.')
+            .split(", ")
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn walk_has_key(value: &Value, forbidden: &[&str]) -> bool {
         match value {
             Value::Object(object) => object.iter().any(|(key, value)| {
@@ -746,20 +805,18 @@ mod tests {
 
     #[test]
     fn computer_actions_require_exact_model_chosen_fields() {
-        let tool = computer_tool(&computer_names()).unwrap();
+        let requirements = computer_action_requirements(&computer_names());
         let required_for = |action: &str| {
-            tool.schema["allOf"]
-                .as_array()
-                .unwrap()
+            requirements
                 .iter()
-                .find(|condition| condition["if"]["properties"]["action"]["const"] == action)
-                .unwrap()["then"]["required"]
-                .as_array()
-                .unwrap()
+                .find(|(name, _)| name == action)
+                .unwrap_or_else(|| panic!("{action} has no requirement list"))
+                .1
                 .iter()
-                .map(|field| field.as_str().unwrap())
+                .map(String::as_str)
                 .collect::<Vec<_>>()
         };
+        assert_eq!(requirements.len(), 10, "{requirements:?}");
         for (action, required) in [
             ("read_state", vec!["target"]),
             ("press_element", vec!["element_id"]),
@@ -890,22 +947,21 @@ mod tests {
                 "{action}: advertised versus parser-required fields"
             );
 
-            // The schema the model sees is built from these same lists.
-            let schema_required: Vec<String> = tool.schema["allOf"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|condition| condition["if"]["properties"]["action"]["const"] == **action)
-                .map(|condition| {
-                    condition["then"]["required"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|field| field.as_str().unwrap().to_string())
-                        .collect()
-                })
+            // The requirement list the schema's notes are written from is
+            // this same list, and every field it names is named for this
+            // action in that field's description.
+            let listed = computer_action_requirements(&admitted)
+                .into_iter()
+                .find(|(name, _)| name == action)
+                .map(|(_, required)| required)
                 .unwrap_or_default();
-            assert_eq!(&schema_required, required, "{action}: schema requirement");
+            assert_eq!(&listed, required, "{action}: requirement list");
+            for field in required {
+                assert!(
+                    required_actions_named(&tool.schema, field).contains(action),
+                    "{action}: the description of {field} does not name it"
+                );
+            }
             advertised_union.extend(properties.keys().cloned());
         }
         let schema_properties: BTreeSet<String> = tool.schema["properties"]
@@ -1213,5 +1269,364 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Both flat tools pass the `tool-provider/v1` contract's own flatness
+    /// check with every action admitted. A host serving a tool under that
+    /// contract refuses an argument schema with a root-level `anyOf`, `oneOf`
+    /// or `allOf`, or a root `type` array, so the check used is the contract
+    /// crate's, not a copy that could drift from it.
+    #[test]
+    fn both_flat_schemas_are_flat_under_the_tool_provider_contract() {
+        let computer = computer_tool(&computer_names()).unwrap();
+        let browser = browser_tool(&browser_names()).unwrap();
+        for tool in [&computer, &browser] {
+            assert_eq!(
+                cortexkit_role_tool_provider::catalog::check_flat_schema(&tool.schema),
+                Ok(()),
+                "{}",
+                tool.name
+            );
+            // The root keeps the constraints that are not unions.
+            assert_eq!(tool.schema["type"], "object", "{}", tool.name);
+            assert_eq!(tool.schema["required"], json!(["action"]), "{}", tool.name);
+            assert_eq!(tool.schema["additionalProperties"], false, "{}", tool.name);
+        }
+    }
+
+    /// The property descriptions are the only place either schema says which
+    /// fields an action needs, so they must say exactly what the requirement
+    /// lists say: each required field's description names every action that
+    /// requires it, and no description names an action that does not.
+    #[test]
+    fn required_for_notes_match_the_requirement_lists_exactly() {
+        use std::collections::BTreeSet;
+        let cases = [
+            (
+                computer_tool(&computer_names()).unwrap(),
+                computer_action_requirements(&computer_names()),
+            ),
+            (
+                browser_tool(&browser_names()).unwrap(),
+                browser_action_requirements(&browser_names()),
+            ),
+        ];
+        for (tool, requirements) in &cases {
+            let offered: Vec<&str> = tool.schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|action| action.as_str().unwrap())
+                .collect();
+            let listed: Vec<&str> = requirements
+                .iter()
+                .map(|(action, _)| action.as_str())
+                .collect();
+            assert_eq!(
+                offered, listed,
+                "{}: one requirement list per offered action",
+                tool.name
+            );
+
+            let mut expected: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+            for (action, required) in requirements {
+                for field in required {
+                    assert!(
+                        tool.schema["properties"].get(field).is_some(),
+                        "{}: {action} requires {field}, which is not advertised",
+                        tool.name
+                    );
+                    expected.entry(field).or_default().insert(action.clone());
+                }
+            }
+            assert!(!expected.is_empty(), "{}: nothing is required", tool.name);
+            for field in tool.schema["properties"].as_object().unwrap().keys() {
+                assert_eq!(
+                    required_actions_named(&tool.schema, field),
+                    expected.get(field.as_str()).cloned().unwrap_or_default(),
+                    "{}.{field}: the actions its description says require it",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// The route every enforcement probe is sent on.
+    const PROBE_CHANNEL: u16 = 7;
+    const PROBE_EPOCH: u32 = 1;
+
+    /// What one flat call sent through the production tool handler produced.
+    struct Answered {
+        /// The bodies of every frame the handler sent.
+        bodies: Vec<Value>,
+        /// Whether a plane reached its dispatch commitment for the call.
+        dispatched: bool,
+    }
+
+    /// Send one unkeyed flat tool call through `handle_tool_request`, the
+    /// handler every model call reaches, on a bound route admitted to act in
+    /// the conversation.
+    async fn call_flat(
+        planes: &crate::Planes,
+        corr: u64,
+        tool: &str,
+        arguments: &Value,
+    ) -> Answered {
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+            PROBE_CHANNEL,
+            PROBE_EPOCH,
+            corr,
+            serde_json::to_vec(&json!({"name": tool, "arguments": arguments})).unwrap(),
+        )
+        .unwrap();
+        crate::install_test_bind(&planes.routes, &frame);
+        // The frame reader registers every request for interruption before
+        // it runs; a computer call that was not registered is refused for
+        // that instead of reaching its parser.
+        let _cancellation = planes
+            .cancellations
+            .register((PROBE_CHANNEL, PROBE_EPOCH, corr));
+        let observation = crate::CallObservation::new();
+        let (writer, mut frames) = tokio::sync::mpsc::channel(8);
+        crate::handle_tool_request(frame, &writer, planes, &observation)
+            .await
+            .unwrap();
+        let mut bodies = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            bodies.push(serde_json::from_slice(&frame.body).unwrap_or(Value::Null));
+        }
+        Answered {
+            bodies,
+            dispatched: observation.dispatch.committed(),
+        }
+    }
+
+    /// The field and reason of an `invalid_request` reply, whether the flat
+    /// translation or the handler shaped it (`detail.field` and
+    /// `detail.reason_code`) or a computer parser did (`field` and `reason`).
+    fn invalid_request(body: &Value) -> Option<(&str, &str)> {
+        if body["outcome"] != "invalid_request" {
+            return None;
+        }
+        let detail = if body["detail"].is_object() {
+            &body["detail"]
+        } else {
+            body
+        };
+        let field = detail["field"].as_str()?;
+        let reason = detail["reason_code"]
+            .as_str()
+            .or_else(|| detail["reason"].as_str())?;
+        Some((field, reason))
+    }
+
+    /// For every action of one flat tool, send its well-formed sample once
+    /// per field with that field removed, and require:
+    ///
+    /// - a field on the action's requirement list is refused at call time as
+    ///   `invalid_request` naming it as `missing_field`, in the one reply, and
+    ///   nothing is dispatched. The schema no longer carries per-action
+    ///   requirements, so this refusal is the only thing holding a model to
+    ///   them;
+    /// - a field refused that way is on the requirement list, so the schema's
+    ///   "Required for" notes tell the model about every field it is held to.
+    async fn assert_requirements_enforced_at_call_time(
+        planes: &crate::Planes,
+        tool: &str,
+        requirements: &[(String, Vec<String>)],
+        samples: &[(&str, Value)],
+    ) {
+        assert!(!requirements.is_empty(), "{tool}: no actions to probe");
+        let mut corr = 100;
+        let mut probed = 0;
+        for (action, required) in requirements {
+            let sample = samples
+                .iter()
+                .find(|(name, _)| name == action)
+                .map(|(_, sample)| sample)
+                .unwrap_or_else(|| panic!("{tool}: no sample request for {action}"));
+            let sample = sample.as_object().unwrap();
+            for field in required {
+                assert!(
+                    sample.contains_key(field),
+                    "{tool}.{action}: the sample omits required {field}"
+                );
+            }
+            for field in sample.keys() {
+                let mut arguments = sample.clone();
+                arguments.remove(field);
+                arguments.insert("action".into(), json!(action));
+                corr += 1;
+                let answered = call_flat(planes, corr, tool, &Value::Object(arguments)).await;
+                let refused_as_missing = matches!(
+                    answered.bodies.as_slice(),
+                    [body] if invalid_request(body) == Some((field.as_str(), "missing_field"))
+                );
+                if required.contains(field) {
+                    probed += 1;
+                    assert!(
+                        refused_as_missing,
+                        "{tool}.{action} without {field} was not refused as missing it: {:?}",
+                        answered.bodies
+                    );
+                    assert!(
+                        !answered.dispatched,
+                        "{tool}.{action} without {field} was dispatched"
+                    );
+                } else {
+                    assert!(
+                        !refused_as_missing,
+                        "{tool}.{action} refuses a call without {field}, which its \
+                         requirement list does not name, so the schema never tells \
+                         the model it is required"
+                    );
+                }
+            }
+        }
+        // A loop that sent nothing would pass vacuously.
+        assert!(probed >= 10, "{tool}: only {probed} requirements probed");
+    }
+
+    /// A model's `browser_use` call missing any field its action requires is
+    /// refused by name at call time, before anything is dispatched. The
+    /// management actions are refused by their own operation parsers.
+    #[tokio::test]
+    async fn a_browser_call_missing_a_required_field_is_refused_before_dispatch() {
+        let planes = crate::isolated_test_planes(&std::sync::Arc::new(
+            cerebellum_core::health::HealthState::new(),
+        ));
+        let severity = json!({"tier": 1, "credential": false, "financial": false});
+        let samples = [
+            ("launch", json!({})),
+            ("status", json!({})),
+            ("close", json!({"browser_session_id": "session-1"})),
+            (
+                "navigate",
+                json!({"url": "https://example.com/", "intent": "read the page", "severity": severity}),
+            ),
+            ("snapshot", json!({})),
+            ("screenshot", json!({})),
+            (
+                "click",
+                json!({"ref": "e1", "snapshot_id": "0123456789abcdef0123456789abcdef", "intent": "press it", "severity": severity}),
+            ),
+            (
+                "click_point",
+                json!({
+                    "point": {"x": 4, "y": 9},
+                    "snapshot_id": "0123456789abcdef0123456789abcdef",
+                    "image_width_px": 100,
+                    "image_height_px": 80,
+                    "intent": "press it",
+                    "severity": severity,
+                }),
+            ),
+            (
+                "open_grant",
+                json!({"origins": ["https://example.com"], "hazards": []}),
+            ),
+            ("present", json!({"origin": "https://example.com"})),
+            ("resume", json!({})),
+            ("import_login", json!({"origin": "https://example.com"})),
+            (
+                "capture_login",
+                json!({
+                    "credential_domain": "example.com",
+                    "account": "me",
+                    "fetch_url": "https://example.com/api",
+                    "login_url": "https://example.com/login",
+                }),
+            ),
+        ];
+        assert_requirements_enforced_at_call_time(
+            &planes,
+            BROWSER_USE,
+            &browser_action_requirements(&browser_names()),
+            &samples,
+        )
+        .await;
+    }
+
+    /// A model's `computer_use` call missing any field its action requires is
+    /// refused by name at call time, before anything is dispatched.
+    ///
+    /// macOS only: the computer plane is built only there and on Windows, and
+    /// its test driver is the macOS one. The screen is pinned unlocked, because
+    /// a locked screen refuses every computer call before its parser runs and
+    /// would hide what this checks. No application name resolves to a running
+    /// process, so a call that wrongly went ahead could reach no real one.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_computer_call_missing_a_required_field_is_refused_before_dispatch() {
+        use crate::computer_capability::{ComputerPlane, NativeComputerPlatformDriver};
+        use cerebellum_computer::platform::TargetResolution;
+
+        struct NothingRuns;
+        impl crate::management::TargetResolver for NothingRuns {
+            fn resolve(&self, _bundle_identity: &str) -> TargetResolution {
+                TargetResolution::NotRunning
+            }
+        }
+
+        let mut planes = crate::Planes::with_browser_config_journaling(
+            std::sync::Arc::new(cerebellum_core::health::HealthState::default()),
+            None,
+            crate::JournalPersistence::Isolated,
+        );
+        planes.management = std::sync::Arc::new(crate::management::ManagementPlane::new(
+            std::sync::Arc::new(NothingRuns),
+        ));
+        planes.computer = crate::computer_capability::computer_audit(
+            crate::JournalPersistence::Isolated,
+        )
+        .map(|audit| {
+            std::sync::Arc::new(
+                ComputerPlane::with_synthetic_driver(audit, || {
+                    NativeComputerPlatformDriver::default().without_expected_post_condition()
+                })
+                .with_session_lock_for_test(Some(false)),
+            )
+        });
+        planes.computer_admitted = std::sync::Arc::new(computer_names().into_iter().collect());
+
+        let app = "com.example.FlatToolProbeNotInstalled";
+        let point = json!({"x": 1, "y": 1});
+        let samples = [
+            ("read_state", json!({"target": app})),
+            ("press_element", json!({"element_id": "e1"})),
+            ("press_point", json!({"image_id": "i1", "x": 1, "y": 1})),
+            (
+                "write_text",
+                json!({"element_id": "e1", "text": "hi", "write_mode": "replace_value"}),
+            ),
+            ("type", json!({"target": app, "text": "hi"})),
+            ("keys", json!({"target": app, "keys": ["s"]})),
+            ("takeover_move", json!({"image_id": "i1", "to": point})),
+            (
+                "takeover_drag",
+                json!({"image_id": "i1", "from": point, "to": point}),
+            ),
+            (
+                "takeover_scroll",
+                json!({"target": app, "axis": "vertical", "amount_lines": 1}),
+            ),
+            (
+                "wait",
+                json!({
+                    "app": app,
+                    "predicate": {"kind": "element_present", "element": {"Identifier": "ready"}},
+                    "timeout_ms": 0,
+                }),
+            ),
+        ];
+        assert_requirements_enforced_at_call_time(
+            &planes,
+            COMPUTER_USE,
+            &computer_action_requirements(&computer_names()),
+            &samples,
+        )
+        .await;
     }
 }
