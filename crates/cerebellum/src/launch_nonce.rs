@@ -43,6 +43,21 @@ pub(crate) fn for_hello() -> Result<Option<String>, subc_os::LaunchNonceError> {
     Ok(subc_os::launch_nonce()?.map(|nonce| nonce.value().to_string()))
 }
 
+/// The nonce to present as `consumer_identity` when this module opens a route
+/// of its own (today only the vault deposit after a granted capture card).
+///
+/// The same cached answer HELLO used: the accessor read the pipe once at
+/// startup and this never reads it again. Without it the daemon stamps the
+/// route `Direct`, and the vault refuses a direct caller. `None` when the
+/// daemon gave no nonce (the module was started by hand) or the read failed;
+/// a failed read already stopped HELLO, so a registered module never sees it.
+pub(crate) fn for_consumer_identity() -> Option<String> {
+    subc_os::launch_nonce()
+        .ok()
+        .flatten()
+        .map(|nonce| nonce.value().to_string())
+}
+
 /// Where this process read its nonce from, as module provenance reports it
 /// (`fd` or `env`). `None` when there is no nonce or it could not be read:
 /// then there is no source to claim.

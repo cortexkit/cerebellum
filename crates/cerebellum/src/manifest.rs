@@ -161,9 +161,9 @@ fn management_surface() -> ProviderRole {
             (
                 crate::management::CAPTURE_LOGIN,
                 "With the person's approval, have them log in to credential_domain in a fresh \
-                 throwaway browser, write the request Cookie header for fetch_url to one local \
-                 file deleted after 10 minutes, and return the ck auth commands the operator \
-                 runs to store it for insula. No cookie value is returned.",
+                 throwaway browser and store the request Cookie header for fetch_url in the \
+                 vault for insula as cookie:<credential_domain>:<account>. Replies with the \
+                 vault's outcome; no cookie value is returned.",
             ),
             (
                 crate::management::CLEAR_LAUNCH_RECOVERY,
@@ -181,7 +181,7 @@ fn management_surface() -> ProviderRole {
                 // cookie store after the person chooses a source browser.
                 ManagementOperationKind::Mutate
             } else if name == crate::management::CAPTURE_LOGIN {
-                // A capture writes a file holding a login onto this machine.
+                // A capture stores a login in the vault.
                 ManagementOperationKind::Mutate
             } else if name == crate::management::REVOKE_APP_GRANT {
                 // A revoke rewrites the durable grant store.
@@ -385,27 +385,19 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
             },
             management_surface(),
         ])
-        // One negative claim, and nothing else yet.
+        // No capability is denied to this module as a caller.
         //
-        // `must_never_reach` fences THIS MODULE AS CALLER: the daemon refuses
-        // any route we open toward a provider of the named capability, and
-        // force-closes live ones if a matching provider appears later. It is
-        // not a claim that nothing may be handed to us -- receipt rides routes
-        // the sender opens, so the inbound half of the credential boundary is
-        // not expressible here and remains an agreement with the vault module.
+        // This module makes exactly one call to the vault (claustrum, the
+        // `credentials-provider/v1` provider): the cookie deposit after a
+        // person grants the `browser.capture_login` consent card. The daemon's
+        // `must_never_reach` names whole capabilities, so denying that one
+        // would refuse the deposit route too; it cannot be narrowed to one op.
         //
-        // We declare it because this module must never pull a secret. It holds
-        // live browser sessions and durable per-agent profiles, so a path from
-        // here into a secret store is the one route whose absence is worth
-        // enforcing rather than remembering.
-        //
-        // Costs nothing today and is not expected to: the vault's sealing
-        // surface, which durable profiles are designed to consult, is a
-        // SEPARATE capability that does not exist yet. Enforcement is
-        // module-granular though, so when sealing lands it will need one of an
-        // op-scoped deny, a distinct provider module, or a visible relaxation
-        // of this line -- a decision that design pass owns explicitly rather
-        // than discovering.
+        // The narrowing lives in the vault instead. This module reaches it as
+        // `reserved:cerebellum`, and claustrum's grant for that principal
+        // allows one operation, `deposit`, in one category, `browser-session`;
+        // every other operation is refused there. This module holds no grant
+        // that reads a credential, so it still cannot pull a secret.
         //
         // `provides` stays empty because it is capability-grammar naming, a
         // different axis from the provider roles above, and this module's
@@ -414,7 +406,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
         .capabilities(Some(CapabilityDeclarations {
             provides: Vec::new(),
             requires: Vec::new(),
-            must_never_reach: vec!["credentials-provider/v1".to_string()],
+            must_never_reach: Vec::new(),
         }))
         .build()
 }

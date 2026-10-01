@@ -1663,6 +1663,15 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
         BrowserSurface::NotConfigured | BrowserSurface::Refused(_) => None,
     };
     let mut planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
+    // Captures deposit into the vault over a connection of their own, opened
+    // with the same connection file as this one. Set before `prepare`, so a
+    // test can put its own vault in its place.
+    planes
+        .capture
+        .set_vault(Arc::new(login_capture::vault::ClaustrumVault::supervised(
+            config.connection_file_path.clone(),
+            config.module_id.clone(),
+        )));
     prepare(&mut planes);
     // Recovery publishes the service before module_loop takes the transport, so
     // an attested orphan from a previous process cannot race a fresh spawn. That
@@ -1688,7 +1697,7 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
         }
     }
     // After launch recovery has terminated any capture browser a previous
-    // module process left running, remove the files and profiles it left.
+    // module process left running, remove the profiles it left.
     planes.capture.sweep_at_startup();
     let idle_enforcer = browser_config.clone().map(|browser| {
         let sessions = planes.sessions.clone();
@@ -3957,15 +3966,15 @@ async fn capture_browser_login(
             },
         )
         .await;
+    // A deposit already made stays in the vault when this record cannot be
+    // written: the vault cannot be asked to withdraw it, and its own audit
+    // row, bound to the consent card's id, still describes it.
     if planes
         .browser
         .journal_login_capture(&facts.identity, outcome.journal)
         .await
         .is_err()
     {
-        if let Some(path) = outcome.captured_file.as_deref() {
-            planes.capture.discard_captured_file(path);
-        }
         return json!({"outcome":"internal_failure","reason":"journal_unavailable"});
     }
     outcome.reply
@@ -7506,7 +7515,7 @@ mod tests {
     }
 
     /// Through the production frame dispatcher and the Withhold reply boundary:
-    /// the planted cookie value reaches the capture file, and is absent from
+    /// the planted cookie value reaches the vault request, and is absent from
     /// the question put to the person, the wire reply, and every decoded
     /// journal entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7534,17 +7543,28 @@ mod tests {
         assert!(planes.elicitor.deliver(
             question.header.channel,
             question.header.corr,
-            json!({"decision": "allow"}),
+            json!({"decision": "allow", "elicitation_id": "el_dispatch_301"}),
         ));
         let reply = next_frame(&mut writer_rx).await;
         assert_eq!(reply.header.corr, 301);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "captured", "{body}");
+        // The answer's card id survives the real elicitor and becomes the
+        // deposit's consent reference.
+        assert_eq!(
+            fixture.vault.request_params()[0]["consent_ref"],
+            "el_dispatch_301"
+        );
 
         // Positive control: the scanner finds the value where it was planted.
-        let files = fixture.fs.files();
-        assert_eq!(files.len(), 1);
-        assert!(contains_bytes(&files[0].1, PLANTED_VALUE));
+        let requests = fixture.vault.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(contains_bytes(&requests[0], PLANTED_VALUE));
+        assert!(fixture.fs.files().is_empty());
+        let cookie_bytes = fixture.vault.request_params()[0]["cookie"]
+            .as_str()
+            .unwrap()
+            .len() as u64;
 
         assert!(
             !contains_bytes(&question.body, PLANTED_VALUE),
@@ -7563,10 +7583,10 @@ mod tests {
         let Some(journal::JournalPayload::LoginCapture(payload)) = &entries[0].payload else {
             panic!("a capture is journaled with its own payload: {export}");
         };
-        assert_eq!(payload.outcome, "captured");
+        assert_eq!(payload.outcome, "captured:created");
         assert_eq!(payload.holder, "reserved:insula");
         assert_eq!(payload.credential_id, "cookie:ollama.com:work");
-        assert_eq!(payload.bytes, files[0].1.len() as u64);
+        assert_eq!(payload.bytes, cookie_bytes);
         assert_eq!(payload.deletion_succeeded, Some(true));
         for entry in &entries {
             let decoded = serde_json::to_vec(entry).unwrap();
@@ -7603,7 +7623,7 @@ mod tests {
         planes.elicitor.deliver(
             question.header.channel,
             question.header.corr,
-            json!({"decision": "allow"}),
+            json!({"decision": "allow", "elicitation_id": "el_dispatch_302"}),
         );
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -7774,6 +7794,30 @@ mod tests {
         assert!(planes
             .browser
             .finish_reply(management::CAPTURE_LOGIN, json!({"path": "/tmp/x"}))
+            .is_err());
+        // `commands` carried the `ck auth` commands a capture used to return
+        // for storing its cookie file by hand; the schema no longer declares
+        // it, so a reply carrying it is withheld.
+        assert!(planes
+            .browser
+            .finish_reply(
+                management::CAPTURE_LOGIN,
+                json!({"outcome": "captured", "commands": ["ck auth put"]})
+            )
+            .is_err());
+        assert!(planes
+            .browser
+            .finish_reply(
+                management::CAPTURE_LOGIN,
+                json!({"outcome": "captured", "credential_id": "cookie:x.com:a", "vault_outcome": "created", "record_version": 3})
+            )
+            .is_ok());
+        assert!(planes
+            .browser
+            .finish_reply(
+                management::CAPTURE_LOGIN,
+                json!({"outcome": "captured", "vault_outcome": "kept"})
+            )
             .is_err());
         assert!(planes
             .browser

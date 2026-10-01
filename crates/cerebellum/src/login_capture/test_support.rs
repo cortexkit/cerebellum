@@ -1,21 +1,23 @@
 //! In-memory stand-ins for every seam a capture touches, shared by this
 //! module's tests and the management-dispatch tests in `lib.rs`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use cerebellum_core::identity::AcceptedBindFacts;
+use serde_json::{json, Value};
 
 use crate::browser_launch::BrowserProcessLiveness;
 
+use super::vault::{BoxFuture, CookieVault, VaultReachError, VaultRoute};
 use super::{
     BackupExclusion, CaptureBrowser, CaptureDriveError, CaptureEnv, CaptureFs,
     CaptureLaunchRefusal, CaptureLauncher, CaptureModule, CapturePlacement, CookieHeader,
-    CookieHeaderError, DeletionScheduler, ResidueEntry, SessionProbe, ToolError, WallClock,
+    CookieHeaderError, ResidueEntry, SessionProbe, ToolError,
 };
 
 /// What one scripted verification load reports.
@@ -69,6 +71,23 @@ impl Verifications {
     }
 }
 
+/// Claustrum's producer-pinned wire contract for `credential.deposit_cookie`,
+/// copied byte for byte from claustrum f3f968a,
+/// `crates/credentials-module/tests/fixtures/deposit_cookie_wire_contract.json`.
+/// See the README beside the copy.
+pub(crate) const DEPOSIT_CONTRACT: &str =
+    include_str!("../../tests/fixtures/deposit_cookie_wire_contract.json");
+
+/// The exact reply bytes the contract fixture gives for `case`.
+pub(crate) fn contract_reply(case: &str) -> Vec<u8> {
+    let fixture: Value = serde_json::from_str(DEPOSIT_CONTRACT).unwrap();
+    fixture[case]
+        .as_str()
+        .unwrap_or_else(|| panic!("the contract fixture has no {case}"))
+        .as_bytes()
+        .to_vec()
+}
+
 /// A value planted in the fake browser's cookies so leak tests can look for it.
 pub(crate) const PLANTED_VALUE: &str = "ck-planted-cookie-value-9e3b71";
 pub(crate) const ROOT: &str = "/fake-tmp/ck-cerebellum-capture";
@@ -101,9 +120,8 @@ pub(crate) enum FakeEntry {
 }
 
 pub(crate) struct FakeFs {
-    pub(crate) entries: Mutex<BTreeMap<PathBuf, (FakeEntry, SystemTime)>>,
+    pub(crate) entries: Mutex<BTreeMap<PathBuf, FakeEntry>>,
     pub(crate) events: Events,
-    pub(crate) clock: Arc<FakeClock>,
     /// Paths whose removal fails with PermissionDenied.
     pub(crate) undeletable: Mutex<BTreeSet<PathBuf>>,
     /// Every directory removal fails.
@@ -114,22 +132,21 @@ pub(crate) struct FakeFs {
 }
 
 impl FakeFs {
-    pub(crate) fn new(events: Events, clock: Arc<FakeClock>) -> Self {
+    pub(crate) fn new(events: Events) -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),
             events,
-            clock,
             undeletable: Mutex::new(BTreeSet::new()),
             directories_undeletable: AtomicBool::new(false),
             removal_delay: Mutex::new(Duration::ZERO),
         }
     }
 
-    pub(crate) fn plant(&self, path: &Path, entry: FakeEntry, modified: SystemTime) {
+    pub(crate) fn plant(&self, path: &Path, entry: FakeEntry) {
         self.entries
             .lock()
             .unwrap()
-            .insert(path.to_path_buf(), (entry, modified));
+            .insert(path.to_path_buf(), entry);
     }
 
     pub(crate) fn exists(&self, path: &Path) -> bool {
@@ -143,7 +160,7 @@ impl FakeFs {
             .unwrap()
             .iter()
             .filter(|(path, _)| path.as_path() != Path::new(ROOT))
-            .map(|(path, (entry, _))| (path.clone(), entry.clone()))
+            .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect()
     }
 
@@ -169,7 +186,7 @@ impl CaptureFs for FakeFs {
             .lock()
             .unwrap()
             .entry(root.to_path_buf())
-            .or_insert((FakeEntry::Dir, self.clock.now()));
+            .or_insert(FakeEntry::Dir);
         Ok(())
     }
 
@@ -180,10 +197,9 @@ impl CaptureFs for FakeFs {
             .unwrap()
             .iter()
             .filter(|(path, _)| path.parent() == Some(root))
-            .map(|(path, (entry, modified))| ResidueEntry {
+            .map(|(path, entry)| ResidueEntry {
                 path: path.clone(),
                 is_dir: *entry == FakeEntry::Dir,
-                modified: Some(*modified),
             })
             .collect())
     }
@@ -193,21 +209,8 @@ impl CaptureFs for FakeFs {
         if entries.contains_key(path) {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        entries.insert(path.to_path_buf(), (FakeEntry::Dir, self.clock.now()));
+        entries.insert(path.to_path_buf(), FakeEntry::Dir);
         self.events.push("profile_created");
-        Ok(())
-    }
-
-    fn write_new_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let mut entries = self.entries.lock().unwrap();
-        if entries.contains_key(path) {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
-        entries.insert(
-            path.to_path_buf(),
-            (FakeEntry::File(bytes.to_vec()), self.clock.now()),
-        );
-        self.events.push("file_written");
         Ok(())
     }
 
@@ -282,63 +285,117 @@ impl BackupExclusion for FakeExclusion {
     }
 }
 
-pub(crate) struct FakeClock(pub(crate) Mutex<SystemTime>);
+/// What the fake vault answers to one deposit call.
+#[derive(Clone, Debug)]
+pub(crate) enum FakeReply {
+    /// Stored, echoing the request's id.
+    Stored { outcome: &'static str, version: u64 },
+    /// The vault's refusal body.
+    Refused {
+        class: &'static str,
+        code: &'static str,
+    },
+    /// Exactly this reply body.
+    Raw(Value),
+    /// Exactly these reply bytes, as a fixture holds them.
+    Bytes(Vec<u8>),
+    /// The route fails instead of answering.
+    Fails(VaultReachError),
+    /// No answer, ever.
+    Hangs,
+}
 
-impl FakeClock {
-    pub(crate) fn at(time: SystemTime) -> Self {
-        Self(Mutex::new(time))
-    }
-
-    pub(crate) fn advance(&self, by: Duration) {
-        let mut now = self.0.lock().unwrap();
-        *now += by;
+impl FakeReply {
+    pub(crate) fn refused(class: &'static str, code: &'static str) -> Self {
+        Self::Refused { class, code }
     }
 }
 
-impl WallClock for FakeClock {
-    fn now(&self) -> SystemTime {
-        *self.0.lock().unwrap()
+/// A vault behind the deposit seam: answers from a script and keeps every
+/// request body it received. Test-only, so it holds the planted cookie; the
+/// leak tests read the reply, the journal and errors, never this.
+pub(crate) struct FakeVault {
+    /// When set, opening the route fails this way.
+    pub(crate) open_fails: Mutex<Option<VaultReachError>>,
+    /// Answers in order, one per call; once they run out, every further call
+    /// is answered as stored with outcome `created`.
+    pub(crate) replies: Mutex<VecDeque<FakeReply>>,
+    pub(crate) requests: Mutex<Vec<Vec<u8>>>,
+    pub(crate) opens: AtomicUsize,
+    pub(crate) events: Events,
+}
+
+impl FakeVault {
+    pub(crate) fn script(&self, replies: impl IntoIterator<Item = FakeReply>) {
+        *self.replies.lock().unwrap() = replies.into_iter().collect();
     }
-}
 
-type ScheduledDeletion = (SystemTime, Box<dyn FnOnce() + Send>);
+    pub(crate) fn calls(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
 
-#[derive(Default)]
-pub(crate) struct FakeScheduler {
-    pub(crate) scheduled: Mutex<Vec<ScheduledDeletion>>,
-}
-
-impl FakeScheduler {
-    pub(crate) fn deadlines(&self) -> Vec<SystemTime> {
-        self.scheduled
+    /// The `params` of every request received, decoded.
+    pub(crate) fn request_params(&self) -> Vec<Value> {
+        self.requests
             .lock()
             .unwrap()
             .iter()
-            .map(|(at, _)| *at)
+            .map(|body| serde_json::from_slice::<Value>(body).unwrap())
+            .map(|request| request["params"].clone())
             .collect()
     }
+}
 
-    /// Run every deletion whose deadline is at or before `now`.
-    pub(crate) fn run_due(&self, now: SystemTime) {
-        let due = {
-            let mut scheduled = self.scheduled.lock().unwrap();
-            let (due, pending): (Vec<_>, Vec<_>) =
-                scheduled.drain(..).partition(|(at, _)| *at <= now);
-            *scheduled = pending;
-            due
-        };
-        for (_, delete) in due {
-            delete();
-        }
+/// The fixture's handle on its fake vault, which the module holds as a
+/// `dyn CookieVault`.
+pub(crate) struct SharedFakeVault(pub(crate) Arc<FakeVault>);
+
+impl CookieVault for SharedFakeVault {
+    fn open(&self) -> BoxFuture<'_, Result<Box<dyn VaultRoute>, VaultReachError>> {
+        let vault = Arc::clone(&self.0);
+        Box::pin(async move {
+            vault.opens.fetch_add(1, Ordering::SeqCst);
+            vault.events.push("vault_open");
+            if let Some(error) = vault.open_fails.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(Box::new(FakeRoute(vault)) as Box<dyn VaultRoute>)
+        })
     }
 }
 
-impl DeletionScheduler for FakeScheduler {
-    fn schedule(&self, at: SystemTime, delete: Box<dyn FnOnce() + Send>) {
-        self.scheduled.lock().unwrap().push((at, delete));
+struct FakeRoute(Arc<FakeVault>);
+
+impl VaultRoute for FakeRoute {
+    fn call<'a>(
+        &'a mut self,
+        request: &'a [u8],
+    ) -> BoxFuture<'a, Result<Vec<u8>, VaultReachError>> {
+        Box::pin(async move {
+            let vault = &self.0;
+            vault.events.push("vault_call");
+            vault.requests.lock().unwrap().push(request.to_vec());
+            let id = serde_json::from_slice::<Value>(request).unwrap()["params"]["id"].clone();
+            let next = vault.replies.lock().unwrap().pop_front();
+            let reply = match next.unwrap_or(FakeReply::Stored {
+                outcome: "created",
+                version: 1,
+            }) {
+                FakeReply::Stored { outcome, version } => {
+                    json!({"result": {"id": id, "outcome": outcome, "record_version": version}})
+                }
+                FakeReply::Refused { class, code } => {
+                    json!({"result": {"error": {"class": class, "code": code}}})
+                }
+                FakeReply::Raw(body) => body,
+                FakeReply::Bytes(bytes) => return Ok(bytes),
+                FakeReply::Fails(error) => return Err(error),
+                FakeReply::Hangs => std::future::pending().await,
+            };
+            Ok(serde_json::to_vec(&reply).unwrap())
+        })
     }
 }
-
 /// How the fake browser behaves once handed to the person.
 #[derive(Clone)]
 pub(crate) struct BrowserScript {
@@ -546,8 +603,7 @@ pub(crate) struct Fixture {
     pub(crate) fs: Arc<FakeFs>,
     pub(crate) exclusion: Arc<FakeExclusion>,
     pub(crate) launcher: Arc<FakeLauncher>,
-    pub(crate) scheduler: Arc<FakeScheduler>,
-    pub(crate) clock: Arc<FakeClock>,
+    pub(crate) vault: Arc<FakeVault>,
     pub(crate) events: Events,
 }
 
@@ -556,11 +612,21 @@ pub(crate) fn fixture() -> Fixture {
 }
 
 pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
+    let fixture = fixture_without_vault_with(adjust);
+    fixture
+        .module
+        .set_vault(Arc::new(SharedFakeVault(Arc::clone(&fixture.vault))));
+    fixture
+}
+
+/// A module that was never given a vault; its fake vault is unreachable to it.
+pub(crate) fn fixture_without_vault() -> Fixture {
+    fixture_without_vault_with(|_| {})
+}
+
+fn fixture_without_vault_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
     let events = Events::default();
-    let clock = Arc::new(FakeClock::at(
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
-    ));
-    let fs = Arc::new(FakeFs::new(events.clone(), Arc::clone(&clock)));
+    let fs = Arc::new(FakeFs::new(events.clone()));
     let exclusion = Arc::new(FakeExclusion {
         answer: Mutex::new(Ok(true)),
         answer_after_add: Mutex::new(None),
@@ -568,7 +634,6 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
         add_fails: Mutex::new(None),
         events: events.clone(),
     });
-    let scheduler = Arc::new(FakeScheduler::default());
     let launcher = Arc::new(FakeLauncher {
         script: Mutex::new(BrowserScript::default()),
         events: events.clone(),
@@ -576,14 +641,18 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
         placements: Mutex::new(Vec::new()),
         verifications: Verifications::default(),
     });
+    let vault = Arc::new(FakeVault {
+        open_fails: Mutex::new(None),
+        replies: Mutex::new(VecDeque::new()),
+        requests: Mutex::new(Vec::new()),
+        opens: AtomicUsize::new(0),
+        events: events.clone(),
+    });
     let mut env = CaptureEnv {
         platform_supported: true,
         root: Some(PathBuf::from(ROOT)),
         exclusion: exclusion.clone(),
         fs: fs.clone(),
-        clock: clock.clone(),
-        scheduler: scheduler.clone(),
-        file_lifetime: super::FILE_LIFETIME,
         handoff_duration: Duration::from_secs(5),
         poll_interval: Duration::from_millis(1),
         drive_deadline_ms: 100,
@@ -592,6 +661,9 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
         verification_min_spacing: Duration::from_millis(5),
         verification_retry_interval: Duration::from_millis(10),
         verification_deadline: Duration::from_millis(100),
+        deposit_deadline: Duration::from_secs(5),
+        // As many retries as production, with waits short enough for tests.
+        deposit_backoff: vec![Duration::from_millis(1); super::vault::RETRY_BACKOFF.len()],
     };
     adjust(&mut env);
     let module = Arc::new(CaptureModule::new(env));
@@ -601,8 +673,7 @@ pub(crate) fn fixture_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
         fs,
         exclusion,
         launcher,
-        scheduler,
-        clock,
+        vault,
         events,
     }
 }

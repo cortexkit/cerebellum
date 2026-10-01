@@ -141,23 +141,20 @@ fn missing_input_and_implementation_failure_are_distinct() {
     assert_ne!(missing_report.outcomes, failed_report.outcomes);
 }
 
-/// The module declares that it must never reach a credential store.
+/// The module does not deny itself the vault it deposits captured logins into.
 ///
-/// A negative capability claim is enforced by the daemon refusing routes we
-/// open toward a provider of the named capability -- so it protects nothing
-/// that this module does, and everything it must never start doing. Precisely
-/// because it constrains only future code, nothing in the current build fails
-/// if the line is deleted: no test would notice, no behaviour would change,
-/// and the fence would be gone until someone read the manifest.
+/// `browser.capture_login` stores the cookie it captures with one vault call,
+/// `credential.deposit_cookie` on claustrum, which provides
+/// `credentials-provider/v1`. The daemon refuses every route an opener's
+/// `must_never_reach` names, whole capability at a time, so a deny edge on that
+/// capability makes every deposit fail with `capability_forbidden` and the
+/// person's sign-in is lost after they granted it.
 ///
-/// This module holds live browser sessions and durable per-agent profiles.
-/// A route from here into a secret store is the one whose absence is worth
-/// enforcing rather than remembering.
+/// The fence this module used to declare here moved to the vault: claustrum's
+/// grant for `reserved:cerebellum` allows only `deposit` on the
+/// `browser-session` category, so this module still cannot read a secret.
 #[test]
-fn the_manifest_forbids_this_module_from_reaching_a_credential_store() {
-    // The plain constructor: the deny edge is a property of the module, not of
-    // any release-gate outcome, so it must hold on the simplest manifest we
-    // can build.
+fn the_manifest_does_not_deny_the_vault_the_capture_deposits_into() {
     let manifest = cerebellum::manifest::build("cerebellum");
     let capabilities = manifest
         .capabilities
@@ -165,12 +162,12 @@ fn the_manifest_forbids_this_module_from_reaching_a_credential_store() {
         .expect("the manifest declares a capability grammar block");
 
     assert!(
-        capabilities
+        !capabilities
             .must_never_reach
             .iter()
             .any(|capability| capability == "credentials-provider/v1"),
-        "the credential-store deny edge is missing: this module may never pull a secret, and \
-         the manifest is the only place a supervisor can be told so"
+        "the manifest denies credentials-provider/v1, so the daemon refuses the capture's \
+         vault deposit route"
     );
 
     // The deny must not sit beside a requirement for the same capability --

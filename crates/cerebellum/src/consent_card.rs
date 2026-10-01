@@ -744,7 +744,7 @@ mod every_card_kind {
             fetch_url: "https://ollama.com/settings".into(),
             login_url: "https://ollama.com/signin".into(),
         };
-        let body = crate::login_capture::consent_question(&request, Duration::from_secs(600));
+        let body = crate::login_capture::consent_question(&request, "capture-login-test");
         let params = as_sent(body, crate::login_import::ELICITATION_DEADLINE).await;
         assert_card(
             "capture_login",
