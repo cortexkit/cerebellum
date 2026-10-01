@@ -15,9 +15,12 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v14.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v15.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
+/// The digest of the v14 artifact, measured before v15 was minted.
+const V14_ARTIFACT_SHA256: &str =
+    "81084b233027765c4466b93247827bd2d5f488f479993b2b43dd0524346ba5a1";
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
 /// The digest of the v12 artifact, measured before v13 was minted.
 const V12_ARTIFACT_SHA256: &str =
@@ -46,11 +49,11 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn vocabulary_has_exactly_ten_rows_and_locked_digest() {
+fn vocabulary_has_exactly_eleven_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
     assert_eq!(validated.revision, COMPUTER_ACTION_VOCABULARY_REVISION);
     assert_eq!(validated.schema_id, "ck-computer-action-vocabulary/v2");
-    assert_eq!(validated.row_count, 10, "absolute row-count invariant");
+    assert_eq!(validated.row_count, 11, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
     assert_eq!(
         computed_vocabulary_sha256(),
@@ -328,7 +331,7 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
         permissions: PermissionLivenessReport::default(),
         startup: driver.startup_probe().clone(),
     });
-    assert_eq!(declarations.len(), 10);
+    assert_eq!(declarations.len(), 11);
     assert_eq!(
         declarations
             .iter()
@@ -434,7 +437,7 @@ fn the_takeover_rows_are_the_only_observed_only_capabilities() {
         .iter()
         .map(|item| item.capability_id.as_str())
         .collect();
-    assert_eq!(ids.len(), 10);
+    assert_eq!(ids.len(), 11);
 }
 
 fn recreated_v9() -> Value {
@@ -744,7 +747,8 @@ fn v13_only_makes_the_changes_recreated_v12_undoes() {
 fn the_minted_artifact_is_the_generator_output_from_v12() {
     let generated =
         vocabulary_mint::v13_from_v12(&recreated_v12(), historical_revision(13).as_str().unwrap());
-    let generated = vocabulary_mint::v14_from_v13(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated = vocabulary_mint::v14_from_v13(&generated, historical_revision(14).as_str().unwrap());
+    let generated = vocabulary_mint::v15_from_v14(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -757,7 +761,7 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
             .iter()
             .map(|row| row["capability_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vocabulary_mint::V13_ROW_IDS
+        vocabulary_mint::V15_ROW_IDS
     );
 }
 
@@ -905,9 +909,109 @@ fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
     }
 }
 
+/// Undo revision 15: the tree and diff arrays back in place of state_text,
+/// subtree_element_id back in place of zoom, no target names, no element
+/// targets, no diff cap word, and no list_apps row.
+fn recreated_v14() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(14);
+    assert_eq!(
+        vocabulary["rows"].as_array_mut().unwrap().pop().unwrap()["capability_id"],
+        "computer.list_apps"
+    );
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let id = row["capability_id"].as_str().unwrap().to_string();
+        let id = id.as_str();
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        if vocabulary_mint::V15_NAMED_TARGET_ROWS.contains(&id) {
+            assert!(properties.remove("candidates").is_some(), "{id}");
+            assert!(properties.remove("target").is_some(), "{id}");
+            let outcome = properties["outcome"].as_object_mut().unwrap();
+            outcome["enum"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|word| !vocabulary_mint::V15_NAME_OUTCOMES.contains(&word.as_str().unwrap()));
+            if id != "computer.read_state" {
+                let description = outcome["description"]
+                    .as_str()
+                    .unwrap()
+                    .strip_suffix(vocabulary_mint::V15_NAME_OUTCOMES_ADDITION)
+                    .expect("the name outcomes are described")
+                    .to_owned();
+                outcome.insert("description".into(), json!(description));
+            }
+        }
+        if vocabulary_mint::V15_ELEMENT_ROWS.contains(&id) {
+            assert!(properties.remove("target").is_some(), "{id}");
+            let outcome = properties["outcome"].as_object_mut().unwrap();
+            assert_eq!(
+                outcome["enum"].as_array_mut().unwrap().pop(),
+                Some(json!("target_mismatch"))
+            );
+            let description = outcome["description"]
+                .as_str()
+                .unwrap()
+                .strip_suffix(vocabulary_mint::V15_TARGET_MISMATCH_ADDITION)
+                .expect("target_mismatch is described")
+                .to_owned();
+            outcome.insert("description".into(), json!(description));
+            assert!(row["request_schema"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("target")
+                .is_some());
+        }
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        if vocabulary_mint::V15_DIFF_ROWS.contains(&id) {
+            assert!(properties.remove("state_text").is_some(), "{id}");
+            properties.extend(vocabulary_mint::v14_diff_fields());
+            assert_eq!(
+                properties["truncation"]["properties"]["reason"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop(),
+                Some(json!("diff_cap_reached"))
+            );
+        }
+        if id == "computer.read_state" {
+            assert!(properties.remove("state_text").is_some());
+            properties.insert("tree".into(), vocabulary_mint::v14_tree_field());
+            let outcome = properties["outcome"].as_object_mut().unwrap();
+            let description = outcome["description"].as_str().unwrap().replacen(
+                vocabulary_mint::V15_READ_STATE_OUTCOME_START,
+                vocabulary_mint::V14_READ_STATE_OUTCOME_START,
+                1,
+            );
+            outcome.insert("description".into(), json!(description));
+            let request = row["request_schema"]["properties"].as_object_mut().unwrap();
+            assert!(request.remove("zoom").is_some());
+            request.insert(
+                "subtree_element_id".into(),
+                vocabulary_mint::v14_subtree_field(),
+            );
+            request.insert(
+                "text_filter".into(),
+                vocabulary_mint::v14_text_filter_field(),
+            );
+        }
+    }
+    vocabulary
+}
+
+/// v15 makes exactly the changes `recreated_v14` undoes, and nothing else.
+///
+/// The digest on the right is v14's, measured before the mint.
+#[test]
+fn v15_only_makes_the_changes_recreated_v14_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v14()).unwrap()),
+        V14_ARTIFACT_SHA256
+    );
+}
+
 /// Restore the open keystroke outcomes and remove the read, image and web refusals.
 fn recreated_v13() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary: Value = recreated_v14();
     vocabulary["revision"] = historical_revision(13);
     for id in ["computer.keys", "computer.type"] {
         let properties = &mut row_mut(&mut vocabulary, id)["result_schema"]["properties"];
@@ -1043,7 +1147,7 @@ fn v14_refusal_words_are_in_closed_enums_and_validate() {
     validate_capability_result(
         "computer.read_state",
         &json!({
-            "outcome": "completed", "tree": "", "unreadable_subtrees": 0,
+            "outcome": "completed", "state_text": "", "unreadable_subtrees": 0,
             "image_unavailable": {"reason": "window_covered_may_be_stale"}
         }),
     )

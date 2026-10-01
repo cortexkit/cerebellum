@@ -157,7 +157,7 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
 
 #[test]
 fn capability_and_containment_maps_are_closed() {
-    assert_eq!(ComputerCapability::ALL.len(), 10);
+    assert_eq!(ComputerCapability::ALL.len(), 11);
     assert_eq!(ComputerCapability::RETIRED.len(), 5);
     assert_eq!(
         ComputerCapability::ReadState.action_kind(),
