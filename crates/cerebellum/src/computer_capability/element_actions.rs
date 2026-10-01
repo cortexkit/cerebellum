@@ -824,8 +824,8 @@ pub(crate) fn adopt(
 /// The read that becomes the baseline also becomes what the conversation
 /// was last shown of the focused element and window, since the diff shows
 /// it: a change this action caused is then never taken for the person's.
-/// Those are read just before each tree read, so the pair describes one
-/// moment.
+/// The focused element and window are read just before each tree read, so
+/// they and the tree describe one moment.
 pub(crate) fn settle_and_observe(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
@@ -1222,8 +1222,8 @@ where
     /// Asked after the grant is held and before anything is sent, so a
     /// refusal has done nothing and a read followed by a retry is safe. The
     /// element and keystroke rows ask it; reads, waits and takeover pointer
-    /// actions do not, the last because they already refuse while the person
-    /// is active.
+    /// actions do not. The takeover actions are left out because they
+    /// already refuse while the person is active.
     pub(super) async fn refuse_if_person_changed(
         &self,
         management: &ManagementPlane,

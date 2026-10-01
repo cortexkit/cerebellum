@@ -26,9 +26,10 @@ use crate::platform::ProcessGrant;
 /// measured that lag and allows the same margin.
 pub const OWN_INPUT_LAG: Duration = Duration::from_millis(crate::dispatch::HID_IDLE_TABLE_LAG_MS);
 
-/// How many of this module's recent posting spans are remembered. A span
-/// older than the agent's last look can no longer explain input the check
-/// cares about, so a short history is enough.
+/// How many of this module's recent posting spans are remembered. The check
+/// only asks about input since the conversation's last read or action reply,
+/// and a span that ended before that moment cannot explain such input, so a
+/// short history is enough.
 const REMEMBERED_POSTS: usize = 64;
 
 /// One reading, or the fact that it could not be taken. A reading that
@@ -153,7 +154,10 @@ pub struct OwnInputLedger {
 struct LedgerState {
     /// When each recent post began and, once it is over, when it ended.
     posts: VecDeque<(Instant, Option<Instant>)>,
-    /// The person's latest input, as last seen before a post hid it.
+    /// The person's latest input as the platform reported it just before
+    /// this module posted. The platform reports only the newest input, so
+    /// once this module's post is newer the person's is no longer reported
+    /// and would be lost without this copy.
     person_before_posts: Option<Instant>,
 }
 
@@ -187,8 +191,10 @@ impl OwnInputLedger {
     }
 
     /// Note that this module is about to post input. `last_input` is when
-    /// the platform last counted input, read just before; if that was the
-    /// person's, it is kept, since the post is about to hide it.
+    /// the platform last counted input, read just before; if that input was
+    /// not this module's own it was the person's, and it is kept, because
+    /// the post about to be made will replace it as the newest input the
+    /// platform reports.
     pub fn begin_posting(&self, last_input: Option<Instant>) -> Posting {
         let mut state = self.lock();
         if let Some(at) = last_input.filter(|at| !state.is_own(*at)) {

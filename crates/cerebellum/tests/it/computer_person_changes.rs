@@ -397,7 +397,7 @@ async fn typing_after_the_person_typed_into_the_frontmost_app_is_refused_and_not
     let rig = rig().await;
     let _ = rig.read().await;
 
-    // A key press from hardware, which the tap attributes to pid 0, while
+    // A key press from hardware (source pid 0, the person) counted while
     // the application is frontmost.
     rig.desk.state().input.push((0, Instant::now()));
     let reply = rig.type_text().await;
@@ -442,7 +442,8 @@ async fn after_the_refusal_a_read_lets_the_press_through() {
     rig.desk.state().focus = DeskFocus::Element(11);
 
     assert_person_refusal(&rig.press(&send).await, "focus_changed");
-    // A refusal shows the agent nothing, so it does not let a retry through.
+    // A refusal shows the agent no new state, so it does not reset what the
+    // agent was last shown and a retry is refused again.
     assert_person_refusal(&rig.press(&send).await, "focus_changed");
 
     let send = rig.read().await;

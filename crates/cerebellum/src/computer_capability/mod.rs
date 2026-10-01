@@ -455,10 +455,10 @@ where
     /// it such keystrokes are refused, and the refusal names only what the
     /// build can do instead.
     fronting_bracket_admitted: bool,
-    /// When this module posted input, so an action's check for the person's
-    /// use of an application does not take this module's own posts for the
-    /// person's. Shared by every conversation: a post is this module's
-    /// whichever conversation asked for it.
+    /// Records when this module posted input, so an action's check for the
+    /// person's use of an application does not mistake this module's own
+    /// posts for the person's. One ledger for every conversation: a post
+    /// counts as this module's whichever conversation asked for it.
     own_input: Arc<OwnInputLedger>,
     /// The screen-lock reading this crate's own tests serve under, in place of
     /// the machine's. Tests that drive the production plane through the frame

@@ -1413,7 +1413,8 @@ pub const V15_PERSON_CHANGE_ROWS: [&str; 5] = [
     "computer.keys",
 ];
 
-/// The refusal for an application the person used since the last look.
+/// The refusal for an application the person used since the conversation's
+/// last read_state or action reply.
 pub const V15_PERSON_CHANGE_OUTCOME: &str = "state_changed_by_person";
 
 /// What revision 15 appends to those rows' outcome description, after its
@@ -1715,8 +1716,9 @@ pub fn v15_from_v14(v14: &Value, revision: &str) -> Value {
                 outcome.insert("description".into(), json!(description));
             }
         }
-        // Last, so its words close the description and undoing it first
-        // leaves the other revision 15 changes as they were made.
+        // Applied after every other revision 15 change, so its sentence ends
+        // the description and removing it first, when revision 14 is
+        // rebuilt, leaves the other changes exactly as they were made.
         if V15_PERSON_CHANGE_ROWS.contains(&id) {
             let outcome = object_mut(row, "/result_schema/properties/outcome");
             let tokens = outcome["enum"].as_array_mut().unwrap();

@@ -925,7 +925,8 @@ fn recreated_v14() -> Value {
         let id = row["capability_id"].as_str().unwrap().to_string();
         let id = id.as_str();
         let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
-        // Made last, so undone first.
+        // The state_changed_by_person refusal was the last revision 15
+        // change applied, so it is the first removed.
         if vocabulary_mint::V15_PERSON_CHANGE_ROWS.contains(&id) {
             let outcome = properties["outcome"].as_object_mut().unwrap();
             let tokens = outcome["enum"].as_array_mut().unwrap();

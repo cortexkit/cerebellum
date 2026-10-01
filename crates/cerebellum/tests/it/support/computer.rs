@@ -718,8 +718,8 @@ pub struct DeskState {
     /// Swapped in for `roots` by the first press or write, so the diff that
     /// follows has something to report.
     pub after_action: Option<Vec<RawElement>>,
-    /// Taken as the application's focus by the first press or write, the
-    /// way pressing a button can move focus to what it opened.
+    /// The application's focus after the first press or write, the way
+    /// pressing a button can move focus to what it opened.
     pub focus_after_action: Option<DeskFocus>,
     pub focused_in_tree: Option<u64>,
     pub elements: std::collections::HashMap<u64, DeskElement>,
