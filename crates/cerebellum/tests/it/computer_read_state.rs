@@ -3,7 +3,7 @@
 //! result schema in withholding mode, so a reply the vocabulary does not
 //! declare fails here rather than reaching a caller.
 
-mod support;
+use super::support;
 
 use std::sync::{Arc, Mutex};
 

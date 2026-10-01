@@ -31,7 +31,9 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
-#[path = "../examples/support/consent_relay.rs"]
+// Allow the included example helper to retain the same name as its enclosing suite.
+#[allow(clippy::module_inception)]
+#[path = "../../examples/support/consent_relay.rs"]
 mod consent_relay;
 
 const MANAGEMENT_CHANNEL: u16 = 4;

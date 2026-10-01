@@ -61,8 +61,8 @@ fn pins() -> ManifestPinSet {
 
 #[test]
 fn checked_in_connector_fixture_artifacts_are_canonical_and_closed() {
-    let plan_bytes = include_bytes!("../resources/b1_s2_connector-test-plan.json");
-    let evidence_bytes = include_bytes!("../resources/b1_s2_connector-evidence.json");
+    let plan_bytes = include_bytes!("../../resources/b1_s2_connector-test-plan.json");
+    let evidence_bytes = include_bytes!("../../resources/b1_s2_connector-evidence.json");
     let plan = ConnectorTestPlan::parse(plan_bytes).unwrap();
     let evidence = ConnectorEvidence::parse(evidence_bytes).unwrap();
     assert_eq!(plan.cases.len(), 1);
@@ -164,7 +164,7 @@ fn a_frozen_type_evidence_pin_matching_the_expected_digest_is_accepted() {
 
 #[test]
 fn checked_in_manifest_pin_fixture_is_canonical_and_common_valid() {
-    let bytes = include_bytes!("../resources/b1_s2_manifest-pins.json");
+    let bytes = include_bytes!("../../resources/b1_s2_manifest-pins.json");
     let parsed = parse_manifest_pins(bytes, &expected_frozen_type_digest()).unwrap();
     assert_eq!(
         parsed.report.frozen_type_evidence,

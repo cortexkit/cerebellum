@@ -141,7 +141,7 @@ fn declared_dependency_names(manifest: &str) -> Vec<String> {
 
 #[test]
 fn manifest_has_no_plane_dependencies() {
-    let manifest = include_str!("../Cargo.toml");
+    let manifest = include_str!("../../Cargo.toml");
     let names = declared_dependency_names(manifest);
 
     // Guard against a parser regression that finds nothing (which would make

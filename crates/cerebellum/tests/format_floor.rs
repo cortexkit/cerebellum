@@ -1,3 +1,4 @@
+// Separate binary: re-executes current_exe() with exact child-test names.
 //! The format floor as each durable store of this module uses it.
 //!
 //! For every format a reader refuses, a record one version newer than this

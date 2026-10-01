@@ -26,7 +26,8 @@
 #   scripts/mutate.sh <file> <mutate-command> <verify-command>
 #
 # <mutate-command> edits <file> in place and may name it as $MUTANT.
-# <verify-command> is normally a test invocation.
+# <verify-command> is normally a test invocation. For a folded suite, select its
+# module inside `it`, e.g. cargo test -p cerebellum --test it one_lease_clock::.
 #
 # Read the result the opposite way round from a normal test run: the verify
 # command FAILING is the good outcome, because something caught the break. The
@@ -59,7 +60,7 @@ fi
 # capture the uncommitted work, and a failed restore would be indistinguishable
 # from the state the caller started in.
 if ! git diff --quiet -- "$MUTANT"; then
-  echo "mutate: $MUTANT has uncommitted changes; commit or stash them first," >&2
+  echo "mutate: $MUTANT has unstaged changes; stage or commit them first," >&2
   echo "        so that a failed restore is distinguishable from your own edits." >&2
   exit 2
 fi

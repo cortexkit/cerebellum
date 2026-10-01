@@ -1,3 +1,4 @@
+// Separate binary: re-executes current_exe() to test process-wide shutdown and signals.
 //! How the module process ends, observed from outside it.
 //!
 //! The in-process connection tests call the serving loop directly and never

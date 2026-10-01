@@ -6,7 +6,7 @@
 //! while posting nothing has shipped from this repository twice, and an
 //! outcome assertion cannot see it.
 
-mod support;
+use super::support;
 
 use std::sync::{Arc, Mutex};
 

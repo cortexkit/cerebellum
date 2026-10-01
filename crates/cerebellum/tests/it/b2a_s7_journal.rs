@@ -566,7 +566,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
 
 #[test]
 fn v3_fixture_reads_through_the_v4_reader() {
-    let fixture = include_str!("fixtures/browser-journal-v3.jsonl");
+    let fixture = include_str!("../fixtures/browser-journal-v3.jsonl");
     let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
     assert_eq!(entry.format_version, "ck-browser-journal/v3");
     assert_eq!(entry.capability, Some(Capability::Snapshot));
@@ -575,7 +575,7 @@ fn v3_fixture_reads_through_the_v4_reader() {
 
 #[test]
 fn v4_fixture_reads_through_the_v5_reader() {
-    let fixture = include_str!("fixtures/browser-journal-v4.jsonl");
+    let fixture = include_str!("../fixtures/browser-journal-v4.jsonl");
     let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
     assert_eq!(entry.format_version, "ck-browser-journal/v4");
     assert_eq!(entry.capability, Some(Capability::Present));
@@ -684,7 +684,7 @@ fn login_import_records_count_and_no_cookie_names_or_values() {
 /// shape would pass a looser check while silently rewriting history.
 #[test]
 fn v5_fixture_reads_back_byte_for_byte() {
-    let fixture = include_str!("fixtures/browser-journal-v5.jsonl");
+    let fixture = include_str!("../fixtures/browser-journal-v5.jsonl");
     let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
     assert_eq!(entry.format_version, "ck-browser-journal/v5");
     assert_eq!(entry.capability, Some(Capability::ImportLogin));

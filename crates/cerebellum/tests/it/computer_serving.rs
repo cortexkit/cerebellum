@@ -2,7 +2,7 @@
 //! all, how a wait finds the application it is about, and how an unreadable
 //! target is reported.
 
-mod support;
+use super::support;
 
 use std::path::PathBuf;
 use std::sync::Arc;

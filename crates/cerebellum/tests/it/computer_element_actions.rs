@@ -4,7 +4,7 @@
 //! withholding mode, and every assertion about what was done reads the
 //! fixture's record of presses and writes rather than the reply.
 
-mod support;
+use super::support;
 
 use std::sync::Arc;
 
