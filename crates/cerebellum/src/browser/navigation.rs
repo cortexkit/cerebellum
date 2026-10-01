@@ -3245,7 +3245,7 @@ fn render_actionable(
             .and_then(|id| by_backend.get(&id.backend_node_id))
             .copied();
         let node = node_index.map(|i| &nodes[i]);
-        let region = node.and_then(&landmark).or(match record.role.as_str() {
+        let region = node.and_then(landmark).or(match record.role.as_str() {
             "main" | "navigation" | "form" | "banner" | "contentinfo" | "complementary"
             | "region" => Some(record.role.as_str()),
             _ => None,

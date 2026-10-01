@@ -627,6 +627,16 @@ pub trait OwnedBrowserProcess: Send {
     }
 
     fn generation_matches(&self) -> bool;
+
+    /// Whether the recorded generation has positively gone, which is narrower
+    /// than `!generation_matches()`: a generation whose reading failed neither
+    /// matches nor has gone, and ending a session on it would end one whose
+    /// browser may still be on screen. The default keeps the older reading for
+    /// adapters that cannot tell the two apart.
+    fn generation_gone(&self) -> bool {
+        !self.generation_matches()
+    }
+
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure>;
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure>;
     fn force_terminate(&mut self) -> Result<(), ProcessControlFailure>;
@@ -672,6 +682,13 @@ pub trait BrowserKiller: Send + Sync {
 pub trait BrowserExitProbe: Send + Sync {
     /// Whether the recorded process generation is still the running process.
     fn generation_matches(&self) -> bool;
+
+    /// Whether the recorded generation has positively gone. Narrower than
+    /// `!generation_matches()` for the reason given on
+    /// [`OwnedBrowserProcess::generation_gone`].
+    fn generation_gone(&self) -> bool {
+        !self.generation_matches()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2150,11 +2167,11 @@ impl BrowserSessions {
                 }
             }
             let exited = match cell.exit_probe.get() {
-                Some(probe) => !probe.generation_matches(),
+                Some(probe) => probe.generation_gone(),
                 None => cell.try_driver().is_some_and(|driver| {
                     driver
                         .as_ref()
-                        .is_some_and(|process| !process.generation_matches())
+                        .is_some_and(|process| process.generation_gone())
                 }),
             };
             if exited {
@@ -2835,7 +2852,10 @@ fn teardown_process_with_grace(
     process: &mut dyn OwnedBrowserProcess,
     grace_period: Duration,
 ) -> Result<(), CleanupStage> {
-    if !process.generation_matches() {
+    // Only a browser known to be gone skips the close request. One whose
+    // generation could not be read may still be running, and the reap below
+    // would wait on it with nothing asking it to quit.
+    if process.generation_gone() {
         return process.wait_until_reaped().map_err(|_| CleanupStage::Reap);
     }
     process

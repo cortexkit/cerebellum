@@ -132,7 +132,10 @@ async fn main() {
         all_passed &= run_handoff_arms(config.clone()).await;
     }
     if let Some(origin) = args.import_origin {
-        all_passed &= run_import_arms(config, &origin).await;
+        all_passed &= run_import_arms(config.clone(), &origin).await;
+    }
+    if let Some(url) = args.capture_url {
+        all_passed &= run_capture_arm(config, &url).await;
     }
 
     if !all_passed {
@@ -144,6 +147,7 @@ async fn main() {
 struct Args {
     handoff: bool,
     import_origin: Option<String>,
+    capture_url: Option<String>,
 }
 
 fn parse_args_from<I, S>(args: I) -> Result<Args, String>
@@ -153,10 +157,17 @@ where
 {
     let mut handoff = false;
     let mut import_origin = None;
+    let mut capture_url = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_ref() {
             "--handoff" => handoff = true,
+            "--capture" => {
+                let url = args
+                    .next()
+                    .ok_or_else(|| "usage: --capture requires an https URL".to_string())?;
+                capture_url = Some(url.as_ref().to_string());
+            }
             "--import" => {
                 let origin = args
                     .next()
@@ -176,7 +187,7 @@ where
             }
         }
     }
-    if !handoff && import_origin.is_none() {
+    if !handoff && import_origin.is_none() && capture_url.is_none() {
         return Err(
             "usage: cargo run -p cerebellum --example live_login -- --handoff, --import <origin>, or both"
                 .to_string(),
@@ -185,6 +196,7 @@ where
     Ok(Args {
         handoff,
         import_origin,
+        capture_url,
     })
 }
 
@@ -376,6 +388,135 @@ async fn present_fronts_the_window(planes: &Planes, origin: &str) -> ArmVerdict 
             "presented with expires_in_ms={expires_in_ms} browser_pid={browser_pid}; frontmost_process_id is macOS-only"
         ))
     }
+}
+
+/// Seconds the capture arm leaves the window to the handoff before it closes
+/// the browser itself, standing in for a person closing the window.
+const CAPTURE_WINDOW_SECONDS: u64 = 20;
+
+/// Run `browser.capture_login` on `url` with nobody logging in, and report
+/// how the handoff ended and when.
+///
+/// Nobody logs in, so the only honest endings are the window closing or the
+/// handoff expiring. The arm closes the browser after
+/// [`CAPTURE_WINDOW_SECONDS`]; a reply of `no_login_observed` before that means
+/// the handoff decided a running browser had exited. While it waits it prints
+/// the kernel's start-time reading for the capture browser once a second: the
+/// reading the handoff's liveness check is built on.
+async fn run_capture_arm(config: BrowserConfig, url: &str) -> bool {
+    let Some(host) = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .filter(|host| !host.is_empty())
+    else {
+        return report_arm(
+            "capture_handoff_stays_open",
+            ArmVerdict::Unmeasurable(format!("--capture takes an https URL, got {url}")),
+        );
+    };
+    let planes = Arc::new(Planes::with_browser_config(
+        Arc::new(HealthState::new()),
+        Some(config),
+    ));
+    bind_route(
+        planes.as_ref(),
+        MANAGEMENT_CHANNEL,
+        MANAGEMENT_EPOCH,
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".to_string(),
+        },
+        true,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let watching = Arc::new(AtomicBool::new(true));
+    let watcher = {
+        let watching = Arc::clone(&watching);
+        std::thread::spawn(move || {
+            let mut closed_at = None;
+            while watching.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(1));
+                let elapsed = started.elapsed().as_secs();
+                let Some(pid) = launched_browser_pid() else {
+                    println!("[capture] t={elapsed}s no capture browser child");
+                    continue;
+                };
+                #[cfg(target_os = "macos")]
+                println!(
+                    "[capture] t={elapsed}s browser pid={pid} start-time reading={:?}",
+                    cerebellum_macos::process_start_time(pid as u32)
+                );
+                #[cfg(not(target_os = "macos"))]
+                println!("[capture] t={elapsed}s browser pid={pid}");
+                if elapsed >= CAPTURE_WINDOW_SECONDS && closed_at.is_none() {
+                    // SIGTERM, as a window close ends the browser; the handoff
+                    // must then see it gone.
+                    let _ = std::process::Command::new("/bin/kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status();
+                    closed_at = Some(elapsed);
+                    println!("[capture] t={elapsed}s closed the capture browser");
+                }
+            }
+            closed_at
+        })
+    };
+
+    let request = route_request(
+        MANAGEMENT_CHANNEL,
+        MANAGEMENT_EPOCH,
+        40,
+        json!({
+            "method": management::CAPTURE_LOGIN,
+            "params": {
+                "account": "live-probe",
+                "credential_domain": host,
+                "login_url": url,
+                "fetch_url": url,
+            }
+        }),
+    );
+    let reply = consent_relay::elicit_and_answer_waiting(
+        planes.as_ref(),
+        request,
+        json!({"decision": "allow"}),
+        management::CAPTURE_LOGIN,
+        |_| {},
+        Duration::from_secs(CAPTURE_WINDOW_SECONDS + 15),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    watching.store(false, Ordering::Release);
+    let closed_at = watcher.join().unwrap_or(None);
+    // Whatever the reply, no capture browser may outlive the arm.
+    if let Some(pid) = launched_browser_pid() {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            return report_arm(
+                "capture_handoff_stays_open",
+                ArmVerdict::Fail(format!("the capture call did not complete: {error}")),
+            )
+        }
+    };
+    let outcome = reply["outcome"].as_str().unwrap_or("?").to_string();
+    let evidence = format!(
+        "outcome={outcome} after {} ms; browser closed by the arm at {closed_at:?} s",
+        elapsed.as_millis()
+    );
+    let verdict = match (outcome.as_str(), closed_at) {
+        ("no_login_observed", Some(_)) => ArmVerdict::Pass(evidence),
+        ("no_login_observed", None) => ArmVerdict::Fail(format!(
+            "{evidence}: the handoff ended on a browser nobody closed"
+        )),
+        _ => ArmVerdict::Fail(format!("{evidence}; reply {reply}")),
+    };
+    report_arm("capture_handoff_stays_open", verdict)
 }
 
 /// The pid of the browser this in-process harness launched.

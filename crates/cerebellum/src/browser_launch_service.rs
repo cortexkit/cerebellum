@@ -853,10 +853,14 @@ impl crate::login_capture::CaptureBrowser for ProductionCaptureBrowser {
         capture_drive(driver.cookie_request_header_for_url(CAPTURE_CONTEXT_KEY, url, deadline_ms))
     }
 
-    fn exited(&mut self) -> bool {
-        self.process.process.as_ref().is_none_or(|process| {
-            platform_generation_exited(BrowserProcessGeneration::from(process.generation()))
-        })
+    fn liveness(&mut self) -> crate::browser_launch::BrowserProcessLiveness {
+        match self.process.process.as_ref() {
+            Some(process) => {
+                platform_generation_liveness(BrowserProcessGeneration::from(process.generation()))
+            }
+            // The child was already reaped, so it has certainly gone.
+            None => crate::browser_launch::BrowserProcessLiveness::Gone,
+        }
     }
 
     fn close(&mut self) -> Result<(), crate::login_capture::CaptureDriveError> {
@@ -1045,6 +1049,21 @@ pub fn browser_launch_arguments(
         // readiness handshake is `Browser.getVersion` and needs no page. The
         // flag has the same meaning for Chromium on Linux.
         OsString::from("--no-startup-window"),
+        // `--remote-debugging-pipe` alone turns on Blink's AutomationControlled
+        // feature, which sets `navigator.webdriver` to true on every page, and
+        // Cloudflare's human verification refuses such a browser. A person
+        // signing in through `browser.capture_login` or `browser.present`
+        // then cannot get past it. Measured on macOS with Chrome 154
+        // (2026-10-01), on a real Cloudflare challenge page
+        // (scrapingcourse.com/cloudflare-challenge), one change at a time:
+        // without this flag `navigator.webdriver` was true and the page stayed
+        // on "Just a moment..." in every run, with no polling, with
+        // browser-level polling only, and with nothing attached to the page at
+        // all. With it, `navigator.webdriver` was false and the page passed in
+        // every run, including with the handoff's page-level polling and
+        // with `Runtime.enable`. The flag changes only that feature;
+        // `examples/turnstile_probe.rs` repeats the measurement.
+        OsString::from("--disable-blink-features=AutomationControlled"),
     ]
 }
 
@@ -1210,17 +1229,62 @@ fn linux_generation_liveness(generation: BrowserProcessGeneration) -> Supervisor
     )
 }
 
+/// Whether the recorded browser generation is running, gone, or cannot be told.
 #[cfg(target_os = "macos")]
-fn platform_generation_exited(generation: BrowserProcessGeneration) -> bool {
-    !platform_generation_matches(generation)
+fn platform_generation_liveness(
+    generation: BrowserProcessGeneration,
+) -> crate::browser_launch::BrowserProcessLiveness {
+    macos_generation_liveness(
+        generation.start_time_micros,
+        cerebellum_macos::process_start_time(generation.pid),
+    )
+}
+
+/// Read one start-time reading against the recorded start time.
+///
+/// Only a reading that names the pid's current process can say "gone": none
+/// at all, or one with a different start time. A refused or malformed read
+/// says nothing about the browser, so it is `Unreadable`, never `Gone`;
+/// counting it as gone is what would end a handoff on a browser still on
+/// screen.
+#[cfg(target_os = "macos")]
+fn macos_generation_liveness(
+    recorded_start_time_micros: u64,
+    reading: cerebellum_macos::ProcessStartTime,
+) -> crate::browser_launch::BrowserProcessLiveness {
+    use crate::browser_launch::BrowserProcessLiveness;
+    use cerebellum_macos::ProcessStartTime;
+    match reading {
+        ProcessStartTime::Started(start) if start == recorded_start_time_micros => {
+            BrowserProcessLiveness::Live
+        }
+        ProcessStartTime::Started(_) | ProcessStartTime::NoSuchProcess => {
+            BrowserProcessLiveness::Gone
+        }
+        ProcessStartTime::NotPermitted
+        | ProcessStartTime::LayoutMismatch
+        | ProcessStartTime::Unclassified(_)
+        | ProcessStartTime::NoStartTime => BrowserProcessLiveness::Unreadable,
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn platform_generation_exited(generation: BrowserProcessGeneration) -> bool {
-    // Unchanged from before the boot ID: anything but an exact match counts as
-    // exited here, and the caller's next step is a generation-checked
-    // termination that refuses an unreadable generation on its own.
-    !platform_generation_matches(generation)
+fn platform_generation_liveness(
+    generation: BrowserProcessGeneration,
+) -> crate::browser_launch::BrowserProcessLiveness {
+    use crate::browser_launch::BrowserProcessLiveness;
+    match linux_generation_liveness(generation) {
+        SupervisorLiveness::Live => BrowserProcessLiveness::Live,
+        SupervisorLiveness::NotLive => BrowserProcessLiveness::Gone,
+        SupervisorLiveness::Unavailable => BrowserProcessLiveness::Unreadable,
+    }
+}
+
+/// Whether the recorded generation has positively gone. An unreadable
+/// generation is not gone: the callers of this wait for an exit or end a
+/// handoff, and either would be wrong about a browser that is still running.
+fn platform_generation_gone(generation: BrowserProcessGeneration) -> bool {
+    platform_generation_liveness(generation) == crate::browser_launch::BrowserProcessLiveness::Gone
 }
 
 #[cfg(target_os = "linux")]
@@ -2101,6 +2165,12 @@ impl OwnedBrowserProcess for ProductionProcess {
         })
     }
 
+    fn generation_gone(&self) -> bool {
+        self.process.as_ref().is_none_or(|process| {
+            platform_generation_gone(BrowserProcessGeneration::from(process.generation()))
+        })
+    }
+
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
         self.driver
             .as_mut()
@@ -2116,7 +2186,7 @@ impl OwnedBrowserProcess for ProductionProcess {
         let generation = process.generation();
         let deadline = Instant::now() + grace_period;
         while Instant::now() < deadline {
-            if platform_generation_exited(BrowserProcessGeneration::from(generation)) {
+            if platform_generation_gone(BrowserProcessGeneration::from(generation)) {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -2172,6 +2242,10 @@ struct ProductionExitProbe {
 impl BrowserExitProbe for ProductionExitProbe {
     fn generation_matches(&self) -> bool {
         platform_generation_matches(self.generation)
+    }
+
+    fn generation_gone(&self) -> bool {
+        platform_generation_gone(self.generation)
     }
 }
 
@@ -2596,6 +2670,53 @@ fn pipe_pair(
     })
 }
 
+/// A browser liveness check names a browser gone only on a reading that shows
+/// it gone. These are the readings the kernel can give for the recorded pid.
+#[cfg(all(test, target_os = "macos"))]
+mod generation_liveness_tests {
+    use super::macos_generation_liveness;
+    use crate::browser_launch::BrowserProcessLiveness;
+    use cerebellum_macos::ProcessStartTime;
+
+    const RECORDED: u64 = 1_790_860_017_410_598;
+
+    #[test]
+    fn the_recorded_start_time_reads_live() {
+        assert_eq!(
+            macos_generation_liveness(RECORDED, ProcessStartTime::Started(RECORDED)),
+            BrowserProcessLiveness::Live
+        );
+    }
+
+    #[test]
+    fn an_empty_or_reused_pid_reads_gone() {
+        assert_eq!(
+            macos_generation_liveness(RECORDED, ProcessStartTime::NoSuchProcess),
+            BrowserProcessLiveness::Gone
+        );
+        assert_eq!(
+            macos_generation_liveness(RECORDED, ProcessStartTime::Started(RECORDED + 1)),
+            BrowserProcessLiveness::Gone
+        );
+    }
+
+    #[test]
+    fn a_failed_reading_is_unreadable_and_never_gone() {
+        for reading in [
+            ProcessStartTime::NotPermitted,
+            ProcessStartTime::LayoutMismatch,
+            ProcessStartTime::Unclassified(35),
+            ProcessStartTime::NoStartTime,
+        ] {
+            assert_eq!(
+                macos_generation_liveness(RECORDED, reading),
+                BrowserProcessLiveness::Unreadable,
+                "{reading:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod executable_identity_launch_tests {
     use super::*;
@@ -2718,8 +2839,22 @@ mod executable_identity_launch_tests {
                 OsString::from("--no-first-run"),
                 OsString::from("--no-default-browser-check"),
                 OsString::from("--no-startup-window"),
+                OsString::from("--disable-blink-features=AutomationControlled"),
             ]
         );
+    }
+
+    /// `--disable-blink-features=AutomationControlled`, like every other launch
+    /// argument, must pass the custody quarantine's refused-argument list;
+    /// otherwise every launch would be refused there.
+    #[test]
+    fn every_launch_argument_passes_the_custody_quarantine() {
+        let profile = Path::new("/tmp/probe-profile");
+        let arguments = browser_launch_arguments(profile, &profile.join("crash"))
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(crate::custody::arguments_are_quarantinable(&arguments));
     }
 
     struct UnsignedExecutable(PathBuf);

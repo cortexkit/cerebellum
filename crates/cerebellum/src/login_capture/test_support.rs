@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime};
 
 use cerebellum_core::identity::AcceptedBindFacts;
 
+use crate::browser_launch::BrowserProcessLiveness;
+
 use super::{
     BackupExclusion, CaptureBrowser, CaptureDriveError, CaptureEnv, CaptureFs,
     CaptureLaunchRefusal, CaptureLauncher, CaptureModule, CapturePlacement, CookieHeader,
@@ -293,6 +295,9 @@ pub(crate) struct BrowserScript {
     pub(crate) logs_in: bool,
     /// Report the process gone at this poll (1-based).
     pub(crate) exits_at_poll: Option<usize>,
+    /// Answer every other liveness check with a failed reading instead of
+    /// "running".
+    pub(crate) liveness_unreadable: bool,
     /// Cookies CDP returns for the fetch URL, in order.
     pub(crate) cookies: Vec<(String, String)>,
     pub(crate) launch_refusal: Option<String>,
@@ -303,6 +308,7 @@ impl Default for BrowserScript {
         Self {
             logs_in: true,
             exits_at_poll: None,
+            liveness_unreadable: false,
             cookies: vec![
                 ("session".to_string(), PLANTED_VALUE.to_string()),
                 ("csrf".to_string(), "t0k3n".to_string()),
@@ -404,9 +410,15 @@ impl CaptureBrowser for FakeBrowser {
         ))
     }
 
-    fn exited(&mut self) -> bool {
+    fn liveness(&mut self) -> BrowserProcessLiveness {
         self.polls += 1;
-        self.script.exits_at_poll == Some(self.polls)
+        if self.script.exits_at_poll == Some(self.polls) {
+            BrowserProcessLiveness::Gone
+        } else if self.script.liveness_unreadable {
+            BrowserProcessLiveness::Unreadable
+        } else {
+            BrowserProcessLiveness::Live
+        }
     }
 
     fn close(&mut self) -> Result<(), CaptureDriveError> {

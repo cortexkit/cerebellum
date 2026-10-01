@@ -449,9 +449,10 @@ pub trait CaptureBrowser: Send {
         url: &str,
         deadline_ms: u64,
     ) -> Result<Result<CookieHeader, CookieHeaderError>, CaptureDriveError>;
-    /// Whether the browser process has gone, for instance because the person
-    /// closed the window.
-    fn exited(&mut self) -> bool;
+    /// Whether the browser process is running, has gone (for instance because
+    /// the person closed the window), or cannot be told. Only `Gone` ends the
+    /// handoff.
+    fn liveness(&mut self) -> crate::browser_launch::BrowserProcessLiveness;
     /// Terminate and reap the browser and close its launch record. Safe to
     /// call more than once.
     fn close(&mut self) -> Result<(), CaptureDriveError>;
@@ -1329,7 +1330,10 @@ impl CaptureModule {
             let saw = saw_credential_field;
             let opening = opening_cookie_names.clone();
             let (returned, polled) = on_browser(browser, move |browser| {
-                if browser.exited() {
+                // A liveness reading that failed is not evidence the person
+                // closed the window, so the handoff stays open on it and the
+                // login observation below still runs.
+                if browser.liveness() == crate::browser_launch::BrowserProcessLiveness::Gone {
                     return Poll::Exited;
                 }
                 // Read failures leave the handoff open, as they do for

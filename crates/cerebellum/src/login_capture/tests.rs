@@ -717,6 +717,34 @@ async fn a_closed_window_ends_with_no_login_observed_and_nothing_written() {
     assert_eq!(outcome.journal.deletion_succeeded, Some(true));
 }
 
+/// A liveness reading that fails says nothing about the window, so the handoff
+/// keeps polling and still sees the login when it happens.
+#[tokio::test]
+async fn an_unreadable_liveness_keeps_the_handoff_open_until_the_login_is_observed() {
+    let fixture = fixture();
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        liveness_unreadable: true,
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured");
+}
+
+/// With no login and no readable liveness, the handoff runs to its deadline
+/// rather than reporting a window the person never closed.
+#[tokio::test]
+async fn an_unreadable_liveness_never_ends_the_handoff_as_a_closed_window() {
+    let fixture = fixture_with(|env| env.handoff_duration = Duration::from_millis(30));
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        logs_in: false,
+        liveness_unreadable: true,
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "expired");
+    nothing_captured(&fixture);
+}
+
 #[tokio::test]
 async fn an_unobserved_login_expires_with_nothing_written() {
     let fixture = fixture_with(|env| env.handoff_duration = Duration::from_millis(30));
