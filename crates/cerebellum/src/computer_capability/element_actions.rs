@@ -82,6 +82,15 @@ pub(crate) fn stale_element_reply() -> Value {
     })
 }
 
+/// The refusal for an element id from an earlier run of the module: its
+/// number may now name a different element, so nothing is done with it.
+pub(crate) fn previous_run_reply() -> Value {
+    json!({
+        "outcome": "stale_element",
+        "remedy": "read_state again; ids from before a restart no longer apply",
+    })
+}
+
 fn blocked_menu_item_reply() -> Value {
     json!({
         "outcome": "blocked_menu_item",
@@ -916,6 +925,9 @@ where
                 cerebellum_computer::app_state::session::ElementResolution::Stale => {
                     return stale_element_reply()
                 }
+                cerebellum_computer::app_state::session::ElementResolution::PreviousRun => {
+                    return previous_run_reply()
+                }
             };
         if let Some(refusal) = self.check_target(target, &bundle_identity, pid).await {
             return refusal;
@@ -1058,6 +1070,9 @@ where
                     pid,
                     process_generation,
                 } => (handle, bundle_identity, pid, process_generation),
+                cerebellum_computer::app_state::session::ElementResolution::PreviousRun => {
+                    return previous_run_reply()
+                }
                 // A session-ending menu item has no text to write, and its id
                 // was never shown; it names nothing writable.
                 _ => return stale_element_reply(),

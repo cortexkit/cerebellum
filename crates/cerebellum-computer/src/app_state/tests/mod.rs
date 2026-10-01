@@ -172,8 +172,12 @@ fn each_element_is_one_line_in_the_pinned_grammar() {
             format!("  {} check box Mute", id("Mute")),
         ]
     );
-    // Ids are bare numbers.
-    assert!(id("Send").bytes().all(|byte| byte.is_ascii_digit()));
+    // An id is the store's run tag followed by a number.
+    let send = id("Send");
+    let number = send
+        .strip_prefix(sessions.run_tag())
+        .expect("the id starts with the run tag");
+    assert!(!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
     assert_eq!(
         first.focused_element_id, None,
         "no focused element was read"
@@ -676,17 +680,26 @@ fn a_new_process_generation_starts_a_new_session() {
     assert_eq!(sessions.session_count(), 1);
 }
 
-/// Only a bare number is an id: anything else names nothing.
+/// An id is the run tag and a number and nothing else: any other shape names
+/// nothing, the bare number included.
 #[test]
-fn an_id_is_only_ever_a_bare_number() {
-    let sessions = AppStateSessions::new();
+fn an_id_is_only_ever_the_run_tag_and_a_number() {
+    let sessions = AppStateSessions::with_run_tag("kq");
     let observed = read(&sessions, &state(vec![window()]));
     let send = id_of(&observed, "Send");
+    let number = send.strip_prefix("kq").expect("the id carries the run tag");
+    assert!(matches!(
+        sessions.resolve(CONVERSATION, &send),
+        ElementResolution::Live { .. }
+    ));
     for shaped in [
-        format!("+{send}"),
+        number.to_string(),
+        format!("kq+{number}"),
         format!("{send} "),
         format!("s{send}"),
         format!("{send}.0"),
+        format!("KQ{number}"),
+        "kq".to_string(),
         String::new(),
     ] {
         assert!(
@@ -695,6 +708,44 @@ fn an_id_is_only_ever_a_bare_number() {
                 ElementResolution::Stale
             ),
             "{shaped:?} resolved"
+        );
+    }
+}
+
+/// An id carrying another run's tag is refused as being from before a
+/// restart even when this run has issued its number to a live element: the
+/// number names a different element now, and pressing it would press that.
+#[test]
+fn an_id_from_another_run_is_refused_even_when_its_number_is_live() {
+    let sessions = AppStateSessions::with_run_tag("kq");
+    let observed = read(&sessions, &state(vec![window()]));
+    let send = id_of(&observed, "Send");
+    let number = send.strip_prefix("kq").unwrap();
+    assert!(matches!(
+        sessions.resolve(CONVERSATION, &send),
+        ElementResolution::Live { .. }
+    ));
+    let earlier_run = format!("ab{number}");
+    assert!(
+        matches!(
+            sessions.resolve(CONVERSATION, &earlier_run),
+            ElementResolution::PreviousRun
+        ),
+        "{earlier_run} was not refused as another run's id"
+    );
+}
+
+/// A run tag is two letters of an alphabet without `l` and `o`, which read
+/// like the digits after them; a fresh store draws one.
+#[test]
+fn a_fresh_store_draws_a_two_letter_run_tag() {
+    for _ in 0..50 {
+        let tag = AppStateSessions::new().run_tag().to_string();
+        assert_eq!(tag.len(), 2, "{tag}");
+        assert!(
+            tag.bytes()
+                .all(|byte| byte.is_ascii_lowercase() && byte != b'l' && byte != b'o'),
+            "{tag}"
         );
     }
 }

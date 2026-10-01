@@ -156,12 +156,17 @@ async fn serve<S: JournalStorage + Send + 'static>(
 }
 
 /// The element ids of a rendered state: the first word of every line after
-/// the header line, where that word is a number.
+/// the header line, where that word is a run tag (two lowercase letters)
+/// followed by a number.
 fn ids(tree: &str) -> Vec<String> {
     tree.lines()
         .skip(1)
         .filter_map(|line| line.split_whitespace().next())
-        .filter(|word| word.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|word| {
+            word.len() > 2
+                && word.as_bytes()[..2].iter().all(u8::is_ascii_lowercase)
+                && word.as_bytes()[2..].iter().all(u8::is_ascii_digit)
+        })
         .map(str::to_string)
         .collect()
 }

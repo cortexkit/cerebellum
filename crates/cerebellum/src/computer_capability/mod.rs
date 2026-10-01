@@ -820,6 +820,11 @@ where
                 } if bundle_identity == grant.bundle_identity
                     && pid == grant.pid
                     && process_generation == grant.process_generation_evidence => {}
+                ElementResolution::PreviousRun => {
+                    let mut reply = element_actions::previous_run_reply();
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
                 _ => {
                     let mut reply = stale_zoom_reply();
                     admission.decorate(&mut reply);

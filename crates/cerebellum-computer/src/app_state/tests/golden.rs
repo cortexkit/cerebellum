@@ -16,6 +16,10 @@ use super::super::session::{AppStateSessions, SessionRead};
 use super::super::source::{ElementValue, RawAppState, RawElement};
 use super::{grant, CONVERSATION};
 
+/// The run tag every fixture's ids carry, fixed so the expected texts below
+/// can be exact.
+const RUN_TAG: &str = "kq";
+
 /// Hands out element tokens in the order a fixture is written.
 struct Tokens(std::cell::Cell<u64>);
 
@@ -50,7 +54,7 @@ impl Tokens {
 }
 
 fn observe(roots: Vec<RawElement>) -> SessionRead {
-    AppStateSessions::new().observe(
+    AppStateSessions::with_run_tag(RUN_TAG).observe(
         CONVERSATION,
         &grant(),
         &RawAppState {
@@ -447,7 +451,7 @@ fn diff_between(
     before: Vec<RawElement>,
     after: Vec<RawElement>,
 ) -> (String, Option<super::super::render::Truncation>) {
-    let sessions = AppStateSessions::new();
+    let sessions = AppStateSessions::with_run_tag(RUN_TAG);
     let raw = |roots| RawAppState {
         roots,
         focused: None,
@@ -476,7 +480,9 @@ fn assert_every_change_is_labelled(diff: &str) {
         let mut words = line[1..].split_whitespace();
         let id = words.next().unwrap_or_default();
         assert!(
-            !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()),
+            id.strip_prefix(RUN_TAG).is_some_and(
+                |number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            ),
             "no id leads {line:?}"
         );
         assert!(
@@ -490,28 +496,28 @@ fn assert_every_change_is_labelled(diff: &str) {
 
 const X_OUTLINE: &str = "\
 Google Chrome · window \"Synthetic Kestrel Feed\" · https://example.com/home
-3 toolbar
-  4 button Back
-  5 button Reload
-  6 text field (settable) Address and search bar, Value: example.com/home
-10 navigation Primary
-  11 link Home, Value: example.com/home
-  12 link Explore, Value: example.com/explore
-  13 link Notifications, Value: example.com/notifications
-  14 link Direct Messages, Value: example.com/i/chat
-  15 link Profile, Value: example.com/juniper_example
-  16 link Post, Value: example.com/compose/post
-17 main Home timeline  [2 elements: Timeline: Your Home Timeline, ~3.7 KB]
-  20 tab group  [3 tabs: For you, Following, AI Developer Tools, ~118 B]
-  24 group Timeline: Your Home Timeline  [2 elements: Your Home Timeline, ~3.4 KB]
-    28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home. 59 views  [3 elements: The rain moved our seed swap indoors. Br…, 59 views, ~791 B]
-    44 group Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 159 views  [3 elements: A seed swap with @moss_example, 159 views, ~564 B]
-    60 group Spindle Press Verified account @spindle_press 20 minutes ago We're planning a live garden tour with Sage. Curious about balcony gardening? Leave a question below. 259 views  [3 elements: We're planning a live garden tour with S…, 259 views, ~730 B]
-    76 group Paper Kite Club Verified account @paper_kite_club 29 minutes ago Fold along with us! · Pocket kite · Paper boat 359 views  [3 elements: Fold along with us! · Pocket kite · Pape…, 359 views, ~580 B]
-    92 group Copper Lantern Verified account @lantern_example 18 hours ago How did those seedlings do? 459 views  [3 elements: How did those seedlings do?, 459 views, ~542 B]
-108 complementary Trending
-  109 link Wren Workshop opens its seed library Trending now · News · 849 posts, Value: example.com/i/trending/1
-  110 link Paper Kite Club shares a folding guide, Value: example.com/i/trending/2
+kq3 toolbar
+  kq4 button Back
+  kq5 button Reload
+  kq6 text field (settable) Address and search bar, Value: example.com/home
+kq10 navigation Primary
+  kq11 link Home, Value: example.com/home
+  kq12 link Explore, Value: example.com/explore
+  kq13 link Notifications, Value: example.com/notifications
+  kq14 link Direct Messages, Value: example.com/i/chat
+  kq15 link Profile, Value: example.com/juniper_example
+  kq16 link Post, Value: example.com/compose/post
+kq17 main Home timeline  [2 elements: Timeline: Your Home Timeline, ~3.8 KB]
+  kq20 tab group  [3 tabs: For you, Following, AI Developer Tools, ~126 B]
+  kq24 group Timeline: Your Home Timeline  [2 elements: Your Home Timeline, ~3.6 KB]
+    kq28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home. 59 views  [3 elements: The rain moved our seed swap indoors. Br…, 59 views, ~815 B]
+    kq44 group Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 159 views  [3 elements: A seed swap with @moss_example, 159 views, ~588 B]
+    kq60 group Spindle Press Verified account @spindle_press 20 minutes ago We're planning a live garden tour with Sage. Curious about balcony gardening? Leave a question below. 259 views  [3 elements: We're planning a live garden tour with S…, 259 views, ~754 B]
+    kq76 group Paper Kite Club Verified account @paper_kite_club 29 minutes ago Fold along with us! · Pocket kite · Paper boat 359 views  [3 elements: Fold along with us! · Pocket kite · Pape…, 359 views, ~604 B]
+    kq92 group Copper Lantern Verified account @lantern_example 18 hours ago How did those seedlings do? 459 views  [3 elements: How did those seedlings do?, 459 views, ~566 B]
+kq108 complementary Trending
+  kq109 link Wren Workshop opens its seed library Trending now · News · 849 posts, Value: example.com/i/trending/1
+  kq110 link Paper Kite Club shares a folding guide, Value: example.com/i/trending/2
 menu bar (zoom: menubar)
 ";
 
@@ -527,18 +533,18 @@ fn x_timeline_outline_is_golden() {
 
 const X_POST: &str = "\
 Google Chrome · window \"Synthetic Kestrel Feed\" · https://example.com/home
-28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home. 59 views
-  30 group
-    33 link Wren Workshop Verified account, Value: example.com/wren_example
-    35 link @wren_example, Value: example.com/wren_example
-    36 link 17 seconds ago, Value: example.com/wren_example/status/2001
-  37 text The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home.
-  38 group 59 views
-    39 button 0 Replies. Reply
-    40 button 0 reposts. Repost
-    41 button 0 Likes. Like
-    42 link 59 views. View post analytics, Value: example.com/wren_example/status/2001/analytics
-    43 button Bookmark
+kq28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home. 59 views
+  kq30 group
+    kq33 link Wren Workshop Verified account, Value: example.com/wren_example
+    kq35 link @wren_example, Value: example.com/wren_example
+    kq36 link 17 seconds ago, Value: example.com/wren_example/status/2001
+  kq37 text The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home.
+  kq38 group 59 views
+    kq39 button 0 Replies. Reply
+    kq40 button 0 reposts. Repost
+    kq41 button 0 Likes. Like
+    kq42 link 59 views. View post analytics, Value: example.com/wren_example/status/2001/analytics
+    kq43 button Bookmark
 ";
 
 /// One zoom into a post from the outline shows the whole post: its text,
@@ -555,19 +561,19 @@ fn an_x_post_reads_after_one_zoom() {
 
 const BIONIC_OUTLINE: &str = "\
 Bionic Reading · window \"Settings\"
-1 window Settings
-  4 toolbar
-    5 button General
-    6 button Reading
-    7 button Account
-  10 group Reading
-    12 check box (checked) Enable Bionic Reading
-    15 slider (settable) Fixation, Value: 3
-    17 slider (settable) Saccade, Value: 10
-    19 pop up button Theme
-    21 group
-      22 text Keyboard shortcut
-      23 text field (settable) Shortcut, Value: ⌃⌥B
+kq1 window Settings
+  kq4 toolbar
+    kq5 button General
+    kq6 button Reading
+    kq7 button Account
+  kq10 group Reading
+    kq12 check box (checked) Enable Bionic Reading
+    kq15 slider (settable) Fixation, Value: 3
+    kq17 slider (settable) Saccade, Value: 10
+    kq19 pop up button Theme
+    kq21 group
+      kq22 text Keyboard shortcut
+      kq23 text field (settable) Shortcut, Value: ⌃⌥B
 ";
 
 /// A small panel is printed whole: every control, none of the unnamed groups
@@ -598,36 +604,36 @@ fn a_filter_prints_each_match_under_its_labelled_ancestors() {
     assert_eq!(
         found,
         "Bionic Reading · window \"Settings\"\n\
-         1 window Settings\n  \
-         10 group Reading\n    \
-         15 slider (settable) Fixation, Value: 3\n"
+         kq1 window Settings\n  \
+         kq10 group Reading\n    \
+         kq15 slider (settable) Fixation, Value: 3\n"
     );
 }
 
 const DASHBOARD_OUTLINE: &str = "\
 Magic Context Dashboard · window \"Magic Context\" · http://localhost:5173/cache
-5 navigation
-  6 button Projects
-  7 button Workspaces
-  8 button Cache
-  9 button User Directives
-  10 button Config
-  11 button Logs
-12 group
-  13 region Cache Diagnostics
-    14 pop up button Project
-    15 pop up button Range
-    16 button Refresh
-    17 button Export
-    4 groups (zoom: 13)
-    30 check box (checked) Auto refresh
-  31 list Recent Sessions
-    8 links, like \"ses_0000\" (zoom: 31)
-  48 group Cache Hit Timeline
-    200 buttons, like \"Sep 30 00:00 · FULL BUST · hit rate 0% ·…\" (zoom: 48)
-  250 list
-    31 rows (zoom: 250)
-623 text DB: 7208.9 MB · 17927 memories · 11834 compartments · 3170 notes
+kq5 navigation
+  kq6 button Projects
+  kq7 button Workspaces
+  kq8 button Cache
+  kq9 button User Directives
+  kq10 button Config
+  kq11 button Logs
+kq12 group
+  kq13 region Cache Diagnostics
+    kq14 pop up button Project
+    kq15 pop up button Range
+    kq16 button Refresh
+    kq17 button Export
+    4 groups (zoom: kq13)
+    kq30 check box (checked) Auto refresh
+  kq31 list Recent Sessions
+    8 links, like \"ses_0000\" (zoom: kq31)
+  kq48 group Cache Hit Timeline
+    200 buttons, like \"Sep 30 00:00 · FULL BUST · hit rate 0% ·…\" (zoom: kq48)
+  kq250 list
+    31 rows (zoom: kq250)
+kq623 text DB: 7208.9 MB · 17927 memories · 11834 compartments · 3170 notes
 menu bar (zoom: menubar)
 ";
 
@@ -786,32 +792,32 @@ fn collapse_keeps_every_actionable_element() {
 }
 
 const X_TAB_SWITCH_DIFF: &str = "\
-~         21 tab (selected) For you, Value: 1
-~         23 tab AI Developer Tools, Value: 0
-+           115 group Thimble Scouts Verified account @thimble_example 2 hours ago Our next sewing circle is on Tuesday. 559 views
-+               120 link Thimble Scouts Verified account, Value: example.com/thimble_example
-+               122 link @thimble_example, Value: example.com/thimble_example
-+               123 link 2 hours ago, Value: example.com/thimble_example/status/2006
-+             124 text Our next sewing circle is on Tuesday.
-+             125 group 559 views
-+               126 button 0 Replies. Reply
-+               127 button 0 reposts. Repost
-+               128 button 0 Likes. Like
-+               129 link 559 views. View post analytics, Value: example.com/thimble_example/status/2006/analytics
-+               130 button Bookmark
-+           131 group River Loom Verified account @river_example 4 minutes ago I made a blue scarf from leftover yarn. 659 views
-+               136 link River Loom Verified account, Value: example.com/river_example
-+               138 link @river_example, Value: example.com/river_example
-+               139 link 4 minutes ago, Value: example.com/river_example/status/2007
-+             140 text I made a blue scarf from leftover yarn.
-+             141 group 659 views
-+               142 button 0 Replies. Reply
-+               143 button 0 reposts. Repost
-+               144 button 0 Likes. Like
-+               145 link 659 views. View post analytics, Value: example.com/river_example/status/2007/analytics
-+               146 button Bookmark
-Removed element IDs: 28-59
-focused: 10 navigation Primary
+~         kq21 tab (selected) For you, Value: 1
+~         kq23 tab AI Developer Tools, Value: 0
++           kq115 group Thimble Scouts Verified account @thimble_example 2 hours ago Our next sewing circle is on Tuesday. 559 views
++               kq120 link Thimble Scouts Verified account, Value: example.com/thimble_example
++               kq122 link @thimble_example, Value: example.com/thimble_example
++               kq123 link 2 hours ago, Value: example.com/thimble_example/status/2006
++             kq124 text Our next sewing circle is on Tuesday.
++             kq125 group 559 views
++               kq126 button 0 Replies. Reply
++               kq127 button 0 reposts. Repost
++               kq128 button 0 Likes. Like
++               kq129 link 559 views. View post analytics, Value: example.com/thimble_example/status/2006/analytics
++               kq130 button Bookmark
++           kq131 group River Loom Verified account @river_example 4 minutes ago I made a blue scarf from leftover yarn. 659 views
++               kq136 link River Loom Verified account, Value: example.com/river_example
++               kq138 link @river_example, Value: example.com/river_example
++               kq139 link 4 minutes ago, Value: example.com/river_example/status/2007
++             kq140 text I made a blue scarf from leftover yarn.
++             kq141 group 659 views
++               kq142 button 0 Replies. Reply
++               kq143 button 0 reposts. Repost
++               kq144 button 0 Likes. Like
++               kq145 link 659 views. View post analytics, Value: example.com/river_example/status/2007/analytics
++               kq146 button Bookmark
+Removed element IDs: kq28-59
+focused: kq10 navigation Primary
 ";
 
 /// A tab switch on X: the two tabs that changed, the posts that appeared
@@ -843,9 +849,9 @@ fn a_diff_past_the_cap_counts_what_it_left_out() {
         )),
         "{diff}"
     );
-    assert!(diff.contains("\nRemoved element IDs: 50-249\n"), "{diff}");
+    assert!(diff.contains("\nRemoved element IDs: kq50-249\n"), "{diff}");
     assert!(
-        diff.ends_with("focused: 9 button User Directives\n"),
+        diff.ends_with("focused: kq9 button User Directives\n"),
         "{diff}"
     );
     assert_every_change_is_labelled(&diff);

@@ -6,8 +6,8 @@
 //! <id> <role words>[ (<states>)] <label>[, Value: <value>]
 //! ```
 //!
-//! for example `389 tab (selected) AI Developer Tools, Value: 1` or
-//! `558 link 17 seconds ago, Value: x.com/polygres/status/2105766657956446225`.
+//! for example `kq389 tab (selected) AI Developer Tools, Value: 1` or
+//! `kq558 link 17 seconds ago, Value: x.com/polygres/status/2105766657956446225`.
 //!
 //! Application text never leaves its line: every line break in a label or a
 //! value becomes " · " and every other control character a space, so no
@@ -1180,29 +1180,42 @@ pub struct RenderedDiff {
     pub truncation: Option<Truncation>,
 }
 
-/// Ids as the shortest list of numbers and ranges: `4, 7-9, 12`. Ids that are
-/// not numbers are listed as they are, after the numbers.
+/// Ids as the shortest list of ids and ranges: `kq4, kq7-9, kq12`. A range
+/// writes its first id in full and only the number of its last, so `kq7-9`
+/// is kq7, kq8 and kq9. Ids are grouped by the letters before their number
+/// (the run tag), and one with no trailing number is listed as it is, last.
 pub fn id_ranges(ids: &[String]) -> String {
-    let mut numbers: Vec<u64> = ids.iter().filter_map(|id| id.parse().ok()).collect();
-    numbers.sort_unstable();
-    numbers.dedup();
+    let split = |id: &str| -> Option<(String, u64)> {
+        let digits_from = id.find(|c: char| c.is_ascii_digit())?;
+        let (prefix, digits) = id.split_at(digits_from);
+        if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Some((prefix.to_string(), digits.parse().ok()?))
+    };
+    let mut numbered: Vec<(String, u64)> = ids.iter().filter_map(|id| split(id)).collect();
+    numbered.sort_unstable();
+    numbered.dedup();
     let mut parts: Vec<String> = Vec::new();
     let mut index = 0;
-    while index < numbers.len() {
-        let start = numbers[index];
+    while index < numbered.len() {
+        let (prefix, start) = numbered[index].clone();
         let mut end = start;
-        while index + 1 < numbers.len() && numbers[index + 1] == end + 1 {
+        while index + 1 < numbered.len()
+            && numbered[index + 1].0 == prefix
+            && numbered[index + 1].1 == end + 1
+        {
             index += 1;
-            end = numbers[index];
+            end = numbered[index].1;
         }
         parts.push(if start == end {
-            start.to_string()
+            format!("{prefix}{start}")
         } else {
-            format!("{start}-{end}")
+            format!("{prefix}{start}-{end}")
         });
         index += 1;
     }
-    parts.extend(ids.iter().filter(|id| id.parse::<u64>().is_err()).cloned());
+    parts.extend(ids.iter().filter(|id| split(id).is_none()).cloned());
     parts.join(", ")
 }
 

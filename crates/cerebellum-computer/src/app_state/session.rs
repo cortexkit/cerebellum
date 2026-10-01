@@ -6,19 +6,23 @@
 //! a later read finds the same element again by token equality, never by
 //! position or title, so the id keeps naming it while it lives.
 //!
-//! An id is the bare number, such as `389`, because a caller reads and types
-//! hundreds of them. Every session draws from one counter, so a number names
-//! one element of one application of one conversation, and an action given
-//! only the number knows which application it is about. A number is issued
-//! once and never again: a new process generation is a new session whose
-//! numbers continue the count, so nothing it numbers can answer to an old
-//! id, and two conversations never hold the same number.
+//! An id is a two-letter run tag followed by a number, such as `kq389`: short,
+//! because a caller reads and types hundreds of them. Every session draws its
+//! numbers from one counter, so a number names one element of one application
+//! of one conversation, and an action given only the id knows which
+//! application it is about. A number is issued once and never again: a new
+//! process generation is a new session whose numbers continue the count, so
+//! nothing it numbers can answer to an old id, and two conversations never
+//! hold the same number.
 //!
-//! The count restarts with the module process. Until the first read after a
-//! restart no id resolves, because no session exists. After that read,
-//! however, a number kept from before the restart can name whatever element
-//! the new read numbered the same: unlike the image ids, element numbers
-//! carry no per-process salt, which is the price of keeping them short.
+//! The counter restarts with the module process, so a number alone could, after
+//! a restart and one new read, name a different element than the one it named
+//! before: a caller pressing what it took for Send would press whatever the new
+//! read numbered the same. The run tag prevents that. It is drawn at random
+//! when the store is created, and an id carrying any other tag is refused as
+//! being from before a restart, whatever its number. Two letters give 576
+//! tags, so a restart draws its predecessor's tag once in 576 times; even
+//! then an old id resolves only if the new run has issued its number.
 //!
 //! The map belongs to a conversation. Two conversations reading the same
 //! application get separate sessions with disjoint ids, so neither can act on
@@ -103,10 +107,6 @@ struct Session {
 }
 
 impl Session {
-    fn element_id(&self, number: u64) -> String {
-        session_element_id(number)
-    }
-
     fn find(&self, handle: &ElementHandle) -> Option<u64> {
         self.by_hash
             .get(&handle.identity_hash())?
@@ -199,6 +199,10 @@ pub enum ElementResolution {
     /// generation that has ended, or issued to another conversation. The
     /// remedy for all of them is the same: read the state again.
     Stale,
+    /// Issued by an earlier run of the module: its run tag is not this run's.
+    /// Its number may well exist now, naming some other element, so it is
+    /// refused before the number is looked at.
+    PreviousRun,
 }
 
 /// The possible results of giving a session id to an element found by a hit
@@ -256,7 +260,37 @@ pub struct AppStateSessions {
     /// handed out before a restart would name whatever image a new read
     /// numbered the same.
     salt: String,
+    /// The two letters every element id of this run starts with. See the
+    /// module documentation for why ids carry it.
+    run_tag: String,
     state: Mutex<StoreState>,
+}
+
+/// The letters a run tag is drawn from: the lowercase alphabet without `l`
+/// and `o`, which a reader confuses with the digits `1` and `0` that follow.
+const RUN_TAG_ALPHABET: &[u8; 24] = b"abcdefghijkmnpqrstuvwxyz";
+
+/// A fresh two-letter run tag.
+fn random_run_tag() -> String {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default(),
+    );
+    hasher.write_u32(std::process::id());
+    let value = hasher.finish() as usize;
+    let letters = RUN_TAG_ALPHABET.len();
+    [value % letters, (value / letters) % letters]
+        .iter()
+        .map(|index| RUN_TAG_ALPHABET[*index] as char)
+        .collect()
+}
+
+/// Whether text has the shape of a run tag: two letters of the alphabet.
+fn is_run_tag(text: &str) -> bool {
+    text.len() == 2 && text.bytes().all(|byte| RUN_TAG_ALPHABET.contains(&byte))
 }
 
 impl Default for AppStateSessions {
@@ -286,10 +320,24 @@ fn process_salt() -> String {
 
 impl AppStateSessions {
     pub fn new() -> Self {
+        Self::with_run_tag(&random_run_tag())
+    }
+
+    /// A store whose ids carry the given run tag rather than a random one, so
+    /// tests can pin exact ids. Panics on a tag that is not two letters of the
+    /// tag alphabet, since ids carrying it could never be parsed back.
+    pub fn with_run_tag(run_tag: &str) -> Self {
+        assert!(is_run_tag(run_tag), "{run_tag:?} is not a run tag");
         Self {
             salt: process_salt(),
+            run_tag: run_tag.to_string(),
             state: Mutex::new(StoreState::default()),
         }
+    }
+
+    /// The run tag this store's element ids start with.
+    pub fn run_tag(&self) -> &str {
+        &self.run_tag
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, StoreState> {
@@ -338,6 +386,7 @@ impl AppStateSessions {
         let first_new = *next_number + 1;
 
         let mut walk = Walk {
+            tag: &self.run_tag,
             session,
             next_number,
             seen: HashSet::new(),
@@ -350,6 +399,7 @@ impl AppStateSessions {
             .map(|(index, root)| walk.node(root, None, index, false, false))
             .collect();
         let Walk {
+            tag: _,
             session,
             next_number,
             seen,
@@ -369,7 +419,8 @@ impl AppStateSessions {
                 // gone. A read that left a subtree unopened may simply not
                 // have reached it, so it neither removes nor ages anything.
                 if entry.in_baseline && !entry.refusing && had_baseline {
-                    diff.removed.push(session_element_id(entry.number));
+                    diff.removed
+                        .push(session_element_id(&self.run_tag, entry.number));
                 }
                 entry.in_baseline = false;
                 entry.absent_reads = entry.absent_reads.saturating_add(1);
@@ -406,7 +457,8 @@ impl AppStateSessions {
             state.owners.remove(&number);
         }
 
-        let focused_element_id = focused_number.map(session_element_id);
+        let focused_element_id =
+            focused_number.map(|number| session_element_id(&self.run_tag, number));
 
         SessionRead {
             roots,
@@ -443,13 +495,13 @@ impl AppStateSessions {
             {
                 Adoption::Refusing
             } else {
-                Adoption::Numbered(session.element_id(number))
+                Adoption::Numbered(session_element_id(&self.run_tag, number))
             };
         }
         match session.insert(&mut state.last_number, handle.clone(), String::new(), false) {
             Some(number) => {
                 state.owners.insert(number, key);
-                Adoption::Numbered(session_element_id(number))
+                Adoption::Numbered(session_element_id(&self.run_tag, number))
             }
             None => Adoption::Full,
         }
@@ -497,9 +549,12 @@ impl AppStateSessions {
 
     /// Where an element id leads, for the conversation holding it.
     pub fn resolve(&self, conversation_key: &str, element_id: &str) -> ElementResolution {
-        let Some(number) = parse_element_id(element_id) else {
+        let Some((tag, number)) = parse_element_id(element_id) else {
             return ElementResolution::Stale;
         };
+        if tag != self.run_tag {
+            return ElementResolution::PreviousRun;
+        }
         let state = self.lock();
         let Some(key) = state.owners.get(&number) else {
             return ElementResolution::Stale;
@@ -585,20 +640,25 @@ impl AppStateSessions {
     }
 }
 
-fn session_element_id(number: u64) -> String {
-    number.to_string()
+fn session_element_id(run_tag: &str, number: u64) -> String {
+    format!("{run_tag}{number}")
 }
 
-/// The number an element id names: digits only, so `"389"` and nothing
-/// like `"+389"` or `"389 "`.
-fn parse_element_id(element_id: &str) -> Option<u64> {
-    if element_id.is_empty() || !element_id.bytes().all(|byte| byte.is_ascii_digit()) {
+/// The run tag and number an element id carries: exactly two tag letters then
+/// digits only, so `"kq389"` and nothing like `"kq+389"`, `"kq389 "` or
+/// `"389"`.
+fn parse_element_id(element_id: &str) -> Option<(&str, u64)> {
+    let tag = element_id.get(..2)?;
+    let digits = &element_id[2..];
+    if !is_run_tag(tag) || digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    element_id.parse().ok()
+    Some((tag, digits.parse().ok()?))
 }
 
 struct Walk<'a> {
+    /// The run tag the ids this walk issues start with.
+    tag: &'a str,
     session: &'a mut Session,
     next_number: &'a mut u64,
     seen: HashSet<u64>,
@@ -641,7 +701,7 @@ impl Walk<'_> {
                 // re-admitted, because its id was never shown.
                 entry.refusing |= hazard;
                 if !entry.refusing && !self.seen.contains(&number) {
-                    let id = session_element_id(number);
+                    let id = session_element_id(self.tag, number);
                     if !entry.in_baseline {
                         self.diff.added.push(id);
                     } else if entry.signature != signature {
@@ -660,7 +720,7 @@ impl Walk<'_> {
                 );
                 if let Some(number) = number {
                     if !hazard {
-                        self.diff.added.push(session_element_id(number));
+                        self.diff.added.push(session_element_id(self.tag, number));
                     }
                 }
                 number
@@ -686,7 +746,7 @@ impl Walk<'_> {
             .collect();
 
         ObservedNode {
-            element_id: number.map(|number| self.session.element_id(number)),
+            element_id: number.map(|number| session_element_id(self.tag, number)),
             description,
             hazard,
             children,

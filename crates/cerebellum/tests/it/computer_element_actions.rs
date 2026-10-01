@@ -198,6 +198,17 @@ async fn read(plane: &Plane, management: &Arc<ManagementPlane>) -> String {
     tree
 }
 
+/// An element id's run tag and number: `kq105` is `("kq", 105)`.
+fn split_id(id: &str) -> (&str, u64) {
+    let (tag, number) = id.split_at(2);
+    (
+        tag,
+        number
+            .parse()
+            .unwrap_or_else(|_| panic!("{id:?} is not an element id")),
+    )
+}
+
 /// The ids an action reply's diff names as `added` (`+` lines), `changed`
 /// (`~` lines) or `removed` (the ranges after `Removed element IDs:`).
 fn ids(reply: &Value, field: &str) -> Vec<String> {
@@ -220,10 +231,15 @@ fn ids(reply: &Value, field: &str) -> Vec<String> {
             .lines()
             .filter_map(|line| line.strip_prefix("Removed element IDs: "))
             .flat_map(|ranges| ranges.split(", "))
+            // A range writes its first id whole and its last as a number:
+            // `kq7-9` is kq7, kq8 and kq9.
             .flat_map(|range| match range.split_once('-') {
-                Some((start, end)) => {
-                    let (start, end): (u64, u64) = (start.parse().unwrap(), end.parse().unwrap());
-                    (start..=end).map(|id| id.to_string()).collect::<Vec<_>>()
+                Some((first, end)) => {
+                    let (tag, start) = split_id(first);
+                    let end: u64 = end.parse().unwrap();
+                    (start..=end)
+                        .map(|number| format!("{tag}{number}"))
+                        .collect::<Vec<_>>()
                 }
                 None => vec![range.to_string()],
             })
@@ -295,9 +311,15 @@ async fn pressing_a_stale_id_refuses_and_presses_nothing() {
     let management = granted_management().await;
     // A read first, so the session exists and the ids below are refused for
     // what they are rather than for there being no session.
-    read(&plane, &management).await;
-    // An id in the old shape, and a number this session never issued.
-    for stale in ["sgone1-4", "999999"] {
+    let tree = read(&plane, &management).await;
+    // An id in the salted shape ids had before, a bare number, and a number
+    // this run never issued.
+    let tag = &id_of(&tree, " button Send")[..2];
+    for stale in [
+        "sgone1-4".to_string(),
+        "10".to_string(),
+        format!("{tag}999999"),
+    ] {
         let reply = serve(
             &plane,
             &management,
@@ -326,9 +348,9 @@ async fn pressing_a_session_ending_menu_item_is_refused() {
         .and_then(|line| line.split_whitespace().next())
         .unwrap_or_else(|| panic!("no menu line in\n{tree}"));
     let save = id_of(&tree, " menu item Save");
-    let menu_number: u64 = menu.parse().unwrap();
-    assert_eq!(save, (menu_number + 2).to_string(), "{tree}");
-    let log_out = (menu_number + 1).to_string();
+    let (tag, menu_number) = split_id(menu);
+    assert_eq!(save, format!("{tag}{}", menu_number + 2), "{tree}");
+    let log_out = format!("{tag}{}", menu_number + 1);
     assert!(
         !tree
             .lines()
@@ -982,6 +1004,59 @@ async fn written_and_typed_text_never_reach_the_journal() {
         !journal_contains(&storage, SECRET),
         "written or typed text reached the journal"
     );
+}
+
+/// An id carrying another run's tag is refused even when this run issued its
+/// number to a live element: after a restart that number names a different
+/// element, so pressing or writing it would act on the wrong one. Nothing is
+/// pressed or written, and the reply says to read again.
+#[tokio::test]
+async fn an_id_from_before_a_restart_refuses_even_when_its_number_is_live() {
+    let desk = desk();
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let send = id_of(&tree, " button Send");
+    let composer = id_of(&tree, "Composer");
+    let (tag, number) = split_id(&send);
+    // Any other two letters of the tag alphabet stand for an earlier run.
+    let earlier = if tag == "ab" { "cd" } else { "ab" };
+    let (_, composer_number) = split_id(&composer);
+
+    let pressed = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": format!("{earlier}{number}")}),
+    )
+    .await;
+    let written = serve(
+        &plane,
+        &management,
+        "computer.write_text",
+        json!({"element_id": format!("{earlier}{composer_number}"), "text": "x", "write_mode": "replace_value"}),
+    )
+    .await;
+    for reply in [&pressed, &written] {
+        assert_eq!(reply["outcome"], "stale_element", "{reply}");
+        assert_eq!(
+            reply["remedy"],
+            "read_state again; ids from before a restart no longer apply"
+        );
+    }
+    assert!(desk.state().presses.is_empty() && desk.state().writes.is_empty());
+
+    // The same numbers under this run's tag are live and act.
+    let live = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": send}),
+    )
+    .await;
+    assert_eq!(live["outcome"], "completed", "{live}");
+    assert_eq!(desk.state().presses, vec![10]);
+    assert!(plane.result_schema_findings().is_empty());
 }
 
 // ---------------------------------------------------------------------------
