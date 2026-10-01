@@ -200,6 +200,28 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
     reply
 }
 
+/// The first ref a snapshot reply's page text names: a ref is the first word
+/// of a line in the default view, and a row's `ref` in the ax view.
+fn first_ref(snapshot: &Value) -> String {
+    let text = snapshot["state_text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no state_text: {snapshot}"));
+    text.lines()
+        .find_map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(row) => row["ref"].as_str().map(str::to_string),
+            Err(_) => line
+                .split_whitespace()
+                .next()
+                .filter(|word| {
+                    word.len() > 1
+                        && word.starts_with('e')
+                        && word[1..].chars().all(|c| c.is_ascii_digit())
+                })
+                .map(str::to_string),
+        })
+        .unwrap_or_else(|| panic!("no ref in state_text: {snapshot}"))
+}
+
 fn snapshot_observation(
     clicked: bool,
     hazardous: bool,
@@ -273,6 +295,7 @@ fn snapshot_observation(
         }],
         ax_truncated: false,
         refs_truncated: false,
+        facts: Default::default(),
     }
 }
 
@@ -975,13 +998,13 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
     let before: Value = serde_json::from_slice(&before.body).unwrap();
     assert_eq!(before["outcome"], "ok", "{before}");
     assert!(
-        before["content"]
+        before["state_text"]
             .as_str()
             .is_some_and(|content| content.contains("Click probe before")),
         "{before}"
     );
     let snapshot_id = before["snapshot_id"].as_str().unwrap();
-    let reference = before["refs"][0]["ref"].as_str().unwrap();
+    let reference = first_ref(&before);
 
     let clicked = invoke(
         &planes,
@@ -1005,10 +1028,64 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
     let after = invoke(&planes, 32, "browser.snapshot", json!({"mode": "ax"})).await;
     let after: Value = serde_json::from_slice(&after.body).unwrap();
     assert!(
-        after["content"]
+        after["state_text"]
             .as_str()
             .is_some_and(|content| content.contains("Click probe after")),
         "{after}"
+    );
+}
+
+/// The default snapshot's page text is plain lines whose first word is the
+/// ref, with no separate ref table, and a ref read off a line is one the click
+/// handler accepts and dispatches.
+#[tokio::test]
+async fn wire_click_dispatches_a_ref_read_from_the_page_text() {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    grant_browser(
+        &planes,
+        "https://page.example",
+        vec![HazardClass::CredentialFormSubmit],
+    )
+    .await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
+
+    let snapshot = invoke(&planes, 30, "browser.snapshot", json!({})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(
+        snapshot.get("content").is_none() && snapshot.get("refs").is_none(),
+        "{snapshot}"
+    );
+    let text = snapshot["state_text"].as_str().unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.ends_with("button Sign in"))
+        .unwrap_or_else(|| panic!("no button line in {text}"));
+    let reference = line.split_whitespace().next().unwrap();
+
+    let clicked = invoke(
+        &planes,
+        31,
+        "browser.click",
+        json!({
+            "ref": reference,
+            "snapshot_id": snapshot["snapshot_id"],
+            "intent": "click the ref the page text printed",
+            "severity": {"tier": 2, "credential": false, "financial": false}
+        }),
+    )
+    .await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["snapshot", "input_press", "input_release"]
     );
 }
 
@@ -1045,7 +1122,7 @@ async fn wire_click_without_a_covering_grant_dispatches_no_input() {
         41,
         "browser.click",
         json!({
-            "ref": snapshot["refs"][0]["ref"],
+            "ref": first_ref(&snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "must remain refused",
             "severity": {"tier": 2, "credential": false, "financial": false}
@@ -1099,7 +1176,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
     let click = json!({
-        "ref": snapshot["refs"][0]["ref"],
+        "ref": first_ref(&snapshot),
         "snapshot_id": snapshot["snapshot_id"],
         "intent": "follow the cross-site link",
         "severity": {"tier": 2, "credential": false, "financial": false}
@@ -1329,7 +1406,7 @@ async fn click_cross_site_link(planes: &Planes, corr: u64) -> Value {
         corr + 1,
         "browser.click",
         json!({
-            "ref": snapshot["refs"][0]["ref"],
+            "ref": first_ref(&snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "follow the cross-site link",
             "severity": {"tier": 2, "credential": false, "financial": false}
@@ -1443,7 +1520,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
         51,
         "browser.click",
         json!({
-            "ref": snapshot["refs"][0]["ref"],
+            "ref": first_ref(&snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "must remain refused",
             "severity": {"tier": 4, "credential": true, "financial": false}
@@ -2807,7 +2884,7 @@ async fn a_browser_relaunched_after_close_serves_snapshots() {
     let relaunched = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(relaunched["outcome"], "ok", "{relaunched}");
     assert!(
-        relaunched["content"]
+        relaunched["state_text"]
             .as_str()
             .is_some_and(|content| content.contains("Click probe before")),
         "{relaunched}"
@@ -2846,7 +2923,7 @@ async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
     assert_eq!(navigated["outcome"], "ok", "{navigated}");
     assert_eq!(navigated["read_page"]["outcome"], "ok", "{navigated}");
     assert!(
-        navigated["read_page"]["content"]
+        navigated["state_text"]
             .as_str()
             .is_some_and(|content| content.contains("Click probe before")),
         "{navigated}"
@@ -2889,7 +2966,7 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
         6,
         "browser.click",
         json!({
-            "ref": old["refs"][0]["ref"],
+            "ref": first_ref(&old),
             "snapshot_id": old["snapshot_id"],
             "intent": "click through a snapshot of the crashed browser",
             "severity": {"tier": 2, "credential": false, "financial": false}
@@ -3352,6 +3429,7 @@ impl OwnedBrowserProcess for CdpClickProcess {
             }],
             ax_truncated: false,
             refs_truncated: false,
+            facts: Default::default(),
         })
     }
 
@@ -3481,7 +3559,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
         101,
         "browser.click",
         json!({
-            "ref": snapshot["refs"][0]["ref"],
+            "ref": first_ref(&snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "follow the Learn more link",
             "severity": {"tier": 4, "credential": false, "financial": false}
@@ -3573,7 +3651,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
         112,
         "browser.click",
         json!({
-            "ref": snapshot["refs"][0]["ref"],
+            "ref": first_ref(&snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "follow the Learn more link",
             "severity": {"tier": 4, "credential": false, "financial": false}
@@ -3988,7 +4066,7 @@ async fn a_page_that_stays_put_reads_as_before() {
     }
     let ax = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
     assert!(
-        ax["content"]
+        ax["state_text"]
             .as_str()
             .is_some_and(|content| content.contains("Click probe before")),
         "{ax}"
@@ -4133,7 +4211,7 @@ async fn click_ref(planes: &Planes, corr: u64, snapshot: &Value) -> Value {
         corr,
         "browser.click",
         json!({
-            "ref": snapshot["refs"][0]["ref"],
+            "ref": first_ref(snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "follow the Learn more link",
             "severity": {"tier": 4, "credential": true, "financial": true}

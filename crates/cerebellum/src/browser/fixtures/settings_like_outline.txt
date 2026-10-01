@@ -1,0 +1,37 @@
+Password and authentication · github.com/settings/security · snapshot 0123456789abcdef0123456789abcdef
+e24 main · 20 lines, 866 B
+  e25 heading Password and authentication
+  e26 form Change password
+    e27 textbox (credential field) Old password
+    e30 textbox (required, credential field) New password
+    e31 textbox (credential field) Username
+    e32 textbox Backup email, Value: octo@example.com, Placeholder: you@example.com
+    e33 checkbox (checked) Keep my email addresses private
+    e34 combobox (collapsed) Theme, Value: Dark
+      e35 MenuListOption Light
+      e36 MenuListOption (selected) Dark
+    e37 button Update password
+    e38 link I forgot my password, Value: github.com/password_reset
+  e39 region Two-factor authentication
+    e40 heading Two-factor authentication
+    e41 paragraph
+      e42 text Two-factor authentication is not enabled yet.
+    e43 button Enable two-factor authentication
+  e44 region Billing
+    e45 textbox (credential field) Card number
+e2 banner
+  e3 link Homepage, Value: github.com
+  e4 navigation Global
+    e5 link Pull requests, Value: github.com/pulls
+    e6 link Issues, Value: github.com/issues
+    e7 link Notifications, Value: github.com/notifications
+  e8 button (collapsed) Open user navigation menu
+e10 navigation Settings
+  e11 list
+    e12 listitem
+      e13 link Public profile, Value: github.com/settings/profile
+    +5 more listitem like this; zoom e11
+e46 contentinfo
+  e47 link Terms, Value: docs.github.com/site-policy/github-terms
+  e48 link Privacy, Value: docs.github.com/site-policy/privacy-policies
+  e49 link Status, Value: www.githubstatus.com

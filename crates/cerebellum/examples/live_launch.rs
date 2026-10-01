@@ -207,11 +207,14 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
         close_browser(&planes, label, &browser_session_id, 91).await;
         return false;
     }
-    let Some(reference) = before["refs"]
-        .as_array()
-        .and_then(|refs| refs.iter().find(|reference| reference["name"] == "Sign in"))
-        .and_then(|reference| reference["ref"].as_str())
-        .map(str::to_string)
+    // The ax view's rows carry their refs; there is no separate ref table.
+    let Some(reference) = before["state_text"]
+        .as_str()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["name"] == "Sign in")
+        .and_then(|row| row["ref"].as_str().map(str::to_string))
     else {
         eprintln!("[{label}] snapshot before click exposed no named button ref");
         close_browser(&planes, label, &browser_session_id, 92).await;
@@ -250,8 +253,8 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
     )
     .await;
     print_wire_snapshot(label, "AFTER", &after);
-    let before_content = before["content"].as_str().unwrap_or_default();
-    let after_content = after["content"].as_str().unwrap_or_default();
+    let before_content = before["state_text"].as_str().unwrap_or_default();
+    let after_content = after["state_text"].as_str().unwrap_or_default();
     let page_changed = before_content.contains("Click probe before")
         && after_content.contains("Click probe after")
         && before_content != after_content;
@@ -348,7 +351,7 @@ async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
                 json!({"mode": "ax", "max_bytes": 65_536}),
             )
             .await;
-            let content = after_point["content"].as_str().unwrap_or_default();
+            let content = after_point["state_text"].as_str().unwrap_or_default();
             let landed = content
                 .split("point ")
                 .nth(1)
@@ -563,7 +566,9 @@ fn print_wire_snapshot(label: &str, phase: &str, snapshot: &Value) {
     println!("[{label}] SNAPSHOT {phase} RESPONSE: {snapshot}");
     println!(
         "[{label}] SNAPSHOT {phase} CONTENT:\n{}",
-        snapshot["content"].as_str().unwrap_or("<missing content>")
+        snapshot["state_text"]
+            .as_str()
+            .unwrap_or("<missing content>")
     );
 }
 

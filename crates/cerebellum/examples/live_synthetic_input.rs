@@ -505,7 +505,7 @@ mod macos_probe {
         if snapshot["outcome"] != "ok" {
             return Err(format!("browser.snapshot refused: {snapshot}"));
         }
-        let content = snapshot["content"]
+        let content = snapshot["state_text"]
             .as_str()
             .ok_or_else(|| format!("browser.snapshot returned no content: {snapshot}"))?;
         content

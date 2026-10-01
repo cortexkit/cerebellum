@@ -1,0 +1,59 @@
+{
+  "url": "https://github.com/settings/security",
+  "tree": {"role": "RootWebArea", "name": "Password and authentication", "tag": "html", "children": [
+    {"role": "banner", "tag": "header", "children": [
+      {"role": "link", "name": "Homepage", "tag": "a", "attrs": {"href": "/"}},
+      {"role": "navigation", "name": "Global", "tag": "nav", "children": [
+        {"role": "link", "name": "Pull requests", "tag": "a", "attrs": {"href": "/pulls"}},
+        {"role": "link", "name": "Issues", "tag": "a", "attrs": {"href": "/issues"}},
+        {"role": "link", "name": "Notifications", "tag": "a", "attrs": {"href": "/notifications"}}
+      ]},
+      {"role": "button", "name": "Open user navigation menu", "tag": "button", "props": {"expanded": false}}
+    ]},
+    {"role": "generic", "children": [
+      {"role": "navigation", "name": "Settings", "tag": "nav", "children": [
+        {"role": "list", "tag": "ul", "children": [
+          {"role": "listitem", "tag": "li", "children": [{"role": "link", "name": "Public profile", "tag": "a", "attrs": {"href": "/settings/profile"}}]},
+          {"role": "listitem", "tag": "li", "children": [{"role": "link", "name": "Account", "tag": "a", "attrs": {"href": "/settings/admin"}}]},
+          {"role": "listitem", "tag": "li", "children": [{"role": "link", "name": "Appearance", "tag": "a", "attrs": {"href": "/settings/appearance"}}]},
+          {"role": "listitem", "tag": "li", "children": [{"role": "link", "name": "Password and authentication", "tag": "a", "attrs": {"href": "/settings/security", "aria-current": "page"}}]},
+          {"role": "listitem", "tag": "li", "children": [{"role": "link", "name": "Emails", "tag": "a", "attrs": {"href": "/settings/emails"}}]},
+          {"role": "listitem", "tag": "li", "children": [{"role": "link", "name": "SSH and GPG keys", "tag": "a", "attrs": {"href": "/settings/keys"}}]}
+        ]}
+      ]},
+      {"role": "main", "tag": "main", "children": [
+        {"role": "heading", "name": "Password and authentication", "tag": "h1"},
+        {"role": "form", "name": "Change password", "tag": "form", "attrs": {"aria-label": "Change password"}, "children": [
+          {"role": "textbox", "name": "Old password", "tag": "input", "attrs": {"type": "password", "name": "user[old_password]", "autocomplete": "current-password"}, "value": "hunter2-planted", "children": [
+            {"role": "generic", "children": [{"role": "StaticText", "name": "hunter2-planted"}]}
+          ]},
+          {"role": "textbox", "name": "New password", "tag": "input", "attrs": {"type": "password", "autocomplete": "new-password"}, "value": "s3cret-new-value", "props": {"required": true}},
+          {"role": "textbox", "name": "Username", "tag": "input", "attrs": {"type": "text", "autocomplete": "username"}, "value": "octocat-private"},
+          {"role": "textbox", "name": "Backup email", "tag": "input", "attrs": {"type": "email", "name": "email", "placeholder": "you@example.com"}, "value": "octo@example.com", "props": {"invalid": "false"}},
+          {"role": "checkbox", "name": "Keep my email addresses private", "tag": "input", "attrs": {"type": "checkbox"}, "props": {"checked": "true"}},
+          {"role": "combobox", "name": "Theme", "tag": "select", "attrs": {"name": "theme"}, "value": "Dark", "props": {"expanded": false}, "children": [
+            {"role": "MenuListPopup", "ignored": true, "children": [
+              {"role": "MenuListOption", "name": "Light", "tag": "option", "props": {"selected": false}},
+              {"role": "MenuListOption", "name": "Dark", "tag": "option", "props": {"selected": true}}
+            ]}
+          ]},
+          {"role": "button", "name": "Update password", "tag": "button"},
+          {"role": "link", "name": "I forgot my password", "tag": "a", "attrs": {"href": "/password_reset"}}
+        ]},
+        {"role": "region", "name": "Two-factor authentication", "tag": "section", "children": [
+          {"role": "heading", "name": "Two-factor authentication", "tag": "h2"},
+          {"role": "paragraph", "tag": "p", "children": [{"role": "StaticText", "name": "Two-factor authentication is not enabled yet."}]},
+          {"role": "button", "name": "Enable two-factor authentication", "tag": "button"}
+        ]},
+        {"role": "region", "name": "Billing", "tag": "section", "children": [
+          {"role": "textbox", "name": "Card number", "tag": "input", "attrs": {"autocomplete": "cc-number"}, "value": "4111111111111111"}
+        ]}
+      ]}
+    ]},
+    {"role": "contentinfo", "tag": "footer", "children": [
+      {"role": "link", "name": "Terms", "tag": "a", "attrs": {"href": "https://docs.github.com/site-policy/github-terms"}},
+      {"role": "link", "name": "Privacy", "tag": "a", "attrs": {"href": "https://docs.github.com/site-policy/privacy-policies"}},
+      {"role": "link", "name": "Status", "tag": "a", "attrs": {"href": "https://www.githubstatus.com/"}}
+    ]}
+  ]}
+}

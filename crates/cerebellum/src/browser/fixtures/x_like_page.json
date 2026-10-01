@@ -1,0 +1,164 @@
+{
+  "fixture": "Synthetic accessibility tree: accounts, posts and links are invented.",
+  "url": "https://example.com/home",
+  "tree": {"role": "RootWebArea", "name": "Synthetic Kestrel Feed", "tag": "html", "children": [
+    {"role": "generic", "children": [
+      {"role": "banner", "tag": "header", "children": [
+        {"role": "generic", "children": [
+          {"role": "navigation", "name": "Primary", "tag": "nav", "children": [
+            {"role": "link", "name": "Kestrel Feed", "tag": "a", "attrs": {"href": "/home"}, "children": [
+              {"role": "generic", "children": [{"role": "image", "name": ""}]}
+            ]},
+            {"role": "link", "name": "Home", "tag": "a", "attrs": {"href": "/home"}, "props": {"url": "https://example.com/home"}, "children": [
+              {"role": "generic", "children": [{"role": "StaticText", "name": "Home", "children": [{"role": "InlineTextBox", "name": "Home"}]}]}
+            ]},
+            {"role": "link", "name": "Explore", "tag": "a", "attrs": {"href": "/explore"}},
+            {"role": "link", "name": "Notifications", "tag": "a", "attrs": {"href": "/notifications"}},
+            {"role": "link", "name": "Messages", "tag": "a", "attrs": {"href": "/messages"}},
+            {"role": "link", "name": "Topics", "tag": "a", "attrs": {"href": "/i/topics"}},
+            {"role": "link", "name": "Bookmarks", "tag": "a", "attrs": {"href": "/i/bookmarks"}},
+            {"role": "link", "name": "Profile", "tag": "a", "attrs": {"href": "/juniper_example"}},
+            {"role": "button", "name": "More menu items", "tag": "button", "props": {"expanded": false}},
+            {"role": "link", "name": "Post", "tag": "a", "attrs": {"href": "/compose/post"}, "children": [
+              {"role": "generic", "children": [{"role": "StaticText", "name": "Post"}]}
+            ]}
+          ]},
+          {"role": "button", "name": "Account menu Juniper Samplewood @juniper_example", "tag": "button"}
+        ]}
+      ]},
+      {"role": "main", "tag": "main", "children": [
+        {"role": "generic", "children": [
+          {"role": "generic", "children": [
+            {"role": "tablist", "tag": "div", "children": [
+              {"role": "tab", "name": "For you", "props": {"selected": true}, "children": [
+                {"role": "generic", "children": [{"role": "StaticText", "name": "For you"}]}
+              ]},
+              {"role": "tab", "name": "Following", "props": {"selected": false}}
+            ]},
+            {"role": "generic", "children": [
+              {"role": "link", "name": "Juniper Samplewood", "tag": "a", "attrs": {"href": "/juniper_example"}},
+              {"role": "textbox", "name": "Post text", "tag": "div", "attrs": {"contenteditable": "true"}, "props": {"focused": true}, "children": [
+                {"role": "generic", "children": [{"role": "StaticText", "name": "What's happening?"}]}
+              ]},
+              {"role": "button", "name": "Add photos or video", "tag": "button"},
+              {"role": "button", "name": "Add a GIF", "tag": "button"},
+              {"role": "button", "name": "Post", "tag": "button", "props": {"disabled": true}}
+            ]},
+            {"role": "region", "name": "Your Home Timeline", "tag": "section", "children": [
+              {"role": "heading", "name": "Your Home Timeline", "tag": "h1"},
+              {"role": "feed", "name": "Timeline: Your Home Timeline", "tag": "div", "children": [
+                {"role": "generic", "children": [{"role": "generic", "children": [
+                  {"role": "article", "name": "Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 3 Likes. 59 views", "tag": "article", "children": [
+                    {"role": "generic", "children": [
+                      {"role": "link", "name": "Pebble Post Verified account", "tag": "a", "attrs": {"href": "/pebble_post"}, "children": [
+                        {"role": "StaticText", "name": "Pebble Post"},
+                        {"role": "image", "name": "Verified account"}
+                      ]},
+                      {"role": "link", "name": "@pebble_post", "tag": "a", "attrs": {"href": "/pebble_post"}, "children": [{"role": "StaticText", "name": "@pebble_post"}]},
+                      {"role": "link", "name": "19 minutes ago", "tag": "a", "attrs": {"href": "/pebble_post/status/1001"}, "children": [{"role": "StaticText", "name": "19m"}]}
+                    ]},
+                    {"role": "generic", "attrs": {"lang": "en"}, "children": [
+                      {"role": "StaticText", "name": "A seed swap with "},
+                      {"role": "link", "name": "@moss_example", "tag": "a", "attrs": {"href": "/moss_example"}}
+                    ]},
+                    {"role": "group", "name": "3 Likes. 59 views", "children": [
+                      {"role": "button", "name": "0 Replies. Reply", "tag": "button"},
+                      {"role": "button", "name": "0 reposts. Repost", "tag": "button"},
+                      {"role": "button", "name": "3 Likes. Like", "tag": "button"},
+                      {"role": "link", "name": "59 views. View post analytics", "tag": "a", "attrs": {"href": "/pebble_post/status/1001/analytics"}},
+                      {"role": "button", "name": "Bookmark", "tag": "button"},
+                      {"role": "button", "name": "Share post", "tag": "button"}
+                    ]}
+                  ]}
+                ]}]},
+                {"role": "generic", "children": [{"role": "generic", "children": [
+                  {"role": "article", "name": "Spindle Press Verified account @spindle_press 20 minutes ago We're planning a live garden tour with @sage_example Curious about balcony gardening? Leave a question and Sage will pick a few to answer live. 2 Likes. 109 views", "tag": "article", "children": [
+                    {"role": "generic", "children": [
+                      {"role": "link", "name": "Spindle Press Verified account", "tag": "a", "attrs": {"href": "/spindle_press"}},
+                      {"role": "link", "name": "@spindle_press", "tag": "a", "attrs": {"href": "/spindle_press"}},
+                      {"role": "link", "name": "20 minutes ago", "tag": "a", "attrs": {"href": "/spindle_press/status/1002"}, "children": [{"role": "StaticText", "name": "20m"}]}
+                    ]},
+                    {"role": "generic", "attrs": {"lang": "en"}, "children": [
+                      {"role": "StaticText", "name": "We're planning a live garden tour with "},
+                      {"role": "link", "name": "@sage_example", "tag": "a", "attrs": {"href": "/sage_example"}},
+                      {"role": "StaticText", "name": " \ud83c\udf99\ufe0f\n\nCurious about balcony gardening? Leave a question and Sage will pick a few to answer live."}
+                    ]},
+                    {"role": "group", "name": "2 Likes. 109 views", "children": [
+                      {"role": "button", "name": "0 Replies. Reply", "tag": "button"},
+                      {"role": "button", "name": "0 reposts. Repost", "tag": "button"},
+                      {"role": "button", "name": "2 Likes. Like", "tag": "button"},
+                      {"role": "link", "name": "109 views. View post analytics", "tag": "a", "attrs": {"href": "/spindle_press/status/1002/analytics"}},
+                      {"role": "button", "name": "Bookmark", "tag": "button"},
+                      {"role": "button", "name": "Share post", "tag": "button"}
+                    ]}
+                  ]}
+                ]}]},
+                {"role": "generic", "children": [{"role": "generic", "children": [
+                  {"role": "article", "name": "Paper Kite Club Verified account @paper_kite_club 26 minutes ago You can now fold our pocket kite with one sheet. 9 reposts. 41 Likes. 816 views", "tag": "article", "children": [
+                    {"role": "generic", "children": [
+                      {"role": "link", "name": "Paper Kite Club Verified account", "tag": "a", "attrs": {"href": "/paper_kite_club"}},
+                      {"role": "link", "name": "@paper_kite_club", "tag": "a", "attrs": {"href": "/paper_kite_club"}},
+                      {"role": "link", "name": "26 minutes ago", "tag": "a", "attrs": {"href": "/paper_kite_club/status/1003"}, "children": [{"role": "StaticText", "name": "26m"}]}
+                    ]},
+                    {"role": "generic", "attrs": {"lang": "en"}, "children": [
+                      {"role": "StaticText", "name": "You can now fold our pocket kite with one sheet."}
+                    ]},
+                    {"role": "group", "name": "9 reposts. 41 Likes. 816 views", "children": [
+                      {"role": "button", "name": "0 Replies. Reply", "tag": "button"},
+                      {"role": "button", "name": "9 reposts. Repost", "tag": "button"},
+                      {"role": "button", "name": "41 Likes. Like", "tag": "button"},
+                      {"role": "link", "name": "816 views. View post analytics", "tag": "a", "attrs": {"href": "/paper_kite_club/status/1003/analytics"}},
+                      {"role": "button", "name": "Bookmark", "tag": "button"},
+                      {"role": "button", "name": "Share post", "tag": "button"}
+                    ]}
+                  ]}
+                ]}]}
+              ]}
+            ]}
+          ]}
+        ]}
+      ]},
+      {"role": "complementary", "name": "Trending", "tag": "aside", "children": [
+        {"role": "search", "name": "Search", "tag": "form", "children": [
+          {"role": "searchbox", "name": "Search query", "tag": "input", "attrs": {"type": "text", "name": "q", "placeholder": "Search"}, "value": "kites"}
+        ]},
+        {"role": "region", "name": "What's happening", "tag": "section", "children": [
+          {"role": "heading", "name": "What's happening", "tag": "h2"},
+          {"role": "link", "name": "Trending in Example Bay Paper boats 12.3K posts", "tag": "a", "attrs": {"href": "/search?q=Paper%20boats"}},
+          {"role": "link", "name": "Crafts · Trending Pocket kites 4,210 posts", "tag": "a", "attrs": {"href": "/search?q=Pocket%20kites"}},
+          {"role": "link", "name": "Show more", "tag": "a", "attrs": {"href": "/explore/tabs/for-you"}}
+        ]},
+        {"role": "region", "name": "Who to follow", "tag": "section", "children": [
+          {"role": "heading", "name": "Who to follow", "tag": "h2"},
+          {"role": "generic", "children": [
+            {"role": "link", "name": "Wren Workshop @wren_example", "tag": "a", "attrs": {"href": "/wren_example"}},
+            {"role": "button", "name": "Follow @wren_example", "tag": "button"}
+          ]},
+          {"role": "generic", "children": [
+            {"role": "link", "name": "Copper Lantern @lantern_example", "tag": "a", "attrs": {"href": "/lantern_example"}},
+            {"role": "button", "name": "Follow @lantern_example", "tag": "button"}
+          ]},
+          {"role": "generic", "children": [
+            {"role": "link", "name": "River Loom @river_example", "tag": "a", "attrs": {"href": "/river_example"}},
+            {"role": "button", "name": "Follow @river_example", "tag": "button"}
+          ]},
+          {"role": "generic", "children": [
+            {"role": "link", "name": "Thimble Scouts @thimble_example", "tag": "a", "attrs": {"href": "/thimble_example"}},
+            {"role": "button", "name": "Follow @thimble_example", "tag": "button"}
+          ]},
+          {"role": "generic", "children": [
+            {"role": "link", "name": "Quill Corner @quill_example", "tag": "a", "attrs": {"href": "/quill_example"}},
+            {"role": "button", "name": "Follow @quill_example", "tag": "button"}
+          ]}
+        ]},
+        {"role": "navigation", "name": "Footer", "tag": "nav", "children": [
+          {"role": "link", "name": "Terms of Service", "tag": "a", "attrs": {"href": "https://example.com/tos"}},
+          {"role": "link", "name": "Privacy Policy", "tag": "a", "attrs": {"href": "https://example.com/privacy"}},
+          {"role": "link", "name": "Cookie Policy", "tag": "a", "attrs": {"href": "https://support.example.com/articles/cookies"}},
+          {"role": "link", "name": "Accessibility", "tag": "a", "attrs": {"href": "https://help.example.com/resources/accessibility"}},
+          {"role": "link", "name": "Ads info", "tag": "a", "attrs": {"href": "https://business.example.com/help/ad-info.html?ref=footer"}}
+        ]}
+      ]}
+    ]}
+  ]}
+}

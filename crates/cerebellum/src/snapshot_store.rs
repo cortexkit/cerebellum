@@ -24,7 +24,13 @@ pub const MAX_VALUE_BYTES: usize = 4_096;
 pub const MAX_AX_RECORD_BYTES: usize = 1_048_576;
 pub const AX_SCHEMA: &str = "ck-browser-snapshot-ax-jsonl/v1";
 pub const DOM_SCHEMA: &str = "ck-browser-snapshot-dom-text/v1";
-pub const ACTIONABLE_SCHEMA: &str = "ck-browser-snapshot-actionable-jsonl/v1";
+/// The default snapshot's page text: one element per line, as
+/// `crate::browser::state_text` renders it.
+pub const STATE_TEXT_SCHEMA: &str = "ck-browser-state-text/v1";
+
+/// The longest source URL a snapshot reply repeats. The retained snapshot
+/// keeps the whole URL for its action checks; only the reply's copy is cut.
+pub const MAX_SOURCE_ORIGIN_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -775,15 +781,29 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Budget the serialized reply, including JSON escaping and the ref table.
-/// Tiny budgets still need routing and truncation metadata: the fixed minimum
-/// envelope is 1024 bytes. The source document kept for actions is never shortened.
-pub fn bounded_text_reply(snapshot: &mut TextSnapshot, max_bytes: usize, context: Value) -> Value {
-    let original_bytes = snapshot.content.len();
-    let original_refs = snapshot.refs.len();
-    let mut source = snapshot.source_origin.clone();
-    // The minimum envelope pays for metadata, not extra page text when a
-    // caller deliberately requests only a tiny excerpt.
+/// Bound a text snapshot's page text to `max_bytes` and build its reply.
+///
+/// The page text goes in `state_text`; there is no separate ref table, the
+/// refs are the ids the text itself prints. So the retained snapshot keeps
+/// exactly the refs its text names, and an action can use a ref only if the
+/// caller was shown it:
+///
+/// - the default view arrives already rendered within the bound with its refs
+///   narrowed to the printed ones (`prior_cut` carries what that render cut);
+/// - the AX view is cut at a line boundary and keeps the refs its remaining
+///   lines name;
+/// - the raw DOM view is cut at a character boundary and names no refs, so it
+///   keeps none.
+///
+/// The reply's copy of the source URL is cut at [`MAX_SOURCE_ORIGIN_BYTES`];
+/// the retained snapshot keeps all of it for its action checks.
+pub fn bounded_text_reply(
+    snapshot: &mut TextSnapshot,
+    max_bytes: usize,
+    prior_cut: (usize, usize),
+    context: Value,
+) -> Value {
+    let (mut cut_bytes, mut cut_lines) = prior_cut;
     if snapshot.content.len() > max_bytes {
         let mut end = max_bytes;
         while !snapshot.content.is_char_boundary(end) {
@@ -792,70 +812,42 @@ pub fn bounded_text_reply(snapshot: &mut TextSnapshot, max_bytes: usize, context
         if snapshot.kind != SnapshotKind::DomFull {
             end = snapshot.content[..end].rfind('\n').map_or(0, |i| i + 1);
         }
+        let removed = &snapshot.content[end..];
+        cut_bytes += removed.len();
+        cut_lines += removed.lines().count();
         snapshot.content.truncate(end);
         snapshot.truncated = true;
     }
-    loop {
-        let reply = serde_json::json!({
-            "outcome":"ok", "mode":snapshot.kind.as_str(),
-            "snapshot_id":snapshot.snapshot_id, "document_epoch":snapshot.document_epoch,
-            "source_origin":source, "content_schema":snapshot.content_schema,
-            "truncated":snapshot.truncated, "refs_truncated":snapshot.refs_truncated,
-            "content":snapshot.content,
-            "refs":snapshot.refs.iter().map(|r| &r.captured).collect::<Vec<_>>(),
-            "omitted":{"content_bytes":original_bytes - snapshot.content.len(),
-                "refs":original_refs - snapshot.refs.len(),
-                "source_origin":source != snapshot.source_origin},
-            "context":context
-        });
-        if serde_json::to_vec(&reply)
-            .expect("snapshot reply serializes")
-            .len()
-            <= max_bytes.max(1024)
-        {
-            return reply;
-        }
-        snapshot.truncated = true;
-        if !snapshot.content.is_empty() {
-            let mut end = snapshot.content.len() / 2;
-            while !snapshot.content.is_char_boundary(end) {
-                end -= 1;
-            }
-            if snapshot.kind != SnapshotKind::DomFull {
-                end = snapshot.content[..end].rfind('\n').map_or(0, |i| i + 1);
-            }
-            snapshot.content.truncate(end);
-        }
-        if !snapshot.refs.is_empty() {
-            snapshot.refs_truncated = true;
-            snapshot.refs.truncate(snapshot.refs.len() / 2);
-            if snapshot.kind != SnapshotKind::DomFull {
-                // Never advertise a ref in the text after its private identity
-                // has been removed from the retained snapshot.
-                snapshot.content = snapshot
-                    .content
-                    .lines()
-                    .filter(|line| {
-                        let Ok(row) = serde_json::from_str::<Value>(line) else {
-                            return false;
-                        };
-                        row.get("ref")
-                            .and_then(Value::as_str)
-                            .is_none_or(|reference| {
-                                snapshot
-                                    .refs
-                                    .iter()
-                                    .any(|r| r.captured.reference == reference)
-                            })
-                    })
-                    .map(|line| format!("{line}\n"))
-                    .collect();
+    match snapshot.kind {
+        SnapshotKind::Ax => {
+            let named: std::collections::HashSet<String> = snapshot
+                .content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|row| row.get("ref").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            let before = snapshot.refs.len();
+            snapshot
+                .refs
+                .retain(|r| named.contains(&r.captured.reference));
+            if snapshot.refs.len() != before {
+                snapshot.refs_truncated = true;
             }
         }
-        if snapshot.content.is_empty() && snapshot.refs.is_empty() {
-            source.clear();
-        }
+        SnapshotKind::DomFull => snapshot.refs.clear(),
+        SnapshotKind::Actionable | SnapshotKind::Screenshot => {}
     }
+    let source = utf8_safe_truncate(&snapshot.source_origin, MAX_SOURCE_ORIGIN_BYTES);
+    serde_json::json!({
+        "outcome":"ok", "mode":snapshot.kind.as_str(),
+        "snapshot_id":snapshot.snapshot_id, "document_epoch":snapshot.document_epoch,
+        "source_origin":source, "content_schema":snapshot.content_schema,
+        "truncated":snapshot.truncated, "refs_truncated":snapshot.refs_truncated,
+        (crate::browser::state_text::STATE_TEXT_FIELD):snapshot.content,
+        "omitted":{"state_text_bytes":cut_bytes, "state_text_lines":cut_lines,
+            "source_origin":source.len() != snapshot.source_origin.len()},
+        "context":context
+    })
 }
 
 #[cfg(test)]

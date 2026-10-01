@@ -1,0 +1,1179 @@
+//! The page as plain text: what a browser snapshot returns to the model.
+//!
+//! Every element is one line, indented two spaces per level:
+//!
+//! ```text
+//! <ref> <role> [(<states>)] <name>[, Value: <value>][, Placeholder: <text>]
+//! ```
+//!
+//! The first line names the page: `<title> · <url> · snapshot <id>`.
+//!
+//! A plain snapshot returns an outline: one line per landmark (main, a feed,
+//! an article, navigation, a sidebar, a form, a dialog, a list, ...) with its
+//! size, small landmarks printed in full, and the page's main content before
+//! its navigation chrome. `zoom` names one ref and prints that element's whole
+//! subtree. This is the same reading order as outlining a file before reading
+//! one function of it, and it keeps a feed page's first reply to a few
+//! kilobytes instead of tens.
+//!
+//! Before anything is printed the tree loses what carries nothing: an
+//! unlabelled wrapper with one child is replaced by that child, and a text
+//! node repeating its parent's name is dropped. Neither rule can remove an
+//! element a caller could act on, because neither ever applies to a control.
+
+use std::collections::{BTreeSet, HashMap};
+
+use crate::snapshot_store::AxRecord;
+
+/// The reply field that carries the rendered page. Prefrontal lifts a
+/// top-level string of this name into a native text part, so the page reaches
+/// the model as text rather than as an escaped JSON string.
+pub const STATE_TEXT_FIELD: &str = "state_text";
+
+/// Names longer than this are cut with an ellipsis. Chrome names a container
+/// with the text of everything inside it (an X post's article is named with
+/// the author, the whole post and its counts), so an uncapped name repeats the
+/// subtree it heads.
+pub const NAME_CHARS: usize = 200;
+
+/// A text node is the page's content itself rather than a summary of it, so
+/// it gets more room than a name: a full-length post (280 characters) and a
+/// typical paragraph survive one zoom intact.
+pub const TEXT_CHARS: usize = 600;
+
+/// An outline line only has to tell landmarks apart; zoom shows the rest.
+/// Half the name cap keeps an X timeline's outline, about a dozen posts plus
+/// the page's chrome, under 3 KB.
+pub const OUTLINE_NAME_CHARS: usize = 100;
+
+/// A landmark whose printed subtree fits in this many bytes is printed in
+/// full inside the outline instead of as one summary line. 600 bytes is
+/// roughly eight element lines: a tab list, a search form or a short menu.
+/// Zooming into one of those would cost a second call plus another header for
+/// about the same text, while anything larger (a feed, a long list) is the
+/// kind of region the outline exists to keep folded. Three or four inlined
+/// regions still fit an outline in the 3 KB the X timeline targets.
+pub const INLINE_BYTES: usize = 600;
+
+/// How much content outside any landmark the outline prints at the top level
+/// before folding the rest into one "more" line. Pages without landmarks
+/// (many simple sites) have everything here, so it gets more room than the
+/// per-landmark allowance below.
+pub const TOP_LOOSE_BYTES: usize = 1_500;
+
+/// How much loose content (elements that are not themselves landmarks) the
+/// outline prints under one large landmark before folding the rest.
+pub const NESTED_LOOSE_BYTES: usize = INLINE_BYTES;
+
+/// Siblings sharing a role and a name shape are printed as one example and a
+/// count once there are more than this many of them, outside a zoom.
+pub const REPEAT_THRESHOLD: usize = 3;
+
+/// Facts about one element the accessibility record alone does not carry,
+/// keyed by the element's ref.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeFacts {
+    /// Accessibility states worth printing, in a fixed order (focused,
+    /// disabled, checked, ...).
+    pub states: Vec<String>,
+    /// The absolute URL a link points to.
+    pub url: Option<String>,
+    /// Whether the element's DOM node is a credential or payment field.
+    /// `None` means the DOM was not read for it, which withholds any value
+    /// just as `Some(true)` does: a value is printed only when the page's own
+    /// markup shows the field is neither.
+    pub credential: Option<bool>,
+    /// The field's placeholder text, which is a hint and never the value.
+    pub placeholder: Option<String>,
+}
+
+/// Which element a zoom asked for and which element of this capture it is.
+#[derive(Debug, Clone, Copy)]
+pub struct Zoom<'a> {
+    /// The ref the caller named.
+    pub requested: &'a str,
+    /// The ref the same element has in this capture, or `None` when it is no
+    /// longer on the page.
+    pub target: Option<&'a str>,
+}
+
+pub struct RenderInput<'a> {
+    /// The accessibility tree in document order, each record carrying its
+    /// depth.
+    pub records: &'a [AxRecord],
+    pub facts: &'a HashMap<String, NodeFacts>,
+    /// The URL of the document the records were read from.
+    pub page_url: &'a str,
+    pub snapshot_id: &'a str,
+    pub zoom: Option<Zoom<'a>>,
+    /// The most bytes the rendered text may have.
+    pub max_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedState {
+    pub text: String,
+    /// Every ref the text names. These, and only these, stay usable for a
+    /// click or a zoom on this snapshot.
+    pub printed_refs: BTreeSet<String>,
+    /// Bytes and lines the `max_bytes` cut removed; zero when nothing was cut.
+    pub cut_bytes: usize,
+    pub cut_lines: usize,
+}
+
+/// Render a captured page as plain text, as an outline or as one zoomed
+/// subtree, within `max_bytes`.
+pub fn render(input: &RenderInput<'_>) -> RenderedState {
+    let tree = Tree::build(input.records, input.facts);
+    let mut header = String::new();
+    let title = cap_chars(one_line(&tree.names[0]), NAME_CHARS);
+    if tree.records[0].is_some_and(|record| record.role == "RootWebArea") && !title.is_empty() {
+        header.push_str(&title);
+        header.push_str(" · ");
+    }
+    header.push_str(&short_url(input.page_url).unwrap_or_else(|| input.page_url.to_string()));
+    header.push_str(" · snapshot ");
+    header.push_str(input.snapshot_id);
+
+    let mut header_refs = Vec::new();
+    let lines = match input.zoom {
+        Some(zoom) => match zoom.target.and_then(|reference| tree.by_ref.get(reference)) {
+            Some(&target) => {
+                // An element inside a text field (Chrome's inner editor and
+                // its text) is the field's value by another route, so a zoom
+                // into one shows the field itself, which withholds it.
+                let target = tree.text_field_ancestor(target).unwrap_or(target);
+                header.push_str(" · zoom ");
+                match tree.reference(target) {
+                    Some(reference) => {
+                        header.push_str(reference);
+                        header_refs.push(reference.to_string());
+                    }
+                    None => header.push_str(zoom.requested),
+                }
+                let mut lines = Vec::new();
+                tree.full_lines(target, 0, &mut lines);
+                lines
+            }
+            None => {
+                header.push_str(&format!(
+                    "\nzoom {}: no such element on the page now; showing the outline",
+                    cap_chars(one_line(zoom.requested), 16)
+                ));
+                tree.outline_lines()
+            }
+        },
+        None => tree.outline_lines(),
+    };
+    fit(header, header_refs, lines, &tree, input.max_bytes)
+}
+
+/// The role word a line prints: `StaticText` reads as `text` and the root
+/// `RootWebArea` as `page`; every other accessibility role prints as is.
+fn display_role(role: &str) -> &str {
+    match role {
+        "StaticText" => "text",
+        "RootWebArea" => "page",
+        other => other,
+    }
+}
+
+/// Chrome's per-line text boxes and line breaks repeat what their text node
+/// already says.
+fn skipped(role: &str) -> bool {
+    matches!(role, "InlineTextBox" | "LineBreak")
+}
+
+fn is_wrapper(role: &str) -> bool {
+    matches!(
+        role,
+        "generic" | "group" | "none" | "presentation" | "GenericContainer" | "Section"
+    )
+}
+
+fn is_actionable(role: &str) -> bool {
+    matches!(
+        role,
+        "link"
+            | "button"
+            | "textbox"
+            | "searchbox"
+            | "combobox"
+            | "listbox"
+            | "option"
+            | "checkbox"
+            | "radio"
+            | "slider"
+            | "spinbutton"
+            | "switch"
+            | "tab"
+            | "menuitem"
+            | "menuitemcheckbox"
+            | "menuitemradio"
+            | "treeitem"
+            | "PopUpButton"
+            | "ToggleButton"
+            | "MenuListOption"
+            | "ListBoxOption"
+    )
+}
+
+/// Text-entry fields (`textbox`, `searchbox`, `combobox`): their value is
+/// what a person typed, so it prints only for a field known not to hold a
+/// credential or payment detail.
+fn is_text_field(role: &str) -> bool {
+    matches!(role, "textbox" | "searchbox" | "combobox")
+}
+
+/// Controls whose value is a number or a position (a slider's level, a
+/// progress bar's percentage); their value always prints.
+fn is_value_control(role: &str) -> bool {
+    matches!(
+        role,
+        "slider" | "spinbutton" | "progressbar" | "meter" | "scrollbar"
+    )
+}
+
+const CONTENT: u8 = 0;
+const NEUTRAL: u8 = 1;
+const CHROME: u8 = 2;
+
+/// Which landmarks hold the page's content and which its chrome (navigation,
+/// header, sidebar, footer). When `max_bytes` forces lines out, content lines
+/// are kept first, and the outline lists content first.
+fn landmark_class(role: &str) -> u8 {
+    match role {
+        "main" | "feed" | "article" | "dialog" | "alertdialog" => CONTENT,
+        "banner" | "navigation" | "complementary" | "contentinfo" | "search" => CHROME,
+        _ => NEUTRAL,
+    }
+}
+
+/// Collapse runs of whitespace (newlines included) to one space, so every
+/// element stays on one line.
+pub fn one_line(value: &str) -> String {
+    value
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn cap_chars(value: String, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value;
+    }
+    let mut capped: String = value.chars().take(max.saturating_sub(1)).collect();
+    capped.push('…');
+    capped
+}
+
+/// A URL as host plus path: the scheme, credentials, query and fragment are
+/// dropped. `None` for a URL that names no place worth printing (script and
+/// data URLs, which can also be arbitrarily long).
+pub fn short_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("javascript:") || lower.starts_with("data:") || lower.starts_with("blob:")
+    {
+        return None;
+    }
+    let rest = ["https://", "http://"]
+        .iter()
+        .find(|scheme| lower.starts_with(*scheme))
+        .map(|scheme| &url[scheme.len()..]);
+    let Some(rest) = rest else {
+        let end = url.find(['?', '#']).unwrap_or(url.len());
+        return Some(cap_chars(one_line(&url[..end]), NAME_CHARS)).filter(|url| !url.is_empty());
+    };
+    let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let path = if path == "/" { "" } else { path };
+    Some(cap_chars(one_line(&format!("{host}{path}")), NAME_CHARS))
+}
+
+/// Resolve a link's `href` attribute against the page it is on. Only used
+/// when Chrome did not report the link's absolute URL itself.
+pub fn resolve_href(href: &str, page_url: &str) -> String {
+    let href = href.trim();
+    let scheme_end = href.find(':');
+    if scheme_end.is_some_and(|end| !href[..end].contains(['/', '?', '#'])) {
+        return href.to_string();
+    }
+    let (scheme, rest) = page_url.split_once("://").unwrap_or(("https", page_url));
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if let Some(network_path) = href.strip_prefix("//") {
+        return format!("{scheme}://{network_path}");
+    }
+    if href.starts_with('/') {
+        return format!("{scheme}://{authority}{href}");
+    }
+    let page = &page_url[..page_url.find(['?', '#']).unwrap_or(page_url.len())];
+    if href.is_empty() || href.starts_with(['?', '#']) {
+        return format!("{page}{href}");
+    }
+    let directory = page
+        .rfind('/')
+        .filter(|slash| *slash > scheme.len() + 2)
+        .map_or(format!("{page}/"), |slash| page[..=slash].to_string());
+    format!("{directory}{href}")
+}
+
+fn size_text(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// The name with its digits removed: "3 Likes" and "12 Likes" have one shape.
+fn shape(name: &str) -> String {
+    name.chars().filter(|c| !c.is_ascii_digit()).collect()
+}
+
+#[derive(Debug, Clone)]
+struct Line {
+    depth: usize,
+    text: String,
+    /// When `max_bytes` forces lines out, content (0) is kept before neutral
+    /// (1) before chrome (2).
+    class: u8,
+    refs: Vec<String>,
+    /// The outermost landmark the line belongs to, so the closing line that
+    /// reports what `max_bytes` removed can name it.
+    section: Option<usize>,
+}
+
+impl Line {
+    fn bytes(&self) -> usize {
+        self.depth * 2 + self.text.len() + 1
+    }
+}
+
+enum Item {
+    Node(usize),
+    /// Siblings folded behind the example printed just before this item.
+    More(Vec<usize>),
+}
+
+struct Tree<'a> {
+    /// Node 0 is the page: the root record when the tree has one, otherwise
+    /// a placeholder holding every top-level record.
+    records: Vec<Option<&'a AxRecord>>,
+    names: Vec<String>,
+    children: Vec<Vec<usize>>,
+    parent: Vec<Option<usize>>,
+    /// Children after collapsing.
+    kids: Vec<Vec<usize>>,
+    by_ref: HashMap<&'a str, usize>,
+    facts: &'a HashMap<String, NodeFacts>,
+    class: Vec<u8>,
+    has_landmark_below: Vec<bool>,
+    section: Vec<Option<usize>>,
+}
+
+impl<'a> Tree<'a> {
+    fn build(records: &'a [AxRecord], facts: &'a HashMap<String, NodeFacts>) -> Self {
+        let mut nodes: Vec<Option<&AxRecord>> = vec![None];
+        let mut children = vec![Vec::new()];
+        let mut parent = vec![None];
+        let mut rest = records
+            .iter()
+            .filter(|record| !skipped(&record.role))
+            .peekable();
+        if rest
+            .peek()
+            .is_some_and(|record| record.role == "RootWebArea")
+        {
+            nodes[0] = rest.next();
+        }
+        // Records arrive in document order with their depth, so a record's
+        // parent is the nearest earlier record that is shallower.
+        let mut stack: Vec<(i64, usize)> = vec![(i64::MIN, 0)];
+        for record in rest {
+            while stack.len() > 1
+                && stack
+                    .last()
+                    .is_some_and(|(depth, _)| *depth >= record.depth)
+            {
+                stack.pop();
+            }
+            let owner = stack.last().expect("the page is never popped").1;
+            let index = nodes.len();
+            nodes.push(Some(record));
+            children.push(Vec::new());
+            parent.push(Some(owner));
+            children[owner].push(index);
+            stack.push((record.depth, index));
+        }
+        let names = nodes
+            .iter()
+            .map(|record| {
+                record
+                    .map(|record| one_line(&record.name))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let by_ref = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| Some((record.as_ref()?.reference.as_deref()?, index)))
+            .collect();
+        let mut tree = Self {
+            records: nodes,
+            names,
+            children,
+            parent,
+            kids: Vec::new(),
+            by_ref,
+            facts,
+            class: Vec::new(),
+            has_landmark_below: Vec::new(),
+            section: Vec::new(),
+        };
+        tree.collapse();
+        tree.classify();
+        tree
+    }
+
+    fn role(&self, node: usize) -> &str {
+        self.records[node].map_or("page", |record| record.role.as_str())
+    }
+
+    fn reference(&self, node: usize) -> Option<&'a str> {
+        self.records[node]?.reference.as_deref()
+    }
+
+    fn facts(&self, node: usize) -> Option<&'a NodeFacts> {
+        self.facts.get(self.reference(node)?)
+    }
+
+    fn is_landmark(&self, node: usize) -> bool {
+        let role = self.role(node);
+        matches!(
+            role,
+            "banner"
+                | "navigation"
+                | "main"
+                | "complementary"
+                | "contentinfo"
+                | "region"
+                | "form"
+                | "search"
+                | "dialog"
+                | "alertdialog"
+                | "feed"
+                | "list"
+                | "article"
+                | "tablist"
+                | "table"
+                | "grid"
+                | "tree"
+                | "menubar"
+        ) || (role == "group" && !self.names[node].is_empty())
+    }
+
+    /// Compute every node's printed children: an unlabelled wrapper with one
+    /// child is replaced by that child (and dropped when it has none), a text
+    /// node empty or equal to its parent's name is dropped, and below a text
+    /// field only controls remain. Records are in document order, so walking
+    /// them backwards visits each node's descendants before the node itself.
+    fn collapse(&mut self) {
+        let count = self.records.len();
+        let mut replacement: Vec<Vec<usize>> = vec![Vec::new(); count];
+        let mut kids: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for node in (0..count).rev() {
+            let role = self.role(node).to_string();
+            let mut collapsed: Vec<usize> = if is_text_field(&role) {
+                // Below a text field is only Chrome's inner editor holding
+                // the value again, which must not print for a credential
+                // field. A control inside one (rare, but a rich editor can
+                // hold a link) stays reachable.
+                let mut found = Vec::new();
+                let mut pending: Vec<usize> = self.children[node].iter().rev().copied().collect();
+                while let Some(child) = pending.pop() {
+                    if is_actionable(self.role(child)) {
+                        found.extend(replacement[child].iter().copied());
+                    } else {
+                        pending.extend(self.children[child].iter().rev().copied());
+                    }
+                }
+                found
+            } else {
+                self.children[node]
+                    .iter()
+                    .flat_map(|child| replacement[*child].iter().copied())
+                    .collect()
+            };
+            let own_name = &self.names[node];
+            collapsed.retain(|child| {
+                self.role(*child) != "StaticText"
+                    || !(self.names[*child].is_empty()
+                        || (!own_name.is_empty() && &self.names[*child] == own_name))
+            });
+            replacement[node] = if node != 0 && is_wrapper(&role) && own_name.is_empty() {
+                match collapsed.len() {
+                    0 => Vec::new(),
+                    1 => collapsed.clone(),
+                    _ => vec![node],
+                }
+            } else {
+                vec![node]
+            };
+            kids[node] = collapsed;
+        }
+        self.kids = kids;
+    }
+
+    fn classify(&mut self) {
+        let count = self.records.len();
+        let mut inherited = vec![NEUTRAL; count];
+        let mut section = vec![None; count];
+        for node in 1..count {
+            let parent = self.parent[node].expect("only the page has no parent");
+            let own = if self.is_landmark(node) {
+                landmark_class(self.role(node))
+            } else {
+                NEUTRAL
+            };
+            inherited[node] = if own == NEUTRAL {
+                inherited[parent]
+            } else {
+                own
+            };
+            section[node] = section[parent].or(self.is_landmark(node).then_some(node));
+        }
+        // A wrapper holding the main content gets the main content's rank,
+        // so trimming to `max_bytes` never keeps a child line while dropping
+        // the parent line it is indented under.
+        let mut class = inherited;
+        let mut below = vec![false; count];
+        for node in (0..count).rev() {
+            for &kid in &self.kids[node] {
+                class[node] = class[node].min(class[kid]);
+                below[node] |= self.is_landmark(kid) || below[kid];
+            }
+        }
+        self.class = class;
+        self.has_landmark_below = below;
+        self.section = section;
+    }
+
+    /// The nearest text field containing `node`, if any.
+    fn text_field_ancestor(&self, node: usize) -> Option<usize> {
+        let mut current = self.parent[node];
+        let mut found = None;
+        while let Some(ancestor) = current {
+            if is_text_field(self.role(ancestor)) {
+                found = Some(ancestor);
+            }
+            current = self.parent[ancestor];
+        }
+        found
+    }
+
+    fn element_text(&self, node: usize, name_chars: usize) -> String {
+        let role = self.role(node);
+        let facts = self.facts(node);
+        let mut text = String::new();
+        if let Some(reference) = self.reference(node) {
+            text.push_str(reference);
+            text.push(' ');
+        }
+        text.push_str(display_role(role));
+        let credential = facts.and_then(|facts| facts.credential);
+        let mut states: Vec<&str> = facts
+            .map(|facts| facts.states.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        if is_text_field(role) && credential == Some(true) {
+            states.push("credential field");
+        }
+        if !states.is_empty() {
+            text.push_str(" (");
+            text.push_str(&states.join(", "));
+            text.push(')');
+        }
+        let name = &self.names[node];
+        if !name.is_empty() {
+            text.push(' ');
+            text.push_str(&cap_chars(name.clone(), name_chars));
+        }
+        let value = self.records[node].and_then(|record| record.value.as_deref());
+        let shown_value = if role == "link" {
+            facts
+                .and_then(|facts| facts.url.as_deref())
+                .and_then(short_url)
+        } else if is_text_field(role) {
+            // Print the value only when the field's DOM was read and shows it
+            // is not a credential or payment field.
+            value.filter(|_| credential == Some(false)).map(one_line)
+        } else if is_value_control(role) {
+            value.map(one_line)
+        } else {
+            None
+        };
+        if let Some(value) = shown_value.filter(|value| !value.is_empty()) {
+            text.push_str(", Value: ");
+            text.push_str(&cap_chars(value, NAME_CHARS));
+        }
+        if is_text_field(role) {
+            if let Some(placeholder) = facts
+                .and_then(|facts| facts.placeholder.as_deref())
+                .map(one_line)
+                .filter(|placeholder| !placeholder.is_empty() && placeholder != name)
+            {
+                text.push_str(", Placeholder: ");
+                text.push_str(&cap_chars(placeholder, NAME_CHARS));
+            }
+        }
+        text
+    }
+
+    fn name_chars(&self, node: usize) -> usize {
+        if self.role(node) == "StaticText" {
+            TEXT_CHARS
+        } else {
+            NAME_CHARS
+        }
+    }
+
+    fn line(&self, node: usize, depth: usize, text: String) -> Line {
+        Line {
+            depth,
+            text,
+            class: self.class[node],
+            refs: self
+                .reference(node)
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+            section: self.section[node],
+        }
+    }
+
+    /// The element and everything below it, nothing folded: a zoom.
+    fn full_lines(&self, node: usize, depth: usize, out: &mut Vec<Line>) {
+        out.push(self.line(node, depth, self.element_text(node, self.name_chars(node))));
+        for &kid in &self.kids[node] {
+            self.full_lines(kid, depth + 1, out);
+        }
+    }
+
+    /// The element and everything below it with repeated siblings folded:
+    /// how the outline prints a small region.
+    fn folded_lines(&self, node: usize, depth: usize, out: &mut Vec<Line>) {
+        // The outline keeps every article to its one line even inside a
+        // region small enough to print in full; see `emit_landmark`.
+        if self.role(node) == "article" {
+            out.push(self.summary_line(node, depth));
+            return;
+        }
+        out.push(self.line(node, depth, self.element_text(node, self.name_chars(node))));
+        for item in self.fold(&self.kids[node]) {
+            match item {
+                Item::Node(kid) => self.folded_lines(kid, depth + 1, out),
+                Item::More(members) => out.push(self.more_line(&members, node, depth + 1)),
+            }
+        }
+    }
+
+    /// Group siblings by role and name shape; a group larger than the
+    /// threshold keeps its first member and folds the rest behind it.
+    fn fold(&self, siblings: &[usize]) -> Vec<Item> {
+        let key = |node: usize| (display_role(self.role(node)), shape(&self.names[node]));
+        let mut groups: HashMap<_, Vec<usize>> = HashMap::new();
+        for &node in siblings {
+            groups.entry(key(node)).or_default().push(node);
+        }
+        let mut items = Vec::new();
+        for &node in siblings {
+            let members = &groups[&key(node)];
+            if members.len() <= REPEAT_THRESHOLD {
+                items.push(Item::Node(node));
+            } else if members[0] == node {
+                items.push(Item::Node(node));
+                items.push(Item::More(members[1..].to_vec()));
+            }
+        }
+        items
+    }
+
+    fn more_line(&self, members: &[usize], owner: usize, depth: usize) -> Line {
+        let mut text = format!(
+            "+{} more {} like this",
+            members.len(),
+            display_role(self.role(members[0]))
+        );
+        let mut refs = Vec::new();
+        if let Some(reference) = self.reference(owner) {
+            text.push_str("; zoom ");
+            text.push_str(reference);
+            refs.push(reference.to_string());
+        }
+        Line {
+            depth,
+            text,
+            class: self.class[members[0]],
+            refs,
+            section: self.section[members[0]],
+        }
+    }
+
+    /// Bytes and lines a zoom on `node` would print.
+    fn zoom_size(&self, node: usize) -> (usize, usize) {
+        let mut lines = Vec::new();
+        self.full_lines(node, 0, &mut lines);
+        (lines.len(), lines.iter().map(Line::bytes).sum())
+    }
+
+    fn summary_line(&self, node: usize, depth: usize) -> Line {
+        let (lines, bytes) = self.zoom_size(node);
+        let text = format!(
+            "{} · {} lines, {}",
+            self.element_text(node, OUTLINE_NAME_CHARS),
+            lines,
+            size_text(bytes)
+        );
+        self.line(node, depth, text)
+    }
+
+    /// The landmarks among `nodes`, looking through anything that is not a
+    /// landmark itself but holds one; what holds none is loose content.
+    fn entries(&self, nodes: &[usize]) -> Vec<usize> {
+        let mut entries = Vec::new();
+        for &node in nodes {
+            if self.is_landmark(node) || !self.has_landmark_below[node] {
+                entries.push(node);
+            } else {
+                entries.extend(self.entries(&self.kids[node]));
+            }
+        }
+        entries
+    }
+
+    fn outline_lines(&self) -> Vec<Line> {
+        let mut entries = self.entries(&self.kids[0]);
+        // Main content first, chrome last; document order within each.
+        entries.sort_by_key(|entry| self.class[*entry]);
+        let mut out = Vec::new();
+        self.emit_level(&entries, 0, 0, TOP_LOOSE_BYTES, &mut out);
+        out
+    }
+
+    fn emit_level(
+        &self,
+        entries: &[usize],
+        depth: usize,
+        owner: usize,
+        loose_budget: usize,
+        out: &mut Vec<Line>,
+    ) {
+        let mut loose_used = 0;
+        let mut hidden: Option<(usize, usize)> = None;
+        let mut previous_hidden = false;
+        for item in self.fold(entries) {
+            match item {
+                Item::Node(node) if self.is_landmark(node) => {
+                    previous_hidden = false;
+                    self.emit_landmark(node, depth, out);
+                }
+                Item::Node(node) => {
+                    let mut lines = Vec::new();
+                    self.folded_lines(node, depth, &mut lines);
+                    let bytes: usize = lines.iter().map(Line::bytes).sum();
+                    if hidden.is_none() && loose_used + bytes <= loose_budget {
+                        loose_used += bytes;
+                        out.extend(lines);
+                        previous_hidden = false;
+                    } else {
+                        // Once one loose element (content outside any nested
+                        // landmark) does not fit its allowance, the later ones
+                        // stay hidden too, so nothing prints after a hidden one.
+                        let (lines, bytes) = self.zoom_size(node);
+                        let total = hidden.get_or_insert((0, 0));
+                        total.0 += lines;
+                        total.1 += bytes;
+                        previous_hidden = true;
+                    }
+                }
+                Item::More(members) => {
+                    if previous_hidden {
+                        let total = hidden.get_or_insert((0, 0));
+                        for member in members {
+                            let (lines, bytes) = self.zoom_size(member);
+                            total.0 += lines;
+                            total.1 += bytes;
+                        }
+                    } else {
+                        out.push(self.more_line(&members, owner, depth));
+                    }
+                }
+            }
+        }
+        if let Some((lines, bytes)) = hidden {
+            let mut text = format!("… {lines} more lines, {} not shown", size_text(bytes));
+            let mut refs = Vec::new();
+            if let Some(reference) = self.reference(owner) {
+                text.push_str("; zoom ");
+                text.push_str(reference);
+                refs.push(reference.to_string());
+            }
+            out.push(Line {
+                depth,
+                text,
+                class: if owner == 0 {
+                    NEUTRAL
+                } else {
+                    self.class[owner]
+                },
+                refs,
+                section: self.section[owner],
+            });
+        }
+    }
+
+    fn emit_landmark(&self, node: usize, depth: usize, out: &mut Vec<Line>) {
+        // An article is one post or story; Chrome names it with its whole
+        // text, so its one line already reads it and a zoom shows the rest.
+        if self.role(node) == "article" {
+            out.push(self.summary_line(node, depth));
+            return;
+        }
+        let mut lines = Vec::new();
+        self.folded_lines(node, depth, &mut lines);
+        if lines.iter().map(Line::bytes).sum::<usize>() <= INLINE_BYTES {
+            out.extend(lines);
+            return;
+        }
+        out.push(self.summary_line(node, depth));
+        let entries = self.entries(&self.kids[node]);
+        self.emit_level(&entries, depth + 1, node, NESTED_LOOSE_BYTES, out);
+    }
+}
+
+/// Keep the text within `max_bytes`. The header goes first, then lines by
+/// class (content, then neutral, then chrome) in display order, so the page's
+/// main content survives a small budget and the navigation goes first. A
+/// line's class is never better than its parent's, so a kept line's parent is
+/// always kept too. The final line says what was cut.
+fn fit(
+    header: String,
+    header_refs: Vec<String>,
+    lines: Vec<Line>,
+    tree: &Tree<'_>,
+    max_bytes: usize,
+) -> RenderedState {
+    let header_bytes = header.len() + 1;
+    let total = header_bytes + lines.iter().map(Line::bytes).sum::<usize>();
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|index| (lines[*index].class, *index));
+
+    let mut keep = vec![true; lines.len()];
+    let mut trailer = String::new();
+    let mut header_kept = total <= max_bytes || header_bytes <= max_bytes;
+    if total > max_bytes {
+        let mut reserve = 0;
+        for _ in 0..4 {
+            let budget = max_bytes.saturating_sub(reserve);
+            keep = vec![false; lines.len()];
+            header_kept = header_bytes <= budget;
+            let mut used = if header_kept { header_bytes } else { 0 };
+            if header_kept {
+                for &index in &order {
+                    let bytes = lines[index].bytes();
+                    if used + bytes > budget {
+                        break;
+                    }
+                    used += bytes;
+                    keep[index] = true;
+                }
+            }
+            trailer = cut_report(&lines, &keep, tree, max_bytes);
+            if trailer.len() < reserve {
+                break;
+            }
+            reserve = trailer.len() + 1;
+        }
+    }
+
+    let mut text = String::new();
+    let mut printed_refs = BTreeSet::new();
+    if header_kept {
+        text.push_str(&header);
+        text.push('\n');
+        printed_refs.extend(header_refs);
+    }
+    let mut cut_bytes = 0;
+    let mut cut_lines = 0;
+    for (line, kept) in lines.iter().zip(&keep) {
+        if *kept {
+            for _ in 0..line.depth {
+                text.push_str("  ");
+            }
+            text.push_str(&line.text);
+            text.push('\n');
+            printed_refs.extend(line.refs.iter().cloned());
+        } else {
+            cut_bytes += line.bytes();
+            cut_lines += 1;
+        }
+    }
+    if !header_kept {
+        cut_bytes += header_bytes;
+        cut_lines += 1;
+    }
+    // A budget too small for the report leaves it out whole rather than
+    // printing half a sentence; the reply's `omitted` counts still say it.
+    if cut_lines > 0 && text.len() + trailer.len() < max_bytes {
+        text.push_str(&trailer);
+        text.push('\n');
+    }
+    RenderedState {
+        text,
+        printed_refs,
+        cut_bytes,
+        cut_lines,
+    }
+}
+
+/// One line naming what the budget removed, by the landmark it belonged to.
+fn cut_report(lines: &[Line], keep: &[bool], tree: &Tree<'_>, max_bytes: usize) -> String {
+    const LISTED: usize = 6;
+    let mut sections: Vec<(Option<usize>, bool)> = Vec::new();
+    let mut cut_lines = 0;
+    let mut cut_bytes = 0;
+    for (line, kept) in lines.iter().zip(keep) {
+        if *kept {
+            continue;
+        }
+        cut_lines += 1;
+        cut_bytes += line.bytes();
+        if !sections.iter().any(|(section, _)| *section == line.section) {
+            let whole = lines
+                .iter()
+                .zip(keep)
+                .filter(|(other, _)| other.section == line.section)
+                .all(|(_, kept)| !kept);
+            sections.push((line.section, whole));
+        }
+    }
+    let mut names: Vec<String> = sections
+        .iter()
+        .take(LISTED)
+        .map(|(section, whole)| {
+            let label = match section {
+                Some(node) => match tree.reference(*node) {
+                    Some(reference) => format!("{} {reference}", display_role(tree.role(*node))),
+                    None => display_role(tree.role(*node)).to_string(),
+                },
+                None => "other content".to_string(),
+            };
+            format!("{label} ({})", if *whole { "all" } else { "partly" })
+        })
+        .collect();
+    if sections.len() > LISTED {
+        names.push(format!("{} more", sections.len() - LISTED));
+    }
+    format!(
+        "[cut {cut_lines} lines, {} to fit max_bytes {max_bytes}: {}; zoom one of them or raise max_bytes]",
+        size_text(cut_bytes),
+        names.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(depth: i64, role: &str, name: &str, reference: Option<&str>) -> AxRecord {
+        AxRecord {
+            depth,
+            role: role.into(),
+            name: name.into(),
+            value: None,
+            reference: reference.map(str::to_string),
+        }
+    }
+
+    fn render_plain(records: &[AxRecord], facts: &HashMap<String, NodeFacts>) -> RenderedState {
+        render(&RenderInput {
+            records,
+            facts,
+            page_url: "https://example.com/page?q=1#top",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 65_536,
+        })
+    }
+
+    #[test]
+    fn line_grammar_states_values_and_placeholders() {
+        let mut records = vec![
+            record(0, "RootWebArea", "Example", Some("e1")),
+            record(1, "link", "Home\n page", Some("e2")),
+            record(1, "textbox", "Search", Some("e3")),
+            record(1, "slider", "Volume", Some("e4")),
+        ];
+        records[2].value = Some("rust\nlang".into());
+        records[3].value = Some("40".into());
+        let facts = HashMap::from([
+            (
+                "e2".to_string(),
+                NodeFacts {
+                    states: vec!["focused".into()],
+                    url: Some("https://user:pw@example.com/home?tab=1#x".into()),
+                    ..NodeFacts::default()
+                },
+            ),
+            (
+                "e3".to_string(),
+                NodeFacts {
+                    credential: Some(false),
+                    placeholder: Some("Search the docs".into()),
+                    ..NodeFacts::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            render_plain(&records, &facts).text,
+            "Example · example.com/page · snapshot s1\n\
+             e2 link (focused) Home page, Value: example.com/home\n\
+             e3 textbox Search, Value: rust lang, Placeholder: Search the docs\n\
+             e4 slider Volume, Value: 40\n"
+        );
+    }
+
+    #[test]
+    fn a_field_whose_markup_was_not_read_withholds_its_value() {
+        let mut records = vec![record(0, "textbox", "Email", Some("e1"))];
+        records[0].value = Some("person@example.com".into());
+        let text = render_plain(&records, &HashMap::new()).text;
+        assert_eq!(text, "example.com/page · snapshot s1\ne1 textbox Email\n");
+    }
+
+    #[test]
+    fn collapse_drops_wrappers_and_repeated_text_but_never_a_control() {
+        let records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "generic", "", Some("e2")),
+            record(2, "generic", "", Some("e3")),
+            record(3, "button", "Save", Some("e4")),
+            record(4, "generic", "", Some("e5")),
+            record(5, "StaticText", "Save", Some("e6")),
+            record(6, "InlineTextBox", "Save", None),
+            record(1, "generic", "", Some("e7")),
+            record(1, "group", "", Some("e8")),
+            record(2, "link", "One", Some("e9")),
+            record(2, "link", "Two", Some("e10")),
+            record(1, "generic", "", Some("e11")),
+            record(2, "generic", "", Some("e12")),
+            record(3, "button", "", Some("e13")),
+        ];
+        let text = render_plain(&records, &HashMap::new()).text;
+        assert_eq!(
+            text,
+            "Page · example.com/page · snapshot s1\n\
+             e4 button Save\n\
+             e8 group\n  e9 link One\n  e10 link Two\n\
+             e13 button\n"
+        );
+    }
+
+    #[test]
+    fn a_tight_budget_keeps_content_before_chrome_and_reports_the_cut() {
+        let mut records = vec![record(0, "RootWebArea", "Page", Some("e1"))];
+        records.push(record(1, "navigation", "Primary", Some("e2")));
+        for index in 0..40 {
+            records.push(record(
+                2,
+                "link",
+                &format!("Chrome link {index}"),
+                Some(&format!("e{}", 3 + index)),
+            ));
+        }
+        records.push(record(1, "main", "", Some("e50")));
+        records.push(record(2, "heading", "Main heading", Some("e51")));
+        let state = render(&RenderInput {
+            records: &records,
+            facts: &HashMap::new(),
+            page_url: "https://example.com/",
+            snapshot_id: "s1",
+            zoom: Some(Zoom {
+                requested: "e1",
+                target: Some("e1"),
+            }),
+            max_bytes: 320,
+        });
+        assert!(state.text.len() <= 320, "{}", state.text);
+        assert!(
+            state.text.contains("e51 heading Main heading"),
+            "{}",
+            state.text
+        );
+        assert!(state.text.contains("navigation e2 ("), "{}", state.text);
+        assert!(!state.printed_refs.contains("e42"));
+        assert!(state.cut_lines > 0);
+    }
+
+    /// The CDP reader replaces an unpaired surrogate in page text with
+    /// U+FFFD; such a name prints as is and caps on a character boundary.
+    #[test]
+    fn a_replacement_character_in_a_name_prints_and_caps_cleanly() {
+        let long = format!("{}\u{FFFD}", "a".repeat(NAME_CHARS - 2)) + &"\u{FFFD}".repeat(10);
+        let records = vec![
+            record(0, "RootWebArea", "Bad \u{FFFD} title", Some("e1")),
+            record(1, "button", "Send \u{FFFD}", Some("e2")),
+            record(1, "link", &long, Some("e3")),
+        ];
+        let text = render_plain(&records, &HashMap::new()).text;
+        let expected_link = format!("{}\u{FFFD}…", "a".repeat(NAME_CHARS - 2));
+        assert_eq!(
+            text,
+            format!(
+                "Bad \u{FFFD} title · example.com/page · snapshot s1\n\
+                 e2 button Send \u{FFFD}\n\
+                 e3 link {expected_link}\n"
+            )
+        );
+        let cut = render(&RenderInput {
+            records: &records,
+            facts: &HashMap::new(),
+            page_url: "https://example.com/",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 150,
+        });
+        assert!(cut.text.len() <= 150, "{}", cut.text);
+    }
+
+    #[test]
+    fn short_urls_and_relative_hrefs() {
+        assert_eq!(short_url("https://x.com/"), Some("x.com".into()));
+        assert_eq!(short_url("javascript:void(0)"), None);
+        assert_eq!(
+            short_url("mailto:a@b.c?subject=x"),
+            Some("mailto:a@b.c".into())
+        );
+        assert_eq!(
+            resolve_href("/a/b?c", "https://x.com/home?x=1"),
+            "https://x.com/a/b?c"
+        );
+        assert_eq!(resolve_href("c", "https://x.com/a/b"), "https://x.com/a/c");
+        assert_eq!(
+            resolve_href("//cdn.x.com/i", "https://x.com/a"),
+            "https://cdn.x.com/i"
+        );
+        assert_eq!(
+            resolve_href("#top", "https://x.com/a?q#f"),
+            "https://x.com/a#top"
+        );
+        assert_eq!(
+            resolve_href("https://y.com/", "https://x.com/"),
+            "https://y.com/"
+        );
+    }
+}

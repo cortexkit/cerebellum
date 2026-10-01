@@ -8,6 +8,7 @@
 pub mod extraction;
 pub mod geometry;
 pub mod navigation;
+pub mod state_text;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -41,7 +42,8 @@ use crate::journal::{
 };
 use crate::snapshot_store::{
     self, AxRecord, BrowserSnapshotStore, CommittedDocument, DocumentEpoch, DocumentTransition,
-    SameDocumentChange, SnapshotError, SnapshotKind, TextSnapshot, AX_SCHEMA, DOM_SCHEMA, MAX_REFS,
+    SameDocumentChange, SnapshotError, SnapshotKind, StoredSnapshot, TextSnapshot, AX_SCHEMA,
+    DOM_SCHEMA, MAX_REFS,
 };
 use cerebellum_computer::platform::vocabulary::{
     CapabilityResultValidationError, CapabilityResultViolation,
@@ -1182,6 +1184,8 @@ struct ContextState {
     ended: bool,
     crashed: bool,
     next_snapshot_seed: u64,
+    /// The text snapshot most recently returned, whose refs a `zoom` names.
+    last_text_snapshot: Option<String>,
 }
 impl ContextState {
     fn new(identity: RouteIdentity) -> Self {
@@ -1193,6 +1197,7 @@ impl ContextState {
             ended: false,
             crashed: false,
             next_snapshot_seed: 0,
+            last_text_snapshot: None,
         }
     }
     fn snapshot_id(&mut self, kind: SnapshotKind) -> String {
@@ -1203,6 +1208,47 @@ impl ContextState {
             kind.as_str(),
             self.next_snapshot_seed
         ))
+    }
+}
+
+/// The ref a zoom's element has in a fresh capture.
+///
+/// Refs are numbered per capture, so the same number can name a different
+/// element once the page has changed (a feed that loaded more posts above).
+/// The element is therefore found by the backend identity the previous
+/// snapshot recorded for the requested ref. Only a ref that snapshot never
+/// showed falls back to its number in this capture. `None` when the element
+/// is no longer on the page.
+fn zoom_target(
+    context: &ContextState,
+    requested: &str,
+    records: &[AxRecord],
+    refs: &[crate::snapshot_store::RefRecord],
+) -> Option<String> {
+    let previous = context
+        .last_text_snapshot
+        .as_deref()
+        .and_then(|id| context.snapshots.get(id))
+        .and_then(|snapshot| match snapshot {
+            StoredSnapshot::Text(snapshot) if snapshot.document_epoch == context.epoch.value() => {
+                snapshot
+                    .refs
+                    .iter()
+                    .find(|record| record.captured.reference == requested)
+            }
+            _ => None,
+        });
+    match previous {
+        Some(record) => {
+            let identity = record.backend_identity.as_ref()?;
+            refs.iter()
+                .find(|fresh| fresh.backend_identity.as_ref() == Some(identity))
+                .map(|fresh| fresh.captured.reference.clone())
+        }
+        None => records
+            .iter()
+            .any(|record| record.reference.as_deref() == Some(requested))
+            .then(|| requested.to_string()),
     }
 }
 
@@ -2362,8 +2408,14 @@ impl BrowserPlane {
         // have written it as a navigation -- and that hole closed when the
         // members were added rather than by anything here changing.
         let read_start = self.state.lock().await.operations.len();
-        let page = match self
-            .capture_snapshot(identity, SnapshotKind::Ax, read_max_bytes, true)
+        let mut page = match self
+            .capture_snapshot(
+                identity,
+                SnapshotKind::Actionable,
+                read_max_bytes,
+                true,
+                None,
+            )
             .await
         {
             Ok(snapshot) => snapshot,
@@ -2373,10 +2425,18 @@ impl BrowserPlane {
                 partial_error_result(&error)
             }
         };
-        response
+        let response_object = response
             .as_object_mut()
-            .expect("navigation response is an object")
-            .insert("read_page".into(), page);
+            .expect("navigation response is an object");
+        // The page text sits at the top of the reply, where Prefrontal lifts
+        // it into a text part, exactly as a snapshot reply carries it.
+        if let Some(text) = page
+            .as_object_mut()
+            .and_then(|page| page.remove(state_text::STATE_TEXT_FIELD))
+        {
+            response_object.insert(state_text::STATE_TEXT_FIELD.into(), text);
+        }
+        response_object.insert("read_page".into(), page);
         Ok(response)
     }
 
@@ -2385,7 +2445,9 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         args: &Value,
     ) -> Result<Value, BrowserError> {
-        let object = self.validate_request(args, &["mode", "max_bytes"]).await?;
+        let object = self
+            .validate_request(args, &["mode", "max_bytes", "zoom"])
+            .await?;
         let kind = match object.get("mode") {
             None => SnapshotKind::Actionable,
             Some(Value::String(value)) if value == "actionable" => SnapshotKind::Actionable,
@@ -2406,7 +2468,30 @@ impl BrowserPlane {
         };
         let max_bytes =
             optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
-        self.capture_snapshot(identity, kind, max_bytes, true).await
+        let zoom = match object.get("zoom") {
+            None => None,
+            // Zoom selects a subtree of the page text, which only the default
+            // view prints; the ax and dom_full views have no outline to narrow.
+            Some(Value::String(value))
+                if snapshot_store::valid_ref(value) && kind == SnapshotKind::Actionable =>
+            {
+                Some(value.clone())
+            }
+            Some(Value::String(_)) => {
+                return Err(BrowserError::InvalidRequest {
+                    field: "zoom".into(),
+                    reason_code: "unsupported_value",
+                })
+            }
+            Some(_) => {
+                return Err(BrowserError::InvalidRequest {
+                    field: "zoom".into(),
+                    reason_code: "wrong_type",
+                })
+            }
+        };
+        self.capture_snapshot(identity, kind, max_bytes, true, zoom.as_deref())
+            .await
     }
 
     async fn record_snapshot_refusal(
@@ -2569,6 +2654,7 @@ impl BrowserPlane {
         kind: SnapshotKind,
         max_bytes: usize,
         persist_journal: bool,
+        zoom: Option<&str>,
     ) -> Result<Value, BrowserError> {
         let document_epoch = {
             let state = self.state.lock().await;
@@ -2660,28 +2746,27 @@ impl BrowserPlane {
             live_after,
         )
         .await?;
-        let result = self
+        let (result, ref_count) = self
             .retain_text_snapshot_inner(
                 identity,
                 kind,
                 &observation.records,
                 observation.dom_text.as_deref(),
                 observation.refs,
+                &observation.facts,
+                zoom,
                 max_bytes,
                 kind != SnapshotKind::DomFull && observation.ax_truncated,
                 observation.refs_truncated,
                 Some(source_document),
             )
             .await?;
+        // The journal records sizes, never page text: the page text's bytes
+        // and how many refs it names.
         let content_bytes = result
-            .get("content")
+            .get(state_text::STATE_TEXT_FIELD)
             .and_then(Value::as_str)
             .map(str::len)
-            .unwrap_or_default();
-        let ref_count = result
-            .get("refs")
-            .and_then(Value::as_array)
-            .map(Vec::len)
             .unwrap_or_default();
         self.finalize(
             identity,
@@ -2718,18 +2803,22 @@ impl BrowserPlane {
         source_document: Option<CommittedDocument>,
     ) -> Result<Value, BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
+        let no_facts = HashMap::new();
         self.retain_text_snapshot_inner(
             identity,
             mode,
             records,
             dom_text,
             refs,
+            &no_facts,
+            None,
             max_bytes,
             false,
             false,
             source_document,
         )
         .await
+        .map(|(reply, _)| reply)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2740,6 +2829,9 @@ impl BrowserPlane {
         records: &[AxRecord],
         dom_text: Option<&str>,
         refs: Vec<crate::snapshot_store::RefRecord>,
+        facts: &HashMap<String, state_text::NodeFacts>,
+        // The ref a zoom names, from the snapshot this context returned last.
+        zoom: Option<&str>,
         max_bytes: usize,
         content_incomplete: bool,
         refs_incomplete: bool,
@@ -2747,7 +2839,7 @@ impl BrowserPlane {
         // snapshot's source. `None` only for an observation handed in without
         // one, whose source falls back to the tracked page.
         source_document: Option<CommittedDocument>,
-    ) -> Result<Value, BrowserError> {
+    ) -> Result<(Value, usize), BrowserError> {
         let mut state = self.state.lock().await;
         let context = state
             .contexts
@@ -2756,21 +2848,52 @@ impl BrowserPlane {
         if context.ended {
             return Err(BrowserError::NoSession);
         }
-        let (content, encoded_truncated, schema) = match mode {
-            SnapshotKind::Actionable => (
-                dom_text.unwrap_or_default().to_string(),
-                false,
-                snapshot_store::ACTIONABLE_SCHEMA,
-            ),
+        let refs_truncated = refs.len() > MAX_REFS || refs_incomplete;
+        let mut refs = refs.into_iter().take(MAX_REFS).collect::<Vec<_>>();
+        let id = context.snapshot_id(mode);
+        let source_origin = source_document
+            .as_ref()
+            .map(|document| document.url.clone())
+            .unwrap_or_else(|| {
+                context
+                    .tracker
+                    .url_final
+                    .clone()
+                    .unwrap_or_else(|| "null".into())
+            });
+        let (content, encoded_truncated, schema, prior_cut) = match mode {
+            SnapshotKind::Actionable => {
+                let target =
+                    zoom.and_then(|requested| zoom_target(context, requested, records, &refs));
+                let rendered = state_text::render(&state_text::RenderInput {
+                    records,
+                    facts,
+                    page_url: &source_origin,
+                    snapshot_id: &id,
+                    zoom: zoom.map(|requested| state_text::Zoom {
+                        requested,
+                        target: target.as_deref(),
+                    }),
+                    max_bytes,
+                });
+                // A ref stays usable only if the caller was shown it.
+                refs.retain(|record| rendered.printed_refs.contains(&record.captured.reference));
+                (
+                    rendered.text,
+                    rendered.cut_lines > 0,
+                    snapshot_store::STATE_TEXT_SCHEMA,
+                    (rendered.cut_bytes, rendered.cut_lines),
+                )
+            }
             SnapshotKind::Ax => {
                 let (content, truncated) = snapshot_store::encode_ax_jsonl(records, usize::MAX)
                     .map_err(map_snapshot_error)?;
-                (content, truncated, AX_SCHEMA)
+                (content, truncated, AX_SCHEMA, (0, 0))
             }
             SnapshotKind::DomFull => {
                 let (content, truncated) =
                     snapshot_store::encode_dom_text(dom_text.unwrap_or_default(), usize::MAX);
-                (content, truncated, DOM_SCHEMA)
+                (content, truncated, DOM_SCHEMA, (0, 0))
             }
             SnapshotKind::Screenshot => {
                 return Err(BrowserError::InvalidRequest {
@@ -2779,24 +2902,12 @@ impl BrowserPlane {
                 })
             }
         };
-        let refs_truncated = refs.len() > MAX_REFS || refs_incomplete;
         let truncated = encoded_truncated || content_incomplete || refs_truncated;
-        let refs = refs.into_iter().take(MAX_REFS).collect::<Vec<_>>();
-        let id = context.snapshot_id(mode);
         let mut snapshot = TextSnapshot {
             snapshot_id: id.clone(),
             kind: mode,
             document_epoch: context.epoch.value(),
-            source_origin: source_document
-                .as_ref()
-                .map(|document| document.url.clone())
-                .unwrap_or_else(|| {
-                    context
-                        .tracker
-                        .url_final
-                        .clone()
-                        .unwrap_or_else(|| "null".into())
-                }),
+            source_origin,
             source_document,
             content_schema: schema,
             content,
@@ -2807,19 +2918,22 @@ impl BrowserPlane {
         let mut reply = snapshot_store::bounded_text_reply(
             &mut snapshot,
             max_bytes,
+            prior_cut,
             BrowserContextResult::from_identity(identity).json(),
         );
+        let ref_count = snapshot.refs.len();
         context
             .snapshots
             .retain_text(snapshot)
             .map_err(map_snapshot_error)?;
-        // Reserve the dispatch envelope in the budget, but let the outer reply
-        // own it: navigate embeds this snapshot without a second context.
+        context.last_text_snapshot = Some(id);
+        // The outer reply owns the dispatch envelope: navigate embeds this
+        // snapshot without a second context.
         reply
             .as_object_mut()
             .expect("snapshot object")
             .remove("context");
-        Ok(reply)
+        Ok((reply, ref_count))
     }
 
     /// Close an already-committed action that `check_snapshot_document`
@@ -3929,13 +4043,13 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         BrowserToolDefinition {
             name: NAVIGATE,
             description: "Navigate managed Chromium through the enforcing connector. Set read_page to return a bounded snapshot of the landing page.",
-            request_schema: json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"type":"string","enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return an accessibility snapshot of the landing page."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
+            request_schema: json!({"type":"object","properties":{"url":{"type":"string"},"intent":{"type":"string"},"wait":{"type":"string","enum":["settle","none"]},"severity":severity_schema(),"read_page":{"type":"boolean","default":false,"description":"Return the landing page's outline in state_text, as snapshot does."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":DEFAULT_READ_PAGE_MAX_BYTES,"description":"Maximum bytes of returned page text; this bounds returned text, not the page observed."}},"required":["url","intent","severity"],"additionalProperties":false}),
             result_schema: navigate_result_schema(),
         },
         BrowserToolDefinition {
             name: SNAPSHOT,
-            description: "Capture a compact actionable snapshot by default; use ax or dom_full only when something is missing.",
-            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Serialized reply cap including refs; below 1024 uses a fixed 1024-byte metadata envelope. If truncated, narrow the page."}},"additionalProperties":false}),
+            description: "Read the page as plain text in state_text: an outline of its landmarks by default, main content first; zoom names one ref to print that element's whole subtree. Use ax or dom_full only when something is missing.",
+            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"zoom":{"type":"string","description":"A ref from the last snapshot; prints that element's whole subtree instead of the outline. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
         },
         BrowserToolDefinition {
@@ -4123,15 +4237,14 @@ fn refusal_detail_schema() -> Value {
 fn text_snapshot_properties() -> Value {
     json!({
         "mode":{"type":"string","enum":["actionable","ax","dom_full"]},
-        "omitted":closed_object(json!({"content_bytes":integer_schema(),"refs":integer_schema(),"source_origin":boolean_schema()}), &["content_bytes","refs","source_origin"]),
+        "omitted":closed_object(json!({"state_text_bytes":integer_schema(),"state_text_lines":integer_schema(),"source_origin":boolean_schema()}), &["state_text_bytes","state_text_lines","source_origin"]),
         "snapshot_id":string_schema(),
         "document_epoch":integer_schema(),
         "source_origin":string_schema(),
         "content_schema":string_schema(),
         "truncated":boolean_schema(),
         "refs_truncated":boolean_schema(),
-        "content":string_schema(),
-        "refs":json!({"type":"array","items":closed_object(json!({"ref":string_schema(),"role":string_schema(),"name":string_schema(),"nth":integer_schema()}), &["ref", "role", "name", "nth"])}),
+        (state_text::STATE_TEXT_FIELD):string_schema(),
     })
 }
 
@@ -4249,6 +4362,7 @@ fn navigate_result_schema() -> Value {
             "lifecycle":navigation_lifecycle_schema(),
             "http_status":integer_schema(),
             "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
+            (state_text::STATE_TEXT_FIELD):string_schema(),
             "read_page":embedded_read_page_schema(),
         }),
         &[],
@@ -5247,16 +5361,78 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
 
 #[cfg(test)]
 mod tests {
+    /// A zoom names a ref from the last snapshot; after the page grew above
+    /// that element its number in the fresh capture differs, and the element
+    /// is still the one zoomed.
+    #[test]
+    fn a_zoom_follows_its_element_when_the_page_renumbers() {
+        let record = |reference: &str, backend: u64| crate::snapshot_store::RefRecord {
+            captured: crate::snapshot_store::SnapshotRef::new(reference, "article", "Post", 0)
+                .unwrap(),
+            frame_path: vec!["frame".into()],
+            backend_identity: Some(
+                crate::snapshot_store::BackendNodeIdentity::new("target", "frame", backend)
+                    .unwrap(),
+            ),
+            raw_role: None,
+            raw_name: None,
+            classification: Err(ClassificationUnavailable::NotCaptured),
+        };
+        let ax = |reference: &str| AxRecord {
+            depth: 0,
+            role: "article".into(),
+            name: "Post".into(),
+            value: None,
+            reference: Some(reference.into()),
+        };
+        let mut context = ContextState::new(identity());
+        // No earlier snapshot: the number is all there is to go on.
+        assert_eq!(
+            zoom_target(&context, "e5", &[ax("e5")], &[record("e5", 50)]),
+            Some("e5".into())
+        );
+        context
+            .snapshots
+            .retain_text(TextSnapshot {
+                snapshot_id: snapshot_store::new_snapshot_id("previous"),
+                kind: SnapshotKind::Actionable,
+                document_epoch: context.epoch.value(),
+                source_origin: "https://example.com/".into(),
+                source_document: None,
+                content_schema: snapshot_store::STATE_TEXT_SCHEMA,
+                content: "e5 article Post\n".into(),
+                truncated: false,
+                refs_truncated: false,
+                refs: vec![record("e5", 50)],
+            })
+            .unwrap();
+        context.last_text_snapshot = Some(snapshot_store::new_snapshot_id("previous"));
+        // Two posts loaded above it: the same element is e7 now, and e5 is
+        // another post that must not be shown in its place.
+        let fresh = [record("e5", 70), record("e6", 60), record("e7", 50)];
+        let records = [ax("e5"), ax("e6"), ax("e7")];
+        assert_eq!(
+            zoom_target(&context, "e5", &records, &fresh),
+            Some("e7".into())
+        );
+        // Gone from the page: no element is substituted for it.
+        assert_eq!(zoom_target(&context, "e5", &records, &fresh[..2]), None);
+    }
+
+    /// `max_bytes` bounds the page text in every mode, the reply's copy of a
+    /// huge source URL is cut, and the reply still matches its declared
+    /// schema on a plane that withholds any reply that does not.
     #[tokio::test]
-    async fn snapshot_whole_reply_cap_includes_escaped_content_refs_and_source() {
+    async fn snapshot_state_text_cap_and_long_source_hold_in_every_mode() {
         let route = identity();
-        let plane = BrowserPlane::new();
+        let plane =
+            BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
         plane.open_context(route.clone()).await.unwrap();
         let records: Vec<_> = (0..1000)
             .map(|i| AxRecord {
                 depth: 0,
                 role: "link".into(),
-                name: "quoted \"\\\" café".repeat(20),
+                name: format!("quoted \"\\\" café {i} ").repeat(20),
                 value: None,
                 reference: Some(format!("e{}", i + 1)),
             })
@@ -5302,14 +5478,19 @@ mod tests {
                     .await
                     .unwrap();
                 let reply = plane.result(&route, Ok(reply)).await;
+                let state_text = reply[state_text::STATE_TEXT_FIELD].as_str().unwrap();
+                assert!(state_text.len() <= budget, "{mode:?}, budget {budget}");
                 assert!(
-                    serde_json::to_vec(&reply).unwrap().len() <= budget.max(1024),
-                    "{mode:?}, budget {budget}"
+                    reply["source_origin"].as_str().unwrap().len()
+                        <= snapshot_store::MAX_SOURCE_ORIGIN_BYTES
                 );
-                assert_eq!(reply["truncated"], true);
-                assert_eq!(reply["refs_truncated"], true);
-                assert!(reply["omitted"]["refs"].as_u64().unwrap() > 0);
+                assert_eq!(reply["omitted"]["source_origin"], true);
+                if budget == 1 || mode != SnapshotKind::Actionable {
+                    assert_eq!(reply["truncated"], true, "{mode:?}, budget {budget}");
+                    assert!(reply["omitted"]["state_text_bytes"].as_u64().unwrap() > 0);
+                }
                 assert_eq!(reply["mode"], mode.as_str());
+                assert!(reply.get("content").is_none() && reply.get("refs").is_none());
                 plane.finish_reply(SNAPSHOT, reply).unwrap();
             }
         }

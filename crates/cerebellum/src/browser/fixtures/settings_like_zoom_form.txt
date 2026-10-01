@@ -1,0 +1,12 @@
+Password and authentication · github.com/settings/security · snapshot 0123456789abcdef0123456789abcdef · zoom e26
+e26 form Change password
+  e27 textbox (credential field) Old password
+  e30 textbox (required, credential field) New password
+  e31 textbox (credential field) Username
+  e32 textbox Backup email, Value: octo@example.com, Placeholder: you@example.com
+  e33 checkbox (checked) Keep my email addresses private
+  e34 combobox (collapsed) Theme, Value: Dark
+    e35 MenuListOption Light
+    e36 MenuListOption (selected) Dark
+  e37 button Update password
+  e38 link I forgot my password, Value: github.com/password_reset
