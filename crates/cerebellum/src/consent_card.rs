@@ -437,7 +437,8 @@ mod tests {
         let valid =
             card(vec![ConsentOption::grant("allow", "Allow")]).render("valid")["params"].clone();
         assert_eq!(core_refusals(&valid), Vec::<String>::new());
-        let tamperings: [(&str, fn(&mut Value)); 16] = [
+        type Tampering = (&'static str, fn(&mut Value));
+        let tamperings: [Tampering; 16] = [
             ("unknown key", |p| p["surprise"] = json!(1)),
             ("no urgency", |p| {
                 p.as_object_mut().unwrap().remove("urgency");
