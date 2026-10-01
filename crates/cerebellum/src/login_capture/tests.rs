@@ -36,8 +36,11 @@ fn ollama() -> CaptureRequest {
     }
 }
 
+/// The card id the default approval reports, as a current consent relay does.
+const ELICITATION_ID: &str = "el_test_approval_1";
+
 fn allow() -> AskOutcome {
-    AskOutcome::Answered(json!({"decision": "allow"}))
+    AskOutcome::Answered(json!({"decision": "allow", "elicitation_id": ELICITATION_ID}))
 }
 
 /// The header the fake browser's default cookies make.
@@ -578,16 +581,87 @@ fn the_question_names_the_holder_site_account_and_the_vault() {
     assert!(!text.contains("ck auth"), "{text}");
 }
 
-/// The deposit names the card the person granted: the vault binds that id
-/// into its audit row.
+/// The deposit names the card the person tapped, as the consent relay reports
+/// it in the answer's `elicitation_id`; the vault binds that id into its audit
+/// row. A key the answer carries beyond those two is ignored.
 #[tokio::test]
-async fn the_deposit_names_the_granted_card_as_its_consent() {
+async fn the_deposit_names_the_card_the_person_answered_as_its_consent() {
     let fixture = fixture();
-    let (outcome, question) = capture(&fixture, &ollama(), allow()).await;
+    let answer = AskOutcome::Answered(json!({
+        "decision": "allow",
+        "elicitation_id": "el_7Qx-relay.card:42",
+        "answered_on": "phone",
+    }));
+    let (outcome, question) = capture(&fixture, &ollama(), answer).await;
     assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
-    let ask_id = question.unwrap()["id"].as_str().unwrap().to_string();
-    assert!(ask_id.starts_with("capture-login-"), "{ask_id}");
-    assert_eq!(fixture.vault.request_params()[0]["consent_ref"], ask_id);
+    validate(&outcome.reply);
+    assert_eq!(
+        fixture.vault.request_params()[0]["consent_ref"],
+        "el_7Qx-relay.card:42"
+    );
+    // The card's own request id is a different value and is not what the
+    // deposit names.
+    let card_id = question.unwrap()["id"].as_str().unwrap().to_string();
+    assert!(card_id.starts_with("capture-login-"), "{card_id}");
+}
+
+/// An approval whose answer cannot name the card the person tapped is refused
+/// right after consent: no browser is launched, nothing is placed or written,
+/// and the vault is never opened.
+#[tokio::test]
+async fn an_approval_without_a_usable_elicitation_id_refuses_before_launch() {
+    let long = "x".repeat(129);
+    for (case, answer) in [
+        ("absent", json!({"decision": "allow"})),
+        ("empty", json!({"decision": "allow", "elicitation_id": ""})),
+        (
+            "whitespace",
+            json!({"decision": "allow", "elicitation_id": "el 1"}),
+        ),
+        (
+            "tab",
+            json!({"decision": "allow", "elicitation_id": "el\t1"}),
+        ),
+        (
+            "too long",
+            json!({"decision": "allow", "elicitation_id": long}),
+        ),
+        (
+            "non-ASCII",
+            json!({"decision": "allow", "elicitation_id": "el_é"}),
+        ),
+        (
+            "not a string",
+            json!({"decision": "allow", "elicitation_id": 7}),
+        ),
+        ("null", json!({"decision": "allow", "elicitation_id": null})),
+    ] {
+        let fixture = fixture();
+        let (outcome, _) = capture(&fixture, &ollama(), AskOutcome::Answered(answer)).await;
+        let reply = &outcome.reply;
+        assert_eq!(reply["outcome"], "capture_not_stored", "{case}: {reply}");
+        assert_eq!(reply["reason"], CONSENT_NOT_LINKABLE, "{case}: {reply}");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("consent relay is too old"),
+            "{case}: {reply}"
+        );
+        validate(reply);
+        assert_eq!(
+            outcome.journal.outcome, "refused:capture_not_stored",
+            "{case}"
+        );
+        assert_eq!(
+            fixture.launcher.launches.load(Ordering::SeqCst),
+            0,
+            "{case}"
+        );
+        assert_eq!(fixture.vault.opens.load(Ordering::SeqCst), 0, "{case}");
+        assert!(fixture.fs.contents().is_empty(), "{case}");
+        assert!(!fixture.events.contains_prefix("tmutil"), "{case}");
+    }
 }
 
 /// A module with no vault to deposit into refuses before the person is asked
@@ -911,15 +985,14 @@ async fn the_vault_request_carries_exactly_the_contract_keys() {
             account: account.to_string(),
             ..ollama()
         };
-        let (outcome, question) = capture(&fixture, &request, allow()).await;
+        let (outcome, _) = capture(&fixture, &request, allow()).await;
         assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
-        let consent_ref = question.unwrap()["id"].clone();
         let sent: Value =
             serde_json::from_slice(&fixture.vault.requests.lock().unwrap()[0]).unwrap();
         let mut params = json!({
             "id": format!("cookie:ollama.com:{account}"),
             "cookie": planted_header(),
-            "consent_ref": consent_ref,
+            "consent_ref": ELICITATION_ID,
         });
         if let Some(email) = email {
             params["email"] = json!(email);

@@ -10,7 +10,9 @@
 //! goes to exactly one place: the vault. Once the person grants the consent
 //! card, the capture deposits the header in claustrum with
 //! `credential.deposit_cookie` (see [`vault`]), and the vault decides who may
-//! read it. Nothing is written to disk by this module and no command is handed
+//! read it. The deposit names the card the person tapped, the answer's
+//! `elicitation_id`, as its `consent_ref`; an approval without one is refused
+//! before the browser is launched. Nothing is written to disk by this module and no command is handed
 //! back for anyone to run.
 //!
 //! The value never reaches the wire reply, the consent question, the journal,
@@ -1111,11 +1113,7 @@ impl CaptureModule {
         if (call.cancelled)() {
             return record.ended("cancelled", None);
         }
-        // The card's id is the consent reference the vault binds into its
-        // audit row for the deposit, so the stored login names the grant that
-        // allowed it.
-        let consent_ref = new_consent_ask_id();
-        let question = consent_question(request, &consent_ref);
+        let question = consent_question(request, &new_card_request_id());
         // The question can wait minutes for a person, so a cancel is watched
         // for alongside it rather than only after it ends.
         let answer = {
@@ -1145,6 +1143,24 @@ impl CaptureModule {
                 json!({"reason": reason, "remedy": consent_refusal_remedy(reason)}),
             );
         }
+        // The deposit's `consent_ref` is the id of the card the person
+        // tapped, as the consent relay reports it, so the vault's audit row
+        // names a consent the relay recorded. An approval that carries no
+        // such id cannot be linked to the stored login, so it is refused
+        // here, before the person is asked to sign in for nothing. This
+        // module's own request id for the card is never used instead: an
+        // older relay records it nowhere, so a reference built from it could
+        // not be traced.
+        let Some(consent_ref) = answered_elicitation_id(&answer) else {
+            return record.refused(
+                "capture_not_stored",
+                json!({
+                    "credential_id": request.credential_id(),
+                    "reason": CONSENT_NOT_LINKABLE,
+                    "remedy": "nothing was captured: the person approved, but the consent relay is too old to say which card they approved, so the approval cannot be linked to the vault record. Update the consent relay before capturing again.",
+                }),
+            );
+        };
 
         // Placement: proven on every capture, because a person can change
         // Time Machine settings between two of them.
@@ -1716,11 +1732,31 @@ fn new_capture_id() -> String {
     )
 }
 
-/// A fresh id for one capture's consent card. It is also the deposit's
-/// `consent_ref`, so it stays within the vault's limit: printable ASCII, at
-/// most [`vault_wire::MAX_CONSENT_REF_BYTES`] bytes (this is under 70).
-fn new_consent_ask_id() -> String {
+/// A fresh JSON-RPC id for one capture's consent card, which the reverse
+/// request to the caller needs. It is never the deposit's `consent_ref`:
+/// that comes from the answer (see [`answered_elicitation_id`]).
+fn new_card_request_id() -> String {
     format!("capture-login-{}", new_capture_id())
+}
+
+/// The `capture_not_stored` reason when an approval carries no usable id of
+/// the card the person tapped, so the deposit could not name its consent.
+pub const CONSENT_NOT_LINKABLE: &str = "consent_not_linkable";
+
+/// The id of the card the person answered, from the answer's
+/// `elicitation_id`, when it can be a `consent_ref`: printable ASCII with no
+/// whitespace, 1 to [`vault_wire::MAX_CONSENT_REF_BYTES`] bytes. Anything else
+/// counts as absent rather than being trimmed or truncated into an id the
+/// relay never issued. Other keys in the answer are ignored.
+fn answered_elicitation_id(answer: &AskOutcome) -> Option<String> {
+    let AskOutcome::Answered(body) = answer else {
+        return None;
+    };
+    let id = body.get("elicitation_id")?.as_str()?;
+    let usable = !id.is_empty()
+        && id.len() <= vault_wire::MAX_CONSENT_REF_BYTES
+        && id.bytes().all(|byte| byte.is_ascii_graphic());
+    usable.then(|| id.to_string())
 }
 
 /// How loudly the capture's consent card notifies. High because `run` holds

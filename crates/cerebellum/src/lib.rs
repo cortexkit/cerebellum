@@ -7536,12 +7536,18 @@ mod tests {
         assert!(planes.elicitor.deliver(
             question.header.channel,
             question.header.corr,
-            json!({"decision": "allow"}),
+            json!({"decision": "allow", "elicitation_id": "el_dispatch_301"}),
         ));
         let reply = next_frame(&mut writer_rx).await;
         assert_eq!(reply.header.corr, 301);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "captured", "{body}");
+        // The answer's card id survives the real elicitor and becomes the
+        // deposit's consent reference.
+        assert_eq!(
+            fixture.vault.request_params()[0]["consent_ref"],
+            "el_dispatch_301"
+        );
 
         // Positive control: the scanner finds the value where it was planted.
         let requests = fixture.vault.requests.lock().unwrap().clone();
@@ -7610,7 +7616,7 @@ mod tests {
         planes.elicitor.deliver(
             question.header.channel,
             question.header.corr,
-            json!({"decision": "allow"}),
+            json!({"decision": "allow", "elicitation_id": "el_dispatch_302"}),
         );
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
