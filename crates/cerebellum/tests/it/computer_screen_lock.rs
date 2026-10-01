@@ -8,7 +8,7 @@
 //! `ComputerPlane::serve` in withholding mode, so every reply shown here also
 //! passed its row's result schema.
 
-mod support;
+use super::support;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

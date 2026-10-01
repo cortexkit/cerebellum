@@ -16,7 +16,7 @@
 //! Both divergence-owner sets must stay empty. The code declares no fields the
 //! artifact omits, and the artifact declares every deliberate served reply field.
 
-mod support;
+use super::support;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

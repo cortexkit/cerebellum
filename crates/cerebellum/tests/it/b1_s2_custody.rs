@@ -33,7 +33,7 @@ fn observation(args: Vec<String>) -> SpawnObservation {
 
 #[test]
 fn checked_in_custody_fixture_is_canonical_and_closed() {
-    let bytes = include_bytes!("../resources/b1_s2_browser-custody.json");
+    let bytes = include_bytes!("../../resources/b1_s2_browser-custody.json");
     let artifact = CustodyArtifact::parse(bytes).unwrap();
     assert_eq!(artifact.schema, "ck-browser-custody/v1");
     assert_eq!(artifact.ordered_args.len(), 2);

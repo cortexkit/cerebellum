@@ -1,3 +1,4 @@
+// Separate binary: re-executes current_exe() with exact child-test names.
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

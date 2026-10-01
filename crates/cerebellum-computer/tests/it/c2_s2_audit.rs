@@ -1111,9 +1111,10 @@ fn a_journal_holding_newer_entries_is_refused_by_name_and_left_untouched() {
         "ck-computer-journal/v{}",
         cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version + 1
     );
-    let fixture = String::from_utf8(include_bytes!("fixtures/v12_computer_journal.json").to_vec())
-        .unwrap()
-        .replace(fixture_version, &next);
+    let fixture =
+        String::from_utf8(include_bytes!("../fixtures/v12_computer_journal.json").to_vec())
+            .unwrap()
+            .replace(fixture_version, &next);
     assert!(fixture.contains(&next));
     let path = std::env::temp_dir().join(format!(
         "cerebellum-newer-computer-journal-{}-{}.json",
@@ -1161,7 +1162,7 @@ fn a_journal_holding_newer_entries_is_refused_by_name_and_left_untouched() {
 
 #[test]
 fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup() {
-    const FIXTURE: &[u8] = include_bytes!("fixtures/v12_computer_journal.json");
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/v12_computer_journal.json");
     // A private copy per run, because reconciliation rewrites the file it
     // loaded and the checked-in fixture must stay as it was written.
     let path = std::env::temp_dir().join(format!(
@@ -1236,7 +1237,7 @@ fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
         AuthEvidence, InputRouteEvidence, RouteCounts,
     };
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/v12_computer_journal.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/v12_computer_journal.json")).unwrap();
     let bytes = cerebellum_core::serde_base64::decode(
         fixture["state"]["entries"]["1"]["bytes"].as_str().unwrap(),
     )
@@ -1294,7 +1295,7 @@ fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
 #[test]
 fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
     let entry = ComputerJournalCodec::decode_entry(include_bytes!(
-        "fixtures/v2_manual_accessibility_entry.json"
+        "../fixtures/v2_manual_accessibility_entry.json"
     ))
     .unwrap();
     assert_eq!(entry["codec_version"], "ck-computer-journal/v2");

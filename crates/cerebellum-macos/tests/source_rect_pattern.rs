@@ -1,3 +1,4 @@
+// Separate binary: uses harness = false to open AppKit on the main thread.
 //! A source rect returns THE REGION, not the whole window scaled into it, and
 //! not some other region of it.
 //!

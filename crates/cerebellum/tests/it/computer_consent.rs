@@ -4,7 +4,7 @@
 //! -- and through the management plane's grant admission, with the person's
 //! answers scripted. Journals and grant stores are held in memory throughout.
 
-mod support;
+use super::support;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

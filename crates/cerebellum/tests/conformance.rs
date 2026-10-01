@@ -1,3 +1,4 @@
+// Separate binary: re-executes current_exe() with exact child-test names.
 //! Conformance tests: verify the wire-v2 registration exchange and
 //! route.bind handling against the pinned conformance fixture.
 //!

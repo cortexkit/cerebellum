@@ -1,3 +1,4 @@
+// Separate binary: changes XDG_DATA_HOME and reads a process-wide grant-store health gauge.
 //! A grant store that cannot be read is disclosed on the health reply.
 //!
 //! Its own test binary, because it points the data home at a scratch

@@ -1,3 +1,4 @@
+// Separate binary: changes HOME, XDG homes and launch-nonce environment variables.
 //! A session scope ending, against the real daemon.
 //!
 //! The frame-level tests in `browser_session_wire.rs` play the daemon

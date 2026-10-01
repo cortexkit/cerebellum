@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-mod vocabulary_mint;
+use super::vocabulary_mint;
 
 use cerebellum_computer::platform::{
     attributed_permission_liveness, canonical_json_bytes, capability_declarations,
@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../resources/computer_action_vocabulary-v14.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v14.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 const V7_ARTIFACT_SHA256: &str = "6548025a7f99bf0984651d0345a962baf792d9428274e8f262542509e61674af";
@@ -24,7 +24,7 @@ const V12_ARTIFACT_SHA256: &str =
     "a820c3519c72bdedf0c7604f8f30531411d4538345e63fc160835aabcb422bfa";
 /// The five rows v12 carried and v13 removed, exactly as v12 wrote them. The
 /// delta chain needs them to rebuild v12, and they exist nowhere else now.
-const RETIRED_V12_ROWS: &str = include_str!("fixtures/v12_retired_rows.json");
+const RETIRED_V12_ROWS: &str = include_str!("../fixtures/v12_retired_rows.json");
 /// The keystroke rows the current vocabulary serves.
 const SYNTHETIC_CAPABILITIES: [&str; 2] = ["computer.type", "computer.keys"];
 /// The five synthetic rows of revisions 8 through 12, which the historical
@@ -980,7 +980,7 @@ fn v14_only_makes_the_changes_recreated_v13_undoes() {
 #[test]
 fn an_unknown_effect_status_is_read_as_indeterminate_by_rule() {
     let vector: Value =
-        serde_json::from_str(include_str!("fixtures/effect_status_unknown_value.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/effect_status_unknown_value.json")).unwrap();
     assert_eq!(
         vector["reader_must_read_effect_status_as"],
         "effect_indeterminate"

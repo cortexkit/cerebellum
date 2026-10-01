@@ -1,3 +1,4 @@
+// Separate binary: re-executes current_exe() with an exact child-test name on Linux.
 #![cfg(target_os = "linux")]
 
 use std::ffi::OsString;

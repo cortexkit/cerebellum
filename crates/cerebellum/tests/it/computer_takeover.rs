@@ -11,7 +11,7 @@
 //! of a held button when a sequence stops. Only the event posting itself is
 //! recorded instead of sent to the window server.
 
-mod support;
+use super::support;
 
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
