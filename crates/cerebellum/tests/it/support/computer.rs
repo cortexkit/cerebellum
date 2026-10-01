@@ -734,6 +734,9 @@ pub struct DeskState {
     pub writes: Vec<(u64, TextAttribute)>,
     pub hit_scopes: Vec<HitScope>,
     pub focus_reads: usize,
+    /// The running applications `list_apps` lists and a target given by
+    /// name is matched against; `None` when the list cannot be read.
+    pub running: Option<Vec<cerebellum_computer::app_state::source::RunningApp>>,
 }
 
 /// A fixture application: its tree, its elements' facts and text, its focus,
@@ -759,6 +762,12 @@ impl Desk {
             writes: Vec::new(),
             hit_scopes: Vec::new(),
             focus_reads: 0,
+            running: Some(vec![cerebellum_computer::app_state::source::RunningApp {
+                name: "Safari".into(),
+                bundle_identity: grant().bundle_identity,
+                pid: grant().pid,
+                frontmost: true,
+            }]),
         })))
     }
 
@@ -923,6 +932,15 @@ impl AppStateSource for Desk {
 
     fn frontmost_pid(&self) -> Option<u32> {
         self.state().frontmost
+    }
+
+    fn running_apps(
+        &self,
+    ) -> Result<Vec<cerebellum_computer::app_state::source::RunningApp>, AppStateReadError> {
+        self.state()
+            .running
+            .clone()
+            .ok_or(AppStateReadError::Unreadable)
     }
 }
 

@@ -285,7 +285,9 @@ async fn pressing_a_stale_id_refuses_and_presses_nothing() {
     let desk = desk();
     let plane = plane(&desk);
     let management = granted_management().await;
-    let tree = read(&plane, &management).await;
+    // A read first, so the session exists and the ids below are refused for
+    // what they are rather than for there being no session.
+    read(&plane, &management).await;
     // An id in the old shape, and a number this session never issued.
     for stale in ["sgone1-4", "999999"] {
         let reply = serve(
@@ -970,4 +972,211 @@ async fn written_and_typed_text_never_reach_the_journal() {
         !journal_contains(&storage, SECRET),
         "written or typed text reached the journal"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Applications by name, and list_apps
+// ---------------------------------------------------------------------------
+
+fn running(name: &str, bundle_identity: &str, pid: u32) -> cerebellum_computer::app_state::source::RunningApp {
+    cerebellum_computer::app_state::source::RunningApp {
+        name: name.into(),
+        bundle_identity: bundle_identity.into(),
+        pid,
+        frontmost: false,
+    }
+}
+
+/// A target given as a name: one running match is read, several are refused
+/// as `ambiguous_app` with the candidates, none as `no_running_app_named`;
+/// a bundle identity nobody runs is still `not_running`. Every reply passes
+/// its row's result schema in withholding mode.
+#[tokio::test]
+async fn a_target_name_resolves_to_exactly_one_running_application() {
+    let desk = desk();
+    desk.state().running = Some(vec![
+        running("Safari", TARGET_BUNDLE_ID, grant().pid),
+        running("Editor", "com.example.Editor", 501),
+        running("Editor", "org.example.Editor", 502),
+    ]);
+    let plane = plane(&desk);
+    let management = granted_management().await;
+
+    let one = serve(&plane, &management, "computer.read_state", json!({"target": "safari"})).await;
+    assert_eq!(one["outcome"], "completed", "{one}");
+    assert!(one["state_text"].as_str().unwrap().contains(" button Send"), "{one}");
+
+    let several = serve(&plane, &management, "computer.read_state", json!({"target": "Editor"})).await;
+    assert_eq!(several["outcome"], "ambiguous_app", "{several}");
+    let candidates: Vec<&str> = several["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["bundle_identity"].as_str().unwrap())
+        .collect();
+    assert_eq!(candidates, vec!["com.example.Editor", "org.example.Editor"]);
+
+    let none = serve(&plane, &management, "computer.type", json!({"target": "Nobody", "text": "x"})).await;
+    assert_eq!(none["outcome"], "no_running_app_named", "{none}");
+    assert_eq!(none["target"], "Nobody");
+
+    let missing = support::computer::management_with(Arc::new(support::computer::Fixed(
+        TargetResolution::NotRunning,
+    )));
+    let not_running = serve(
+        &plane,
+        &missing,
+        "computer.read_state",
+        json!({"target": "com.example.NotInstalled"}),
+    )
+    .await;
+    assert_eq!(not_running["outcome"], "not_running", "{not_running}");
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// An element action's `target` is checked against the element's own
+/// application: one naming another application is refused and nothing is
+/// pressed or written; one naming the element's application by name or
+/// bundle identity changes nothing.
+#[tokio::test]
+async fn an_element_action_refuses_a_target_naming_another_application() {
+    let desk = desk();
+    desk.state().running = Some(vec![
+        running("Safari", TARGET_BUNDLE_ID, grant().pid),
+        running("Notes", "com.apple.Notes", 777),
+    ]);
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let send = id_of(&tree, " button Send");
+    let composer = id_of(&tree, "Composer");
+
+    for other in ["com.apple.Notes", "Notes"] {
+        let pressed = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_id": send, "target": other}),
+        )
+        .await;
+        assert_eq!(pressed["outcome"], "target_mismatch", "{pressed}");
+        let written = serve(
+            &plane,
+            &management,
+            "computer.write_text",
+            json!({"element_id": composer, "target": other, "text": "x", "write_mode": "replace_value"}),
+        )
+        .await;
+        assert_eq!(written["outcome"], "target_mismatch", "{written}");
+    }
+    assert!(desk.state().presses.is_empty() && desk.state().writes.is_empty());
+
+    for own in ["Safari", TARGET_BUNDLE_ID] {
+        let pressed = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_id": send, "target": own}),
+        )
+        .await;
+        assert_eq!(pressed["outcome"], "completed", "{own}: {pressed}");
+    }
+    assert_eq!(desk.state().presses, vec![10, 10]);
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// list_apps is served in withholding mode without any application's grant:
+/// one line per running application, the frontmost marked. Its journal row
+/// holds the count alone. The scan that finds no application name is first
+/// shown to find a planted marker the journal does record, the bundle
+/// identity of the application a read was granted for, so its silence
+/// about the names means something.
+#[tokio::test]
+async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
+    const PLANTED: &str = "PlantedPositive9d2c";
+    const SECRET_NAME: &str = "Sw0rdf1sh Private Ledger";
+    const SECRET_BUNDLE: &str = "com.example.LedgerSecret4e1b";
+    let target = ProcessGrant {
+        bundle_identity: format!("com.example.{PLANTED}"),
+        ..grant()
+    };
+    let desk = desk();
+    desk.state().running = Some(vec![
+        running("Safari", &target.bundle_identity, grant().pid),
+        running(SECRET_NAME, SECRET_BUNDLE, 4321),
+    ]);
+    if let Some(apps) = desk.state().running.as_mut() {
+        apps[0].frontmost = true;
+    }
+    let storage = InMemoryJournalStorage::new();
+    let plane: Plane = ComputerPlane::with_result_schema_enforcement(
+        support::computer::audit_with_storage(storage.clone()),
+        ResultSchemaEnforcement::Withhold,
+    )
+    .with_app_state_source(desk.source());
+    let management = support::computer::management_with(Arc::new(support::computer::Fixed(
+        TargetResolution::Resolved(target.clone()),
+    )));
+
+    // No grant is held and no question can be asked: the list needs neither.
+    let before = plane.journal_entry_count().await;
+    let listed = serve(&plane, &management, "computer.list_apps", json!({})).await;
+    assert_eq!(listed["outcome"], "completed", "{listed}");
+    assert_eq!(
+        listed["state_text"],
+        format!(
+            "Safari · {} · pid {} · frontmost\n{SECRET_NAME} · {SECRET_BUNDLE} · pid 4321\n",
+            target.bundle_identity,
+            grant().pid
+        )
+    );
+    assert_eq!(listed["apps"].as_array().unwrap().len(), 2);
+    assert!(
+        plane.journal_entry_count().await > before,
+        "the listing was not journaled, so its absence of names proves nothing"
+    );
+
+    // A granted read journals the bundle identity it was granted for.
+    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let (drain_sender, drain) = tokio::sync::watch::channel(false);
+    std::mem::forget(drain_sender);
+    let consent = ConsentContext::new(
+        GrantCaller {
+            conversation_key: identity().conversation_key,
+            agent_project_id: GRANTEE.into(),
+            durable_identity_attested: false,
+        },
+        Some(Arc::new(carrier) as Arc<dyn QuestionCarrier>),
+        Arc::new(cerebellum::computer_grants::AlwaysOpenRoute),
+        drain,
+        None,
+    );
+    let read = serve_as(
+        &plane,
+        &management,
+        identity(),
+        consent,
+        "computer.read_state",
+        json!({"target": target.bundle_identity}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(read["outcome"], "completed", "{read}");
+
+    assert!(
+        journal_contains(&storage, PLANTED),
+        "the scan cannot find the planted marker in the journal, so it proves nothing"
+    );
+    assert!(journal_contains(&storage, "app_count"), "the count was not recorded");
+    for secret in [SECRET_NAME, SECRET_BUNDLE, "Sw0rdf1sh"] {
+        assert!(!journal_contains(&storage, secret), "{secret} reached the journal");
+    }
+
+    // An unreadable list is disclosed, never shown as no applications.
+    desk.state().running = None;
+    let unreadable = serve(&plane, &management, "computer.list_apps", json!({})).await;
+    assert_eq!(unreadable["outcome"], "targets_unreadable", "{unreadable}");
+    let invalid = serve(&plane, &management, "computer.list_apps", json!({"target": "Safari"})).await;
+    assert_eq!(invalid["outcome"], "invalid_request", "{invalid}");
+    assert!(plane.result_schema_findings().is_empty());
 }

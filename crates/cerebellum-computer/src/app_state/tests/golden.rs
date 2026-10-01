@@ -819,24 +819,3 @@ fn a_diff_past_the_cap_counts_what_it_left_out() {
     assert!(diff.ends_with("focused: 9 button User Directives\n"), "{diff}");
     assert_every_change_is_labelled(&diff);
 }
-
-#[test]
-fn print_fixtures_for_review() {
-    for (app, roots) in [
-        ("Google Chrome", x_timeline()),
-        ("Bionic Reading", bionic_settings()),
-        ("Magic Context Dashboard", dashboard()),
-    ] {
-        let read = observe(roots);
-        let outline = outline_of(app, &read);
-        println!("===== {app} outline ({} bytes)\n{outline}", outline.len());
-    }
-    let read = observe(x_timeline());
-    let post = find(&read.roots, "Wren Workshop");
-    let zoomed = zoom_of("Google Chrome", &read, id(post));
-    println!("===== zoom post ({} bytes)\n{zoomed}", zoomed.len());
-    let (text, _) = diff_between(x_timeline(), x_timeline_with(0, &[2, 3, 4, 5, 6]));
-    println!("===== x diff ({} bytes)\n{text}", text.len());
-    let (text, truncation) = diff_between(dashboard(), dashboard_with(1));
-    println!("===== dashboard diff ({} bytes) {truncation:?}\n{text}", text.len());
-}

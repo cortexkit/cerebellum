@@ -172,7 +172,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         .iter()
         .all(|name| cerebellum::dispatchable_tool(name).is_some()));
 
-    assert_eq!(evidence.frozen_row_count, 10);
+    assert_eq!(evidence.frozen_row_count, 11);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers

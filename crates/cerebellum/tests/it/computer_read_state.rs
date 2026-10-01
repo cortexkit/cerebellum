@@ -155,9 +155,14 @@ async fn serve<S: JournalStorage + Send + 'static>(
         .expect("every read_state reply conforms to its row")
 }
 
+/// The element ids of a rendered state: the first word of every line after
+/// the header line, where that word is a number.
 fn ids(tree: &str) -> Vec<String> {
     tree.lines()
-        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| word.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(str::to_string)
         .collect()
 }
 
@@ -185,24 +190,24 @@ async fn read_state_serves_the_tree_and_passes_withholding() {
     .await;
 
     assert_eq!(reply["outcome"], "completed", "{reply}");
-    let tree = reply["tree"].as_str().unwrap();
-    assert!(line_with(tree, "text area").ends_with("\"Message @IceTea\" [settable]"));
-    let sheet = line_with(tree, "sheet \"GoToWindow\"");
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(line_with(tree, "text area").ends_with("text area (settable) Message @IceTea"));
+    let sheet = line_with(tree, "sheet GoToWindow");
     assert!(
-        sheet.starts_with("  s"),
+        sheet.starts_with("  ") && !sheet.starts_with("   "),
         "the sheet is not under its window: {sheet}"
     );
-    assert!(line_with(tree, "PathTextField").starts_with("    s"));
+    assert!(line_with(tree, "PathTextField").starts_with("    "));
     assert!(!tree.contains("SECRET_SENTINEL"), "{tree}");
     assert_eq!(reply["unreadable_subtrees"], 0);
     assert!(reply.get("image").is_none() && reply.get("image_unavailable").is_none());
     assert!(plane.result_schema_findings().is_empty());
 }
 
-/// Filters narrow the reply and keep the ancestor path; a subtree id this
+/// Filters narrow the reply and keep the ancestor path; a zoom id this
 /// session does not hold is refused as stale.
 #[tokio::test]
-async fn filters_and_a_stale_subtree_id_are_served_through_withholding() {
+async fn filters_and_a_stale_zoom_id_are_served_through_withholding() {
     let management = granted_management().await;
     let plane = plane(FixtureSource::new(vec![chat_window()]));
     let reply = serve(
@@ -214,15 +219,16 @@ async fn filters_and_a_stale_subtree_id_are_served_through_withholding() {
         InMemoryCaptureBackend::default(),
     )
     .await;
-    let tree = reply["tree"].as_str().unwrap();
-    assert_eq!(tree.lines().count(), 3, "{tree}");
+    // The header, the window, the sheet that holds the match, and the match.
+    let tree = reply["state_text"].as_str().unwrap();
+    assert_eq!(tree.lines().count(), 4, "{tree}");
 
     let stale = serve(
         &plane,
         &management,
         "conversation-1",
         no_relay(),
-        json!({"target": TARGET_BUNDLE_ID, "subtree_element_id": "sgone1-4"}),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": "999999"}),
         InMemoryCaptureBackend::default(),
     )
     .await;
@@ -268,8 +274,8 @@ async fn two_conversations_hold_disjoint_ids_that_end_with_them() {
     )
     .await;
     let (first, second) = (
-        ids(first["tree"].as_str().unwrap()),
-        ids(second["tree"].as_str().unwrap()),
+        ids(first["state_text"].as_str().unwrap()),
+        ids(second["state_text"].as_str().unwrap()),
     );
     assert!(!first.is_empty());
     assert!(
@@ -283,7 +289,7 @@ async fn two_conversations_hold_disjoint_ids_that_end_with_them() {
         &management,
         "conversation-b",
         no_relay_for("conversation-b"),
-        json!({"target": TARGET_BUNDLE_ID, "subtree_element_id": first[1]}),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": first[1]}),
         InMemoryCaptureBackend::default(),
     )
     .await;
@@ -414,7 +420,7 @@ async fn a_missing_image_is_declared_and_the_tree_still_returns() {
         )
         .await;
         assert_eq!(reply["outcome"], "completed", "{reply}");
-        assert!(reply["tree"].as_str().unwrap().contains("GoToWindow"));
+        assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));
         assert!(reply.get("image").is_none(), "{reason}: {reply}");
         assert_eq!(reply["image_unavailable"]["reason"], reason, "{reply}");
     }
@@ -443,7 +449,7 @@ async fn a_missing_image_is_declared_and_the_tree_still_returns() {
     .await;
     assert!(reply.get("image").is_none(), "{reply}");
     assert_eq!(reply["outcome"], "audit_unavailable", "{reply}");
-    assert!(reply.get("tree").is_none(), "{reply}");
+    assert!(reply.get("state_text").is_none(), "{reply}");
 }
 
 trait ZeroCapture {
@@ -517,7 +523,7 @@ async fn an_ungranted_read_is_refused_before_anything_is_read() {
     )
     .await;
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
-    assert!(reply.get("tree").is_none());
+    assert!(reply.get("state_text").is_none());
     assert_eq!(management.app_state_sessions().session_count(), 0);
     assert_eq!(plane.journal_entry_count().await, before);
 }
@@ -580,7 +586,7 @@ async fn covered_unmeasured_app_image_refusal_passes_withholding_and_keeps_tree(
             json!({"reason": "window_covered_may_be_stale"})
         );
         assert!(reply.get("image").is_none());
-        assert!(reply["tree"].as_str().unwrap().contains("GoToWindow"));
+        assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));
         assert!(plane.result_schema_findings().is_empty());
         assert_eq!(*facts.seen.lock().unwrap(), vec![None]);
         assert_eq!(
@@ -725,7 +731,7 @@ async fn no_image_read_writes_one_text_free_row() {
     )
     .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
-    assert!(reply["tree"].as_str().unwrap().contains(LABEL));
+    assert!(reply["state_text"].as_str().unwrap().contains(LABEL));
     assert_eq!(plane.journal_entry_count().await, before + 1);
     let row = recorded_read(&storage);
     assert_eq!(row["phase"], "finalized");
@@ -768,7 +774,7 @@ async fn failed_read_journal_withholds_tree_and_image() {
         )
         .await;
         assert_eq!(reply["outcome"], "audit_unavailable", "{reply}");
-        assert!(reply.get("tree").is_none());
+        assert!(reply.get("state_text").is_none());
         assert!(reply.get("image").is_none());
         assert!(!reply.to_string().contains(LABEL));
         assert!(plane.result_schema_findings().is_empty());
