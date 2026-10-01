@@ -916,6 +916,10 @@ fn activation_policy_is_regular(pid: i32) -> Option<bool> {
     })
 }
 
+/// One application as the window server lists it: pid, bundle identifier and
+/// name, copied out of the completion callback.
+type ListedApplication = (u32, String, String);
+
 /// Every application the window server describes to this process, with
 /// whether each is a regular one.
 ///
@@ -924,7 +928,7 @@ fn activation_policy_is_regular(pid: i32) -> Option<bool> {
 /// system declines, because "no applications" and "not permitted to look" are
 /// different answers.
 pub fn running_applications(timeout: Duration) -> Result<Vec<RunningApplication>, String> {
-    let delivery: Arc<Delivery<Result<Vec<(u32, String, String)>, String>>> = Delivery::new();
+    let delivery: Arc<Delivery<Result<Vec<ListedApplication>, String>>> = Delivery::new();
     let sink = delivery.clone();
     let handler = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
