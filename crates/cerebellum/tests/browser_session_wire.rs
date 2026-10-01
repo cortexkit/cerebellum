@@ -4211,7 +4211,7 @@ async fn click_ref(planes: &Planes, corr: u64, snapshot: &Value) -> Value {
         corr,
         "browser.click",
         json!({
-            "ref": first_ref(&snapshot),
+            "ref": first_ref(snapshot),
             "snapshot_id": snapshot["snapshot_id"],
             "intent": "follow the Learn more link",
             "severity": {"tier": 4, "credential": true, "financial": true}

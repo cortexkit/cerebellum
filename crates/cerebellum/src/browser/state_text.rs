@@ -893,7 +893,7 @@ fn fit(
                 }
             }
             trailer = cut_report(&lines, &keep, tree, max_bytes);
-            if trailer.len() + 1 <= reserve {
+            if trailer.len() < reserve {
                 break;
             }
             reserve = trailer.len() + 1;
