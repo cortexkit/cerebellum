@@ -184,207 +184,260 @@ pub(crate) fn assert_contract(body: &Value, ids: &[&str], decline: &str) {
     }
 }
 
-/// Every top-level key Prefrontal core's `ConsentRequest` accepts. Core decodes
-/// it with `deny_unknown_fields`, so a card with any other key is refused.
+/// Why Prefrontal core refuses a consent request: the `code` and `message` of
+/// core's `Refusal`.
 #[cfg(test)]
-const CORE_REQUEST_KEYS: [&str; 20] = [
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreRefusal {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[cfg(test)]
+impl std::fmt::Display for CoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+#[cfg(test)]
+fn core_invalid(message: impl Into<String>) -> CoreRefusal {
+    CoreRefusal {
+        code: "elicitation_invalid_request",
+        message: message.into(),
+    }
+}
+
+/// The top-level keys `ConsentRequest` requires and the ones it also accepts.
+/// Every struct core decodes is `deny_unknown_fields`, so any other key is
+/// refused.
+#[cfg(test)]
+const CORE_REQUIRED_KEYS: [&str; 11] = [
     "kind",
     "title",
     "prompt",
     "options",
     "default",
     "urgency",
-    "dedup_key",
     "on_expiry",
     "material_damage",
+    "late_execution",
+    "target",
+    "expires_in_ms",
+];
+#[cfg(test)]
+const CORE_OPTIONAL_KEYS: [&str; 9] = [
+    "dedup_key",
     "scope",
     "duration",
     "args_digest",
-    "late_execution",
     "session_ref",
     "parent_session_ref",
-    "target",
     "facts",
     "preview",
-    "expires_in_ms",
     "requestedSchema",
 ];
 
 /// The longest a consent request may stay open in Prefrontal core: a day.
 #[cfg(test)]
-const CORE_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+const CORE_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// The reasons Prefrontal core would refuse these consent `params`. Empty
-/// when core would accept them.
+/// serde's decode of one `deny_unknown_fields` struct whose fields are named
+/// in `required` and `optional`.
+#[cfg(test)]
+fn core_decode_struct(
+    value: &Value,
+    what: &str,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<(), CoreRefusal> {
+    let Some(object) = value.as_object() else {
+        return Err(core_invalid(format!(
+            "invalid type: {what} is not an object"
+        )));
+    };
+    if let Some(key) = object
+        .keys()
+        .find(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+    {
+        return Err(core_invalid(format!("unknown field `{key}` in {what}")));
+    }
+    if let Some(key) = required.iter().find(|key| !object.contains_key(**key)) {
+        return Err(core_invalid(format!("missing field `{key}` in {what}")));
+    }
+    Ok(())
+}
+
+/// serde's decode of the named fields of `value` as `String`, or as
+/// `Option<String>` (absent or null allowed) when `optional`.
+#[cfg(test)]
+fn core_decode_strings(value: &Value, keys: &[&str], optional: bool) -> Result<(), CoreRefusal> {
+    for key in keys {
+        let field = &value[*key];
+        if !(field.is_string() || optional && field.is_null()) {
+            return Err(core_invalid(format!(
+                "invalid type: `{key}` is not a string"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Prefrontal core's verdict on these consent `params`: `Ok` when core would
+/// accept them, otherwise the first refusal core would give.
 ///
 /// Core decodes the `params` of every `elicitation/create` whose `kind` is
 /// `consent` and answers `not_put_to_anyone` when it cannot. The person never
 /// sees that card, and the agent only learns that nobody was asked. This
-/// restates the `ConsentRequest` decode (every struct is
-/// `deny_unknown_fields`) and `ConsentRequest::validate` from prefrontal's
+/// mirrors `ConsentRequest::decode` (serde with `deny_unknown_fields` on every
+/// struct) and `ConsentRequest::validate`, in their order, from prefrontal's
 /// `crates/prefrontal-core-store/src/elicitation.rs` at commit
-/// f5957f2fe01f0bb3fe0e0c3619c6711d160b2504 ("consent: accept MCP
-/// requestedSchema, ..."), so a card core would refuse fails in this crate's
-/// tests instead of in front of a person.
+/// d15391996594ce24ba53aa42fd1c31bb85922745. Refusal codes are core's, and
+/// each message contains core's wording; serde's own wording is only
+/// approximated (`unknown field `x``, `missing field `x``).
 ///
-/// It is the only place that contract is written down here. When Prefrontal
-/// publishes request vectors for it, replace this body with a check against
-/// them; callers only ask whether core would accept the params.
+/// It is the only place that contract is written down in this crate. It is
+/// held to Prefrontal's published request vectors (see
+/// `the_contract_mirror_agrees_with_core_on_every_request_vector`), so it
+/// cannot accept a body core refuses among those vectors, and every rendered
+/// card is held to it.
 #[cfg(test)]
-pub(crate) fn core_refusals(params: &Value) -> Vec<String> {
-    let mut refusals = Vec::new();
-    let Some(object) = params.as_object() else {
-        return vec!["params is not an object".into()];
-    };
-    for key in object.keys() {
-        if !CORE_REQUEST_KEYS.contains(&key.as_str()) {
-            refusals.push(format!("unknown top-level key `{key}`"));
-        }
-    }
-    for key in [
-        "kind",
-        "title",
-        "prompt",
-        "options",
-        "default",
-        "urgency",
-        "on_expiry",
-        "material_damage",
-        "late_execution",
-        "target",
-        "expires_in_ms",
-    ] {
-        if !object.contains_key(key) {
-            refusals.push(format!("missing required key `{key}`"));
-        }
-    }
-    let nonempty = |value: &Value| value.as_str().is_some_and(|s| !s.trim().is_empty());
-    let only_keys = |value: &Value, allowed: &[&str]| {
-        value
-            .as_object()
-            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
-    };
-
-    if params["kind"] != "consent" {
-        refusals.push("`kind` is not `consent`".into());
-    }
-    for key in ["title", "prompt"] {
-        if !nonempty(&params[key]) {
-            refusals.push(format!("`{key}` is not a nonempty string"));
-        }
-    }
-
-    let options = params["options"].as_array().cloned().unwrap_or_default();
-    if options.is_empty() {
-        refusals.push("`options` is not a nonempty array".into());
-    }
-    let mut ids: Vec<&str> = Vec::new();
-    for option in &options {
-        if !only_keys(option, &["id", "label", "effect", "detail"]) {
-            refusals.push(format!("option has a key core does not accept: {option}"));
-        }
-        if !nonempty(&option["id"]) || !nonempty(&option["label"]) || !option["effect"].is_string()
-        {
-            refusals.push(format!(
-                "option needs a nonempty id and label and an effect: {option}"
-            ));
-        }
-        let id = option["id"].as_str().unwrap_or_default();
-        if ids.contains(&id) {
-            refusals.push(format!("option id `{id}` is not unique"));
-        }
-        ids.push(id);
-    }
-    match options.iter().find(|o| o["id"] == params["default"]) {
-        None => refusals.push("`default` names no option".into()),
-        Some(option) if option["effect"] != "decline" => {
-            refusals.push("`default` names an option that is not a decline".into())
-        }
-        Some(_) => {}
-    }
-    if params["on_expiry"] != "deny" {
-        refusals.push("`on_expiry` is not `deny`".into());
-    }
-    if !matches!(params["urgency"].as_str(), Some("low" | "normal" | "high")) {
-        refusals.push("`urgency` is not low, normal or high".into());
-    }
-    if !matches!(
-        params["late_execution"].as_str(),
-        Some("execute" | "notify_only")
-    ) {
-        refusals.push("`late_execution` is not execute or notify_only".into());
-    }
+pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
+    // Decoding: shape, unknown and missing fields, and types.
+    core_decode_struct(
+        params,
+        "the request",
+        &CORE_REQUIRED_KEYS,
+        &CORE_OPTIONAL_KEYS,
+    )?;
+    core_decode_strings(
+        params,
+        &[
+            "kind",
+            "title",
+            "prompt",
+            "default",
+            "urgency",
+            "on_expiry",
+            "late_execution",
+        ],
+        false,
+    )?;
+    core_decode_strings(
+        params,
+        &[
+            "dedup_key",
+            "args_digest",
+            "session_ref",
+            "parent_session_ref",
+        ],
+        true,
+    )?;
     if !params["material_damage"].is_boolean() {
-        refusals.push("`material_damage` is not a boolean".into());
-    }
-    if !params["expires_in_ms"]
-        .as_u64()
-        .is_some_and(|ms| (1..=CORE_RETENTION_MS).contains(&ms))
-    {
-        refusals.push("`expires_in_ms` is not positive and at most 24 hours".into());
-    }
-    // Core decodes `scope` and `args_digest` as optional, so an explicit null
-    // counts as absent.
-    let has_digest = nonempty(&params["args_digest"]);
-    let has_scope = !params["scope"].is_null();
-    if !has_digest && !has_scope {
-        refusals.push("neither `scope` nor `args_digest` is present".into());
-    }
-    for key in [
-        "args_digest",
-        "dedup_key",
-        "session_ref",
-        "parent_session_ref",
-    ] {
-        if !params[key].is_null() && !params[key].is_string() {
-            refusals.push(format!("`{key}` is not a string"));
-        }
-    }
-    let target = &params["target"];
-    if !only_keys(target, &["kind", "label"])
-        || !nonempty(&target["kind"])
-        || !nonempty(&target["label"])
-    {
-        refusals.push(format!(
-            "`target` is not exactly a nonempty kind and label: {target}"
+        return Err(core_invalid(
+            "invalid type: `material_damage` is not a bool",
         ));
     }
-    if !params["facts"].is_null() {
-        let facts_ok = params["facts"].as_array().is_some_and(|facts| {
-            facts.iter().all(|fact| {
-                only_keys(fact, &["label", "value"])
-                    && fact["label"].is_string()
-                    && fact["value"].is_string()
-            })
-        });
-        if !facts_ok {
-            refusals.push("`facts` is not a list of label and value strings".into());
+    let Some(expires_in_ms) = params["expires_in_ms"].as_i64() else {
+        return Err(core_invalid("invalid type: `expires_in_ms` is not an i64"));
+    };
+    let Some(options) = params["options"].as_array() else {
+        return Err(core_invalid("invalid type: `options` is not a sequence"));
+    };
+    for option in options {
+        core_decode_struct(option, "an option", &["id", "label", "effect"], &["detail"])?;
+        core_decode_strings(option, &["id", "label", "effect"], false)?;
+        core_decode_strings(option, &["detail"], true)?;
+    }
+    let target = &params["target"];
+    core_decode_struct(target, "target", &["kind", "label"], &[])?;
+    core_decode_strings(target, &["kind", "label"], false)?;
+    // `facts` defaults to empty when absent, but a present null is not a list.
+    if let Some(facts) = params.get("facts") {
+        let Some(facts) = facts.as_array() else {
+            return Err(core_invalid("invalid type: `facts` is not a sequence"));
+        };
+        for fact in facts {
+            core_decode_struct(fact, "a fact", &["label", "value"], &[])?;
+            core_decode_strings(fact, &["label", "value"], false)?;
         }
     }
     let preview = &params["preview"];
-    if !preview.is_null()
-        && !(only_keys(preview, &["label", "text"])
-            && preview["label"].is_string()
-            && preview["text"].is_string())
-    {
-        refusals.push("`preview` is not a label and text".into());
+    if !preview.is_null() {
+        core_decode_struct(preview, "preview", &["label", "text"], &[])?;
+        core_decode_strings(preview, &["label", "text"], false)?;
     }
-    if !params["requestedSchema"].is_null() {
-        // Core compares the schema's decision enum and the option ids as
-        // sets, so their order is not part of its contract.
-        let mut answerable: Vec<&str> = params["requestedSchema"]
+
+    // Validation, in `ConsentRequest::validate`'s order. Every field read
+    // below was checked for its type above.
+    let text = |key: &str| params[key].as_str().unwrap_or_default();
+    let blank = |value: &Value| value.as_str().unwrap_or_default().trim().is_empty();
+    if text("kind") != "consent" {
+        return Err(CoreRefusal {
+            code: "elicitation_unknown_kind",
+            message: "only consent is supported".into(),
+        });
+    }
+    if text("title").trim().is_empty() || text("prompt").trim().is_empty() || options.is_empty() {
+        return Err(core_invalid(
+            "title, prompt and nonempty options are required",
+        ));
+    }
+    let mut option_ids: Vec<&str> = Vec::new();
+    for option in options {
+        let id = option["id"].as_str().unwrap_or_default();
+        if id.trim().is_empty() || blank(&option["label"]) || option_ids.contains(&id) {
+            return Err(core_invalid(
+                "option ids must be unique and nonempty; labels must be nonempty",
+            ));
+        }
+        option_ids.push(id);
+    }
+    // An absent or null schema is not checked. A present one must carry a
+    // decision enum of strings equal to the option ids as a set: core sorts
+    // both before comparing.
+    let schema = &params["requestedSchema"];
+    if !schema.is_null() {
+        let mismatch = || core_invalid("requestedSchema decision enum must equal option ids");
+        let mut schema_ids = schema
             .pointer("/properties/decision/enum")
             .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        let mut offered = ids.clone();
-        answerable.sort_unstable();
+            .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            .ok_or_else(mismatch)?;
+        let mut offered = option_ids.clone();
+        schema_ids.sort_unstable();
         offered.sort_unstable();
-        if answerable != offered {
-            refusals.push("`requestedSchema` decision enum is not exactly the option ids".into());
+        if schema_ids != offered {
+            return Err(mismatch());
         }
     }
-    refusals
+    let Some(default) = options.iter().find(|o| o["id"] == params["default"]) else {
+        return Err(core_invalid("default must name an option"));
+    };
+    if default["effect"] != "decline" || text("on_expiry") != "deny" {
+        return Err(CoreRefusal {
+            code: "elicitation_fail_closed_required",
+            message: "consent requires a decline default and on_expiry deny".into(),
+        });
+    }
+    if !matches!(text("urgency"), "low" | "normal" | "high")
+        || !matches!(text("late_execution"), "execute" | "notify_only")
+    {
+        return Err(core_invalid("invalid urgency or late_execution"));
+    }
+    if expires_in_ms <= 0 || expires_in_ms > CORE_RETENTION_MS {
+        return Err(core_invalid(
+            "expires_in_ms must be positive and at most 24 hours",
+        ));
+    }
+    // Core decodes `scope` as `Option<Value>`, so an explicit null is absent.
+    if blank(&params["args_digest"]) && params["scope"].is_null() {
+        return Err(core_invalid("provide args_digest or scope"));
+    }
+    if blank(&target["kind"]) || blank(&target["label"]) {
+        return Err(core_invalid("target kind and label must be nonempty"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -428,67 +481,149 @@ mod tests {
         assert_contract(&body, &["allow", "deny"], "deny");
     }
 
-    /// `core_refusals` is the only thing standing between a malformed card and
-    /// a silent `not_put_to_anyone`, so each rule it restates must actually
-    /// refuse something. A check that accepted everything would pass every
-    /// card test below without anyone noticing.
-    #[test]
-    fn core_refusals_refuses_each_thing_core_refuses() {
-        let valid =
-            card(vec![ConsentOption::grant("allow", "Allow")]).render("valid")["params"].clone();
-        assert_eq!(core_refusals(&valid), Vec::<String>::new());
-        type Tampering = (&'static str, fn(&mut Value));
-        let tamperings: [Tampering; 16] = [
-            ("unknown key", |p| p["surprise"] = json!(1)),
-            ("no urgency", |p| {
-                p.as_object_mut().unwrap().remove("urgency");
-            }),
-            ("urgency outside its set", |p| {
-                p["urgency"] = json!("urgent")
-            }),
-            ("neither scope nor digest", |p| {
-                p.as_object_mut().unwrap().remove("scope");
-            }),
-            ("null scope", |p| p["scope"] = Value::Null),
-            ("empty digest only", |p| {
-                p.as_object_mut().unwrap().remove("scope");
-                p["args_digest"] = json!(" ");
-            }),
-            ("default is a grant", |p| p["default"] = json!("allow")),
-            ("on_expiry not deny", |p| p["on_expiry"] = json!("allow")),
-            ("late_execution outside its set", |p| {
-                p["late_execution"] = json!("later")
-            }),
-            ("zero expiry", |p| p["expires_in_ms"] = json!(0)),
-            ("expiry past a day", |p| {
-                p["expires_in_ms"] = json!(CORE_RETENTION_MS + 1)
-            }),
-            ("duplicate option id", |p| {
-                p["options"][0]["id"] = json!("deny")
-            }),
-            ("schema enum disagrees", |p| {
-                p["requestedSchema"]["properties"]["decision"]["enum"] = json!(["allow"])
-            }),
-            ("extra target key", |p| p["target"]["path"] = json!("/")),
-            ("no target label", |p| p["target"]["label"] = json!("")),
-            ("extra option key", |p| p["options"][0]["why"] = json!("x")),
-        ];
-        for (name, tamper) in tamperings {
-            let mut params = valid.clone();
-            tamper(&mut params);
-            assert!(!core_refusals(&params).is_empty(), "{name} was accepted");
+    /// Prefrontal's consent request vectors, copied byte for byte from
+    /// prefrontal's `test-vectors/elicitation-request-v1/` (see the README
+    /// beside the directory for the source commit).
+    const REQUEST_VECTORS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/elicitation-request-v1"
+    );
+
+    /// The SHA-256 of the copied `SHA256SUMS`. The manifest covers every other
+    /// file but cannot cover itself, so the vectors' README asks consumers to
+    /// pin its hash.
+    const REQUEST_VECTORS_MANIFEST_SHA256: &str =
+        "70617099cddb426b8ce4b6cf49d04337e58dd61230f909bc0bcba31c73c64c88";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Every file under `dir`, as a path relative to `root` with `/` between
+    /// components, the form `SHA256SUMS` names them in.
+    fn files_under(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files_under(root, &path, found);
+            } else {
+                let relative = path.strip_prefix(root).unwrap();
+                found.push(
+                    relative
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                );
+            }
         }
-        let mut digest_only = valid.clone();
-        digest_only.as_object_mut().unwrap().remove("scope");
-        digest_only["args_digest"] = json!("sha256:abc");
-        assert_eq!(core_refusals(&digest_only), Vec::<String>::new());
+    }
+
+    /// The vectors are trusted only as the exact bytes Prefrontal published:
+    /// an edited or reformatted body could agree with this crate's mirror and
+    /// disagree with core.
+    #[test]
+    fn the_request_vectors_are_the_ones_prefrontal_published() {
+        let root = std::path::Path::new(REQUEST_VECTORS);
+        let manifest = std::fs::read(root.join("SHA256SUMS")).unwrap();
+        assert_eq!(
+            sha256_hex(&manifest),
+            REQUEST_VECTORS_MANIFEST_SHA256,
+            "SHA256SUMS is not the manifest Prefrontal published"
+        );
+        let mut listed = Vec::new();
+        for line in String::from_utf8(manifest).unwrap().lines() {
+            let (expected, name) = line
+                .split_once("  ")
+                .unwrap_or_else(|| panic!("SHA256SUMS line is not `<hash>  <path>`: {line}"));
+            let bytes = std::fs::read(root.join(name))
+                .unwrap_or_else(|error| panic!("{name} is listed but unreadable: {error}"));
+            assert_eq!(
+                sha256_hex(&bytes),
+                expected,
+                "{name} does not match SHA256SUMS"
+            );
+            listed.push(name.to_string());
+        }
+        let mut present = Vec::new();
+        files_under(root, root, &mut present);
+        present.retain(|name| name != "SHA256SUMS");
+        present.sort();
+        listed.sort();
+        assert_eq!(
+            present, listed,
+            "the vector directory holds files SHA256SUMS does not list, or lacks listed ones"
+        );
+    }
+
+    /// Prefrontal's published verdicts on 31 request bodies, against
+    /// `core_verdict`. Every valid card is accepted; every refused body is
+    /// refused with core's code, in a message containing the part of core's
+    /// diagnostic the vector pins. So the mirror the rendered cards are held to
+    /// cannot accept anything core refuses among these bodies, nor refuse
+    /// what core accepts.
+    #[test]
+    fn the_contract_mirror_agrees_with_core_on_every_request_vector() {
+        let read = |path: std::path::PathBuf| -> Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap())
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        };
+        let root = std::path::Path::new(REQUEST_VECTORS);
+        let bodies = |dir: &str| {
+            let mut names: Vec<String> = std::fs::read_dir(root.join(dir))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".json") && !name.ends_with(".expected.json"))
+                .collect();
+            names.sort();
+            names
+        };
+
+        let valid = bodies("valid");
+        for name in &valid {
+            let body = read(root.join("valid").join(name));
+            if let Err(refusal) = core_verdict(&body) {
+                panic!("valid/{name}: core accepts it, the mirror refused it: {refusal}");
+            }
+        }
+
+        let refused = bodies("refused");
+        for name in &refused {
+            let body = read(root.join("refused").join(name));
+            let expected = read(
+                root.join("refused")
+                    .join(name.replace(".json", ".expected.json")),
+            );
+            let refusal = core_verdict(&body).err().unwrap_or_else(|| {
+                panic!("refused/{name}: core refuses it, the mirror accepted it")
+            });
+            assert_eq!(
+                refusal.code, expected["code"],
+                "refused/{name}: wrong refusal code ({refusal})"
+            );
+            let pinned = expected["message_contains"].as_str().unwrap();
+            assert!(
+                refusal.message.contains(pinned),
+                "refused/{name}: `{}` does not contain core's `{pinned}`",
+                refusal.message
+            );
+        }
+        assert_eq!(
+            (valid.len(), refused.len()),
+            (7, 24),
+            "the vector set changed size; check it was updated deliberately"
+        );
     }
 }
 
 /// Every kind of consent card this crate sends, built by the same function
 /// production calls, put through `Elicitor::ask` with the deadline its call
 /// site uses (which is what stamps `expires_in_ms` on the wire), and held to
-/// Prefrontal core's decode contract in [`core_refusals`].
+/// Prefrontal core's decode contract in [`core_verdict`].
 ///
 /// One test per kind, so a card core would refuse is named by the test that
 /// goes red. Each test also pins the urgency the kind was assigned and the
@@ -521,11 +656,9 @@ mod every_card_kind {
     /// that is a nonempty object (never a digest stand-in or prose) and the
     /// MCP answer schema beside the options.
     fn assert_core_accepts(kind: &str, params: &Value) {
-        let refusals = core_refusals(params);
-        assert!(
-            refusals.is_empty(),
-            "{kind}: Prefrontal core would refuse this card: {refusals:?}\n{params:#}"
-        );
+        if let Err(refusal) = core_verdict(params) {
+            panic!("{kind}: Prefrontal core would refuse this card: {refusal}\n{params:#}");
+        }
         assert!(
             params["scope"].as_object().is_some_and(|s| !s.is_empty()),
             "{kind}: scope is not a nonempty object: {}",
