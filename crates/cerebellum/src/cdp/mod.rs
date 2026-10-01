@@ -508,7 +508,8 @@ pub fn parse_json_message(bytes: &[u8]) -> Result<Value, CdpError> {
             bound: MAX_MESSAGE_BYTES,
         });
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| CdpError::InvalidUtf8)?;
+    let bytes = replace_lone_surrogate_escapes(bytes);
+    let text = std::str::from_utf8(&bytes).map_err(|_| CdpError::InvalidUtf8)?;
     let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
     let value = stream
         .next()
@@ -520,10 +521,125 @@ pub fn parse_json_message(bytes: &[u8]) -> Result<Value, CdpError> {
     Ok(value)
 }
 
+/// Replace every `\u` escape of an unpaired UTF-16 surrogate with `\ufffd`.
+///
+/// Chrome writes page strings as UTF-16 and escapes each non-ASCII code unit
+/// as `\uXXXX`. A JavaScript string may hold half of a surrogate pair -- a
+/// page that cut text in the middle of an emoji, say -- and Chrome sends that
+/// half as it is: measured against Chrome 154 (2026-10-01), a button whose
+/// text a script set to `"cut \ud83d"` came back from
+/// `Accessibility.getChildAXNodes` with the name `"cut \ud83d"`
+/// (`examples/handoff_attachment_probe.rs`). Such an escape names no Unicode
+/// character, so serde_json refuses the whole message, and the read waiting
+/// on it failed for as long as the page showed that text.
+///
+/// The replacement character is what the browser itself produces when it
+/// encodes such a string as UTF-8. A surrogate pair, every other escape and
+/// every other byte are left untouched, and both escapes are six bytes long,
+/// so nothing else in the message moves. Anything that is still not valid
+/// JSON afterwards is left for the parser to refuse.
+fn replace_lone_surrogate_escapes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const REPLACEMENT: &[u8; 6] = b"\\ufffd";
+    let mut replaced: Option<Vec<u8>> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        // A backslash and the byte after it are one escape, so the `u` of an
+        // escaped backslash followed by text (`\\ud83d`) is never read as
+        // the start of a `\u` escape.
+        let Some(unit) = escaped_code_unit(bytes, index) else {
+            index += 2;
+            continue;
+        };
+        let lone = match unit {
+            0xD800..=0xDBFF => {
+                if escaped_code_unit(bytes, index + 6)
+                    .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next))
+                {
+                    // A whole pair: step over both halves.
+                    index += 12;
+                    continue;
+                }
+                true
+            }
+            0xDC00..=0xDFFF => true,
+            _ => false,
+        };
+        if lone {
+            replaced.get_or_insert_with(|| bytes.to_vec())[index..index + 6]
+                .copy_from_slice(REPLACEMENT);
+        }
+        index += 6;
+    }
+    match replaced {
+        Some(bytes) => std::borrow::Cow::Owned(bytes),
+        None => std::borrow::Cow::Borrowed(bytes),
+    }
+}
+
+/// The code unit named by a `\uXXXX` escape starting at `at`, if one does.
+fn escaped_code_unit(bytes: &[u8], at: usize) -> Option<u16> {
+    let escape = bytes.get(at..at.checked_add(6)?)?;
+    if escape[0] != b'\\' || escape[1] != b'u' {
+        return None;
+    }
+    let digits = std::str::from_utf8(&escape[2..]).ok()?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(digits, 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_lone_surrogate_escape_parses_as_the_replacement_character() {
+        let parsed = |text: &str| {
+            parse_json_message(text.as_bytes())
+                .map(|value| value["s"].as_str().unwrap().to_string())
+        };
+        // Chrome's own bytes: half of an emoji at the end of a string, and
+        // a low half with nothing before it.
+        assert_eq!(parsed(r#"{"s":"cut \ud83d"}"#).unwrap(), "cut \u{fffd}");
+        assert_eq!(parsed(r#"{"s":"\ude00 x"}"#).unwrap(), "\u{fffd} x");
+        // A high half followed by another high half: only the first is
+        // lone, and the second pairs with the low half after it.
+        assert_eq!(
+            parsed(r#"{"s":"\ud83d\ud83d\ude00"}"#).unwrap(),
+            "\u{fffd}\u{1f600}"
+        );
+        // A high half followed by an escape that is not a low half.
+        assert_eq!(parsed(r#"{"s":"\ud83d\u0041"}"#).unwrap(), "\u{fffd}A");
+        // A pair, an escaped backslash before text that looks like an
+        // escape, and plain text are all read as they were.
+        assert_eq!(parsed(r#"{"s":"\ud83d\ude00"}"#).unwrap(), "\u{1f600}");
+        assert_eq!(parsed(r#"{"s":"\\ud83d"}"#).unwrap(), "\\ud83d");
+        assert_eq!(parsed(r#"{"s":"\\\ud83d"}"#).unwrap(), "\\\u{fffd}");
+        assert_eq!(parsed(r#"{"s":"plain"}"#).unwrap(), "plain");
+        // A malformed escape is still refused.
+        assert_eq!(parsed(r#"{"s":"\ud8"}"#), Err(CdpError::InvalidJson));
+    }
+
+    #[test]
+    fn an_event_with_a_lone_surrogate_does_not_close_the_transport() {
+        let mut cdp = CdpTransport::new();
+        let event = cdp
+            .accept_event(
+                br#"{"method":"DOM.characterDataModified","params":{"nodeId":5,"characterData":"cut \ud83d"},"sessionId":"s"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            event.params.unwrap()["characterData"],
+            json!("cut \u{fffd}")
+        );
+        assert!(!cdp.is_closed());
+    }
 
     #[test]
     fn commands_correlate_out_of_order_and_require_one_terminal_member() {

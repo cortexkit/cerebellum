@@ -2369,8 +2369,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
         let mut matched = None;
         for frame in self.decoder.push(&self.read_buffer[..bytes]) {
-            let value: Value =
-                serde_json::from_slice(&frame).map_err(|_| NavigationDriveError::CdpFailure)?;
+            // The transport's own parser, so a frame is read here exactly as
+            // the transport reads it below; it accepts the unpaired
+            // surrogates Chrome sends for page text that serde_json alone
+            // refuses.
+            let value =
+                crate::cdp::parse_json_message(&frame).map_err(|_| NavigationDriveError::CdpFailure)?;
             if value.get("id").is_some() {
                 let response = self
                     .transport
@@ -6616,5 +6620,169 @@ mod verification_tests {
         assert!(verify(&mut driver).is_err());
         let after = methods(&driver)[before..].to_vec();
         assert_eq!(after, ["Target.closeTarget", "Target.getTargetInfo"]);
+    }
+}
+
+/// Reading a page after a person signed in on it, against a pipe that
+/// answers each command with the bytes Chrome sent for that page.
+#[cfg(test)]
+mod signed_in_page_read_tests {
+    use std::collections::VecDeque;
+    use std::io;
+
+    use super::*;
+
+    const TARGET: &str = "target-own";
+    const SESSION: &str = "session-own";
+    const ROUTE: &str = "route-own";
+
+    /// Answers a command written to it with Chrome's response text, built from
+    /// raw JSON so it can carry what `serde_json` would never write itself.
+    struct ChromeBytesPipe {
+        methods: Vec<String>,
+        reads: VecDeque<Vec<u8>>,
+    }
+
+    impl ChromeBytesPipe {
+        /// The `result` member Chrome answered each command with, and the
+        /// events it sent right after, as raw JSON text.
+        fn answer(method: &str) -> (&'static str, Vec<&'static str>) {
+            match method {
+                "Page.getNavigationHistory" => (
+                    r#"{"currentIndex":1,"entries":[{"id":7,"url":"about:blank","userTypedURL":"about:blank","title":"","transitionType":"auto_toplevel"},{"id":46,"url":"https://x.com/home","userTypedURL":"https://x.com/home","title":"Home","transitionType":"link"}]}"#,
+                    Vec::new(),
+                ),
+                "Page.getFrameTree" => (
+                    r#"{"frameTree":{"frame":{"id":"target-own","loaderId":"E02D954DD0558A31A413AC49B889D821","url":"https://x.com/home","securityOrigin":"https://x.com","mimeType":"text/html"}}}"#,
+                    Vec::new(),
+                ),
+                "Accessibility.getRootAXNode" => (
+                    r#"{"node":{"nodeId":"86","ignored":false,"role":{"type":"internalRole","value":"RootWebArea"},"chromeRole":{"type":"internalRole","value":144},"name":{"type":"computedString","value":"Home"},"properties":[],"childIds":["93"],"backendDOMNodeId":86,"frameId":"target-own"}}"#,
+                    Vec::new(),
+                ),
+                // The page's text holds half of a surrogate pair. These are
+                // the bytes Chrome 154 sent for such a button, recorded by
+                // `examples/handoff_attachment_probe.rs`.
+                "Accessibility.getChildAXNodes" => (
+                    r#"{"nodes":[{"nodeId":"93","ignored":false,"role":{"type":"role","value":"button"},"chromeRole":{"type":"internalRole","value":9},"name":{"type":"computedString","value":"cut \ud83d","sources":[{"type":"relatedElement","attribute":"aria-labelledby"},{"type":"attribute","attribute":"aria-label"},{"type":"relatedElement","nativeSource":"label"},{"type":"contents","value":{"type":"computedString","value":"cut \ud83d"}},{"type":"attribute","attribute":"title","superseded":true}]},"properties":[{"name":"invalid","value":{"type":"token","value":"false"}},{"name":"focusable","value":{"type":"booleanOrUndefined","value":true}}],"parentId":"86","childIds":[],"backendDOMNodeId":93}]}"#,
+                    Vec::new(),
+                ),
+                // Once the DOM domain is on, Chrome reports the page's text
+                // changes, with the same unpaired half in them.
+                "DOM.enable" => (
+                    "{}",
+                    vec![
+                        r#"{"method":"DOM.characterDataModified","params":{"nodeId":94,"characterData":"cut \udc00 again"},"sessionId":"session-own"}"#,
+                    ],
+                ),
+                "DOM.getFlattenedDocument" => (r#"{"nodes":[]}"#, Vec::new()),
+                _ => ("{}", Vec::new()),
+            }
+        }
+    }
+
+    impl CdpPipeIo for ChromeBytesPipe {
+        fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            let method = command["method"].as_str().unwrap().to_string();
+            let (result, events) = Self::answer(&method);
+            let response = format!(
+                r#"{{"id":{},"result":{result},"sessionId":{}}}"#,
+                command["id"], command["sessionId"]
+            );
+            for frame in std::iter::once(response).chain(events.into_iter().map(String::from)) {
+                let mut bytes = frame.into_bytes();
+                bytes.push(0);
+                self.reads.push_back(bytes);
+            }
+            self.methods.push(method);
+            Ok(())
+        }
+
+        fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+            let Some(bytes) = self.reads.pop_front() else {
+                return Ok(PipeRead::WouldBlock);
+            };
+            destination[..bytes.len()].copy_from_slice(&bytes);
+            Ok(PipeRead::Bytes(bytes.len()))
+        }
+    }
+
+    struct StepClock(Instant);
+
+    impl NavigationClock for StepClock {
+        fn now(&mut self) -> Instant {
+            self.0
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.0 += duration;
+        }
+    }
+
+    fn signed_in_driver() -> CdpNavigationDriver<ChromeBytesPipe> {
+        let mut driver = CdpNavigationDriver::new(
+            ChromeBytesPipe {
+                methods: Vec::new(),
+                reads: VecDeque::new(),
+            },
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        );
+        driver
+            .identities
+            .attach(Attachment {
+                target_id: TARGET.into(),
+                session_id: SESSION.into(),
+                frame_ids: Vec::new(),
+                context_key: ROUTE.into(),
+            })
+            .unwrap();
+        driver.attachment = Some(AttachedTarget {
+            target_id: TARGET.into(),
+            session_id: SESSION.into(),
+            context_key: ROUTE.into(),
+        });
+        driver
+    }
+
+    /// `browser.snapshot` reads the committed document, captures the page,
+    /// and reads the committed document again. Every step must succeed on a
+    /// page whose text Chrome sends with an unpaired surrogate half, and the
+    /// half reads as the replacement character.
+    #[test]
+    fn a_page_whose_text_holds_half_a_surrogate_pair_can_still_be_read() {
+        let mut driver = signed_in_driver();
+        let clock = &mut StepClock(Instant::now());
+
+        let before = driver
+            .committed_document_with_clock(ROUTE, 5_000, clock)
+            .expect("committed document before the capture");
+        assert_eq!(before.url, "https://x.com/home");
+        let observation = driver
+            .snapshot_with_clock(
+                ROUTE,
+                SnapshotKind::Actionable,
+                5_000,
+                Some((1, before.url.as_str())),
+                clock,
+            )
+            .expect("the capture reads the page");
+        assert!(
+            observation
+                .records
+                .iter()
+                .any(|record| record.role == "button" && record.name == "cut \u{fffd}"),
+            "{:?}",
+            observation.records
+        );
+        let after = driver
+            .committed_document_with_clock(ROUTE, 5_000, clock)
+            .expect("committed document after the capture");
+        assert_eq!(after, before);
+        assert!(
+            driver.pipe.methods.contains(&"DOM.enable".to_string()),
+            "the read must reach the point where Chrome sends DOM events"
+        );
     }
 }
