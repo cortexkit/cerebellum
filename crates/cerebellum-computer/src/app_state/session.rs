@@ -320,11 +320,14 @@ impl AppStateSessions {
         for old in replaced {
             state.remove_session(&old);
         }
-        state.sessions.entry(key.clone()).or_insert_with(|| Session {
-            entries: BTreeMap::new(),
-            by_hash: HashMap::new(),
-            has_baseline: false,
-        });
+        state
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| Session {
+                entries: BTreeMap::new(),
+                by_hash: HashMap::new(),
+                has_baseline: false,
+            });
         let session = state
             .sessions
             .get_mut(&key)

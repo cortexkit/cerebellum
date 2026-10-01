@@ -223,7 +223,10 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
     replies.push(
         match_target_name(
             "Editor",
-            &[editor("com.example.Editor", 1), editor("org.example.Editor", 2)],
+            &[
+                editor("com.example.Editor", 1),
+                editor("org.example.Editor", 2),
+            ],
         )
         .unwrap_err(),
     );

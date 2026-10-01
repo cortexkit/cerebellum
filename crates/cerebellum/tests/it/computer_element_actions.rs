@@ -206,8 +206,16 @@ fn ids(reply: &Value, field: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("the diff is missing from {reply}"));
     let first_word = |line: &str| line[1..].split_whitespace().next().unwrap().to_string();
     match field {
-        "added" => text.lines().filter(|line| line.starts_with('+')).map(first_word).collect(),
-        "changed" => text.lines().filter(|line| line.starts_with('~')).map(first_word).collect(),
+        "added" => text
+            .lines()
+            .filter(|line| line.starts_with('+'))
+            .map(first_word)
+            .collect(),
+        "changed" => text
+            .lines()
+            .filter(|line| line.starts_with('~'))
+            .map(first_word)
+            .collect(),
         "removed" => text
             .lines()
             .filter_map(|line| line.strip_prefix("Removed element IDs: "))
@@ -322,7 +330,9 @@ async fn pressing_a_session_ending_menu_item_is_refused() {
     assert_eq!(save, (menu_number + 2).to_string(), "{tree}");
     let log_out = (menu_number + 1).to_string();
     assert!(
-        !tree.lines().any(|line| line.trim_start().starts_with(&format!("{log_out} ")))
+        !tree
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{log_out} ")))
             && !tree.contains("Log Out"),
         "{tree}"
     );
@@ -978,7 +988,11 @@ async fn written_and_typed_text_never_reach_the_journal() {
 // Applications by name, and list_apps
 // ---------------------------------------------------------------------------
 
-fn running(name: &str, bundle_identity: &str, pid: u32) -> cerebellum_computer::app_state::source::RunningApp {
+fn running(
+    name: &str,
+    bundle_identity: &str,
+    pid: u32,
+) -> cerebellum_computer::app_state::source::RunningApp {
     cerebellum_computer::app_state::source::RunningApp {
         name: name.into(),
         bundle_identity: bundle_identity.into(),
@@ -1002,11 +1016,26 @@ async fn a_target_name_resolves_to_exactly_one_running_application() {
     let plane = plane(&desk);
     let management = granted_management().await;
 
-    let one = serve(&plane, &management, "computer.read_state", json!({"target": "safari"})).await;
+    let one = serve(
+        &plane,
+        &management,
+        "computer.read_state",
+        json!({"target": "safari"}),
+    )
+    .await;
     assert_eq!(one["outcome"], "completed", "{one}");
-    assert!(one["state_text"].as_str().unwrap().contains(" button Send"), "{one}");
+    assert!(
+        one["state_text"].as_str().unwrap().contains(" button Send"),
+        "{one}"
+    );
 
-    let several = serve(&plane, &management, "computer.read_state", json!({"target": "Editor"})).await;
+    let several = serve(
+        &plane,
+        &management,
+        "computer.read_state",
+        json!({"target": "Editor"}),
+    )
+    .await;
     assert_eq!(several["outcome"], "ambiguous_app", "{several}");
     let candidates: Vec<&str> = several["candidates"]
         .as_array()
@@ -1016,7 +1045,13 @@ async fn a_target_name_resolves_to_exactly_one_running_application() {
         .collect();
     assert_eq!(candidates, vec!["com.example.Editor", "org.example.Editor"]);
 
-    let none = serve(&plane, &management, "computer.type", json!({"target": "Nobody", "text": "x"})).await;
+    let none = serve(
+        &plane,
+        &management,
+        "computer.type",
+        json!({"target": "Nobody", "text": "x"}),
+    )
+    .await;
     assert_eq!(none["outcome"], "no_running_app_named", "{none}");
     assert_eq!(none["target"], "Nobody");
 
@@ -1167,16 +1202,28 @@ async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
         journal_contains(&storage, PLANTED),
         "the scan cannot find the planted marker in the journal, so it proves nothing"
     );
-    assert!(journal_contains(&storage, "app_count"), "the count was not recorded");
+    assert!(
+        journal_contains(&storage, "app_count"),
+        "the count was not recorded"
+    );
     for secret in [SECRET_NAME, SECRET_BUNDLE, "Sw0rdf1sh"] {
-        assert!(!journal_contains(&storage, secret), "{secret} reached the journal");
+        assert!(
+            !journal_contains(&storage, secret),
+            "{secret} reached the journal"
+        );
     }
 
     // An unreadable list is disclosed, never shown as no applications.
     desk.state().running = None;
     let unreadable = serve(&plane, &management, "computer.list_apps", json!({})).await;
     assert_eq!(unreadable["outcome"], "targets_unreadable", "{unreadable}");
-    let invalid = serve(&plane, &management, "computer.list_apps", json!({"target": "Safari"})).await;
+    let invalid = serve(
+        &plane,
+        &management,
+        "computer.list_apps",
+        json!({"target": "Safari"}),
+    )
+    .await;
     assert_eq!(invalid["outcome"], "invalid_request", "{invalid}");
     assert!(plane.result_schema_findings().is_empty());
 }

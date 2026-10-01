@@ -1619,10 +1619,11 @@ pub fn v15_from_v14(v14: &Value, revision: &str) -> Value {
             properties.remove("tree");
             properties.insert("state_text".into(), read_state_text());
             let outcome = properties["outcome"].as_object_mut().unwrap();
-            let description = outcome["description"]
-                .as_str()
-                .unwrap()
-                .replacen(V14_READ_STATE_OUTCOME_START, V15_READ_STATE_OUTCOME_START, 1);
+            let description = outcome["description"].as_str().unwrap().replacen(
+                V14_READ_STATE_OUTCOME_START,
+                V15_READ_STATE_OUTCOME_START,
+                1,
+            );
             outcome.insert("description".into(), json!(description));
             let request = object_mut(row, "/request_schema/properties");
             request.remove("subtree_element_id");

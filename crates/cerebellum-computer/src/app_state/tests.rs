@@ -542,7 +542,9 @@ fn a_truncated_label_is_disclosed() {
     );
     let rendered = render_state(&HEADER, &observed.roots, &StateRequest::default());
     assert!(!rendered.text.contains(&long));
-    assert!(rendered.text.contains(&format!("{}…", "x".repeat(MAX_LABEL_CHARS))));
+    assert!(rendered
+        .text
+        .contains(&format!("{}…", "x".repeat(MAX_LABEL_CHARS))));
     let truncation = rendered.truncation.expect("disclosed");
     assert_eq!(truncation.reason, TruncationReason::LabelTruncated);
 }

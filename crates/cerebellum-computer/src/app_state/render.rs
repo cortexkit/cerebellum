@@ -24,11 +24,6 @@ use std::collections::HashSet;
 use super::session::StateDiff;
 use super::source::{ElementValue, RawElement};
 
-/// The name of the reply field that carries the rendered state. Every reply
-/// that shows state uses this one field, and a host lifts it into a native
-/// text part, so it is named once here rather than spelled at each reply.
-pub const STATE_TEXT_FIELD: &str = "state_text";
-
 /// The longest label or value rendered, in characters. Labels are
 /// application text of any length, and one long document value must not
 /// crowd every other element out of the reply.
@@ -177,7 +172,9 @@ pub fn describe(element: &RawElement) -> ElementDescription {
     let candidates = [
         element.title.as_deref(),
         element.description.as_deref(),
-        (!secure).then_some(element.value_description.as_deref()).flatten(),
+        (!secure)
+            .then_some(element.value_description.as_deref())
+            .flatten(),
         (!secure && !text_input).then_some(string_value).flatten(),
     ];
     let mut parts: Vec<&str> = Vec::new();
@@ -870,7 +867,13 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
 /// Inside a summarised region, only the regions it holds are named, one line
 /// each, and only the large ones are opened further. The rest of a region's
 /// content is what zooming into it shows.
-fn outline_regions(views: &[View<'_>], parent_id: &str, depth: usize, nesting: usize, out: &mut Emitter) {
+fn outline_regions(
+    views: &[View<'_>],
+    parent_id: &str,
+    depth: usize,
+    nesting: usize,
+    out: &mut Emitter,
+) {
     for run in runs(views) {
         let members = &views[run];
         if members.len() > REPEAT_RUN_LIMIT {
@@ -1060,8 +1063,8 @@ fn header(header: &StateHeader<'_>, roots: &[ObservedNode]) -> String {
     if let Some(window) = roots.iter().find(|root| raw_role(root) == "AXWindow") {
         let (title, _) = clipped(&window.description.label, MAX_LABEL_CHARS);
         parts.push(format!("window \"{title}\""));
-        if let Some(url) =
-            find_role(std::slice::from_ref(window), "AXWebArea").and_then(|web| web.description.value.as_deref())
+        if let Some(url) = find_role(std::slice::from_ref(window), "AXWebArea")
+            .and_then(|web| web.description.value.as_deref())
         {
             parts.push(clipped(url, MAX_LABEL_CHARS).0);
         }
@@ -1091,7 +1094,10 @@ pub fn render_state(
     let scope: Vec<View<'_>> = match (request.zoom, target) {
         (Some(_), Some(target)) => build(target, "", true),
         (Some(_), None) => Vec::new(),
-        (None, _) => roots.iter().flat_map(|root| build(root, "", true)).collect(),
+        (None, _) => roots
+            .iter()
+            .flat_map(|root| build(root, "", true))
+            .collect(),
     };
 
     if request.narrows() {
@@ -1193,11 +1199,7 @@ pub fn id_ranges(ids: &[String]) -> String {
         });
         index += 1;
     }
-    parts.extend(
-        ids.iter()
-            .filter(|id| id.parse::<u64>().is_err())
-            .cloned(),
-    );
+    parts.extend(ids.iter().filter(|id| id.parse::<u64>().is_err()).cloned());
     parts.join(", ")
 }
 
@@ -1239,7 +1241,10 @@ pub fn render_diff(
 ) -> RenderedDiff {
     let changed: HashSet<&str> = diff.changed.iter().map(String::as_str).collect();
     let added: HashSet<&str> = diff.added.iter().map(String::as_str).collect();
-    let views: Vec<View<'_>> = roots.iter().flat_map(|root| build(root, "", true)).collect();
+    let views: Vec<View<'_>> = roots
+        .iter()
+        .flat_map(|root| build(root, "", true))
+        .collect();
     let mut found = Vec::new();
     for view in &views {
         collect_changes(view, 0, &changed, &added, &mut found);

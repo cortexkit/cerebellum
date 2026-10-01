@@ -747,7 +747,8 @@ fn v13_only_makes_the_changes_recreated_v12_undoes() {
 fn the_minted_artifact_is_the_generator_output_from_v12() {
     let generated =
         vocabulary_mint::v13_from_v12(&recreated_v12(), historical_revision(13).as_str().unwrap());
-    let generated = vocabulary_mint::v14_from_v13(&generated, historical_revision(14).as_str().unwrap());
+    let generated =
+        vocabulary_mint::v14_from_v13(&generated, historical_revision(14).as_str().unwrap());
     let generated = vocabulary_mint::v15_from_v14(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
@@ -927,10 +928,9 @@ fn recreated_v14() -> Value {
             assert!(properties.remove("candidates").is_some(), "{id}");
             assert!(properties.remove("target").is_some(), "{id}");
             let outcome = properties["outcome"].as_object_mut().unwrap();
-            outcome["enum"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|word| !vocabulary_mint::V15_NAME_OUTCOMES.contains(&word.as_str().unwrap()));
+            outcome["enum"].as_array_mut().unwrap().retain(|word| {
+                !vocabulary_mint::V15_NAME_OUTCOMES.contains(&word.as_str().unwrap())
+            });
             if id != "computer.read_state" {
                 let description = outcome["description"]
                     .as_str()

@@ -101,7 +101,11 @@ mod macos_probe {
         // it, so the probe sees the whole tree rather than the outline.
         let mut tree = String::new();
         let mut truncation: Option<Truncation> = None;
-        for root in observed.roots.iter().filter_map(|root| root.element_id.as_deref()) {
+        for root in observed
+            .roots
+            .iter()
+            .filter_map(|root| root.element_id.as_deref())
+        {
             let rendered = render_state(
                 &StateHeader {
                     app_name: &grant.bundle_identity,

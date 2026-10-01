@@ -128,9 +128,7 @@ impl ComputerCapability {
     pub const fn action_kind(self) -> ActionKind {
         match self {
             Self::Drag | Self::TakeoverDrag => ActionKind::MutateDurable,
-            Self::Screenshot | Self::Wait | Self::ReadState | Self::ListApps => {
-                ActionKind::Observe
-            }
+            Self::Screenshot | Self::Wait | Self::ReadState | Self::ListApps => ActionKind::Observe,
             Self::Click
             | Self::Type
             | Self::Keys

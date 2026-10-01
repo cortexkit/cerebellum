@@ -125,8 +125,9 @@ pub use macos::{
     frontmost_process_id, hardware_uuid, is_off_main_thread, post_event_at_hid_tap_for_measurement,
     post_event_globally, post_event_to_pid, process_owner, process_start_time,
     process_start_time_micros, responsible_process, running_applications,
-    screen_capture_is_permitted, screen_is_locked, CaptureError, CaptureSourceRect, CgEventPostCall,
-    OwnedCgEvent, ProcessOwner, ProcessStartTime, RawCapture, RawWindow, RunningApplication,
+    screen_capture_is_permitted, screen_is_locked, CaptureError, CaptureSourceRect,
+    CgEventPostCall, OwnedCgEvent, ProcessOwner, ProcessStartTime, RawCapture, RawWindow,
+    RunningApplication,
 };
 #[cfg(any(target_os = "macos", test))]
 pub use manual_accessibility::{ManualAccessibility, ManualAccessibilityScope};

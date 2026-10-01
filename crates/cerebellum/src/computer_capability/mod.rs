@@ -18,11 +18,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use cerebellum_computer::app_state::image::{
     release_through_custody, ImageUnavailable, ReleasedImage, WindowImageCapture,
 };
-use cerebellum_computer::app_state::render::{
-    render_state, StateHeader, StateRequest, Zoom, STATE_TEXT_FIELD,
-};
-use cerebellum_computer::app_state::source::RunningApp;
+use cerebellum_computer::app_state::render::{render_state, StateHeader, StateRequest, Zoom};
+// The browser plane's reply field, shared so that both planes' state reaches a
+// host under one key.
+use crate::browser::state_text::STATE_TEXT_FIELD;
 use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage};
+use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
 use cerebellum_computer::app_state::AuditImageCustody;
 use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
@@ -1655,7 +1656,12 @@ where
         rung,
         ObservationState::HumanUnobserved,
     )
-    .dispatch_material(ComputerCapability::ListApps.capability_id().as_bytes().to_vec());
+    .dispatch_material(
+        ComputerCapability::ListApps
+            .capability_id()
+            .as_bytes()
+            .to_vec(),
+    );
     let token = audit
         .commit_dispatched(reservation, &dispatch, b"session_route".to_vec(), None)
         .map_err(|_| ())?;
@@ -1825,7 +1831,10 @@ fn running_apps_text(apps: &[RunningApp]) -> String {
     let mut text = String::new();
     for app in apps {
         let name = cerebellum_computer::app_state::render::one_line(&app.name);
-        text.push_str(&format!("{name} · {} · pid {}", app.bundle_identity, app.pid));
+        text.push_str(&format!(
+            "{name} · {} · pid {}",
+            app.bundle_identity, app.pid
+        ));
         if app.frontmost {
             text.push_str(" · frontmost");
         }

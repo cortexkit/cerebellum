@@ -19,10 +19,12 @@
 
 use std::time::{Duration, Instant};
 
-use cerebellum_computer::app_state::render::{
-    is_session_ending_title, render_diff, STATE_TEXT_FIELD,
-};
+use cerebellum_computer::app_state::render::{is_session_ending_title, render_diff};
 use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
+
+// One reply field name for both planes, so a host lifts browser and computer
+// state into text by the same key.
+use crate::browser::state_text::STATE_TEXT_FIELD;
 use cerebellum_computer::app_state::source::{
     AppStateSource, ElementActionError, ElementFacts, ElementHandle, HitScope, ReadBounds,
     TextAttribute,

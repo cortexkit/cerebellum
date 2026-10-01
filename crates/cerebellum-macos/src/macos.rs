@@ -957,13 +957,17 @@ pub fn running_applications(timeout: Duration) -> Result<Vec<RunningApplication>
     // and the delivery it writes into is kept alive by this frame until the
     // wait below returns.
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
-    let listed = delivery
-        .wait(timeout)
-        .unwrap_or_else(|| Err(format!("the application list did not arrive within {timeout:?}")))?;
+    let listed = delivery.wait(timeout).unwrap_or_else(|| {
+        Err(format!(
+            "the application list did not arrive within {timeout:?}"
+        ))
+    })?;
     Ok(listed
         .into_iter()
         .map(|(pid, bundle_identifier, name)| RunningApplication {
-            regular: i32::try_from(pid).ok().and_then(activation_policy_is_regular),
+            regular: i32::try_from(pid)
+                .ok()
+                .and_then(activation_policy_is_regular),
             pid,
             bundle_identifier,
             name,

@@ -166,9 +166,12 @@ fn post(index: usize) -> RawElement {
     // container's line alone reads the post.
     let summary = format!("{name} Verified account @{handle} {age} {body} {views}");
     let header = tokens.wrap(vec![
-        tokens.link(&format!("{name} Verified account"), &format!("example.com/{handle}")),
+        tokens.link(
+            &format!("{name} Verified account"),
+            &format!("example.com/{handle}"),
+        ),
         tokens.wrap(vec![
-            tokens.link(&format!("@{handle}"), &format!("example.com/{handle}")),
+            tokens.link(&format!("@{handle}"), &format!("example.com/{handle}"))
         ]),
         tokens.link(age, &status),
     ]);
@@ -231,7 +234,10 @@ fn x_timeline_with(selected: usize, posts: &[usize]) -> Vec<RawElement> {
         .with_children(vec![t.text("Your Home Timeline")]);
     let timeline = t
         .titled("AXGroup", "Timeline: Your Home Timeline")
-        .with_children(vec![heading, t.wrap(posts.iter().map(|index| post(*index)).collect())]);
+        .with_children(vec![
+            heading,
+            t.wrap(posts.iter().map(|index| post(*index)).collect()),
+        ]);
     let main = t
         .element("AXGroup")
         .with_subrole("AXLandmarkMain")
@@ -281,7 +287,9 @@ fn bionic_settings() -> Vec<RawElement> {
     let mut saccade = t.titled("AXSlider", "Saccade");
     saccade.value = ElementValue::Number(10.0);
     saccade.value_settable = true;
-    let theme = t.titled("AXPopUpButton", "Theme").with_children(vec![t.text("Theme")]);
+    let theme = t
+        .titled("AXPopUpButton", "Theme")
+        .with_children(vec![t.text("Theme")]);
     let mut shortcut = t.element("AXTextField").described("Shortcut");
     shortcut.value = ElementValue::Text("⌃⌥B".into());
     shortcut.value_settable = true;
@@ -390,16 +398,16 @@ fn dashboard_with(chart_generation: u64) -> Vec<RawElement> {
         .with_subrole("AXLandmarkRegion")
         .described("Cache Diagnostics")
         .with_children(controls);
-    let recent = t
-        .titled("AXList", "Recent Sessions")
-        .with_children(
-            (0..8)
-                .map(|index| {
-                    t.element("AXGroup")
-                        .with_children(vec![t.link(&format!("ses_{index:04}"), &format!("http://localhost:5173/s/{index}"))])
-                })
-                .collect(),
-        );
+    let recent = t.titled("AXList", "Recent Sessions").with_children(
+        (0..8)
+            .map(|index| {
+                t.element("AXGroup").with_children(vec![t.link(
+                    &format!("ses_{index:04}"),
+                    &format!("http://localhost:5173/s/{index}"),
+                )])
+            })
+            .collect(),
+    );
     let chart_tokens = Tokens(std::cell::Cell::new(100_000 + 1_000 * chart_generation));
     let points: Vec<RawElement> = (0..200)
         .map(|index| chart_point(&chart_tokens, index))
@@ -435,7 +443,10 @@ fn dashboard_with(chart_generation: u64) -> Vec<RawElement> {
     vec![window, menu_bar]
 }
 
-fn diff_between(before: Vec<RawElement>, after: Vec<RawElement>) -> (String, Option<super::super::render::Truncation>) {
+fn diff_between(
+    before: Vec<RawElement>,
+    after: Vec<RawElement>,
+) -> (String, Option<super::super::render::Truncation>) {
     let sessions = AppStateSessions::new();
     let raw = |roots| RawAppState {
         roots,
@@ -445,7 +456,9 @@ fn diff_between(before: Vec<RawElement>, after: Vec<RawElement>) -> (String, Opt
     };
     sessions.observe(CONVERSATION, &grant(), &raw(before));
     let mut after = raw(after);
-    after.focused = Some(std::sync::Arc::new(super::super::source::FixtureElementToken(5)));
+    after.focused = Some(std::sync::Arc::new(
+        super::super::source::FixtureElementToken(5),
+    ));
     let observed = sessions.observe(CONVERSATION, &grant(), &after);
     let diff = super::super::render::render_diff(
         &observed.roots,
@@ -467,7 +480,9 @@ fn assert_every_change_is_labelled(diff: &str) {
             "no id leads {line:?}"
         );
         assert!(
-            words.next().is_some_and(|role| role.chars().all(|c| c.is_ascii_lowercase())),
+            words
+                .next()
+                .is_some_and(|role| role.chars().all(|c| c.is_ascii_lowercase())),
             "{line:?} names no role after its id"
         );
     }
@@ -532,7 +547,9 @@ Google Chrome · window \"Synthetic Kestrel Feed\" · https://example.com/home
 fn an_x_post_reads_after_one_zoom() {
     let read = observe(x_timeline());
     let post = find(&read.roots, "Wren Workshop");
-    assert!(outline_of("Google Chrome", &read).contains(&format!("\n    {} group Wren Workshop", id(post))));
+    assert!(
+        outline_of("Google Chrome", &read).contains(&format!("\n    {} group Wren Workshop", id(post)))
+    );
     assert_eq!(zoom_of("Google Chrome", &read, id(post)), X_POST);
 }
 
@@ -646,8 +663,16 @@ fn zoom_lists_the_zoomed_elements_repeated_children_and_the_menu_bar() {
         },
     );
     assert!(menus.zoom_found);
-    assert!(menus.text.contains(" menu bar item File\n"), "{}", menus.text);
-    assert!(menus.text.contains(" menu item File item 8\n"), "{}", menus.text);
+    assert!(
+        menus.text.contains(" menu bar item File\n"),
+        "{}",
+        menus.text
+    );
+    assert!(
+        menus.text.contains(" menu item File item 8\n"),
+        "{}",
+        menus.text
+    );
     assert!(!outline_of("Magic Context Dashboard", &read).contains("menu item"));
 }
 
@@ -754,7 +779,10 @@ fn collapse_keeps_every_actionable_element() {
             check(app, &read, root, &mut checked);
         }
     }
-    assert!(checked > 300, "only {checked} actionable elements were checked");
+    assert!(
+        checked > 300,
+        "only {checked} actionable elements were checked"
+    );
 }
 
 const X_TAB_SWITCH_DIFF: &str = "\
@@ -816,6 +844,9 @@ fn a_diff_past_the_cap_counts_what_it_left_out() {
         "{diff}"
     );
     assert!(diff.contains("\nRemoved element IDs: 50-249\n"), "{diff}");
-    assert!(diff.ends_with("focused: 9 button User Directives\n"), "{diff}");
+    assert!(
+        diff.ends_with("focused: 9 button User Directives\n"),
+        "{diff}"
+    );
     assert_every_change_is_labelled(&diff);
 }
