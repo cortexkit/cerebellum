@@ -1,0 +1,19 @@
+Synthetic Kestrel Feed · example.com/home · snapshot 0123456789abcdef0123456789abcdef · zoom e45
+e45 article Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 3 Likes. 59 views
+  e46 generic
+    e47 link Pebble Post Verified account, Value: example.com/pebble_post
+      e48 text Pebble Post
+      e49 image Verified account
+    e50 link @pebble_post, Value: example.com/pebble_post
+    e52 link 19 minutes ago, Value: example.com/pebble_post/status/1001
+      e53 text 19m
+  e54 generic
+    e55 text A seed swap with
+    e56 link @moss_example, Value: example.com/moss_example
+  e57 group 3 Likes. 59 views
+    e58 button 0 Replies. Reply
+    e59 button 0 reposts. Repost
+    e60 button 3 Likes. Like
+    e61 link 59 views. View post analytics, Value: example.com/pebble_post/status/1001/analytics
+    e62 button Bookmark
+    e63 button Share post

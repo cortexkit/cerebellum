@@ -18,6 +18,7 @@ use crate::classification::{
     NodeIdentityInput, NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
 };
 use crate::coordinate::{InputRect, TransformInputs, ViewportObservation};
+use crate::browser::state_text::{self, NodeFacts};
 use crate::snapshot_store::{
     truncate_ax_field, AxRecord, BackendNodeIdentity, RefRecord, SnapshotKind, SnapshotRef,
     MAX_NAME_BYTES, MAX_REFS, MAX_ROLE_BYTES, MAX_VALUE_BYTES,
@@ -84,6 +85,10 @@ pub struct BrowserSnapshotObservation {
     pub refs: Vec<RefRecord>,
     pub ax_truncated: bool,
     pub refs_truncated: bool,
+    /// What the page text prints beside an element's role and name (its
+    /// states, a link's URL, whether a field holds a credential), keyed by
+    /// ref. Empty for an observation that carries none.
+    pub facts: HashMap<String, NodeFacts>,
 }
 
 /// Browser-reported image bytes and geometry bracketing one visual viewport capture.
@@ -183,6 +188,10 @@ struct RawAxNode {
     child_ids: Vec<String>,
     backend_node_id: Option<u64>,
     frame_id: Option<String>,
+    /// Printable states from the node's `properties`, in [`AX_STATES`] order.
+    states: Vec<String>,
+    /// A link's absolute URL, from its `url` property.
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1656,16 +1665,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
 
         if mode == SnapshotKind::Actionable {
-            let nodes = snapshot_dom
+            // Without the DOM the page text still prints every element; it
+            // only loses field values and placeholders, which stay withheld.
+            if let Some(nodes) = snapshot_dom
                 .as_ref()
-                .and_then(|result| result.as_ref().ok());
-            render_actionable(
-                &mut observation,
-                nodes.map(Vec::as_slice).unwrap_or(&[]),
-                classification_context,
-            );
-            if nodes.is_none() {
-                observation.ax_truncated = true;
+                .and_then(|result| result.as_ref().ok())
+            {
+                collect_dom_facts(
+                    &mut observation,
+                    nodes,
+                    classification_context.map(|(_, url)| url),
+                );
             }
         }
         if mode == SnapshotKind::DomFull {
@@ -3215,6 +3225,7 @@ impl RawAxNode {
                     .to_string(),
             ),
         };
+        let (states, url) = ax_states_and_url(object.get("properties"));
         Ok(Self {
             node_id,
             ignored,
@@ -3224,8 +3235,59 @@ impl RawAxNode {
             child_ids,
             backend_node_id,
             frame_id,
+            states,
+            url,
         })
     }
+}
+
+/// The accessibility states the page text prints, in the order it prints
+/// them. Others (focusable, settable, live-region settings, relations) describe
+/// how the page is built rather than what a reader sees.
+const AX_STATES: [&str; 10] = [
+    "focused", "disabled", "checked", "pressed", "selected", "expanded", "required",
+    "invalid", "readonly", "modal",
+];
+
+/// Read the printable states and a link's URL from a node's `properties`.
+///
+/// Lenient on purpose: a property of a shape this does not know is skipped
+/// rather than failing the snapshot, because these only decorate a line and
+/// Chrome adds properties over time.
+fn ax_states_and_url(properties: Option<&Value>) -> (Vec<String>, Option<String>) {
+    let mut found: HashMap<&str, String> = HashMap::new();
+    let mut url = None;
+    for property in properties.and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = property.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let value = property.get("value").and_then(|value| value.get("value"));
+        let text = match value {
+            Some(Value::Bool(value)) => value.to_string(),
+            Some(Value::String(value)) => value.clone(),
+            _ => continue,
+        };
+        if name == "url" {
+            url = Some(text).filter(|url| !url.is_empty() && url.len() <= 4_096);
+            continue;
+        }
+        let state = match (name, text.as_str()) {
+            ("checked" | "pressed", "mixed") => "mixed".to_string(),
+            ("expanded", "false") => "collapsed".to_string(),
+            ("invalid", "false") => continue,
+            ("invalid", _) => "invalid".to_string(),
+            (_, "true") => name.to_string(),
+            _ => continue,
+        };
+        if let Some(known) = AX_STATES.iter().find(|known| **known == name) {
+            found.insert(known, state);
+        }
+    }
+    let states = AX_STATES
+        .iter()
+        .filter_map(|name| found.remove(name))
+        .collect();
+    (states, url)
 }
 
 fn ax_value_text(value: Option<&Value>) -> Option<String> {
@@ -3270,6 +3332,7 @@ where
     let mut refs = Vec::new();
     let mut fallback_counts: HashMap<(Vec<String>, String, String), u64> = HashMap::new();
     let mut node_cache = HashMap::<String, RawAxNode>::new();
+    let mut facts = HashMap::new();
     let mut processed = 0usize;
     let mut ax_truncated = false;
     let mut refs_truncated = false;
@@ -3331,6 +3394,16 @@ where
                         classification: Err(ClassificationUnavailable::NotCaptured),
                     });
                     *nth = nth.saturating_add(1);
+                    if !node.states.is_empty() || node.url.is_some() {
+                        facts.insert(
+                            ref_name.clone(),
+                            NodeFacts {
+                                states: node.states.clone(),
+                                url: node.url.clone(),
+                                ..NodeFacts::default()
+                            },
+                        );
+                    }
                     reference = Some(ref_name);
                 }
             }
@@ -3447,6 +3520,7 @@ where
         refs,
         ax_truncated,
         refs_truncated,
+        facts,
     })
 }
 
@@ -3518,255 +3592,82 @@ impl NavigationClock for SystemNavigationClock {
     }
 }
 
-fn actionable_landmark(node: &RawDomNode) -> Option<&str> {
-    match node
+/// Whether a form field holds a credential or payment value: a password
+/// input, a field whose autocomplete names a username, password, one-time code
+/// or card detail, or one whose name or id says so. The page text never prints
+/// such a field's value.
+fn credential_or_payment_field(node: &RawDomNode) -> bool {
+    let input_type = node
         .attributes
-        .get("role")
+        .get("type")
         .map(String::as_str)
-        .unwrap_or(&node.local_name)
-    {
-        "main" => Some("main"),
-        "nav" | "navigation" => Some("navigation"),
-        "form" => Some("form"),
-        "header" | "banner" => Some("banner"),
-        "footer" | "contentinfo" => Some("contentinfo"),
-        "aside" | "complementary" => Some("complementary"),
-        "section" | "region" => Some("region"),
-        _ => None,
-    }
+        .unwrap_or("text");
+    input_type.eq_ignore_ascii_case("password")
+        || node.attributes.get("autocomplete").is_some_and(|tokens| {
+            tokens.split_ascii_whitespace().any(|token| {
+                let token = token.to_ascii_lowercase();
+                matches!(
+                    token.as_str(),
+                    "username" | "current-password" | "new-password" | "one-time-code"
+                ) || token.starts_with("cc-")
+            })
+        })
+        || ["name", "id"]
+            .iter()
+            .filter_map(|key| node.attributes.get(*key))
+            .any(|name| {
+                let name = name.to_ascii_lowercase();
+                [
+                    "password", "passwd", "secret", "token", "card", "cvv", "cvc", "iban",
+                ]
+                .iter()
+                .any(|token| name.contains(token))
+            })
 }
 
-/// Keep the DOM-backed controls in document order, with landmark membership
-/// explicit so repeated navigation and form labels remain distinguishable.
-fn render_actionable(
+/// Add what only the DOM knows to each ref's facts: whether a field is a
+/// credential or payment field, its placeholder, and a link's target when
+/// Chrome did not report one.
+///
+/// Every element whose DOM node is found gets a credential verdict, so the
+/// page text can print a field's value only when the verdict is "no"; an
+/// element the DOM read missed keeps none and its value stays withheld.
+fn collect_dom_facts(
     observation: &mut BrowserSnapshotObservation,
     nodes: &[RawDomNode],
-    classification_context: Option<(u64, &str)>,
+    page_url: Option<&str>,
 ) {
     let by_backend: HashMap<_, _> = nodes
         .iter()
-        .enumerate()
-        .map(|(i, n)| (n.backend_node_id, i))
+        .map(|node| (node.backend_node_id, node))
         .collect();
-    let by_id: HashMap<_, _> = nodes.iter().map(|n| (n.node_id, n)).collect();
-    let landmark = actionable_landmark;
-    // Unnamed forms are often ignored by AX, but still own their controls.
-    // Give those DOM landmarks real backend refs rather than dangling groups.
-    for node in nodes.iter().filter(|node| landmark(node).is_some()) {
-        if observation.refs.iter().any(|r| {
-            r.backend_identity
-                .as_ref()
-                .is_some_and(|id| id.backend_node_id == node.backend_node_id)
-        }) {
-            continue;
-        }
-        if observation.refs.len() == MAX_REFS {
-            observation.refs_truncated = true;
-            observation.ax_truncated = true;
-            break;
-        }
-        let identity = observation
-            .refs
-            .iter()
-            .filter_map(|r| r.backend_identity.as_ref())
-            .find(|id| {
-                let mut current = by_backend.get(&id.backend_node_id).map(|i| &nodes[*i]);
-                let mut seen = HashSet::new();
-                while let Some(child) = current {
-                    if !seen.insert(child.node_id) {
-                        break;
-                    }
-                    if child.node_id == node.node_id {
-                        return true;
-                    }
-                    current = child.parent_id.and_then(|id| by_id.get(&id).copied());
-                }
-                false
-            })
-            .or_else(|| {
-                observation
-                    .refs
-                    .iter()
-                    .find_map(|r| r.backend_identity.as_ref())
-            })
-            .cloned();
-        let Some(mut identity) = identity else {
-            continue;
-        };
-        identity.backend_node_id = node.backend_node_id;
-        let role = landmark(node).unwrap().to_string();
-        let name = bounded_ax_field(
-            node.attributes
-                .get("aria-label")
-                .map(String::as_str)
-                .unwrap_or(""),
-            MAX_NAME_BYTES,
-        )
-        .0;
-        let reference = format!("e{}", observation.refs.len() + 1);
-        let classification = classification_context
-            .ok_or(ClassificationUnavailable::NotCaptured)
-            .and_then(|(epoch, url)| {
-                let origin = document_origin(url)?;
-                build_non_type_classification(nodes, &identity, epoch, &origin).map(Box::new)
-            });
-        observation.refs.push(RefRecord {
-            captured: SnapshotRef::new(&reference, &role, &name, 0).expect("bounded landmark"),
-            frame_path: vec![identity.frame_id.clone()],
-            backend_identity: Some(identity),
-            raw_role: Some(role.clone()),
-            raw_name: Some(name.clone()),
-            classification,
-        });
-        observation.records.push(AxRecord {
-            depth: 0,
-            role,
-            name,
-            value: None,
-            reference: Some(reference),
-        });
-    }
-    let mut rows = Vec::new();
-    let mut retained = HashSet::new();
-    for (record_index, record) in observation.records.iter().enumerate() {
-        let Some(reference) = record.reference.as_ref() else {
-            continue;
-        };
-        let Some(captured) = observation
-            .refs
-            .iter()
-            .find(|r| &r.captured.reference == reference)
+    for reference in &observation.refs {
+        let Some(node) = reference
+            .backend_identity
+            .as_ref()
+            .and_then(|identity| by_backend.get(&identity.backend_node_id))
         else {
             continue;
         };
-        let node_index = captured
-            .backend_identity
-            .as_ref()
-            .and_then(|id| by_backend.get(&id.backend_node_id))
-            .copied();
-        let node = node_index.map(|i| &nodes[i]);
-        let region = node.and_then(landmark).or(match record.role.as_str() {
-            "main" | "navigation" | "form" | "banner" | "contentinfo" | "complementary"
-            | "region" => Some(record.role.as_str()),
-            _ => None,
-        });
-        let is_control = matches!(
-            record.role.as_str(),
-            "link"
-                | "button"
-                | "textbox"
-                | "searchbox"
-                | "combobox"
-                | "listbox"
-                | "checkbox"
-                | "radio"
-                | "slider"
-                | "spinbutton"
-                | "switch"
-                | "heading"
-        ) || node.is_some_and(|n| {
-            matches!(
-                n.local_name.as_str(),
-                "a" | "button" | "input" | "select" | "textarea"
-            )
-        });
-        if region.is_none() && !is_control {
-            continue;
-        }
-        let mut row = serde_json::json!({"ref":reference,"role":region.unwrap_or(&record.role),"name":record.name});
-        if let Some(node) = node {
-            if let Some(href) = node.attributes.get("href") {
-                row["href"] = Value::String(href.clone());
-            }
-            let mut parent = node.parent_id;
-            let mut visited = HashSet::new();
-            while let Some(ancestor) = parent.and_then(|id| by_id.get(&id).copied()) {
-                if !visited.insert(ancestor.node_id) {
-                    break;
-                }
-                if let Some(role) = landmark(ancestor) {
-                    row["landmark"] = Value::String(format!("{}:{}", role, ancestor.node_id));
-                    break;
-                }
-                parent = ancestor.parent_id;
-            }
-            if let Some(region) = region {
-                row["group"] = Value::String(format!("{}:{}", region, node.node_id));
-            }
-            if matches!(node.local_name.as_str(), "input" | "textarea" | "select") {
-                let input_type = node
-                    .attributes
-                    .get("type")
-                    .map(String::as_str)
-                    .unwrap_or("text");
-                row["type"] = Value::String(input_type.into());
-                if let Some(name) = node.attributes.get("name") {
-                    row["input_name"] = Value::String(name.clone());
-                }
-                let sensitive = input_type.eq_ignore_ascii_case("password")
-                    || node.attributes.get("autocomplete").is_some_and(|tokens| {
-                        tokens.split_ascii_whitespace().any(|token| {
-                            matches!(
-                                token.to_ascii_lowercase().as_str(),
-                                "username" | "current-password" | "new-password" | "one-time-code"
-                            ) || token.to_ascii_lowercase().starts_with("cc-")
-                        })
-                    })
-                    || ["name", "id"]
-                        .iter()
-                        .filter_map(|key| node.attributes.get(*key))
-                        .any(|name| {
-                            let name = name.to_ascii_lowercase();
-                            [
-                                "password", "passwd", "secret", "token", "card", "cvv", "cvc",
-                                "iban",
-                            ]
-                            .iter()
-                            .any(|token| name.contains(token))
-                        });
-                if !sensitive {
-                    if let Some(value) = record.value.as_ref() {
-                        row["value"] = Value::String(value.clone());
-                    }
-                }
+        let facts = observation
+            .facts
+            .entry(reference.captured.reference.clone())
+            .or_default();
+        facts.credential = Some(credential_or_payment_field(node));
+        facts.placeholder = node
+            .attributes
+            .get("placeholder")
+            .filter(|placeholder| !placeholder.trim().is_empty())
+            .map(|placeholder| truncate_ax_field(placeholder, MAX_NAME_BYTES));
+        if facts.url.is_none() && matches!(node.local_name.as_str(), "a" | "area") {
+            if let (Some(href), Some(page_url)) = (node.attributes.get("href"), page_url) {
+                facts.url = Some(truncate_ax_field(
+                    &state_text::resolve_href(href, page_url),
+                    MAX_NAME_BYTES,
+                ));
             }
         }
-        if region.is_some() {
-            let excerpt = observation.records[record_index + 1..]
-                .iter()
-                .take_while(|r| r.depth > record.depth)
-                .filter(|r| r.role == "StaticText")
-                .map(|r| r.name.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            row["excerpt"] = Value::String(bounded_ax_field(&excerpt, 240).0);
-        }
-        retained.insert(reference.clone());
-        // FlattenedDocument can list descendants before their parents. A
-        // root-to-node path preserves sibling order while placing each group
-        // before its children, independent of that CDP serialization order.
-        let mut order = vec![node_index.unwrap_or(nodes.len() + record_index)];
-        let mut parent = node.and_then(|node| node.parent_id);
-        let mut visited = HashSet::new();
-        while let Some(ancestor) = parent.and_then(|id| by_id.get(&id).copied()) {
-            if !visited.insert(ancestor.node_id) {
-                break;
-            }
-            order.push(by_backend[&ancestor.backend_node_id]);
-            parent = ancestor.parent_id;
-        }
-        order.reverse();
-        rows.push((order, row));
     }
-    rows.sort_by(|(a, _), (b, _)| a.cmp(b));
-    observation.dom_text = Some(
-        rows.into_iter()
-            .map(|(_, row)| format!("{row}\n"))
-            .collect(),
-    );
-    observation
-        .refs
-        .retain(|r| retained.contains(&r.captured.reference));
 }
 
 #[cfg(test)]
@@ -4301,8 +4202,20 @@ mod tests {
             )
             .await
             .unwrap();
+        // A snapshot keeps only the refs its text names, so the text lists
+        // every ref handed in.
+        let records: Vec<AxRecord> = refs
+            .iter()
+            .map(|record| AxRecord {
+                depth: 0,
+                role: record.captured.role.clone(),
+                name: record.captured.name.clone(),
+                value: None,
+                reference: Some(record.captured.reference.clone()),
+            })
+            .collect();
         let retained = plane
-            .retain_text_snapshot(&route, SnapshotKind::Ax, &[], None, refs, 4096, None)
+            .retain_text_snapshot(&route, SnapshotKind::Ax, &records, None, refs, 4096, None)
             .await
             .unwrap();
         plane
@@ -5375,147 +5288,284 @@ mod tests {
             .all(|write| write["method"] != "Input.dispatchMouseEvent"));
     }
 
-    fn actionable_fixture() -> BrowserSnapshotObservation {
-        let mut password = ax_node("password", "textbox", "Password", &[], 60, None);
-        password["value"] = json!({"type":"string", "value":"secret-password-value"});
-        let mut normal = ax_node("query", "textbox", "Query", &[], 70, None);
-        normal["value"] = json!({"type":"string", "value":"visible-query"});
-        let mut payment = ax_node("payment", "textbox", "Card", &[], 80, None);
-        payment["value"] = json!({"type":"string", "value":"secret-payment-value"});
-        let mut form = ax_node(
-            "form",
-            "form",
-            "Search",
-            &[
-                "password", "query", "payment", "heading", "select", "button",
-            ],
-            50,
-            None,
-        );
-        form["ignored"] = json!(true);
-        let frames = [
+    /// Turn a recorded page fixture into the CDP replies a real capture of
+    /// that page receives, and run the real snapshot over them.
+    ///
+    /// A fixture is a nested accessibility tree whose nodes may carry a DOM
+    /// tag and attributes, a value, and AX properties. Node `i` in document
+    /// order gets AX id `n{i}` and backend id `i + 1`; the root is in
+    /// `frame-main`. Replies are queued in the order the traversal asks: the
+    /// root, then each node's children in document order, then the DOM read.
+    fn fixture_observation(fixture: &str) -> (BrowserSnapshotObservation, String) {
+        fn flatten(node: &Value, parent: Option<usize>, out: &mut Vec<(Value, Option<usize>, Vec<usize>)>) {
+            let index = out.len();
+            out.push((node.clone(), parent, Vec::new()));
+            for child in node["children"].as_array().into_iter().flatten() {
+                let child_index = out.len();
+                out[index].2.push(child_index);
+                flatten(child, Some(index), out);
+            }
+        }
+        let fixture: Value = serde_json::from_str(fixture).unwrap();
+        let url = fixture["url"].as_str().unwrap().to_string();
+        let mut nodes = Vec::new();
+        flatten(&fixture["tree"], None, &mut nodes);
+        let ax = |index: usize| -> Value {
+            let (node, _, children) = &nodes[index];
+            let mut value = json!({
+                "nodeId": format!("n{index}"),
+                "ignored": node["ignored"].as_bool().unwrap_or(false),
+                "role": {"type": "role", "value": node["role"]},
+                "name": {"type": "computedString", "value": node["name"].as_str().unwrap_or("")},
+                "childIds": children.iter().map(|child| format!("n{child}")).collect::<Vec<_>>(),
+                "backendDOMNodeId": index + 1,
+            });
+            if index == 0 {
+                value["frameId"] = json!("frame-main");
+            }
+            if let Some(text) = node.get("value") {
+                value["value"] = json!({"type": "string", "value": text});
+            }
+            if let Some(properties) = node["props"].as_object() {
+                value["properties"] = properties
+                    .iter()
+                    .map(|(name, property)| {
+                        let kind = if property.is_boolean() { "boolean" } else { "token" };
+                        json!({"name": name, "value": {"type": kind, "value": property}})
+                    })
+                    .collect();
+            }
+            value
+        };
+        let mut frames = vec![
             json!({"id":1,"sessionId":"session-own","result":{}}),
-            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Settings", &["nav","form"],10,Some("frame-main"))}}),
-            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
-                ax_node("nav","navigation","Navigation", &["link1","link2","text"],20,None),
-                form
-            ]}}),
-            json!({"id":4,"sessionId":"session-own","result":{"nodes":[
-                ax_node("link1","link","Home", &[],30,None), ax_node("link2","link","Apps", &[],40,None),
-                ax_node("text","StaticText","Manage installed applications", &[],35,None)
-            ]}}),
-            json!({"id":5,"sessionId":"session-own","result":{"nodes":[password,normal,payment,
-                ax_node("heading","heading","Options", &[],90,None),
-                ax_node("select","combobox","Scope", &[],100,None),
-                ax_node("button","button","Search", &[],110,None)
-            ]}}),
-            json!({"id":6,"sessionId":"session-own","result":{}}),
-            json!({"id":7,"sessionId":"session-own","result":{"nodes":[
-                flattened_dom_node(3,Some(2),30,"a", &["href","/home"]),
-                flattened_dom_node(4,Some(2),40,"a", &["href","/apps"]),
-                flattened_dom_node(2,Some(1),20,"nav", &[]),
-                flattened_dom_node(6,Some(5),60,"input", &["type","password","name","password"]),
-                flattened_dom_node(7,Some(5),70,"input", &["type","search","name","q"]),
-                flattened_dom_node(8,Some(5),80,"input", &["autocomplete","cc-number"]),
-                flattened_dom_node(9,Some(5),90,"h2", &[]),
-                flattened_dom_node(10,Some(5),100,"select", &["name","scope"]),
-                flattened_dom_node(11,Some(5),110,"button", &[]),
-                flattened_dom_node(5,Some(1),50,"form", &[]),
-                flattened_dom_node(1,None,10,"html", &[])
-            ]}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax(0)}}),
         ];
-        attached_driver(frames)
+        for (_, _, children) in &nodes {
+            if !children.is_empty() {
+                let id = frames.len() + 1;
+                let replies: Vec<Value> = children.iter().map(|child| ax(*child)).collect();
+                frames.push(json!({"id":id,"sessionId":"session-own","result":{"nodes":replies}}));
+            }
+        }
+        let dom: Vec<Value> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (node, parent, _))| {
+                let attributes: Vec<&str> = node["attrs"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(name, value)| [name.as_str(), value.as_str().unwrap()])
+                    .collect();
+                flattened_dom_node(
+                    index as u64 + 1,
+                    parent.map(|parent| parent as u64 + 1),
+                    index as u64 + 1,
+                    node["tag"].as_str().unwrap_or("div"),
+                    &attributes,
+                )
+            })
+            .collect();
+        let id = frames.len() + 1;
+        frames.push(json!({"id":id,"sessionId":"session-own","result":{}}));
+        frames.push(json!({"id":id + 1,"sessionId":"session-own","result":{"nodes":dom}}));
+        let observation = attached_driver(frames)
             .snapshot_with_clock(
                 "route-own",
                 SnapshotKind::Actionable,
                 1000,
-                Some((7, PAGE_URL)),
+                Some((7, &url)),
                 &mut FakeClock::new(),
             )
+            .unwrap();
+        (observation, url)
+    }
+
+    const X_LIKE: &str = include_str!("fixtures/x_like_page.json");
+    const SETTINGS_LIKE: &str = include_str!("fixtures/settings_like_page.json");
+
+    fn render_fixture(
+        observation: &BrowserSnapshotObservation,
+        url: &str,
+        zoom: Option<&str>,
+        max_bytes: usize,
+    ) -> state_text::RenderedState {
+        state_text::render(&state_text::RenderInput {
+            records: &observation.records,
+            facts: &observation.facts,
+            page_url: url,
+            snapshot_id: "0123456789abcdef0123456789abcdef",
+            zoom: zoom.map(|reference| state_text::Zoom {
+                requested: reference,
+                target: Some(reference),
+            }),
+            max_bytes,
+        })
+    }
+
+    /// The ref of the first record with `role` (and `name`, when given).
+    fn ref_of(observation: &BrowserSnapshotObservation, role: &str, name: Option<&str>) -> String {
+        observation
+            .records
+            .iter()
+            .find(|record| record.role == role && name.is_none_or(|name| record.name == name))
+            .and_then(|record| record.reference.clone())
             .unwrap()
     }
 
     #[test]
-    fn actionable_snapshot_omits_credential_and_payment_values() {
-        let observation = actionable_fixture();
-        let text = observation.dom_text.unwrap();
-        assert!(!text.contains("secret-password-value"));
-        assert!(!text.contains("secret-payment-value"));
-        assert!(text.contains("visible-query"));
-        let rows: Vec<Value> = text
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert!(rows
-            .iter()
-            .filter(|row| row["name"] == "Password" || row["name"] == "Card")
-            .all(|row| row.get("value").is_none()));
+    fn x_like_outline_and_zoom_match_their_golden_text() {
+        let (observation, url) = fixture_observation(X_LIKE);
+        let outline = render_fixture(&observation, &url, None, 65_536).text;
+        assert_eq!(outline, include_str!("fixtures/x_like_outline.txt"));
+        // The outline of a timeline page stays small...
+        assert!(outline.len() < 3 * 1024, "{} bytes", outline.len());
+        // ...and one zoom on a post (an article named in the outline) reads it.
+        let article = ref_of(&observation, "article", None);
+        assert!(outline.contains(&format!("{article} article Pebble Post")));
+        let zoomed = render_fixture(&observation, &url, Some(&article), 65_536).text;
+        assert_eq!(zoomed, include_str!("fixtures/x_like_zoom_article.txt"));
+        assert!(zoomed.contains("text A seed swap with"), "{zoomed}");
+        assert!(zoomed.contains("@moss_example, Value: example.com/moss_example"), "{zoomed}");
     }
 
     #[test]
-    fn actionable_snapshot_links_have_hrefs_and_refs_drive_real_click() {
-        let observation = actionable_fixture();
-        let text = observation.dom_text.as_ref().unwrap();
-        assert!(text.len() < 2000);
-        let rows: Vec<Value> = text
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(
-            rows.iter()
-                .map(|r| r["role"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            [
-                "navigation",
-                "link",
-                "link",
-                "form",
-                "textbox",
-                "textbox",
-                "textbox",
-                "heading",
-                "combobox",
-                "button"
-            ]
+    fn settings_like_outline_and_zoom_match_their_golden_text() {
+        let (observation, url) = fixture_observation(SETTINGS_LIKE);
+        let outline = render_fixture(&observation, &url, None, 65_536).text;
+        assert_eq!(outline, include_str!("fixtures/settings_like_outline.txt"));
+        let form = ref_of(&observation, "form", Some("Change password"));
+        let zoomed = render_fixture(&observation, &url, Some(&form), 65_536).text;
+        assert_eq!(zoomed, include_str!("fixtures/settings_like_zoom_form.txt"));
+    }
+
+    #[test]
+    fn a_small_budget_keeps_posts_before_the_sidebar() {
+        let (observation, url) = fixture_observation(X_LIKE);
+        let outline = render_fixture(&observation, &url, None, 65_536).text;
+        // The full outline has both the posts and the sidebar...
+        assert!(outline.contains("article Paper Kite Club"), "{outline}");
+        assert!(outline.contains("complementary Trending"), "{outline}");
+        // ...and the posts are listed before it.
+        assert!(outline.find("article Paper Kite") < outline.find("complementary Trending"));
+
+        // A budget that cannot hold both keeps the posts and cuts the
+        // sidebar, and the last line says so.
+        let cut = render_fixture(&observation, &url, None, 1_200);
+        assert!(cut.text.len() <= 1_200, "{}", cut.text);
+        assert!(cut.text.contains("article Paper Kite Club"), "{}", cut.text);
+        assert!(!cut.text.contains("complementary Trending"), "{}", cut.text);
+        assert!(!cut.printed_refs.contains(&ref_of(&observation, "searchbox", None)));
+        assert!(
+            cut.text.ends_with("complementary e100 (all); zoom one of them or raise max_bytes]\n"),
+            "{}",
+            cut.text
         );
-        assert_eq!(rows[0]["excerpt"], "Manage installed applications");
-        assert!(rows[4..]
-            .iter()
-            .all(|row| row["landmark"] == rows[3]["group"]));
-        assert_eq!(rows[5]["input_name"], "q");
-        let links: Vec<_> = rows.iter().filter(|r| r["role"] == "link").collect();
-        assert_eq!(
-            links
+
+        // The whole page zoomed is in document order, navigation first, yet a
+        // cut still spends the budget on the posts and drops the chrome.
+        let root = ref_of(&observation, "RootWebArea", None);
+        let page = render_fixture(&observation, &url, Some(&root), 3_000);
+        assert!(page.text.len() <= 3_000, "{}", page.text);
+        assert!(page.text.contains("text A seed swap with"), "{}", page.text);
+        assert!(page.text.contains("Curious about balcony gardening?"), "{}", page.text);
+        assert!(!page.text.contains("Who to follow"), "{}", page.text);
+        assert!(!page.text.contains("link Explore"), "{}", page.text);
+        assert!(page.text.contains("banner e3 (all)"), "{}", page.text);
+    }
+
+    #[test]
+    fn every_actionable_ref_appears_in_a_full_zoom() {
+        for fixture in [X_LIKE, SETTINGS_LIKE] {
+            let (observation, url) = fixture_observation(fixture);
+            let root = ref_of(&observation, "RootWebArea", None);
+            let page = render_fixture(&observation, &url, Some(&root), 262_144);
+            let actionable: Vec<&str> = observation
+                .records
                 .iter()
-                .map(|r| r["href"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["/home", "/apps"]
-        );
-        assert!(links.iter().all(|r| r["landmark"] == rows[0]["group"]));
-        for row in &rows {
-            assert!(observation
-                .refs
-                .iter()
-                .any(|r| r.captured.reference == row["ref"] && r.backend_identity.is_some()));
+                .filter(|record| {
+                    matches!(
+                        record.role.as_str(),
+                        "link" | "button" | "textbox" | "searchbox" | "combobox" | "checkbox"
+                            | "tab" | "MenuListOption"
+                    )
+                })
+                .filter_map(|record| record.reference.as_deref())
+                .collect();
+            assert!(actionable.len() > 10, "{actionable:?}");
+            for reference in actionable {
+                assert!(
+                    page.printed_refs.contains(reference)
+                        && page.text.lines().any(|line| line.trim_start().starts_with(&format!("{reference} "))),
+                    "{reference} missing from\n{}",
+                    page.text
+                );
+            }
         }
-        let id = new_snapshot_id("actionable-click");
+    }
+
+    #[test]
+    fn credential_and_payment_values_never_print() {
+        let (observation, url) = fixture_observation(SETTINGS_LIKE);
+        let root = ref_of(&observation, "RootWebArea", None);
+        let old_password = ref_of(&observation, "textbox", Some("Old password"));
+        // Chrome's inner editor holds the password again as text; a zoom on
+        // it shows the field instead.
+        let inner_text = ref_of(&observation, "StaticText", Some("hunter2-planted"));
+        let texts = [
+            render_fixture(&observation, &url, None, 65_536).text,
+            render_fixture(&observation, &url, Some(&root), 65_536).text,
+            render_fixture(&observation, &url, Some(&old_password), 65_536).text,
+            render_fixture(&observation, &url, Some(&inner_text), 65_536).text,
+        ];
+        for text in &texts {
+            for secret in ["hunter2-planted", "s3cret-new-value", "octocat-private", "4111111111111111"] {
+                assert!(!text.contains(secret), "{secret} printed in\n{text}");
+            }
+        }
+        // Values do print where the field is ordinary, so the checks above
+        // are not passing for want of any value at all.
+        assert!(texts[1].contains("textbox Backup email, Value: octo@example.com"), "{}", texts[1]);
+        assert!(texts[1].contains("(credential field) Old password"), "{}", texts[1]);
+        assert!(texts[3].contains(&format!("zoom {old_password}")), "{}", texts[3]);
+    }
+
+    #[test]
+    fn a_ref_from_the_page_text_resolves_and_drives_a_real_click() {
+        let (observation, url) = fixture_observation(X_LIKE);
+        let article = ref_of(&observation, "article", None);
+        let zoomed = render_fixture(&observation, &url, Some(&article), 65_536);
+        // Take the post's timestamp link as printed, the way a caller would.
+        let line = zoomed
+            .text
+            .lines()
+            .find(|line| line.contains("link 19 minutes ago"))
+            .unwrap();
+        let reference = line.split_whitespace().next().unwrap();
+        let id = new_snapshot_id("page-text-click");
         let mut store = BrowserSnapshotStore::new(1).unwrap();
+        let printed: Vec<_> = observation
+            .refs
+            .iter()
+            .filter(|record| zoomed.printed_refs.contains(&record.captured.reference))
+            .cloned()
+            .collect();
         store
             .retain_text(TextSnapshot {
                 snapshot_id: id.clone(),
                 kind: SnapshotKind::Actionable,
                 document_epoch: 7,
-                source_origin: PAGE_URL.into(),
+                source_origin: url.clone(),
                 source_document: None,
-                content_schema: crate::snapshot_store::ACTIONABLE_SCHEMA,
-                content: text.clone(),
+                content_schema: crate::snapshot_store::STATE_TEXT_SCHEMA,
+                content: zoomed.text.clone(),
                 truncated: false,
                 refs_truncated: false,
-                refs: observation.refs.clone(),
+                refs: printed.clone(),
             })
             .unwrap();
-        let candidates: Vec<_> = observation
-            .refs
+        let candidates: Vec<_> = printed
             .iter()
             .enumerate()
             .map(|(i, r)| RefCandidate {
@@ -5526,19 +5576,19 @@ mod tests {
                 traversal_index: i,
             })
             .collect();
-        let resolved = store
-            .resolve_ref(&id, links[0]["ref"].as_str().unwrap(), 7, &candidates)
-            .unwrap();
-        let RefResolution::Resolved(reference) = resolved else {
-            panic!("ref must resolve");
+        let RefResolution::Resolved(resolved) =
+            store.resolve_ref(&id, reference, 7, &candidates).unwrap()
+        else {
+            panic!("a printed ref must resolve");
         };
+        let backend = resolved.backend_identity.as_ref().unwrap().backend_node_id;
         let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
         let mut driver = attached_driver([
             json!({"id":1,"sessionId":"session-own","result":{"quads":quad}}),
             json!({"id":2,"sessionId":"session-own","result":{}}),
             json!({"id":3,"sessionId":"session-own","result":{"quads":quad}}),
             json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0,0.0,1280.0,713.0)}),
-            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":30,"frameId":"frame-main"}}),
+            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":backend,"frameId":"frame-main"}}),
             json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"id":7,"sessionId":"session-own","result":{}}),
             json!({"id":8,"sessionId":"session-own","result":{}}),
@@ -5548,18 +5598,28 @@ mod tests {
         driver
             .click_for_test(
                 "route-own",
-                reference.backend_identity.as_ref().unwrap(),
+                resolved.backend_identity.as_ref().unwrap(),
                 1000,
                 &mut |event| events.push(event),
                 &mut FakeClock::new(),
             )
             .unwrap();
         assert_eq!(events.len(), 2);
-        assert!(driver
-            .pipe
-            .writes
-            .iter()
-            .any(|w| w["method"] == "Input.dispatchMouseEvent"));
+    }
+
+    #[test]
+    fn link_urls_states_and_dom_facts_reach_the_observation() {
+        let (observation, _) = fixture_observation(X_LIKE);
+        let home = ref_of(&observation, "link", Some("Home"));
+        let explore = ref_of(&observation, "link", Some("Explore"));
+        let tab = ref_of(&observation, "tab", Some("For you"));
+        let search = ref_of(&observation, "searchbox", None);
+        // Chrome's own absolute URL wins; a bare href is resolved against the page.
+        assert_eq!(observation.facts[&home].url.as_deref(), Some("https://example.com/home"));
+        assert_eq!(observation.facts[&explore].url.as_deref(), Some("https://example.com/explore"));
+        assert_eq!(observation.facts[&tab].states, ["selected"]);
+        assert_eq!(observation.facts[&search].credential, Some(false));
+        assert_eq!(observation.facts[&search].placeholder.as_deref(), Some("Search"));
     }
 
     #[test]

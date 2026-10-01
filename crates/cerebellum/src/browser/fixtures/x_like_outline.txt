@@ -1,0 +1,52 @@
+Synthetic Kestrel Feed · example.com/home · snapshot 0123456789abcdef0123456789abcdef
+e24 main · 63 lines, 3.3 KB
+  e27 tablist
+    e28 tab (selected) For you
+    e31 tab Following
+  e32 generic
+    e33 link Juniper Samplewood, Value: example.com/juniper_example
+    e34 textbox (focused) Post text
+    e37 button Add photos or video
+    e38 button Add a GIF
+    e39 button (disabled) Post
+  e40 region Your Home Timeline
+    e41 heading Your Home Timeline
+    e42 feed Timeline: Your Home Timeline
+      e45 article Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 3 Likes. 59… · 18 lines, 790 B
+      e66 article Spindle Press Verified account @spindle_press 20 minutes ago We're planning a live garden tour with… · 17 lines, 975 B
+      e85 article Paper Kite Club Verified account @paper_kite_club 26 minutes ago You can now fold our pocket kite w… · 14 lines, 764 B
+e3 banner · 15 lines, 658 B
+  e5 navigation Primary
+    e6 link Kestrel Feed, Value: example.com/home
+      e8 image
+    e9 link Home, Value: example.com/home
+    e13 link Explore, Value: example.com/explore
+    e14 link Notifications, Value: example.com/notifications
+    e15 link Messages, Value: example.com/messages
+    e16 link Topics, Value: example.com/i/topics
+    e17 link Bookmarks, Value: example.com/i/bookmarks
+    e18 link Profile, Value: example.com/juniper_example
+    e19 button (collapsed) More menu items
+    e20 link Post, Value: example.com/compose/post
+  e23 button Account menu Juniper Samplewood @juniper_example
+e100 complementary Trending · 31 lines, 1.5 KB
+  e101 search Search
+    e102 searchbox Search query, Value: kites, Placeholder: Search
+  e103 region What's happening
+    e104 heading What's happening
+    e105 link Trending in Example Bay Paper boats 12.3K posts, Value: example.com/search
+    e106 link Crafts · Trending Pocket kites 4,210 posts, Value: example.com/search
+    e107 link Show more, Value: example.com/explore/tabs/for-you
+  e108 region Who to follow
+    e109 heading Who to follow
+    e110 generic
+      e111 link Wren Workshop @wren_example, Value: example.com/wren_example
+      e112 button Follow @wren_example
+    +4 more generic like this; zoom e108
+  e125 navigation Footer
+    e126 link Terms of Service, Value: example.com/tos
+    e127 link Privacy Policy, Value: example.com/privacy
+    e128 link Cookie Policy, Value: support.example.com/articles/cookies
+    e129 link Accessibility, Value: help.example.com/resources/accessibility
+    e130 link Ads info, Value: business.example.com/help/ad-info.html
+[outline: content is folded into the summaries above; use zoom on a container ref to read it]
