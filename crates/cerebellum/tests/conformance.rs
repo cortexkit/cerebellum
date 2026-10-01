@@ -860,6 +860,8 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
 struct LiveDaemonGuard {
     task: Option<JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>>,
     directory: PathBuf,
+    /// Where the daemon writes everything the spawned module printed.
+    module_output: PathBuf,
 }
 
 impl LiveDaemonGuard {
@@ -873,7 +875,48 @@ impl LiveDaemonGuard {
 
 impl Drop for LiveDaemonGuard {
     fn drop(&mut self) {
+        // A live test that fails has usually watched the module die: the daemon
+        // log says only that it "exited abnormally (crash) exit_code=Some(1)",
+        // and the reason is the `Error: ...` line std printed to the module's
+        // stderr when `main` returned an error. The daemon captures that stream
+        // into a file inside the directory `stop` is about to delete, so print
+        // it first, while the panic is unwinding, and libtest shows it beside
+        // the assertion that failed.
+        if std::thread::panicking() {
+            eprintln!("{}", module_output_report(&self.module_output));
+        }
         self.stop();
+    }
+}
+
+/// What the spawned module wrote to stdout and stderr, for a failure report.
+///
+/// The module writes nothing to either stream in normal operation, so any text
+/// here is the module's own account of why it stopped. The daemon copies the
+/// child's output into the file from a background task, line by line, so the
+/// last line can land a moment after the test has already seen the module's
+/// connection close; a short bounded wait for a non-empty file covers that.
+/// The wait only ever runs on a test that is already failing.
+fn module_output_report(path: &Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let captured = loop {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        if !text.trim().is_empty() || std::time::Instant::now() >= deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if captured.trim().is_empty() {
+        format!(
+            "---- spawned module output ({}) ----\n(the module wrote nothing)",
+            path.display()
+        )
+    } else {
+        format!(
+            "---- spawned module output ({}) ----\n{}",
+            path.display(),
+            captured.trim_end()
+        )
     }
 }
 
@@ -1052,6 +1095,14 @@ async fn start_live_daemon_with_browser(
         .expect("write isolated browser configuration");
     }
 
+    // The daemon names the capture file `<module id>.stderr.log` inside this
+    // directory, and it holds both of the child's output streams.
+    let capture_logs_dir = home
+        .join(".local")
+        .join("share")
+        .join("cortexkit")
+        .join("run")
+        .join("logs");
     let daemon_config_path = directory.join("subc.jsonc");
     fs::write(
         &daemon_config_path,
@@ -1089,13 +1140,7 @@ async fn start_live_daemon_with_browser(
         // test binary, whose HOME is the real one. Without this the module's
         // stderr lands in the operator's live run dir; SUBC found
         // `cerebellum.stderr.log` there. Point it at the isolated home.
-        .with_capture_logs_dir(
-            home.join(".local")
-                .join("share")
-                .join("cortexkit")
-                .join("run")
-                .join("logs"),
-        )
+        .with_capture_logs_dir(&capture_logs_dir)
         // Same reason, one file over: the terminal journal also defaults into
         // the daemon's own run dir, where the live daemon appends every
         // module exit and `ck module terminals` reads them. A fixture module
@@ -1108,6 +1153,7 @@ async fn start_live_daemon_with_browser(
                 .join("terminals.jsonl"),
         );
     let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
+    let module_output = capture_logs_dir.join(format!("{MODULE_ID}.stderr.log"));
 
     // Same reasoning as `wait_for_cerebellum_catalog`: this is a startup race
     // against a real daemon process, not a network operation, so the bound is
@@ -1127,6 +1173,7 @@ async fn start_live_daemon_with_browser(
         LiveDaemonGuard {
             task: Some(task),
             directory,
+            module_output,
         },
         connection,
     )
