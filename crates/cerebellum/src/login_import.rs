@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::elicit::AskOutcome;
 use crate::profile_custody::{
     ProfileCustodyAcquisition, ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
 };
@@ -179,7 +180,7 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
     json!({
         "type":"object",
         "properties":{
-            "outcome":{"type":"string","enum":["transferred","denied","hand_off","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","transfer_failed","invalid_origin","internal_failure"]},
+            "outcome":{"type":"string","enum":["transferred","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","transfer_failed","invalid_origin","internal_failure"]},
             "domains_matched":{"type":"array","items":{"type":"string"}},
             "browser":{"type":"string"},
             "rows":{"type":"integer"},
@@ -260,6 +261,25 @@ impl LoginImportPlan {
                     .iter()
                     .any(|browser| browser.browser == id && browser.transfer == "available")
             })
+    }
+
+    /// The result for however the consent question ended.
+    ///
+    /// Only an answer is read as a decision. The other three endings are
+    /// reported as themselves rather than as `denied`: a refusal tells the
+    /// caller not to ask again, which is wrong for a person who was asked and
+    /// stayed silent, and wrong in the other direction for a question nobody
+    /// was shown, where asking again reaches nobody again.
+    pub fn conclude(self, answer: &AskOutcome) -> ImportResult {
+        let ending = match answer {
+            AskOutcome::Answered(body) => {
+                return self.decide(body.get("decision").and_then(Value::as_str))
+            }
+            AskOutcome::NoAnswer => "no_answer",
+            AskOutcome::NotPutToAnyone => "not_put_to_anyone",
+            AskOutcome::Undeliverable => "undeliverable",
+        };
+        self.result(ending, None, 0, Some(unanswered_remedy(ending)))
     }
 
     pub fn decide(self, decision: Option<&str>) -> ImportResult {
@@ -372,6 +392,18 @@ impl LoginImportPlan {
             return Err(TransferError::Failed);
         }
         transferred
+    }
+}
+
+/// What a caller should do after a consent question that ended without an
+/// answer. Each ending has its own remedy because they are opposite: a person
+/// who was asked may answer the next question, while a question nobody was
+/// shown will reach nobody however many times it is put.
+fn unanswered_remedy(ending: &str) -> &'static str {
+    match ending {
+        "no_answer" => "nothing was copied; the person was asked but did not answer in time. Ask again when they are available.",
+        "not_put_to_anyone" => "nothing was copied; the question was shown to no one, and putting it again reaches no one either until the caller's consent route can put it to a person.",
+        _ => "nothing was copied; the question could not be sent. Retry once; if it fails again, the module needs attention.",
     }
 }
 
@@ -1215,10 +1247,18 @@ mod tests {
             Ok(())
         }));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // A closed receiver is a carrier the question cannot be sent to.
+        let undeliverable = decision == "undeliverable";
+        if undeliverable {
+            rx.close();
+        }
         let cancel = crate::CancelHandle::pending();
         let request =
             crate::complete_login_import(&planes, &facts, &tx, 4, 1, plan, Some(cancel.clone()));
         let answer = async {
+            if undeliverable {
+                return;
+            }
             let question = rx.recv().await.unwrap();
             assert!(
                 events.lock().unwrap().is_empty(),
@@ -1303,6 +1343,68 @@ mod tests {
             assert_eq!(status["outcome"], "ready");
             assert_eq!(status["browser_session_id"], old);
             assert!(events.is_empty());
+        }
+    }
+
+    /// Every way the consent question can end without an answer is reported as
+    /// that ending, never as `denied`, and copies nothing.
+    ///
+    /// The endings call for opposite next steps: a refusal should not be asked
+    /// again, a person who stayed silent may answer next time, and a question
+    /// nobody was shown is shown to nobody next time either. Reported as
+    /// `denied`, a question the carrier never put to anyone told the agent the
+    /// person had refused.
+    #[tokio::test]
+    async fn an_import_question_that_ended_unanswered_is_never_reported_as_denied() {
+        // The decision word delivered for each case, the outcome it must
+        // produce, and the remedy it must carry. `no_answer` and
+        // `not_put_to_anyone` are the decision words a consumer sends when a
+        // person stayed silent or nobody could be asked (see `elicit`);
+        // `undeliverable` closes the receiver so the question cannot be sent.
+        let cases = [
+            ("deny", "denied", None),
+            (
+                "no_answer",
+                "no_answer",
+                Some("Ask again when they are available"),
+            ),
+            (
+                "not_put_to_anyone",
+                "not_put_to_anyone",
+                Some("shown to no one"),
+            ),
+            ("undeliverable", "undeliverable", Some("could not be sent")),
+            ("some_future_word", "denied", None),
+        ];
+        for (decision, outcome, remedy) in cases {
+            let (reply, status, old, events) =
+                open_import_case(decision, false, false, false).await;
+            assert_eq!(reply["outcome"], outcome, "{decision}: {reply}");
+            match remedy {
+                Some(remedy) => assert!(
+                    reply["remedy"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(remedy),
+                    "{decision}: {reply}"
+                ),
+                None => assert!(reply.get("remedy").is_none(), "{decision}: {reply}"),
+            }
+            if decision == "not_put_to_anyone" {
+                let remedy = reply["remedy"].as_str().unwrap().to_lowercase();
+                for loop_word in ["ask again", "retry", "wait"] {
+                    assert!(
+                        !remedy.contains(loop_word),
+                        "a question nobody was shown sends the caller round a loop: {remedy}"
+                    );
+                }
+            }
+            // Nothing was copied, and the agent's open browser session, which a
+            // transfer would close first, is still the same one.
+            assert!(events.is_empty(), "{decision}: {events:?}");
+            assert!(reply.get("rows").is_none(), "{decision}: {reply}");
+            assert_eq!(status["outcome"], "ready", "{decision}");
+            assert_eq!(status["browser_session_id"], old, "{decision}");
         }
     }
 

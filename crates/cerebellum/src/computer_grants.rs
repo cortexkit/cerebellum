@@ -1412,8 +1412,11 @@ impl ComputerGrants {
             AskOutcome::NotPutToAnyone => {
                 return Settlement::Ended {
                     reason: "not_put_to_anyone",
-                    remedy: "Nobody could be asked; retry when the person is available.",
-                }
+                    // Not "retry": the question reached no person, and the
+                    // next one goes the same way until the consent route can
+                    // reach someone, so a retry loops.
+                    remedy: "Nobody could be asked: the question was shown to no one, and the next call's question reaches no one either until the caller's consent route can put it to a person.",
+                };
             }
             AskOutcome::Undeliverable => {
                 return Settlement::Ended {

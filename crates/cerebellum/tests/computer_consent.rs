@@ -946,7 +946,7 @@ async fn nobody_asked_and_nobody_answered_are_not_reported_as_pending() {
     assert_eq!(unreached["reason"], "not_put_to_anyone", "{unreached}");
     assert_eq!(
         unreached["remedy"],
-        "Nobody could be asked; retry when the person is available."
+        "Nobody could be asked: the question was shown to no one, and the next call's question reaches no one either until the caller's consent route can put it to a person."
     );
 
     let unanswered = serve(

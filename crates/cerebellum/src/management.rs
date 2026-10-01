@@ -32,6 +32,7 @@ use crate::computer_grants::{
 };
 #[cfg(target_os = "macos")]
 use crate::computer_grants::{AppIdentity, AppIdentityUnreadable};
+use crate::elicit::AskOutcome;
 use crate::launch_recovery::{ClearFailure, ClearPreview, LaunchRecoveryRegistry};
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
 use crate::CancelHandle;
@@ -337,6 +338,63 @@ pub struct ManagementPlane {
     /// request for that project. The answer arrives on a task nobody waits
     /// on, so this is where an answer that did nothing says so.
     launch_recovery_settlements: Mutex<BTreeMap<String, Value>>,
+    /// Browser grant questions that reached no person, by conversation and
+    /// the sorted origins asked about, holding the ask id that was never put.
+    ///
+    /// Kept so the next request for the same grant can say what became of the
+    /// previous one. Without it every attempt looks like the first, and the
+    /// caller is told to wait for an answer nobody was offered the chance to
+    /// give. Not a refusal: the question is still put each time, because a
+    /// person who becomes reachable should simply be asked.
+    unreached_browser_grants: Mutex<BTreeMap<(String, Vec<String>), String>>,
+    /// Profile-root rebind questions that reached no person, by conversation,
+    /// holding the ask id that was never put, so the next rebind request from
+    /// that conversation can say the previous question was shown to nobody.
+    unreached_profile_root_rebinds: Mutex<BTreeMap<String, String>>,
+}
+
+/// What a consent question settled by `ask_id` is reported as on the next
+/// request for the same thing, when the carrier said it could put the question
+/// to nobody. The remedy deliberately does not say to wait or to ask again:
+/// the new question goes out anyway, and it reaches nobody either until the
+/// caller's consent route can reach a person.
+fn previous_request_not_put_to_anyone(ask_id: &str) -> Value {
+    json!({
+        "ask_id": ask_id,
+        "disposition": "not_put_to_anyone",
+        "remedy": "the previous question was shown to no one; this one is put the same way and reaches no one either until the caller's consent route can put it to a person",
+    })
+}
+
+/// Note how a consent question about `key` ended, for the next request about
+/// the same thing. Only a question nobody was shown is remembered. Any ending
+/// that shows a person was reached (an answer, or silence from someone who was
+/// asked) clears an earlier note, since it is now stale. A question that could
+/// not be sent, or one withdrawn before it ended, says nothing about whether a
+/// person is reachable, so it leaves the note as it was.
+async fn note_reachability<K: Ord>(
+    unreached: &Mutex<BTreeMap<K, String>>,
+    key: K,
+    ask_id: &str,
+    ending: Option<&AskOutcome>,
+) {
+    match ending {
+        Some(AskOutcome::NotPutToAnyone) => {
+            unreached.lock().await.insert(key, ask_id.to_string());
+        }
+        Some(AskOutcome::Answered(_) | AskOutcome::NoAnswer) => {
+            unreached.lock().await.remove(&key);
+        }
+        Some(AskOutcome::Undeliverable) | None => {}
+    }
+}
+
+/// The key under which a browser grant question is remembered: the same
+/// origins asked in another order are the same grant.
+fn browser_grant_key(conversation_key: &str, origins: &[String]) -> (String, Vec<String>) {
+    let mut origins = origins.to_vec();
+    origins.sort();
+    (conversation_key.to_string(), origins)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,8 +427,17 @@ pub enum ClearSettlement {
     Cleared {
         sequence: u64,
     },
-    /// The person chose to keep the record, or gave no usable answer.
+    /// The person chose to keep the record.
     Kept,
+    /// The person was asked and did not answer before the deadline.
+    NoAnswer,
+    /// The question was shown to nobody: the caller's consent route had no
+    /// person to put it to, or refused it.
+    NotPutToAnyone,
+    /// The question could not be sent.
+    Undeliverable,
+    /// An answer with a word the question did not offer.
+    UnrecognizedAnswer,
     /// Answered after the question's deadline.
     Expired,
     /// Asked by an earlier start of this module; nothing was done.
@@ -385,7 +452,30 @@ impl ClearSettlement {
     pub fn as_json(&self) -> Value {
         match self {
             Self::Cleared { sequence } => json!({"outcome": "cleared", "sequence": sequence}),
-            Self::Kept => json!({"outcome": "kept"}),
+            // Each ending that cleared nothing has its own remedy, because they
+            // call for opposite next steps: a refusal should not be asked
+            // again, silence may be answered next time, and a question nobody
+            // was shown will be shown to nobody next time either.
+            Self::Kept => json!({
+                "outcome": "kept",
+                "remedy": "nothing was cleared; the person chose to keep the record. Ask again only if they now want it cleared",
+            }),
+            Self::NoAnswer => json!({
+                "outcome": "no_answer",
+                "remedy": "nothing was cleared; the person was asked but did not answer in time. Ask again when they are available",
+            }),
+            Self::NotPutToAnyone => json!({
+                "outcome": "not_put_to_anyone",
+                "remedy": "nothing was cleared; the question was shown to no one, and putting it again reaches no one either until the caller's consent route can put it to a person",
+            }),
+            Self::Undeliverable => json!({
+                "outcome": "undeliverable",
+                "remedy": "nothing was cleared; the question could not be sent. Retry once; if it fails again, the module needs attention",
+            }),
+            Self::UnrecognizedAnswer => json!({
+                "outcome": "unrecognized_answer",
+                "remedy": "nothing was cleared; the answer was not one this question offered. Ask again",
+            }),
             Self::Expired => json!({
                 "outcome": "expired",
                 "remedy": "the answer arrived after the question's deadline and did nothing; ask again",
@@ -436,6 +526,8 @@ impl ManagementPlane {
             launch_recovery: Arc::new(LaunchRecoveryRegistry::new()),
             pending_launch_recovery_clears: Mutex::new(BTreeMap::new()),
             launch_recovery_settlements: Mutex::new(BTreeMap::new()),
+            unreached_browser_grants: Mutex::new(BTreeMap::new()),
+            unreached_profile_root_rebinds: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -663,15 +755,27 @@ impl ManagementPlane {
         severity_tier: Option<u8>,
         can_relay_to_a_person: bool,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
-        self.open_browser_grant_with_urgency(
-            conversation_key,
-            origins,
-            hazards,
-            severity_tier,
-            can_relay_to_a_person,
-            crate::consent_card::Urgency::Normal,
-        )
-        .await
+        let key = browser_grant_key(conversation_key, &origins);
+        let (mut reply, question) = self
+            .open_browser_grant_with_urgency(
+                conversation_key,
+                origins,
+                hazards,
+                severity_tier,
+                can_relay_to_a_person,
+                crate::consent_card::Urgency::Normal,
+            )
+            .await?;
+        // Only this reply carries the previous question's fate. A browser
+        // action held open on its own question replies under the browser
+        // action's closed result schema, and that question's ending is in its
+        // own reply already.
+        if question.is_some() {
+            if let Some(ask_id) = self.unreached_browser_grants.lock().await.get(&key) {
+                reply["previous_request"] = previous_request_not_put_to_anyone(ask_id);
+            }
+        }
+        Ok((reply, question))
     }
 
     /// [`Self::open_browser_grant_at_tier`] for a browser call that is held
@@ -790,15 +894,42 @@ impl ManagementPlane {
     }
 
     /// Apply exactly one human answer to the browser scope recorded at ask time.
+    ///
+    /// `None` is a question withdrawn without an ending. For a question that
+    /// ended, use [`Self::settle_browser_grant_ending`], which also records
+    /// whether anyone was asked.
     pub async fn settle_browser_grant(&self, ask_id: &str, answer: Option<&Value>) -> bool {
+        let answer = answer.map(|body| AskOutcome::Answered(body.clone()));
+        self.settle_browser_grant_ending(ask_id, answer.as_ref())
+            .await
+    }
+
+    /// Settle a browser grant question by how it ended; `None` means it was
+    /// withdrawn (cancelled, route closed, draining) before it ended.
+    ///
+    /// Only an answer of `allow` grants anything. The ending is also noted so
+    /// that the next request for the same grant can say the previous question
+    /// was shown to nobody.
+    pub async fn settle_browser_grant_ending(
+        &self,
+        ask_id: &str,
+        ending: Option<&AskOutcome>,
+    ) -> bool {
         let Some(pending) = self.pending_browser_grants.lock().await.remove(ask_id) else {
             return false;
         };
-        if answer
-            .and_then(|body| body.get("decision"))
-            .and_then(Value::as_str)
-            != Some("allow")
-        {
+        note_reachability(
+            &self.unreached_browser_grants,
+            browser_grant_key(&pending.conversation_key, &pending.authorized_origins),
+            ask_id,
+            ending,
+        )
+        .await;
+        let decision = match ending {
+            Some(AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
+            _ => None,
+        };
+        if decision != Some("allow") {
             return true;
         }
 
@@ -826,6 +957,11 @@ impl ManagementPlane {
         question.expect("an elicitable browser grant produces a question")
     }
 
+    /// How many browser grant questions are still waiting to be settled.
+    pub async fn browser_grant_pending_count(&self) -> usize {
+        self.pending_browser_grants.lock().await.len()
+    }
+
     pub async fn browser_grant_count(&self) -> usize {
         self.browser_grants.lock().await.current_grants().count()
     }
@@ -851,6 +987,10 @@ impl ManagementPlane {
             .lock()
             .await
             .retain(|_, pending| pending.conversation_key != conversation_key);
+        self.unreached_browser_grants
+            .lock()
+            .await
+            .retain(|(conversation, _), _| conversation != conversation_key);
         let mut grants = self.browser_grants.lock().await;
         let held: Vec<String> = grants
             .current_grants()
@@ -968,23 +1108,45 @@ impl ManagementPlane {
             body: profile_root_rebind_question(&ask_id, &root_path, &preview),
             deadline: PHONE_CONSENT_DEADLINE,
         };
-        (
-            json!({
-                "outcome": "consent_pending",
-                "ask_id": ask_id,
-                "root_path": root_path,
-                "old_identity": preview.old_identity,
-                "new_identity": preview.new_identity,
-                "generation": preview.generation_before,
-                "record_count": preview.record_count,
-                "remedy": "wait for the person to answer before retrying browser launch",
-            }),
-            Some(question),
-        )
+        let mut reply = json!({
+            "outcome": "consent_pending",
+            "ask_id": ask_id,
+            "root_path": root_path,
+            "old_identity": preview.old_identity,
+            "new_identity": preview.new_identity,
+            "generation": preview.generation_before,
+            "record_count": preview.record_count,
+            "remedy": "wait for the person to answer before retrying browser launch",
+        });
+        if let Some(previous) = self
+            .unreached_profile_root_rebinds
+            .lock()
+            .await
+            .get(conversation_key)
+        {
+            reply["previous_request"] = previous_request_not_put_to_anyone(previous);
+        }
+        (reply, Some(question))
     }
 
     /// Apply one answer only when the registry situation still matches the question.
+    ///
+    /// `None` is a question withdrawn without an ending. For a question that
+    /// ended, use [`Self::settle_profile_root_rebind_ending`].
     pub async fn settle_profile_root_rebind(&self, ask_id: &str, answer: Option<&Value>) -> bool {
+        let answer = answer.map(|body| AskOutcome::Answered(body.clone()));
+        self.settle_profile_root_rebind_ending(ask_id, answer.as_ref())
+            .await
+    }
+
+    /// Settle a rebind question by how it ended; `None` means it was withdrawn
+    /// before it ended. Only an answer of `allow` rebinds anything, and the
+    /// ending is noted for the next rebind request from the same conversation.
+    pub async fn settle_profile_root_rebind_ending(
+        &self,
+        ask_id: &str,
+        ending: Option<&AskOutcome>,
+    ) -> bool {
         let Some(pending) = self
             .pending_profile_root_rebinds
             .lock()
@@ -993,11 +1155,18 @@ impl ManagementPlane {
         else {
             return false;
         };
-        if answer
-            .and_then(|body| body.get("decision"))
-            .and_then(Value::as_str)
-            != Some("allow")
-        {
+        note_reachability(
+            &self.unreached_profile_root_rebinds,
+            pending.conversation_key.clone(),
+            ask_id,
+            ending,
+        )
+        .await;
+        let decision = match ending {
+            Some(AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
+            _ => None,
+        };
+        if decision != Some("allow") {
             return true;
         }
         let Ok(lifecycle) = self.profile_lifecycle_for_rebind() else {
@@ -1094,7 +1263,7 @@ impl ManagementPlane {
         (with_previous(reply), Some(question))
     }
 
-    /// Apply one answer to a clear question.
+    /// Apply one answer to a clear question. `None` is read as no answer.
     pub async fn settle_launch_recovery_clear(
         &self,
         ask_id: &str,
@@ -1110,6 +1279,34 @@ impl ManagementPlane {
         &self,
         ask_id: &str,
         answer: Option<&Value>,
+        answered_at: Instant,
+    ) -> ClearSettlement {
+        let ending = answer.map_or(AskOutcome::NoAnswer, |body| {
+            AskOutcome::Answered(body.clone())
+        });
+        self.settle_launch_recovery_clear_ending_at(ask_id, &ending, answered_at)
+            .await
+    }
+
+    /// Settle a clear question by how it ended. What the ending did is kept
+    /// and reported on the next clear request for the same project, naming
+    /// the ending rather than folding every non-answer into `kept`.
+    pub async fn settle_launch_recovery_clear_ending(
+        &self,
+        ask_id: &str,
+        ending: &AskOutcome,
+    ) -> ClearSettlement {
+        self.settle_launch_recovery_clear_ending_at(ask_id, ending, Instant::now())
+            .await
+    }
+
+    /// [`Self::settle_launch_recovery_clear_ending`] with the time the question
+    /// ended given explicitly, so a test can end it after the deadline without
+    /// waiting for it.
+    pub async fn settle_launch_recovery_clear_ending_at(
+        &self,
+        ask_id: &str,
+        ending: &AskOutcome,
         answered_at: Instant,
     ) -> ClearSettlement {
         let incarnation = self.launch_recovery.incarnation();
@@ -1135,24 +1332,37 @@ impl ManagementPlane {
             }
             Some(pending) => {
                 let project = pending.preview.agent_project_id.clone();
+                // A question that ended without an answer is reported as that
+                // ending before the deadline is looked at: silence is only
+                // reported once the deadline has passed, so checking the
+                // deadline first would call every silence a late answer.
                 let settlement = if pending.incarnation != incarnation {
                     ClearSettlement::AskedByEarlierStart
-                } else if answered_at.saturating_duration_since(pending.asked_at)
-                    > PHONE_CONSENT_DEADLINE
-                {
-                    ClearSettlement::Expired
-                } else if answer
-                    .and_then(|body| body.get("decision"))
-                    .and_then(Value::as_str)
-                    != Some("clear")
-                {
-                    ClearSettlement::Kept
                 } else {
-                    match self.launch_recovery.clear(&pending.preview, ask_id) {
-                        Ok(()) => ClearSettlement::Cleared {
-                            sequence: pending.preview.sequence,
-                        },
-                        Err(failure) => ClearSettlement::Failed(failure),
+                    match ending {
+                        AskOutcome::NoAnswer => ClearSettlement::NoAnswer,
+                        AskOutcome::NotPutToAnyone => ClearSettlement::NotPutToAnyone,
+                        AskOutcome::Undeliverable => ClearSettlement::Undeliverable,
+                        AskOutcome::Answered(_)
+                            if answered_at.saturating_duration_since(pending.asked_at)
+                                > PHONE_CONSENT_DEADLINE =>
+                        {
+                            ClearSettlement::Expired
+                        }
+                        AskOutcome::Answered(body) => {
+                            match body.get("decision").and_then(Value::as_str) {
+                                Some("clear") => {
+                                    match self.launch_recovery.clear(&pending.preview, ask_id) {
+                                        Ok(()) => ClearSettlement::Cleared {
+                                            sequence: pending.preview.sequence,
+                                        },
+                                        Err(failure) => ClearSettlement::Failed(failure),
+                                    }
+                                }
+                                Some("keep") => ClearSettlement::Kept,
+                                _ => ClearSettlement::UnrecognizedAnswer,
+                            }
+                        }
                     }
                 };
                 (settlement, project)
