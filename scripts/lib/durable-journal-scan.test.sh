@@ -65,7 +65,7 @@ expect() {
     echo "FAIL $name: exit $got, wanted $want" >&2
     printf '%s\n' "$output" | sed 's/^/    /' >&2
     failures=$((failures + 1))
-  elif [ -n "$needle" ] && ! printf '%s' "$output" | grep -qF -- "$needle"; then
+  elif [ -n "$needle" ] && ! grep -qF -- "$needle" <<<"$output"; then
     echo "FAIL $name: report does not name $needle" >&2
     printf '%s\n' "$output" | sed 's/^/    /' >&2
     failures=$((failures + 1))
