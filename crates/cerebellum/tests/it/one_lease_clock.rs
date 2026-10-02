@@ -124,7 +124,7 @@ fn scan_crate(crate_root: &Path) -> TreeScan {
 ///
 /// Each [`ALLOWED`] entry for this file excuses one production site whose line
 /// matches it exactly; every other site is a violation, including a second
-/// copy of the allowed line. Sites inside `#[cfg(test)]` modules are never
+/// copy of the allowed line. Sites inside items marked `#[cfg(test)]` are never
 /// counted.
 fn clock_violations(path: &str, source: &str) -> Vec<String> {
     let mut allowances: Vec<&str> = ALLOWED
@@ -162,7 +162,11 @@ fn clock_violations(path: &str, source: &str) -> Vec<String> {
 /// as a construction too. The effect is that the fence errs towards a false
 /// alarm the author can reword, never towards a missed clock.
 fn construction_sites(source: &str) -> Vec<(usize, String)> {
-    let lines = production_lines(source);
+    let owned_lines = production_lines(source);
+    let lines: Vec<(usize, &str)> = owned_lines
+        .iter()
+        .map(|(line_number, line)| (*line_number, line.as_str()))
+        .collect();
     let tokens = source_scan::tokens(&lines);
     let aliases = clock_aliases(&tokens);
     let names_clock = |token: &str| token.ends_with("SystemClock") || aliases.contains(&token);
@@ -250,42 +254,229 @@ fn rust_sources(directory: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Lines outside every `#[cfg(test)]` module, with their 1-based numbers.
+/// Lines outside every item marked `#[cfg(test)]`, with their 1-based numbers.
+/// Text that belongs to a test-only item is blanked, so a line shared with
+/// shipped code keeps only the shipped part, and a line left empty is dropped.
 ///
 /// Test code builds its own clocks deliberately and that is fine: a test owns
-/// the whole timeline it measures. Skipping by brace balance rather than by
-/// "everything after the first test module", because this crate's largest file
-/// carries production code after one test module and before the next.
-fn production_lines(source: &str) -> Vec<(usize, &str)> {
-    let mut kept = Vec::new();
-    let mut skipping_from_depth: Option<i32> = None;
-    let mut depth = 0_i32;
-    let mut pending_test_module = false;
-    for (index, line) in source.lines().enumerate() {
-        let opens = line.matches('{').count() as i32;
-        let closes = line.matches('}').count() as i32;
-        if skipping_from_depth.is_none() {
-            if pending_test_module && line.contains("mod ") && line.contains('{') {
-                skipping_from_depth = Some(depth);
-                pending_test_module = false;
-                depth += opens - closes;
-                continue;
-            }
-            if line.trim_start().starts_with("#[cfg(test)]") {
-                pending_test_module = true;
-                depth += opens - closes;
-                continue;
-            }
-            kept.push((index + 1, line));
-        }
-        depth += opens - closes;
-        if let Some(entered_at) = skipping_from_depth {
-            if depth <= entered_at {
-                skipping_from_depth = None;
-            }
+/// the whole timeline it measures. Each marked item is skipped over its own
+/// extent, whatever kind of item it is (module, function, `impl`, `use`,
+/// `const`, struct field), rather than everything after the first marker,
+/// because this crate's largest file carries shipped code between test modules
+/// and after test-only functions and fields.
+///
+/// Markers are found in code only: a `#[cfg(test)]` inside a comment or a
+/// string literal marks nothing, and braces inside them do not count towards
+/// an item's extent. Only the exact predicate `cfg(test)` marks an item
+/// test-only. `all(test, ..)` would qualify too but is scanned as shipped code,
+/// which errs towards a false alarm; `any(test, ..)` and `not(test)` code ships
+/// and must be scanned.
+fn production_lines(source: &str) -> Vec<(usize, String)> {
+    let original: Vec<char> = source.chars().collect();
+    let code = code_only(&original);
+    let mut test_only = vec![false; code.len()];
+    let mut index = 0;
+    while index < code.len() {
+        if let Some(after_attribute) = test_attribute_end(&code, index) {
+            let end = item_end(&code, after_attribute);
+            test_only[index..end].fill(true);
+            index = end;
+        } else {
+            index += 1;
         }
     }
+
+    let mut kept = Vec::new();
+    let mut line = String::new();
+    let mut line_number = 1;
+    for (position, &c) in original.iter().enumerate() {
+        if c == '\n' {
+            if !line.trim().is_empty() {
+                kept.push((line_number, std::mem::take(&mut line)));
+            }
+            line.clear();
+            line_number += 1;
+        } else {
+            line.push(if test_only[position] { ' ' } else { c });
+        }
+    }
+    if !line.trim().is_empty() {
+        kept.push((line_number, line));
+    }
     kept
+}
+
+/// The source with every comment and the contents of every string and char
+/// literal replaced by spaces, line breaks kept, so positions line up with
+/// the original. Structure (attributes, brackets) is read from this view only.
+fn code_only(source: &[char]) -> Vec<char> {
+    let is_identifier = |c: char| c.is_alphanumeric() || c == '_';
+    let at = |index: usize| source.get(index).copied();
+    let mut code = source.to_vec();
+    let mut blank = |from: usize, to: usize| {
+        for c in &mut code[from..to.min(source.len())] {
+            if *c != '\n' {
+                *c = ' ';
+            }
+        }
+    };
+    let mut index = 0;
+    while index < source.len() {
+        let c = source[index];
+        if c == '/' && at(index + 1) == Some('/') {
+            let end = (index..source.len())
+                .find(|&position| source[position] == '\n')
+                .unwrap_or(source.len());
+            blank(index, end);
+            index = end;
+        } else if c == '/' && at(index + 1) == Some('*') {
+            // Block comments nest in Rust.
+            let mut depth = 0;
+            let mut position = index;
+            while position < source.len() {
+                if source[position] == '/' && at(position + 1) == Some('*') {
+                    depth += 1;
+                    position += 2;
+                } else if source[position] == '*' && at(position + 1) == Some('/') {
+                    depth -= 1;
+                    position += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    position += 1;
+                }
+            }
+            blank(index, position);
+            index = position;
+        } else if c == '"' {
+            let mut position = index + 1;
+            while position < source.len() && source[position] != '"' {
+                if source[position] == '\\' {
+                    position += 1;
+                }
+                position += 1;
+            }
+            blank(index, position + 1);
+            index = position + 1;
+        } else if c == '\'' {
+            // A char literal, or else a lifetime, which is left alone.
+            if at(index + 1) == Some('\\') {
+                let end = (index + 3..source.len())
+                    .find(|&position| source[position] == '\'')
+                    .unwrap_or(source.len());
+                blank(index, end + 1);
+                index = end + 1;
+            } else if at(index + 2) == Some('\'') {
+                blank(index, index + 3);
+                index += 3;
+            } else {
+                index += 1;
+            }
+        } else if is_identifier(c) {
+            // Whole identifiers at a time, so that only a standalone `r` or
+            // `br` can open a raw string.
+            let start = index;
+            while index < source.len() && is_identifier(source[index]) {
+                index += 1;
+            }
+            let word: String = source[start..index].iter().collect();
+            if word == "r" || word == "br" {
+                let hashes = (index..source.len())
+                    .take_while(|&position| source[position] == '#')
+                    .count();
+                if at(index + hashes) == Some('"') {
+                    let mut position = index + hashes + 1;
+                    while position < source.len()
+                        && !(source[position] == '"'
+                            && (1..=hashes).all(|offset| at(position + offset) == Some('#')))
+                    {
+                        position += 1;
+                    }
+                    let end = position + 1 + hashes;
+                    blank(start, end);
+                    index = end;
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+    code
+}
+
+/// If an outer attribute whose whole predicate is `cfg(test)` starts at
+/// `index`, the position just after its closing `]`.
+fn test_attribute_end(code: &[char], index: usize) -> Option<usize> {
+    if code[index] != '#' {
+        return None;
+    }
+    let open = (index + 1..code.len()).find(|&position| !code[position].is_whitespace())?;
+    if code[open] != '[' {
+        return None;
+    }
+    let mut depth = 0;
+    let mut content = String::new();
+    for (position, &c) in code.iter().enumerate().skip(open) {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (content == "[cfg(test)").then_some(position + 1);
+                }
+            }
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            content.push(c);
+        }
+    }
+    None
+}
+
+/// Where the item an attribute applies to ends, scanning from just after the
+/// attribute: after its body's closing brace (and a `;` that directly follows,
+/// as in `use a::{b};`), after a `;` or a `,` at its own level (a statement,
+/// a bodiless item, a field), or just before the bracket that closes the
+/// enclosing scope.
+///
+/// Angle brackets are tracked only at the item's own level, so the commas in
+/// `fn helper<A, B>(..)` do not end it. Every misjudgement here ends an item
+/// early rather than late, which scans test code as shipped code and so errs
+/// towards a false alarm, never a missed clock.
+fn item_end(code: &[char], start: usize) -> usize {
+    let mut depth = 0_i32;
+    let mut angle = 0_i32;
+    let mut previous = ' ';
+    for (position, &c) in code.iter().enumerate().skip(start) {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => return position,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if c == '}' && depth == 0 {
+                    let after =
+                        (position + 1..code.len()).find(|&next| !code[next].is_whitespace());
+                    return match after {
+                        Some(next) if code[next] == ';' => next + 1,
+                        _ => position + 1,
+                    };
+                }
+            }
+            ';' if depth == 0 => return position + 1,
+            ',' if depth == 0 && angle == 0 => return position + 1,
+            '<' if depth == 0 => angle += 1,
+            '>' if depth == 0 && previous != '-' && previous != '=' => {
+                angle = (angle - 1).max(0);
+            }
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            previous = c;
+        }
+    }
+    code.len()
 }
 
 /// The fence's positive control: planted constructions the detector must flag.
@@ -457,6 +648,155 @@ fn the_clock_detector_flags_every_planted_construction() {
         ),
     ];
     for (case, lines, expected) in variants {
+        assert_flags(case, "src/consent.rs", lines, expected);
+    }
+
+    // Test markers on items other than a module, and markers that are not
+    // code. In each, the shipped construction must be flagged and anything in
+    // the marked item must not. The skipper this replaced cut from a marker
+    // to the next `mod .. {` line, so it scanned a marked function or `impl`
+    // as shipped code and then skipped the next shipped module whole.
+    let marked: &[(&str, &[&str], &[usize])] = &[
+        (
+            "a marked fn, then a shipped module",
+            &[
+                "#[cfg(test)]",
+                "fn helper() -> SystemClock {",
+                "    SystemClock::new()",
+                "}",
+                "mod shipped {",
+                "    fn open() { let clock = SystemClock::new(); }",
+                "}",
+            ],
+            &[6],
+        ),
+        (
+            "a marked fn with generic parameters",
+            &[
+                "#[cfg(test)]",
+                "fn helper<A, B>(a: A, b: B) -> SystemClock {",
+                "    SystemClock::new()",
+                "}",
+                "fn open() { let clock = SystemClock::new(); }",
+            ],
+            &[5],
+        ),
+        (
+            "a marked const",
+            &[
+                "#[cfg(test)]",
+                "const MAKE: fn() -> SystemClock = SystemClock::new;",
+                "fn open() { let clock = SystemClock::default(); }",
+            ],
+            &[3],
+        ),
+        (
+            "a marked use",
+            &[
+                "#[cfg(test)]",
+                "use cerebellum_core::clock::{MonoInstant, SystemClock as TestClock};",
+                "fn open() { let clock = SystemClock::new(); }",
+            ],
+            &[3],
+        ),
+        (
+            "a marked impl",
+            &[
+                "#[cfg(test)]",
+                "impl Planes {",
+                "    fn test_clock() -> SystemClock { SystemClock::new() }",
+                "}",
+                "impl Planes {",
+                "    fn clock() -> SystemClock { SystemClock::new() }",
+                "}",
+            ],
+            &[6],
+        ),
+        (
+            "a marked field in a struct literal",
+            &[
+                "fn build() -> Planes {",
+                "    Planes {",
+                "        #[cfg(test)]",
+                "        test_clock: SystemClock::new(),",
+                "        lease_clock: Arc::new(SystemClock::new()),",
+                "    }",
+                "}",
+            ],
+            &[5],
+        ),
+        (
+            "a marker in a line comment",
+            &[
+                "// #[cfg(test)]",
+                "mod shipped {",
+                "    fn open() { let clock = SystemClock::new(); }",
+                "}",
+            ],
+            &[3],
+        ),
+        (
+            "a marker in a block comment",
+            &["/* #[cfg(test)] */ fn open() { let clock = SystemClock::new(); }"],
+            &[1],
+        ),
+        (
+            "a marker in a string literal",
+            &[
+                "const EXAMPLE: &str = \"",
+                "#[cfg(test)]",
+                "mod tests {\";",
+                "fn open() { let clock = SystemClock::new(); }",
+            ],
+            &[4],
+        ),
+        (
+            "a brace in a string inside a test module",
+            &[
+                "#[cfg(test)]",
+                "mod tests {",
+                "    const OPEN: &str = \"{\";",
+                "}",
+                "fn open() { let clock = SystemClock::new(); }",
+            ],
+            &[5],
+        ),
+        // Only `cfg(test)` itself marks test-only code. `any(test, ..)` and
+        // `not(test)` code ships; `all(test, ..)` does not, but is scanned as
+        // shipped all the same, erring towards a false alarm. Pinned so that
+        // treating any of these as test-only is a decision made here.
+        (
+            "a cfg(all(test, ..)) module",
+            &[
+                "#[cfg(all(test, feature = \"live\"))]",
+                "mod live_tests {",
+                "    fn helper() { let clock = SystemClock::new(); }",
+                "}",
+            ],
+            &[3],
+        ),
+        (
+            "a cfg(any(test, ..)) module",
+            &[
+                "#[cfg(any(test, feature = \"fixtures\"))]",
+                "mod fixtures {",
+                "    fn helper() { let clock = SystemClock::new(); }",
+                "}",
+            ],
+            &[3],
+        ),
+        (
+            "a cfg(not(test)) module",
+            &[
+                "#[cfg(not(test))]",
+                "mod shipped {",
+                "    fn open() { let clock = SystemClock::new(); }",
+                "}",
+            ],
+            &[3],
+        ),
+    ];
+    for (case, lines, expected) in marked {
         assert_flags(case, "src/consent.rs", lines, expected);
     }
 }

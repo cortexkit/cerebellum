@@ -346,6 +346,99 @@ fn the_nonce_detector_flags_every_planted_read() {
     for (case, lines, expected) in variants {
         assert_flags(case, ELSEWHERE, &lines.join("\n"), expected);
     }
+
+    // Test markers of every shape. This scan has no notion of test code, so
+    // a marker never hides anything: the read in the marked item and the one
+    // in shipped code after it are both flagged, whatever the marker is on,
+    // whether it is real code or sits in a comment or string, and whatever
+    // its predicate (`all(test, ..)`, `any(test, ..)`).
+    let marked: &[(&str, &[&str], &[usize])] = &[
+        (
+            "a marked fn, then a shipped module",
+            &[
+                "#[cfg(test)]",
+                "fn helper() { let nonce = std::env::var(\"SUBC_LAUNCH_NONCE\"); }",
+                "mod shipped {",
+                "    fn open() { let nonce = subc_os::launch_nonce(); }",
+                "}",
+            ],
+            &[2, 4],
+        ),
+        (
+            "a marked const",
+            &[
+                "#[cfg(test)]",
+                "const NAME: &str = \"SUBC_LAUNCH_NONCE\";",
+                "fn open() { let fd = std::env::var_os(subc_os::LAUNCH_NONCE_FD_ENV); }",
+            ],
+            &[2, 3],
+        ),
+        (
+            "a marked use",
+            &[
+                "#[cfg(test)]",
+                "use subc_os::LAUNCH_NONCE_ENV;",
+                "fn open() { let nonce = subc_os::launch_nonce(); }",
+            ],
+            &[2, 3],
+        ),
+        (
+            "a marked impl",
+            &[
+                "#[cfg(test)]",
+                "impl Probe {",
+                "    fn read() { let nonce = subc_os::launch_nonce(); }",
+                "}",
+                "impl Probe {",
+                "    fn open() { let nonce = std::env::var(subc_os::LAUNCH_NONCE_ENV); }",
+                "}",
+            ],
+            &[3, 6],
+        ),
+        (
+            "a marker in a comment",
+            &[
+                "// #[cfg(test)]",
+                "mod shipped {",
+                "    fn open() { let nonce = subc_os::launch_nonce(); }",
+                "}",
+            ],
+            &[3],
+        ),
+        (
+            "a marker in a string literal",
+            &[
+                "const EXAMPLE: &str = \"",
+                "#[cfg(test)]",
+                "mod tests {\";",
+                "fn open() { let nonce = subc_os::launch_nonce(); }",
+            ],
+            &[4],
+        ),
+        (
+            "a cfg(all(test, ..)) module",
+            &[
+                "#[cfg(all(test, feature = \"live\"))]",
+                "mod live_tests {",
+                "    fn read() { let nonce = subc_os::launch_nonce(); }",
+                "}",
+            ],
+            &[3],
+        ),
+        (
+            "a cfg(any(test, ..)) module",
+            &[
+                "#[cfg(any(test, feature = \"fixtures\"))]",
+                "mod fixtures {",
+                "    fn read() { let nonce = subc_os::launch_nonce(); }",
+                "}",
+            ],
+            &[3],
+        ),
+    ];
+    for (case, lines, expected) in marked {
+        assert_flags(case, ELSEWHERE, &lines.join("\n"), expected);
+    }
 }
 
 /// The fence's negative control: planted source the detector must pass.
