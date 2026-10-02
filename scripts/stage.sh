@@ -105,6 +105,20 @@ trap 'rm -f "$FORMAT_VERSIONS"' EXIT
 mkdir -p "$STAGE"
 cp target/release/"$DEPLOYED_NAME" "$STAGE/"
 
+# A release binary must carry no debug-map (STABS) entries. Cargo strips them
+# by running rust-objcopy, and when that step fails it only warns and the build
+# still succeeds: on 2026-10-02 a rustc wrapper that dropped
+# DYLD_FALLBACK_LIBRARY_PATH made rust-objcopy abort, and two staged builds
+# shipped with 3,528 entries naming this machine's build paths, with nothing
+# failing. nm prints a debug-map entry with "-" in its second column.
+debug_entries="$(nm -a "$STAGE/$DEPLOYED_NAME" 2>/dev/null | awk '$2 == "-"' | wc -l | tr -d ' ')"
+if [ "$debug_entries" != 0 ]; then
+  echo "refused: $DEPLOYED_NAME still carries $debug_entries debug-map entries;" >&2
+  echo "the release build's strip step failed (look for 'rust-objcopy failed' in" >&2
+  echo "the build output) and must be fixed before staging." >&2
+  rm -rf "$STAGE"
+  exit 1
+fi
 # What this build reads, beside the binary, so the placer can check it against
 # the floor on the machine it places onto rather than trusting this host's.
 cp "$FORMAT_VERSIONS" "$STAGE/format-versions.json"
