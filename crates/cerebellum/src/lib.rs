@@ -9786,3 +9786,224 @@ mod computer_consent_wire_tests {
         );
     }
 }
+
+/// A relayed `computer_use` call, driven through the production frame loop and
+/// the tool handler, writes the caller behind it on its computer journal row.
+#[cfg(all(test, target_os = "macos"))]
+mod relayed_computer_call_tests {
+    use super::*;
+    use cerebellum_computer::app_state::source::{
+        AppStateReadError, AppStateSource, RawAppState, ReadBounds,
+    };
+    use cerebellum_computer::capture_custody::{
+        CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+    };
+    use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
+    use cerebellum_core::journal::{
+        CallOriginRecord, InMemoryJournalStorage, JournalConfig, JournalStorage, OriginCarrier,
+    };
+
+    const CHANNEL: u16 = 7;
+    const EPOCH: u32 = 1;
+    const APP: &str = "com.example.Editor";
+
+    struct Running;
+
+    impl management::TargetResolver for Running {
+        fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+            TargetResolution::Resolved(ProcessGrant {
+                pid: 4242,
+                bundle_identity: bundle_identity.to_string(),
+                process_generation_evidence: "1700000000000000".to_string(),
+            })
+        }
+
+        fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn computer_grants::AppCode> {
+            Arc::new(computer_grants::SignedByFixtureTeam)
+        }
+    }
+
+    /// An application whose state cannot be read. The plane journals such a
+    /// read before it answers, so the call writes a row without touching a
+    /// real application.
+    struct Unreadable;
+
+    impl AppStateSource for Unreadable {
+        fn read_app_state(
+            &self,
+            _target: &ProcessGrant,
+            _bounds: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            Err(AppStateReadError::Unreadable)
+        }
+    }
+
+    /// Planes whose computer journal is held in `storage`, in memory, with one
+    /// tool route for the session caller that can relay a question.
+    fn planes(storage: &InMemoryJournalStorage) -> Planes {
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        );
+        planes.management = Arc::new(ManagementPlane::new(Arc::new(Running)));
+        let custody = CaptureCustody::new(
+            CustodyBounds {
+                maximum_verification_duration_ms: 5_000,
+                maximum_pin_lifetime_ms: 30_000,
+                maximum_concurrently_pinned_artifacts: 8,
+                maximum_total_pinned_artifact_bytes: 64 * 1024 * 1024,
+                maximum_custody_attachment_bytes: 16 * 1024 * 1024,
+            },
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .unwrap();
+        let audit = cerebellum_computer::audit::ComputerAudit::new(
+            cerebellum_computer::audit::redaction::ExcludeApplicationText,
+            cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+            JournalConfig {
+                journal_retention_bytes: 8 * 1024 * 1024,
+                journal_max_entry_bytes: 64 * 1024,
+            },
+            PlaneJournalStorage::InMemory(storage.clone()),
+            custody,
+        )
+        .unwrap();
+        // The screen is pinned unlocked: a locked developer machine would
+        // refuse the call before it reads anything.
+        planes.computer = Ok(Arc::new(
+            computer_capability::ComputerPlane::with_synthetic_driver(audit, || {
+                computer_capability::NativeComputerPlatformDriver::default()
+                    .without_expected_post_condition()
+            })
+            .with_session_lock_for_test(Some(false))
+            .with_app_state_source(Arc::new(Unreadable)),
+        ));
+        planes.computer_admitted = Arc::new(["computer.read_state".to_string()].into());
+        planes.routes.insert(
+            CHANNEL,
+            EPOCH,
+            AcceptedBindFacts::from_bind(
+                &subc_protocol::BindIdentity::new(
+                    "/test/project",
+                    "test",
+                    "test-session".to_string(),
+                ),
+                session_caller_principal_for_test(),
+                Some(&json!({
+                    "agentProjectId": "test-project",
+                    "sessionKind": "primary",
+                    "effectiveCapabilityScope": ["*"],
+                })),
+                Some(&["elicitation".to_string()]),
+                &subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+        planes
+    }
+
+    /// Send one `computer_use` read of the application, allow the app when
+    /// the call asks, and return the computer journal's decoded entries.
+    async fn read_state_rows(origin: Option<Value>) -> Vec<Value> {
+        let storage = InMemoryJournalStorage::new();
+        let planes = planes(&storage);
+        let mut request = json!({
+            "name": flat_tools::COMPUTER_USE,
+            "arguments": {"action": "read_state", "target": APP},
+        });
+        if let Some(origin) = origin {
+            request["origin"] = origin;
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                CHANNEL,
+                EPOCH,
+                42,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap(),
+            &tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let mut frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the call answered or asked")
+            .unwrap();
+        if frame.header.ty == FrameType::Request {
+            assert!(planes.elicitor.deliver(
+                frame.header.channel,
+                frame.header.corr,
+                json!({"decision": "allow_conversation"}),
+            ));
+            frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the allowed call answered")
+                .unwrap();
+        }
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        assert_eq!(frame.header.corr, 42);
+
+        let state = serde_json::to_value(storage.load().unwrap()).unwrap();
+        state["entries"]
+            .as_object()
+            .into_iter()
+            .flat_map(|entries| entries.values())
+            .map(|entry| {
+                let bytes = cerebellum_core::serde_base64::decode(entry["bytes"].as_str().unwrap())
+                    .unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_computer_call_names_its_origin_on_its_journal_row() {
+        let rows = read_state_rows(Some(json!({
+            "carrier": {"kind": "reserved", "module_id": "agent-host"},
+            "call_key": "agent:read-1",
+        })))
+        .await;
+        assert!(!rows.is_empty(), "the read wrote no journal row");
+        let expected = serde_json::to_value(CallOriginRecord::Relayed {
+            carrier: OriginCarrier::Reserved {
+                module_id: "agent-host".to_string(),
+            },
+            call_key: "agent:read-1".to_string(),
+        })
+        .unwrap();
+        for row in &rows {
+            assert_eq!(row["codec_version"], "ck-computer-journal/v3", "{row}");
+            assert_eq!(row["identity"]["origin"], expected, "{row}");
+            // Still the route's own principal: the origin names who it acted
+            // for, never who acted.
+            assert!(
+                row["identity"]["principal"]
+                    .as_str()
+                    .is_some_and(|principal| principal.contains("prefrontal-core")),
+                "{row}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_computer_call_naming_no_origin_writes_none_on_its_journal_row() {
+        let rows = read_state_rows(None).await;
+        assert!(!rows.is_empty(), "the read wrote no journal row");
+        for row in &rows {
+            assert!(row["identity"].get("origin").is_none(), "{row}");
+        }
+    }
+}
