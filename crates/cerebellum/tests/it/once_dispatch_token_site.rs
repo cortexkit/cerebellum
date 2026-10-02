@@ -51,7 +51,7 @@ fn the_pointer_dispatch_token_is_minted_only_by_the_takeover_grant_check() {
             .expect("sources live under the crates directory")
             .to_string_lossy()
             .replace('\\', "/");
-        let source = std::fs::read_to_string(&file).expect("read a workspace source file");
+        let source = std::fs::read_to_string(file).expect("read a workspace source file");
         for (line_number, line) in source_scan::shipped_lines(&source) {
             let code = line.trim_start();
             if code.starts_with("//") {

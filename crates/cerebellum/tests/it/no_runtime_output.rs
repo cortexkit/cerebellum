@@ -46,7 +46,7 @@ fn shipped_code_prints_nothing() {
                 .expect("sources live under the workspace root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let source = std::fs::read_to_string(&file).expect("read a source file");
+            let source = std::fs::read_to_string(file).expect("read a source file");
             for (line_number, line) in source_scan::shipped_lines(&source) {
                 let code = line.trim_start();
                 if code.starts_with("//") {
