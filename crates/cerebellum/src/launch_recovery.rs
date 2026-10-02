@@ -430,10 +430,11 @@ pub trait ProcessTable {
     fn host_name(&self) -> Option<String>;
 }
 
-/// How many more times an unreadable process of this user is read before the
-/// table counts as unreadable, and how long apart. A process part-way through
-/// exiting or exec'ing refuses the argument read for a moment.
-const UNREADABLE_RETRIES: u32 = 5;
+/// A compiler observed exec'ing from sccache to rustc refused argument reads
+/// with EIO and then EINVAL for 151 ms under load. Allow more than that measured
+/// transition, without letting many unreadable processes multiply the wait:
+/// the deadline is shared by the whole table, starting at its first refusal.
+const UNREADABLE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 const UNREADABLE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// The arguments of every running process of this module's user.
@@ -451,6 +452,7 @@ pub fn user_process_arguments(
 ) -> Result<Vec<(u32, Vec<OsString>)>, Unreadable> {
     let this_user = table.this_user().ok_or(Unreadable)?;
     let mut processes = Vec::new();
+    let mut retry_deadline = None;
     for pid in table.process_ids()? {
         match table.users(pid) {
             ProcessFact::Gone => continue,
@@ -459,7 +461,6 @@ pub fn user_process_arguments(
             ProcessFact::Read(_) => {}
             ProcessFact::NotPermitted | ProcessFact::Unreadable => return Err(Unreadable),
         }
-        let mut retries = 0;
         loop {
             match table.arguments(pid) {
                 ProcessFact::Read(arguments) => {
@@ -470,11 +471,15 @@ pub fn user_process_arguments(
                 ProcessFact::NotPermitted | ProcessFact::Unreadable => match table.users(pid) {
                     ProcessFact::Gone => break,
                     ProcessFact::Read(users) if users.zombie => break,
-                    _ if retries < UNREADABLE_RETRIES => {
-                        retries += 1;
-                        std::thread::sleep(UNREADABLE_RETRY_PAUSE);
+                    _ => {
+                        let now = std::time::Instant::now();
+                        let deadline = *retry_deadline.get_or_insert(now + UNREADABLE_RETRY_WINDOW);
+                        let remaining = deadline.saturating_duration_since(now);
+                        if remaining.is_zero() {
+                            return Err(Unreadable);
+                        }
+                        std::thread::sleep(UNREADABLE_RETRY_PAUSE.min(remaining));
                     }
-                    _ => return Err(Unreadable),
                 },
             }
         }
@@ -842,6 +847,61 @@ mod tests {
             arguments_of_10: ProcessFact::NotPermitted,
         };
         assert_eq!(user_process_arguments(&gone), Ok(Vec::new()));
+    }
+
+    struct ExecTransitionTable {
+        fixed: FixedTable,
+        unreadable_reads: std::cell::Cell<u32>,
+    }
+
+    impl ProcessTable for ExecTransitionTable {
+        fn this_user(&self) -> Option<u32> {
+            self.fixed.this_user()
+        }
+        fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
+            self.fixed.process_ids()
+        }
+        fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
+            self.fixed.users(pid)
+        }
+        fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
+            let remaining = self.unreadable_reads.get();
+            if pid == 10 && remaining > 0 {
+                self.unreadable_reads.set(remaining - 1);
+                ProcessFact::Unreadable
+            } else {
+                self.fixed.arguments(pid)
+            }
+        }
+        fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable> {
+            self.fixed.executable(pid)
+        }
+        fn host_name(&self) -> Option<String> {
+            self.fixed.host_name()
+        }
+    }
+
+    #[test]
+    fn an_exec_transition_outlasting_five_retries_is_read_not_skipped() {
+        let arguments = vec![OsString::from("--user-data-dir=/profiles/p1")];
+        // The observed compiler was unreadable for six reads, then readable on
+        // the seventh. Its owner stayed readable throughout the exec transition.
+        for after_exec in [ProcessFact::Read(arguments.clone()), ProcessFact::Gone] {
+            let table = ExecTransitionTable {
+                fixed: FixedTable {
+                    users_of_10: run_by(THIS_USER),
+                    arguments_of_10: after_exec.clone(),
+                },
+                unreadable_reads: std::cell::Cell::new(6),
+            };
+            let expected = match after_exec {
+                ProcessFact::Read(arguments) => vec![(10, arguments)],
+                ProcessFact::Gone => Vec::new(),
+                _ => unreachable!(),
+            };
+            assert_eq!(user_process_arguments(&table), Ok(expected));
+            assert_eq!(table.unreadable_reads.get(), 0);
+        }
     }
 
     #[test]
