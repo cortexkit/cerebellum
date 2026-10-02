@@ -17,6 +17,8 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::support::source_scan;
+
 /// Production sources that build browser.launch, status, or close replies.
 const LAUNCH_PATH_FILES: &[&str] = &[
     "src/browser_launch.rs",
@@ -40,11 +42,10 @@ fn every_launch_path_outcome_literal_is_declared_by_a_browser_session_schema() {
     for relative in LAUNCH_PATH_FILES {
         let text = std::fs::read_to_string(crate_root.join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
-        let lines = production_lines(&text)
-            .into_iter()
-            .map(|(number, line)| (number, line.to_string()))
-            .collect::<Vec<_>>();
-        sources.push((relative.to_string(), lines));
+        // Test modules write refusal fixtures of their own, including
+        // deliberately undeclared ones; only what production can send is
+        // fenced.
+        sources.push((relative.to_string(), source_scan::shipped_lines(&text)));
     }
     let (lib_path, lib_function) = LIB_FUNCTION;
     let lib = std::fs::read_to_string(crate_root.join(lib_path)).expect("read src/lib.rs");
@@ -194,50 +195,6 @@ fn function_lines(source: &str, signature: &str) -> Vec<(usize, String)> {
     kept
 }
 
-/// Lines outside every `#[cfg(test)]` module, with their 1-based numbers.
-///
-/// Test modules write refusal fixtures of their own, including deliberately
-/// undeclared ones; only what production can send is fenced. Skipped by brace
-/// balance rather than "everything after the first test module", because
-/// these files carry production code between test modules.
-fn production_lines(source: &str) -> Vec<(usize, &str)> {
-    let mut kept = Vec::new();
-    let mut skipping_from_depth: Option<i32> = None;
-    let mut depth = 0_i32;
-    let mut pending_test_module = false;
-    for (index, line) in source.lines().enumerate() {
-        let opens = line.matches('{').count() as i32;
-        let closes = line.matches('}').count() as i32;
-        if skipping_from_depth.is_none() {
-            // The item a test attribute gates is skipped whatever it is: a
-            // module, or a lone `#[test] fn` written at file level.
-            if pending_test_module && !line.trim_start().starts_with("#[") {
-                pending_test_module = false;
-                if opens > closes {
-                    skipping_from_depth = Some(depth);
-                }
-                depth += opens - closes;
-                continue;
-            }
-            if line.trim_start().starts_with("#[cfg(test)]")
-                || line.trim_start().starts_with("#[cfg(all(test")
-            {
-                pending_test_module = true;
-                depth += opens - closes;
-                continue;
-            }
-            kept.push((index + 1, line));
-        }
-        depth += opens - closes;
-        if let Some(entered_at) = skipping_from_depth {
-            if depth <= entered_at {
-                skipping_from_depth = None;
-            }
-        }
-    }
-    kept
-}
-
 #[test]
 fn the_scan_reads_outcome_words_and_string_details_the_way_they_are_written() {
     assert_eq!(
@@ -275,9 +232,9 @@ fn the_scan_skips_test_modules_and_keeps_production_lines() {
                   json!({\"outcome\": \"skipped_lone\"});\n\
                   }\n\
                   fn b() { json!({\"outcome\": \"kept_b\"}); }\n";
-    let words: Vec<String> = production_lines(source)
+    let words: Vec<String> = source_scan::shipped_lines(source)
         .into_iter()
-        .flat_map(|(_, line)| outcome_words(line))
+        .flat_map(|(_, line)| outcome_words(&line))
         .collect();
     assert_eq!(words, vec!["kept_a".to_string(), "kept_b".to_string()]);
 }

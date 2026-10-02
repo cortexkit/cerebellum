@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::source_scan::{self, copy_tree, scratch_directory};
+use crate::support::source_scan::{self, copy_tree, scratch_directory};
 
 /// The one file allowed to read the nonce.
 const READER: &str = "crates/cerebellum/src/launch_nonce.rs";
