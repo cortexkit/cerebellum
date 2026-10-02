@@ -96,6 +96,7 @@ mod live {
         planes.management = management;
 
         let bind = ModuleControlRequest::RouteBind {
+            role_versions: None,
             route_channel: CHANNEL,
             epoch: EPOCH,
             target: RouteTarget::ManagementSurface {

@@ -733,6 +733,7 @@ async fn bind_management_route_as(
     principal: Option<Principal>,
 ) {
     let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 4,
         epoch: 1,
         target: RouteTarget::ManagementSurface {

@@ -77,6 +77,7 @@ async fn management_planes() -> Planes {
         JournalPersistence::Isolated,
     );
     let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: MANAGEMENT_CHANNEL,
         epoch: MANAGEMENT_EPOCH,
         target: RouteTarget::ManagementSurface {

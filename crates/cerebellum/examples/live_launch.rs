@@ -441,6 +441,7 @@ async fn bind_route(
     declares_elicitation: bool,
 ) {
     let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel,
         epoch,
         target,

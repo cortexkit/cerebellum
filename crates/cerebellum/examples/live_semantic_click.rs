@@ -887,6 +887,7 @@ mod macos_probe {
         declares_elicitation: bool,
     ) -> Result<(), String> {
         let request = ModuleControlRequest::RouteBind {
+            role_versions: None,
             route_channel,
             epoch,
             target,

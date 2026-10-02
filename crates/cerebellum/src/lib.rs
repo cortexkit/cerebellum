@@ -4145,6 +4145,8 @@ async fn handle_control_request(
             consumer_capabilities,
             target,
             scope,
+            // Cerebellum declares no versioned roles today.
+            role_versions: _,
         } => {
             // In-module principal default-deny backstop: the gateway policy
             // (subc-mcp) is the primary exclusion of cerebellum capabilities
