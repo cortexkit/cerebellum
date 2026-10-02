@@ -4925,7 +4925,8 @@ async fn handle_tool_request(
             .await;
     };
 
-    // Tool-route envelopes are closed. `progress_token` is an optional gateway
+    // Tool-route envelopes are closed: a member not listed here is refused by
+    // name as `unknown_field`. `progress_token` is an optional gateway
     // member, accepted for correlation but not used here. `origin` names the
     // caller behind a relayed call; it was read before this handler (see
     // `handle_keyed_tool_request`) and reaches it only through `call`.
