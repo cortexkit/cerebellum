@@ -762,11 +762,12 @@ fn out_of_line_test_modules_are_found_by_path() {
     assert_eq!(found, expected);
 }
 
-/// The fewest of the workspace's non-blank source lines the skipper may read
-/// as shipped. About 68% shipped when this was set; a skipper that cuts at
-/// the first marker in each file, the failure other projects' scans were
-/// measured with, read a small fraction and falls well below.
-const MIN_SHIPPED_PERCENT: usize = 50;
+/// The smallest share of the workspace's non-blank source lines the skipper
+/// may read as shipped. When this was set it read 68% (96,311 of 141,567
+/// lines); a skipper that drops everything after the first test marker in
+/// each file read 49.6%, and one that drops everything reads none, so both
+/// fall below while ordinary churn in the test share stays above.
+const MIN_SHIPPED_PERCENT: usize = 60;
 
 /// The real tree, read whole: a skipper that has gone blind fails here even if
 /// every planted case still happened to pass.
