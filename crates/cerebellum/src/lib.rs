@@ -4373,8 +4373,21 @@ async fn handle_keyed_tool_request(
         }
         return handle_tool_withdraw(&object, (ver, channel, epoch, corr), writer, planes).await;
     }
+    // Read once, here, so the call record and every audit row the call writes
+    // carry the same value. An origin that fails validation never refuses the
+    // call: it says who a relaying module claims to be acting for, which is
+    // attribution, not authorization. It is recorded as absent with a marker
+    // instead, and nothing below this point decides anything by it.
+    let origin =
+        cerebellum_core::journal::CallOriginRecord::from_request_member(object.get("origin"));
     let Some(call_key) = call_key else {
-        return handle_tool_request(frame, writer, planes, &CallObservation::new()).await;
+        return handle_tool_request(
+            frame,
+            writer,
+            planes,
+            &CallObservation::new().with_origin(origin),
+        )
+        .await;
     };
     let mut call = frame;
     call.body = serde_json::to_vec(&Value::Object(object)).map_err(ModuleError::Json)?;
@@ -4382,7 +4395,13 @@ async fn handle_keyed_tool_request(
     // Nothing is lost by not recording it: `handle_tool_request` refuses any
     // call on an unbound route (`route_not_bound`) before it does anything.
     let Some(facts) = planes.routes.get(channel, epoch) else {
-        return handle_tool_request(call, writer, planes, &CallObservation::new()).await;
+        return handle_tool_request(
+            call,
+            writer,
+            planes,
+            &CallObservation::new().with_origin(origin),
+        )
+        .await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
     // The call's record is synced to disk before the call may proceed. The write and
@@ -4397,12 +4416,16 @@ async fn handle_keyed_tool_request(
             .scope
             .as_ref()
             .map(call_records::ScopeIdentity::from_stamp);
+        // Stored on a new record only; the record is still found by the
+        // route's principal and the call key alone.
+        let origin = origin.clone();
         tokio::task::spawn_blocking(move || {
-            calls.begin_scoped(
+            calls.begin_attributed(
                 &principal,
                 &call_key,
                 &conversation_key,
                 scope,
+                origin,
                 wall_clock_ms(),
             )
         })
@@ -4486,7 +4509,7 @@ async fn handle_keyed_tool_request(
     let (proxy, mut outgoing) = mpsc::channel::<Frame>(16);
     let mut pending = PendingSettlement {
         ticket: Some(ticket),
-        observation: CallObservation::new(),
+        observation: CallObservation::new().with_origin(origin),
         unattributed_at_start: cerebellum_core::dispatch_witness::unattributed_commit_count(),
         request: (channel, epoch, corr),
     };
@@ -4529,7 +4552,8 @@ async fn handle_keyed_tool_request(
 }
 
 /// What the tool handler watches while one request runs, so a keyed call's
-/// record can say whether the action was dispatched.
+/// record can say whether the action was dispatched, and who the request says
+/// it was relayed for.
 ///
 /// Armed for every tool request, keyed or not, so that in a running module a
 /// dispatch commitment made under a detached witness always means a commit
@@ -4541,6 +4565,9 @@ struct CallObservation {
     /// Set just before the request is handed to a plane every one of whose
     /// dispatches passes a commitment that marks `dispatch`.
     commit_point: Arc<std::sync::atomic::AtomicBool>,
+    /// The request's `origin`, already validated, for the audit rows the call
+    /// writes. Attribution only: admission reads the route's own facts.
+    origin: cerebellum_core::journal::CallOriginRecord,
 }
 
 impl CallObservation {
@@ -4548,7 +4575,13 @@ impl CallObservation {
         Self {
             dispatch: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
             commit_point: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            origin: cerebellum_core::journal::CallOriginRecord::Absent,
         }
+    }
+
+    fn with_origin(mut self, origin: cerebellum_core::journal::CallOriginRecord) -> Self {
+        self.origin = origin;
+        self
     }
 
     fn commit_point_follows(&self) {
@@ -4892,11 +4925,19 @@ async fn handle_tool_request(
             .await;
     };
 
-    // Tool-route envelopes are closed. `progress_token` is the only optional
-    // gateway member; it is accepted for correlation but not used here.
+    // Tool-route envelopes are closed: a member not listed here is refused by
+    // name as `unknown_field`. `progress_token` is an optional gateway
+    // member, accepted for correlation but not used here. `origin` names the
+    // caller behind a relayed call; it was read before this handler (see
+    // `handle_keyed_tool_request`) and reaches it only through `call`.
     if let Some(field) = object
         .keys()
-        .filter(|field| !matches!(field.as_str(), "name" | "arguments" | "progress_token"))
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "name" | "arguments" | "progress_token" | "origin"
+            )
+        })
         .min()
     {
         return send_invalid_request_response(
@@ -4973,6 +5014,10 @@ async fn handle_tool_request(
     // This request's copy of the route identity carries its own witness, so a
     // browser dispatch committed for it marks this request and no other.
     accepted_facts.identity.witness = call.dispatch.clone();
+    // And its own origin, so every audit row written for it names the caller
+    // behind it. Set after the route lookup and read by nothing below that
+    // admits, refuses or keys the call.
+    accepted_facts.identity.origin = call.origin.clone();
     // Session admission, before the capability scope and before anything
     // below reads a grant, asks a person or reserves a journal entry; see
     // `send_session_caller_not_admitted`. Every tool call acts in the route's
@@ -5204,6 +5249,7 @@ async fn handle_tool_request(
                         conversation_key: accepted_facts.identity.conversation_key.clone(),
                         agent_project_id: accepted_facts.identity.agent_project_id.clone(),
                         session_kind: accepted_facts.identity.session_kind,
+                        origin: accepted_facts.identity.origin.clone(),
                     },
                     management: &planes.management,
                     consent: consent_context(planes, &accepted_facts, writer, channel, epoch),
@@ -9738,5 +9784,226 @@ mod computer_consent_wire_tests {
             refused["detail"]["reason_code"], "missing_field",
             "{refused}"
         );
+    }
+}
+
+/// A relayed `computer_use` call, driven through the production frame loop and
+/// the tool handler, writes the caller behind it on its computer journal row.
+#[cfg(all(test, target_os = "macos"))]
+mod relayed_computer_call_tests {
+    use super::*;
+    use cerebellum_computer::app_state::source::{
+        AppStateReadError, AppStateSource, RawAppState, ReadBounds,
+    };
+    use cerebellum_computer::capture_custody::{
+        CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+    };
+    use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
+    use cerebellum_core::journal::{
+        CallOriginRecord, InMemoryJournalStorage, JournalConfig, JournalStorage, OriginCarrier,
+    };
+
+    const CHANNEL: u16 = 7;
+    const EPOCH: u32 = 1;
+    const APP: &str = "com.example.Editor";
+
+    struct Running;
+
+    impl management::TargetResolver for Running {
+        fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+            TargetResolution::Resolved(ProcessGrant {
+                pid: 4242,
+                bundle_identity: bundle_identity.to_string(),
+                process_generation_evidence: "1700000000000000".to_string(),
+            })
+        }
+
+        fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn computer_grants::AppCode> {
+            Arc::new(computer_grants::SignedByFixtureTeam)
+        }
+    }
+
+    /// An application whose state cannot be read. The plane journals such a
+    /// read before it answers, so the call writes a row without touching a
+    /// real application.
+    struct Unreadable;
+
+    impl AppStateSource for Unreadable {
+        fn read_app_state(
+            &self,
+            _target: &ProcessGrant,
+            _bounds: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            Err(AppStateReadError::Unreadable)
+        }
+    }
+
+    /// Planes whose computer journal is held in `storage`, in memory, with one
+    /// tool route for the session caller that can relay a question.
+    fn planes(storage: &InMemoryJournalStorage) -> Planes {
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        );
+        planes.management = Arc::new(ManagementPlane::new(Arc::new(Running)));
+        let custody = CaptureCustody::new(
+            CustodyBounds {
+                maximum_verification_duration_ms: 5_000,
+                maximum_pin_lifetime_ms: 30_000,
+                maximum_concurrently_pinned_artifacts: 8,
+                maximum_total_pinned_artifact_bytes: 64 * 1024 * 1024,
+                maximum_custody_attachment_bytes: 16 * 1024 * 1024,
+            },
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .unwrap();
+        let audit = cerebellum_computer::audit::ComputerAudit::new(
+            cerebellum_computer::audit::redaction::ExcludeApplicationText,
+            cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+            JournalConfig {
+                journal_retention_bytes: 8 * 1024 * 1024,
+                journal_max_entry_bytes: 64 * 1024,
+            },
+            PlaneJournalStorage::InMemory(storage.clone()),
+            custody,
+        )
+        .unwrap();
+        // The screen is pinned unlocked: a locked developer machine would
+        // refuse the call before it reads anything.
+        planes.computer = Ok(Arc::new(
+            computer_capability::ComputerPlane::with_synthetic_driver(audit, || {
+                computer_capability::NativeComputerPlatformDriver::default()
+                    .without_expected_post_condition()
+            })
+            .with_session_lock_for_test(Some(false))
+            .with_app_state_source(Arc::new(Unreadable)),
+        ));
+        planes.computer_admitted = Arc::new(["computer.read_state".to_string()].into());
+        planes.routes.insert(
+            CHANNEL,
+            EPOCH,
+            AcceptedBindFacts::from_bind(
+                &subc_protocol::BindIdentity::new(
+                    "/test/project",
+                    "test",
+                    "test-session".to_string(),
+                ),
+                session_caller_principal_for_test(),
+                Some(&json!({
+                    "agentProjectId": "test-project",
+                    "sessionKind": "primary",
+                    "effectiveCapabilityScope": ["*"],
+                })),
+                Some(&["elicitation".to_string()]),
+                &subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "cerebellum".to_string(),
+                },
+            ),
+        );
+        planes
+    }
+
+    /// Send one `computer_use` read of the application, allow the app when
+    /// the call asks, and return the computer journal's decoded entries.
+    async fn read_state_rows(origin: Option<Value>) -> Vec<Value> {
+        let storage = InMemoryJournalStorage::new();
+        let planes = planes(&storage);
+        let mut request = json!({
+            "name": flat_tools::COMPUTER_USE,
+            "arguments": {"action": "read_state", "target": APP},
+        });
+        if let Some(origin) = origin {
+            request["origin"] = origin;
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                CHANNEL,
+                EPOCH,
+                42,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap(),
+            &tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let mut frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the call answered or asked")
+            .unwrap();
+        if frame.header.ty == FrameType::Request {
+            assert!(planes.elicitor.deliver(
+                frame.header.channel,
+                frame.header.corr,
+                json!({"decision": "allow_conversation"}),
+            ));
+            frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the allowed call answered")
+                .unwrap();
+        }
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        assert_eq!(frame.header.corr, 42);
+
+        let state = serde_json::to_value(storage.load().unwrap()).unwrap();
+        state["entries"]
+            .as_object()
+            .into_iter()
+            .flat_map(|entries| entries.values())
+            .map(|entry| {
+                let bytes = cerebellum_core::serde_base64::decode(entry["bytes"].as_str().unwrap())
+                    .unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_computer_call_names_its_origin_on_its_journal_row() {
+        let rows = read_state_rows(Some(json!({
+            "carrier": {"kind": "reserved", "module_id": "agent-host"},
+            "call_key": "agent:read-1",
+        })))
+        .await;
+        assert!(!rows.is_empty(), "the read wrote no journal row");
+        let expected = serde_json::to_value(CallOriginRecord::Relayed {
+            carrier: OriginCarrier::Reserved {
+                module_id: "agent-host".to_string(),
+            },
+            call_key: "agent:read-1".to_string(),
+        })
+        .unwrap();
+        for row in &rows {
+            assert_eq!(row["codec_version"], "ck-computer-journal/v3", "{row}");
+            assert_eq!(row["identity"]["origin"], expected, "{row}");
+            // Still the route's own principal: the origin names who it acted
+            // for, never who acted.
+            assert!(
+                row["identity"]["principal"]
+                    .as_str()
+                    .is_some_and(|principal| principal.contains("prefrontal-core")),
+                "{row}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_computer_call_naming_no_origin_writes_none_on_its_journal_row() {
+        let rows = read_state_rows(None).await;
+        assert!(!rows.is_empty(), "the read wrote no journal row");
+        for row in &rows {
+            assert!(row["identity"].get("origin").is_none(), "{row}");
+        }
     }
 }

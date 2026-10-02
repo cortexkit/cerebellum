@@ -14,6 +14,7 @@ use crate::identity::SessionKind;
 
 pub mod codec;
 pub mod late_events;
+pub mod origin;
 pub mod redaction;
 pub mod refusal_ring;
 pub mod recovery {
@@ -44,6 +45,10 @@ pub use late_events::{
     DeliveryRoute, LateDelivery, LateEventCause, LateEventDescriptor, LateEventError,
     LateEventQueue, LateEventSequence,
 };
+pub use origin::{
+    origin_invalid_count, CallOriginRecord, OriginCarrier, ORIGIN_INVALID_MARKER,
+    ORIGIN_MODULE_ID_MAX_LEN,
+};
 pub use redaction::{redact_then_truncate, RedactionUnavailable, Redactor};
 pub use refusal_ring::{
     CallerRefusalHistory, RefusalRecord, RefusalRing, RefusalRingConfig, RefusalRingError,
@@ -70,6 +75,11 @@ pub struct JournalIdentity {
     pub conversation_key: String,
     pub agent_project_id: String,
     pub session_kind: SessionKind,
+    /// The caller behind a relayed call, for attribution only. Omitted from
+    /// the stored record when the request named none, which keeps a record
+    /// without one byte-identical to the previous journal schema.
+    #[serde(default, skip_serializing_if = "CallOriginRecord::is_absent")]
+    pub origin: CallOriginRecord,
     /// The request this obligation serves, marked when its dispatch is
     /// committed. Never persisted; a reloaded identity carries a detached one.
     #[serde(skip)]
@@ -1676,6 +1686,7 @@ mod tests {
             conversation_key: "c".to_string(),
             agent_project_id: "a".to_string(),
             session_kind: SessionKind::Primary,
+            origin: CallOriginRecord::Absent,
         }
     }
 

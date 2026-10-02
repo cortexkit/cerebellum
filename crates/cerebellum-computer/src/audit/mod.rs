@@ -276,7 +276,11 @@ pub struct ComputerJournalCodec {
 
 /// The version of the computer journal's entries, as the codec writes it and
 /// startup reconciliation reads it back.
-pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v2";
+///
+/// Version 3 added the optional `identity.origin` member: the caller behind a
+/// relayed call. Version 2 and older entries are still read; an entry without
+/// the member means the call named no origin.
+pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v3";
 
 /// The computer journal's entry format. Its floor is raised before entries are
 /// written, and staging refuses a build whose readers stop short of it.
@@ -321,12 +325,18 @@ impl ComputerJournalCodec {
     }
 
     fn identity(value: &JournalIdentity) -> Value {
-        json!({
+        let mut identity = json!({
             "agent_project_id": value.agent_project_id,
             "conversation_key": value.conversation_key,
             "principal": value.principal,
             "session_kind": value.session_kind,
-        })
+        });
+        // Written only when the request named an origin, so an entry for a
+        // call nobody relayed reads exactly as it did before the member existed.
+        if !value.origin.is_absent() {
+            identity["origin"] = json!(value.origin);
+        }
+        identity
     }
 
     fn severity(value: Option<SeverityInputs>) -> Value {
@@ -1230,6 +1240,7 @@ pub fn journal_identity(
         conversation_key: conversation_key.into(),
         agent_project_id: agent_project_id.into(),
         session_kind,
+        origin: Default::default(),
     }
 }
 

@@ -133,6 +133,7 @@ mod macos_probe {
             conversation_key: "live-ax-actions".into(),
             agent_project_id: "live-probe".into(),
             session_kind: SessionKind::Primary,
+            origin: Default::default(),
         }
     }
 

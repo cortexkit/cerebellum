@@ -114,6 +114,7 @@ fn identity() -> JournalIdentity {
         conversation_key: "conversation-1".into(),
         agent_project_id: "project-1".into(),
         session_kind: SessionKind::Primary,
+        origin: Default::default(),
     }
 }
 
@@ -1230,8 +1231,75 @@ fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup(
     );
 }
 
+/// Opening a journal the previous build wrote, with nothing for startup
+/// reconciliation to settle, writes nothing: the file keeps its bytes (schema
+/// 2, v1 entries) and no floor is raised, so the previous build can still be
+/// placed. The first entry this build writes moves the file to schema 3 and
+/// raises both floors before it does.
 #[test]
-fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
+fn a_settled_older_journal_is_left_as_it_stands_until_this_build_writes_an_entry() {
+    use cerebellum_core::format_floor::{read_floors, FormatFloor};
+
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/v12_computer_journal.json")).unwrap();
+    // Only the two settled entries: the orphaned reservations would be
+    // settled, and so written, at startup.
+    fixture["state"]["reservations"] = json!({});
+    assert_eq!(fixture["schema_version"], 2);
+    let older = serde_json::to_vec_pretty(&fixture).unwrap();
+    let directory = std::env::temp_dir().join(format!(
+        "cerebellum-older-computer-journal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("computer.json");
+    let floor = directory.join("format-floor.json");
+    std::fs::write(&path, &older).unwrap();
+    let custody = CaptureCustody::new(
+        bounds(),
+        InMemoryGrantAuthority::default(),
+        InMemoryCustodyStorage::new(),
+    )
+    .unwrap();
+    let mut audit = ComputerAudit::new(
+        ExcludeApplicationText,
+        cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+        JournalConfig {
+            journal_retention_bytes: 8 * 1024 * 1024,
+            journal_max_entry_bytes: 64 * 1024,
+        },
+        cerebellum_core::journal::FilesystemJournalStorage::new(path.clone())
+            .with_format_floor(FormatFloor::at(&floor)),
+        custody,
+    )
+    .expect("an older journal binds");
+    audit
+        .startup_reconcile(10)
+        .expect("nothing to settle at startup");
+    let after_start = std::fs::read(&path).unwrap();
+    let floor_after_start = floor.exists();
+
+    let descriptor = actuation_descriptor();
+    audit.reserve(identity(), descriptor).unwrap();
+    let after_write: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let floors = read_floors(&floor);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    assert_eq!(after_start, older, "starting rewrote the older journal");
+    assert!(!floor_after_start, "starting raised a format floor");
+    assert_eq!(after_write["schema_version"], 3);
+    let floors = floors.expect("the first write raised the floors");
+    assert_eq!(floors.get("audit-journal"), Some(&3), "{floors:?}");
+    assert_eq!(floors.get("computer-journal-entry"), Some(&3), "{floors:?}");
+}
+
+#[test]
+fn old_journal_fixture_reads_and_route_summary_round_trips_in_the_current_version() {
     use cerebellum_computer::audit::{ActuationOutcome, RecordedActuationOutcome};
     use cerebellum_computer::platform::input_route::{
         AuthEvidence, InputRouteEvidence, RouteCounts,
@@ -1284,16 +1352,16 @@ fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
         .finalize_actuation_outcome_with_routes(token, &old_outcome.outcome, &routes)
         .unwrap();
     let new = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
-    assert_eq!(new["codec_version"], "ck-computer-journal/v2");
+    assert_eq!(new["codec_version"], "ck-computer-journal/v3");
     let completed: Vec<u8> = serde_json::from_value(new["completed_result"].clone()).unwrap();
     let recorded: RecordedActuationOutcome = serde_json::from_slice(&completed).unwrap();
     assert_eq!(recorded.routes, routes);
     assert_eq!(recorded.outcome, old_outcome.outcome);
-    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 3);
 }
 
 #[test]
-fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
+fn v2_manual_accessibility_fixture_still_reads_under_the_v3_codec() {
     let entry = ComputerJournalCodec::decode_entry(include_bytes!(
         "../fixtures/v2_manual_accessibility_entry.json"
     ))
@@ -1307,7 +1375,65 @@ fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
     let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(dispatch["pid"], 42);
     assert_eq!(dispatch["bundle_identity"], "com.example.target");
-    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
+    // Written before identities could carry an origin: it has none.
+    assert!(entry["identity"].get("origin").is_none());
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 3);
+}
+
+/// Every phase of an entry names the caller behind a relayed call, and an
+/// entry for a call nobody relayed writes no `origin` member at all.
+#[test]
+fn each_entry_names_a_relayed_calls_origin_and_only_then() {
+    use cerebellum_core::journal::{CallOriginRecord, OriginCarrier};
+
+    let relayed = CallOriginRecord::Relayed {
+        carrier: OriginCarrier::Reserved {
+            module_id: "agent-host".to_string(),
+        },
+        call_key: "agent:7".to_string(),
+    };
+    for origin in [
+        CallOriginRecord::Absent,
+        relayed,
+        CallOriginRecord::OriginInvalid,
+    ] {
+        let mut audit = audit();
+        let mut identity = identity();
+        identity.origin = origin.clone();
+        let descriptor = actuation_descriptor();
+        let handle = audit.reserve(identity, descriptor.clone()).unwrap();
+        let token = audit
+            .commit_actuation_intent(
+                handle,
+                &descriptor,
+                &ActuationIntent {
+                    element: None,
+                    action: "computer.type".into(),
+                    grant_identity: target_grant(),
+                },
+            )
+            .unwrap();
+        audit
+            .finalize_actuation_outcome(
+                token,
+                &cerebellum_computer::audit::ActuationOutcome::HandlerReturned {
+                    unreadable_subtrees: 0,
+                },
+            )
+            .unwrap();
+        let entry = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+        assert_eq!(entry["codec_version"], "ck-computer-journal/v3");
+        match &origin {
+            CallOriginRecord::Absent => {
+                assert!(entry["identity"].get("origin").is_none(), "{entry}")
+            }
+            _ => assert_eq!(
+                entry["identity"]["origin"],
+                serde_json::to_value(&origin).unwrap(),
+                "{entry}"
+            ),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1344,7 +1470,7 @@ fn accessibility_read_evidence_is_on_each_actions_own_row_and_not_its_result() {
             let entry =
                 ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
             assert_eq!(entry["manual_accessibility"], status);
-            assert_eq!(entry["codec_version"], "ck-computer-journal/v2");
+            assert_eq!(entry["codec_version"], "ck-computer-journal/v3");
             let bytes: Vec<u8> =
                 serde_json::from_value(entry["dispatch_material"].clone()).unwrap();
             let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

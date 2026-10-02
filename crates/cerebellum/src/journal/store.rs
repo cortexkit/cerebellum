@@ -202,6 +202,7 @@ impl JournalStore {
                 SessionKind::Subagent => cerebellum_core::identity::SessionKind::Subagent,
                 SessionKind::Ephemeral => cerebellum_core::identity::SessionKind::Ephemeral,
             },
+            origin: identity.origin.clone(),
         }
     }
 

@@ -1760,6 +1760,7 @@ impl<S: JournalStorage> LaunchJournalPort for DurableLaunchJournal<S> {
             conversation_key: intent.route.conversation_key.clone(),
             agent_project_id: intent.route.agent_project_id.clone(),
             session_kind: intent.route.session_kind,
+            origin: Default::default(),
         };
         let bytes = serde_json::to_vec(intent).map_err(|_| CoreJournalError::CodecFailed)?;
         self.core

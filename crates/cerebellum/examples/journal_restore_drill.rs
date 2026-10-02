@@ -185,6 +185,7 @@ fn main() -> ExitCode {
             conversation_key: "journal-restore-drill".into(),
             agent_project_id: "drill".into(),
             session_kind: SessionKind::Primary,
+            origin: Default::default(),
         };
         let sequence = match kind {
             "actuation" => {

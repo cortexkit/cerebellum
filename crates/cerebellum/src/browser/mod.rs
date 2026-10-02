@@ -1119,6 +1119,7 @@ pub fn journal_identity(identity: &RouteIdentity) -> JournalIdentity {
         profile_uuid: None,
         profile_name: (identity.session_kind != SessionKind::Ephemeral)
             .then(|| "default".to_string()),
+        origin: identity.origin.clone(),
         witness: identity.witness.clone(),
     }
 }

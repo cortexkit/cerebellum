@@ -60,6 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use cerebellum_core::journal::CallOriginRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_protocol::{Frame, FrameType, Principal};
@@ -67,8 +68,15 @@ use subc_protocol::{Frame, FrameType, Principal};
 /// The file name under the journal data home.
 pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
 
-/// The only file version this build reads or writes.
-pub const CALL_RECORD_VERSION: u64 = 1;
+/// The file version this build writes, and the newest it reads.
+///
+/// Version 2 added the optional `origin` member to each record: the caller
+/// behind a relayed call. A version 1 file is still read, and is rewritten
+/// under the current header when it is opened.
+pub const CALL_RECORD_VERSION: u64 = 2;
+
+/// The oldest file version this build reads.
+const OLDEST_READ_CALL_RECORD_VERSION: u64 = 1;
 
 /// The file's format, as the format floor and staging name it.
 pub const CALL_RECORD_FORMAT: cerebellum_core::format_floor::DurableFormat =
@@ -184,6 +192,12 @@ pub struct CallRecord {
     pub effect_status: Option<String>,
     #[serde(default)]
     pub posts_returned: Option<u64>,
+    /// The caller behind a relayed call, as the first call with this key
+    /// named it. Attribution only: the record is found by `principal` and
+    /// `call_key` alone, so a resend naming another origin is still the same
+    /// call. Omitted when the call named no origin.
+    #[serde(default, skip_serializing_if = "CallOriginRecord::is_absent")]
+    pub origin: CallOriginRecord,
     pub started_at_ms: u64,
     #[serde(default)]
     pub settled_at_ms: Option<u64>,
@@ -645,6 +659,10 @@ struct Inner {
     /// refused rather than run unprotected.
     broken: Option<CallRecordError>,
     header_written: bool,
+    /// The file on disk was written by an older build, under an older
+    /// header. It is read as it stands and rewritten under the current header
+    /// only when this build first writes a record.
+    older_header: bool,
     appended_since_compaction: usize,
     entries: HashMap<Key, Entry>,
     cached: VecDeque<Key>,
@@ -687,7 +705,10 @@ fn line(record: &CallRecord) -> Result<Vec<u8>, CallRecordError> {
 /// A last line without its newline is a write the crash interrupted. It is
 /// ignored: the record is written before the call acts, so an interrupted
 /// write means the call never went ahead.
-fn parse(bytes: &[u8]) -> Result<Vec<CallRecord>, CallRecordError> {
+///
+/// Also says which version the file's header names (the current one for an
+/// empty file), so an older file can be rewritten under the current header.
+fn parse_versioned(bytes: &[u8]) -> Result<(u64, Vec<CallRecord>), CallRecordError> {
     let text =
         std::str::from_utf8(bytes).map_err(|error| CallRecordError::Corrupt(error.to_string()))?;
     let mut lines: Vec<&str> = text.split('\n').collect();
@@ -696,7 +717,7 @@ fn parse(bytes: &[u8]) -> Result<Vec<CallRecord>, CallRecordError> {
     lines.pop();
     let mut lines = lines.into_iter();
     let Some(first) = lines.next() else {
-        return Ok(Vec::new());
+        return Ok((CALL_RECORD_VERSION, Vec::new()));
     };
     let header: Value =
         serde_json::from_str(first).map_err(|error| CallRecordError::Corrupt(error.to_string()))?;
@@ -708,7 +729,7 @@ fn parse(bytes: &[u8]) -> Result<Vec<CallRecord>, CallRecordError> {
             "the header names no version".to_string(),
         ));
     };
-    if version != CALL_RECORD_VERSION {
+    if !(OLDEST_READ_CALL_RECORD_VERSION..=CALL_RECORD_VERSION).contains(&version) {
         return Err(CallRecordError::UnknownVersion(version));
     }
     if header.get("format").and_then(Value::as_str) != Some(CALL_RECORD_FORMAT.name) {
@@ -721,7 +742,8 @@ fn parse(bytes: &[u8]) -> Result<Vec<CallRecord>, CallRecordError> {
         .map(|line| {
             serde_json::from_str(line).map_err(|error| CallRecordError::Corrupt(error.to_string()))
         })
-        .collect()
+        .collect::<Result<_, _>>()
+        .map(|records| (version, records))
 }
 
 impl CallRecords {
@@ -745,6 +767,7 @@ impl CallRecords {
             inner: Mutex::new(Inner {
                 broken: Some(error),
                 header_written: false,
+                older_header: false,
                 appended_since_compaction: 0,
                 entries: HashMap::new(),
                 cached: VecDeque::new(),
@@ -759,14 +782,22 @@ impl CallRecords {
     /// call replied; it becomes `unknown`. Records past retention are dropped.
     /// If anything changed the file is rewritten at once, so the reconciled
     /// state is what the next start reads too.
+    ///
+    /// A file from an older build is the exception: it is left exactly as it
+    /// is until this build writes a record. Any rewrite here would be in the
+    /// current format and raise its format floor, and a raised floor stops the
+    /// older build from being placed again, so merely starting this build
+    /// must not raise it. Leaving the file costs nothing: a reconciled record
+    /// is reconciled again on the next start, and one past retention is
+    /// dropped again.
     pub fn open(storage: Box<dyn CallRecordStorage>, now_ms: u64) -> Self {
         let loaded = storage.load().and_then(|bytes| match bytes {
             None => Ok(None),
-            Some(bytes) => parse(&bytes).map(Some),
+            Some(bytes) => parse_versioned(&bytes).map(Some),
         });
-        let (records, existed) = match loaded {
-            Ok(Some(records)) => (records, true),
-            Ok(None) => (Vec::new(), false),
+        let (records, existed, outdated) = match loaded {
+            Ok(Some((version, records))) => (records, true, version < CALL_RECORD_VERSION),
+            Ok(None) => (Vec::new(), false, false),
             Err(error) => {
                 let mut broken = Self::broken(error);
                 broken.storage = storage;
@@ -776,6 +807,7 @@ impl CallRecords {
         let mut inner = Inner {
             broken: None,
             header_written: existed,
+            older_header: outdated,
             appended_since_compaction: 0,
             entries: HashMap::new(),
             cached: VecDeque::new(),
@@ -808,7 +840,8 @@ impl CallRecords {
         {
             let mut inner = records.lock();
             let dropped = Self::apply_retention(&mut inner, now_ms);
-            if existed && (reconciled || dropped || line_count != inner.entries.len()) {
+            if existed && !outdated && (reconciled || dropped || line_count != inner.entries.len())
+            {
                 if let Err(error) = records.compact(&mut inner) {
                     inner.broken = Some(error);
                 }
@@ -868,6 +901,7 @@ impl CallRecords {
         }
         self.storage.replace(&bytes)?;
         inner.header_written = true;
+        inner.older_header = false;
         inner.appended_since_compaction = 0;
         Ok(())
     }
@@ -884,6 +918,14 @@ impl CallRecords {
             self.storage.replace(&bytes)?;
             inner.header_written = true;
             return Ok(());
+        }
+        // The first record this build writes into an older build's file: the
+        // whole file is rewritten under the current header first, since a
+        // record that may carry newer members under an older header would read
+        // as corruption to the build that wrote the header, where the format
+        // floor (raised by this write) tells that build to stop by name.
+        if inner.older_header {
+            self.compact(inner)?;
         }
         self.storage.append(&line(record)?)?;
         inner.appended_since_compaction += 1;
@@ -934,6 +976,29 @@ impl CallRecords {
         scope: Option<ScopeIdentity>,
         now_ms: u64,
     ) -> Begin {
+        self.begin_attributed(
+            principal,
+            call_key,
+            conversation_key,
+            scope,
+            CallOriginRecord::Absent,
+            now_ms,
+        )
+    }
+
+    /// [`Self::begin_scoped`] for a call that names the caller behind it: a
+    /// new record stores `origin`. The origin takes no part in finding the
+    /// record, so a key already recorded is answered exactly as
+    /// [`Self::begin_scoped`] answers it, whatever origin either call named.
+    pub fn begin_attributed(
+        &self,
+        principal: &str,
+        call_key: &str,
+        conversation_key: &str,
+        scope: Option<ScopeIdentity>,
+        origin: CallOriginRecord,
+        now_ms: u64,
+    ) -> Begin {
         let mut inner = self.lock();
         if let Some(error) = inner.broken.clone() {
             return Begin::Unavailable(error);
@@ -963,6 +1028,7 @@ impl CallRecords {
             refusal_reason: None,
             effect_status: None,
             posts_returned: None,
+            origin,
             started_at_ms: now_ms,
             settled_at_ms: None,
         };
@@ -1238,18 +1304,135 @@ mod tests {
 
         let newer = InMemoryCallRecordStorage::new();
         newer
-            .replace(b"{\"format\":\"call-records\",\"version\":2}\n")
+            .replace(b"{\"format\":\"call-records\",\"version\":3}\n")
             .unwrap();
         let records = CallRecords::open(Box::new(newer.clone()), 0);
         assert!(matches!(
             records.begin("direct", "k", "c", 0),
-            Begin::Unavailable(CallRecordError::UnknownVersion(2))
+            Begin::Unavailable(CallRecordError::UnknownVersion(3))
         ));
         assert_eq!(
             newer.contents().unwrap(),
-            b"{\"format\":\"call-records\",\"version\":2}\n",
+            b"{\"format\":\"call-records\",\"version\":3}\n",
             "a newer build's file was overwritten"
         );
+    }
+
+    /// A version 1 file as the previous build wrote it: one settled call and
+    /// one a crash left `started`, which opening reconciles.
+    const V1_FILE: &str = concat!(
+        "{\"format\":\"call-records\",\"version\":1}\n",
+        "{\"principal\":\"reserved:prefrontal-core\",\"call_key\":\"pf:v1\",",
+        "\"scope\":null,\"state\":\"replied\",\"outcome\":\"ok\",",
+        "\"refusal_reason\":null,\"effect_status\":null,\"posts_returned\":null,",
+        "\"started_at_ms\":10,\"settled_at_ms\":20}\n",
+        "{\"principal\":\"reserved:prefrontal-core\",\"call_key\":\"pf:v1-started\",",
+        "\"scope\":null,\"state\":\"started\",\"outcome\":null,",
+        "\"refusal_reason\":null,\"effect_status\":null,\"posts_returned\":null,",
+        "\"started_at_ms\":15,\"settled_at_ms\":null}\n",
+    );
+
+    /// A v1 file on disk with its own format floor, in a fresh directory.
+    fn v1_on_disk(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-call-records-{name}-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CALL_RECORD_FILE);
+        fs::write(&path, V1_FILE).unwrap();
+        let floor = directory.join("floor.json");
+        (directory, path, floor)
+    }
+
+    fn open_on_disk(path: &Path, floor: &Path, now_ms: u64) -> CallRecords {
+        CallRecords::open(
+            Box::new(
+                FilesystemCallRecordStorage::new(path)
+                    .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(floor)),
+            ),
+            now_ms,
+        )
+    }
+
+    /// Starting this build over a version 1 file, and answering from it,
+    /// writes nothing: the file keeps its bytes and the call-records floor is
+    /// not raised, so the previous build can still be placed again.
+    #[test]
+    fn a_version_1_file_is_read_as_it_stands_while_no_call_is_recorded() {
+        let (directory, path, floor) = v1_on_disk("v1-no-call");
+        let records = open_on_disk(&path, &floor, 30);
+
+        // Both records are read, the started one reconciled in memory.
+        assert!(matches!(
+            records.begin("reserved:prefrontal-core", "pf:v1", "c", 40),
+            Begin::NotRetained { outcome } if outcome.as_deref() == Some("ok")
+        ));
+        assert!(matches!(
+            records.begin("reserved:prefrontal-core", "pf:v1-started", "c", 40),
+            Begin::OutcomeUnknown
+        ));
+        drop(records);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), V1_FILE);
+        assert!(
+            !floor.exists(),
+            "opening raised the floor: {}",
+            fs::read_to_string(&floor).unwrap_or_default()
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The first record this build writes moves a version 1 file to version
+    /// 2: rewritten under the current header with every earlier record, then
+    /// the new one, and the floor raised to 2 before the write.
+    #[test]
+    fn the_first_recorded_call_moves_a_version_1_file_to_version_2() {
+        let (directory, path, floor) = v1_on_disk("v1-one-call");
+        let records = open_on_disk(&path, &floor, 30);
+        let _ticket = executed(records.begin_attributed(
+            "reserved:prefrontal-core",
+            "pf:v2",
+            "c",
+            None,
+            CallOriginRecord::OriginInvalid,
+            40,
+        ));
+        drop(records);
+
+        let written = fs::read_to_string(&path).unwrap();
+        let mut lines = written.lines();
+        assert_eq!(
+            lines.next(),
+            Some("{\"format\":\"call-records\",\"version\":2}"),
+            "{written}"
+        );
+        let records: Vec<CallRecord> = lines
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let state_of = |key: &str| {
+            records
+                .iter()
+                .rev()
+                .find(|record| record.call_key == key)
+                .map(|record| (record.state, record.origin.clone()))
+        };
+        assert_eq!(
+            state_of("pf:v1"),
+            Some((CallState::Replied, CallOriginRecord::Absent))
+        );
+        assert_eq!(
+            state_of("pf:v1-started"),
+            Some((CallState::Unknown, CallOriginRecord::Absent))
+        );
+        assert_eq!(
+            state_of("pf:v2"),
+            Some((CallState::Started, CallOriginRecord::OriginInvalid))
+        );
+        let floors = cerebellum_core::format_floor::read_floors(&floor).unwrap();
+        assert_eq!(floors.get("call-records"), Some(&2));
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

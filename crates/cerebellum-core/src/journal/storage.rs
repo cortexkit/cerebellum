@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use super::{DurableState, StorageError};
 use crate::format_floor::{DurableFormat, FormatFloor};
 
-const JOURNAL_SCHEMA_VERSION: u64 = 2;
+/// Version 3 added the optional `origin` member to each record's identity: the
+/// caller behind a relayed call. A version 2 file is read as it stands, since
+/// a record without the member means the call named no origin.
+const JOURNAL_SCHEMA_VERSION: u64 = 3;
 
 /// The journal file format, shared by every audit journal this module keeps
 /// (browser, computer and launch): they are written and read by this one
@@ -23,6 +26,7 @@ const JOURNAL_SCHEMA_VERSION: u64 = 2;
 pub const AUDIT_JOURNAL_FORMAT: DurableFormat =
     DurableFormat::new("audit-journal", JOURNAL_SCHEMA_VERSION);
 const LEGACY_JOURNAL_SCHEMA_VERSION: u64 = 1;
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u64 = 2;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,6 +206,10 @@ impl FilesystemJournalStorage {
                 path: self.path.clone(),
                 source,
             })?;
+            value["schema_version"] = JOURNAL_SCHEMA_VERSION.into();
+        } else if version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
+            // Nothing to convert, and nothing is rewritten here: the next save
+            // writes the current version, raising the floor before it does.
             value["schema_version"] = JOURNAL_SCHEMA_VERSION.into();
         } else if version != JOURNAL_SCHEMA_VERSION {
             return Err(StorageError::UnknownSchemaVersion {
@@ -677,16 +685,37 @@ mod tests {
     fn unrecognized_schema_version_is_typed_and_never_starts_fresh() {
         let directory = TemporaryDirectory::new("unknown-version");
         let path = directory.join("journal.json");
-        fs::write(&path, br#"{"schema_version":3,"state":{}}"#).expect("write future journal");
+        fs::write(&path, br#"{"schema_version":4,"state":{}}"#).expect("write future journal");
 
         assert_eq!(
             FilesystemJournalStorage::new(&path).load(),
             Err(StorageError::UnknownSchemaVersion {
                 path,
-                found: 3,
-                supported: 2,
+                found: 4,
+                supported: 3,
             })
         );
+    }
+
+    /// A journal the previous build wrote (schema 2) loads, and is left as it
+    /// was until the next save. Version 2 records holding identities are read
+    /// by the computer journal's frozen fixture test in `cerebellum-computer`.
+    #[test]
+    fn a_version_2_journal_still_loads() {
+        let directory = TemporaryDirectory::new("previous-version");
+        let path = directory.join("journal.json");
+        let written = state(3);
+        FilesystemJournalStorage::new(&path)
+            .save(&written)
+            .expect("save");
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stored["schema_version"] = 2.into();
+        let previous = serde_json::to_vec(&stored).unwrap();
+        fs::write(&path, &previous).unwrap();
+
+        assert_eq!(FilesystemJournalStorage::new(&path).load(), Ok(written));
+        assert_eq!(fs::read(&path).unwrap(), previous, "loading rewrote it");
     }
 
     #[test]

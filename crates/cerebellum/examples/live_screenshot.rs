@@ -98,6 +98,7 @@ fn main() {
                         conversation_key: "live-probe".to_string(),
                         agent_project_id: grantee.to_string(),
                         session_kind: SessionKind::Primary,
+                        origin: Default::default(),
                     },
                     management: &management,
                     consent,
