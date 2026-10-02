@@ -742,7 +742,10 @@ fn a_v7_identity_writes_its_origin_only_when_there_is_one() {
     let export = journal.export();
     let lines: Vec<&str> = export.lines().collect();
     assert_eq!(lines.len(), 3);
-    assert!(!lines[0].contains("\"origin\""), "{}", lines[0]);
+    // The handoff payload has an `origin` of its own (the site), so the
+    // identity is read rather than the line searched.
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert!(first["identity"].get("origin").is_none(), "{}", lines[0]);
     assert!(
         lines[1].contains(
             r#""origin":{"status":"relayed","carrier":{"kind":"reserved","module_id":"agent-host"},"call_key":"agent:1"}"#
