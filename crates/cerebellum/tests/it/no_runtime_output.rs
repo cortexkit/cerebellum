@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::support::source_scan;
+
 /// The print macros looked for. `print!(` also finds `eprint!(`.
 const PRINT_MACROS: &[&str] = &["println!(", "print!(", "dbg!("];
 
@@ -34,15 +36,18 @@ fn shipped_code_prints_nothing() {
         panic!("could not list {}", crates.display());
     };
     for member in members.flatten() {
-        for file in rust_sources(&member.path().join("src")) {
+        // Files an out-of-line test module loads are test code throughout.
+        let files = rust_sources(&member.path().join("src"));
+        let test_files = source_scan::test_only_module_files(&files);
+        for file in files.iter().filter(|file| !test_files.contains(file)) {
             files_scanned += 1;
             let relative = file
                 .strip_prefix(workspace)
                 .expect("sources live under the workspace root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let source = std::fs::read_to_string(&file).expect("read a source file");
-            for (line_number, line) in production_lines(&source) {
+            let source = std::fs::read_to_string(file).expect("read a source file");
+            for (line_number, line) in source_scan::shipped_lines(&source) {
                 let code = line.trim_start();
                 if code.starts_with("//") {
                     continue;
@@ -111,69 +116,9 @@ fn rust_sources(directory: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Whether an attribute line makes the next item test-only.
-fn is_test_only_attribute(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test,")
-}
-
-/// Lines outside every test-only item, with their 1-based numbers.
-///
-/// The same brace-balanced skipping as `one_lease_clock.rs`, widened in two
-/// ways because prints turn up in more shapes than clock constructions: a
-/// test-only function or impl is skipped as well as a module, and
-/// `#[cfg(all(test, ...))]` counts as test-only. An attribute followed by an
-/// item with no body (`mod tests;`, a `use`) skips just that line.
-fn production_lines(source: &str) -> Vec<(usize, &str)> {
-    let mut kept = Vec::new();
-    let mut skipping_from_depth: Option<i32> = None;
-    let mut depth = 0_i32;
-    let mut pending_test_item = false;
-    for (index, line) in source.lines().enumerate() {
-        let opens = line.matches('{').count() as i32;
-        let closes = line.matches('}').count() as i32;
-        if skipping_from_depth.is_none() {
-            if is_test_only_attribute(line) {
-                pending_test_item = true;
-                depth += opens - closes;
-                continue;
-            }
-            if pending_test_item {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("#[") || trimmed.starts_with("///") {
-                    // Another attribute or a doc comment on the same item.
-                    depth += opens - closes;
-                    continue;
-                }
-                pending_test_item = false;
-                if opens > closes {
-                    skipping_from_depth = Some(depth);
-                    depth += opens - closes;
-                    continue;
-                }
-                if line.contains(';') || opens > 0 {
-                    // A bodyless or one-line test-only item.
-                    depth += opens - closes;
-                    continue;
-                }
-                // A signature split over several lines: skip until its body
-                // opens and closes again.
-                skipping_from_depth = Some(depth);
-                depth += opens - closes;
-                continue;
-            }
-            kept.push((index + 1, line));
-        }
-        depth += opens - closes;
-        if let Some(entered_at) = skipping_from_depth {
-            if depth <= entered_at && (opens > 0 || closes > 0) {
-                skipping_from_depth = None;
-            }
-        }
-    }
-    kept
-}
-
+/// Test code prints freely; only shipped code is fenced. This checks the scan
+/// sees that the shared skipper sets test items aside, and keeps the
+/// production prints around them.
 #[test]
 fn the_scan_skips_test_items_and_keeps_production_lines() {
     let source = "fn a() { eprintln!(\"a\"); }\n\
@@ -192,7 +137,7 @@ fn the_scan_skips_test_items_and_keeps_production_lines() {
                   fn b() {\n\
                   print!(\"b\");\n\
                   }\n";
-    let kept: Vec<_> = production_lines(source)
+    let kept: Vec<_> = source_scan::shipped_lines(source)
         .into_iter()
         .filter(|(_, line)| PRINT_MACROS.iter().any(|name| line.contains(name)))
         .collect();

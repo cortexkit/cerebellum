@@ -17,6 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::support::source_scan;
+
 /// Construction sites allowed outside test code, with the reason each exists,
 /// as paths under the workspace's `crates` directory.
 const ALLOWED_CALLS: &[(&str, &str)] = &[(
@@ -39,15 +41,18 @@ fn the_pointer_dispatch_token_is_minted_only_by_the_takeover_grant_check() {
     let mut calls = Vec::new();
     let mut literals = Vec::new();
     let mut files_scanned = 0;
-    for file in workspace_sources(&crates) {
+    // Files an out-of-line test module loads are test code throughout.
+    let files = workspace_sources(&crates);
+    let test_files = source_scan::test_only_module_files(&files);
+    for file in files.iter().filter(|file| !test_files.contains(file)) {
         files_scanned += 1;
         let relative = file
             .strip_prefix(&crates)
             .expect("sources live under the crates directory")
             .to_string_lossy()
             .replace('\\', "/");
-        let source = std::fs::read_to_string(&file).expect("read a workspace source file");
-        for (line_number, line) in production_lines(&source) {
+        let source = std::fs::read_to_string(file).expect("read a workspace source file");
+        for (line_number, line) in source_scan::shipped_lines(&source) {
             let code = line.trim_start();
             if code.starts_with("//") {
                 continue;
@@ -136,60 +141,10 @@ fn workspace_sources(crates: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Lines outside every item compiled only for tests, with their 1-based
-/// numbers.
-///
 /// Unit tests build tokens of their own to drive the dispatch path, and that
-/// is fine: they are not part of a running module. An item is test-only when
-/// it carries `#[cfg(test)]` or `#[cfg(all(test, ...))]`; it is skipped by
-/// brace balance rather than as "everything after the first test module",
-/// because several files carry production code after one test module and
-/// before the next. An attribute applies to the next item only, so a test
-/// attribute on something without a body ends at that item's `;`.
-fn production_lines(source: &str) -> Vec<(usize, &str)> {
-    let mut kept = Vec::new();
-    let mut skipping_from_depth: Option<i32> = None;
-    let mut depth = 0_i32;
-    let mut pending_test_item = false;
-    for (index, line) in source.lines().enumerate() {
-        let opens = line.matches('{').count() as i32;
-        let closes = line.matches('}').count() as i32;
-        if skipping_from_depth.is_none() {
-            let code = line.trim_start();
-            if code.starts_with("#[cfg(test)]") || code.starts_with("#[cfg(all(test") {
-                pending_test_item = true;
-                depth += opens - closes;
-                continue;
-            }
-            if pending_test_item {
-                if line.contains('{') {
-                    skipping_from_depth = Some(depth);
-                    pending_test_item = false;
-                } else if code.trim_end().ends_with(';') {
-                    pending_test_item = false;
-                }
-                // Further attributes, a signature split over lines, or the
-                // opening line itself: all part of the test-only item.
-                depth += opens - closes;
-                if let Some(entered_at) = skipping_from_depth {
-                    if depth <= entered_at {
-                        skipping_from_depth = None;
-                    }
-                }
-                continue;
-            }
-            kept.push((index + 1, line));
-        }
-        depth += opens - closes;
-        if let Some(entered_at) = skipping_from_depth {
-            if depth <= entered_at {
-                skipping_from_depth = None;
-            }
-        }
-    }
-    kept
-}
-
+/// is fine: they are not part of a running module. This checks the scan sees
+/// that the shared skipper sets test code aside, and keeps the production
+/// lines around it.
 #[test]
 fn the_scan_skips_test_modules_and_keeps_production_lines() {
     let source = "fn a() { let _ = OnceDispatchToken::admitted_by_takeover_grant(); }\n\
@@ -205,7 +160,7 @@ fn the_scan_skips_test_modules_and_keeps_production_lines() {
                   #[cfg(test)]\n\
                   use something;\n\
                   fn b() { let _ = OnceDispatchToken::admitted_by_takeover_grant(); }\n";
-    let kept: Vec<_> = production_lines(source)
+    let kept: Vec<_> = source_scan::shipped_lines(source)
         .into_iter()
         .filter(|(_, line)| line.contains("admitted_by_takeover_grant("))
         .collect();
