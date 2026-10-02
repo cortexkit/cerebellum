@@ -6556,10 +6556,21 @@ async fn a_relayed_call_is_admitted_only_as_its_route_principal() {
     bind_second_principal(&planes).await;
 
     let session_caller = cerebellum_core::principal::SESSION_CALLER_MODULE_ID;
-    let plain = served(&planes, relayed_navigation(10, 801, None, None)).await;
-    let claiming = served(
+    // Sent without answering anything: a refused call writes its refusal at
+    // once, and an admitted one would stop to ask a person instead.
+    let (tx, mut rx) = mpsc::channel(8);
+    let plain = exchange(
         &planes,
-        relayed_navigation(10, 801, None, Some(origin_naming(session_caller, "pf:1"))),
+        &tx,
+        &mut rx,
+        relayed_navigation(10, 801, None, None),
+    )
+    .await;
+    let claiming = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        relayed_navigation(10, 802, None, Some(origin_naming(session_caller, "pf:1"))),
     )
     .await;
     assert_eq!(
@@ -6570,6 +6581,10 @@ async fn a_relayed_call_is_admitted_only_as_its_route_principal() {
         (claiming.header.ty, body(&claiming)),
         (plain.header.ty, body(&plain)),
         "an origin naming the admitted module changed a refused principal's answer"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a refused call wrote a second frame"
     );
 
     let admitted = served(
