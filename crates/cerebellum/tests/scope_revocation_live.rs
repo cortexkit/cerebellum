@@ -171,6 +171,7 @@ async fn open_scoped_route(
         &mut client,
         7,
         ClientControlRequest::RouteOpen {
+            role_versions: None,
             target: RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
             },

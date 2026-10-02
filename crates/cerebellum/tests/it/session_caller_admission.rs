@@ -92,6 +92,7 @@ fn management_route() -> RouteTarget {
 /// the control reply.
 async fn bind(planes: &Planes, principal: Option<Principal>, target: RouteTarget) -> Frame {
     let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: CHANNEL,
         epoch: EPOCH,
         target,

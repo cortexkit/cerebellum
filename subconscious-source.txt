@@ -15,7 +15,7 @@
 # for c in subc-protocol subc-transport subc-jsonc subc-os; do
 # echo "$(git -C ../subconscious rev-parse HEAD:crates/$c) $c"
 # done > subconscious-source.txt
-6ab1e97a37f442fd1c8bfe309c83cafee5d56c00 subc-protocol
-b8a77b6a1ff7edf5b6d8a492f194de96d98ea345 subc-transport
+3d09c2514d987abb1a5e19aace5ecc75ed3d8111 subc-protocol
+f41eb5aeb375fe91316fa6644025bb9467e85602 subc-transport
 0f149ef98068082642efdd8efe754a2ecc893154 subc-jsonc
 631a9adabab1d4d97bde0123fb438873ae19d906 subc-os

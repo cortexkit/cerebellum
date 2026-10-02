@@ -249,6 +249,7 @@ mod probe {
             // Use one run-specific project-root identity on both routes so a
             // later probe run does not intentionally reuse this run's grant.
             let request = ClientControlRequest::RouteOpen {
+                role_versions: None,
                 target: target.clone(),
                 identity: BindIdentity::new(
                     self.project_root.clone(),

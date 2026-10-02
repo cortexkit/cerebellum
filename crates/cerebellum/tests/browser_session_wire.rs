@@ -123,6 +123,7 @@ const MANAGEMENT_EPOCH: u32 = 1;
 /// reads.
 async fn bind_management_route(planes: &Planes) {
     let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: MANAGEMENT_CHANNEL,
         epoch: MANAGEMENT_EPOCH,
         target: RouteTarget::ManagementSurface {
@@ -1772,6 +1773,7 @@ async fn bind_tool_route_with_facts(planes: &Planes, admission_facts: Value) {
 /// carrying exactly `admission_facts`, and return the control reply.
 async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame {
     let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -4347,6 +4349,7 @@ async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
     planes.launch_service = Some(launcher.clone());
     launch_at(&planes, &launcher.page, "https://page.example").await;
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -4869,6 +4872,7 @@ fn body(frame: &Frame) -> Value {
 /// conversation, so this principal's calls are refused before dispatch.
 async fn bind_second_principal(planes: &Planes) {
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 10,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -5298,6 +5302,7 @@ async fn bind_route(
     scope: Option<subc_protocol::scope::ScopeStamp>,
 ) {
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -5892,6 +5897,7 @@ async fn bind_reply(
     stamp: subc_protocol::scope::ScopeStamp,
 ) -> Frame {
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {

@@ -118,6 +118,7 @@ async fn first_party_route_bind_is_acked() {
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 42,
         epoch: 7,
         target: RouteTarget::ToolProvider {
@@ -161,6 +162,7 @@ async fn ineligible_principal_receives_transport_rejection() {
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 42,
         epoch: 7,
         target: RouteTarget::ToolProvider {
@@ -246,6 +248,7 @@ async fn absent_principal_is_rejected() {
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
 
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 42,
         epoch: 7,
         target: RouteTarget::ToolProvider {
@@ -620,6 +623,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
     let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
 
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -698,6 +702,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
     let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
     let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
         route_channel: 10,
         epoch: 4,
         target: RouteTarget::ToolProvider {
@@ -1371,6 +1376,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
         stream,
         corr,
         ClientControlRequest::RouteOpen {
+            role_versions: None,
             target: RouteTarget::ToolProvider {
                 module_id: MODULE_ID.to_string(),
             },
