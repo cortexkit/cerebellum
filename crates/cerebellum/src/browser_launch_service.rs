@@ -4416,15 +4416,86 @@ mod orphan_recovery_tests {
             json!({"decision": "clear"})
         }
 
-        /// A running process whose arguments carry `--user-data-dir=<dir>`,
-        /// the way every Chrome process does.
-        fn process_naming(directory: &Path) -> std::process::Child {
-            std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg("sleep 30; true")
-                .arg(format!("--user-data-dir={}", directory.display()))
-                .spawn()
-                .expect("spawn a process naming the profile")
+        /// A shell whose arguments carry `--user-data-dir=<dir>`, the way
+        /// every Chrome process does, running `script`.
+        ///
+        /// The shell forks to run the script's commands, and a fork carries
+        /// its parent's arguments until it execs, so for that moment (or, for
+        /// a subshell, for as long as it runs) a second process names the
+        /// directory. The evidence reader reports the first naming process it
+        /// meets and macOS lists the newest process first, so a refusal may
+        /// rightly name the fork: check a reported pid with `started`, never
+        /// against the shell's pid alone.
+        struct ProfileNamer {
+            shell: std::process::Child,
+        }
+
+        impl ProfileNamer {
+            fn spawn(directory: &Path, script: &str) -> Self {
+                use std::os::unix::process::CommandExt;
+                let shell = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(script)
+                    .arg(format!("--user-data-dir={}", directory.display()))
+                    // Its own process group, which every fork inherits, so
+                    // its processes can be told apart and stopped together.
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn a process naming the profile");
+                Self { shell }
+            }
+
+            /// A shell that sleeps; `; true` keeps the shell from replacing
+            /// itself with `sleep`, so it stays running under its arguments.
+            fn sleeping(directory: &Path) -> Self {
+                Self::spawn(directory, "sleep 30; true")
+            }
+
+            /// Whether `pid` is the shell or a process it started.
+            fn started(&self, pid: u32) -> bool {
+                let group = std::process::Command::new("/bin/ps")
+                    .args(["-o", "pgid=", "-p", &pid.to_string()])
+                    .output()
+                    .expect("run ps");
+                String::from_utf8_lossy(&group.stdout).trim() == self.shell.id().to_string()
+            }
+
+            /// Wait until `count` processes name `directory`, and return them.
+            fn wait_for_namers(&self, directory: &Path, count: usize) -> Vec<u32> {
+                let mut naming = OsString::from("--user-data-dir=");
+                naming.push(directory);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let namers: Vec<u32> = crate::launch_recovery::user_process_arguments(
+                        &crate::launch_recovery::SystemProcessTable,
+                    )
+                    .expect("read the process table")
+                    .into_iter()
+                    .filter(|(_, arguments)| arguments.contains(&naming))
+                    .map(|(pid, _)| pid)
+                    .collect();
+                    if namers.len() >= count {
+                        return namers;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "only {namers:?} name the profile"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+
+        impl Drop for ProfileNamer {
+            fn drop(&mut self) {
+                // The whole group: a fork left running would outlive the
+                // test, holding the test binary's output open.
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", "--", &format!("-{}", self.shell.id())])
+                    .status();
+                let _ = self.shell.kill();
+                let _ = self.shell.wait();
+            }
         }
 
         /// A running process whose executable is named like Chromium.
@@ -4555,12 +4626,32 @@ mod orphan_recovery_tests {
         #[tokio::test]
         async fn a_clear_refuses_while_a_process_names_the_profile_directory() {
             let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
-            let child = process_naming(&fixture.profile_directory.0);
+            let namer = ProfileNamer::sleeping(&fixture.profile_directory.0);
             let reply = fixture.refusal().await;
-            let pid = child.id();
-            stop(child);
             assert_eq!(reply["reason"], "profile_in_use", "{reply}");
-            assert_eq!(reply["pid"], pid);
+            let pid = reply["pid"].as_u64().expect("a pid") as u32;
+            assert!(namer.started(pid), "{pid} is not the namer's: {reply}");
+            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
+        }
+
+        /// A shell naming the profile forks to run its commands, and the fork
+        /// also names the profile until it execs, so a clear read in that
+        /// window is refused naming the fork, not the shell (on macOS, whose
+        /// process table lists the newest process first). The script runs its
+        /// sleep in a subshell, a fork that never execs, so two processes name
+        /// the profile for the whole test instead of for a moment. The refusal
+        /// must name one of the namer's processes, whichever is listed first.
+        #[tokio::test]
+        async fn a_fork_still_naming_the_profile_refuses_a_clear() {
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
+            let directory = &fixture.profile_directory.0;
+            let namer = ProfileNamer::spawn(directory, "(sleep 30; true); true");
+            let namers = namer.wait_for_namers(directory, 2);
+            let reply = fixture.refusal().await;
+            assert_eq!(reply["reason"], "profile_in_use", "{reply}");
+            let pid = reply["pid"].as_u64().expect("a pid") as u32;
+            assert!(namers.contains(&pid), "{pid} is not in {namers:?}: {reply}");
+            assert!(namer.started(pid), "{pid} is not the namer's: {reply}");
             fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "after");
         }
 
@@ -4888,17 +4979,17 @@ mod orphan_recovery_tests {
         async fn the_evidence_is_read_again_when_the_answer_arrives() {
             let fixture = retained(RecoveryPendingReason::GenerationUnobservable);
             let (_, ask_id) = fixture.ask().await;
-            let child = process_naming(&fixture.profile_directory.0);
+            let namer = ProfileNamer::sleeping(&fixture.profile_directory.0);
             let settlement = fixture
                 .plane
                 .settle_launch_recovery_clear(&ask_id, Some(&clear()))
                 .await;
-            let pid = child.id();
-            stop(child);
-            assert_eq!(
-                settlement,
-                ClearSettlement::Failed(ClearFailure::Refused(ClearRefusal::ProfileInUse { pid }))
-            );
+            let ClearSettlement::Failed(ClearFailure::Refused(ClearRefusal::ProfileInUse { pid })) =
+                settlement
+            else {
+                panic!("not refused as in use: {settlement:?}");
+            };
+            assert!(namer.started(pid), "{pid} is not the namer's");
             fixture.assert_still_held(RecoveryPendingReason::GenerationUnobservable, "after");
         }
 
