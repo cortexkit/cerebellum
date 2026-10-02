@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -21,7 +20,6 @@ use crate::profile_custody::{
     ProfileCustodyAcquisition, ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
 };
 
-pub const ELICITATION_DEADLINE: Duration = Duration::from_secs(300);
 const COOKIES_RELATIVE_PATH: &str = "Default/Cookies";
 const SQLITE_PROGRAM: &str = "/usr/bin/sqlite3";
 
@@ -142,6 +140,8 @@ pub struct ImportResult {
     pub rows: u64,
     pub browsers: Vec<BrowserPresence>,
     pub remedy: Option<&'static str>,
+    /// Only on `consent_pending`: the consent card still open.
+    pub ask_id: Option<String>,
 }
 
 impl ImportResult {
@@ -160,6 +160,9 @@ impl ImportResult {
         if let Some(remedy) = self.remedy {
             object.insert("remedy".to_string(), Value::String(remedy.to_string()));
         }
+        if let Some(ask_id) = &self.ask_id {
+            object.insert("ask_id".to_string(), Value::String(ask_id.clone()));
+        }
         value
     }
 
@@ -172,6 +175,7 @@ impl ImportResult {
             rows: 0,
             browsers: Vec::new(),
             remedy: Some(remedy),
+            ask_id: None,
         }
     }
 }
@@ -180,11 +184,12 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
     json!({
         "type":"object",
         "properties":{
-            "outcome":{"type":"string","enum":["transferred","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","transfer_failed","invalid_origin","internal_failure"]},
+            "outcome":{"type":"string","enum":["transferred","consent_pending","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","transfer_failed","invalid_origin","internal_failure"]},
             "domains_matched":{"type":"array","items":{"type":"string"}},
             "browser":{"type":"string"},
             "rows":{"type":"integer"},
             "remedy":{"type":"string"},
+            "ask_id":{"type":"string"},
             "reason":{"type":"string"},
             "relaunched":{
                 "type":["object","null"],"properties":{
@@ -230,6 +235,8 @@ pub struct LoginImportPlan {
     host: String,
     domains: Vec<String>,
     project_id: String,
+    /// The browser the login is copied into.
+    launch_executable: PathBuf,
     location: DurableProfileLocation,
     settings: ImportSettings,
     presence: Vec<BrowserPresence>,
@@ -251,6 +258,28 @@ impl LoginImportPlan {
 
     pub fn refusal(&self, code: &'static str, remedy: &'static str) -> ImportResult {
         self.result(code, None, 0, Some(remedy))
+    }
+
+    /// What the consent answer is about, in one string compared exactly: the
+    /// origin, and the browser the login is copied into. A consent answer
+    /// that arrives after its call returned is used only by a retry that
+    /// matches it. The browser copied from is the person's choice inside the
+    /// answer, and is checked again against what is copyable at the retry.
+    pub fn consent_parameters(&self) -> String {
+        json!([self.origin, self.launch_executable.display().to_string()]).to_string()
+    }
+
+    /// The reply when the person has not answered within the call's wait:
+    /// nothing was copied, and the card `ask_id` stays open.
+    pub fn pending(&self, ask_id: String) -> ImportResult {
+        let mut result = self.result(
+            "consent_pending",
+            None,
+            0,
+            Some(crate::computer_grants::LOGIN_CONSENT_PENDING_REMEDY),
+        );
+        result.ask_id = Some(ask_id);
+        result
     }
 
     pub fn permits_transfer(&self, decision: Option<&str>) -> bool {
@@ -342,6 +371,7 @@ impl LoginImportPlan {
             rows,
             browsers: self.presence.clone(),
             remedy,
+            ask_id: None,
         }
     }
 
@@ -460,10 +490,11 @@ pub(crate) fn import_question(
         facts,
         grants,
         decline: ConsentOption::decline("deny", "Don't allow"),
-        expires_in: ELICITATION_DEADLINE,
+        expires_in: crate::consent_card::LOGIN_CARD_LIFETIME,
         material_damage: true,
-        // The import call waits on the answer, so the agent is blocked until
-        // the person decides.
+        // The import call waits on the answer (up to
+        // `computer_grants::CONSENT_PARK_LIMIT`), so the agent is blocked
+        // until the person decides or that wait ends.
         urgency: Urgency::High,
         // The plan the answer applies to is prepared for this one origin: the
         // cookie domains it copies are derived from it.
@@ -519,6 +550,7 @@ pub fn prepare_import(
         host,
         domains,
         project_id: project_id.to_string(),
+        launch_executable: launch_executable.to_path_buf(),
         location,
         settings,
         presence,
@@ -1059,6 +1091,7 @@ fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     use std::sync::Mutex;
 

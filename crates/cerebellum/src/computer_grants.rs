@@ -18,6 +18,12 @@
 //! that wait: an answer that arrives later still writes the grant, and the
 //! caller, told `consent_pending`, retries once woken.
 //!
+//! The same question registry holds the login consent cards of
+//! `browser.capture_login` and `browser.import_login` (see
+//! [`ComputerGrants::require_login`]): they park the call the same way, and
+//! end with the conversation the same way. A late answer to one is
+//! remembered for the agent's retry rather than written as a grant.
+//!
 //! "Always" answers are written to a small versioned file of their own, bound
 //! to this machine's hardware identity so that a copy restored onto another
 //! machine grants nothing there. The file is read once when the module starts;
@@ -591,6 +597,13 @@ enum Subject {
     Takeover {
         conversation_key: String,
     },
+    /// One login consent card: a login capability called with exactly these
+    /// parameters in this conversation.
+    Login {
+        conversation_key: String,
+        capability: LoginCapability,
+        parameters: String,
+    },
 }
 
 impl Subject {
@@ -613,7 +626,10 @@ impl Subject {
             Self::App {
                 conversation_key, ..
             }
-            | Self::Takeover { conversation_key } => conversation_key,
+            | Self::Takeover { conversation_key }
+            | Self::Login {
+                conversation_key, ..
+            } => conversation_key,
         }
     }
 }
@@ -840,6 +856,61 @@ impl ConsentRefusal {
 }
 
 // ---------------------------------------------------------------------------
+// Login consent cards
+// ---------------------------------------------------------------------------
+
+/// The login capabilities that ask the person through a consent card held
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LoginCapability {
+    /// `browser.capture_login`.
+    CaptureLogin,
+    /// `browser.import_login`.
+    ImportLogin,
+}
+
+/// One login call's need for the person's consent.
+pub struct LoginConsentRequest {
+    /// The conversation the call arrived on. Remembered answers and open
+    /// cards are scoped to it and end with it.
+    pub conversation_key: String,
+    pub capability: LoginCapability,
+    /// Everything the answer is about, in one string compared exactly: a
+    /// remembered answer is used only by a retry with the same parameters.
+    pub parameters: String,
+    /// How to reach the person.
+    pub carrier: Arc<dyn QuestionCarrier>,
+    /// The request's in-flight guard, parked while the call waits on the
+    /// person, as for a computer grant.
+    pub park_guard: Option<Arc<InFlightGuard>>,
+}
+
+/// How a login call's wait for consent ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginConsent {
+    /// The ending of the card this call waited on, or an answer the person
+    /// gave to an earlier card for the same parameters after its call had
+    /// returned. Each capability reads it exactly as it reads an answer that
+    /// arrived in the call.
+    Ended(AskOutcome),
+    /// The person has not answered within the call's wait. The card stays
+    /// open, and an answer that arrives later is remembered for a retry.
+    Pending { ask_id: String },
+}
+
+impl From<AskOutcome> for LoginConsent {
+    fn from(outcome: AskOutcome) -> Self {
+        Self::Ended(outcome)
+    }
+}
+
+/// The remedy a login call gives with `consent_pending`. The calling session
+/// is woken when the card settles, and the late answer is used only by a
+/// call with the same arguments.
+pub const LOGIN_CONSENT_PENDING_REMEDY: &str = "The person hasn't answered yet; you'll be woken \
+     when they do. Then call this again with the same arguments.";
+
+// ---------------------------------------------------------------------------
 // The grants
 // ---------------------------------------------------------------------------
 
@@ -862,6 +933,14 @@ enum Settlement {
     Ended {
         reason: &'static str,
         remedy: &'static str,
+    },
+    /// How a login card ended, handed to the calls waiting on it unread: each
+    /// login capability turns the ending into its own reply. `allows` says
+    /// the answer was one of the card's granting options, which only one
+    /// waiting call may act on.
+    Login {
+        outcome: AskOutcome,
+        allows: bool,
     },
 }
 
@@ -888,6 +967,31 @@ struct OpenQuestion {
     next_waiter: u64,
     settled: SettledSignal,
     asking: Option<tokio::task::AbortHandle>,
+    /// Set only for a login card: what its answers mean and when it expires.
+    login: Option<LoginCard>,
+}
+
+/// What settling a login card needs to know about it.
+struct LoginCard {
+    /// The option ids whose effect is to grant.
+    grants: Vec<String>,
+    /// The option id whose effect is to decline.
+    decline: Option<String>,
+    expires_at: tokio::time::Instant,
+}
+
+/// An answer to a login card that arrived after every call waiting on the
+/// card had returned, kept for the agent's retry with the same parameters.
+struct RememberedLoginAnswer {
+    /// The answer exactly as it arrived, including the `elicitation_id` a
+    /// capture names as its vault `consent_ref`.
+    body: Value,
+    /// A granting answer is used by one retry and then forgotten; a declining
+    /// one refuses every retry until it expires.
+    allows: bool,
+    /// The card's own expiry: the answer is not kept longer than the person
+    /// was told the question was open.
+    expires_at: tokio::time::Instant,
 }
 
 #[derive(Default)]
@@ -900,6 +1004,11 @@ struct GrantState {
     takeover_denies: HashSet<String>,
     questions: HashMap<String, OpenQuestion>,
     open_by_subject: BTreeMap<Subject, String>,
+    /// Late answers to login cards, by the card's subject.
+    login_answers: HashMap<Subject, RememberedLoginAnswer>,
+    /// How long a login call waits in place; [`CONSENT_PARK_LIMIT`] unless a
+    /// test shortened it.
+    login_park_limit: Option<Duration>,
 }
 
 enum Standing {
@@ -1234,10 +1343,14 @@ impl ComputerGrants {
             Ending::Settled(Settlement::Ended { reason, remedy }, _) => {
                 Err(ConsentRefusal::Unavailable { reason, remedy })
             }
-            Ending::Withdrawn => Err(ConsentRefusal::Unavailable {
-                reason: "question_withdrawn",
-                remedy: "retry this call to ask again",
-            }),
+            // A grant question is never settled as a login card; read as a
+            // withdrawn question, which grants nothing.
+            Ending::Settled(Settlement::Login { .. }, _) | Ending::Withdrawn => {
+                Err(ConsentRefusal::Unavailable {
+                    reason: "question_withdrawn",
+                    remedy: "retry this call to ask again",
+                })
+            }
             // The question stays open: an answer that arrives later still
             // writes the grant, and the caller retries once woken.
             Ending::TimedOut => Err(ConsentRefusal::Pending {
@@ -1284,6 +1397,199 @@ impl ComputerGrants {
         })
     }
 
+    /// Wait for the person's consent to one login call, filing a card only
+    /// when nothing already answers it.
+    ///
+    /// In order: an answer the person gave to an earlier card for the same
+    /// conversation, capability and parameters after that card's call had
+    /// returned (an allow is used once and forgotten; a deny refuses until the
+    /// card would have expired); the card still open for them, which this
+    /// call waits on rather than filing a second; otherwise a new card from
+    /// `new_card`, which returns its ask id and body.
+    ///
+    /// The call waits up to [`CONSENT_PARK_LIMIT`] and then returns
+    /// [`LoginConsent::Pending`]. The card is asked on its own task and stays
+    /// open for its full [`LOGIN_CARD_LIFETIME`]: neither that return nor the
+    /// caller dropping this future closes it. A late answer is remembered
+    /// rather than acted on, because nobody is waiting for the result.
+    ///
+    /// [`LOGIN_CARD_LIFETIME`]: crate::consent_card::LOGIN_CARD_LIFETIME
+    pub async fn require_login(
+        self: &Arc<Self>,
+        request: LoginConsentRequest,
+        mut new_card: impl FnMut() -> (String, Value),
+    ) -> LoginConsent {
+        let subject = Subject::Login {
+            conversation_key: request.conversation_key.clone(),
+            capability: request.capability,
+            parameters: request.parameters.clone(),
+        };
+        loop {
+            let park_limit = self.login_park_limit();
+            let (ask_id, id, mut settled) = {
+                let mut state = lock(&self.state);
+                let now = tokio::time::Instant::now();
+                let remembered = state
+                    .login_answers
+                    .get(&subject)
+                    .map(|answer| (answer.allows, answer.expires_at <= now));
+                match remembered {
+                    Some((_, true)) => {
+                        state.login_answers.remove(&subject);
+                    }
+                    // Taken out under the same lock it was found under, so
+                    // two retries cannot both use one approval.
+                    Some((true, false)) => {
+                        if let Some(answer) = state.login_answers.remove(&subject) {
+                            return LoginConsent::Ended(AskOutcome::Answered(answer.body));
+                        }
+                    }
+                    Some((false, false)) => {
+                        if let Some(answer) = state.login_answers.get(&subject) {
+                            return LoginConsent::Ended(AskOutcome::Answered(answer.body.clone()));
+                        }
+                    }
+                    None => {}
+                }
+                if let Some((ask_id, id, settled)) = join_open(&mut state, &subject) {
+                    (ask_id, id, settled)
+                } else {
+                    let (ask_id, body) = new_card();
+                    let (grants, decline) = card_choices(&body);
+                    let (settled_tx, settled) = watch::channel(None);
+                    state.questions.insert(
+                        ask_id.clone(),
+                        OpenQuestion {
+                            subject: subject.clone(),
+                            offered: Vec::new(),
+                            always_grantee: None,
+                            identity: None,
+                            parked: BTreeSet::from([0]),
+                            next_waiter: 1,
+                            settled: settled_tx,
+                            asking: None,
+                            login: Some(LoginCard {
+                                grants,
+                                decline,
+                                expires_at: now + crate::consent_card::LOGIN_CARD_LIFETIME,
+                            }),
+                        },
+                    );
+                    state
+                        .open_by_subject
+                        .insert(subject.clone(), ask_id.clone());
+                    drop(state);
+                    self.put_question(
+                        &ask_id,
+                        &request.carrier,
+                        body,
+                        crate::consent_card::LOGIN_CARD_LIFETIME,
+                    );
+                    (ask_id, 0, settled)
+                }
+            };
+            let waiter = Waiter {
+                grants: self,
+                ask_id,
+                id,
+            };
+            let parked = request
+                .park_guard
+                .as_ref()
+                .map(|guard| guard.park_on_consent());
+            let waited = tokio::select! {
+                result = settled.wait_for(Option::is_some) => match result {
+                    Ok(value) => Some(value.clone()),
+                    // The card was withdrawn unanswered: its conversation
+                    // ended, or the call that filed it was withdrawn.
+                    Err(_) => None,
+                },
+                () = tokio::time::sleep(park_limit) => Some(None),
+            };
+            drop(parked);
+            let ask_id = waiter.ask_id.clone();
+            let settlement = match waited {
+                Some(Some(settlement)) => Some(settlement),
+                // Off the card and looking again under one hold of the state,
+                // which the card is settled under too: an answer either
+                // settled before and is read here, or settles after and,
+                // finding no call waiting, is remembered. Never both, so one
+                // approval cannot be acted on now and kept for a retry.
+                Some(None) => {
+                    let mut state = lock(&self.state);
+                    if let Some(question) = state.questions.get_mut(&ask_id) {
+                        question.parked.remove(&id);
+                    }
+                    let settlement = settled.borrow().clone();
+                    drop(state);
+                    settlement
+                }
+                None => return LoginConsent::Ended(AskOutcome::NoAnswer),
+            };
+            drop(waiter);
+            match settlement {
+                None => return LoginConsent::Pending { ask_id },
+                // One approval admits one call: the first to have joined the
+                // card. Another call waiting on the same card starts over and
+                // needs consent of its own.
+                Some((Settlement::Login { allows: true, .. }, executor))
+                    if executor != Some(id) =>
+                {
+                    continue
+                }
+                Some((Settlement::Login { outcome, .. }, _)) => {
+                    return LoginConsent::Ended(outcome)
+                }
+                Some(_) => return LoginConsent::Ended(AskOutcome::NoAnswer),
+            }
+        }
+    }
+
+    /// Shorten how long a login call waits in place, for tests that cannot
+    /// wait the production two minutes. The card's own lifetime is unchanged.
+    #[doc(hidden)]
+    pub fn set_login_park_limit(&self, park_limit: Duration) {
+        lock(&self.state).login_park_limit = Some(park_limit);
+    }
+
+    /// How long a login call waits in place before `consent_pending`.
+    pub fn login_park_limit(&self) -> Duration {
+        lock(&self.state)
+            .login_park_limit
+            .unwrap_or(CONSENT_PARK_LIMIT)
+    }
+
+    /// Whether an answer to a login card is remembered for a retry, for
+    /// tests of when one is dropped.
+    #[doc(hidden)]
+    pub fn remembers_login_answer(&self) -> bool {
+        !lock(&self.state).login_answers.is_empty()
+    }
+
+    /// Put a question already recorded under `ask_id` to the person.
+    ///
+    /// Asked on its own task, because the question outlives the call that
+    /// raised it: a call that stops waiting leaves the question open, and a
+    /// later answer still has to be applied.
+    fn put_question(
+        self: &Arc<Self>,
+        ask_id: &str,
+        carrier: &Arc<dyn QuestionCarrier>,
+        body: Value,
+        deadline: Duration,
+    ) {
+        let grants = Arc::clone(self);
+        let question = carrier.put(body, deadline);
+        let settling_ask = ask_id.to_string();
+        let task = tokio::spawn(async move {
+            let outcome = question.await;
+            grants.settle(&settling_ask, outcome);
+        });
+        if let Some(open) = lock(&self.state).questions.get_mut(ask_id) {
+            open.asking = Some(task.abort_handle());
+        }
+    }
+
     /// Park the caller on the open question for this grant, or open one.
     ///
     /// A second call needing the same grant joins the question already out
@@ -1301,21 +1607,15 @@ impl ComputerGrants {
         let offers_always =
             matches!(need, GrantNeed::App { .. }) && self.offers_always(caller, identity.as_ref());
         let mut state = lock(&self.state);
-        if let Some(ask_id) = state.open_by_subject.get(&subject).cloned() {
-            if let Some(question) = state.questions.get_mut(&ask_id) {
-                let id = question.next_waiter;
-                question.next_waiter += 1;
-                question.parked.insert(id);
-                let settled = question.settled.subscribe();
-                return (
-                    Waiter {
-                        grants: self,
-                        ask_id,
-                        id,
-                    },
-                    settled,
-                );
-            }
+        if let Some((ask_id, id, settled)) = join_open(&mut state, &subject) {
+            return (
+                Waiter {
+                    grants: self,
+                    ask_id,
+                    id,
+                },
+                settled,
+            );
         }
 
         let grant_kind = need.grant_kind();
@@ -1347,24 +1647,13 @@ impl ComputerGrants {
                 next_waiter: 1,
                 settled: settled_tx,
                 asking: None,
+                login: None,
             },
         );
         state.open_by_subject.insert(subject, ask_id.clone());
         drop(state);
 
-        // Asked on its own task, because the question outlives the call that
-        // raised it: a call that stops waiting leaves the question open, and a
-        // later answer still has to be applied.
-        let grants = Arc::clone(self);
-        let question = carrier.put(body, deadline);
-        let settling_ask = ask_id.clone();
-        let task = tokio::spawn(async move {
-            let outcome = question.await;
-            grants.settle(&settling_ask, outcome);
-        });
-        if let Some(open) = lock(&self.state).questions.get_mut(&ask_id) {
-            open.asking = Some(task.abort_handle());
-        }
+        self.put_question(&ask_id, carrier, body, deadline);
         (
             Waiter {
                 grants: self,
@@ -1381,10 +1670,14 @@ impl ComputerGrants {
     /// was withdrawn with its conversation, or it was never asked here.
     pub fn settle(&self, ask_id: &str, outcome: AskOutcome) {
         let open = {
-            let state = lock(&self.state);
+            let mut state = lock(&self.state);
             let Some(question) = state.questions.get(ask_id) else {
                 return;
             };
+            if question.login.is_some() {
+                settle_login(&mut state, ask_id, outcome);
+                return;
+            }
             AnsweredQuestion {
                 ask_id: ask_id.to_string(),
                 subject: question.subject.clone(),
@@ -1517,6 +1810,8 @@ impl ComputerGrants {
             Subject::Takeover { conversation_key } => {
                 state.takeovers.insert(conversation_key.clone());
             }
+            // A login answer is remembered by `settle_login`, never as a grant.
+            Subject::Login { .. } => {}
         }
     }
 
@@ -1534,6 +1829,7 @@ impl ComputerGrants {
             Subject::Takeover { conversation_key } => {
                 state.takeover_denies.insert(conversation_key.clone());
             }
+            Subject::Login { .. } => {}
         }
     }
 
@@ -1612,8 +1908,9 @@ impl ComputerGrants {
 
     /// Forget everything held for a conversation whose last route unbound.
     ///
-    /// Its grants and remembered refusals go, and any question it raised is
-    /// withdrawn, so an answer that arrives afterwards grants nothing.
+    /// Its grants and remembered refusals go, as do the late answers to its
+    /// login cards, and any question it raised is withdrawn (login cards
+    /// included), so an answer that arrives afterwards grants nothing.
     pub fn end_conversation(&self, conversation_key: &str) {
         let mut state = lock(&self.state);
         state
@@ -1624,6 +1921,9 @@ impl ComputerGrants {
             .retain(|(conversation, _)| conversation != conversation_key);
         state.takeovers.remove(conversation_key);
         state.takeover_denies.remove(conversation_key);
+        state
+            .login_answers
+            .retain(|subject, _| subject.conversation_key() != conversation_key);
         let asked: Vec<String> = state
             .questions
             .iter()
@@ -1754,6 +2054,93 @@ impl ComputerGrants {
         *lock(&self.always) = AlwaysState::Loaded(kept);
         json!({"outcome": "revoked", "records": count})
     }
+}
+
+/// Park one more call on the question already open for `subject`, if there
+/// is one: its ask id, the call's join order, and the watch its ending is
+/// sent on.
+fn join_open(state: &mut GrantState, subject: &Subject) -> Option<(String, u64, SettledWatch)> {
+    let ask_id = state.open_by_subject.get(subject).cloned()?;
+    let question = state.questions.get_mut(&ask_id)?;
+    let id = question.next_waiter;
+    question.next_waiter += 1;
+    question.parked.insert(id);
+    Some((ask_id, id, question.settled.subscribe()))
+}
+
+/// Close a login card on its ending and release the calls waiting on it.
+///
+/// With a call still waiting, the ending goes to it and nothing is kept: the
+/// call acts on the answer as it always has. With none waiting, the call that
+/// filed the card has returned `consent_pending`, so a granting or declining
+/// answer is remembered for the agent's retry instead of being acted on:
+/// nobody would receive the result, and a capture needs the person at the
+/// sign-in window. Any other ending (silence, a card nobody was shown, an
+/// answer the card did not offer) leaves nothing.
+fn settle_login(state: &mut GrantState, ask_id: &str, outcome: AskOutcome) {
+    let Some(question) = state.questions.remove(ask_id) else {
+        return;
+    };
+    if state
+        .open_by_subject
+        .get(&question.subject)
+        .map(String::as_str)
+        == Some(ask_id)
+    {
+        state.open_by_subject.remove(&question.subject);
+    }
+    let decision = match &outcome {
+        AskOutcome::Answered(body) => body.get("decision").and_then(Value::as_str),
+        _ => None,
+    };
+    let (allows, declines, expires_at) = match (&question.login, decision) {
+        (Some(card), Some(decision)) => (
+            card.grants.iter().any(|grant| grant == decision),
+            card.decline.as_deref() == Some(decision),
+            Some(card.expires_at),
+        ),
+        _ => (false, false, None),
+    };
+    if let (true, Some(expires_at), AskOutcome::Answered(body)) =
+        (question.parked.is_empty(), expires_at, &outcome)
+    {
+        if (allows || declines) && tokio::time::Instant::now() < expires_at {
+            state.login_answers.insert(
+                question.subject.clone(),
+                RememberedLoginAnswer {
+                    body: body.clone(),
+                    allows,
+                    expires_at,
+                },
+            );
+        }
+    }
+    let executor = question.parked.first().copied();
+    let _ = question
+        .settled
+        .send(Some((Settlement::Login { outcome, allows }, executor)));
+}
+
+/// The option ids of a rendered consent card that grant, and the one that
+/// declines, read from the card exactly as it is sent.
+fn card_choices(body: &Value) -> (Vec<String>, Option<String>) {
+    let options = body
+        .pointer("/params/options")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let with_effect = |effect: &'static str| -> Vec<String> {
+        options
+            .iter()
+            .filter(|option| option.get("effect").and_then(Value::as_str) == Some(effect))
+            .filter_map(|option| option.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    };
+    (
+        with_effect("grant"),
+        with_effect("decline").into_iter().next(),
+    )
 }
 
 fn withdraw_question(state: &mut GrantState, ask_id: &str, question: OpenQuestion) {

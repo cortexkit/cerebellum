@@ -3,6 +3,17 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 
+/// How long a login consent card (`browser.capture_login`,
+/// `browser.import_login`) stays open on the person's phone.
+///
+/// Thirty minutes, the span a browser origin grant card stays open
+/// (`management::PHONE_CONSENT_DEADLINE`), because a person takes minutes to
+/// notice a phone prompt and a shorter card shows them an "expired, retry"
+/// note instead of the question. The call that files the card waits for only
+/// part of this (`computer_grants::CONSENT_PARK_LIMIT`); an answer that
+/// arrives after the call returned is remembered for the agent's retry.
+pub(crate) const LOGIN_CARD_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Effect {
@@ -731,8 +742,9 @@ mod every_card_kind {
         ] {
             let body =
                 crate::login_import::import_question("import", "https://x.com", "x.com", &presence);
-            let params = as_sent(body, crate::login_import::ELICITATION_DEADLINE).await;
+            let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
             assert_card(case, &params, "high", json!({"origin": "https://x.com"}));
+            assert_login_card_life(case, &params);
         }
     }
 
@@ -745,12 +757,24 @@ mod every_card_kind {
             login_url: "https://ollama.com/signin".into(),
         };
         let body = crate::login_capture::consent_question(&request, "capture-login-test");
-        let params = as_sent(body, crate::login_import::ELICITATION_DEADLINE).await;
+        let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
         assert_card(
             "capture_login",
             &params,
             "high",
             json!({"credential_domain": "ollama.com", "account": "work"}),
+        );
+        assert_login_card_life("capture_login", &params);
+    }
+
+    /// A login card stays open for thirty minutes, and core only notifies the
+    /// agent when it settles: the capability never runs on a late answer by
+    /// itself, it waits for the agent's retry.
+    fn assert_login_card_life(kind: &str, params: &Value) {
+        assert_eq!(params["expires_in_ms"], 1_800_000, "{kind}: expires_in_ms");
+        assert_eq!(
+            params["late_execution"], "notify_only",
+            "{kind}: late_execution"
         );
     }
 
