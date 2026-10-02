@@ -73,3 +73,6 @@ subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # One copy of subc-os as well: the published daemon depends on it by version,
 # and a second copy would carry a second process-wide nonce cache.
 subc-os = { path = "../subconscious/crates/subc-os" }
+# The published tool-provider contract depends on cortexkit-store-types by
+# version; one copy, the sibling the module itself links and pins.
+cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
