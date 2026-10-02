@@ -1066,6 +1066,7 @@ mod macos_probe {
             conversation_key: "live-discord-task".into(),
             agent_project_id: "live-probe".into(),
             session_kind: SessionKind::Primary,
+            origin: Default::default(),
         }
     }
 

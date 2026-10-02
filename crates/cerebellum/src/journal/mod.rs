@@ -1,7 +1,7 @@
 //! Audit journal, redaction, snapshot retention, and late-event delivery.
 //!
 //! This module implements the browser plane's journal surface and the closed
-//! `ck-browser-journal/v6` entry contract. It owns durable allocation and
+//! `ck-browser-journal/v7` entry contract. It owns durable allocation and
 //! storage, reservations and transition pins, dispatch commitment, recovery,
 //! retained governing observations and snapshot pins, policy events, audit
 //! obligations, and live-session late-event delivery.
@@ -41,13 +41,17 @@ pub mod retention;
 pub mod snapshots;
 pub mod store;
 
+pub use cerebellum_core::journal::CallOriginRecord;
 use serde::{Deserialize, Serialize};
 
 /// The literal `format_version` carried by every journal entry.
-pub const FORMAT_VERSION: &str = "ck-browser-journal/v6";
+///
+/// v7 added the optional `identity.origin` member: the caller behind a relayed
+/// call. Entries of v3 through v6 still decode as [`JournalEntry`].
+pub const FORMAT_VERSION: &str = "ck-browser-journal/v7";
 
 /// The export `format_version` reported by the administration export surface.
-pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v6";
+pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v7";
 
 /// The greatest sequence the allocator may hand out (`9007199254740991`).
 ///
@@ -290,6 +294,10 @@ pub struct JournalIdentity {
     pub session_kind: SessionKind,
     pub profile_uuid: Option<String>,
     pub profile_name: Option<String>,
+    /// The caller behind a relayed call, for attribution only; omitted when
+    /// the request named none.
+    #[serde(default, skip_serializing_if = "CallOriginRecord::is_absent")]
+    pub origin: CallOriginRecord,
     /// The request this entry serves, handed on to the core journal so its
     /// dispatch commitment marks the request. Never exported or persisted.
     #[serde(skip)]
@@ -507,7 +515,7 @@ pub enum PolicyEventDetail {
     },
 }
 
-/// The closed `ck-browser-journal/v6` entry.
+/// The closed `ck-browser-journal/v7` entry.
 ///
 /// No additional fields are permitted (`deny_unknown_fields`). For a policy
 /// event, `capability`, `intent_redacted`, `requested_severity`,
@@ -594,6 +602,7 @@ mod tests {
             session_kind: SessionKind::Primary,
             profile_uuid: None,
             profile_name: None,
+            origin: Default::default(),
         }
     }
 

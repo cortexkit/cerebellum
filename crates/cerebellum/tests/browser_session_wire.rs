@@ -2375,6 +2375,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
             // real registry keeps, so it is the one that must not land there.
             profile_disposition: ProfileDisposition::Durable,
             project_root: std::path::PathBuf::from("/tmp"),
+            origin: Default::default(),
         },
         // The bind validator refuses an empty principal before the registry
         // is opened.
@@ -6210,4 +6211,399 @@ async fn a_scope_with_a_route_still_bound_is_not_polled() {
         "a scope with a bound route was polled"
     );
     assert!(planes.sessions.has_open_session("test-session"));
+}
+
+// ---------------------------------------------------------------------------
+// origin: the caller behind a relayed call, recorded on every audit row the
+// call writes and consulted by nothing that admits, keys or cancels it
+// ---------------------------------------------------------------------------
+
+/// A navigation on `channel`/3 that the fixture's grant lets run, with the
+/// request's `origin` member set to `origin` exactly as given (any JSON, so a
+/// malformed one can be sent), and a `call_key` when one is named.
+fn relayed_navigation(
+    channel: u16,
+    corr: u64,
+    call_key: Option<&str>,
+    origin: Option<Value>,
+) -> Frame {
+    let mut request = json!({
+        "name": "browser.navigate",
+        "arguments": {"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}},
+    });
+    if let Some(call_key) = call_key {
+        request["call_key"] = call_key.into();
+    }
+    if let Some(origin) = origin {
+        request["origin"] = origin;
+    }
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        3,
+        corr,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A well-formed origin naming a reserved module as the caller behind a call.
+fn origin_naming(module_id: &str, call_key: &str) -> Value {
+    json!({"carrier": {"kind": "reserved", "module_id": module_id}, "call_key": call_key})
+}
+
+fn relayed_record(module_id: &str, call_key: &str) -> cerebellum::journal::CallOriginRecord {
+    cerebellum::journal::CallOriginRecord::Relayed {
+        carrier: cerebellum_core::journal::OriginCarrier::Reserved {
+            module_id: module_id.to_string(),
+        },
+        call_key: call_key.to_string(),
+    }
+}
+
+/// Send `frame` on the session caller's route and return its reply, answering
+/// "allow" if the call stops to ask a person first.
+async fn served(planes: &Planes, frame: Frame) -> Frame {
+    let (tx, mut rx) = mpsc::channel(8);
+    let first = exchange(planes, &tx, &mut rx, frame).await;
+    if first.header.ty != FrameType::Request {
+        return first;
+    }
+    answer_browser(planes, &tx, &first, "allow").await;
+    consent_frame(&mut rx).await
+}
+
+/// The browser journal's rows, as exported.
+async fn journal_rows(planes: &Planes) -> Vec<cerebellum::journal::JournalEntry> {
+    planes
+        .browser
+        .journal_export_for_test()
+        .await
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The latest record the call-record file holds for `call_key`, as written.
+fn stored_record(
+    storage: &cerebellum::journal::call_records::InMemoryCallRecordStorage,
+    call_key: &str,
+) -> Value {
+    let stored = String::from_utf8(storage.contents().expect("records were written")).unwrap();
+    stored
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["call_key"] == call_key)
+        .last()
+        .unwrap_or_else(|| panic!("no record for {call_key}: {stored}"))
+}
+
+#[tokio::test]
+async fn a_relayed_call_names_its_origin_on_its_journal_rows_and_its_call_record() {
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+
+    let reply = served(
+        &planes,
+        relayed_navigation(
+            9,
+            801,
+            Some("pf:relayed-1"),
+            Some(origin_naming("agent-host", "agent:call-1")),
+        ),
+    )
+    .await;
+    assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
+
+    let expected = relayed_record("agent-host", "agent:call-1");
+    let rows = journal_rows(&planes).await;
+    assert!(!rows.is_empty(), "the call wrote no journal row");
+    for row in &rows {
+        assert_eq!(row.identity.origin, expected, "{row:?}");
+        assert_eq!(row.format_version, "ck-browser-journal/v7");
+    }
+    let record = stored_record(&storage, "pf:relayed-1");
+    assert_eq!(
+        record["origin"],
+        serde_json::to_value(&expected).unwrap(),
+        "{record}"
+    );
+    // The record is still the route principal's: the origin names who it acted
+    // for, never who acted.
+    assert_eq!(record["principal"], "reserved:prefrontal-core", "{record}");
+}
+
+#[tokio::test]
+async fn a_call_naming_no_origin_records_none() {
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+
+    let reply = served(
+        &planes,
+        relayed_navigation(9, 801, Some("pf:direct-1"), None),
+    )
+    .await;
+    assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
+
+    let export = planes.browser.journal_export_for_test().await;
+    assert!(!export.is_empty(), "the call wrote no journal row");
+    for line in export.lines() {
+        let row: Value = serde_json::from_str(line).unwrap();
+        assert!(row["identity"].get("origin").is_none(), "{row}");
+    }
+    let record = stored_record(&storage, "pf:direct-1");
+    assert!(record.get("origin").is_none(), "{record}");
+}
+
+#[tokio::test]
+async fn an_invalid_origin_is_recorded_absent_with_its_marker_and_never_refuses_the_call() {
+    let (mut planes, launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+    let invalid_before = cerebellum_core::journal::origin_invalid_count();
+
+    // A keyed call whose origin key carries a space, which the wire crate's
+    // rule refuses.
+    let keyed = served(
+        &planes,
+        relayed_navigation(
+            9,
+            801,
+            Some("pf:invalid-1"),
+            Some(origin_naming("agent-host", "agent call")),
+        ),
+    )
+    .await;
+    assert_eq!(body(&keyed)["outcome"], "ok", "{}", body(&keyed));
+    // And a call with no key whose origin is not even an object.
+    let unkeyed = served(
+        &planes,
+        relayed_navigation(9, 802, None, Some(json!("prefrontal-core"))),
+    )
+    .await;
+    assert_eq!(body(&unkeyed)["outcome"], "ok", "{}", body(&unkeyed));
+    assert_eq!(
+        launcher.effects.lock().unwrap().as_slice(),
+        ["navigate", "navigate"],
+        "both calls must have run"
+    );
+
+    let rows = journal_rows(&planes).await;
+    assert!(rows.len() >= 2, "{rows:?}");
+    for row in &rows {
+        assert_eq!(
+            row.identity.origin,
+            cerebellum::journal::CallOriginRecord::OriginInvalid,
+            "{row:?}"
+        );
+    }
+    let export = planes.browser.journal_export_for_test().await;
+    assert!(
+        export.contains(r#""origin":{"status":"origin_invalid"}"#),
+        "{export}"
+    );
+    assert!(!export.contains("agent call"), "{export}");
+    let record = stored_record(&storage, "pf:invalid-1");
+    assert_eq!(
+        record["origin"],
+        json!({"status": cerebellum_core::journal::ORIGIN_INVALID_MARKER}),
+        "{record}"
+    );
+    // Other tests in this binary may count too, so only growth is checked.
+    assert!(cerebellum_core::journal::origin_invalid_count() >= invalid_before + 2);
+}
+
+/// Text planted in an origin member past its bound, or in a member the
+/// protocol does not define, reaches neither the journal nor the call
+/// records. The control call plants text within the bounds and must be
+/// found, or the scan proves nothing.
+#[tokio::test]
+async fn text_planted_in_an_origin_past_its_bounds_reaches_no_record() {
+    const CONTROL: &str = "PLANTED-ORIGIN-CONTROL-3b9e";
+    const OVERLONG_KEY: &str = "PLANTED-ORIGIN-KEY-77c1";
+    const OVERLONG_MODULE: &str = "PLANTED-ORIGIN-MODULE-5f02";
+    const UNDEFINED_MEMBER: &str = "PLANTED-ORIGIN-NOTE-a41d";
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+
+    let mut extra_member = origin_naming("agent-host", "agent:note");
+    extra_member["note"] = UNDEFINED_MEMBER.into();
+    let calls = [
+        ("pf:leak-control", origin_naming("agent-host", CONTROL)),
+        (
+            "pf:leak-key",
+            origin_naming("agent-host", &format!("{OVERLONG_KEY}{}", "k".repeat(256))),
+        ),
+        (
+            "pf:leak-module",
+            origin_naming(&format!("{OVERLONG_MODULE}{}", "m".repeat(255)), "agent:m"),
+        ),
+        ("pf:leak-note", extra_member),
+    ];
+    for (corr, (call_key, origin)) in (801..).zip(calls) {
+        let reply = served(
+            &planes,
+            relayed_navigation(9, corr, Some(call_key), Some(origin)),
+        )
+        .await;
+        assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
+    }
+
+    let journal = planes.browser.journal_export_for_test().await;
+    let records = String::from_utf8(storage.contents().unwrap()).unwrap();
+    for (name, text) in [("journal", &journal), ("call records", &records)] {
+        assert!(
+            text.contains(CONTROL),
+            "the control origin is missing from the {name}, so the scan proves nothing: {text}"
+        );
+        for planted in [OVERLONG_KEY, OVERLONG_MODULE, UNDEFINED_MEMBER] {
+            assert!(
+                !text.contains(planted),
+                "{planted} reached the {name}: {text}"
+            );
+        }
+    }
+    // The over-long members cost the attribution, and the undefined member
+    // only itself.
+    assert!(records.contains(r#""origin":{"status":"origin_invalid"}"#));
+    assert_eq!(
+        stored_record(&storage, "pf:leak-note")["origin"],
+        serde_json::to_value(relayed_record("agent-host", "agent:note")).unwrap()
+    );
+}
+
+/// With the same principal and bind facts, calls naming different origins,
+/// a malformed one or none are answered alike, and the origin takes no part
+/// in finding a call key's record: a resend naming another origin is the same
+/// call, answered from the first one's record.
+#[tokio::test]
+async fn the_origin_changes_no_answer_and_no_call_key_lookup() {
+    let (mut planes, launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+
+    let mut outcomes = Vec::new();
+    for (corr, origin) in (801..).zip([
+        None,
+        Some(origin_naming("agent-host", "agent:1")),
+        Some(origin_naming("broca", "broca:1")),
+        Some(json!({"carrier": {"kind": "direct"}, "call_key": "direct:1"})),
+        Some(json!(17)),
+    ]) {
+        let reply = served(&planes, relayed_navigation(9, corr, None, origin)).await;
+        outcomes.push((reply.header.ty, body(&reply)["outcome"].clone()));
+    }
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| *outcome == (FrameType::Response, json!("ok"))),
+        "{outcomes:?}"
+    );
+
+    let first = served(
+        &planes,
+        relayed_navigation(
+            9,
+            810,
+            Some("pf:same-call"),
+            Some(origin_naming("agent-host", "agent:first")),
+        ),
+    )
+    .await;
+    assert_eq!(body(&first)["outcome"], "ok", "{}", body(&first));
+    let navigations = launcher.effects.lock().unwrap().len();
+    for (corr, origin) in [
+        (811, Some(origin_naming("broca", "broca:resend"))),
+        (812, None),
+        (813, Some(json!("not an origin"))),
+    ] {
+        let resent = served(
+            &planes,
+            relayed_navigation(9, corr, Some("pf:same-call"), origin),
+        )
+        .await;
+        assert_eq!(resent.header.corr, corr);
+        assert_eq!(body(&resent), body(&first), "a resend was not replayed");
+    }
+    assert_eq!(
+        launcher.effects.lock().unwrap().len(),
+        navigations,
+        "a resend naming another origin ran again"
+    );
+    // One record for the key, still naming the first call's origin.
+    assert_eq!(
+        stored_record(&storage, "pf:same-call")["origin"],
+        serde_json::to_value(relayed_record("agent-host", "agent:first")).unwrap()
+    );
+    let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
+    let keyed: std::collections::BTreeSet<String> = stored
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["call_key"].to_string())
+        .collect();
+    assert_eq!(keyed.len(), 1, "{stored}");
+    assert_eq!(planes.calls.record_count(), 1);
+}
+
+/// A route is admitted as its own principal. A principal that may not act in
+/// a conversation is refused alike whether or not its call names the admitted
+/// module as its origin, and the admitted principal's call is served even
+/// when its origin names a module that may not act.
+#[tokio::test]
+async fn a_relayed_call_is_admitted_only_as_its_route_principal() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_second_principal(&planes).await;
+
+    let session_caller = cerebellum_core::principal::SESSION_CALLER_MODULE_ID;
+    let plain = served(&planes, relayed_navigation(10, 801, None, None)).await;
+    let claiming = served(
+        &planes,
+        relayed_navigation(10, 801, None, Some(origin_naming(session_caller, "pf:1"))),
+    )
+    .await;
+    assert_eq!(
+        error_code(&plain),
+        cerebellum_core::principal::SESSION_CALLER_NOT_ADMITTED
+    );
+    assert_eq!(
+        (claiming.header.ty, body(&claiming)),
+        (plain.header.ty, body(&plain)),
+        "an origin naming the admitted module changed a refused principal's answer"
+    );
+
+    let admitted = served(
+        &planes,
+        relayed_navigation(9, 802, None, Some(origin_naming("broca", "broca:1"))),
+    )
+    .await;
+    assert_eq!(body(&admitted)["outcome"], "ok", "{}", body(&admitted));
+}
+
+/// A relayed call waiting on a person is cancelled by its correlation id
+/// exactly as any other call is.
+#[tokio::test]
+async fn a_relayed_call_is_cancelled_like_any_other() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let call = relayed_navigation(9, 801, None, Some(origin_naming("agent-host", "agent:1")));
+    cerebellum::handle_frame_for_test(call.clone(), &tx, &planes)
+        .await
+        .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let mut cancel = call;
+    cancel.header.ty = FrameType::Cancel;
+    cancel.body.clear();
+    cerebellum::handle_frame_for_test(cancel, &tx, &planes)
+        .await
+        .unwrap();
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(
+        body(&reply)["detail"]["decision"],
+        "cancelled",
+        "{}",
+        body(&reply)
+    );
+    assert!(launcher.effects.lock().unwrap().is_empty());
 }

@@ -93,6 +93,7 @@ pub fn identity() -> JournalIdentity {
         conversation_key: "conversation-1".into(),
         agent_project_id: "project-1".into(),
         session_kind: SessionKind::Primary,
+        origin: Default::default(),
     }
 }
 

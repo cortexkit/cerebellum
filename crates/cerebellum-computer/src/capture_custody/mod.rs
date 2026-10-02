@@ -1522,6 +1522,7 @@ pub fn identity(
         conversation_key: conversation_key.into(),
         agent_project_id: agent_project_id.into(),
         session_kind,
+        origin: Default::default(),
     }
 }
 

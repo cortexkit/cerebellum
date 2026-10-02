@@ -29,6 +29,7 @@ fn identity() -> JournalIdentity {
         session_kind: SessionKind::Primary,
         profile_uuid: None,
         profile_name: None,
+        origin: Default::default(),
     }
 }
 
@@ -609,7 +610,7 @@ fn handoff_records_carry_a_count_and_no_names() {
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().all(|entry| {
-        entry.format_version == "ck-browser-journal/v6"
+        entry.format_version == "ck-browser-journal/v7"
             && entry.capability == Some(Capability::Present)
             && entry.action.is_none()
     }));
@@ -662,7 +663,7 @@ fn login_import_records_count_and_no_cookie_names_or_values() {
         .unwrap();
     let export = journal.export();
     let entry: JournalEntry = serde_json::from_str(export.trim()).unwrap();
-    assert_eq!(entry.format_version, "ck-browser-journal/v6");
+    assert_eq!(entry.format_version, "ck-browser-journal/v7");
     assert_eq!(entry.capability, Some(Capability::ImportLogin));
     assert!(entry.action.is_none());
     let Some(JournalPayload::LoginImport(payload)) = entry.payload else {
@@ -695,6 +696,73 @@ fn v5_fixture_reads_back_byte_for_byte() {
     assert_eq!(entry.export_line(), fixture);
 }
 
+/// The v6 fixture is a login-capture entry as the v6 serializer wrote it,
+/// before identities could carry an `origin`. It still decodes, as an entry
+/// with no origin, and re-serializes to the same bytes.
+#[test]
+fn v6_fixture_reads_back_byte_for_byte_with_no_origin() {
+    let fixture = include_str!("../fixtures/browser-journal-v6.jsonl");
+    let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v6");
+    assert_eq!(entry.capability, Some(Capability::CaptureLogin));
+    assert_eq!(
+        entry.identity.origin,
+        cerebellum::journal::CallOriginRecord::Absent
+    );
+    assert_eq!(entry.export_line(), fixture);
+}
+
+/// A v7 identity names the caller behind a relayed call, and one without an
+/// origin writes no member, exactly as v6 did.
+#[test]
+fn a_v7_identity_writes_its_origin_only_when_there_is_one() {
+    use cerebellum::journal::CallOriginRecord;
+    use cerebellum_core::journal::OriginCarrier;
+
+    let mut journal = store();
+    let mut relayed = identity();
+    relayed.origin = CallOriginRecord::Relayed {
+        carrier: OriginCarrier::Reserved {
+            module_id: "agent-host".to_string(),
+        },
+        call_key: "agent:1".to_string(),
+    };
+    let mut invalid = identity();
+    invalid.origin = CallOriginRecord::OriginInvalid;
+    for identity in [identity(), relayed.clone(), invalid.clone()] {
+        journal
+            .commit_handoff(
+                identity,
+                "https://login.example".to_string(),
+                HandoffJournalOutcome::Opened,
+                None,
+            )
+            .unwrap();
+    }
+    let export = journal.export();
+    let lines: Vec<&str> = export.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(!lines[0].contains("\"origin\""), "{}", lines[0]);
+    assert!(
+        lines[1].contains(
+            r#""origin":{"status":"relayed","carrier":{"kind":"reserved","module_id":"agent-host"},"call_key":"agent:1"}"#
+        ),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains(r#""origin":{"status":"origin_invalid"}"#),
+        "{}",
+        lines[2]
+    );
+    let decoded: Vec<JournalEntry> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(decoded[1].identity.origin, relayed.origin);
+    assert_eq!(decoded[2].identity.origin, invalid.origin);
+}
+
 #[test]
 fn login_capture_records_decode_as_their_own_payload() {
     use cerebellum::journal::LoginCapturePayload;
@@ -713,7 +781,7 @@ fn login_capture_records_decode_as_their_own_payload() {
         .unwrap();
     let export = journal.export();
     let entry: JournalEntry = serde_json::from_str(export.trim()).unwrap();
-    assert_eq!(entry.format_version, "ck-browser-journal/v6");
+    assert_eq!(entry.format_version, "ck-browser-journal/v7");
     assert_eq!(entry.capability, Some(Capability::CaptureLogin));
     assert!(entry.action.is_none());
     // Untagged payloads decode as the first shape that fits; a capture must

@@ -4373,8 +4373,21 @@ async fn handle_keyed_tool_request(
         }
         return handle_tool_withdraw(&object, (ver, channel, epoch, corr), writer, planes).await;
     }
+    // Read once, here, so the call record and every audit row the call writes
+    // carry the same value. An origin that fails validation never refuses the
+    // call: it says who a relaying module claims to be acting for, which is
+    // attribution, not authorization. It is recorded as absent with a marker
+    // instead, and nothing below this point decides anything by it.
+    let origin =
+        cerebellum_core::journal::CallOriginRecord::from_request_member(object.get("origin"));
     let Some(call_key) = call_key else {
-        return handle_tool_request(frame, writer, planes, &CallObservation::new()).await;
+        return handle_tool_request(
+            frame,
+            writer,
+            planes,
+            &CallObservation::new().with_origin(origin),
+        )
+        .await;
     };
     let mut call = frame;
     call.body = serde_json::to_vec(&Value::Object(object)).map_err(ModuleError::Json)?;
@@ -4382,7 +4395,13 @@ async fn handle_keyed_tool_request(
     // Nothing is lost by not recording it: `handle_tool_request` refuses any
     // call on an unbound route (`route_not_bound`) before it does anything.
     let Some(facts) = planes.routes.get(channel, epoch) else {
-        return handle_tool_request(call, writer, planes, &CallObservation::new()).await;
+        return handle_tool_request(
+            call,
+            writer,
+            planes,
+            &CallObservation::new().with_origin(origin),
+        )
+        .await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
     // The call's record is synced to disk before the call may proceed. The write and
@@ -4397,12 +4416,16 @@ async fn handle_keyed_tool_request(
             .scope
             .as_ref()
             .map(call_records::ScopeIdentity::from_stamp);
+        // Stored on a new record only; the record is still found by the
+        // route's principal and the call key alone.
+        let origin = origin.clone();
         tokio::task::spawn_blocking(move || {
-            calls.begin_scoped(
+            calls.begin_attributed(
                 &principal,
                 &call_key,
                 &conversation_key,
                 scope,
+                origin,
                 wall_clock_ms(),
             )
         })
@@ -4486,7 +4509,7 @@ async fn handle_keyed_tool_request(
     let (proxy, mut outgoing) = mpsc::channel::<Frame>(16);
     let mut pending = PendingSettlement {
         ticket: Some(ticket),
-        observation: CallObservation::new(),
+        observation: CallObservation::new().with_origin(origin),
         unattributed_at_start: cerebellum_core::dispatch_witness::unattributed_commit_count(),
         request: (channel, epoch, corr),
     };
@@ -4529,7 +4552,8 @@ async fn handle_keyed_tool_request(
 }
 
 /// What the tool handler watches while one request runs, so a keyed call's
-/// record can say whether the action was dispatched.
+/// record can say whether the action was dispatched, and who the request says
+/// it was relayed for.
 ///
 /// Armed for every tool request, keyed or not, so that in a running module a
 /// dispatch commitment made under a detached witness always means a commit
@@ -4541,6 +4565,9 @@ struct CallObservation {
     /// Set just before the request is handed to a plane every one of whose
     /// dispatches passes a commitment that marks `dispatch`.
     commit_point: Arc<std::sync::atomic::AtomicBool>,
+    /// The request's `origin`, already validated, for the audit rows the call
+    /// writes. Attribution only: admission reads the route's own facts.
+    origin: cerebellum_core::journal::CallOriginRecord,
 }
 
 impl CallObservation {
@@ -4548,7 +4575,13 @@ impl CallObservation {
         Self {
             dispatch: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
             commit_point: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            origin: cerebellum_core::journal::CallOriginRecord::Absent,
         }
+    }
+
+    fn with_origin(mut self, origin: cerebellum_core::journal::CallOriginRecord) -> Self {
+        self.origin = origin;
+        self
     }
 
     fn commit_point_follows(&self) {
@@ -4892,11 +4925,18 @@ async fn handle_tool_request(
             .await;
     };
 
-    // Tool-route envelopes are closed. `progress_token` is the only optional
-    // gateway member; it is accepted for correlation but not used here.
+    // Tool-route envelopes are closed. `progress_token` is an optional gateway
+    // member, accepted for correlation but not used here. `origin` names the
+    // caller behind a relayed call; it was read before this handler (see
+    // `handle_keyed_tool_request`) and reaches it only through `call`.
     if let Some(field) = object
         .keys()
-        .filter(|field| !matches!(field.as_str(), "name" | "arguments" | "progress_token"))
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "name" | "arguments" | "progress_token" | "origin"
+            )
+        })
         .min()
     {
         return send_invalid_request_response(
@@ -4973,6 +5013,10 @@ async fn handle_tool_request(
     // This request's copy of the route identity carries its own witness, so a
     // browser dispatch committed for it marks this request and no other.
     accepted_facts.identity.witness = call.dispatch.clone();
+    // And its own origin, so every audit row written for it names the caller
+    // behind it. Set after the route lookup and read by nothing below that
+    // admits, refuses or keys the call.
+    accepted_facts.identity.origin = call.origin.clone();
     // Session admission, before the capability scope and before anything
     // below reads a grant, asks a person or reserves a journal entry; see
     // `send_session_caller_not_admitted`. Every tool call acts in the route's
@@ -5204,6 +5248,7 @@ async fn handle_tool_request(
                         conversation_key: accepted_facts.identity.conversation_key.clone(),
                         agent_project_id: accepted_facts.identity.agent_project_id.clone(),
                         session_kind: accepted_facts.identity.session_kind,
+                        origin: accepted_facts.identity.origin.clone(),
                     },
                     management: &planes.management,
                     consent: consent_context(planes, &accepted_facts, writer, channel, epoch),

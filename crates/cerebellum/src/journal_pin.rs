@@ -438,6 +438,7 @@ impl JournalPin {
             session_kind: bind_facts.session_kind,
             profile_uuid: assoc.profile_uuid.clone(),
             profile_name: assoc.profile_name.clone(),
+            origin: Default::default(),
         };
         // S7 reserve: durably advances the allocator and establishes the
         // reservation. Failure is journal_reservation_failed.

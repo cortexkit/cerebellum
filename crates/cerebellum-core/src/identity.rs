@@ -132,6 +132,12 @@ pub struct RouteIdentity {
     /// commits a dispatch for it. A route's stored identity carries a detached
     /// one; the tool handler gives each request's copy its own.
     pub witness: crate::dispatch_witness::DispatchWitness,
+    /// The caller behind the request being served, when another module
+    /// relayed it, so the audit records written for it can name that caller.
+    /// A route's stored identity carries none; the tool handler sets it on
+    /// each request's copy. Attribution only: no admission, grant or call-key
+    /// decision reads it.
+    pub origin: crate::journal::CallOriginRecord,
 }
 
 impl RouteIdentity {
@@ -162,6 +168,7 @@ impl RouteIdentity {
             profile_disposition,
             project_root: identity.project_root.clone(),
             witness: crate::dispatch_witness::DispatchWitness::detached(),
+            origin: crate::journal::CallOriginRecord::Absent,
         }
     }
 
@@ -444,6 +451,7 @@ impl AcceptedBindFacts {
                 profile_disposition: ProfileDisposition::None,
                 project_root: self.identity.project_root.clone(),
                 witness: self.identity.witness.clone(),
+                origin: self.identity.origin.clone(),
             },
             principal: self.principal.clone(),
             agent_project_id_attested: false,

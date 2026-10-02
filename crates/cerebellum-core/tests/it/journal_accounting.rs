@@ -82,6 +82,7 @@ fn identity() -> JournalIdentity {
         conversation_key: "conversation-1".to_string(),
         agent_project_id: "project-1".to_string(),
         session_kind: SessionKind::Primary,
+        origin: Default::default(),
     }
 }
 

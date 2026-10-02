@@ -114,6 +114,7 @@ fn identity() -> JournalIdentity {
         conversation_key: "conversation-1".into(),
         agent_project_id: "project-1".into(),
         session_kind: SessionKind::Primary,
+        origin: Default::default(),
     }
 }
 
@@ -1231,7 +1232,7 @@ fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup(
 }
 
 #[test]
-fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
+fn old_journal_fixture_reads_and_route_summary_round_trips_in_the_current_version() {
     use cerebellum_computer::audit::{ActuationOutcome, RecordedActuationOutcome};
     use cerebellum_computer::platform::input_route::{
         AuthEvidence, InputRouteEvidence, RouteCounts,
@@ -1284,16 +1285,16 @@ fn old_journal_fixture_reads_and_route_summary_round_trips_in_v2() {
         .finalize_actuation_outcome_with_routes(token, &old_outcome.outcome, &routes)
         .unwrap();
     let new = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
-    assert_eq!(new["codec_version"], "ck-computer-journal/v2");
+    assert_eq!(new["codec_version"], "ck-computer-journal/v3");
     let completed: Vec<u8> = serde_json::from_value(new["completed_result"].clone()).unwrap();
     let recorded: RecordedActuationOutcome = serde_json::from_slice(&completed).unwrap();
     assert_eq!(recorded.routes, routes);
     assert_eq!(recorded.outcome, old_outcome.outcome);
-    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 3);
 }
 
 #[test]
-fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
+fn v2_manual_accessibility_fixture_still_reads_under_the_v3_codec() {
     let entry = ComputerJournalCodec::decode_entry(include_bytes!(
         "../fixtures/v2_manual_accessibility_entry.json"
     ))
@@ -1307,7 +1308,65 @@ fn v2_manual_accessibility_fixture_reads_without_changing_the_format_floor() {
     let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(dispatch["pid"], 42);
     assert_eq!(dispatch["bundle_identity"], "com.example.target");
-    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 2);
+    // Written before identities could carry an origin: it has none.
+    assert!(entry["identity"].get("origin").is_none());
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 3);
+}
+
+/// Every phase of an entry names the caller behind a relayed call, and an
+/// entry for a call nobody relayed writes no `origin` member at all.
+#[test]
+fn each_entry_names_a_relayed_calls_origin_and_only_then() {
+    use cerebellum_core::journal::{CallOriginRecord, OriginCarrier};
+
+    let relayed = CallOriginRecord::Relayed {
+        carrier: OriginCarrier::Reserved {
+            module_id: "agent-host".to_string(),
+        },
+        call_key: "agent:7".to_string(),
+    };
+    for origin in [
+        CallOriginRecord::Absent,
+        relayed,
+        CallOriginRecord::OriginInvalid,
+    ] {
+        let mut audit = audit();
+        let mut identity = identity();
+        identity.origin = origin.clone();
+        let descriptor = actuation_descriptor();
+        let handle = audit.reserve(identity, descriptor.clone()).unwrap();
+        let token = audit
+            .commit_actuation_intent(
+                handle,
+                &descriptor,
+                &ActuationIntent {
+                    element: None,
+                    action: "computer.type".into(),
+                    grant_identity: target_grant(),
+                },
+            )
+            .unwrap();
+        audit
+            .finalize_actuation_outcome(
+                token,
+                &cerebellum_computer::audit::ActuationOutcome::HandlerReturned {
+                    unreadable_subtrees: 0,
+                },
+            )
+            .unwrap();
+        let entry = ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
+        assert_eq!(entry["codec_version"], "ck-computer-journal/v3");
+        match &origin {
+            CallOriginRecord::Absent => {
+                assert!(entry["identity"].get("origin").is_none(), "{entry}")
+            }
+            _ => assert_eq!(
+                entry["identity"]["origin"],
+                serde_json::to_value(&origin).unwrap(),
+                "{entry}"
+            ),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1344,7 +1403,7 @@ fn accessibility_read_evidence_is_on_each_actions_own_row_and_not_its_result() {
             let entry =
                 ComputerJournalCodec::decode_entry(&audit.journal().export_bytes()).unwrap();
             assert_eq!(entry["manual_accessibility"], status);
-            assert_eq!(entry["codec_version"], "ck-computer-journal/v2");
+            assert_eq!(entry["codec_version"], "ck-computer-journal/v3");
             let bytes: Vec<u8> =
                 serde_json::from_value(entry["dispatch_material"].clone()).unwrap();
             let dispatch: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
