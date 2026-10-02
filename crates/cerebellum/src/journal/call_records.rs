@@ -1224,12 +1224,8 @@ mod tests {
     /// unknown and never as runnable.
     #[test]
     fn a_started_record_left_by_a_crash_reads_as_outcome_unknown_after_reopening_from_disk() {
-        let directory = std::env::temp_dir().join(format!(
-            "cerebellum-call-records-{}-{}",
-            std::process::id(),
-            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&directory).unwrap();
+        let scratch = ScratchDirectory::new("crash");
+        let directory = scratch.0.clone();
         let path = directory.join(CALL_RECORD_FILE);
         let storage = || {
             Box::new(FilesystemCallRecordStorage::new(&path).with_format_floor(
@@ -1255,7 +1251,6 @@ mod tests {
         }
         let floor = fs::read_to_string(directory.join("floor.json")).unwrap();
         assert!(floor.contains("call-records"), "{floor}");
-        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -1332,18 +1327,37 @@ mod tests {
         "\"started_at_ms\":15,\"settled_at_ms\":null}\n",
     );
 
+    /// A fresh directory for one test, removed when the guard drops, which
+    /// includes a test that fails part way: a cleanup line at the end of the
+    /// test body never runs after a failed assertion, and the directory would
+    /// stay behind in the temporary folder.
+    struct ScratchDirectory(PathBuf);
+
+    impl ScratchDirectory {
+        fn new(name: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "cerebellum-call-records-{name}-{}-{}",
+                std::process::id(),
+                TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A v1 file on disk with its own format floor, in a fresh directory.
-    fn v1_on_disk(name: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let directory = std::env::temp_dir().join(format!(
-            "cerebellum-call-records-{name}-{}-{}",
-            std::process::id(),
-            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(CALL_RECORD_FILE);
+    fn v1_on_disk(name: &str) -> (ScratchDirectory, PathBuf, PathBuf) {
+        let scratch = ScratchDirectory::new(name);
+        let path = scratch.0.join(CALL_RECORD_FILE);
         fs::write(&path, V1_FILE).unwrap();
-        let floor = directory.join("floor.json");
-        (directory, path, floor)
+        let floor = scratch.0.join("floor.json");
+        (scratch, path, floor)
     }
 
     fn open_on_disk(path: &Path, floor: &Path, now_ms: u64) -> CallRecords {
@@ -1361,7 +1375,7 @@ mod tests {
     /// not raised, so the previous build can still be placed again.
     #[test]
     fn a_version_1_file_is_read_as_it_stands_while_no_call_is_recorded() {
-        let (directory, path, floor) = v1_on_disk("v1-no-call");
+        let (_scratch, path, floor) = v1_on_disk("v1-no-call");
         let records = open_on_disk(&path, &floor, 30);
 
         // Both records are read, the started one reconciled in memory.
@@ -1381,7 +1395,6 @@ mod tests {
             "opening raised the floor: {}",
             fs::read_to_string(&floor).unwrap_or_default()
         );
-        let _ = fs::remove_dir_all(&directory);
     }
 
     /// The first record this build writes moves a version 1 file to version
@@ -1389,7 +1402,7 @@ mod tests {
     /// the new one, and the floor raised to 2 before the write.
     #[test]
     fn the_first_recorded_call_moves_a_version_1_file_to_version_2() {
-        let (directory, path, floor) = v1_on_disk("v1-one-call");
+        let (_scratch, path, floor) = v1_on_disk("v1-one-call");
         let records = open_on_disk(&path, &floor, 30);
         let _ticket = executed(records.begin_attributed(
             "reserved:prefrontal-core",
@@ -1432,7 +1445,6 @@ mod tests {
         );
         let floors = cerebellum_core::format_floor::read_floors(&floor).unwrap();
         assert_eq!(floors.get("call-records"), Some(&2));
-        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
