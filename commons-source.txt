@@ -16,4 +16,4 @@
 # (its flatness check), so it never reaches a release binary; it is pinned so
 # the test gate verifies the sibling those tests compile against.
 6676798778308ecee47e02486203e706630d8e00 cortexkit-store-types
-0a74dea5164aa479213a3185647013777b5d7fd1 cortexkit-role-tool-provider
+c7252c752435647e653bd97d3369ee80d276a571 cortexkit-role-tool-provider
