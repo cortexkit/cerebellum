@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::source_scan::{self, copy_tree, scratch_directory};
+
 /// The one file allowed to read the nonce.
 const READER: &str = "crates/cerebellum/src/launch_nonce.rs";
 
@@ -21,12 +23,17 @@ const ALLOWED_MENTIONS: &[(&str, &str)] = &[(
      builder and expecting them dropped",
 )];
 
-const PATTERNS: &[&str] = &[
+/// Text that marks an identifier as naming the nonce's environment variables:
+/// the variable names themselves (which `SUBC_LAUNCH_NONCE_FD` contains too)
+/// and `subc_os`'s constants for them.
+const VARIABLE_NAMES: &[&str] = &[
     "SUBC_LAUNCH_NONCE",
     "LAUNCH_NONCE_ENV",
     "LAUNCH_NONCE_FD_ENV",
-    "launch_nonce()",
 ];
+
+/// The accessor `subc_os` reads the nonce through.
+const ACCESSOR: &str = "launch_nonce";
 
 /// What an actual read looks like in [`READER`]. The real-tree scan insists on
 /// finding it there, so a reader that moved or stopped reading fails the scan
@@ -60,7 +67,15 @@ fn only_launch_nonce_rs_reads_the_launch_nonce() {
     assert!(
         scan.reader_reads > 0,
         "{READER} has no line matching {READER_READ:?}; if the reader moved or \
-         reads differently now, update READER, READER_READ and PATTERNS to match"
+         reads differently now, update READER, READER_READ and the detector to match"
+    );
+    // An allowance that no longer covers anything would quietly excuse the
+    // next mention someone adds to that file, so each must still be in use.
+    assert!(
+        scan.unused_allowances.is_empty(),
+        "these ALLOWED_MENTIONS entries no longer mention the nonce; remove them \
+         so they cannot excuse a new read:\n{}",
+        scan.unused_allowances.join("\n")
     );
     assert!(
         scan.violations.is_empty(),
@@ -72,8 +87,12 @@ fn only_launch_nonce_rs_reads_the_launch_nonce() {
 /// What one walk over the workspace's crate sources found.
 struct TreeScan {
     files_scanned: usize,
-    /// Lines in [`READER`] that match the patterns and contain [`READER_READ`].
+    /// Lines in [`READER`] that the detector matches and that contain
+    /// [`READER_READ`].
     reader_reads: usize,
+    /// [`ALLOWED_MENTIONS`] paths the walk did not find, or found with no
+    /// mention left in them.
+    unused_allowances: Vec<String>,
     /// Forbidden mentions, as `path:line: text`.
     violations: Vec<String>,
 }
@@ -91,8 +110,10 @@ fn scan_workspace(workspace: &Path) -> TreeScan {
     let mut scan = TreeScan {
         files_scanned: sources.len(),
         reader_reads: 0,
+        unused_allowances: Vec::new(),
         violations: Vec::new(),
     };
+    let mut allowance_used = vec![false; ALLOWED_MENTIONS.len()];
     for file in &sources {
         let relative = file
             .strip_prefix(workspace)
@@ -106,7 +127,17 @@ fn scan_workspace(workspace: &Path) -> TreeScan {
                 .filter(|(_, line)| line.contains(READER_READ))
                 .count();
         }
+        for (used, (path, _)) in allowance_used.iter_mut().zip(ALLOWED_MENTIONS) {
+            if *path == relative && !mentions(&source).is_empty() {
+                *used = true;
+            }
+        }
         scan.violations.extend(nonce_violations(&relative, &source));
+    }
+    for (used, (path, reason)) in allowance_used.iter().zip(ALLOWED_MENTIONS) {
+        if !used {
+            scan.unused_allowances.push(format!("{path}: {reason}"));
+        }
     }
     scan
 }
@@ -127,21 +158,58 @@ fn nonce_violations(path: &str, source: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every line naming the nonce's variables or accessor, with its 1-based number.
+/// Every line naming the nonce's variables or accessor, with its 1-based number
+/// and text. A mention split over several lines is reported on the line where
+/// the name sits.
+///
+/// Matched on tokens rather than text, so layout cannot hide a read. A
+/// variable is named by any identifier containing one of [`VARIABLE_NAMES`],
+/// which covers the quoted name, `subc_os`'s constants, and a `const` the name
+/// is stashed in (flagged where the name is written). The accessor is named
+/// when it is called, with any spacing or line break before the parenthesis,
+/// and when `subc_os::launch_nonce` is
+/// referenced or renamed without a call, as an import or a function value.
+/// The module `launch_nonce` and paths through it are not the accessor.
+///
+/// Comments and string literals are not parsed, so a mention in either counts
+/// as well, as it did when this was a plain text match.
 fn mentions(source: &str) -> Vec<(usize, &str)> {
-    source
+    let lines: Vec<(usize, &str)> = source
         .lines()
         .enumerate()
-        .filter(|(_, line)| PATTERNS.iter().any(|pattern| line.contains(pattern)))
         .map(|(index, line)| (index + 1, line))
-        .collect()
+        .collect();
+    let tokens = source_scan::tokens(&lines);
+    let token_at = |index: usize| tokens.get(index).map(|(_, token)| *token);
+    let mut found: Vec<(usize, &str)> = Vec::new();
+    for (index, &(line_number, token)) in tokens.iter().enumerate() {
+        let names_variable = VARIABLE_NAMES.iter().any(|name| token.contains(name));
+        // The accessor takes no arguments. Any identifier ending in its name
+        // and called with none counts, as it did under the text match; one
+        // called with arguments counts only if it is the accessor's own name,
+        // which keeps `without_launch_nonce(&mut command)`, the helper that
+        // strips the nonce from a child, from reading as a read.
+        let calls_accessor = token_at(index + 1) == Some("(")
+            && (token == ACCESSOR
+                || (token.ends_with(ACCESSOR) && token_at(index + 2) == Some(")")));
+        let references_accessor = token == ACCESSOR
+            && (token_at(index + 1) == Some("as")
+                || (index >= 2
+                    && token_at(index - 2) == Some("subc_os")
+                    && token_at(index - 1) == Some("::")));
+        let is_mention = names_variable || calls_accessor || references_accessor;
+        if is_mention && found.last().is_none_or(|(last, _)| *last != line_number) {
+            found.push((line_number, lines[line_number - 1].1));
+        }
+    }
+    found
 }
 
 /// A file outside the reader and the allowed list, for planted source.
 const ELSEWHERE: &str = "crates/cerebellum/src/consent.rs";
 
-/// One planted read per spelling in [`PATTERNS`], through `std::env::var`,
-/// `std::env::var_os` and the accessor.
+/// One planted read per variable spelling and the accessor, through
+/// `std::env::var`, `std::env::var_os` and the accessor's call.
 const READS: &[&str] = &[
     "let nonce = std::env::var(\"SUBC_LAUNCH_NONCE\");",
     "let fd = std::env::var_os(\"SUBC_LAUNCH_NONCE_FD\");",
@@ -154,8 +222,8 @@ const READS: &[&str] = &[
 /// flag.
 ///
 /// The real-tree test passes on a clean tree and on a detector that has gone
-/// blind alike, so on its own a green result proves nothing. Every spelling in
-/// [`PATTERNS`] is planted, so dropping or breaking one fails here.
+/// blind alike, so on its own a green result proves nothing. Every spelling the
+/// detector looks for is planted, so dropping or breaking one fails here.
 #[test]
 fn the_nonce_detector_flags_every_planted_read() {
     for read in READS {
@@ -205,6 +273,79 @@ fn the_nonce_detector_flags_every_planted_read() {
             &[2],
         );
     }
+    // Layout variants. The plain-text match this detector replaced caught the
+    // variable forms on the line holding the name, as this does, but missed
+    // the accessor spaced from its parentheses, split between them, renamed on
+    // import, or taken as a value. Each form is kept here so that a return to
+    // text matching fails by name.
+    let variants: &[(&str, &[&str], &[usize])] = &[
+        (
+            "the variable name on the line after env::var(",
+            &[
+                "let nonce = std::env::var(",
+                "    \"SUBC_LAUNCH_NONCE\",",
+                ");",
+            ],
+            &[2],
+        ),
+        (
+            "the variable name held in a const",
+            &[
+                "const NAME: &str = \"SUBC_LAUNCH_NONCE\";",
+                "fn hello() { let nonce = std::env::var(NAME); }",
+            ],
+            &[1],
+        ),
+        (
+            "the subc_os constant split from its path",
+            &[
+                "let fd = std::env::var_os(subc_os::",
+                "    LAUNCH_NONCE_FD_ENV);",
+            ],
+            &[2],
+        ),
+        (
+            "a space before the accessor's parentheses",
+            &["let nonce = subc_os::launch_nonce ();"],
+            &[1],
+        ),
+        (
+            "the accessor's call split across lines",
+            &["let nonce = subc_os::launch_nonce(", ");"],
+            &[1],
+        ),
+        (
+            "the accessor's path split across lines",
+            &["let nonce = subc_os::", "    launch_nonce();"],
+            &[2],
+        ),
+        (
+            "the accessor imported under another name",
+            &[
+                "use subc_os::launch_nonce as read_proof;",
+                "fn hello() { let nonce = read_proof(); }",
+            ],
+            &[1],
+        ),
+        (
+            "the accessor imported in a group and renamed",
+            &[
+                "use subc_os::{",
+                "    launch_nonce as read_proof,",
+                "    ModuleIdentity,",
+                "};",
+            ],
+            &[2],
+        ),
+        (
+            "the accessor taken as a function value",
+            &["let read = subc_os::launch_nonce;"],
+            &[1],
+        ),
+    ];
+    for (case, lines, expected) in variants {
+        assert_flags(case, ELSEWHERE, &lines.join("\n"), expected);
+    }
 }
 
 /// The fence's negative control: planted source the detector must pass.
@@ -227,18 +368,22 @@ fn the_nonce_detector_passes_every_planted_non_read() {
         }
     }
     // Near misses outside the reader: other environment variables, including
-    // one sharing the prefix, and code that names the reader module without
-    // calling the accessor.
+    // one sharing the prefix, the reader module and paths through it, and
+    // names that only contain the accessor's.
     assert_flags(
         "code that does not touch the nonce",
         ELSEWHERE,
         &[
             "mod launch_nonce;",
+            "use crate::launch_nonce;",
             "fn hello() {",
             "    let home = std::env::var(\"HOME\");",
             "    let id = std::env::var_os(\"SUBC_LAUNCH_ID\");",
             "    launch_nonce::scrub_child_environment(&mut command);",
+            "    crate::launch_nonce::verify(&proof);",
+            "    crate::launch_nonce::without_launch_nonce(&mut command);",
             "    let proof = handoff.nonce();",
+            "    let source = provenance.launch_nonce_source;",
             "}",
         ]
         .join("\n"),
@@ -288,6 +433,11 @@ fn the_tree_walk_reports_a_planted_file_in_a_nested_module() {
         scan.reader_reads > 0,
         "the copied tree still holds the reader, so the walk must find it"
     );
+    assert!(
+        scan.unused_allowances.is_empty(),
+        "the copied tree still holds every allowed mention, so the walk must find them: {:?}",
+        scan.unused_allowances
+    );
 }
 
 /// Runs the detector over planted source and asserts exactly `expected` (1-based
@@ -317,35 +467,6 @@ fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_rust_sources(&path, out);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             out.push(path);
-        }
-    }
-}
-
-/// A fresh directory under the system temp directory. It only ever holds
-/// copied source text, never anything executed.
-fn scratch_directory(label: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "cerebellum-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock is after the epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&directory).expect("create a scratch directory");
-    directory
-}
-
-/// Copies a directory tree, files and subdirectories, into `to`.
-fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("create a copy directory");
-    for entry in std::fs::read_dir(from).expect("list a directory to copy") {
-        let path = entry.expect("directory entry").path();
-        let target = to.join(path.file_name().expect("an entry has a name"));
-        if path.is_dir() {
-            copy_tree(&path, &target);
-        } else {
-            std::fs::copy(&path, &target).expect("copy a source file");
         }
     }
 }

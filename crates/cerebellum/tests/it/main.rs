@@ -31,4 +31,5 @@ mod one_launch_nonce_reader;
 mod one_lease_clock;
 mod profile_root_rebind;
 mod session_caller_admission;
+mod source_scan;
 mod support;

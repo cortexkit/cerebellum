@@ -20,6 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::source_scan::{self, copy_tree, scratch_directory};
+
 /// Construction sites allowed outside test code: the file, the site's exact
 /// trimmed line, and the reason it exists. The line is matched exactly so that
 /// the real-tree scan can insist on finding it: a site that is renamed or moved
@@ -141,24 +143,95 @@ fn clock_violations(path: &str, source: &str) -> Vec<String> {
     violations
 }
 
-/// Every production line that builds a `SystemClock`, with its 1-based number
-/// and trimmed text.
+/// Every production line that names a `SystemClock` constructor, with its
+/// 1-based number and trimmed text. A site split over several lines is
+/// reported on the line where the type is named.
 ///
-/// The match is plain text on the line, so a mention in a comment or a string
-/// literal counts as a construction too. The effect is that the fence errs
-/// towards a false alarm the author can reword, never towards a missed clock.
+/// Matched on tokens rather than text, so layout cannot hide a call:
+/// `SystemClock::new ()`, `SystemClock` and `::new()` on separate lines, and
+/// the path-qualified `cerebellum_core::clock::SystemClock::new()` all count.
+/// So does naming the constructor without calling it, as in
+/// `.unwrap_or_else(SystemClock::new)`, which builds a clock all the same, and
+/// `<SystemClock as Default>::default()`. A name the type is imported or
+/// aliased under in the same file (`use ...::SystemClock as Clock;`,
+/// `type Clock = ...::SystemClock;`) is matched like the type itself. Any
+/// identifier ending in `SystemClock` counts, as it did when this was a plain
+/// text match.
+///
+/// Comments and string literals are not parsed, so a mention in either counts
+/// as a construction too. The effect is that the fence errs towards a false
+/// alarm the author can reword, never towards a missed clock.
 fn construction_sites(source: &str) -> Vec<(usize, String)> {
-    production_lines(source)
-        .into_iter()
-        .filter(|(_, line)| {
-            line.contains("SystemClock::new()") || line.contains("SystemClock::default()")
-        })
-        .map(|(line_number, line)| (line_number, line.trim().to_string()))
-        .collect()
+    let lines = production_lines(source);
+    let tokens = source_scan::tokens(&lines);
+    let aliases = clock_aliases(&tokens);
+    let names_clock = |token: &str| token.ends_with("SystemClock") || aliases.contains(&token);
+    let token_at = |index: usize| tokens.get(index).map(|(_, token)| *token);
+    let is_constructor = |token: Option<&str>| matches!(token, Some("new" | "default"));
+    let mut sites: Vec<(usize, String)> = Vec::new();
+    for (index, &(line_number, token)) in tokens.iter().enumerate() {
+        if !names_clock(token) {
+            continue;
+        }
+        // `SystemClock::new`, or the trait-qualified
+        // `<SystemClock as Default>::default`.
+        let direct = token_at(index + 1) == Some("::") && is_constructor(token_at(index + 2));
+        let qualified = token_at(index + 1) == Some("as")
+            && token_at(index + 3) == Some(">")
+            && token_at(index + 4) == Some("::")
+            && is_constructor(token_at(index + 5));
+        // One entry per line, as the line-based match gave, so the allowed
+        // line is counted once however many constructors it names.
+        if (direct || qualified) && sites.last().is_none_or(|(last, _)| *last != line_number) {
+            let text = lines
+                .iter()
+                .find(|(number, _)| *number == line_number)
+                .map(|(_, line)| line.trim().to_string())
+                .unwrap_or_default();
+            sites.push((line_number, text));
+        }
+    }
+    sites
+}
+
+/// Names the clock type goes by in a file besides its own:
+/// `use ...::SystemClock as Alias` (alone or inside a `{ ... }` group) and
+/// `type Alias = ...::SystemClock;`.
+fn clock_aliases<'a>(tokens: &[(usize, &'a str)]) -> Vec<&'a str> {
+    let token_at = |index: usize| tokens.get(index).map(|(_, token)| *token);
+    let mut aliases = Vec::new();
+    for (index, &(_, token)) in tokens.iter().enumerate() {
+        // A use item ends in `;`, `,` or `}`. The `>` of the trait-qualified
+        // form `<SystemClock as Default>` is what tells that apart.
+        if token.ends_with("SystemClock")
+            && token_at(index + 1) == Some("as")
+            && matches!(token_at(index + 3), Some(";" | "," | "}"))
+        {
+            aliases.extend(token_at(index + 2));
+        }
+        if token == "type" && token_at(index + 2) == Some("=") {
+            let target: Vec<&str> = tokens[index + 3..]
+                .iter()
+                .map(|(_, token)| *token)
+                .take_while(|token| *token != ";")
+                .collect();
+            let is_path = target.iter().all(|token| {
+                *token == "::" || token.chars().all(|c| c.is_alphanumeric() || c == '_')
+            });
+            if is_path
+                && target
+                    .last()
+                    .is_some_and(|last| last.ends_with("SystemClock"))
+            {
+                aliases.extend(token_at(index + 1));
+            }
+        }
+    }
+    aliases
 }
 
 /// Every `.rs` file under a directory, recursively.
-fn rust_sources(directory: &Path) -> Vec<std::path::PathBuf> {
+fn rust_sources(directory: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![directory.to_path_buf()];
     while let Some(next) = stack.pop() {
@@ -314,6 +387,78 @@ fn the_clock_detector_flags_every_planted_construction() {
         ],
         &[2],
     );
+    // Layout variants. The plain-text match this detector replaced missed
+    // every one of these except the path-qualified call; each is kept here so
+    // that a return to text matching fails by name.
+    let variants: &[(&str, &[&str], &[usize])] = &[
+        (
+            "a space before the call's parentheses",
+            &["let clock = SystemClock::new ();"],
+            &[1],
+        ),
+        (
+            "spaces around the path separator",
+            &["let clock = SystemClock :: default();"],
+            &[1],
+        ),
+        (
+            "the path-qualified call",
+            &["let clock = cerebellum_core::clock::SystemClock::new();"],
+            &[1],
+        ),
+        (
+            "a call split across lines",
+            &[
+                "fn open() {",
+                "    let clock = cerebellum_core::clock::SystemClock",
+                "        ::new();",
+                "}",
+            ],
+            &[2],
+        ),
+        (
+            "a use alias",
+            &[
+                "use cerebellum_core::clock::SystemClock as Clock;",
+                "fn open() {",
+                "    let clock = Clock::new();",
+                "}",
+            ],
+            &[3],
+        ),
+        (
+            "an alias inside a grouped use",
+            &[
+                "use cerebellum_core::clock::{",
+                "    MonoInstant,",
+                "    SystemClock as Clock,",
+                "};",
+                "fn open() { let clock = Clock::default(); }",
+            ],
+            &[5],
+        ),
+        (
+            "a type alias",
+            &[
+                "type Clock = cerebellum_core::clock::SystemClock;",
+                "fn open() { let clock = Clock::new(); }",
+            ],
+            &[2],
+        ),
+        (
+            "the constructor named without a call",
+            &["let clock = cached.unwrap_or_else(SystemClock::new);"],
+            &[1],
+        ),
+        (
+            "the trait-qualified default",
+            &["let clock = <SystemClock as Default>::default();"],
+            &[1],
+        ),
+    ];
+    for (case, lines, expected) in variants {
+        assert_flags(case, "src/consent.rs", lines, expected);
+    }
 }
 
 /// The fence's negative control: planted source the detector must pass.
@@ -356,6 +501,23 @@ fn the_clock_detector_passes_every_planted_non_construction() {
             "    let shared = Arc::clone(&planes.lease_clock);",
             "    let fake = MockClock::new();",
             "    let now = shared.now();",
+            "}",
+        ],
+        &[],
+    );
+    // An alias is matched only where it is declared, and only as an exact
+    // name: other clocks ending in the alias's text are not the system clock,
+    // and the trait-qualified form is not an alias declaration.
+    assert_flags(
+        "other clocks beside an alias, and non-constructor calls",
+        "src/consent.rs",
+        &[
+            "use cerebellum_core::clock::SystemClock as Clock;",
+            "fn open(shared: &SystemClock) {",
+            "    let fake = MockClock::new();",
+            "    let now = <SystemClock as Clock>::now(shared);",
+            "    let later = SystemClock::now(shared);",
+            "    let plain = Clock::now(shared);",
             "}",
         ],
         &[],
@@ -414,33 +576,4 @@ fn assert_flags(case: &str, path: &str, lines: &[&str], expected: &[usize]) {
         flagged, expected,
         "case {case:?}: the detector flagged the wrong lines: {violations:?}"
     );
-}
-
-/// A fresh directory under the system temp directory. It only ever holds
-/// copied source text, never anything executed.
-fn scratch_directory(label: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "cerebellum-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock is after the epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&directory).expect("create a scratch directory");
-    directory
-}
-
-/// Copies a directory tree, files and subdirectories, into `to`.
-fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("create a copy directory");
-    for entry in std::fs::read_dir(from).expect("list a directory to copy") {
-        let path = entry.expect("directory entry").path();
-        let target = to.join(path.file_name().expect("an entry has a name"));
-        if path.is_dir() {
-            copy_tree(&path, &target);
-        } else {
-            std::fs::copy(&path, &target).expect("copy a source file");
-        }
-    }
 }
