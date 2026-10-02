@@ -659,6 +659,10 @@ struct Inner {
     /// refused rather than run unprotected.
     broken: Option<CallRecordError>,
     header_written: bool,
+    /// The file on disk was written by an older build, under an older
+    /// header. It is read as it stands and rewritten under the current header
+    /// only when this build first writes a record.
+    older_header: bool,
     appended_since_compaction: usize,
     entries: HashMap<Key, Entry>,
     cached: VecDeque<Key>,
@@ -763,6 +767,7 @@ impl CallRecords {
             inner: Mutex::new(Inner {
                 broken: Some(error),
                 header_written: false,
+                older_header: false,
                 appended_since_compaction: 0,
                 entries: HashMap::new(),
                 cached: VecDeque::new(),
@@ -777,6 +782,14 @@ impl CallRecords {
     /// call replied; it becomes `unknown`. Records past retention are dropped.
     /// If anything changed the file is rewritten at once, so the reconciled
     /// state is what the next start reads too.
+    ///
+    /// A file from an older build is the exception: it is left exactly as it
+    /// is until this build writes a record. Any rewrite here would be in the
+    /// current format and raise its format floor, and a raised floor stops the
+    /// older build from being placed again, so merely starting this build
+    /// must not raise it. Leaving the file costs nothing: a reconciled record
+    /// is reconciled again on the next start, and one past retention is
+    /// dropped again.
     pub fn open(storage: Box<dyn CallRecordStorage>, now_ms: u64) -> Self {
         let loaded = storage.load().and_then(|bytes| match bytes {
             None => Ok(None),
@@ -794,6 +807,7 @@ impl CallRecords {
         let mut inner = Inner {
             broken: None,
             header_written: existed,
+            older_header: outdated,
             appended_since_compaction: 0,
             entries: HashMap::new(),
             cached: VecDeque::new(),
@@ -826,11 +840,8 @@ impl CallRecords {
         {
             let mut inner = records.lock();
             let dropped = Self::apply_retention(&mut inner, now_ms);
-            // An older file is rewritten under the current header before
-            // anything is appended to it: a newer record under an older header
-            // would read as corruption to the build that wrote the header,
-            // where the format floor tells that build to stop by name.
-            if existed && (outdated || reconciled || dropped || line_count != inner.entries.len()) {
+            if existed && !outdated && (reconciled || dropped || line_count != inner.entries.len())
+            {
                 if let Err(error) = records.compact(&mut inner) {
                     inner.broken = Some(error);
                 }
@@ -890,6 +901,7 @@ impl CallRecords {
         }
         self.storage.replace(&bytes)?;
         inner.header_written = true;
+        inner.older_header = false;
         inner.appended_since_compaction = 0;
         Ok(())
     }
@@ -906,6 +918,14 @@ impl CallRecords {
             self.storage.replace(&bytes)?;
             inner.header_written = true;
             return Ok(());
+        }
+        // The first record this build writes into an older build's file: the
+        // whole file is rewritten under the current header first, since a
+        // record that may carry newer members under an older header would read
+        // as corruption to the build that wrote the header, where the format
+        // floor (raised by this write) tells that build to stop by name.
+        if inner.older_header {
+            self.compact(inner)?;
         }
         self.storage.append(&line(record)?)?;
         inner.appended_since_compaction += 1;
@@ -1298,37 +1318,121 @@ mod tests {
         );
     }
 
-    /// A file the previous build wrote (version 1, records without `origin`)
-    /// still reads, and is rewritten under the current header before this
-    /// build appends a record that may carry an origin.
-    #[test]
-    fn a_version_1_file_still_reads_and_is_rewritten_under_the_current_header() {
-        const V1: &str = concat!(
-            "{\"format\":\"call-records\",\"version\":1}\n",
-            "{\"principal\":\"reserved:prefrontal-core\",\"call_key\":\"pf:v1\",",
-            "\"scope\":null,\"state\":\"replied\",\"outcome\":\"ok\",",
-            "\"refusal_reason\":null,\"effect_status\":null,\"posts_returned\":null,",
-            "\"started_at_ms\":10,\"settled_at_ms\":20}\n",
-        );
-        let storage = InMemoryCallRecordStorage::new();
-        storage.replace(V1.as_bytes()).unwrap();
-        let records = CallRecords::open(Box::new(storage.clone()), 30);
+    /// A version 1 file as the previous build wrote it: one settled call and
+    /// one a crash left `started`, which opening reconciles.
+    const V1_FILE: &str = concat!(
+        "{\"format\":\"call-records\",\"version\":1}\n",
+        "{\"principal\":\"reserved:prefrontal-core\",\"call_key\":\"pf:v1\",",
+        "\"scope\":null,\"state\":\"replied\",\"outcome\":\"ok\",",
+        "\"refusal_reason\":null,\"effect_status\":null,\"posts_returned\":null,",
+        "\"started_at_ms\":10,\"settled_at_ms\":20}\n",
+        "{\"principal\":\"reserved:prefrontal-core\",\"call_key\":\"pf:v1-started\",",
+        "\"scope\":null,\"state\":\"started\",\"outcome\":null,",
+        "\"refusal_reason\":null,\"effect_status\":null,\"posts_returned\":null,",
+        "\"started_at_ms\":15,\"settled_at_ms\":null}\n",
+    );
 
+    /// A v1 file on disk with its own format floor, in a fresh directory.
+    fn v1_on_disk(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-call-records-{name}-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CALL_RECORD_FILE);
+        fs::write(&path, V1_FILE).unwrap();
+        let floor = directory.join("floor.json");
+        (directory, path, floor)
+    }
+
+    fn open_on_disk(path: &Path, floor: &Path, now_ms: u64) -> CallRecords {
+        CallRecords::open(
+            Box::new(
+                FilesystemCallRecordStorage::new(path)
+                    .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(floor)),
+            ),
+            now_ms,
+        )
+    }
+
+    /// Starting this build over a version 1 file, and answering from it,
+    /// writes nothing: the file keeps its bytes and the call-records floor is
+    /// not raised, so the previous build can still be placed again.
+    #[test]
+    fn a_version_1_file_is_read_as_it_stands_while_no_call_is_recorded() {
+        let (directory, path, floor) = v1_on_disk("v1-no-call");
+        let records = open_on_disk(&path, &floor, 30);
+
+        // Both records are read, the started one reconciled in memory.
         assert!(matches!(
             records.begin("reserved:prefrontal-core", "pf:v1", "c", 40),
             Begin::NotRetained { outcome } if outcome.as_deref() == Some("ok")
         ));
-        let rewritten = String::from_utf8(storage.contents().unwrap()).unwrap();
-        let mut lines = rewritten.lines();
+        assert!(matches!(
+            records.begin("reserved:prefrontal-core", "pf:v1-started", "c", 40),
+            Begin::OutcomeUnknown
+        ));
+        drop(records);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), V1_FILE);
+        assert!(
+            !floor.exists(),
+            "opening raised the floor: {}",
+            fs::read_to_string(&floor).unwrap_or_default()
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The first record this build writes moves a version 1 file to version
+    /// 2: rewritten under the current header with every earlier record, then
+    /// the new one, and the floor raised to 2 before the write.
+    #[test]
+    fn the_first_recorded_call_moves_a_version_1_file_to_version_2() {
+        let (directory, path, floor) = v1_on_disk("v1-one-call");
+        let records = open_on_disk(&path, &floor, 30);
+        let _ticket = executed(records.begin_attributed(
+            "reserved:prefrontal-core",
+            "pf:v2",
+            "c",
+            None,
+            CallOriginRecord::OriginInvalid,
+            40,
+        ));
+        drop(records);
+
+        let written = fs::read_to_string(&path).unwrap();
+        let mut lines = written.lines();
         assert_eq!(
             lines.next(),
             Some("{\"format\":\"call-records\",\"version\":2}"),
-            "{rewritten}"
+            "{written}"
         );
-        let record: CallRecord = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(record.call_key, "pf:v1");
-        assert_eq!(record.origin, CallOriginRecord::Absent);
-        assert!(!rewritten.contains("origin"), "{rewritten}");
+        let records: Vec<CallRecord> = lines
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let state_of = |key: &str| {
+            records
+                .iter()
+                .rev()
+                .find(|record| record.call_key == key)
+                .map(|record| (record.state, record.origin.clone()))
+        };
+        assert_eq!(
+            state_of("pf:v1"),
+            Some((CallState::Replied, CallOriginRecord::Absent))
+        );
+        assert_eq!(
+            state_of("pf:v1-started"),
+            Some((CallState::Unknown, CallOriginRecord::Absent))
+        );
+        assert_eq!(
+            state_of("pf:v2"),
+            Some((CallState::Started, CallOriginRecord::OriginInvalid))
+        );
+        let floors = cerebellum_core::format_floor::read_floors(&floor).unwrap();
+        assert_eq!(floors.get("call-records"), Some(&2));
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

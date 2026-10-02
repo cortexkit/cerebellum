@@ -1231,6 +1231,73 @@ fn a_journal_holding_retired_click_and_screenshot_entries_reconciles_at_startup(
     );
 }
 
+/// Opening a journal the previous build wrote, with nothing for startup
+/// reconciliation to settle, writes nothing: the file keeps its bytes (schema
+/// 2, v1 entries) and no floor is raised, so the previous build can still be
+/// placed. The first entry this build writes moves the file to schema 3 and
+/// raises both floors before it does.
+#[test]
+fn a_settled_older_journal_is_left_as_it_stands_until_this_build_writes_an_entry() {
+    use cerebellum_core::format_floor::{read_floors, FormatFloor};
+
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/v12_computer_journal.json")).unwrap();
+    // Only the two settled entries: the orphaned reservations would be
+    // settled, and so written, at startup.
+    fixture["state"]["reservations"] = json!({});
+    assert_eq!(fixture["schema_version"], 2);
+    let older = serde_json::to_vec_pretty(&fixture).unwrap();
+    let directory = std::env::temp_dir().join(format!(
+        "cerebellum-older-computer-journal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("computer.json");
+    let floor = directory.join("format-floor.json");
+    std::fs::write(&path, &older).unwrap();
+    let custody = CaptureCustody::new(
+        bounds(),
+        InMemoryGrantAuthority::default(),
+        InMemoryCustodyStorage::new(),
+    )
+    .unwrap();
+    let mut audit = ComputerAudit::new(
+        ExcludeApplicationText,
+        cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+        JournalConfig {
+            journal_retention_bytes: 8 * 1024 * 1024,
+            journal_max_entry_bytes: 64 * 1024,
+        },
+        cerebellum_core::journal::FilesystemJournalStorage::new(path.clone())
+            .with_format_floor(FormatFloor::at(&floor)),
+        custody,
+    )
+    .expect("an older journal binds");
+    audit
+        .startup_reconcile(10)
+        .expect("nothing to settle at startup");
+    let after_start = std::fs::read(&path).unwrap();
+    let floor_after_start = floor.exists();
+
+    let descriptor = actuation_descriptor();
+    audit.reserve(identity(), descriptor).unwrap();
+    let after_write: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let floors = read_floors(&floor);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    assert_eq!(after_start, older, "starting rewrote the older journal");
+    assert!(!floor_after_start, "starting raised a format floor");
+    assert_eq!(after_write["schema_version"], 3);
+    let floors = floors.expect("the first write raised the floors");
+    assert_eq!(floors.get("audit-journal"), Some(&3), "{floors:?}");
+    assert_eq!(floors.get("computer-journal-entry"), Some(&3), "{floors:?}");
+}
+
 #[test]
 fn old_journal_fixture_reads_and_route_summary_round_trips_in_the_current_version() {
     use cerebellum_computer::audit::{ActuationOutcome, RecordedActuationOutcome};
