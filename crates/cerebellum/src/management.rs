@@ -1870,6 +1870,126 @@ fn new_launch_recovery_clear_ask_id(incarnation: &str) -> String {
     )
 }
 
+/// Browser grants expire with a conversation and cannot cover long-lived
+/// automation. Without a durable site grant, installation must report that a
+/// permission prompt would be needed. A per-agent site grant store can replace
+/// this function without changing the evaluator.
+fn browser_standing_grant_answer(
+    _agent: &str,
+    _origin: &str,
+    _level: Option<u64>,
+) -> (&'static str, &'static str) {
+    ("would_ask", "browser_standing_grants_unavailable")
+}
+
+pub(crate) struct WouldAskItem {
+    tool: String,
+    target: Value,
+    level: Option<u64>,
+}
+pub(crate) struct WouldAskRequest {
+    pub agent_id: String,
+    pub flow_id: String,
+    items: Vec<WouldAskItem>,
+}
+pub(crate) struct WouldAskRequestError {
+    pub field: String,
+    pub reason: &'static str,
+}
+
+pub(crate) fn parse_would_ask(
+    params: &serde_json::Map<String, Value>,
+) -> Result<WouldAskRequest, WouldAskRequestError> {
+    let error = |field: &str, reason| WouldAskRequestError {
+        field: field.to_string(),
+        reason,
+    };
+    if let Some(field) = params
+        .keys()
+        .filter(|k| !matches!(k.as_str(), "agent_id" | "flow_id" | "items"))
+        .min()
+    {
+        return Err(error(field, "unknown_field"));
+    }
+    let agent_id = params
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error("agent_id", "missing_field"))?
+        .to_string();
+    let flow_id = params
+        .get("flow_id")
+        .and_then(Value::as_str)
+        .filter(|s| (1..=256).contains(&s.len()) && s.bytes().all(|b| (33..=126).contains(&b)))
+        .ok_or_else(|| error("flow_id", "invalid_value"))?
+        .to_string();
+    let items = params
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("items", "wrong_type"))?;
+    if !(1..=64).contains(&items.len()) {
+        return Err(error("items", "out_of_range"));
+    }
+    let mut parsed = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let prefix = format!("items[{index}]");
+        let item = item
+            .as_object()
+            .ok_or_else(|| error(&prefix, "wrong_type"))?;
+        if let Some(field) = item
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "tool" | "target" | "level"))
+            .min()
+        {
+            return Err(error(&format!("{prefix}.{field}"), "unknown_field"));
+        }
+        let tool = item
+            .get("tool")
+            .and_then(Value::as_str)
+            .filter(|t| matches!(*t, "browser_use" | "computer_use"))
+            .ok_or_else(|| error(&format!("{prefix}.tool"), "invalid_value"))?;
+        let target = item
+            .get("target")
+            .ok_or_else(|| error(&format!("{prefix}.target"), "missing_field"))?;
+        if !target.is_string() && !(tool == "browser_use" && target.is_null()) {
+            return Err(error(&format!("{prefix}.target"), "wrong_type"));
+        }
+        let level = match item.get("level") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|v| (1..=4).contains(v))
+                    .ok_or_else(|| error(&format!("{prefix}.level"), "out_of_range"))?,
+            ),
+        };
+        parsed.push(WouldAskItem {
+            tool: tool.to_string(),
+            target: target.clone(),
+            level,
+        });
+    }
+    Ok(WouldAskRequest {
+        agent_id,
+        flow_id,
+        items: parsed,
+    })
+}
+
+pub(crate) fn would_ask_result_schema() -> Value {
+    json!({"type":"object","required":["items"],"additionalProperties":false,"properties":{
+        "items":{"type":"array","items":{
+            "type":"object","required":["tool","target","verdict","reason"],"additionalProperties":false,
+            "properties":{
+                "tool":{"type":"string","enum":["browser_use","computer_use"]},
+                "target":{"type":"string"},
+                "verdict":{"type":"string","enum":["yes","no","would_ask"]},
+                "reason":{"type":"string","enum":["standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target"]}
+            }
+        }}
+    }})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2244,123 +2364,4 @@ mod tests {
         assert_eq!(held.unwrap().body["params"]["urgency"], "high");
         assert_eq!(ahead.unwrap().body["params"]["urgency"], "normal");
     }
-}
-
-/// Browser grants currently expire with a conversation and cannot cover a
-/// flow installation. A per-agent site store can replace this function without
-/// changing the evaluator; until then every valid origin would need a card.
-fn browser_standing_grant_answer(
-    _agent: &str,
-    _origin: &str,
-    _level: Option<u64>,
-) -> (&'static str, &'static str) {
-    ("would_ask", "browser_standing_grants_unavailable")
-}
-
-pub(crate) struct WouldAskItem {
-    tool: String,
-    target: Value,
-    level: Option<u64>,
-}
-pub(crate) struct WouldAskRequest {
-    pub agent_id: String,
-    pub flow_id: String,
-    items: Vec<WouldAskItem>,
-}
-pub(crate) struct WouldAskRequestError {
-    pub field: String,
-    pub reason: &'static str,
-}
-
-pub(crate) fn parse_would_ask(
-    params: &serde_json::Map<String, Value>,
-) -> Result<WouldAskRequest, WouldAskRequestError> {
-    let error = |field: &str, reason| WouldAskRequestError {
-        field: field.to_string(),
-        reason,
-    };
-    if let Some(field) = params
-        .keys()
-        .filter(|k| !matches!(k.as_str(), "agent_id" | "flow_id" | "items"))
-        .min()
-    {
-        return Err(error(field, "unknown_field"));
-    }
-    let agent_id = params
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| error("agent_id", "missing_field"))?
-        .to_string();
-    let flow_id = params
-        .get("flow_id")
-        .and_then(Value::as_str)
-        .filter(|s| (1..=256).contains(&s.len()) && s.bytes().all(|b| (33..=126).contains(&b)))
-        .ok_or_else(|| error("flow_id", "invalid_value"))?
-        .to_string();
-    let items = params
-        .get("items")
-        .and_then(Value::as_array)
-        .ok_or_else(|| error("items", "wrong_type"))?;
-    if !(1..=64).contains(&items.len()) {
-        return Err(error("items", "out_of_range"));
-    }
-    let mut parsed = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        let prefix = format!("items[{index}]");
-        let item = item
-            .as_object()
-            .ok_or_else(|| error(&prefix, "wrong_type"))?;
-        if let Some(field) = item
-            .keys()
-            .filter(|k| !matches!(k.as_str(), "tool" | "target" | "level"))
-            .min()
-        {
-            return Err(error(&format!("{prefix}.{field}"), "unknown_field"));
-        }
-        let tool = item
-            .get("tool")
-            .and_then(Value::as_str)
-            .filter(|t| matches!(*t, "browser_use" | "computer_use"))
-            .ok_or_else(|| error(&format!("{prefix}.tool"), "invalid_value"))?;
-        let target = item
-            .get("target")
-            .ok_or_else(|| error(&format!("{prefix}.target"), "missing_field"))?;
-        if !target.is_string() && !(tool == "browser_use" && target.is_null()) {
-            return Err(error(&format!("{prefix}.target"), "wrong_type"));
-        }
-        let level = match item.get("level") {
-            None => None,
-            Some(value) => Some(
-                value
-                    .as_u64()
-                    .filter(|v| (1..=4).contains(v))
-                    .ok_or_else(|| error(&format!("{prefix}.level"), "out_of_range"))?,
-            ),
-        };
-        parsed.push(WouldAskItem {
-            tool: tool.to_string(),
-            target: target.clone(),
-            level,
-        });
-    }
-    Ok(WouldAskRequest {
-        agent_id,
-        flow_id,
-        items: parsed,
-    })
-}
-
-pub(crate) fn would_ask_result_schema() -> Value {
-    json!({"type":"object","required":["items"],"additionalProperties":false,"properties":{
-        "items":{"type":"array","items":{
-            "type":"object","required":["tool","target","verdict","reason"],"additionalProperties":false,
-            "properties":{
-                "tool":{"type":"string","enum":["browser_use","computer_use"]},
-                "target":{"type":"string"},
-                "verdict":{"type":"string","enum":["yes","no","would_ask"]},
-                "reason":{"type":"string","enum":["standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target"]}
-            }
-        }}
-    }})
 }
