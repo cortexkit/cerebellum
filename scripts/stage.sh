@@ -103,7 +103,10 @@ trap 'rm -f "$FORMAT_VERSIONS"' EXIT
 ./scripts/release-build.sh
 
 mkdir -p "$STAGE"
-cp target/release/"$DEPLOYED_NAME" "$STAGE/"
+# Copy from the directory release-build.sh just built into. A CARGO_TARGET_DIR
+# set by the caller (attested builds keep their own) moves that output, and a
+# hard-coded target/release would then pick up an older binary instead.
+cp "${CARGO_TARGET_DIR:-target}/release/$DEPLOYED_NAME" "$STAGE/"
 
 # A release binary must carry no debug-map (STABS) entries. Cargo strips them
 # by running rust-objcopy, and when that step fails it only warns and the build
