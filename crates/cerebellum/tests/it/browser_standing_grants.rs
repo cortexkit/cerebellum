@@ -41,10 +41,8 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
-// The suite's own copy of the probes' relay; only the observing variant is used.
-#[allow(dead_code)]
-#[path = "../../examples/support/consent_relay.rs"]
-mod consent_relay;
+// The probes' consent relay, as the suite's consent_relay module includes it.
+use crate::consent_relay::consent_relay;
 
 /// The machine every store in these tests is bound to.
 const MACHINE: &str = "machine-under-test";
