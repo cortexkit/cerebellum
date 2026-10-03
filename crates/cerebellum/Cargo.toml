@@ -64,7 +64,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # daemon, so this repo's lock moves when it chooses to absorb a release rather
 # than whenever commons publishes one. Its subc-protocol dependency resolves to
 # the sibling copy through the workspace's [patch.crates-io].
-cortexkit-role-tool-provider = "0.4.3"
+cortexkit-role-tool-provider = "0.5.0"
 
 # Examples carry their own tests, and cargo defaults an example target to
 # test = false -- so `cargo test --workspace` builds them and skips their

@@ -370,6 +370,47 @@ async fn browser_status_returns_flat_no_session_result() {
     assert_ne!(body["outcome"], "ok");
 }
 
+#[tokio::test]
+async fn tool_requests_serve_without_preset_and_refuse_named_presets() {
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let health = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
+    for name in ["browser.status", "browser_use"] {
+        for preset in [None, Some(Value::Null), Some(json!("head"))] {
+            let mut request = json!({
+                "name": name,
+                "arguments": if name == "browser_use" { json!({"action":"status"}) } else { json!({}) },
+            });
+            if let Some(value) = &preset {
+                request["preset"] = value.clone();
+            }
+            let frame = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                5,
+                1,
+                99,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            cerebellum::handle_tool_request_for_test(frame, &tx, &health)
+                .await
+                .unwrap();
+            let response = rx.recv().await.unwrap();
+            assert_eq!(response.header.ty, FrameType::Response);
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            if preset == Some(json!("head")) {
+                assert_eq!(body["outcome"], "invalid_request", "{name}: {body}");
+                assert_eq!(body["detail"]["field"], "preset");
+                assert_eq!(body["detail"]["value"], "head");
+                assert_eq!(body["detail"]["reason_code"], "unsupported_value");
+            } else {
+                assert_eq!(body, json!({"outcome":"no_session"}), "{name}");
+            }
+        }
+    }
+}
+
 /// browser.status with an unknown field returns `invalid_request` with the
 /// pinned detail shape (application-level rejection, not a transport Error).
 #[tokio::test]
