@@ -44,6 +44,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cerebellum_core::identity::AcceptedBindFacts;
 use serde_json::{json, Map, Value};
 
+use crate::computer_grants::LoginConsent;
 use crate::elicit::AskOutcome;
 use crate::journal::LoginCapturePayload;
 
@@ -113,8 +114,9 @@ const MAX_ACCOUNT_BYTES: usize = 128;
 
 /// Every outcome the reply may carry. Declared once so the reply schema and
 /// the code that builds replies cannot disagree about the vocabulary.
-pub const OUTCOMES: [&str; 18] = [
+pub const OUTCOMES: [&str; 19] = [
     "captured",
+    "consent_pending",
     "no_login_observed",
     "expired",
     "cancelled",
@@ -146,6 +148,8 @@ pub fn reply_schema() -> Value {
             "credential_id": string(),
             "vault_outcome": {"type": "string", "enum": ["created", "replaced"]},
             "record_version": {"type": "integer"},
+            // Only on `consent_pending`: the consent card still open.
+            "ask_id": string(),
             // Only on the residue, placement and profile-deletion refusals:
             // the capture directory or profile directory they are about.
             "path": string(),
@@ -254,6 +258,20 @@ pub fn parse_request(params: &Map<String, Value>) -> Result<CaptureRequest, Inva
 }
 
 impl CaptureRequest {
+    /// Every request parameter, in one string compared exactly. A consent
+    /// answer that arrives after its call returned is used only by a retry
+    /// that matches it, so an approval for one account, site or URL never
+    /// admits a capture of another.
+    pub fn consent_parameters(&self) -> String {
+        json!([
+            self.credential_domain,
+            self.account,
+            self.fetch_url,
+            self.login_url
+        ])
+        .to_string()
+    }
+
     /// The vault id the capture is deposited under.
     pub fn credential_id(&self) -> String {
         format!("cookie:{}:{}", self.credential_domain, self.account)
@@ -902,7 +920,10 @@ pub struct CaptureModule {
 pub struct CaptureCall<'a, Ask, Cancelled> {
     pub accepted: &'a AcceptedBindFacts,
     pub declares_elicitation: bool,
-    /// Put one question to the person. The deadline is the ask's own.
+    /// Put one question to the person. The deadline is the ask's own. The
+    /// answer is either how the question ended or, from the module's consent
+    /// registry, that the person has not answered yet (see
+    /// [`crate::computer_grants::ComputerGrants::require_login`]).
     pub ask: Ask,
     /// Whether the caller cancelled the request, its route went away, or the
     /// module began draining.
@@ -1033,14 +1054,15 @@ impl CaptureModule {
     /// Run one capture to its end. The throwaway profile is deleted before
     /// the login is deposited and before this returns, so the session exists
     /// in one place, the vault, by the time a caller hears back.
-    pub async fn run<Ask, AskFuture, Cancelled>(
+    pub async fn run<Ask, AskFuture, Answer, Cancelled>(
         &self,
         request: &CaptureRequest,
         call: CaptureCall<'_, Ask, Cancelled>,
     ) -> CaptureOutcome
     where
         Ask: FnOnce(Value, Duration) -> AskFuture,
-        AskFuture: Future<Output = AskOutcome>,
+        AskFuture: Future<Output = Answer>,
+        Answer: Into<LoginConsent>,
         Cancelled: Fn() -> bool,
     {
         let record = Record::new(request);
@@ -1115,9 +1137,10 @@ impl CaptureModule {
         }
         let question = consent_question(request, &new_card_request_id());
         // The question can wait minutes for a person, so a cancel is watched
-        // for alongside it rather than only after it ends.
+        // for alongside it rather than only after it ends. Stopping the wait
+        // leaves the card itself open.
         let answer = {
-            let asked = (call.ask)(question, crate::login_import::ELICITATION_DEADLINE);
+            let asked = (call.ask)(question, crate::consent_card::LOGIN_CARD_LIFETIME);
             tokio::pin!(asked);
             let check = self.env.poll_interval.min(CANCEL_CHECK_INTERVAL);
             loop {
@@ -1133,6 +1156,21 @@ impl CaptureModule {
         };
         let Some(answer) = answer else {
             return record.ended("cancelled", None);
+        };
+        let answer = match answer.into() {
+            LoginConsent::Ended(answer) => answer,
+            // Nothing was launched: the capture runs only on a call made
+            // while the person is at hand, so a later approval is kept for
+            // the retry rather than acted on.
+            LoginConsent::Pending { ask_id } => {
+                return record.refused(
+                    "consent_pending",
+                    json!({
+                        "ask_id": ask_id,
+                        "remedy": crate::computer_grants::LOGIN_CONSENT_PENDING_REMEDY,
+                    }),
+                )
+            }
         };
         if (call.cancelled)() {
             return record.ended("cancelled", None);
@@ -1773,8 +1811,9 @@ fn answered_elicitation_id(answer: &AskOutcome) -> Option<String> {
 }
 
 /// How loudly the capture's consent card notifies. High because `run` holds
-/// the `browser.capture_login` call open on the answer, with no shorter park:
-/// the agent is blocked until the person decides or the question expires.
+/// the `browser.capture_login` call open on the answer for up to
+/// `computer_grants::CONSENT_PARK_LIMIT`: the agent is blocked until the
+/// person decides or that wait ends.
 const CAPTURE_CONSENT_URGENCY: crate::consent_card::Urgency = crate::consent_card::Urgency::High;
 
 /// Built before a browser exists so no captured cookie can enter the question.
@@ -1808,7 +1847,7 @@ pub fn consent_question(request: &CaptureRequest, ask_id: &str) -> Value {
         ],
         grants: vec![ConsentOption::grant(ALLOW_DECISION, "Allow")],
         decline: ConsentOption::decline(DENY_DECISION, "Don't allow"),
-        expires_in: crate::login_import::ELICITATION_DEADLINE,
+        expires_in: crate::consent_card::LOGIN_CARD_LIFETIME,
         material_damage: true,
         urgency: CAPTURE_CONSENT_URGENCY,
         // The two parts of the vault id the captured login is stored under

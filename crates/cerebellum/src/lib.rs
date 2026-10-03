@@ -1415,6 +1415,31 @@ impl computer_grants::QuestionCarrier for RouteCarrier {
     }
 }
 
+/// What a login call on this route needs to ask the person and wait: the
+/// route's carrier, and the request's in-flight guard to park while it waits.
+/// Called only once the route was checked to declare elicitation.
+fn login_consent_request(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    writer: &mpsc::Sender<Frame>,
+    (channel, epoch): (u16, u32),
+    capability: computer_grants::LoginCapability,
+    parameters: String,
+) -> computer_grants::LoginConsentRequest {
+    computer_grants::LoginConsentRequest {
+        conversation_key: facts.identity.conversation_key.clone(),
+        capability,
+        parameters,
+        carrier: Arc::new(RouteCarrier {
+            elicitor: Arc::clone(&planes.elicitor),
+            writer: writer.clone(),
+            channel,
+            epoch,
+        }),
+        park_guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
+    }
+}
+
 /// Everything a computer call on this route needs to ask for a grant and wait.
 ///
 /// The identity is the route's accepted bind, never the request body. The
@@ -3801,11 +3826,32 @@ async fn complete_login_import(
     plan: login_import::LoginImportPlan,
     cancel: Option<CancelHandle>,
 ) -> Value {
-    let ask_id = login_import::new_ask_id();
-    let question = plan.question(&ask_id, &facts.identity.agent_project_id);
+    let consent = planes.management.computer_grants().require_login(
+        login_consent_request(
+            planes,
+            facts,
+            writer,
+            (channel, epoch),
+            computer_grants::LoginCapability::ImportLogin,
+            plan.consent_parameters(),
+        ),
+        || {
+            let ask_id = login_import::new_ask_id();
+            let question = plan.question(&ask_id, &facts.identity.agent_project_id);
+            (ask_id, question)
+        },
+    );
     // `None` when the caller cancelled the request before the question ended.
+    // A cancel stops this call's wait; the card stays open, and an answer to
+    // it is remembered for a retry.
     let answer = tokio::select! {
-        answer = planes.elicitor.ask(writer, channel, epoch, question, login_import::ELICITATION_DEADLINE) => Some(answer),
+        consent = consent => match consent {
+            computer_grants::LoginConsent::Ended(answer) => Some(answer),
+            computer_grants::LoginConsent::Pending { ask_id } => {
+                return journal_login_import_result(planes, &facts.identity, plan.pending(ask_id))
+                    .await;
+            }
+        },
         () = async {
             match &cancel {
                 Some(cancel) => cancel.cancelled().await,
@@ -3958,10 +4004,23 @@ async fn capture_browser_login(
             login_capture::CaptureCall {
                 accepted: facts,
                 declares_elicitation: facts.declares_elicitation(),
-                ask: |question, deadline| {
-                    planes
-                        .elicitor
-                        .ask(writer, channel, epoch, question, deadline)
+                // The card is filed through the module's consent registry,
+                // which holds the call for a bounded wait, keeps the card
+                // open past it, and answers a retry from a late answer. The
+                // deadline is the card's lifetime, which the registry owns.
+                ask: |question: Value, _deadline| {
+                    let ask_id = question["id"].as_str().unwrap_or_default().to_string();
+                    planes.management.computer_grants().require_login(
+                        login_consent_request(
+                            planes,
+                            facts,
+                            writer,
+                            (channel, epoch),
+                            computer_grants::LoginCapability::CaptureLogin,
+                            request.consent_parameters(),
+                        ),
+                        move || (ask_id.clone(), question.clone()),
+                    )
                 },
                 cancelled: move || {
                     cancel.as_ref().is_some_and(CancelHandle::is_cancelled)
@@ -7692,9 +7751,11 @@ mod tests {
     }
 
     /// A cancel frame for the request, arriving while the question is open,
-    /// ends the capture with nothing written.
+    /// ends the capture with nothing written. The card stays open: the person
+    /// may still answer it, and that answer is kept for a retry rather than
+    /// acted on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancel_during_consent_ends_the_capture_and_deregisters_its_question() {
+    async fn a_cancel_during_consent_ends_the_capture_and_leaves_its_card_open() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
@@ -7723,18 +7784,19 @@ mod tests {
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "cancelled", "{body}");
-        // The abandoned question is deregistered, so a late answer finds no
-        // entry and is discarded rather than settling a capture that ended.
+        // The card outlives the cancelled call, so an answer to it is still
+        // received; it is remembered, and nothing runs on it.
         assert_eq!(
             planes.elicitor.outstanding(),
-            0,
-            "the cancelled capture left its question registered"
+            1,
+            "the cancelled capture closed its card"
         );
-        assert!(!planes.elicitor.deliver(
+        assert!(planes.elicitor.deliver(
             question.header.channel,
             question.header.corr,
-            json!({"decision": "allow"}),
+            json!({"decision": "allow", "elicitation_id": "el_cancelled"}),
         ));
+        await_remembered(&planes, true).await;
         assert!(fixture.fs.contents().is_empty());
         assert_eq!(
             fixture
@@ -7743,6 +7805,339 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    /// Wait until a late login answer is, or is no longer, remembered. The
+    /// answer is applied on the card's own task, a moment after it arrives.
+    async fn await_remembered(planes: &Planes, expected: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while planes.management.computer_grants().remembers_login_answer() != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the late answer was not applied");
+    }
+
+    /// The next frame, which must be the reply to request `corr` and not a
+    /// new consent card.
+    async fn reply_without_a_card(rx: &mut mpsc::Receiver<Frame>, corr: u64) -> Value {
+        let frame = next_frame(rx).await;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "a card was filed where none was expected: {body}"
+        );
+        assert_eq!(frame.header.corr, corr);
+        body
+    }
+
+    /// The next frame, which must be a new consent card.
+    async fn card(rx: &mut mpsc::Receiver<Frame>) -> (Frame, Value) {
+        let frame = next_frame(rx).await;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Request,
+            "no card was filed: {body}"
+        );
+        (frame, body)
+    }
+
+    /// Send one capture request and run it until it replies
+    /// `consent_pending`, returning the card it filed and the reply.
+    async fn capture_until_pending(
+        planes: &Planes,
+        writer: &mpsc::Sender<Frame>,
+        rx: &mut mpsc::Receiver<Frame>,
+        corr: u64,
+        params: Value,
+    ) -> (Frame, Value) {
+        handle_frame(capture_request_frame(corr, params), writer, planes)
+            .await
+            .unwrap();
+        let (question, _) = card(rx).await;
+        let reply = reply_without_a_card(rx, corr).await;
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        (question, reply)
+    }
+
+    /// Capture planes whose login calls wait a fraction of a second in place
+    /// instead of the production two minutes. The card's own life is
+    /// unchanged.
+    fn short_wait_capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
+        let planes = capture_planes(fixture);
+        planes
+            .management
+            .computer_grants()
+            .set_login_park_limit(Duration::from_millis(300));
+        planes
+    }
+
+    /// The capture card goes out with a thirty-minute life, and asks core
+    /// only to notify the agent when it settles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_capture_card_is_sent_for_thirty_minutes_notify_only() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        handle_frame(
+            capture_request_frame(310, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let (_, asked) = card(&mut writer_rx).await;
+        assert_eq!(asked["params"]["expires_in_ms"], 1_800_000, "{asked}");
+        assert_eq!(asked["params"]["late_execution"], "notify_only", "{asked}");
+    }
+
+    /// Unanswered, the capture call is held for the park and then replies
+    /// `consent_pending` naming the card, which stays registered so a later
+    /// answer is still received. The park is shortened here; production's
+    /// is the two minutes pinned at the end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_capture_replies_consent_pending_after_the_park_and_keeps_its_card() {
+        use login_capture::test_support::fixture;
+
+        let production = capture_planes(&login_capture::test_support::fixture());
+        assert_eq!(
+            production.management.computer_grants().login_park_limit(),
+            Duration::from_secs(120)
+        );
+        let fixture = fixture();
+        let planes = short_wait_capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let started = std::time::Instant::now();
+        handle_frame(
+            capture_request_frame(311, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let (question, asked) = card(&mut writer_rx).await;
+        let reply = next_frame(&mut writer_rx).await;
+        assert_eq!(reply.header.corr, 311);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "consent_pending", "{body}");
+        assert_eq!(body["ask_id"], asked["id"], "{body}");
+        assert_eq!(
+            body["remedy"],
+            computer_grants::LOGIN_CONSENT_PENDING_REMEDY,
+            "{body}"
+        );
+        assert_eq!(
+            planes.elicitor.outstanding(),
+            1,
+            "the card was closed when the call returned"
+        );
+        assert!(fixture.fs.contents().is_empty());
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow", "elicitation_id": "el_late_311"}),
+        ));
+    }
+
+    /// An approval that arrives after the call returned is used by the next
+    /// call with the same parameters, which captures without a second card
+    /// and names the approved card as its consent. A call with other
+    /// parameters does not use it, and once used it is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_capture_approval_is_used_once_by_a_retry_with_the_same_parameters() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = short_wait_capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
+        let (question, _) = capture_until_pending(
+            &planes,
+            &writer_tx,
+            &mut writer_rx,
+            320,
+            ollama_capture_params(),
+        )
+        .await;
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow", "elicitation_id": "el_late_320"}),
+        ));
+        await_remembered(&planes, true).await;
+        assert_eq!(
+            fixture.vault.request_params().len(),
+            0,
+            "ran on a late answer"
+        );
+
+        // Another account: the approval is not for it, so it gets a card of
+        // its own.
+        let mut other = ollama_capture_params();
+        other["account"] = json!("personal");
+        let (other_card, _) =
+            capture_until_pending(&planes, &writer_tx, &mut writer_rx, 321, other).await;
+        assert_ne!(other_card.header.corr, question.header.corr);
+        assert!(planes.management.computer_grants().remembers_login_answer());
+
+        handle_frame(
+            capture_request_frame(322, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let body = reply_without_a_card(&mut writer_rx, 322).await;
+        assert_eq!(body["outcome"], "captured", "{body}");
+        assert_eq!(
+            fixture.vault.request_params()[0]["consent_ref"],
+            "el_late_320"
+        );
+        assert!(!planes.management.computer_grants().remembers_login_answer());
+
+        // Used once: the next call asks again.
+        handle_frame(
+            capture_request_frame(323, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        card(&mut writer_rx).await;
+        assert_eq!(fixture.vault.request_params().len(), 1);
+    }
+
+    /// A refusal that arrives after the call returned refuses the retry
+    /// with the same parameters as declined, without a second card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_capture_refusal_declines_the_retry_without_a_card() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = short_wait_capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
+        let (question, _) = capture_until_pending(
+            &planes,
+            &writer_tx,
+            &mut writer_rx,
+            330,
+            ollama_capture_params(),
+        )
+        .await;
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "deny", "elicitation_id": "el_late_330"}),
+        ));
+        await_remembered(&planes, true).await;
+        handle_frame(
+            capture_request_frame(331, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let body = reply_without_a_card(&mut writer_rx, 331).await;
+        assert_eq!(body["outcome"], "capture_consent_not_given", "{body}");
+        assert_eq!(body["reason"], "deny", "{body}");
+        assert_eq!(
+            fixture
+                .launcher
+                .launches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// A retry while the card is still unanswered waits on that card rather
+    /// than filing a second one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_retry_while_its_card_is_open_rejoins_it() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = short_wait_capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
+        let (question, first) = capture_until_pending(
+            &planes,
+            &writer_tx,
+            &mut writer_rx,
+            340,
+            ollama_capture_params(),
+        )
+        .await;
+        handle_frame(
+            capture_request_frame(341, ollama_capture_params()),
+            &writer_tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let second = reply_without_a_card(&mut writer_rx, 341).await;
+        assert_eq!(second["outcome"], "consent_pending", "{second}");
+        assert_eq!(second["ask_id"], first["ask_id"], "{second}");
+        assert_eq!(planes.elicitor.outstanding(), 1);
+        // The one card still answers the agent's next retry.
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow", "elicitation_id": "el_late_340"}),
+        ));
+        await_remembered(&planes, true).await;
+    }
+
+    /// Revoking the session scope drops an approval that arrived after its
+    /// call returned, so the next call asks again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scope_revocation_drops_a_late_capture_approval() {
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let planes = short_wait_capture_planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
+        let (question, _) = capture_until_pending(
+            &planes,
+            &writer_tx,
+            &mut writer_rx,
+            350,
+            ollama_capture_params(),
+        )
+        .await;
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "allow", "elicitation_id": "el_late_350"}),
+        ));
+        await_remembered(&planes, true).await;
+        let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
+        revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
+        assert!(!planes.management.computer_grants().remembers_login_answer());
+        let (_, pending) = capture_until_pending(
+            &planes,
+            &writer_tx,
+            &mut writer_rx,
+            351,
+            ollama_capture_params(),
+        )
+        .await;
+        assert_eq!(fixture.vault.request_params().len(), 0);
+        // The revocation also closes a card still open, so its answer is
+        // received by nothing.
+        assert_eq!(planes.elicitor.outstanding(), 1, "{pending}");
+        let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
+        revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while planes.elicitor.outstanding() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the open card was not closed");
     }
 
     /// A consumer that answers the question with an error frame (a client with
@@ -7783,7 +8178,8 @@ mod tests {
         .unwrap();
         handle_frame(refusal, &writer_tx, &planes).await.unwrap();
         // `next_frame` gives up after ten seconds; the question's own deadline
-        // is five minutes, so a reply inside that window is the error ending it.
+        // is thirty minutes and the call's wait two, so a reply inside that
+        // window is the error ending it.
         let reply = next_frame(&mut writer_rx).await;
         assert_eq!(reply.header.corr, 304);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -9289,6 +9685,188 @@ mod drain_tests {
         .unwrap());
         assert!(rx.try_recv().is_err());
         assert!(!planes.draining.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+/// The import's consent card, filed from the prepared-plan boundary of
+/// `browser.import_login` (as `drain_tests` does, so no test reads the
+/// operator's own cookie stores). Nothing in the fixture's browsers holds a
+/// copyable login, so the card's one granting option is `hand_off`.
+#[cfg(test)]
+mod login_import_consent_tests {
+    use super::*;
+
+    fn plan(root: &std::path::Path) -> login_import::LoginImportPlan {
+        let executable = root.join("browser");
+        let login_import::PreparedImport::Ready(plan) = login_import::prepare_import(
+            "https://example.com",
+            "project",
+            &executable,
+            login_import::DurableProfileLocation {
+                managed_root: root.to_path_buf(),
+                profile_directory: root.join("profile"),
+            },
+            login_import::ImportSettings::for_test(
+                root.join("sqlite"),
+                root.join("data"),
+                root.join("cookies"),
+                vec![login_import::BrowserSource {
+                    id: "chrome",
+                    display_name: "Chrome",
+                    data_directory: "chrome".into(),
+                    executable: executable.clone(),
+                }],
+            ),
+        ) else {
+            panic!("prepared import")
+        };
+        plan
+    }
+
+    fn root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "login-import-consent-{}",
+            login_import::new_ask_id()
+        ));
+        assert!(!root.exists());
+        root
+    }
+
+    fn short_wait_planes() -> Planes {
+        let planes = super::tests::management_bound_planes(1, 1);
+        planes
+            .management
+            .computer_grants()
+            .set_login_park_limit(Duration::from_millis(300));
+        planes
+    }
+
+    /// Run one import until it replies, returning the card it filed (if any)
+    /// and the reply.
+    async fn import(
+        planes: &Planes,
+        root: &std::path::Path,
+        rx: &mut mpsc::Receiver<Frame>,
+        writer: &mpsc::Sender<Frame>,
+    ) -> (Option<Frame>, Value) {
+        let facts = planes.routes.get(1, 1).unwrap();
+        let running = {
+            let planes = planes.clone();
+            let writer = writer.clone();
+            let plan = plan(root);
+            tokio::spawn(async move {
+                complete_login_import(&planes, &facts, &writer, 1, 1, plan, None).await
+            })
+        };
+        let reply = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("the import replies")
+            .unwrap();
+        (rx.try_recv().ok(), reply)
+    }
+
+    async fn await_remembered(planes: &Planes) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !planes.management.computer_grants().remembers_login_answer() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the late answer was not applied");
+    }
+
+    #[tokio::test]
+    async fn the_import_card_is_sent_for_thirty_minutes_notify_only() {
+        let planes = short_wait_planes();
+        let root = root();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (question, reply) = import(&planes, &root, &mut rx, &tx).await;
+        let question = question.expect("a card was filed");
+        let asked: Value = serde_json::from_slice(&question.body).unwrap();
+        assert_eq!(asked["params"]["expires_in_ms"], 1_800_000, "{asked}");
+        assert_eq!(asked["params"]["late_execution"], "notify_only", "{asked}");
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        assert_eq!(reply["ask_id"], asked["id"], "{reply}");
+        assert_eq!(
+            reply["remedy"],
+            computer_grants::LOGIN_CONSENT_PENDING_REMEDY,
+            "{reply}"
+        );
+        assert_eq!(planes.elicitor.outstanding(), 1);
+    }
+
+    /// A granting answer that arrives after the call returned is used by the
+    /// retry with the same origin, with no second card, and only once.
+    #[tokio::test]
+    async fn a_late_import_approval_is_used_once_by_the_retry() {
+        let planes = short_wait_planes();
+        let root = root();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (question, reply) = import(&planes, &root, &mut rx, &tx).await;
+        let question = question.expect("a card was filed");
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "hand_off", "elicitation_id": "el_import"}),
+        ));
+        await_remembered(&planes).await;
+        let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
+        assert!(card.is_none(), "a second card was filed");
+        assert_eq!(reply["outcome"], "hand_off", "{reply}");
+        let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
+        assert!(card.is_some(), "the approval was used twice");
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+    }
+
+    /// A refusal that arrives after the call returned refuses the retry as
+    /// denied, with no second card.
+    #[tokio::test]
+    async fn a_late_import_refusal_denies_the_retry() {
+        let planes = short_wait_planes();
+        let root = root();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (question, _) = import(&planes, &root, &mut rx, &tx).await;
+        let question = question.expect("a card was filed");
+        assert!(planes.elicitor.deliver(
+            question.header.channel,
+            question.header.corr,
+            json!({"decision": "deny", "elicitation_id": "el_import"}),
+        ));
+        await_remembered(&planes).await;
+        let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
+        assert!(card.is_none(), "a second card was filed");
+        assert_eq!(reply["outcome"], "denied", "{reply}");
+    }
+
+    /// A question nobody was shown still ends the import at once, as itself.
+    #[tokio::test]
+    async fn a_card_nobody_was_shown_ends_the_import_at_once() {
+        let planes = super::tests::management_bound_planes(1, 1);
+        let root = root();
+        let (tx, mut rx) = mpsc::channel(8);
+        let facts = planes.routes.get(1, 1).unwrap();
+        let running = {
+            let planes = planes.clone();
+            let writer = tx.clone();
+            let plan = plan(&root);
+            tokio::spawn(async move {
+                complete_login_import(&planes, &facts, &writer, 1, 1, plan, None).await
+            })
+        };
+        let question = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(planes
+            .elicitor
+            .refuse(question.header.channel, question.header.corr));
+        let reply = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("refused at once, not held for the park")
+            .unwrap();
+        assert_eq!(reply["outcome"], "not_put_to_anyone", "{reply}");
+        assert!(!planes.management.computer_grants().remembers_login_answer());
     }
 }
 
