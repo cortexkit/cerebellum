@@ -227,7 +227,9 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
             "modules": {
                 CEREBELLUM: {
                     "program": "/bin/sh",
-                    "args": ["-c", "printf %s \"$SUBC_LAUNCH_NONCE\" > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
+                    // The daemon passes the nonce only on a pipe at descriptor 3
+                    // (named by SUBC_LAUNCH_NONCE_FD), never in the environment.
+                    "args": ["-c", "cat <&3 > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
                     "env": {
                         "HOME": home,
                         "NONCE_OUT": nonce_file,
