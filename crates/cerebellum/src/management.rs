@@ -444,7 +444,8 @@ pub enum BrowserGrantChoice {
 }
 
 impl BrowserGrantChoice {
-    /// The option id on the card, as agreed with the phone app and core.
+    /// The option id on the card. The phone app renders these ids and
+    /// Prefrontal core decodes them, so they must not change.
     pub const fn option_id(self) -> &'static str {
         match self {
             Self::Conversation => "allow_conversation",
@@ -941,6 +942,7 @@ impl ManagementPlane {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_browser_grant_with_urgency(
         &self,
         conversation_key: &str,

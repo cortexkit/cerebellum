@@ -2604,12 +2604,12 @@ impl Planes {
         )
     }
 
-    /// [`Self::with_browser_config_journaling`] holding standing browser
-    /// grants in `standing` rather than in the store `journal` selects: the
-    /// operator's file for a durable plane, memory that never offers a
-    /// standing answer for an isolated one. For tests that need standing
-    /// answers offered, a store reopened across a restart, or a clock they
-    /// move.
+    /// Like [`Self::with_browser_config_journaling`], but keeps standing
+    /// browser grants in `standing` when it is given. Without it, `journal`
+    /// chooses: the operator's file for a durable plane, or memory that never
+    /// offers a standing answer for an isolated one. Tests pass a store to
+    /// have standing answers offered, to reopen a store across a restart, or
+    /// to control the store's clock.
     pub fn with_browser_config_journaling_and_standing_grants(
         health: Arc<HealthState>,
         browser_config: Option<BrowserConfig>,

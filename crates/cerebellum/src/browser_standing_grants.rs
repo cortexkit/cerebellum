@@ -455,8 +455,8 @@ impl StandingGrantStorage for FilesystemStandingGrantStorage {
     }
 }
 
-/// The wall clock standing rows are stamped and expired by, in milliseconds
-/// since the Unix epoch.
+/// The clock that stamps standing rows and decides when they expire, read as
+/// wall-clock milliseconds since the Unix epoch.
 ///
 /// A wall clock rather than the module's monotonic lease clock because a row
 /// outlives the process: the lease clock's epoch is the module's start, so an
@@ -505,7 +505,8 @@ pub enum RevokeTarget {
     Everything,
     /// The agent's row for one origin.
     Origin(String),
-    /// The agent's all-sites rows, the ten-minute one and the lasting one.
+    /// The agent's all-sites rows: both the ten-minute row and the one that
+    /// lasts until revoked.
     AllSites,
 }
 

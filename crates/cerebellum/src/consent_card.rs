@@ -768,14 +768,18 @@ mod every_card_kind {
                 .chain(["deny"])
                 .collect::<Vec<_>>()
         };
-        let cases: [(
-            &str,
-            &Vec<String>,
-            &BTreeSet<HazardClass>,
+        /// The vector's file, the card's origins and hazards, the ceiling
+        /// the request needs, whether the session may be offered standing
+        /// answers, and the option ids the card must carry.
+        type Case<'a> = (
+            &'a str,
+            &'a Vec<String>,
+            &'a BTreeSet<HazardClass>,
             Severity,
             bool,
-            &[&str],
-        ); 5] = [
+            &'a [&'a str],
+        );
+        let cases: [Case<'_>; 5] = [
             (
                 "all-options.json",
                 &public,

@@ -1,8 +1,8 @@
 # Browser site-access card vectors
 
 The `params` of the `elicitation/create` request cerebellum sends for the
-browser site-access consent card, one file per option set the card can offer,
-exactly as sent (the `expires_in_ms` is the one `Elicitor::ask` stamps).
+browser site-access consent card, one file for each set of options the card
+can present, exactly as sent (the `expires_in_ms` is the one `Elicitor::ask` stamps).
 
 | File | Options offered | Case |
 |---|---|---|
@@ -14,7 +14,8 @@ exactly as sent (the `expires_in_ms` is the one `Elicitor::ask` stamps).
 
 Each option is `{id, label, effect, detail?}`; no option carries a level or a
 duration. The card-wide `duration` is left unset. What each granting option
-grants is recorded by cerebellum against its id when the card is filed.
+grants is recorded by cerebellum against its id when the card is sent, and an
+answer is mapped back through that record, never through the id's spelling.
 
 `SHA256SUMS` pins each file. The test
 `consent_card::every_card_kind::browser_site_access_card_vectors_are_pinned_and_decode_in_core`
