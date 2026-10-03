@@ -1126,6 +1126,38 @@ impl ComputerGrants {
             && identity.is_some_and(AppIdentity::names_a_lasting_signer)
     }
 
+    /// Read only the durable app grants, without inspecting a running process.
+    pub(crate) fn has_standing_app_grant(&self, agent_project_id: &str, bundle: &str) -> bool {
+        let Some(machine) = self.machine_uuid.as_deref() else {
+            return false;
+        };
+        match &*lock(&self.always) {
+            AlwaysState::Loaded(records) => records.iter().any(|record| {
+                record.agent_project_id == agent_project_id
+                    && record.bundle_identity == bundle
+                    && record.machine_uuid == machine
+                    && record
+                        .designated_requirement
+                        .as_deref()
+                        .is_some_and(|r| !r.is_empty())
+            }),
+            AlwaysState::Failed(_) => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_conversation_app_for_test(&self, conversation: &str, bundle: &str) {
+        lock(&self.state).conversation_apps.insert(
+            (conversation.to_string(), bundle.to_string()),
+            AppIdentity {
+                team_id: Some("TESTTEAM".to_string()),
+                designated_requirement: "test requirement".to_string(),
+                apple_anchored: false,
+                ad_hoc: false,
+            },
+        );
+    }
+
     /// The designated requirement of each "always" record on this machine for
     /// the caller's app, or `None` for a record that names none.
     fn always_requirements(

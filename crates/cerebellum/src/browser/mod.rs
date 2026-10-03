@@ -1496,6 +1496,37 @@ impl BrowserPlane {
         .await
     }
 
+    /// Record only aggregate permission answers, never targets or screen text.
+    pub(crate) async fn journal_would_ask(
+        &self,
+        identity: &RouteIdentity,
+        principal: String,
+        agent_id: &str,
+        flow_id: &str,
+        counts: Value,
+    ) -> Result<(), JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        journal
+            .store
+            .as_mut()
+            .expect("an enabled journal opens a store")
+            .commit_would_ask(
+                JournalIdentity {
+                    principal,
+                    ..journal_identity(identity)
+                },
+                agent_id,
+                flow_id,
+                counts,
+            )
+    }
+
     /// Record one login-import decision without cookie names or values.
     pub async fn journal_login_import(
         &self,
@@ -4096,6 +4127,12 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             description: "Import an existing login with consent, reopening an idle browser session.",
             request_schema: json!({"type":"object","properties":{"origin":{"type":"string"}},"required":["origin"],"additionalProperties":false}),
             result_schema: crate::login_import::reply_schema(browser_launch_result_schema()),
+        },
+        BrowserToolDefinition {
+            name: crate::management::WOULD_ASK,
+            description: "Check standing per-agent grants without elicitation.",
+            request_schema: json!({"type":"object"}),
+            result_schema: crate::management::would_ask_result_schema(),
         },
         BrowserToolDefinition {
             name: crate::management::CAPTURE_LOGIN,
