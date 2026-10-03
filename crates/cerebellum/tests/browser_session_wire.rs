@@ -5368,6 +5368,62 @@ fn with_readable_call_records(
     storage
 }
 
+#[tokio::test]
+async fn flow_id_scope_stamp_decodes_and_binds_without_changing_service() {
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    for (channel, flow_id) in [(10, None), (11, Some("flow-1".to_owned()))] {
+        let mut scope = scope_stamp(1, true);
+        scope.attributes.flow_id = flow_id;
+        bind_route(&planes, channel, reserved("prefrontal-core"), Some(scope)).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let reply = exchange(
+            &planes,
+            &tx,
+            &mut rx,
+            keyed_on(channel, 801, "browser.status", json!({}), "pf:flow-status"),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "no_session", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn named_preset_refusal_records_refused_before_dispatch() {
+    let (mut planes, _launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut frame = keyed_on(
+        9,
+        801,
+        "browser_use",
+        json!({"action":"status"}),
+        "pf:preset",
+    );
+    let mut request: Value = serde_json::from_slice(&frame.body).unwrap();
+    request["preset"] = json!("head");
+    frame.body = serde_json::to_vec(&request).unwrap();
+    let reply = exchange(&planes, &tx, &mut rx, frame).await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "invalid_request", "{body}");
+    assert_eq!(body["detail"]["field"], "preset");
+    assert_eq!(body["detail"]["value"], "head");
+    let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
+    let record: Value = serde_json::from_str(stored.lines().last().unwrap()).unwrap();
+    assert_eq!(record["state"], "refused", "{stored}");
+    assert_eq!(record["refusal_reason"], "invalid_request", "{stored}");
+    let withdrawn = withdraw(&planes, &tx, &mut rx, 9, 802, "pf:preset").await;
+    let withdraw_body: Value = serde_json::from_slice(&withdrawn.body).unwrap();
+    assert_eq!(
+        withdraw_body,
+        json!({"answer":"refused", "reason":"invalid_request"})
+    );
+}
+
 /// A route opened without a scope is served exactly as before scopes: its
 /// call record names no scope, its close tears the browser down at once as
 /// `route_unbound` and ends the conversation's computer state as it always

@@ -5317,7 +5317,7 @@ async fn handle_tool_request(
         .filter(|field| {
             !matches!(
                 field.as_str(),
-                "name" | "arguments" | "progress_token" | "origin"
+                "name" | "arguments" | "progress_token" | "origin" | "preset"
             )
         })
         .min()
@@ -5330,6 +5330,29 @@ async fn handle_tool_request(
             corr,
             field,
             "unknown_field",
+        )
+        .await;
+    }
+
+    // This provider declares no presets. An absent or null preset preserves
+    // the existing service; it never selects a more capable preset implicitly.
+    if let Some(preset) = object.get("preset").filter(|value| !value.is_null()) {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            json!({
+                "outcome": "invalid_request",
+                "context": null,
+                "session": null,
+                "detail": {
+                    "field": "preset",
+                    "reason_code": "unsupported_value",
+                    "value": preset,
+                },
+            }),
         )
         .await;
     }
