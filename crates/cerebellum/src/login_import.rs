@@ -8,9 +8,10 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ use crate::profile_custody::{
 
 const COOKIES_RELATIVE_PATH: &str = "Default/Cookies";
 const SQLITE_PROGRAM: &str = "/usr/bin/sqlite3";
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The registry-owned durable profile and the root that coordinates its custody.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub struct BrowserSource {
 #[derive(Debug, Clone)]
 pub struct ImportSettings {
     pub sqlite_program: PathBuf,
+    pub transfer_timeout: Duration,
     pub application_support: PathBuf,
     pub safari_store: PathBuf,
     pub browsers: Vec<BrowserSource>,
@@ -51,6 +54,7 @@ impl ImportSettings {
         let application_support = home.join("Library/Application Support");
         Self {
             sqlite_program: PathBuf::from(SQLITE_PROGRAM),
+            transfer_timeout: TRANSFER_TIMEOUT,
             safari_store: home.join("Library/Cookies/Cookies.binarycookies"),
             application_support,
             browsers: vec![
@@ -113,6 +117,7 @@ impl ImportSettings {
     ) -> Self {
         Self {
             sqlite_program,
+            transfer_timeout: TRANSFER_TIMEOUT,
             application_support,
             safari_store,
             browsers,
@@ -142,6 +147,7 @@ pub struct ImportResult {
     pub remedy: Option<&'static str>,
     /// Only on `consent_pending`: the consent card still open.
     pub ask_id: Option<String>,
+    pub reason: Option<&'static str>,
 }
 
 impl ImportResult {
@@ -163,6 +169,9 @@ impl ImportResult {
         if let Some(ask_id) = &self.ask_id {
             object.insert("ask_id".to_string(), Value::String(ask_id.clone()));
         }
+        if let Some(reason) = self.reason {
+            object.insert("reason".to_string(), Value::String(reason.to_string()));
+        }
         value
     }
 
@@ -176,6 +185,7 @@ impl ImportResult {
             browsers: Vec::new(),
             remedy: Some(remedy),
             ask_id: None,
+            reason: None,
         }
     }
 }
@@ -336,6 +346,11 @@ impl LoginImportPlan {
                         0,
                         Some("close every browser session using this durable profile, then retry"),
                     ),
+                    Err(TransferError::TimedOut) => {
+                        let mut result = self.result("transfer_failed", Some(browser_id.to_string()), 0, Some("cookie transfer timed out; retry once the local SQLite service responds"));
+                        result.reason = Some("transfer_timed_out");
+                        result
+                    }
                     Err(TransferError::Failed) => self.result(
                         "transfer_failed",
                         Some(browser_id.to_string()),
@@ -372,6 +387,7 @@ impl LoginImportPlan {
             browsers: self.presence.clone(),
             remedy,
             ask_id: None,
+            reason: None,
         }
     }
 
@@ -389,6 +405,7 @@ impl LoginImportPlan {
             .join(COOKIES_RELATIVE_PATH);
         let target_store = self.location.profile_directory.join(COOKIES_RELATIVE_PATH);
 
+        let deadline = Instant::now() + self.settings.transfer_timeout;
         let mut locks = ProfileCustodyLocks::open_filesystem(&self.location.managed_root)
             .map_err(|_| TransferError::Failed)?;
         let holder = locks.mint_holder().map_err(|_| TransferError::Failed)?;
@@ -398,7 +415,7 @@ impl LoginImportPlan {
         {
             ProfileCustodyAcquisition::Acquired(claim) => claim,
             ProfileCustodyAcquisition::ProfileBusy { .. } => {
-                return Err(TransferError::ProfileBusy)
+                return Err(TransferError::ProfileBusy);
             }
         };
         if locks
@@ -415,8 +432,15 @@ impl LoginImportPlan {
             &target_store,
             &self.domains,
             self.observer.as_ref(),
+            deadline,
         )
-        .map_err(|_| TransferError::Failed);
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                TransferError::TimedOut
+            } else {
+                TransferError::Failed
+            }
+        });
         let released = locks.release_exact(&claim);
         if !matches!(released, Ok(ProfileCustodyRelease::Released)) {
             return Err(TransferError::Failed);
@@ -504,9 +528,10 @@ pub(crate) fn import_question(
     .render(ask_id)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TransferError {
     ProfileBusy,
+    TimedOut,
     Failed,
 }
 
@@ -668,20 +693,29 @@ fn transfer_store(
     target_store: &Path,
     domains: &[String],
     observer: &dyn ProfileWriteObserver,
+    deadline: Instant,
 ) -> io::Result<u64> {
     let temporary = PrivateTempDir::new("transfer")?;
     let pruned = temporary.path().join("Cookies");
-    copy_store_private(sqlite_program, source_store, &pruned)?;
-    sqlite_write(
+    copy_store_private_until(sqlite_program, source_store, &pruned, deadline)?;
+    sqlite_write_until(
         sqlite_program,
         &pruned,
         &format!(
             "BEGIN IMMEDIATE; DELETE FROM cookies WHERE has_expires != 1 OR host_key NOT IN ({}); COMMIT;",
             sql_values(domains)
         ),
+        deadline,
     )?;
-    let rows =
-        parse_count(sqlite_read(sqlite_program, &pruned, "SELECT COUNT(*) FROM cookies;")?.trim())?;
+    let rows = parse_count(
+        sqlite_read_until(
+            sqlite_program,
+            &pruned,
+            "SELECT COUNT(*) FROM cookies;",
+            deadline,
+        )?
+        .trim(),
+    )?;
     observer.before_profile_write(&pruned)?;
 
     let Some(parent) = target_store.parent() else {
@@ -703,8 +737,8 @@ fn transfer_store(
         }
     }
 
-    let source_columns = cookie_columns(sqlite_program, &pruned)?;
-    let target_columns = cookie_columns(sqlite_program, target_store)?;
+    let source_columns = cookie_columns(sqlite_program, &pruned, deadline)?;
+    let target_columns = cookie_columns(sqlite_program, target_store, deadline)?;
     if source_columns.is_empty() || source_columns != target_columns {
         return Err(io::Error::other("cookie store schemas differ"));
     }
@@ -723,15 +757,20 @@ fn transfer_store(
          COMMIT; DETACH DATABASE imported;",
         sql_literal(&attached_uri)
     );
-    sqlite_write(sqlite_program, target_store, &sql)?;
+    sqlite_write_until(sqlite_program, target_store, &sql, deadline)?;
     Ok(rows)
 }
 
-fn cookie_columns(sqlite_program: &Path, store: &Path) -> io::Result<Vec<String>> {
-    let output = sqlite_read(
+fn cookie_columns(
+    sqlite_program: &Path,
+    store: &Path,
+    deadline: Instant,
+) -> io::Result<Vec<String>> {
+    let output = sqlite_read_until(
         sqlite_program,
         store,
         "SELECT name FROM pragma_table_info('cookies') ORDER BY cid;",
+        deadline,
     )?;
     Ok(output
         .lines()
@@ -745,21 +784,75 @@ fn sqlite_read(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
     // Not `-readonly`: every store this reads is a private copy or the route's
     // own closed profile store, and a read-only connection cannot roll back a
     // hot journal, so it would refuse the one copy that most needs recovering.
-    sqlite(program, None, store.as_os_str(), sql)
+    sqlite_read_until(program, store, sql, Instant::now() + TRANSFER_TIMEOUT)
 }
 
 fn sqlite_write(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
-    sqlite(program, None, store.as_os_str(), sql)
+    sqlite_read_until(program, store, sql, Instant::now() + TRANSFER_TIMEOUT)
 }
 
-fn sqlite(program: &Path, mode: Option<&OsStr>, store: &OsStr, sql: &str) -> io::Result<String> {
+fn sqlite_read_until(
+    program: &Path,
+    store: &Path,
+    sql: &str,
+    deadline: Instant,
+) -> io::Result<String> {
+    sqlite(program, None, store.as_os_str(), sql, deadline)
+}
+
+fn sqlite_write_until(
+    program: &Path,
+    store: &Path,
+    sql: &str,
+    deadline: Instant,
+) -> io::Result<String> {
+    sqlite_read_until(program, store, sql, deadline)
+}
+
+fn sqlite(
+    program: &Path,
+    mode: Option<&OsStr>,
+    store: &OsStr,
+    sql: &str,
+    deadline: Instant,
+) -> io::Result<String> {
     let mut command = Command::new(program);
     crate::launch_nonce::without_launch_nonce(&mut command);
     command.arg("-batch");
     if let Some(mode) = mode {
         command.arg(mode);
     }
-    let output = command.arg(store).arg(sql).output()?;
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SQLite transfer timed out",
+        ));
+    }
+    let mut child = command
+        .arg(store)
+        .arg(sql)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // macOS security-policy evaluation can leave a child blocked in
+            // the kernel even after a kill signal. Do not wait indefinitely for
+            // its exit: that would undo the operation deadline.
+            let _ = child.kill();
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = child.try_wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SQLite transfer timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         return Err(io::Error::other("SQLite could not read the cookie store"));
     }
@@ -801,6 +894,20 @@ fn sqlite_uri(path: &Path) -> String {
 /// reports as unreadable rather than as a count or a transfer of rows nobody
 /// can decrypt.
 fn copy_store_private(sqlite_program: &Path, source: &Path, destination: &Path) -> io::Result<()> {
+    copy_store_private_until(
+        sqlite_program,
+        source,
+        destination,
+        Instant::now() + TRANSFER_TIMEOUT,
+    )
+}
+
+fn copy_store_private_until(
+    sqlite_program: &Path,
+    source: &Path,
+    destination: &Path,
+    deadline: Instant,
+) -> io::Result<()> {
     let journal = sidecar_path(source, "-journal");
     if journal.exists() {
         copy_private(&journal, &sidecar_path(destination, "-journal"))?;
@@ -829,8 +936,9 @@ fn copy_store_private(sqlite_program: &Path, source: &Path, destination: &Path) 
     }
     // The CLI reports a damaged page either as a non-"ok" verdict or by
     // failing outright; both are the same answer here.
-    match sqlite_read(sqlite_program, destination, "PRAGMA quick_check;") {
+    match sqlite_read_until(sqlite_program, destination, "PRAGMA quick_check;", deadline) {
         Ok(verdict) if verdict.trim() == "ok" => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(error),
         Ok(_) | Err(_) => Err(io::Error::other(
             "the copied cookie store is not consistent",
         )),
@@ -2373,6 +2481,34 @@ mod tests {
                 "x.com",
                 ".x.com",
             ]
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_transfer_deadline_bounds_a_silent_child() {
+        let program = crate::content_named_fixture::content_named_fixture(
+            "sqlite-deadline",
+            "sqlite",
+            b"#!/bin/sh\nexec /bin/sleep 2\n",
+            0o700,
+        );
+        let start = Instant::now();
+        let error = sqlite_read_until(
+            &program,
+            Path::new("/tmp/unused-cookie-store"),
+            "SELECT 1;",
+            start + Duration::from_millis(40),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "silent SQLite exceeded the transfer deadline"
         );
     }
 }
