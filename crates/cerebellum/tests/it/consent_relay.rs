@@ -140,7 +140,7 @@ async fn the_relay_answers_the_question_and_the_consent_settles() {
     let reply = consent_relay::elicit_and_answer(
         &planes,
         open_grant(10),
-        json!({"decision": "allow"}),
+        json!({"decision": "allow_conversation"}),
         "browser.open_grant",
     )
     .await

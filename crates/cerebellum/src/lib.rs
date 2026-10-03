@@ -17,6 +17,7 @@ pub mod browser_launch_readiness;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod browser_launch_service;
 pub mod browser_session;
+pub mod browser_standing_grants;
 pub mod browser_type;
 pub mod capability;
 pub mod cdp;
@@ -800,6 +801,9 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
             | management::REBIND_PROFILE_ROOT
             | management::CAPTURE_LOGIN
             | management::CLEAR_LAUNCH_RECOVERY
+            | management::REVOKE_ACCESS
+            | management::REVOKE_GRANT
+            | management::LIST_GRANTS
     ) || (matches!(name, management::PRESENT | management::RESUME)
         && browser::has_wire_dispatch_route(name))
 }
@@ -822,7 +826,56 @@ fn is_operator_operation(name: &str) -> bool {
             | management::CLEAR_LAUNCH_RECOVERY
             | management::LIST_APP_GRANTS
             | management::REVOKE_APP_GRANT
+            | management::REVOKE_GRANT
+            | management::LIST_GRANTS
     )
+}
+
+/// The request fields of the standing-grant operations, checked in one
+/// place: `Err` names the field and the reason code of the refusal.
+mod standing_grant_params {
+    use serde_json::{Map, Value};
+
+    pub(super) type Refusal = (&'static str, &'static str);
+
+    /// Refuse any field outside `allowed`, naming the first in sorted order.
+    pub(super) fn only(params: &Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
+        match params
+            .keys()
+            .filter(|field| !allowed.contains(&field.as_str()))
+            .min()
+        {
+            Some(field) => Err(field.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// An optional canonical origin a standing row could name.
+    pub(super) fn origin(params: &Map<String, Value>) -> Result<Option<String>, Refusal> {
+        match params.get("origin") {
+            None => Ok(None),
+            Some(Value::String(origin)) => {
+                if crate::classification::canonical_grant_origin(origin).as_deref()
+                    == Some(origin.as_str())
+                {
+                    Ok(Some(origin.clone()))
+                } else {
+                    Err(("origin", "invalid_origin"))
+                }
+            }
+            Some(_) => Err(("origin", "wrong_type")),
+        }
+    }
+
+    /// The required, nonempty `agent_id` an operator names.
+    pub(super) fn agent_id(params: &Map<String, Value>) -> Result<String, Refusal> {
+        match params.get("agent_id") {
+            Some(Value::String(agent)) if !agent.is_empty() => Ok(agent.clone()),
+            Some(Value::String(_)) => Err(("agent_id", "empty_value")),
+            Some(_) => Err(("agent_id", "wrong_type")),
+            None => Err(("agent_id", "missing_field")),
+        }
+    }
 }
 
 /// The dispatch predicate, exposed so a test can compare the surface reporter
@@ -2543,6 +2596,26 @@ impl Planes {
         browser_config: Option<BrowserConfig>,
         journal: JournalPersistence,
     ) -> Self {
+        Self::with_browser_config_journaling_and_standing_grants(
+            health,
+            browser_config,
+            journal,
+            None,
+        )
+    }
+
+    /// [`Self::with_browser_config_journaling`] holding standing browser
+    /// grants in `standing` rather than in the store `journal` selects: the
+    /// operator's file for a durable plane, memory that never offers a
+    /// standing answer for an isolated one. For tests that need standing
+    /// answers offered, a store reopened across a restart, or a clock they
+    /// move.
+    pub fn with_browser_config_journaling_and_standing_grants(
+        health: Arc<HealthState>,
+        browser_config: Option<BrowserConfig>,
+        journal: JournalPersistence,
+        standing: Option<Arc<browser_standing_grants::StandingBrowserGrants>>,
+    ) -> Self {
         // The launch service picks its process launcher per platform and has
         // done since the Linux barrier landed. This wiring stayed macOS-only,
         // which left a merged Linux launcher unreachable and the refusal
@@ -2563,16 +2636,37 @@ impl Planes {
         // The operator's "always" grants are read from their store only for a
         // durable plane; an isolated plane keeps grants in memory and, with no
         // machine identity, never offers "always".
-        let computer_grants = match journal {
-            JournalPersistence::Durable => Arc::new(computer_grants::ComputerGrants::open_durable(
-                computer_grants::this_machine_uuid(),
-            )),
-            JournalPersistence::Isolated => Arc::new(computer_grants::ComputerGrants::in_memory()),
+        // Standing browser grants follow the same rule, and are bound to the
+        // same machine identity.
+        let (computer_grants, durable_standing) = match journal {
+            JournalPersistence::Durable => {
+                let machine_uuid = computer_grants::this_machine_uuid();
+                (
+                    Arc::new(computer_grants::ComputerGrants::open_durable(
+                        machine_uuid.clone(),
+                    )),
+                    Some(machine_uuid),
+                )
+            }
+            JournalPersistence::Isolated => {
+                (Arc::new(computer_grants::ComputerGrants::in_memory()), None)
+            }
         };
-        let management = Arc::new(ManagementPlane::with_computer_grants(
-            Arc::new(management::PlatformResolver::new()),
-            computer_grants,
-        ));
+        let standing = standing.unwrap_or_else(|| {
+            Arc::new(match durable_standing {
+                Some(machine_uuid) => {
+                    browser_standing_grants::StandingBrowserGrants::open_durable(machine_uuid)
+                }
+                None => browser_standing_grants::StandingBrowserGrants::in_memory(),
+            })
+        });
+        let management = Arc::new(
+            ManagementPlane::with_computer_grants(
+                Arc::new(management::PlatformResolver::new()),
+                computer_grants,
+            )
+            .with_standing_browser_grants(standing),
+        );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
             browser_config
@@ -3429,6 +3523,59 @@ async fn handle_management_request(
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
     }
 
+    if matches!(
+        method,
+        management::REVOKE_ACCESS | management::REVOKE_GRANT | management::LIST_GRANTS
+    ) {
+        let reply = match standing_grant_operation(method, params_object, facts, planes) {
+            Ok(reply) => reply,
+            Err(StandingGrantOperationRefusal::UnknownField(field)) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &field,
+                    "unknown_field",
+                )
+                .await
+            }
+            Err(StandingGrantOperationRefusal::Invalid((field, reason))) => {
+                return send_invalid_request_response(
+                    writer, ver, channel, epoch, corr, field, reason,
+                )
+                .await
+            }
+        };
+        // The agent's own revocation is reached from the browser tool, so its
+        // reply is held to the result schema the tool declares for it.
+        let reply = if method == management::REVOKE_ACCESS {
+            match planes.browser.finish_reply(method, reply) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        browser::RESULT_SCHEMA_VIOLATION_CODE,
+                        &format!(
+                            "the revoke_access reply violated its declared result schema \
+                             ({error}); the access may already have been removed, so call \
+                             revoke_access again rather than retrying from this response"
+                        ),
+                    )
+                    .await
+                }
+            }
+        } else {
+            reply
+        };
+        return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
     enum Settlement {
         BrowserGrant,
         ProfileRootRebind,
@@ -3544,6 +3691,7 @@ async fn handle_management_request(
                 hazards,
                 severity_tier,
                 facts.declares_elicitation(),
+                standing_offer_agent(facts),
             )
             .await;
         let (reply, question) = match opened {
@@ -3727,6 +3875,102 @@ async fn handle_management_request(
     }
 
     send_tool_response(writer, ver, channel, epoch, corr, reply).await
+}
+
+/// Why a standing-grant operation's request was refused before it ran.
+enum StandingGrantOperationRefusal {
+    UnknownField(String),
+    Invalid(standing_grant_params::Refusal),
+}
+
+impl From<standing_grant_params::Refusal> for StandingGrantOperationRefusal {
+    fn from(refusal: standing_grant_params::Refusal) -> Self {
+        Self::Invalid(refusal)
+    }
+}
+
+/// Serve `browser.revoke_access`, `browser.revoke_grant` or `grants.list`.
+///
+/// `browser.revoke_access` acts for the route's own agent, which must be
+/// attested, since it names the rows it removes; it asks nobody because it
+/// only narrows. The other two name the agent explicitly and are the
+/// operator's (see `is_operator_operation`).
+fn standing_grant_operation(
+    method: &str,
+    params: &serde_json::Map<String, Value>,
+    facts: &AcceptedBindFacts,
+    planes: &Planes,
+) -> Result<Value, StandingGrantOperationRefusal> {
+    use browser_standing_grants::RevokeTarget;
+    let standing = planes.management.standing_browser_grants();
+    match method {
+        management::REVOKE_ACCESS => {
+            standing_grant_params::only(params, &["origin"])
+                .map_err(StandingGrantOperationRefusal::UnknownField)?;
+            let origin = standing_grant_params::origin(params)?;
+            if !facts.agent_project_id_attested {
+                return Ok(json!({
+                    "outcome": "agent_not_attested",
+                    "revoked": 0,
+                    "remedy": "this route's agent identity is not attested, so it holds no standing browser access to remove",
+                }));
+            }
+            let target = origin.map_or(RevokeTarget::Everything, RevokeTarget::Origin);
+            Ok(standing.revoke(&facts.identity.agent_project_id, &target))
+        }
+        management::REVOKE_GRANT => {
+            standing_grant_params::only(params, &["agent_id", "origin", "all_sites"])
+                .map_err(StandingGrantOperationRefusal::UnknownField)?;
+            let agent_id = standing_grant_params::agent_id(params)?;
+            let origin = standing_grant_params::origin(params)?;
+            let all_sites = match params.get("all_sites") {
+                None => false,
+                Some(Value::Bool(true)) => true,
+                Some(Value::Bool(false)) => {
+                    return Err(("all_sites", "unsupported_value").into());
+                }
+                Some(_) => return Err(("all_sites", "wrong_type").into()),
+            };
+            let target = match (origin, all_sites) {
+                (Some(_), true) => return Err(("all_sites", "conflicting_fields").into()),
+                (Some(origin), false) => RevokeTarget::Origin(origin),
+                (None, true) => RevokeTarget::AllSites,
+                (None, false) => RevokeTarget::Everything,
+            };
+            Ok(standing.revoke(&agent_id, &target))
+        }
+        _ => {
+            standing_grant_params::only(params, &["agent_id"])
+                .map_err(StandingGrantOperationRefusal::UnknownField)?;
+            let agent_id = standing_grant_params::agent_id(params)?;
+            let apps = planes.management.computer_grants().list();
+            let app_grants: Vec<Value> = apps["grants"]
+                .as_array()
+                .map(|grants| {
+                    grants
+                        .iter()
+                        .filter(|grant| grant["grantee"] == agent_id.as_str())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(json!({
+                "agent_id": agent_id,
+                "browser": {
+                    "grants": standing
+                        .live_rows(&agent_id)
+                        .iter()
+                        .map(browser_standing_grants::StandingBrowserGrant::describe)
+                        .collect::<Vec<_>>(),
+                    "store": standing.store_state(),
+                },
+                "apps": {
+                    "grants": app_grants,
+                    "store": apps["store"].clone(),
+                },
+            }))
+        }
+    }
 }
 
 async fn import_browser_login(
@@ -5453,10 +5697,11 @@ async fn serve_browser_with_consent(
     arguments: &Value,
     park_limit: Duration,
 ) -> Result<Value, cerebellum_computer::platform::vocabulary::CapabilityResultValidationError> {
-    let mut reply = planes
-        .browser
-        .serve(&facts.identity, capability, arguments)
-        .await?;
+    let mut reply = authorization::with_standing_caller(
+        standing_caller(facts),
+        planes.browser.serve(&facts.identity, capability, arguments),
+    )
+    .await?;
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
@@ -5495,6 +5740,7 @@ async fn serve_browser_with_consent(
             origins,
             hazards,
             Some(tier),
+            standing_offer_agent(facts),
         )
         .await
     else {
@@ -5519,20 +5765,23 @@ async fn serve_browser_with_consent(
             outcome = elicitor.ask(&writer, channel, epoch, question.body, question.deadline) => Ok(outcome),
         };
         let settled = management
-            .settle_browser_grant_ending(&question.ask_id, ending.as_ref().ok())
+            .settle_browser_grant_outcome(&question.ask_id, ending.as_ref().ok())
             .await;
-        match &ending {
-            // An allowing answer to a question no longer held (withdrawn with
-            // its conversation meanwhile) grants nothing.
-            Ok(elicit::AskOutcome::Answered(answer)) if answer["decision"] == "allow" => {
-                if settled {
-                    "allow"
-                } else {
-                    "unavailable"
-                }
+        match (&ending, settled) {
+            (_, management::BrowserGrantSettlement::Granted(_)) => "allow",
+            // A granting answer whose grant was not recorded, or that came to
+            // a question no longer held (withdrawn with its conversation
+            // meanwhile), grants nothing.
+            (
+                _,
+                management::BrowserGrantSettlement::NotRecorded { .. }
+                | management::BrowserGrantSettlement::UnknownAsk,
+            ) => "unavailable",
+            (_, management::BrowserGrantSettlement::UnrecognizedAnswer) => "unrecognized_answer",
+            (Ok(outcome), management::BrowserGrantSettlement::NotGranted) => {
+                in_call_grant_decision(outcome)
             }
-            Ok(outcome) => in_call_grant_decision(outcome),
-            Err(withdrawn) => *withdrawn,
+            (Err(withdrawn), management::BrowserGrantSettlement::NotGranted) => *withdrawn,
         }
     });
     let guard = elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
@@ -5543,10 +5792,11 @@ async fn serve_browser_with_consent(
         Ok(Ok("allow")) => {
             // Re-enter normal authorization, rather than treating the answer as
             // authority: the session or its origin may have changed meanwhile.
-            planes
-                .browser
-                .serve(&facts.identity, capability, arguments)
-                .await
+            authorization::with_standing_caller(
+                standing_caller(facts),
+                planes.browser.serve(&facts.identity, capability, arguments),
+            )
+            .await
         }
         Ok(decision) => {
             let decision = decision.unwrap_or("unavailable");
@@ -5561,6 +5811,27 @@ async fn serve_browser_with_consent(
             planes.browser.finish_reply(capability.name(), pending)
         }
     }
+}
+
+/// The agent whose standing browser rows may authorize a request on this
+/// route: only an `agentProjectId` the daemon attested, never one taken from
+/// the caller-controlled project-root fallback.
+fn standing_caller(facts: &AcceptedBindFacts) -> Option<authorization::StandingCaller> {
+    facts
+        .agent_project_id_attested
+        .then(|| authorization::StandingCaller {
+            agent_id: facts.identity.agent_project_id.clone(),
+        })
+}
+
+/// The agent a site-access card on this route may offer standing answers for:
+/// a primary session whose agent and session kind the daemon both attested.
+/// Worker and ephemeral sessions are offered this conversation only.
+fn standing_offer_agent(facts: &AcceptedBindFacts) -> Option<&str> {
+    (facts.agent_project_id_attested
+        && facts.session_kind_attested
+        && facts.identity.session_kind == cerebellum_core::identity::SessionKind::Primary)
+        .then_some(facts.identity.agent_project_id.as_str())
 }
 
 /// The `detail.decision` a browser action held open on a grant question
@@ -6770,7 +7041,7 @@ mod tests {
             question_frame.header.channel,
             question_frame.header.epoch,
             question_frame.header.corr,
-            serde_json::to_vec(&json!({"decision": "allow"})).unwrap(),
+            serde_json::to_vec(&json!({"decision": "allow_conversation"})).unwrap(),
         )
         .unwrap();
         handle_frame(answer, &writer_tx, &planes)
@@ -7079,7 +7350,10 @@ mod tests {
             )
             .await;
         management
-            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+            .settle_browser_grant(
+                &question.ask_id,
+                Some(&json!({"decision": "allow_conversation"})),
+            )
             .await;
         let browser = browser_plane_with_shared_grants_for_test(management.browser_grants());
         let route = RouteIdentity {

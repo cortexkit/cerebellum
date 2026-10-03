@@ -109,7 +109,10 @@ async fn grant_browser(planes: &Planes, origin: &str, hazards: Vec<HazardClass>)
     assert!(
         planes
             .management
-            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+            .settle_browser_grant(
+                &question.ask_id,
+                Some(&json!({"decision": "allow_conversation"}))
+            )
             .await
     );
 }
@@ -185,7 +188,7 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
     let reply = consent_relay::elicit_and_answer(
         planes,
         opening,
-        json!({"decision": "allow"}),
+        json!({"decision": "allow_conversation"}),
         "browser.open_grant",
     )
     .await
@@ -5829,7 +5832,7 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
         assert!(
             !planes
                 .management
-                .settle_browser_grant(&ask_id, Some(&json!({"decision": "allow"})))
+                .settle_browser_grant(&ask_id, Some(&json!({"decision": "allow_conversation"})))
                 .await
         );
         assert_eq!(planes.management.browser_grant_count().await, 0);
@@ -6010,7 +6013,10 @@ async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing
     assert!(
         !planes
             .management
-            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+            .settle_browser_grant(
+                &question.ask_id,
+                Some(&json!({"decision": "allow_conversation"}))
+            )
             .await
     );
     assert_eq!(planes.management.browser_grant_count().await, 0);

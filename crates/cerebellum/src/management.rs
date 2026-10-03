@@ -26,6 +26,9 @@ use crate::authorization::{
     ActionGrant, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE, MUTATE_REVERSIBLE,
     OBSERVE,
 };
+use crate::browser_standing_grants::{
+    origin_is_public, StandingBrowserGrants, StandingSubject, ALL_SITES_SHORT_GRANT_MS,
+};
 use crate::classification::canonical_grant_origin;
 use crate::computer_grants::{
     AppCode, ComputerGrants, ConsentContext, GrantNeed, NoIdentityReader,
@@ -59,7 +62,15 @@ pub const CAPTURE_LOGIN: &str = "browser.capture_login";
 /// browser from before a restart gone. Operator-only: it is a management
 /// operation, never a tool, so no model sees it in a tool catalog.
 pub const CLEAR_LAUNCH_RECOVERY: &str = "browser.clear_launch_recovery";
-pub const OPERATIONS: [&str; 10] = [
+/// Remove the calling agent's own standing browser access, all of it or one
+/// origin's. Only ever narrows, so it asks nobody.
+pub const REVOKE_ACCESS: &str = "browser.revoke_access";
+/// Remove a named agent's standing browser access. Operator-only.
+pub const REVOKE_GRANT: &str = "browser.revoke_grant";
+/// List a named agent's standing browser access and always-allow app grants.
+/// Operator-only.
+pub const LIST_GRANTS: &str = "grants.list";
+pub const OPERATIONS: [&str; 13] = [
     OPEN_TARGET,
     LIST_APP_GRANTS,
     REVOKE_APP_GRANT,
@@ -70,6 +81,9 @@ pub const OPERATIONS: [&str; 10] = [
     REBIND_PROFILE_ROOT,
     CAPTURE_LOGIN,
     CLEAR_LAUNCH_RECOVERY,
+    REVOKE_ACCESS,
+    REVOKE_GRANT,
+    LIST_GRANTS,
 ];
 
 /// How long a question the person usually answers from a phone may stay open:
@@ -328,6 +342,9 @@ pub struct ManagementPlane {
     app_state_sessions: Arc<AppStateSessions>,
     resolver: Arc<dyn TargetResolver>,
     browser_grants: Arc<Mutex<GrantStore>>,
+    /// Standing per-agent browser rows; the same store `browser_grants`
+    /// consults.
+    standing_browser_grants: Arc<StandingBrowserGrants>,
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
     profile_lifecycle: Option<Arc<ProfileLifecycle>>,
     pending_profile_root_rebinds: Mutex<BTreeMap<String, PendingProfileRootRebind>>,
@@ -403,6 +420,101 @@ struct PendingBrowserGrant {
     authorized_origins: Vec<String>,
     disclosed_hazards: BTreeSet<HazardClass>,
     severity: Severity,
+    /// The granting options the card offered, which are the only answers
+    /// that grant anything.
+    choices: Vec<BrowserGrantChoice>,
+    /// The attested agent standing rows are recorded for, present only when
+    /// the card offered a standing option.
+    standing_agent: Option<String>,
+}
+
+/// One granting option of the browser site-access card, and what answering
+/// it grants. The card sends only the option's id, label and detail; the rest
+/// of what it means is kept here against the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserGrantChoice {
+    /// A grant for the conversation that asked.
+    Conversation,
+    /// A standing row for each origin asked about.
+    OriginAlways,
+    /// A standing all-sites row that lapses after ten minutes.
+    AllSitesTenMinutes,
+    /// A standing all-sites row that lasts until revoked.
+    AllSitesAlways,
+}
+
+impl BrowserGrantChoice {
+    /// The option id on the card, as agreed with the phone app and core.
+    pub const fn option_id(self) -> &'static str {
+        match self {
+            Self::Conversation => "allow_conversation",
+            Self::OriginAlways => "allow_origin_always",
+            Self::AllSitesTenMinutes => "allow_all_sites_10m",
+            Self::AllSitesAlways => "allow_all_sites_always",
+        }
+    }
+}
+
+/// The id of the browser site-access card's decline option, its default.
+pub const BROWSER_GRANT_DECLINE: &str = "deny";
+
+/// The granting options a browser site-access card offers, in card order.
+///
+/// The conversation grant is always offered. The standing options need a
+/// primary session with an attested agent (`standing_offered`). Both
+/// all-sites options are further withheld from a request that needs lasting
+/// changes, that discloses any hazard, or that names an origin which is not a
+/// public website.
+pub(crate) fn offered_browser_grant_choices(
+    origins: &[String],
+    hazards: &BTreeSet<HazardClass>,
+    severity: Severity,
+    standing_offered: bool,
+) -> Vec<BrowserGrantChoice> {
+    let mut choices = vec![BrowserGrantChoice::Conversation];
+    if !standing_offered {
+        return choices;
+    }
+    choices.push(BrowserGrantChoice::OriginAlways);
+    if severity.tier < MUTATE_DURABLE
+        && hazards.is_empty()
+        && origins.iter().all(|origin| origin_is_public(origin))
+    {
+        choices.extend([
+            BrowserGrantChoice::AllSitesTenMinutes,
+            BrowserGrantChoice::AllSitesAlways,
+        ]);
+    }
+    choices
+}
+
+/// How one answer to a browser site-access card was applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserGrantSettlement {
+    /// No question with this id was open.
+    UnknownAsk,
+    /// The answer chose this granting option and its grant is in force.
+    Granted(BrowserGrantChoice),
+    /// Declined, unanswered, shown to nobody, or withdrawn.
+    NotGranted,
+    /// An answer naming no option the card offered. It grants nothing.
+    UnrecognizedAnswer,
+    /// A granting option was chosen and its grant could not be recorded;
+    /// `reason` says why.
+    NotRecorded { reason: &'static str },
+}
+
+/// The id of the card the person answered, from the answer's
+/// `elicitation_id`, when it can name the consent: printable ASCII with no
+/// whitespace, 1 to 128 bytes. The same rule the vault deposit applies to its
+/// `consent_ref`; anything else counts as absent.
+fn answered_elicitation_id(answer: &Value) -> Option<String> {
+    const MAX_CONSENT_REF_BYTES: usize = 128;
+    let id = answer.get("elicitation_id")?.as_str()?;
+    let usable = !id.is_empty()
+        && id.len() <= MAX_CONSENT_REF_BYTES
+        && id.bytes().all(|byte| byte.is_ascii_graphic());
+    usable.then(|| id.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,11 +627,15 @@ impl ManagementPlane {
         resolver: Arc<dyn TargetResolver>,
         computer_grants: Arc<ComputerGrants>,
     ) -> Self {
+        let standing_browser_grants = Arc::new(StandingBrowserGrants::in_memory());
         Self {
             computer_grants,
             app_state_sessions: Arc::new(AppStateSessions::new()),
             resolver,
-            browser_grants: Arc::new(Mutex::new(GrantStore::default())),
+            browser_grants: Arc::new(Mutex::new(
+                GrantStore::default().with_standing_grants(Arc::clone(&standing_browser_grants)),
+            )),
+            standing_browser_grants,
             pending_browser_grants: Mutex::new(BTreeMap::new()),
             profile_lifecycle: None,
             pending_profile_root_rebinds: Mutex::new(BTreeMap::new()),
@@ -529,6 +645,23 @@ impl ManagementPlane {
             unreached_browser_grants: Mutex::new(BTreeMap::new()),
             unreached_profile_root_rebinds: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Use `standing` for standing browser rows, which is how a running module
+    /// attaches the operator's durable store. Replaces the browser grant store
+    /// with an empty one consulting `standing`, so call it while building the
+    /// plane, before the browser grants are shared.
+    pub fn with_standing_browser_grants(mut self, standing: Arc<StandingBrowserGrants>) -> Self {
+        self.browser_grants = Arc::new(Mutex::new(
+            GrantStore::default().with_standing_grants(Arc::clone(&standing)),
+        ));
+        self.standing_browser_grants = standing;
+        self
+    }
+
+    /// The standing per-agent browser rows.
+    pub fn standing_browser_grants(&self) -> &Arc<StandingBrowserGrants> {
+        &self.standing_browser_grants
     }
 
     /// The computer plane's grants.
@@ -734,6 +867,7 @@ impl ManagementPlane {
             hazards,
             None,
             can_relay_to_a_person,
+            None,
         )
         .await
     }
@@ -747,6 +881,10 @@ impl ManagementPlane {
     /// For a question asked ahead of the browser call that needs it: the call
     /// asking returns `consent_pending` at once, so the card is sent at normal
     /// urgency.
+    ///
+    /// `standing_agent` is the attested agent of a primary session, for which
+    /// the card may also offer standing options; `None` offers only this
+    /// conversation.
     pub async fn open_browser_grant_at_tier(
         &self,
         conversation_key: &str,
@@ -754,6 +892,7 @@ impl ManagementPlane {
         hazards: Vec<HazardClass>,
         severity_tier: Option<u8>,
         can_relay_to_a_person: bool,
+        standing_agent: Option<&str>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         let key = browser_grant_key(conversation_key, &origins);
         let (mut reply, question) = self
@@ -764,6 +903,7 @@ impl ManagementPlane {
                 severity_tier,
                 can_relay_to_a_person,
                 crate::consent_card::Urgency::Normal,
+                standing_agent,
             )
             .await?;
         // Only this reply carries the previous question's fate. A browser
@@ -787,6 +927,7 @@ impl ManagementPlane {
         origins: Vec<String>,
         hazards: Vec<HazardClass>,
         severity_tier: Option<u8>,
+        standing_agent: Option<&str>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         self.open_browser_grant_with_urgency(
             conversation_key,
@@ -795,6 +936,7 @@ impl ManagementPlane {
             severity_tier,
             true,
             crate::consent_card::Urgency::High,
+            standing_agent,
         )
         .await
     }
@@ -807,6 +949,7 @@ impl ManagementPlane {
         severity_tier: Option<u8>,
         can_relay_to_a_person: bool,
         urgency: crate::consent_card::Urgency,
+        standing_agent: Option<&str>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         if severity_tier.is_some_and(|tier| {
             !(crate::authorization::OBSERVE..=crate::authorization::MAX_GRANTABLE_TIER)
@@ -858,12 +1001,22 @@ impl ManagementPlane {
             ));
         }
 
+        let standing_agent = standing_agent
+            .filter(|agent| !agent.is_empty() && self.standing_browser_grants.can_record());
+        let choices = offered_browser_grant_choices(
+            &authorized_origins,
+            &disclosed_hazards,
+            severity,
+            standing_agent.is_some(),
+        );
         let ask_id = new_browser_grant_ask_id();
         let pending = PendingBrowserGrant {
             conversation_key: conversation_key.to_string(),
             authorized_origins: authorized_origins.clone(),
             disclosed_hazards,
             severity,
+            choices: choices.clone(),
+            standing_agent: standing_agent.map(str::to_string),
         };
         self.pending_browser_grants
             .lock()
@@ -877,6 +1030,7 @@ impl ManagementPlane {
                 &disclosed_hazards_wire,
                 severity,
                 urgency,
+                &choices,
             ),
             deadline: PHONE_CONSENT_DEADLINE,
         };
@@ -907,16 +1061,33 @@ impl ManagementPlane {
     /// Settle a browser grant question by how it ended; `None` means it was
     /// withdrawn (cancelled, route closed, draining) before it ended.
     ///
-    /// Only an answer of `allow` grants anything. The ending is also noted so
-    /// that the next request for the same grant can say the previous question
-    /// was shown to nobody.
+    /// Returns false when no such question was open or the chosen grant could
+    /// not be recorded; see [`Self::settle_browser_grant_outcome`] for which.
     pub async fn settle_browser_grant_ending(
         &self,
         ask_id: &str,
         ending: Option<&AskOutcome>,
     ) -> bool {
+        !matches!(
+            self.settle_browser_grant_outcome(ask_id, ending).await,
+            BrowserGrantSettlement::UnknownAsk | BrowserGrantSettlement::NotRecorded { .. }
+        )
+    }
+
+    /// Settle a browser grant question by how it ended, and say what that did.
+    ///
+    /// Only an answer naming a granting option the card offered grants
+    /// anything, and it grants exactly what was recorded for that option when
+    /// the card was filed: a conversation grant, a standing row per origin, or
+    /// one all-sites row. The ending is also noted so that the next request
+    /// for the same grant can say the previous question was shown to nobody.
+    pub async fn settle_browser_grant_outcome(
+        &self,
+        ask_id: &str,
+        ending: Option<&AskOutcome>,
+    ) -> BrowserGrantSettlement {
         let Some(pending) = self.pending_browser_grants.lock().await.remove(ask_id) else {
-            return false;
+            return BrowserGrantSettlement::UnknownAsk;
         };
         note_reachability(
             &self.unreached_browser_grants,
@@ -925,23 +1096,88 @@ impl ManagementPlane {
             ending,
         )
         .await;
-        let decision = match ending {
-            Some(AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
-            _ => None,
+        let Some(AskOutcome::Answered(answer)) = ending else {
+            return BrowserGrantSettlement::NotGranted;
         };
-        if decision != Some("allow") {
-            return true;
+        let decision = answer.get("decision").and_then(Value::as_str);
+        if decision == Some(BROWSER_GRANT_DECLINE) {
+            return BrowserGrantSettlement::NotGranted;
+        }
+        let Some(choice) = pending
+            .choices
+            .iter()
+            .copied()
+            .find(|choice| Some(choice.option_id()) == decision)
+        else {
+            return BrowserGrantSettlement::UnrecognizedAnswer;
+        };
+
+        if choice == BrowserGrantChoice::Conversation {
+            let grant = ActionGrant::new(
+                format!("grant-{ask_id}"),
+                1,
+                pending.conversation_key,
+                pending.severity,
+                pending.authorized_origins,
+            )
+            .with_disclosed_hazards(pending.disclosed_hazards);
+            return match self.browser_grants.lock().await.replace(grant) {
+                Ok(()) => BrowserGrantSettlement::Granted(choice),
+                Err(_) => BrowserGrantSettlement::NotRecorded {
+                    reason: "grant_store_invalid",
+                },
+            };
         }
 
-        let grant = ActionGrant::new(
-            format!("grant-{ask_id}"),
-            1,
-            pending.conversation_key,
-            pending.severity,
-            pending.authorized_origins,
-        )
-        .with_disclosed_hazards(pending.disclosed_hazards);
-        self.browser_grants.lock().await.replace(grant).is_ok()
+        let Some(agent) = pending.standing_agent.as_deref() else {
+            return BrowserGrantSettlement::NotRecorded {
+                reason: "agent_not_attested",
+            };
+        };
+        // The row names the card the person answered, as the vault deposit
+        // does; an answer that does not say which card it was grants nothing
+        // lasting.
+        let Some(consent_ref) = answered_elicitation_id(answer) else {
+            return BrowserGrantSettlement::NotRecorded {
+                reason: "consent_not_linkable",
+            };
+        };
+        let (subjects, hazards, lifetime_ms) = match choice {
+            BrowserGrantChoice::OriginAlways => (
+                pending
+                    .authorized_origins
+                    .iter()
+                    .cloned()
+                    .map(StandingSubject::Origin)
+                    .collect::<Vec<_>>(),
+                pending.disclosed_hazards.iter().copied().collect(),
+                None,
+            ),
+            BrowserGrantChoice::AllSitesTenMinutes => (
+                vec![StandingSubject::AllSites],
+                Vec::new(),
+                Some(ALL_SITES_SHORT_GRANT_MS),
+            ),
+            BrowserGrantChoice::AllSitesAlways => {
+                (vec![StandingSubject::AllSites], Vec::new(), None)
+            }
+            BrowserGrantChoice::Conversation => unreachable!("settled above"),
+        };
+        for subject in subjects {
+            if let Err(error) = self.standing_browser_grants.record(
+                agent,
+                subject,
+                pending.severity.tier,
+                hazards.clone(),
+                lifetime_ms,
+                &consent_ref,
+            ) {
+                return BrowserGrantSettlement::NotRecorded {
+                    reason: error.reason_code(),
+                };
+            }
+        }
+        BrowserGrantSettlement::Granted(choice)
     }
 
     pub async fn browser_grant_question_for_test(
@@ -1515,12 +1751,57 @@ fn browser_grant_severity_value(severity: Severity) -> Value {
     })
 }
 
+/// What a grant at this ceiling lets the agent do, as an option's detail.
+fn browser_grant_level_words(tier: u8) -> &'static str {
+    match tier {
+        OBSERVE => "Up to reading pages.",
+        COMPOSE => "Up to clicking ordinary links and buttons.",
+        MUTATE_REVERSIBLE => "Up to filling in forms and other changes that can be undone.",
+        _ => "Up to making lasting changes.",
+    }
+}
+
+/// What an all-sites option adds to its level words: how far it reaches and
+/// how to take it back.
+const ALL_SITES_DETAIL: &str = "Covers every public website, including ones where you're signed in. To withdraw it, ask the agent to remove its browser access.";
+
+/// The card option for one granting choice.
+fn browser_grant_option(
+    choice: BrowserGrantChoice,
+    hosts: &[String],
+    severity: Severity,
+) -> crate::consent_card::ConsentOption {
+    let level = browser_grant_level_words(severity.tier);
+    let (label, detail) = match choice {
+        BrowserGrantChoice::Conversation => {
+            ("Allow for this conversation".to_string(), level.to_string())
+        }
+        BrowserGrantChoice::OriginAlways => (
+            format!(
+                "Always allow on {}",
+                join_words(&hosts.iter().map(String::as_str).collect::<Vec<_>>(), "and")
+            ),
+            level.to_string(),
+        ),
+        BrowserGrantChoice::AllSitesTenMinutes => (
+            "Allow on all sites for 10 minutes".to_string(),
+            format!("{level} {ALL_SITES_DETAIL}"),
+        ),
+        BrowserGrantChoice::AllSitesAlways => (
+            "Always allow on all sites".to_string(),
+            format!("{level} {ALL_SITES_DETAIL}"),
+        ),
+    };
+    crate::consent_card::ConsentOption::grant(choice.option_id(), label).with_detail(detail)
+}
+
 pub(crate) fn browser_grant_question(
     ask_id: &str,
     origins: &[String],
     hazards: &[String],
     severity: Severity,
     urgency: crate::consent_card::Urgency,
+    choices: &[BrowserGrantChoice],
 ) -> Value {
     use crate::consent_card::*;
     let hosts: Vec<String> = origins
@@ -1568,8 +1849,11 @@ pub(crate) fn browser_grant_question(
             label: hosts.join(", "),
         },
         facts,
-        grants: vec![ConsentOption::grant("allow", "Allow")],
-        decline: ConsentOption::decline("deny", "Don't allow"),
+        grants: choices
+            .iter()
+            .map(|choice| browser_grant_option(*choice, &hosts, severity))
+            .collect(),
+        decline: ConsentOption::decline(BROWSER_GRANT_DECLINE, "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
         urgency,
@@ -1916,6 +2200,7 @@ mod tests {
                 &[],
                 Severity::new(2, false, false),
                 crate::consent_card::Urgency::Normal,
+                &[BrowserGrantChoice::Conversation],
             );
             assert_eq!(body["params"]["scope"]["origins"], json!(origins));
             assert!(body["params"]["facts"]
@@ -1930,6 +2215,7 @@ mod tests {
             &[],
             Severity::new(2, false, false),
             crate::consent_card::Urgency::Normal,
+            &[BrowserGrantChoice::Conversation],
         );
         assert!(!body["params"]["facts"]
             .as_array()
@@ -1968,7 +2254,11 @@ mod tests {
             .await
             .unwrap();
         let question = question.unwrap();
-        crate::consent_card::assert_contract(&question.body, &["allow", "deny"], "deny");
+        crate::consent_card::assert_contract(
+            &question.body,
+            &["allow_conversation", "deny"],
+            "deny",
+        );
         assert_eq!(
             question.body["params"]["target"]["label"],
             "login.example, pay.example"
@@ -2007,7 +2297,10 @@ mod tests {
 
         assert!(
             plane
-                .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+                .settle_browser_grant(
+                    &question.ask_id,
+                    Some(&json!({"decision": "allow_conversation"}))
+                )
                 .await
         );
         let grants = plane.browser_grants.lock().await;
@@ -2059,6 +2352,7 @@ mod tests {
                 vec![],
                 Some(MUTATE_DURABLE),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2081,7 +2375,10 @@ mod tests {
         );
         assert!(
             plane
-                .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow"})))
+                .settle_browser_grant(
+                    &question.ask_id,
+                    Some(&json!({"decision": "allow_conversation"}))
+                )
                 .await
         );
         let grants = plane.browser_grants.lock().await;
@@ -2096,6 +2393,7 @@ mod tests {
                 vec![],
                 Some(MUTATE_REVERSIBLE),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2117,6 +2415,7 @@ mod tests {
                 vec![],
                 Some(OBSERVE),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2141,6 +2440,7 @@ mod tests {
                         vec![],
                         Some(tier),
                         true,
+                        None,
                     )
                     .await
                     .unwrap_err(),
@@ -2195,11 +2495,17 @@ mod tests {
         let plane = plane(TargetResolution::NotRunning);
         let origins = vec!["https://example.com".to_string()];
         let (_, held) = plane
-            .open_in_call_browser_grant("conversation", origins.clone(), vec![], Some(OBSERVE))
+            .open_in_call_browser_grant(
+                "conversation",
+                origins.clone(),
+                vec![],
+                Some(OBSERVE),
+                None,
+            )
             .await
             .unwrap();
         let (_, ahead) = plane
-            .open_browser_grant_at_tier("conversation", origins, vec![], Some(OBSERVE), true)
+            .open_browser_grant_at_tier("conversation", origins, vec![], Some(OBSERVE), true, None)
             .await
             .unwrap();
         assert_eq!(held.unwrap().body["params"]["urgency"], "high");

@@ -1355,7 +1355,7 @@ async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
     let pending = consent_relay::elicit_and_answer(
         planes,
         opening,
-        json!({"decision": "allow"}),
+        json!({"decision": "allow_conversation"}),
         "browser.open_grant",
     )
     .await

@@ -4097,6 +4097,14 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             request_schema: json!({"type":"object","properties":{"origin":{"type":"string"}},"required":["origin"],"additionalProperties":false}),
             result_schema: crate::login_import::reply_schema(browser_launch_result_schema()),
         },
+        // Served on the management surface and reached as the flat tool's
+        // revoke_access action; listed for the same closed-schema boundary.
+        BrowserToolDefinition {
+            name: crate::management::REVOKE_ACCESS,
+            description: "Remove this agent's own standing browser access: every standing grant, or the one for origin.",
+            request_schema: json!({"type":"object","properties":{"origin":{"type":"string"}},"additionalProperties":false}),
+            result_schema: revoke_access_result_schema(),
+        },
         BrowserToolDefinition {
             name: crate::management::CAPTURE_LOGIN,
             description: "Capture a fresh login in a throwaway browser for the operator to store.",
@@ -4413,6 +4421,27 @@ fn wait_for_result_schema() -> Value {
 
 fn enum_schema(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
+}
+
+/// The reply of `browser.revoke_access`: how many standing rows it revoked,
+/// and why none were when the store could not be read or written or the
+/// route's agent is not attested.
+fn revoke_access_result_schema() -> Value {
+    closed_object(
+        json!({
+            "outcome":enum_schema(&[
+                "revoked",
+                "nothing_to_revoke",
+                "store_unavailable",
+                "revoke_failed",
+                "agent_not_attested",
+            ]),
+            "revoked":integer_schema(),
+            "reason":string_schema(),
+            "remedy":string_schema(),
+        }),
+        &["outcome", "revoked"],
+    )
 }
 
 fn browser_lease_result_schema() -> Value {
