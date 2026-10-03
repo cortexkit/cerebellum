@@ -961,6 +961,9 @@ mod tests {
                 crate::management::REBIND_PROFILE_ROOT,
                 crate::management::CAPTURE_LOGIN,
                 crate::management::CLEAR_LAUNCH_RECOVERY,
+                crate::management::REVOKE_ACCESS,
+                crate::management::REVOKE_GRANT,
+                crate::management::LIST_GRANTS,
             ]
         );
         let dispatchable = crate::management::OPERATIONS

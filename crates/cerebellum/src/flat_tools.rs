@@ -755,7 +755,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            13
+            14
         );
         let partial_browser = browser_tool(&browser_names[1..]).unwrap();
         assert!(!partial_browser.schema["properties"]["action"]["enum"]
@@ -1542,6 +1542,7 @@ mod tests {
                     "login_url": "https://example.com/login",
                 }),
             ),
+            ("revoke_access", json!({"origin": "https://example.com"})),
         ];
         assert_requirements_enforced_at_call_time(
             &planes,
