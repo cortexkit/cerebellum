@@ -308,6 +308,39 @@ impl JournalStore {
         self.commit_reserved_policy(handle, entry.export_line().into_bytes())
     }
 
+    /// The generic detail field is readable by older journal readers, so this
+    /// count-only management event does not introduce a new durable format.
+    pub(crate) fn commit_would_ask(
+        &mut self,
+        identity: JournalIdentity,
+        agent_id: &str,
+        flow_id: &str,
+        counts: serde_json::Value,
+    ) -> Result<(), JournalError> {
+        let handle = self.reserve_policy_event(&identity)?;
+        let entry = JournalEntry {
+            format_version: FORMAT_VERSION.to_string(),
+            sequence: handle.sequence(),
+            phase: Phase::Dispatched,
+            identity,
+            capability: None,
+            intent_redacted: None,
+            requested_severity: None,
+            effective_severity: None,
+            grant_decision: GrantDecision::not_reached(),
+            governing_observation: GoverningObservation::observation_not_required(),
+            action: None,
+            locator: None,
+            snapshot_ids: Vec::new(),
+            outcome: None,
+            payload: None,
+            detail: Some(
+                serde_json::json!({"event":"grants.would_ask","caller":{"agent_id":agent_id,"flow_id":flow_id},"counts":counts}),
+            ),
+        };
+        self.commit_reserved_policy(handle, entry.export_line().into_bytes())
+    }
+
     pub fn commit_login_import(
         &mut self,
         identity: JournalIdentity,

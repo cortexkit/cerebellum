@@ -793,6 +793,7 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
     matches!(
         name,
         management::OPEN_TARGET
+            | management::WOULD_ASK
             | management::LIST_APP_GRANTS
             | management::REVOKE_APP_GRANT
             | management::OPEN_GRANT
@@ -3123,13 +3124,25 @@ async fn handle_management_request(
         )
         .await;
     }
+    if method == management::WOULD_ASK && !facts.admits_session_calls() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "principal_denied",
+            "grants.would_ask is reserved to reserved:prefrontal-core",
+        )
+        .await;
+    }
     // Session admission, before any operation below asks a person, opens or
     // reads a grant, or writes the journal; see `send_session_caller_not_admitted`.
     // A caller not admitted to act in a conversation reaches only the
     // operator's operations, and those see these facts with every trace of
     // the conversation removed.
     let operator_facts;
-    let facts = if facts.admits_session_calls() {
+    let facts = if method == management::WOULD_ASK || facts.admits_session_calls() {
         facts
     } else if is_operator_operation(method) {
         operator_facts = facts.outside_session_scope();
@@ -3221,6 +3234,72 @@ async fn handle_management_request(
             present_browser_handoff(planes, &facts.identity, origin).await
         };
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+    }
+
+    if method == management::WOULD_ASK {
+        let request = match management::parse_would_ask(params_object) {
+            Ok(request) => request,
+            Err(error) => {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &error.field,
+                    error.reason,
+                )
+                .await
+            }
+        };
+        let reply = planes.management.would_ask(&request);
+        let items = reply["items"]
+            .as_array()
+            .expect("the evaluator returns items");
+        let counts = json!({
+            "item_count":items.len(),
+            "yes":items.iter().filter(|i| i["verdict"] == "yes").count(),
+            "no":items.iter().filter(|i| i["verdict"] == "no").count(),
+            "would_ask":items.iter().filter(|i| i["verdict"] == "would_ask").count(),
+        });
+        if planes
+            .browser
+            .journal_would_ask(
+                &facts.identity,
+                principal_label(&facts.principal),
+                &request.agent_id,
+                &request.flow_id,
+                counts,
+            )
+            .await
+            .is_err()
+        {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "journal_unavailable",
+                "permission query could not be audited",
+            )
+            .await;
+        }
+        return match planes.browser.finish_reply(method, reply) {
+            Ok(reply) => send_tool_response(writer, ver, channel, epoch, corr, reply).await,
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!("the permission reply violated its declared result schema ({error})"),
+                )
+                .await
+            }
+        };
     }
 
     if method == management::CAPTURE_LOGIN {
@@ -6811,6 +6890,230 @@ mod tests {
                 .unwrap();
         assert_ne!(navigated["outcome"], "authorization_denied", "{navigated}");
         assert_eq!(navigated["outcome"], "no_session", "{navigated}");
+    }
+
+    mod would_ask_tests {
+        use super::*;
+        use crate::computer_grants::{
+            AlwaysGrantRecord, ComputerGrants, GrantStorage, GrantStoreState, InMemoryGrantStorage,
+            GRANT_STORE_VERSION,
+        };
+
+        fn planes() -> Planes {
+            let mut planes = open_grant_planes();
+            let storage = Arc::new(InMemoryGrantStorage::new());
+            storage
+                .save(&GrantStoreState {
+                    version: GRANT_STORE_VERSION,
+                    records: vec![AlwaysGrantRecord {
+                        agent_project_id: "owner".to_string(),
+                        bundle_identity: "com.example.Always".to_string(),
+                        team_id: Some("TEAM".to_string()),
+                        designated_requirement: Some("test requirement".to_string()),
+                        machine_uuid: "machine".to_string(),
+                        created_at_ms: 1,
+                    }],
+                })
+                .unwrap();
+            planes.management = Arc::new(ManagementPlane::with_computer_grants(
+                Arc::new(management::PlatformResolver::new()),
+                Arc::new(ComputerGrants::open(storage, Some("machine".to_string()))),
+            ));
+            planes
+        }
+
+        async fn query(planes: &Planes, params: Value) -> Value {
+            let (tx, mut rx) = mpsc::channel(8);
+            let frame = Frame::build_with_version(
+                subc_protocol::PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                4,
+                1,
+                500,
+                serde_json::to_vec(&json!({"method":management::WOULD_ASK,"params":params}))
+                    .unwrap(),
+            )
+            .unwrap();
+            handle_frame(frame, &tx, planes).await.unwrap();
+            let reply = next_frame(&mut rx).await;
+            assert_ne!(reply.header.ty, FrameType::Request, "query raised a card");
+            assert_eq!(planes.elicitor.outstanding(), 0);
+            assert!(rx.try_recv().is_err(), "unexpected extra frame");
+            serde_json::from_slice(&reply.body).unwrap()
+        }
+
+        #[tokio::test]
+        async fn standing_only_and_count_only_audit() {
+            let planes = planes();
+            planes
+                .management
+                .computer_grants()
+                .seed_conversation_app_for_test(
+                    &planes.routes.get(4, 1).unwrap().identity.conversation_key,
+                    "com.example.Session",
+                );
+            let reply = query(
+                &planes,
+                json!({"flow_id":"flow:test","agent_id":"owner","items":[
+                    {"tool":"computer_use","target":"com.example.Always","level":4},
+                    {"tool":"computer_use","target":"com.example.Missing"},
+                    {"tool":"computer_use","target":"com.example.Session"}
+                ]}),
+            )
+            .await;
+            assert_eq!(
+                reply,
+                json!({"items":[
+                    {"tool":"computer_use","target":"com.example.Always","verdict":"yes","reason":"standing_grant"},
+                    {"tool":"computer_use","target":"com.example.Missing","verdict":"would_ask","reason":"no_standing_grant"},
+                    {"tool":"computer_use","target":"com.example.Session","verdict":"would_ask","reason":"no_standing_grant"}
+                ]})
+            );
+            let export = planes.browser.journal_export_for_test().await;
+            let entries: Vec<journal::JournalEntry> = export
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].identity.principal, "reserved:prefrontal-core");
+            assert_eq!(
+                entries[0].detail,
+                Some(
+                    json!({"event":"grants.would_ask","caller":{"agent_id":"owner","flow_id":"flow:test"},"counts":{"item_count":3,"yes":1,"no":0,"would_ask":2}})
+                )
+            );
+            assert!(!export.contains("com.example"));
+            let other = query(&planes, json!({"flow_id":"flow:test","agent_id":"other","items":[{"tool":"computer_use","target":"com.example.Always"}]})).await;
+            assert_eq!(other["items"][0]["verdict"], "would_ask");
+        }
+
+        #[tokio::test]
+        async fn browser_has_no_standing_store() {
+            let reply = query(&planes(), json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"browser_use","target":"https://example.com","level":1}]})).await;
+            assert_eq!(reply["items"][0]["verdict"], "would_ask");
+            assert_eq!(
+                reply["items"][0]["reason"],
+                "browser_standing_grants_unavailable"
+            );
+        }
+
+        #[tokio::test]
+        async fn inputs_are_closed_and_targets_are_validated() {
+            let planes = planes();
+            for target in [
+                json!("null"),
+                Value::Null,
+                json!("https://example.com/path"),
+                json!(""),
+            ] {
+                let reply = query(&planes, json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"browser_use","target":target}]})).await;
+                assert_eq!(reply["items"][0]["verdict"], "no", "{reply}");
+                assert_eq!(reply["items"][0]["reason"], "invalid_target");
+            }
+            for (params, field) in [
+                (
+                    json!({"flow_id":"flow:test","agent_id":"owner","items":[],"extra":true}),
+                    "extra",
+                ),
+                (
+                    json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"computer_use","target":"com.example.App","extra":1}]}),
+                    "items[0].extra",
+                ),
+                (
+                    json!({"flow_id":"flow:test","agent_id":"owner","items":[]}),
+                    "items",
+                ),
+                (
+                    json!({"flow_id":"flow:test","agent_id":"owner","items":vec![json!({"tool":"computer_use","target":"com.example.App"});65]}),
+                    "items",
+                ),
+                (
+                    json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"computer_use","target":"com.example.App","level":5}]}),
+                    "items[0].level",
+                ),
+                (
+                    json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"other","target":"com.example.App"}]}),
+                    "items[0].tool",
+                ),
+            ] {
+                let reply = query(&planes, params).await;
+                assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+                assert_eq!(reply["detail"]["field"], field, "{reply}");
+            }
+        }
+
+        #[tokio::test]
+        async fn flow_identity_is_required_bounded_and_audit_only() {
+            let planes = planes();
+            for flow in [
+                Value::Null,
+                json!(""),
+                json!("has space"),
+                json!("line\nfeed"),
+                json!("é"),
+                json!("a".repeat(257)),
+            ] {
+                let reply = query(&planes, json!({"agent_id":"owner","flow_id":flow,"items":[{"tool":"computer_use","target":"com.example.Always"}]})).await;
+                assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+                assert_eq!(reply["detail"]["field"], "flow_id", "{reply}");
+            }
+            let missing = query(&planes, json!({"agent_id":"owner","items":[{"tool":"computer_use","target":"com.example.Always"}]})).await;
+            assert_eq!(missing["detail"]["field"], "flow_id");
+            for flow in ["x".to_string(), "~".repeat(256)] {
+                let reply = query(&planes, json!({"agent_id":"owner","flow_id":flow,"items":[{"tool":"computer_use","target":"com.example.Always"}]})).await;
+                assert_eq!(reply["items"][0]["verdict"], "yes", "{reply}");
+            }
+        }
+
+        #[test]
+        fn result_schema_is_closed_and_withheld() {
+            let planes = planes();
+            for item in [
+                json!({"tool":"computer_use","target":"com.example.App","verdict":"maybe","reason":"standing_grant"}),
+                json!({"tool":"computer_use","target":"com.example.App","verdict":"yes","reason":"unknown"}),
+                json!({"tool":"computer_use","target":"com.example.App","verdict":"yes","reason":"standing_grant","extra":true}),
+            ] {
+                assert!(planes
+                    .browser
+                    .finish_reply(management::WOULD_ASK, json!({"items":[item]}))
+                    .is_err());
+            }
+            assert!(!browser::tool_definitions()
+                .iter()
+                .any(|(name, _, _)| *name == management::WOULD_ASK));
+        }
+
+        #[tokio::test]
+        async fn only_prefrontal_core_is_admitted() {
+            for principal in [
+                Some(subc_protocol::Principal::Direct),
+                Some(subc_protocol::Principal::Reserved {
+                    module_id: "aft".to_string(),
+                }),
+                Some(subc_protocol::Principal::Reserved {
+                    module_id: "alfonso-core".to_string(),
+                }),
+            ] {
+                let planes = planes();
+                planes.routes.insert(
+                    4,
+                    1,
+                    AcceptedBindFacts::from_bind(
+                        &bind_identity_for_test(),
+                        principal,
+                        None,
+                        None,
+                        &subc_protocol::RouteTarget::ManagementSurface {
+                            module_id: "cerebellum".to_string(),
+                        },
+                    ),
+                );
+                let reply = query(&planes, json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"computer_use","target":"com.example.Always"}]})).await;
+                assert_eq!(reply["code"], "principal_denied", "{reply}");
+                assert!(planes.browser.journal_export_for_test().await.is_empty());
+            }
+        }
     }
 
     /// Planes with one management route (channel 4, epoch 1) whose consumer

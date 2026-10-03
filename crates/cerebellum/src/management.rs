@@ -59,7 +59,10 @@ pub const CAPTURE_LOGIN: &str = "browser.capture_login";
 /// browser from before a restart gone. Operator-only: it is a management
 /// operation, never a tool, so no model sees it in a tool catalog.
 pub const CLEAR_LAUNCH_RECOVERY: &str = "browser.clear_launch_recovery";
-pub const OPERATIONS: [&str; 10] = [
+/// Check standing per-agent permissions without asking or touching a target.
+pub const WOULD_ASK: &str = "grants.would_ask";
+pub const OPERATIONS: [&str; 11] = [
+    WOULD_ASK,
     OPEN_TARGET,
     LIST_APP_GRANTS,
     REVOKE_APP_GRANT,
@@ -529,6 +532,42 @@ impl ManagementPlane {
             unreached_browser_grants: Mutex::new(BTreeMap::new()),
             unreached_profile_root_rebinds: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// A flow outlives a conversation, so only durable per-agent grants count.
+    pub(crate) fn would_ask(&self, request: &WouldAskRequest) -> Value {
+        let items: Vec<Value> = request
+            .items
+            .iter()
+            .map(|item| {
+                let target = item.target.as_str().unwrap_or("null");
+                let valid = if item.tool == "browser_use" {
+                    canonical_grant_origin(target).as_deref() == Some(target)
+                } else {
+                    !target.is_empty()
+                        && target != "null"
+                        && target
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                };
+                let (verdict, reason) = if !valid {
+                    ("no", "invalid_target")
+                } else if item.tool == "browser_use" {
+                    browser_standing_grant_answer(&request.agent_id, target, item.level)
+                } else if self
+                    .computer_grants
+                    .has_standing_app_grant(&request.agent_id, target)
+                {
+                    // The running app's signer is checked only at call time; this
+                    // install-time query must not resolve or inspect a process.
+                    ("yes", "standing_grant")
+                } else {
+                    ("would_ask", "no_standing_grant")
+                };
+                json!({"tool":item.tool,"target":target,"verdict":verdict,"reason":reason})
+            })
+            .collect();
+        json!({"items":items})
     }
 
     /// The computer plane's grants.
@@ -2205,4 +2244,123 @@ mod tests {
         assert_eq!(held.unwrap().body["params"]["urgency"], "high");
         assert_eq!(ahead.unwrap().body["params"]["urgency"], "normal");
     }
+}
+
+/// Browser grants currently expire with a conversation and cannot cover a
+/// flow installation. A per-agent site store can replace this function without
+/// changing the evaluator; until then every valid origin would need a card.
+fn browser_standing_grant_answer(
+    _agent: &str,
+    _origin: &str,
+    _level: Option<u64>,
+) -> (&'static str, &'static str) {
+    ("would_ask", "browser_standing_grants_unavailable")
+}
+
+pub(crate) struct WouldAskItem {
+    tool: String,
+    target: Value,
+    level: Option<u64>,
+}
+pub(crate) struct WouldAskRequest {
+    pub agent_id: String,
+    pub flow_id: String,
+    items: Vec<WouldAskItem>,
+}
+pub(crate) struct WouldAskRequestError {
+    pub field: String,
+    pub reason: &'static str,
+}
+
+pub(crate) fn parse_would_ask(
+    params: &serde_json::Map<String, Value>,
+) -> Result<WouldAskRequest, WouldAskRequestError> {
+    let error = |field: &str, reason| WouldAskRequestError {
+        field: field.to_string(),
+        reason,
+    };
+    if let Some(field) = params
+        .keys()
+        .filter(|k| !matches!(k.as_str(), "agent_id" | "flow_id" | "items"))
+        .min()
+    {
+        return Err(error(field, "unknown_field"));
+    }
+    let agent_id = params
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error("agent_id", "missing_field"))?
+        .to_string();
+    let flow_id = params
+        .get("flow_id")
+        .and_then(Value::as_str)
+        .filter(|s| (1..=256).contains(&s.len()) && s.bytes().all(|b| (33..=126).contains(&b)))
+        .ok_or_else(|| error("flow_id", "invalid_value"))?
+        .to_string();
+    let items = params
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("items", "wrong_type"))?;
+    if !(1..=64).contains(&items.len()) {
+        return Err(error("items", "out_of_range"));
+    }
+    let mut parsed = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let prefix = format!("items[{index}]");
+        let item = item
+            .as_object()
+            .ok_or_else(|| error(&prefix, "wrong_type"))?;
+        if let Some(field) = item
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "tool" | "target" | "level"))
+            .min()
+        {
+            return Err(error(&format!("{prefix}.{field}"), "unknown_field"));
+        }
+        let tool = item
+            .get("tool")
+            .and_then(Value::as_str)
+            .filter(|t| matches!(*t, "browser_use" | "computer_use"))
+            .ok_or_else(|| error(&format!("{prefix}.tool"), "invalid_value"))?;
+        let target = item
+            .get("target")
+            .ok_or_else(|| error(&format!("{prefix}.target"), "missing_field"))?;
+        if !target.is_string() && !(tool == "browser_use" && target.is_null()) {
+            return Err(error(&format!("{prefix}.target"), "wrong_type"));
+        }
+        let level = match item.get("level") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|v| (1..=4).contains(v))
+                    .ok_or_else(|| error(&format!("{prefix}.level"), "out_of_range"))?,
+            ),
+        };
+        parsed.push(WouldAskItem {
+            tool: tool.to_string(),
+            target: target.clone(),
+            level,
+        });
+    }
+    Ok(WouldAskRequest {
+        agent_id,
+        flow_id,
+        items: parsed,
+    })
+}
+
+pub(crate) fn would_ask_result_schema() -> Value {
+    json!({"type":"object","required":["items"],"additionalProperties":false,"properties":{
+        "items":{"type":"array","items":{
+            "type":"object","required":["tool","target","verdict","reason"],"additionalProperties":false,
+            "properties":{
+                "tool":{"type":"string","enum":["browser_use","computer_use"]},
+                "target":{"type":"string"},
+                "verdict":{"type":"string","enum":["yes","no","would_ask"]},
+                "reason":{"type":"string","enum":["standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target"]}
+            }
+        }}
+    }})
 }

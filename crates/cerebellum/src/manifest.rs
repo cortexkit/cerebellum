@@ -117,6 +117,10 @@ fn management_surface() -> ProviderRole {
         concurrency: Concurrency::ModuleManaged,
         operations: [
             (
+                crate::management::WOULD_ASK,
+                "Check standing per-agent grants for flow installation without asking or touching targets. Prefrontal core only.",
+            ),
+            (
                 crate::management::OPEN_TARGET,
                 "Settle an application's app grant ahead of any computer action: \
                  asks the person if the grant is not held and waits for the \
@@ -931,6 +935,7 @@ mod tests {
         assert_eq!(
             advertised,
             vec![
+                crate::management::WOULD_ASK,
                 crate::management::OPEN_TARGET,
                 crate::management::LIST_APP_GRANTS,
                 crate::management::REVOKE_APP_GRANT,
