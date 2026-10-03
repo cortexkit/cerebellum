@@ -795,7 +795,7 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     else {
         panic!("a real subc catalogue must carry cerebellum's management surface");
     };
-    assert_eq!(operations.len(), 10);
+    assert_eq!(operations.len(), 13);
     assert_eq!(operations[0].name, "computer.open_target");
     assert_eq!(operations[1].name, "computer.list_app_grants");
     assert_eq!(operations[2].name, "computer.revoke_app_grant");
@@ -806,6 +806,9 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     assert_eq!(operations[7].name, "browser.rebind_profile_root");
     assert_eq!(operations[8].name, "browser.capture_login");
     assert_eq!(operations[9].name, "browser.clear_launch_recovery");
+    assert_eq!(operations[10].name, "browser.revoke_access");
+    assert_eq!(operations[11].name, "browser.revoke_grant");
+    assert_eq!(operations[12].name, "grants.list");
 
     let Some(tools) = entry.roles.iter().find_map(|role| match role {
         ProviderRole::ToolProvider { tools, .. } => Some(tools),
