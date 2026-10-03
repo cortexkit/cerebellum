@@ -122,6 +122,68 @@ fn a_grant_store_save_without_a_floor_is_refused_and_writes_nothing() {
     assert!(!path.exists());
 }
 
+// ---- standing browser grant store ----
+
+mod standing_browser_grants {
+    use super::*;
+    use cerebellum::browser_standing_grants::{
+        FilesystemStandingGrantStorage, StandingGrantStorage, StandingGrantStoreError,
+        StandingGrantStoreState, STANDING_GRANT_STORE_FORMAT,
+    };
+
+    #[test]
+    fn a_standing_grant_store_from_the_next_version_is_refused_by_name_not_as_corrupt() {
+        let scratch = Scratch::new("standing-newer");
+        let path = scratch.path().join("browser_standing_grants.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version": STANDING_GRANT_STORE_FORMAT.version + 1,
+                "grants": [{"a_field_this_build_does_not_know": true}],
+                "added_later": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            FilesystemStandingGrantStorage::new(&path).load(),
+            Err(StandingGrantStoreError::UnknownVersion {
+                found: STANDING_GRANT_STORE_FORMAT.version + 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_standing_grant_store_save_raises_the_floor_before_writing() {
+        let scratch = Scratch::new("standing-raise");
+        let path = scratch.path().join("browser_standing_grants.json");
+        FilesystemStandingGrantStorage::new(&path)
+            .with_format_floor(FormatFloor::at(scratch.floor()))
+            .save(&StandingGrantStoreState::default())
+            .unwrap();
+        assert_eq!(
+            read_floors(&scratch.floor())
+                .unwrap()
+                .get("browser-standing-grants"),
+            Some(&STANDING_GRANT_STORE_FORMAT.version)
+        );
+    }
+
+    #[test]
+    fn a_standing_grant_store_save_without_a_floor_is_refused_and_writes_nothing() {
+        let scratch = Scratch::new("standing-refuse");
+        let path = scratch.path().join("browser_standing_grants.json");
+        let result = FilesystemStandingGrantStorage::new(&path)
+            .with_format_floor(FormatFloor::at(scratch.unwritable_floor()))
+            .save(&StandingGrantStoreState::default());
+        assert!(
+            matches!(&result, Err(StandingGrantStoreError::WriteFailed { detail }) if detail.contains("format floor")),
+            "{result:?}"
+        );
+        assert!(!path.exists());
+    }
+}
+
 // ---- profile custody lock ----
 
 #[cfg(unix)]

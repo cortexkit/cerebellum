@@ -9,14 +9,52 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::browser_standing_grants::StandingBrowserGrants;
 use crate::classification::{
     canonical_grant_origin, canonical_origin, NonTypeClassificationFingerprint,
     NonTypeClassificationRecord,
 };
+
+/// The start of the grant id of every decision made under a standing browser
+/// row rather than a conversation grant. The rest of the id is the row's key,
+/// which commit uses to check the row is still in force.
+pub const STANDING_GRANT_ID_PREFIX: &str = "standing:";
+
+/// The agent a browser request is served for, when its identity was attested
+/// by the daemon, so that standing browser rows of that agent may be consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingCaller {
+    /// The attested `agentProjectId`.
+    pub agent_id: String,
+}
+
+tokio::task_local! {
+    /// Set around one browser request by the code that knows whether its
+    /// route's agent identity is attested. Authorization reads it rather than
+    /// taking it as an argument because the browser plane builds its requests
+    /// from a route identity that does not carry the attestation. A request
+    /// served outside such a scope, or on a task spawned from it, sees no
+    /// caller and is authorized by conversation grants alone.
+    static STANDING_CALLER: Option<StandingCaller>;
+}
+
+/// Run `future` with `caller` as the agent whose standing browser rows may
+/// authorize it. `None` hides any caller an enclosing scope set.
+pub async fn with_standing_caller<F: std::future::Future>(
+    caller: Option<StandingCaller>,
+    future: F,
+) -> F::Output {
+    STANDING_CALLER.scope(caller, future).await
+}
+
+fn current_standing_caller() -> Option<StandingCaller> {
+    STANDING_CALLER.try_with(Clone::clone).ok().flatten()
+}
 
 pub const OBSERVE: u8 = 1;
 pub const COMPOSE: u8 = 2;
@@ -503,6 +541,10 @@ impl AuthorizationCommitment {
 pub struct GrantStore {
     current: BTreeMap<String, ActionGrant>,
     invalid: bool,
+    /// Standing per-agent browser rows, consulted when no conversation grant
+    /// covers an action and the request runs for an attested agent (see
+    /// [`with_standing_caller`]).
+    standing: Option<Arc<StandingBrowserGrants>>,
 }
 
 pub type AuthorizationStore = GrantStore;
@@ -526,6 +568,84 @@ impl GrantStore {
             store.insert_initial(grant)?;
         }
         Ok(store)
+    }
+
+    /// Consult `standing` for actions no conversation grant covers.
+    pub fn with_standing_grants(mut self, standing: Arc<StandingBrowserGrants>) -> Self {
+        self.standing = Some(standing);
+        self
+    }
+
+    /// The standing browser rows this store consults, if any.
+    pub fn standing_grants(&self) -> Option<&Arc<StandingBrowserGrants>> {
+        self.standing.as_ref()
+    }
+
+    /// A grant standing in for the live standing row that covers this action,
+    /// when the request runs for an attested agent that holds one.
+    ///
+    /// The grant names only the attempted origin, so the decision's origin
+    /// scope is that one origin: a redirect or a later read elsewhere is
+    /// authorized again on its own, exactly as under a conversation grant.
+    fn standing_grant(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        required: Severity,
+        attempted_origin: &str,
+        required_hazards: &BTreeSet<HazardClass>,
+    ) -> Option<ActionGrant> {
+        let standing = self.standing.as_ref()?;
+        let caller = current_standing_caller()?;
+        // The request names the agent it acts for; a scope set for another
+        // agent must never lend that agent's rows to this request.
+        if caller.agent_id.is_empty() || caller.agent_id != request.bind_identity {
+            return None;
+        }
+        let origin = canonical_grant_origin(attempted_origin)?;
+        let row = standing.covering_row(
+            &caller.agent_id,
+            &origin,
+            required,
+            required_hazards,
+            standing.now_ms(),
+        )?;
+        Some(
+            ActionGrant::new(
+                format!("{STANDING_GRANT_ID_PREFIX}{}", row.key()),
+                row.granted_at_ms.max(1),
+                request.conversation_key,
+                row.severity(),
+                [origin],
+            )
+            .with_disclosed_hazards(row.hazards.iter().copied()),
+        )
+    }
+
+    /// The conversation grant covering this action, or else the standing row
+    /// that does. When neither does, the conversation's refusal is returned
+    /// unchanged, so its remedy still names the card that would cover it.
+    fn select_conversation_or_standing(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        required: Severity,
+        attempted_origin: &str,
+        required_hazards: &BTreeSet<HazardClass>,
+    ) -> Result<ActionGrant, AuthorizationError> {
+        match self.select_covering_grant_for_hazards(
+            request.conversation_key,
+            required,
+            attempted_origin,
+            required_hazards,
+        ) {
+            Ok(grant) => Ok(grant),
+            Err(
+                refusal @ (AuthorizationError::InvalidGrant
+                | AuthorizationError::InvalidSeverityTier),
+            ) => Err(refusal),
+            Err(refusal) => self
+                .standing_grant(request, required, attempted_origin, required_hazards)
+                .ok_or(refusal),
+        }
     }
 
     fn insert_initial(&mut self, grant: ActionGrant) -> Result<(), AuthorizationError> {
@@ -708,8 +828,8 @@ impl GrantStore {
             return Err(AuthorizationError::SeverityBelowFloor { required: computed });
         }
         let effective = request.requested_severity.maximum(computed);
-        let grant = self.select_covering_grant_for_hazards(
-            request.conversation_key,
+        let grant = self.select_conversation_or_standing(
+            &request,
             effective,
             attempted_origin,
             &required_hazards,
@@ -718,8 +838,8 @@ impl GrantStore {
             .classification
             .and_then(|record| record.activation_destination_origin.as_deref())
         {
-            self.select_covering_grant_for_hazards(
-                request.conversation_key,
+            self.select_conversation_or_standing(
+                &request,
                 effective,
                 destination,
                 &required_hazards,
@@ -736,6 +856,20 @@ impl GrantStore {
     ) -> Result<AuthorizationCommitment, AuthorizationCommitError> {
         self.ensure_valid()
             .map_err(|_| AuthorizationCommitError::InvalidGrantState)?;
+        if let Some(key) = decision.grant_id.strip_prefix(STANDING_GRANT_ID_PREFIX) {
+            // A standing decision commits only while its row is still in
+            // force: revoked or expired since authorization admits nothing.
+            let live = self.standing.as_ref().is_some_and(|standing| {
+                standing.row_is_live(&decision.bind_identity, key, standing.now_ms())
+            });
+            if !live {
+                return Err(AuthorizationCommitError::GrantRevoked);
+            }
+            return Ok(AuthorizationCommitment {
+                token: format!("commit-{}", decision.decision_id),
+                decision: decision.clone(),
+            });
+        }
         let Some(current) = self.current.get(&decision.grant_id) else {
             return Err(AuthorizationCommitError::GrantRevoked);
         };

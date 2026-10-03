@@ -176,6 +176,21 @@ fn management_surface() -> ProviderRole {
                  Refuses unless no running process names the profile and Chrome's lock names no \
                  running browser; both are read again before anything is cleared.",
             ),
+            (
+                crate::management::REVOKE_ACCESS,
+                "Remove the calling agent's own standing browser access: every standing grant, \
+                 or the one for origin. Only narrows, so it asks nobody.",
+            ),
+            (
+                crate::management::REVOKE_GRANT,
+                "Remove a named agent's standing browser access: all of it, one origin's, or \
+                 the all-sites grants. Operator-only.",
+            ),
+            (
+                crate::management::LIST_GRANTS,
+                "List a named agent's live standing browser grants and always-allow app \
+                 grants. Operator-only.",
+            ),
         ]
         .into_iter()
         .map(|(name, description)| ManagementOperation {
@@ -187,8 +202,13 @@ fn management_surface() -> ProviderRole {
             } else if name == crate::management::CAPTURE_LOGIN {
                 // A capture stores a login in the vault.
                 ManagementOperationKind::Mutate
-            } else if name == crate::management::REVOKE_APP_GRANT {
-                // A revoke rewrites the durable grant store.
+            } else if matches!(
+                name,
+                crate::management::REVOKE_APP_GRANT
+                    | crate::management::REVOKE_ACCESS
+                    | crate::management::REVOKE_GRANT
+            ) {
+                // A revoke rewrites a durable grant store.
                 ManagementOperationKind::Mutate
             } else {
                 // The remaining operations report state or arrange authority;
@@ -946,6 +966,9 @@ mod tests {
                 crate::management::REBIND_PROFILE_ROOT,
                 crate::management::CAPTURE_LOGIN,
                 crate::management::CLEAR_LAUNCH_RECOVERY,
+                crate::management::REVOKE_ACCESS,
+                crate::management::REVOKE_GRANT,
+                crate::management::LIST_GRANTS,
             ]
         );
         let dispatchable = crate::management::OPERATIONS

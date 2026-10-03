@@ -780,7 +780,7 @@ mod macos_probe {
                     }
                 }),
             ),
-            json!({"decision": "allow"}),
+            json!({"decision": "allow_conversation"}),
             "browser grant",
         )
         .await?;

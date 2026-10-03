@@ -812,6 +812,9 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
             "browser.rebind_profile_root",
             "browser.capture_login",
             "browser.clear_launch_recovery",
+            "browser.revoke_access",
+            "browser.revoke_grant",
+            "grants.list",
         ]
     );
 

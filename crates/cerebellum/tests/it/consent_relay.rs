@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 // Allow the included example helper to retain the same name as its enclosing suite.
 #[allow(clippy::module_inception)]
 #[path = "../../examples/support/consent_relay.rs"]
-mod consent_relay;
+pub(crate) mod consent_relay;
 
 const MANAGEMENT_CHANNEL: u16 = 4;
 const MANAGEMENT_EPOCH: u32 = 1;
@@ -140,7 +140,7 @@ async fn the_relay_answers_the_question_and_the_consent_settles() {
     let reply = consent_relay::elicit_and_answer(
         &planes,
         open_grant(10),
-        json!({"decision": "allow"}),
+        json!({"decision": "allow_conversation"}),
         "browser.open_grant",
     )
     .await

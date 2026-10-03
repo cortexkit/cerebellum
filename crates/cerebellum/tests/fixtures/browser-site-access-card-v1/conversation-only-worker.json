@@ -1,0 +1,60 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Can",
+      "value": "It can open and read pages there and click ordinary buttons and links"
+    },
+    {
+      "label": "Can't",
+      "value": "It can't submit sign-in forms, payment forms or forms whose purpose it couldn't check"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "detail": "Up to clicking ordinary links and buttons.",
+      "effect": "grant",
+      "id": "allow_conversation",
+      "label": "Allow for this conversation"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Let the agent use its own browser on news.example to read pages and click.",
+  "requestedSchema": {
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "allow_conversation",
+          "deny"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision"
+    ],
+    "type": "object"
+  },
+  "scope": {
+    "origins": [
+      "https://news.example"
+    ],
+    "tier": 2
+  },
+  "target": {
+    "kind": "site",
+    "label": "news.example"
+  },
+  "title": "Allow access to news.example?",
+  "urgency": "high"
+}

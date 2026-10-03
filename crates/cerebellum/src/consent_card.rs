@@ -26,6 +26,12 @@ pub(crate) struct ConsentOption {
     id: String,
     label: String,
     effect: Effect,
+    /// A sentence under the label saying what choosing it allows. Core's
+    /// option carries only `id`, `label`, `effect` and this, so anything else
+    /// an option means (a ceiling, a duration) is kept by the asker against
+    /// the option id rather than sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,7 +47,12 @@ impl ConsentOption {
             id: id.into(),
             label: label.into(),
             effect: Effect::Grant,
+            detail: None,
         }
+    }
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
     pub fn decline(id: impl Into<String>, label: impl Into<String>) -> DeclineOption {
         DeclineOption {
@@ -506,7 +517,7 @@ mod tests {
     const REQUEST_VECTORS_MANIFEST_SHA256: &str =
         "70617099cddb426b8ce4b6cf49d04337e58dd61230f909bc0bcba31c73c64c88";
 
-    fn sha256_hex(bytes: &[u8]) -> String {
+    pub(super) fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         Sha256::digest(bytes)
             .iter()
@@ -701,6 +712,7 @@ mod every_card_kind {
                 &hazards,
                 Severity::new(4, true, false),
                 urgency,
+                &[crate::management::BrowserGrantChoice::Conversation],
             );
             let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
             assert_card(
@@ -716,6 +728,7 @@ mod every_card_kind {
             &[],
             Severity::new(2, false, false),
             Urgency::Normal,
+            &[crate::management::BrowserGrantChoice::Conversation],
         );
         let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
         assert_card(
@@ -723,6 +736,153 @@ mod every_card_kind {
             &params,
             "normal",
             json!({"origins": origins, "tier": 2}),
+        );
+    }
+
+    /// The site-access card for each option set it can offer, pinned as the
+    /// exact `params` sent, so the phone app and core can check their decoders
+    /// against the same bytes.
+    ///
+    /// Each card is built by the production builder from the option set the
+    /// production offering rule picks for its case, put through
+    /// `Elicitor::ask`, held to core's contract, and compared with the pinned
+    /// file. `SHA256SUMS` beside the files pins each file's hash. Run with
+    /// `CEREBELLUM_WRITE_SITE_CARD_VECTORS=1` to rewrite the files and the sums
+    /// after a deliberate change to the card.
+    #[tokio::test]
+    async fn browser_site_access_card_vectors_are_pinned_and_decode_in_core() {
+        use crate::management::{offered_browser_grant_choices, BrowserGrantChoice};
+        use std::collections::BTreeSet;
+        const DIR: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/browser-site-access-card-v1"
+        );
+        let public = vec!["https://news.example".to_string()];
+        let private = vec!["http://10.0.0.5".to_string()];
+        let credential = BTreeSet::from([HazardClass::CredentialFormSubmit]);
+        let none = BTreeSet::new();
+        let all = |choices: &[BrowserGrantChoice]| {
+            choices
+                .iter()
+                .map(|choice| choice.option_id())
+                .chain(["deny"])
+                .collect::<Vec<_>>()
+        };
+        /// The vector's file, the card's origins and hazards, the ceiling
+        /// the request needs, whether the session may be offered standing
+        /// answers, and the option ids the card must carry.
+        type Case<'a> = (
+            &'a str,
+            &'a Vec<String>,
+            &'a BTreeSet<HazardClass>,
+            Severity,
+            bool,
+            &'a [&'a str],
+        );
+        let cases: [Case<'_>; 5] = [
+            (
+                "all-options.json",
+                &public,
+                &none,
+                Severity::new(2, false, false),
+                true,
+                &[
+                    "allow_conversation",
+                    "allow_origin_always",
+                    "allow_all_sites_10m",
+                    "allow_all_sites_always",
+                    "deny",
+                ],
+            ),
+            (
+                "no-all-sites-level-4.json",
+                &public,
+                &none,
+                Severity::new(4, false, false),
+                true,
+                &["allow_conversation", "allow_origin_always", "deny"],
+            ),
+            (
+                "no-all-sites-hazard.json",
+                &public,
+                &credential,
+                Severity::new(4, true, false),
+                true,
+                &["allow_conversation", "allow_origin_always", "deny"],
+            ),
+            (
+                "no-all-sites-private-origin.json",
+                &private,
+                &none,
+                Severity::new(2, false, false),
+                true,
+                &["allow_conversation", "allow_origin_always", "deny"],
+            ),
+            (
+                "conversation-only-worker.json",
+                &public,
+                &none,
+                Severity::new(2, false, false),
+                false,
+                &["allow_conversation", "deny"],
+            ),
+        ];
+        let write = std::env::var_os("CEREBELLUM_WRITE_SITE_CARD_VECTORS").is_some();
+        let mut sums = String::new();
+        for (name, origins, hazards, severity, standing, expected_ids) in cases {
+            let choices = offered_browser_grant_choices(origins, hazards, severity, standing);
+            assert_eq!(all(&choices), expected_ids, "{name}: offered options");
+            let hazards_wire: Vec<String> = hazards
+                .iter()
+                .map(|hazard| hazard.as_str().to_string())
+                .collect();
+            let body = crate::management::browser_grant_question(
+                "browser-site-access-vector",
+                origins,
+                &hazards_wire,
+                severity,
+                Urgency::High,
+                &choices,
+            );
+            let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
+            assert_core_accepts(name, &params);
+            // Core's option is `{id, label, effect, detail?}` and nothing else.
+            for option in params["options"].as_array().unwrap() {
+                let keys: BTreeSet<&str> = option
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert!(
+                    keys.is_subset(&BTreeSet::from(["id", "label", "effect", "detail"])),
+                    "{name}: option carries {keys:?}"
+                );
+            }
+            let rendered = format!("{}\n", serde_json::to_string_pretty(&params).unwrap());
+            let path = std::path::Path::new(DIR).join(name);
+            if write {
+                std::fs::create_dir_all(DIR).unwrap();
+                std::fs::write(&path, &rendered).unwrap();
+            }
+            let pinned = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{name}: {error}\nrendered:\n{rendered}"));
+            assert_eq!(
+                pinned, rendered,
+                "{name}: the card changed from the pinned vector"
+            );
+            let digest = super::tests::sha256_hex(pinned.as_bytes());
+            eprintln!("{name} sha256 {digest}");
+            sums.push_str(&format!("{digest}  {name}\n"));
+        }
+        let sums_path = std::path::Path::new(DIR).join("SHA256SUMS");
+        if write {
+            std::fs::write(&sums_path, &sums).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&sums_path).unwrap(),
+            sums,
+            "SHA256SUMS does not match the pinned vectors"
         );
     }
 

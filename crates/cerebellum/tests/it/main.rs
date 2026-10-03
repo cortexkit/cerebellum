@@ -11,6 +11,7 @@ mod b2a_s7_journal;
 mod b2b_s8_profile;
 mod b2b_s9_custody;
 mod browser_profile_custody;
+mod browser_standing_grants;
 mod c1_s6_integration;
 mod computer_consent;
 mod computer_element_actions;

@@ -1,0 +1,71 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Can",
+      "value": "It can open and read pages there and click ordinary buttons and links"
+    },
+    {
+      "label": "Can't",
+      "value": "It can't submit sign-in forms, payment forms or forms whose purpose it couldn't check"
+    },
+    {
+      "label": "Exact sites",
+      "value": "http://10.0.0.5"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "detail": "Up to clicking ordinary links and buttons.",
+      "effect": "grant",
+      "id": "allow_conversation",
+      "label": "Allow for this conversation"
+    },
+    {
+      "detail": "Up to clicking ordinary links and buttons.",
+      "effect": "grant",
+      "id": "allow_origin_always",
+      "label": "Always allow on 10.0.0.5"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Let the agent use its own browser on 10.0.0.5 to read pages and click.",
+  "requestedSchema": {
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "allow_conversation",
+          "allow_origin_always",
+          "deny"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision"
+    ],
+    "type": "object"
+  },
+  "scope": {
+    "origins": [
+      "http://10.0.0.5"
+    ],
+    "tier": 2
+  },
+  "target": {
+    "kind": "site",
+    "label": "10.0.0.5"
+  },
+  "title": "Allow access to 10.0.0.5?",
+  "urgency": "high"
+}
