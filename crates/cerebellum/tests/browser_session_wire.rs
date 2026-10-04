@@ -6684,3 +6684,234 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
     );
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
+
+#[cfg(unix)]
+mod resource_busy_wire {
+    use super::*;
+    use cerebellum::browser_launch::{HeldOpenedProfile, ProfileBoundLaunch};
+    use cerebellum::profile::{
+        stamped_bind_context, BindFacts, DispatchCommitmentToken, InvocationToken,
+        JournalReservationHandle, ProfileLifecycle, RegistryConfig,
+    };
+    use cerebellum::profile_custody::{
+        FilesystemProfileCustodyJournal, KernelSupervisorLiveness, ProfileCustodyKey,
+        ProfileCustodyLocks,
+    };
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    type Locks = ProfileCustodyLocks<FilesystemProfileCustodyJournal, KernelSupervisorLiveness>;
+    struct CustodyLauncher {
+        lifecycle: Arc<Mutex<ProfileLifecycle>>,
+        locks: Arc<Mutex<Locks>>,
+        process: RecordingLauncher,
+    }
+    struct CustodyCleanup {
+        holder_id: String,
+        opened: Option<HeldOpenedProfile>,
+        lifecycle: Arc<Mutex<ProfileLifecycle>>,
+        locks: Arc<Mutex<Locks>>,
+    }
+    impl SessionCleanup for CustodyCleanup {
+        fn custody_holder_id(&self) -> Option<&str> {
+            Some(&self.holder_id)
+        }
+        fn after_reap(
+            &mut self,
+        ) -> Result<cerebellum::browser_session::SessionCleanupOutcome, CleanupStage> {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            let mut locks = self.locks.lock().unwrap();
+            ProfileBoundLaunch::new(&mut lifecycle, &mut locks)
+                .rollback_opened(self.opened.take().unwrap())
+                .unwrap();
+            Ok(cerebellum::browser_session::SessionCleanupOutcome::Complete)
+        }
+    }
+    impl BrowserSessionLauncher for CustodyLauncher {
+        fn launch(
+            &self,
+            accepted: &cerebellum_core::identity::AcceptedBindFacts,
+            id: &str,
+        ) -> Result<LaunchedBrowser, Value> {
+            let context = stamped_bind_context(BindFacts {
+                principal: "direct:agent".into(),
+                conversation_key: accepted.identity.conversation_key.clone(),
+                agent_project_id: accepted.identity.agent_project_id.clone(),
+                session_kind: Some("primary".into()),
+                session_kind_attested: true,
+                profile_disposition: Some("durable".into()),
+                effective_capability_scope: Some(vec!["browser.launch".into()]),
+                provenance: "daemon_attested_spec_a".into(),
+            })
+            .unwrap();
+            let invocation = InvocationToken::for_test(id);
+            let reservation =
+                JournalReservationHandle::for_test(&invocation, format!("reservation-{id}"));
+            let commitment = DispatchCommitmentToken::for_test(
+                &invocation,
+                &reservation,
+                format!("commitment-{id}"),
+            );
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            let mut locks = self.locks.lock().unwrap();
+            let mut bound =
+                ProfileBoundLaunch::new(&mut lifecycle, &mut locks).with_launch_timeout(100);
+            let prepared = bound
+                .acquire_and_prepare(
+                    ProfileCustodyKey::durable(&accepted.identity.agent_project_id),
+                    &invocation,
+                    &reservation,
+                    &context,
+                )
+                .map_err(|e| e.as_json())?;
+            let opened = bound
+                .launch_prepared(prepared, &commitment)
+                .map_err(|e| e.as_json())?;
+            let holder_id = opened.holder_id().as_str().to_string();
+            let mut browser = self.process.launch(accepted, id)?;
+            browser.cleanup = Box::new(CustodyCleanup {
+                holder_id,
+                opened: Some(opened),
+                lifecycle: self.lifecycle.clone(),
+                locks: self.locks.clone(),
+            });
+            Ok(browser)
+        }
+    }
+    async fn bind(planes: &Planes, channel: u16, conversation: &str) {
+        let control = ModuleControlRequest::RouteBind {
+            role_versions: None,
+            route_channel: channel,
+            epoch: 3,
+            target: RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+            identity: BindIdentity::new("/same/project", "test", conversation),
+            principal: cerebellum::session_caller_principal_for_test(),
+            consumer_capabilities: None,
+            admission_facts: Some(
+                json!({"agentProjectId":"same-agent","sessionKind":"primary","profileDisposition":"durable","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.launch","browser.status","browser.close"]}),
+            ),
+            scope: None,
+        };
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&control).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        cerebellum::handle_control_request_for_test_with_bindings(
+            frame,
+            &tx,
+            &planes.health,
+            &planes.routes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+    }
+    async fn launch(planes: &Planes, channel: u16) -> Value {
+        let frame = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), channel, 3, 1, serde_json::to_vec(&json!({"name":"browser.launch","arguments":{},"call_key":format!("launch-{channel}")})).unwrap()).unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        cerebellum::handle_tool_request_for_test_with_existing_planes(frame, &tx, planes)
+            .await
+            .unwrap();
+        serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap()
+    }
+    #[tokio::test]
+    async fn resource_busy_same_agent_launch_reaches_withhold_boundary_with_real_lease_timing() {
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let root: PathBuf =
+            std::env::temp_dir().join(format!("ck-resource-busy-{}-{since}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let launcher = Arc::new(CustodyLauncher {
+            lifecycle: Arc::new(Mutex::new(
+                ProfileLifecycle::open_with_config(
+                    &root,
+                    RegistryConfig {
+                        uuid_protocol_compatible: true,
+                        grant_verifier_available: true,
+                        sealing_available: true,
+                        ..RegistryConfig::default()
+                    },
+                )
+                .unwrap(),
+            )),
+            locks: Arc::new(Mutex::new(
+                ProfileCustodyLocks::open_filesystem(&root).unwrap(),
+            )),
+            process: RecordingLauncher::default(),
+        });
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            Some(config()),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        planes.browser = Arc::new(
+            BrowserPlane::with_session_gate(
+                planes.sessions.clone(),
+                Arc::clone(&planes.lease_clock),
+                100,
+            )
+            .with_result_schema_enforcement(
+                cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+            ),
+        );
+        planes.launch_service = Some(launcher.clone());
+        bind(&planes, 9, "holder-conversation").await;
+        bind(&planes, 10, "contender-conversation").await;
+        let launched = launch(&planes, 9).await;
+        assert_eq!(launched["outcome"], "launched", "{launched}");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let reply = launch(&planes, 10).await;
+        assert_eq!(reply["outcome"], "resource_busy", "{reply}");
+        let detail: cortexkit_resource_busy::ResourceBusy =
+            serde_json::from_value(reply["detail"].clone()).unwrap();
+        detail.validate().unwrap();
+        assert_eq!(detail.resource, "browser_profile");
+        assert_eq!(detail.holder, cortexkit_resource_busy::Holder::head());
+        assert!(reply["detail"]["holder"].get("flow_id").is_none());
+        assert!(detail.since_ms >= since && detail.since_ms <= since + 3000);
+        assert!(
+            detail.retry_after_ms <= config().browser_idle_timeout_ms - 50,
+            "retry hint ignores activity: {reply}"
+        );
+        assert_eq!(
+            *launcher.process.launches.lock().unwrap(),
+            1,
+            "refusal must not launch a second process"
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        let record = withdraw(&planes, &tx, &mut rx, 10, 2, "launch-10").await;
+        assert_eq!(
+            body(&record),
+            json!({"answer":"refused","reason":"resource_busy"})
+        );
+        planes.sessions.close(
+            "holder-conversation",
+            launched["browser_session_id"].as_str().unwrap(),
+            &config(),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fleet_head_browser_profile_vector_decodes_with_provider_types() {
+        let bytes = include_str!("../../../../commons/crates/cortexkit-resource-busy/tests/vectors/head-browser-profile.json");
+        let detail: cortexkit_resource_busy::ResourceBusy = serde_json::from_str(bytes).unwrap();
+        detail.validate().unwrap();
+        assert_eq!(detail.holder, cortexkit_resource_busy::Holder::head());
+        assert_eq!(
+            serde_json::to_value(detail).unwrap(),
+            serde_json::from_str::<Value>(bytes).unwrap()
+        );
+    }
+}

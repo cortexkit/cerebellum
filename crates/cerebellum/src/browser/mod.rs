@@ -4511,7 +4511,11 @@ fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Va
     let mut outcomes = outcomes.to_vec();
     outcomes.push("authorization_denied");
     properties.insert("outcome".into(), enum_schema(&outcomes));
-    properties.insert("detail".into(), invalid_request_detail_result_schema());
+    let detail = match properties.remove("detail") {
+        Some(detail) => json!({"anyOf": [invalid_request_detail_result_schema(), detail]}),
+        None => invalid_request_detail_result_schema(),
+    };
+    properties.insert("detail".into(), detail);
     properties.insert("remedy".into(), string_schema());
     // `browser.launch` already carries a free-form `reason` for its own
     // refusals; the other two get the closed admission vocabulary.
@@ -4543,6 +4547,7 @@ fn browser_launch_result_schema() -> Value {
             // needs; left undeclared, the reply boundary replaced them with a
             // schema violation that told the caller nothing.
             "profile_busy",
+            "resource_busy",
             // The profile is held by startup recovery for a browser from
             // before a restart that could not be proven gone. `reason` names
             // why and `remedy` names the operator's clear.
@@ -4573,6 +4578,7 @@ fn browser_launch_result_schema() -> Value {
             // The custody holder currently owning the profile. Minted by the
             // custody lock, never a profile UUID or path.
             "holder_id":string_schema(),
+            "detail":resource_busy_detail_schema(),
             "rollback":enum_schema(&["rollback_opened"]),
             "pipe":enum_schema(&["command", "response", "cdp"]),
             "claim_kind":enum_schema(&["code_signed", "image_digest"]),
@@ -4732,6 +4738,25 @@ fn validate_runtime_result_schema(
             "{path} result schema is not an object"
         ))
     })?;
+    if let Some(alternatives) = object.get("anyOf") {
+        if object.len() != 1 {
+            return Err(CapabilityResultValidationError::MalformedArtifact(format!(
+                "{path}.anyOf cannot be combined with other keywords"
+            )));
+        }
+        let alternatives = alternatives
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .ok_or_else(|| {
+                CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path}.anyOf must be a nonempty array"
+                ))
+            })?;
+        for (index, alternative) in alternatives.iter().enumerate() {
+            validate_runtime_result_schema(alternative, &format!("{path}.anyOf[{index}]"))?;
+        }
+        return Ok(());
+    }
     for keyword in object.keys() {
         if !matches!(
             keyword.as_str(),
@@ -4919,6 +4944,24 @@ fn collect_result_violations(
     let object = schema
         .as_object()
         .expect("cached result schemas were validated while loading");
+    if let Some(alternatives) = object.get("anyOf").and_then(Value::as_array) {
+        let mut closest: Option<Vec<CapabilityResultViolation>> = None;
+        for alternative in alternatives {
+            let mut errors = Vec::new();
+            collect_result_violations(alternative, result, path, &mut errors);
+            if errors.is_empty() {
+                return;
+            }
+            if closest
+                .as_ref()
+                .is_none_or(|prior| errors.len() < prior.len())
+            {
+                closest = Some(errors);
+            }
+        }
+        violations.extend(closest.expect("validated alternatives are nonempty"));
+        return;
+    }
     let schema_types = schema_types(object, path)
         .expect("cached result schema types were validated while loading");
     if !schema_types
@@ -6390,5 +6433,73 @@ mod tests {
             result["remedy"],
             "choose an in-page action that does not start a download"
         );
+    }
+}
+
+/// Schema for a shared resource-busy refusal; resource names and future holder
+/// kinds are open strings.
+pub(crate) fn resource_busy_detail_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "resource":{"type":"string"},
+            "holder":{
+                "type":"object",
+                "properties":{"kind":{"type":"string"},"flow_id":{"type":"string"}},
+                "required":["kind"],"additionalProperties":false
+            },
+            "since_ms":{"type":"integer"},
+            "retry_after_ms":{"type":"integer"}
+        },
+        "required":["resource","holder","since_ms","retry_after_ms"],
+        "additionalProperties":false
+    })
+}
+
+#[cfg(test)]
+mod resource_busy_schema_tests {
+    use super::*;
+
+    #[test]
+    fn resource_busy_detail_alternatives_are_closed_and_enforced() {
+        let schema = json!({"anyOf":[invalid_request_detail_result_schema(), resource_busy_detail_schema()]});
+        validate_runtime_result_schema(&schema, "detail").unwrap();
+        for detail in [
+            json!({"field":"url","reason_code":"missing_field"}),
+            serde_json::to_value(cortexkit_resource_busy::ResourceBusy::new(
+                "browser_profile",
+                cortexkit_resource_busy::Holder::head(),
+                1,
+                2,
+            ))
+            .unwrap(),
+        ] {
+            let mut errors = Vec::new();
+            collect_result_violations(&schema, &detail, "$", &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        for detail in [
+            json!({}),
+            json!({"field":"url","reason_code":"missing_field","extra":true}),
+            json!({"resource":"browser_profile","holder":{"kind":"head"},"since_ms":1}),
+        ] {
+            let mut errors = Vec::new();
+            collect_result_violations(&schema, &detail, "$", &mut errors);
+            assert!(!errors.is_empty(), "undeclared detail accepted: {detail}");
+        }
+    }
+
+    #[test]
+    fn resource_busy_detail_alternatives_reject_malformed_schema_branches() {
+        for schema in [
+            json!({"anyOf":[]}),
+            json!({"anyOf":[{"type":"object"}]}),
+            json!({"anyOf":[{"type":"string"}],"type":"string"}),
+        ] {
+            assert!(
+                validate_runtime_result_schema(&schema, "detail").is_err(),
+                "{schema}"
+            );
+        }
     }
 }

@@ -4858,6 +4858,9 @@ pub enum BrowserLaunchOutcome {
     ProfileBusy {
         holder_id: HolderId,
     },
+    ResourceBusy {
+        detail: cortexkit_resource_busy::ResourceBusy,
+    },
     /// The profile is held by startup recovery, not by a session: a browser
     /// from before the module restarted could not be proven gone.
     ProfileRecoveryPending {
@@ -4881,6 +4884,15 @@ pub enum BrowserLaunchOutcome {
 impl BrowserLaunchOutcome {
     pub fn as_json(&self) -> Value {
         match self {
+            Self::ResourceBusy { detail } => {
+                detail
+                    .validate()
+                    .expect("browser profile refusal must be valid");
+                json!({"outcome": "resource_busy", "detail": {
+                    "resource": detail.resource, "holder": detail.holder,
+                    "since_ms": detail.since_ms, "retry_after_ms": detail.retry_after_ms,
+                }})
+            }
             Self::ProfileBusy { holder_id } => {
                 // Says WHY the profile is held, because the common cause looks
                 // like a defect from the caller's seat. Two live sessions on one
@@ -5064,6 +5076,7 @@ where
 {
     lifecycle: &'a mut ProfileLifecycle,
     locks: &'a mut ProfileCustodyLocks<J, P>,
+    launch_timeout_ms: Option<u64>,
 }
 
 impl<'a, J, P> ProfileBoundLaunch<'a, J, P>
@@ -5075,7 +5088,16 @@ where
         lifecycle: &'a mut ProfileLifecycle,
         locks: &'a mut ProfileCustodyLocks<J, P>,
     ) -> Self {
-        Self { lifecycle, locks }
+        Self {
+            lifecycle,
+            locks,
+            launch_timeout_ms: None,
+        }
+    }
+
+    pub fn with_launch_timeout(mut self, timeout_ms: u64) -> Self {
+        self.launch_timeout_ms = Some(timeout_ms);
+        self
     }
 
     /// Acquire the logical profile before the existing prepare API performs any
@@ -5097,7 +5119,12 @@ where
         let mut claim = match self.locks.acquire(key, holder_id) {
             Ok(ProfileCustodyAcquisition::Acquired(claim)) => claim,
             Ok(ProfileCustodyAcquisition::ProfileBusy { holder_id }) => {
-                return Err(BrowserLaunchOutcome::ProfileBusy { holder_id })
+                if let Some(detail) = crate::profile_custody::lease_refusal(holder_id.as_str()) {
+                    return Err(BrowserLaunchOutcome::ResourceBusy { detail });
+                }
+                // Another supervisor's durable lock has no timing this process
+                // can know without changing the disk format. Keep its legacy refusal.
+                return Err(BrowserLaunchOutcome::ProfileBusy { holder_id });
             }
             Err(_) => {
                 return Err(BrowserLaunchOutcome::InternalFailure {
@@ -5106,6 +5133,12 @@ where
             }
         };
 
+        if let Some(timeout_ms) = self.launch_timeout_ms {
+            crate::profile_custody::lease_deadline(
+                claim.holder_id().as_str(),
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms),
+            );
+        }
         let prepared = match self
             .lifecycle
             .prepare_context_open(invocation, reservation, context)
@@ -5385,6 +5418,7 @@ fn cleanup_stage_after_profile_completion(attempt: &PreparedProfileAttempt) -> L
 /// carry a profile UUID or profile path without updating the structural fence.
 const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
     BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
+    | BrowserLaunchOutcome::ResourceBusy { detail: _ }
     | BrowserLaunchOutcome::ProfileRecoveryPending { reason: _ }
     | BrowserLaunchOutcome::ProfileGrantRequired
     | BrowserLaunchOutcome::ProfileRegistryUntrustedRoot { reason: _ }
@@ -5404,6 +5438,11 @@ mod launch_outcome_schema_tests {
     /// changes the rendered words (a remedy appears for some reasons only).
     fn renderings_of(variant: &BrowserLaunchOutcome) -> Vec<BrowserLaunchOutcome> {
         match variant {
+            BrowserLaunchOutcome::ResourceBusy { detail } => {
+                vec![BrowserLaunchOutcome::ResourceBusy {
+                    detail: detail.clone(),
+                }]
+            }
             BrowserLaunchOutcome::ProfileBusy { .. } => vec![BrowserLaunchOutcome::ProfileBusy {
                 holder_id: serde_json::from_value(json!("holder-under-test"))
                     .expect("a holder id deserializes from its string"),
@@ -5494,6 +5533,14 @@ mod launch_outcome_schema_tests {
         // One seed per variant; `renderings_of` refuses to compile if a
         // variant is missing from its match.
         let seeds = [
+            BrowserLaunchOutcome::ResourceBusy {
+                detail: cortexkit_resource_busy::ResourceBusy::new(
+                    "browser_profile",
+                    cortexkit_resource_busy::Holder::head(),
+                    1,
+                    2,
+                ),
+            },
             BrowserLaunchOutcome::ProfileBusy {
                 holder_id: serde_json::from_value(json!("seed")).expect("holder id"),
             },
@@ -5531,9 +5578,9 @@ mod launch_outcome_schema_tests {
         }
         // One rendering each for busy, grant, storage and internal failure,
         // three recovery-pending reasons, eighteen untrusted-root reasons, and
-        // three cleanup stages: 28. A lower count means a rendering was
+        // three cleanup stages, plus the fleet resource refusal: 29. A lower count means a rendering was
         // dropped from the check.
-        assert_eq!(checked, 28);
+        assert_eq!(checked, 29);
     }
 
     /// Platform launch refusals reach the caller through the launch service's

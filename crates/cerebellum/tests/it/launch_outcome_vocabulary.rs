@@ -33,7 +33,7 @@ const LIB_FUNCTION: (&str, &str) = ("src/lib.rs", "async fn handle_browser_contr
 
 /// Fewer distinct words than this means the scan stopped reading the sources
 /// it names, and an empty scan proves nothing.
-const MINIMUM_DISTINCT_WORDS: usize = 20;
+const MINIMUM_DISTINCT_WORDS: usize = 21;
 
 #[test]
 fn every_launch_path_outcome_literal_is_declared_by_a_browser_session_schema() {

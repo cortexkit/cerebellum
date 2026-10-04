@@ -148,6 +148,7 @@ pub struct ImportResult {
     /// Only on `consent_pending`: the consent card still open.
     pub ask_id: Option<String>,
     pub reason: Option<&'static str>,
+    pub busy_detail: Option<cortexkit_resource_busy::ResourceBusy>,
 }
 
 impl ImportResult {
@@ -169,6 +170,15 @@ impl ImportResult {
         if let Some(ask_id) = &self.ask_id {
             object.insert("ask_id".to_string(), Value::String(ask_id.clone()));
         }
+        if let Some(detail) = &self.busy_detail {
+            detail
+                .validate()
+                .expect("browser profile refusal must be valid");
+            object.insert(
+                "detail".to_string(),
+                serde_json::to_value(detail).expect("serialize resource busy"),
+            );
+        }
         if let Some(reason) = self.reason {
             object.insert("reason".to_string(), Value::String(reason.to_string()));
         }
@@ -186,6 +196,7 @@ impl ImportResult {
             remedy: Some(remedy),
             ask_id: None,
             reason: None,
+            busy_detail: None,
         }
     }
 }
@@ -194,7 +205,7 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
     json!({
         "type":"object",
         "properties":{
-            "outcome":{"type":"string","enum":["transferred","consent_pending","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","transfer_failed","invalid_origin","internal_failure"]},
+            "outcome":{"type":"string","enum":["transferred","consent_pending","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","resource_busy","transfer_failed","invalid_origin","internal_failure"]},
             "domains_matched":{"type":"array","items":{"type":"string"}},
             "browser":{"type":"string"},
             "rows":{"type":"integer"},
@@ -207,7 +218,7 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
                     "restored_url":{"type":["string","null"]}
                 },"required":["browser_session_id","restored_url"],"additionalProperties":false
             },
-            "detail":launch_refusal
+            "detail":{"anyOf":[launch_refusal,crate::browser::resource_busy_detail_schema()]}
         },
         "required":["outcome"],"additionalProperties":false
     })
@@ -340,6 +351,12 @@ impl LoginImportPlan {
                     Ok(rows) => {
                         self.result("transferred", Some(browser_id.to_string()), rows, None)
                     }
+                    Err(TransferError::ResourceBusy(detail)) => {
+                        let mut result =
+                            self.result("resource_busy", Some(browser_id.to_string()), 0, None);
+                        result.busy_detail = Some(detail);
+                        result
+                    }
                     Err(TransferError::ProfileBusy) => self.result(
                         "profile_busy",
                         Some(browser_id.to_string()),
@@ -388,6 +405,7 @@ impl LoginImportPlan {
             remedy,
             ask_id: None,
             reason: None,
+            busy_detail: None,
         }
     }
 
@@ -414,10 +432,14 @@ impl LoginImportPlan {
             .map_err(|_| TransferError::Failed)?
         {
             ProfileCustodyAcquisition::Acquired(claim) => claim,
-            ProfileCustodyAcquisition::ProfileBusy { .. } => {
+            ProfileCustodyAcquisition::ProfileBusy { holder_id } => {
+                if let Some(detail) = crate::profile_custody::lease_refusal(holder_id.as_str()) {
+                    return Err(TransferError::ResourceBusy(detail));
+                }
                 return Err(TransferError::ProfileBusy);
             }
         };
+        crate::profile_custody::lease_deadline(claim.holder_id().as_str(), deadline);
         if locks
             .bind_profile_directory(&mut claim, &self.location.profile_directory)
             .is_err()
@@ -531,6 +553,7 @@ pub(crate) fn import_question(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TransferError {
     ProfileBusy,
+    ResourceBusy(cortexkit_resource_busy::ResourceBusy),
     TimedOut,
     Failed,
 }
@@ -787,6 +810,7 @@ fn sqlite_read(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
     sqlite_read_until(program, store, sql, Instant::now() + TRANSFER_TIMEOUT)
 }
 
+#[cfg(test)]
 fn sqlite_write(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
     sqlite_read_until(program, store, sql, Instant::now() + TRANSFER_TIMEOUT)
 }

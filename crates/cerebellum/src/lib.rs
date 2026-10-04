@@ -4980,14 +4980,16 @@ struct PendingSettlement {
     request: (u16, u32, u64),
 }
 
-/// Whether `reply` is one `handle_tool_request` sends from its own checks,
-/// before any plane is reached. These are the refusals that prove by
-/// themselves that nothing ran.
+/// Return true for replies sent by `handle_tool_request` before dispatch or
+/// for a provider resource-busy refusal; neither case dispatched the tool.
 fn refused_before_dispatch(reply: &Frame) -> bool {
     let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
     match reply.header.ty {
         // The envelope and argument checks answer in the reply body.
-        FrameType::Response => body["outcome"] == "invalid_request",
+        FrameType::Response => matches!(
+            body["outcome"].as_str(),
+            Some("invalid_request" | "resource_busy")
+        ),
         FrameType::Error => body["code"].as_str().is_some_and(|code| {
             [
                 "invalid_request",
